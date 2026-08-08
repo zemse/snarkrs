@@ -37,7 +37,10 @@ pub enum ProveError {
     #[error("witness has {got} entries, proving key expects {want}")]
     WitnessLength { got: usize, want: usize },
     #[error("backend {backend}: {reason}")]
-    Backend { backend: &'static str, reason: String },
+    Backend {
+        backend: &'static str,
+        reason: String,
+    },
 }
 
 /// A Groth16 proof. Serialises to snarkjs' `proof.json` shape so `snarkjs groth16 verify`

@@ -9,3 +9,7 @@ g16-field.workspace = true
 ark-ff.workspace = true
 ark-ec.workspace = true
 rayon.workspace = true
+
+[dev-dependencies]
+# test_rng and UniformRand for the oracles; tests only, nothing in the library path.
+ark-std.workspace = true

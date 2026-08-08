@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "g16_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "g16"
 path = "src/main.rs"
@@ -18,7 +22,9 @@ ark-bn254.workspace = true
 ark-ff.workspace = true
 ark-ec.workspace = true
 ark-serialize.workspace = true
-ark-std.workspace = true
+# `getrandom` is ark-std's name for rand/std: without it there is no OS-seeded RNG in
+# scope, and the zero-knowledge blinders have nowhere trustworthy to come from.
+ark-std = { workspace = true, features = ["std", "getrandom"] }
 clap.workspace = true
 anyhow.workspace = true
 serde.workspace = true
