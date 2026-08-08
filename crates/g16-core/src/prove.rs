@@ -378,7 +378,7 @@ mod tests {
             let h = circuit.compute_h(&witness, &mut t).unwrap();
             assert_eq!(h.len(), circuit.domain_size());
             assert_eq!(h.len(), circuit.key().h_query.len());
-            assert!(h.iter().any(|x| !x.is_zero()));
+            assert!(h.to_host().unwrap().iter().any(|x| !x.is_zero()));
             // Stage timings have to be filled in, otherwise `bench` reports a free prover.
             assert!(t.gather_us > 0 || t.ntt_us > 0 || t.pointwise_us > 0);
         });

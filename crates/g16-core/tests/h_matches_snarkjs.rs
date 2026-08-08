@@ -42,6 +42,7 @@ fn h_matches_snarkjs_element_by_element() {
         let circuit = CpuBackend::new().prepare(pk).unwrap();
         let mut t = StageTimings::default();
         let got = circuit.compute_h(&w, &mut t).unwrap();
+        let got = got.to_host().unwrap();
 
         let text = std::fs::read_to_string(dir.join("h_expected.json")).unwrap();
         let want: Vec<String> = serde_json::from_str(&text).unwrap();

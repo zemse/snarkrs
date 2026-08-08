@@ -2,7 +2,7 @@
 
 use std::time::Instant;
 
-use crate::{Backend, MsmOutputs, PreparedCircuit, ProveError, StageTimings};
+use crate::{Backend, HPoly, MsmOutputs, PreparedCircuit, ProveError, StageTimings};
 use g16_field::*;
 use g16_msm::{CpuMsm, MsmBackend};
 use g16_ntt::{CpuNtt, Direction, NttBackend};
@@ -164,7 +164,7 @@ impl PreparedCircuit for CpuCircuit {
         &self.pk
     }
 
-    fn compute_h(&self, witness: &[Fr], t: &mut StageTimings) -> Result<Vec<Fr>, ProveError> {
+    fn compute_h(&self, witness: &[Fr], t: &mut StageTimings) -> Result<HPoly, ProveError> {
         self.check_witness(witness)?;
 
         // Stage 0. There is no C matrix in the zkey: snarkjs' buildABC1 fills C by
@@ -215,16 +215,22 @@ impl PreparedCircuit for CpuCircuit {
         pointwise_us += start.elapsed().as_micros() as u64;
         t.pointwise_us += pointwise_us;
 
-        Ok(h)
+        Ok(HPoly::Host(h))
     }
 
     fn msms(
         &self,
         witness: &[Fr],
-        h: &[Fr],
+        h: &HPoly,
         t: &mut StageTimings,
     ) -> Result<MsmOutputs, ProveError> {
         self.check_witness(witness)?;
+        // The CPU backend has nowhere else to keep H, so a device handle here can only
+        // have come from another backend and there is nothing sane to do with it.
+        let h = h.to_host().ok_or_else(|| ProveError::Backend {
+            backend: "cpu",
+            reason: "compute_h output came from another backend".to_string(),
+        })?;
         if h.len() != self.domain.size {
             return Err(ProveError::Backend {
                 backend: "cpu",

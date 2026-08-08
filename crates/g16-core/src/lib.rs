@@ -52,6 +52,65 @@ pub struct Proof {
     pub c: G1Affine,
 }
 
+/// The result of stages 0-4, carried from [`PreparedCircuit::compute_h`] into
+/// [`PreparedCircuit::msms`] without forcing it through host memory.
+///
+/// The CPU backend has the coefficients on the host already and stores them inline. A GPU
+/// backend leaves them in device memory and returns [`HPoly::Device`], carrying a handle
+/// only it knows how to interpret plus the buffer length. Stage 9's MSM then reads its
+/// scalars from the buffer stage 4 wrote, which is the entire point of grouping the stages
+/// this way.
+///
+/// The handle travels through the value rather than being stashed on the circuit, because
+/// `PreparedCircuit` is `&self` and explicitly safe to prove with concurrently. A circuit
+/// holding "the last H buffer" would race between two in-flight proofs, and the race would
+/// produce a proof that simply fails to verify, with nothing else to go on.
+pub enum HPoly {
+    /// Coefficients in host memory.
+    Host(Vec<Fr>),
+    /// Coefficients in backend-owned memory. `tag` identifies the owning backend so a
+    /// handle cannot be handed to a backend that would misread it, and `data` is that
+    /// backend's own handle: a buffer index, a wrapped device pointer, whatever it needs.
+    Device {
+        tag: &'static str,
+        len: usize,
+        data: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    },
+}
+
+impl HPoly {
+    pub fn len(&self) -> usize {
+        match self {
+            HPoly::Host(v) => v.len(),
+            HPoly::Device { len, .. } => *len,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Host-visible coefficients, copying down from the device if that is where they live.
+    /// Tests and cross-checks want this; the proving path should not, since forcing the
+    /// copy is exactly the round trip the enum exists to avoid.
+    pub fn to_host(&self) -> Option<&[Fr]> {
+        match self {
+            HPoly::Host(v) => Some(v),
+            HPoly::Device { .. } => None,
+        }
+    }
+
+    /// The backend's own handle, if `self` came from that backend. Returns `None` for a
+    /// host vector or for another backend's handle, so a backend can fall back rather
+    /// than misinterpret someone else's pointer.
+    pub fn device_handle<T: std::any::Any + Send + Sync>(&self, want: &'static str) -> Option<&T> {
+        match self {
+            HPoly::Device { tag, data, .. } if *tag == want => data.downcast_ref::<T>(),
+            _ => None,
+        }
+    }
+}
+
 /// The five MSM results, stages 5-9.
 pub struct MsmOutputs {
     pub a_g1: G1Projective,
@@ -93,14 +152,15 @@ pub trait PreparedCircuit: Send + Sync {
     fn key(&self) -> &ProvingKey;
 
     /// Stages 0-4. Returns `H` evaluated on the coset, length `domain_size`.
-    fn compute_h(&self, witness: &[Fr], t: &mut StageTimings) -> Result<Vec<Fr>, ProveError>;
+    fn compute_h(&self, witness: &[Fr], t: &mut StageTimings) -> Result<HPoly, ProveError>;
 
-    /// Stages 5-9. `h` is the output of [`Self::compute_h`]. A GPU backend is expected to
-    /// take `h` from its own device buffer rather than the slice when it can.
+    /// Stages 5-9. `h` must be the value [`Self::compute_h`] returned on this same
+    /// circuit; passing one from a different circuit is a caller error and backends are
+    /// entitled to reject it.
     fn msms(
         &self,
         witness: &[Fr],
-        h: &[Fr],
+        h: &HPoly,
         t: &mut StageTimings,
     ) -> Result<MsmOutputs, ProveError>;
 }
