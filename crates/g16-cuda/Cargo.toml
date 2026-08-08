@@ -4,8 +4,25 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Off by default so a macOS workspace build never needs CUDA. With the feature on, this
+# crate COMPILES anywhere (cudarc's dynamic-loading feature dlopens libcuda/libnvrtc at
+# run time rather than linking them), and only RUNNING needs an NVIDIA GPU. That is what
+# lets the backend be developed and typechecked on the M2 Max.
+cuda = ["dep:cudarc"]
+
 [dependencies]
 g16-field.workspace = true
 g16-zkey.workspace = true
 g16-core.workspace = true
+g16-gpu-layout.workspace = true
+ark-ff.workspace = true
+ark-ec.workspace = true
 thiserror.workspace = true
+cudarc = { version = "0.19", optional = true, default-features = false, features = [
+    "driver",
+    "nvrtc",
+    "cuda-12080",
+    "dynamic-loading",
+    "std",
+] }

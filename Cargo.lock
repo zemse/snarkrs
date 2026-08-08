@@ -351,6 +351,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cudarc"
+version = "0.19.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42310153e06cf4cd532901f7096beb27504d681736a29ee90728ae4e2d93b2a8"
+dependencies = [
+ "libloading",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -476,8 +485,12 @@ dependencies = [
 name = "g16-cuda"
 version = "0.1.0"
 dependencies = [
+ "ark-ec",
+ "ark-ff",
+ "cudarc",
  "g16-core",
  "g16-field",
+ "g16-gpu-layout",
  "g16-zkey",
  "thiserror",
 ]
@@ -492,6 +505,15 @@ dependencies = [
  "ark-serialize",
  "ark-std",
  "thiserror",
+]
+
+[[package]]
+name = "g16-gpu-layout"
+version = "0.1.0"
+dependencies = [
+ "ark-ec",
+ "ark-ff",
+ "g16-field",
 ]
 
 [[package]]
@@ -615,6 +637,16 @@ name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+
+[[package]]
+name = "libloading"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "754ca22de805bb5744484a5b151a9e1a8e837d5dc232c2d7d8c2e3492edc8b60"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
 
 [[package]]
 name = "log"

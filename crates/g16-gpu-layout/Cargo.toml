@@ -1,0 +1,10 @@
+[package]
+name = "g16-gpu-layout"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+g16-field.workspace = true
+ark-ff.workspace = true
+ark-ec.workspace = true
