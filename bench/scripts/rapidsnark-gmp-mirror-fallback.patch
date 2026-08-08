@@ -1,0 +1,58 @@
+--- build_gmp.sh.orig
++++ build_gmp.sh
+@@ -46,7 +46,17 @@
+         fi
+     }
+ 
+-    if [ ! -f ${GMP_ARCHIVE} ]; then
++    # LOCAL PATCH (see build_gmp.sh.orig for upstream). Two changes:
++    #  1. An existing archive that already verifies is reused instead of being
++    #     re-downloaded and clobbered.
++    #  2. The checksum is verified INSIDE the mirror loop, so a corrupt response from
++    #     the first mirror falls through to the next one. Upstream verifies only after
++    #     the loop has already broken on the first successful transfer, which turns a
++    #     bad mirror into a hard build failure with the good mirrors never tried.
++    if [ -f ${GMP_ARCHIVE} ] && verify_checksum > /dev/null 2>&1; then
++        echo "Reusing verified ${GMP_ARCHIVE}"
++    else
++        rm -f ${GMP_ARCHIVE}
+         for url in "${GMP_MIRRORS[@]}"; do
+             echo "Attempting to download from: $url"
+             set +e
+@@ -54,27 +64,24 @@
+             exit_code=$?
+             set -e
+ 
+-            if [ $exit_code -eq 0 ]; then
+-                echo "Successfully downloaded from: $url"
+-                break
+-            else
++            if [ $exit_code -ne 0 ]; then
+                 echo "Failed to download from: $url"
+                 rm -f ${GMP_ARCHIVE}
++                continue
+             fi
++            if verify_checksum; then
++                echo "Successfully downloaded and verified from: $url"
++                break
++            fi
++            echo "Checksum mismatch from: $url, trying next mirror"
++            rm -f ${GMP_ARCHIVE}
+         done
+ 
+         if [ ! -f ${GMP_ARCHIVE} ]; then
+-            echo "ERROR: Failed to download GMP from all mirrors"
++            echo "ERROR: Failed to obtain a verified GMP from any mirror"
+             exit 1
+         fi
+     fi
+-
+-    echo "Verifying checksum..."
+-    if ! verify_checksum; then
+-        echo "ERROR: Checksum verification failed for ${GMP_ARCHIVE}"
+-        rm -f ${GMP_ARCHIVE}
+-        exit 1
+-    fi
+     echo "Checksum verified successfully"
+ 
+     if [ ! -d gmp ]; then
