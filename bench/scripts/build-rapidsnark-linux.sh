@@ -32,7 +32,7 @@ fi
 
 PKG="$SRC/package"
 mkdir -p "$HERE/bin"
-cp "$PKG/bin/prover" "$HERE/bin/rapidsnark-prover"
+cp "$PKG/bin/prover" "$HERE/bin/rapidsnark"
 cp "$PKG/bin/verifier" "$HERE/bin/rapidsnark-verify"
 
 # Warm wrapper: the stock CLI reparses the zkey on every invocation, so it cannot measure
@@ -49,4 +49,4 @@ g++ -std=c++17 -O3 -o "$HERE/bin/rapidsnark-warm" \
     -L"$PKG/lib" -lrapidsnark -lrapidsnark-fr-fq -lfr -lfq -lgmp -lpthread \
     -Wl,-rpath,"$PKG/lib"
 
-echo "built: $HERE/bin/rapidsnark-prover $HERE/bin/rapidsnark-verify $HERE/bin/rapidsnark-warm"
+echo "built: $HERE/bin/rapidsnark $HERE/bin/rapidsnark-verify $HERE/bin/rapidsnark-warm"

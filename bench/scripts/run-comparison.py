@@ -19,7 +19,7 @@ Cold and warm mean exactly one thing each here:
         and it is the only mode in which a GPU backend can look good, which is
         precisely why vendor charts prefer it.
 """
-import argparse, csv, json, os, platform, statistics, subprocess, sys, time
+import argparse, csv, json, os, platform, shutil, statistics, subprocess, sys, time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent.parent
@@ -38,9 +38,59 @@ def verify_fast(vkey, public, proof):
     return "Valid proof" in (r.stdout + r.stderr)
 
 
+HAVE_SNARKJS = shutil.which("snarkjs") is not None
+
+
 def verify_snarkjs(vkey, public, proof):
+    """True, False, or None when snarkjs is not installed.
+
+    The tri-state matters. An earlier version returned False when snarkjs was simply
+    absent, which wrote "snarkjs_compatible: no" into the CSV and read as a real
+    encoding incompatibility. Not measured and measured-bad have to look different.
+    """
+    if not HAVE_SNARKJS:
+        return None
     r = sh(["snarkjs", "groth16", "verify", str(vkey), str(public), str(proof)])
     return "OK!" in (r.stdout + r.stderr)
+
+
+def compat_cell(c):
+    return "unknown" if c is None else ("yes" if c else "no")
+
+
+def detect_gpu():
+    """Name of the accelerator, for the record. Empty when there is none to name."""
+    r = sh(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"])
+    if r.returncode == 0 and r.stdout.strip():
+        return r.stdout.strip().splitlines()[0].strip()
+    if platform.system() == "Darwin":
+        r = sh(["sysctl", "-n", "machdep.cpu.brand_string"])
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    return ""
+
+
+def detect_machine():
+    """A short label for the box, so two result sets can never be mistaken for one.
+
+    On EC2 the instance type is the only label anyone can act on, and it is available
+    from the instance metadata service without credentials. IMDSv2 needs the token
+    dance; a one second timeout keeps this from stalling on a non-EC2 host.
+    """
+    if platform.system() == "Linux":
+        tok = sh(["curl", "-s", "-m", "1", "-X", "PUT",
+                  "http://169.254.169.254/latest/api/token",
+                  "-H", "X-aws-ec2-metadata-token-ttl-seconds: 60"])
+        if tok.returncode == 0 and tok.stdout.strip():
+            r = sh(["curl", "-s", "-m", "1",
+                    "http://169.254.169.254/latest/meta-data/instance-type",
+                    "-H", f"X-aws-ec2-metadata-token: {tok.stdout.strip()}"])
+            if r.returncode == 0 and r.stdout.strip():
+                gpu = detect_gpu().replace(" ", "-")
+                return f"aws-{r.stdout.strip()}" + (f"-{gpu}" if gpu else "")
+    if platform.system() == "Darwin":
+        return detect_gpu().replace(" ", "-") or platform.node()
+    return platform.node()
 
 
 def time_cold(cmd, reps, vkey, proof_out, public_out):
@@ -66,9 +116,19 @@ def main():
     ap.add_argument("--variants", nargs="*", default=None)
     ap.add_argument("--backends", nargs="*", default=["cpu"],
                     help="our backends to test, e.g. cpu metal")
-    ap.add_argument("--csv", default=str(HERE / "results" / "comparison.csv"))
+    ap.add_argument("--csv", default=None,
+                    help="default: results/comparison-<machine>.csv, so two machines "
+                         "never overwrite each other")
+    ap.add_argument("--machine", default=None,
+                    help="label for this box, recorded in every row (default: autodetected)")
     ap.add_argument("--skip-rapidsnark", action="store_true")
     args = ap.parse_args()
+
+    machine = args.machine or detect_machine()
+    gpu = detect_gpu()
+    if args.csv is None:
+        safe = "".join(c if c.isalnum() or c in "-._" else "-" for c in machine)
+        args.csv = str(HERE / "results" / f"comparison-{safe}.csv")
 
     g16 = HERE.parent / "target" / "release" / "g16"
     variants = args.variants or sorted(
@@ -80,6 +140,9 @@ def main():
     os_name, arch = platform.system(), platform.machine()
     cores = os.cpu_count()
     rows, notes = [], []
+    print(f"machine: {machine}   gpu: {gpu or '(none)'}   cores: {cores}   "
+          f"snarkjs: {'yes' if HAVE_SNARKJS else 'NOT INSTALLED, encoding cross-check skipped'}")
+    stamp = dict(machine=machine, gpu=gpu, host=host, os=os_name, arch=arch, cores=cores)
 
     for v in variants:
         d = ART / v
@@ -114,12 +177,12 @@ def main():
                 continue
             compat = verify_snarkjs(vkey, "/tmp/g16bench_public.json", "/tmp/g16bench_proof.json")
             print(f"  {prover:12s} {backend:6s} {mode:5s}  median {statistics.median(ms):8.1f} ms "
-                  f"(min {min(ms):.1f} max {max(ms):.1f})  snarkjs-compatible: {compat}", flush=True)
+                  f"(min {min(ms):.1f} max {max(ms):.1f})  snarkjs-compatible: {compat_cell(compat)}", flush=True)
             for i, m in enumerate(ms, 1):
-                rows.append(dict(host=host, os=os_name, arch=arch, cores=cores, variant=v,
+                rows.append(dict(**stamp, variant=v,
                                  constraints=nc, prover=prover, backend=backend, mode=mode,
                                  rep=i, ms=round(m, 3), verified="yes",
-                                 snarkjs_compatible="yes" if compat else "no"))
+                                 snarkjs_compatible=compat_cell(compat)))
 
         # warm: rapidsnark through its object API, ours through `g16 bench --mode warm`
         if not args.skip_rapidsnark and (BIN / "rapidsnark-warm").exists():
@@ -130,9 +193,10 @@ def main():
                 print(f"  {'rapidsnark':12s} {'cpu':6s} {'warm':5s}  median {statistics.median(times):8.1f} ms "
                       f"(min {min(times):.1f} max {max(times):.1f})", flush=True)
                 for i, m in enumerate(times, 1):
-                    rows.append(dict(host=host, os=os_name, arch=arch, cores=cores, variant=v,
+                    rows.append(dict(**stamp, variant=v,
                                      constraints=nc, prover="rapidsnark", backend="cpu", mode="warm",
-                                     rep=i, ms=m, verified="yes", snarkjs_compatible="yes"))
+                                     rep=i, ms=m, verified="yes",
+                                     snarkjs_compatible=compat_cell(True if HAVE_SNARKJS else None)))
             else:
                 notes.append(f"{v}/rapidsnark/warm: no timings or proof failed to verify")
 
@@ -149,6 +213,10 @@ def main():
             p = Path(f"/tmp/g16bench_warm_{v}_{b}.csv")
             if p.exists():
                 got = list(csv.DictReader(p.open()))
+                # g16 bench writes its own columns; stamp the machine on them too or the
+                # warm rows would be the only ones in the file with no machine label.
+                for row in got:
+                    row.update(stamp)
                 rows.extend(got)
                 t = [float(x["ms"]) for x in got if x.get("ms")]
                 if t:
