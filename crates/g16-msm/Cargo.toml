@@ -13,3 +13,5 @@ rayon.workspace = true
 [dev-dependencies]
 # test_rng and UniformRand for the oracles; tests only, nothing in the library path.
 ark-std.workspace = true
+# field_cpu_throughput needs a concrete curve to time; tests only.
+ark-bn254.workspace = true

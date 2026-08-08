@@ -30,6 +30,12 @@ pub mod layout;
 pub mod backend;
 #[cfg(target_os = "macos")]
 pub mod kernels;
+#[cfg(target_os = "macos")]
+pub mod msm;
+/// Stages 0 to 4 on the GPU: the CSR gather, the six NTTs, the coset shift and
+/// `H = A*B - C`, all in one command buffer with the domain vectors kept resident.
+#[cfg(target_os = "macos")]
+pub mod stages;
 
 #[cfg(target_os = "macos")]
-pub use backend::MetalBackend;
+pub use backend::{MetalBackend, MetalCircuit, PrepareCost};

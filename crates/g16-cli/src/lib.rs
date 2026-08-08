@@ -27,11 +27,12 @@ impl BackendKind {
 
 /// Construct a backend, or explain precisely why it cannot exist in this binary.
 ///
-/// The two failure modes are worth distinguishing in the message, because they need
-/// opposite fixes: "not compiled in" is a rebuild, "not implemented" is more code. The
-/// second one is a `todo!()` inside `g16-metal`, and since the release profile is
-/// `panic = "abort"` it cannot be caught here, so the warning is printed before the call
-/// rather than translated after it.
+/// Three failure modes, and they need three different fixes, so they get three different
+/// messages: the feature is off (rebuild), the feature is on but the target is not macOS
+/// (wrong machine), and the feature is on and the machine has no Metal device (this
+/// backend cannot run here). The last one is an error rather than a quiet fall back to
+/// the CPU backend, because a benchmark that silently measures the other backend is
+/// worse than no number at all.
 pub fn make_backend(kind: BackendKind) -> Result<Box<dyn Backend>> {
     match kind {
         BackendKind::Cpu => Ok(Box::new(CpuBackend::new())),
@@ -41,11 +42,11 @@ pub fn make_backend(kind: BackendKind) -> Result<Box<dyn Backend>> {
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 fn metal_backend() -> Result<Box<dyn Backend>> {
-    eprintln!(
-        "note: the metal backend is compiled in but NOT implemented yet; the next call \
-         is expected to abort on todo!() in g16-metal/src/backend.rs"
-    );
-    Ok(Box::new(g16_metal::MetalBackend::new()?))
+    // `MetalBackend::new` is the expensive constructor: it compiles the MSL and builds
+    // every pipeline state, so it belongs here, once, and never on a proving path.
+    Ok(Box::new(g16_metal::MetalBackend::new().map_err(|e| {
+        anyhow::anyhow!("backend `metal` is unavailable: {e}")
+    })?))
 }
 
 #[cfg(all(feature = "metal", not(target_os = "macos")))]
@@ -60,8 +61,7 @@ fn metal_backend() -> Result<Box<dyn Backend>> {
 fn metal_backend() -> Result<Box<dyn Backend>> {
     anyhow::bail!(
         "backend `metal` is unavailable: this binary was built WITHOUT the `metal` \
-         feature. Rebuild with `cargo build --release --features metal`. (The backend \
-         itself is also still unimplemented: with the feature on it aborts on a todo!().)"
+         feature. Rebuild with `cargo build --release --features metal`."
     )
 }
 

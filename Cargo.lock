@@ -512,6 +512,7 @@ dependencies = [
 name = "g16-msm"
 version = "0.1.0"
 dependencies = [
+ "ark-bn254",
  "ark-ec",
  "ark-ff",
  "ark-std",
