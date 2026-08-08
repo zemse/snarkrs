@@ -39,8 +39,9 @@ pub struct ProvingKey {
     pub b_g2_query: Vec<G2Affine>,
     /// Section 8: bases for the L MSM. Length `n_vars - n_public - 1`.
     pub l_query: Vec<G1Affine>,
-    /// Section 9: bases for the H MSM. Length `domain_size` (snarkjs writes `domain_size`
-    /// entries; only the first `domain_size - 1` are ever used).
+    /// Section 9: bases for the H MSM. Length `domain_size`, and all of them are used.
+    /// ffjavascript's `multiExp` rejects a scalar vector shorter than the base vector, so
+    /// the H MSM runs over the full section rather than `domain_size - 1` of it.
     pub h_query: Vec<G1Affine>,
     /// Section 4, already sorted into CSR by constraint index. See [`Coefficients`].
     pub coeffs: Coefficients,

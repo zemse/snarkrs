@@ -305,7 +305,11 @@ where
     // buckets, and it is far cheaper than merging bucket arrays. Splitting past what the
     // pool can run at once is a pure loss: it buys no parallelism and pays another bucket
     // reduction per chunk.
-    let n_buckets = (1usize << (c - 1)) + 1;
+    // Signed digits land in [-2^(c-1), 2^(c-1)] and index as `d - 1` when positive and
+    // `-d - 1` when negative, so the highest reachable index is 2^(c-1) - 1. Allocating
+    // 2^(c-1) + 1 left a bucket that is never written and still walked by the running-sum
+    // reduction, costing two Jacobian additions per window per point chunk.
+    let n_buckets = 1usize << (c - 1);
     let point_chunks = threads
         .max(1)
         .div_ceil(n_windows)

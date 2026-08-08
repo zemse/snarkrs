@@ -31,15 +31,20 @@ pub trait NttBackend: Send + Sync {
     fn distribute_powers(&self, a: &mut [Fr], shift: Fr);
 }
 
-/// Below this length the serial path wins. A transform is `log n` sequential passes, and
-/// every one of them pays a full rayon fork/join, so the overhead scales with `log n`
-/// while the work only starts to dominate at `n log n`. Measured on a 12-core M-series
-/// (forward transform, release): 2^12 ran at 0.76x of serial, 2^14 at 1.98x, 2^16 at
-/// 3.4x, so the crossover sits near 2^13 rather than the 2^10 that the butterfly count
-/// alone suggests. The measurement was taken on a busy machine, so if anything the true
-/// crossover is lower; erring high only costs a fraction of a millisecond on domains this
-/// small, and real circuits are 2^16 and up.
-const PARALLEL_THRESHOLD: usize = 1 << 13;
+/// Below this length the serial path wins. A transform is `log n` sequential passes and
+/// every one pays a full rayon fork/join, so the overhead scales with `log n` while the
+/// work only starts to dominate at `n log n`.
+///
+/// This was first set to 2^13 from a sweep taken while a `snarkjs powersoftau prepare
+/// phase2` was using 900% CPU, which inflated the parallel path's apparent cost by up to
+/// 6x. Re-measured on a quiet 12-core M2 Max (forward transform, release): the parallel
+/// path is 1.44x faster than serial at 2^12, 1.20x at 2^11, and break-even at 2^10. The
+/// old constant left a visible discontinuity in the sweep, where 2^13 completed twice the
+/// work of 2^12 in less wall time because only one of them took the parallel path.
+///
+/// Benchmark numbers taken under load are worse than no numbers, because they look like
+/// measurements.
+const PARALLEL_THRESHOLD: usize = 1 << 10;
 
 /// Rayon tasks per pass, as a multiple of the thread count. Slight oversubscription lets
 /// work stealing even out threads that lose time to cache misses; going much higher just
