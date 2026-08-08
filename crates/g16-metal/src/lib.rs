@@ -21,6 +21,11 @@
 //! silicon, degrading toward 1.5-2x once witness generation is counted. This backend is
 //! for client-side proving, not server throughput. Measure, do not hope.
 
+/// The packed structs that cross into MSL. Host-side only, so it builds everywhere;
+/// its definitions are mirrored by `src/shaders/bn254_fr.metal` and the two must be
+/// changed together.
+pub mod layout;
+
 #[cfg(target_os = "macos")]
 pub mod backend;
 #[cfg(target_os = "macos")]
