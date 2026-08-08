@@ -1,0 +1,19 @@
+[package]
+name = "g16-zkey"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+g16-field.workspace = true
+ark-bn254.workspace = true
+ark-ff.workspace = true
+ark-ec.workspace = true
+ark-serialize.workspace = true
+memmap2.workspace = true
+byteorder.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+num-bigint.workspace = true
+rayon.workspace = true

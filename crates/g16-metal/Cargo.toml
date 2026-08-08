@@ -1,0 +1,20 @@
+[package]
+name = "g16-metal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+g16-field.workspace = true
+g16-zkey.workspace = true
+g16-core.workspace = true
+ark-ff.workspace = true
+ark-ec.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = "0.29"
+objc = "0.2"
+
+[features]
+default = []

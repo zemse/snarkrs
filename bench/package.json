@@ -1,0 +1,2 @@
+{ "name": "g16-bench-artifacts", "private": true, "version": "0.0.0",
+  "dependencies": { "circomlib": "^2.0.5", "circomlibjs": "^0.1.7" } }

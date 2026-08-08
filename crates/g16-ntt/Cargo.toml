@@ -1,0 +1,10 @@
+[package]
+name = "g16-ntt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+g16-field.workspace = true
+ark-ff.workspace = true
+rayon.workspace = true

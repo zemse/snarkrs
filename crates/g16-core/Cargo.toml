@@ -1,0 +1,21 @@
+[package]
+name = "g16-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+g16-field.workspace = true
+g16-zkey.workspace = true
+g16-ntt.workspace = true
+g16-msm.workspace = true
+ark-bn254.workspace = true
+ark-ff.workspace = true
+ark-ec.workspace = true
+ark-std.workspace = true
+ark-serialize.workspace = true
+rayon.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+num-bigint.workspace = true

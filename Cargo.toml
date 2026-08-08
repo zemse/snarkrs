@@ -1,0 +1,55 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/g16-field",
+    "crates/g16-zkey",
+    "crates/g16-ntt",
+    "crates/g16-msm",
+    "crates/g16-core",
+    "crates/g16-metal",
+    "crates/g16-cuda",
+    "crates/g16-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+authors = ["Soham Zemse <soham@zemse.in>"]
+repository = "https://github.com/zemse/gpu-snark"
+
+[workspace.dependencies]
+ark-bn254    = { version = "0.5", default-features = false, features = ["curve"] }
+ark-ff       = { version = "0.5", default-features = false, features = ["asm"] }
+ark-ec       = { version = "0.5", default-features = false }
+ark-serialize = { version = "0.5", default-features = false }
+ark-std      = { version = "0.5", default-features = false }
+rayon        = "1.10"
+memmap2      = "0.9"
+thiserror    = "2"
+anyhow       = "1"
+byteorder    = "1.5"
+num-bigint   = "0.4"
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+clap         = { version = "4", features = ["derive"] }
+hex          = "0.4"
+
+g16-field = { path = "crates/g16-field" }
+g16-zkey  = { path = "crates/g16-zkey" }
+g16-ntt   = { path = "crates/g16-ntt" }
+g16-msm   = { path = "crates/g16-msm" }
+g16-core  = { path = "crates/g16-core" }
+g16-metal = { path = "crates/g16-metal" }
+g16-cuda  = { path = "crates/g16-cuda" }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+inherits = "release"
+panic = "unwind"
