@@ -41,7 +41,7 @@ for v in $VARIANTS; do
   d="$OUT/$NAME"; mkdir -p "$d"
 
   cat > "$d/circuit.circom" <<CIRC
-pragma circom 2.2.2;
+pragma circom 2.1.4;
 include "joinsplit.circom";
 component main {public [merkleRoot, nullifiers, outCommitments, tokenId]} =
     JoinSplit($NIN, $NOUT, $DEPTH, $VBITS);
