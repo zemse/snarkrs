@@ -14,6 +14,7 @@ use g16_core::{cpu::CpuBackend, Backend};
 pub enum BackendKind {
     Cpu,
     Metal,
+    Cuda,
 }
 
 impl BackendKind {
@@ -21,6 +22,7 @@ impl BackendKind {
         match self {
             BackendKind::Cpu => "cpu",
             BackendKind::Metal => "metal",
+            BackendKind::Cuda => "cuda",
         }
     }
 }
@@ -37,6 +39,7 @@ pub fn make_backend(kind: BackendKind) -> Result<Box<dyn Backend>> {
     match kind {
         BackendKind::Cpu => Ok(Box::new(CpuBackend::new())),
         BackendKind::Metal => metal_backend(),
+        BackendKind::Cuda => cuda_backend(),
     }
 }
 
@@ -62,6 +65,31 @@ fn metal_backend() -> Result<Box<dyn Backend>> {
     anyhow::bail!(
         "backend `metal` is unavailable: this binary was built WITHOUT the `metal` \
          feature. Rebuild with `cargo build --release --features metal`."
+    )
+}
+
+/// CUDA has one fewer failure mode than Metal, and it is worth saying why.
+///
+/// `g16-cuda` uses `cudarc` with `dynamic-loading`, so it compiles on any target and
+/// resolves `libcuda` and `libnvrtc` with `dlopen` at run time. There is therefore no
+/// "wrong operating system" arm here: either the feature is off, or the feature is on and
+/// the machine either has a usable device or does not. As with Metal, a missing device is
+/// an error rather than a quiet fall back to the CPU backend, because a benchmark that
+/// silently measures a different backend is worse than no number at all.
+#[cfg(feature = "cuda")]
+fn cuda_backend() -> Result<Box<dyn Backend>> {
+    // The expensive constructor: NVRTC compiles every kernel here, once, never on a
+    // proving path.
+    Ok(Box::new(g16_cuda::CudaBackend::new().map_err(|e| {
+        anyhow::anyhow!("backend `cuda` is unavailable: {e}")
+    })?))
+}
+
+#[cfg(not(feature = "cuda"))]
+fn cuda_backend() -> Result<Box<dyn Backend>> {
+    anyhow::bail!(
+        "backend `cuda` is unavailable: this binary was built WITHOUT the `cuda` \
+         feature. Rebuild with `cargo build --release --features cuda`."
     )
 }
 
@@ -116,6 +144,19 @@ mod tests {
 
     /// Without the feature the error must name the feature, so the fix is obvious from
     /// the message alone.
+    #[cfg(not(feature = "cuda"))]
+    #[test]
+    fn cuda_without_the_feature_says_so() {
+        match make_backend(BackendKind::Cuda) {
+            Ok(_) => panic!("built a cuda backend without the cuda feature"),
+            Err(e) => {
+                let e = e.to_string();
+                assert!(e.contains("cuda"), "{e}");
+                assert!(e.contains("--features cuda"), "{e}");
+            }
+        }
+    }
+
     #[cfg(not(feature = "metal"))]
     #[test]
     fn metal_without_the_feature_says_so() {
