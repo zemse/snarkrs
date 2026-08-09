@@ -407,3 +407,126 @@ fn snarkjs_reference_proof_verifies_under_the_parsed_key() {
         assert_eq!(out, PairingOutput::zero(), "{}: pairing check", a.name);
     });
 }
+
+// Regression tests for the two key-handling findings from the audit. Both were
+// confirmed by running the attack before the fix landed, so both are pinned here.
+
+/// Byte offsets inside section 2, derived from the file rather than hardcoded.
+///
+/// Layout, in order: `n8q`, `q`, `n8r`, `r`, `nVars`, `nPublic`, `domainSize`, then
+/// `alpha1` (G1), `beta1` (G1), `beta2` (G2), `gamma2` (G2), `delta1` (G1), `delta2` (G2).
+struct Header2 {
+    domain_size_at: usize,
+    beta_g1_at: usize,
+    delta_g1_at: usize,
+}
+
+fn locate(bytes: &[u8]) -> Header2 {
+    assert_eq!(&bytes[..4], b"zkey");
+    let nsec = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+    let mut off = 12usize;
+    let mut s2 = None;
+    for _ in 0..nsec {
+        let sid = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+        let slen = u64::from_le_bytes(bytes[off + 4..off + 12].try_into().unwrap()) as usize;
+        off += 12;
+        if sid == 2 && s2.is_none() {
+            s2 = Some(off);
+        }
+        off += slen;
+    }
+    let s2 = s2.expect("section 2");
+    let n8q = u32::from_le_bytes(bytes[s2..s2 + 4].try_into().unwrap()) as usize;
+    let p = s2 + 4 + n8q;
+    let n8r = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
+    let p = p + 4 + n8r + 8; // skip nVars, nPublic
+    let alpha1 = p + 4;
+    Header2 {
+        domain_size_at: p,
+        beta_g1_at: alpha1 + 64,
+        delta_g1_at: alpha1 + 64 + 64 + 128 + 128,
+    }
+}
+
+fn load_mutated(name: &str, base: &std::path::Path, edit: impl Fn(&mut Vec<u8>)) -> Result<(), ZkeyError> {
+    let mut bytes = std::fs::read(base.join("circuit.zkey")).unwrap();
+    edit(&mut bytes);
+    let path = std::env::temp_dir().join(format!("g16-zkey-regression-{name}-{}.zkey", std::process::id()));
+    std::fs::write(&path, &bytes).unwrap();
+    let r = ProvingKey::load(&path).map(|_| ());
+    let _ = std::fs::remove_file(&path);
+    r
+}
+
+/// The critical finding: zeroing `beta_g1` or `delta_g1` switches zero knowledge off while
+/// proofs still verify against the genuine vkey, because neither quantity appears in it.
+///
+/// The identity passes `is_on_curve` and `is_in_correct_subgroup_assuming_on_curve` in
+/// arkworks, so only an explicit infinity test catches this.
+#[test]
+fn a_zeroed_toxic_waste_point_is_rejected() {
+    for_each_artifact("a_zeroed_toxic_waste_point_is_rejected", |a| {
+        for (what, pick) in [
+            ("beta_g1", (|h: &Header2| h.beta_g1_at) as fn(&Header2) -> usize),
+            ("delta_g1", |h: &Header2| h.delta_g1_at),
+        ] {
+            let err = load_mutated(what, &a.dir, |b| {
+                let at = pick(&locate(b));
+                b[at..at + 64].fill(0);
+            })
+            .expect_err(&format!(
+                "{}: a zkey with {what} zeroed must be rejected; accepting it means this \
+                 key silently provides no zero knowledge",
+                a.name
+            ));
+            let msg = err.to_string();
+            assert!(msg.contains(what), "{}: unhelpful error: {msg}", a.name);
+            assert!(msg.contains("infinity"), "{}: unhelpful error: {msg}", a.name);
+        }
+    });
+}
+
+/// The unmutated key must still load. A gate that rejects real keys is worse than no gate,
+/// and real snarkjs keys genuinely do contain points at infinity inside the query sections,
+/// which is why the query check is ALL and not ANY.
+#[test]
+fn the_genuine_key_still_loads_after_the_infinity_gates() {
+    for_each_artifact("the_genuine_key_still_loads_after_the_infinity_gates", |a| {
+        ProvingKey::load(&a.dir.join("circuit.zkey"))
+            .unwrap_or_else(|e| panic!("{}: genuine key rejected: {e}", a.name));
+    });
+}
+
+/// The allocation bomb. A four kilobyte file claiming `domainSize = 2^31` used to cost
+/// 34 GB and 11.5 seconds before the section 9 length check refuted it, because that check
+/// ran after the allocations sized from the header. Both gates now run first, so this is a
+/// parse error with nothing allocated.
+#[test]
+fn a_lying_domain_size_is_refused_before_anything_is_allocated() {
+    for_each_artifact("a_lying_domain_size_is_refused_before_anything_is_allocated", |a| {
+        for claim in [1u32 << 31, 1 << 29, 1 << 24] {
+            let t = std::time::Instant::now();
+            let err = load_mutated("bomb", &a.dir, |b| {
+                let at = locate(b).domain_size_at;
+                b[at..at + 4].copy_from_slice(&claim.to_le_bytes());
+            })
+            .expect_err(&format!("{}: domainSize {claim} must be rejected", a.name));
+            // The point is not only that it errors but that it errors cheaply. Ten seconds
+            // is a very loose bound; the real figure is milliseconds. A regression that
+            // reintroduces the allocation shows up as tens of seconds and tens of GB.
+            assert!(
+                t.elapsed().as_secs() < 10,
+                "{}: rejecting domainSize {claim} took {:?}, which means something was \
+                 allocated from the header before it was validated",
+                a.name,
+                t.elapsed()
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains("two-adicity") || msg.contains("section 9") || msg.contains("records"),
+                "{}: expected a two-adicity or section-length error, got: {msg}",
+                a.name
+            );
+        }
+    });
+}

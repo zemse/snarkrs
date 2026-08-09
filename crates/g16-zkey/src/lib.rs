@@ -133,6 +133,33 @@ impl ProvingKey {
                 reason: format!("domain size {domain_size} is not a power of two"),
             });
         }
+        // Bound `domain_size` here, before a single byte is allocated from it.
+        //
+        // Two independent gates, because the header is attacker-controlled and everything
+        // below sizes allocations from it. Ordering is the whole point: `read_coefficients`
+        // allocates four vectors of `domain_size + 1` and section 9 is read as
+        // `domain_size` points, and the length check that would refute a lie used to run
+        // afterwards. A 4 KB file claiming 2^31 therefore cost 34 GB and 11.5 seconds
+        // before erroring. Same class as CVE-2024-50354 in gnark.
+        //
+        // 1. Two-adicity. The NTT needs a 2^log_size-th root of unity, and Fr has one only
+        //    up to 2^TWO_ADICITY (28 for BN254). A larger domain cannot be transformed at
+        //    all, so accepting it buys nothing and costs an allocation.
+        let log_size = domain_size.trailing_zeros();
+        if log_size > Fr::TWO_ADICITY {
+            return Err(ZkeyError::Malformed {
+                section: 2,
+                reason: format!(
+                    "domain size 2^{log_size} exceeds the two-adicity of Fr (2^{}), so no \
+                     root of unity of that order exists",
+                    Fr::TWO_ADICITY
+                ),
+            });
+        }
+        // 2. Cross-check against the file that is actually present. Section 9 holds exactly
+        //    `domain_size` G1 points, so its length refutes a lying header for the cost of
+        //    a slice lookup, with nothing allocated yet.
+        expect_records(file.unique_section(9)?, domain_size, G1_BYTES, 9)?;
         // The L query covers the private wires only, so an n_vars that does not leave
         // room for `1 + n_public` would underflow the section 8 length below.
         if n_vars < n_public + 1 {
@@ -161,6 +188,76 @@ impl ProvingKey {
         check_g2(&gamma_g2, 2, "gamma_g2")?;
         check_g1(&delta_g1, 2, "delta_g1")?;
         check_g2(&delta_g2, 2, "delta_g2")?;
+        // And none of the six may be the point at infinity. This is the gate that stops a
+        // malicious key from silently switching zero knowledge off.
+        //
+        // `check_g1` and `check_g2` do not catch it: arkworks' `is_on_curve` and
+        // `is_in_correct_subgroup_assuming_on_curve` both return TRUE for the identity, and
+        // ffjavascript encodes infinity as affine (0, 0), which `binfile::g1` faithfully
+        // maps to the identity. So an all-zero point passes every check above.
+        //
+        // The attack, confirmed by running it: zero `beta_g1`, `delta_g1` and the whole of
+        // the section 6 B-in-G1 query. Then `pi_a = alpha + sum(w_j A_j) + r * delta_g1`
+        // loses its `r` term and becomes a deterministic function of the entire witness,
+        // and `pib1` collapses to the identity. Proofs from that key still verify against
+        // the untouched genuine `vkey.json`, with `pi_a` bit-identical across runs, because
+        // none of the three edited quantities appears in the verification key. No verifier
+        // anywhere can detect it: not ours, not snarkjs, not rapidsnark. The result is a
+        // witness confirmation oracle, and outright recovery for a low-entropy witness.
+        //
+        // Rejecting is safe: every one of these six is [x]_1 or [x]_2 for a nonzero element
+        // of the toxic waste, so a real setup can never produce the identity here. Only a
+        // key that was tampered with or generated with zero toxic waste can trip this.
+        for (is_inf, what) in [
+            (alpha_g1.infinity, "alpha_g1"),
+            (beta_g1.infinity, "beta_g1"),
+            (delta_g1.infinity, "delta_g1"),
+        ] {
+            if is_inf {
+                return Err(ZkeyError::Malformed {
+                    section: 2,
+                    reason: format!(
+                        "{what} is the point at infinity, which no honest setup produces; \
+                         this key cannot provide zero knowledge"
+                    ),
+                });
+            }
+        }
+        for (is_inf, what) in [
+            (beta_g2.infinity, "beta_g2"),
+            (gamma_g2.infinity, "gamma_g2"),
+            (delta_g2.infinity, "delta_g2"),
+        ] {
+            if is_inf {
+                return Err(ZkeyError::Malformed {
+                    section: 2,
+                    reason: format!(
+                        "{what} is the point at infinity, which no honest setup produces; \
+                         this key cannot provide zero knowledge"
+                    ),
+                });
+            }
+        }
+        // A whole query section of identities is the other half of the same attack. Note
+        // this is deliberately an ALL check and not an ANY check: real snarkjs keys do
+        // contain points at infinity in these sections, 33.9% of the B query in
+        // js_16x16_d32, so rejecting them individually would reject every real key.
+        for (section, all_inf, n) in [
+            (5u32, a_query.iter().all(|p| p.infinity), a_query.len()),
+            (6, b_g1_query.iter().all(|p| p.infinity), b_g1_query.len()),
+            (7, b_g2_query.iter().all(|p| p.infinity), b_g2_query.len()),
+            (9, h_query.iter().all(|p| p.infinity), h_query.len()),
+        ] {
+            if n > 0 && all_inf {
+                return Err(ZkeyError::Malformed {
+                    section,
+                    reason: format!(
+                        "every one of the {n} points in this query section is the point at \
+                         infinity; the section has been zeroed"
+                    ),
+                });
+            }
+        }
         for (i, p) in ic.iter().enumerate() {
             check_g1(p, 3, &format!("ic[{i}]"))?;
         }
