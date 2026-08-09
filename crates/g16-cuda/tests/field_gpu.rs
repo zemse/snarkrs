@@ -109,7 +109,8 @@ fn fr_arithmetic_matches_arkworks_on_device() {
         .iter()
         .map(|d| {
             let w = stream.clone_dtoh(d).unwrap();
-            let packed: Vec<PackedFr> = from_words(&w).expect("output length is a whole number of Fr");
+            let packed: Vec<PackedFr> =
+                from_words(&w).expect("output length is a whole number of Fr");
             PackedFr::unpack_slice(&packed)
         })
         .collect();

@@ -10,9 +10,33 @@
 /// [`crate::tests::cuda_declares_the_same_constants`].
 pub const FR_CUH: &str = include_str!("kernels/bn254_fr.cuh");
 
+/// Stage 0: gather the A and B coefficient columns out of the CSR proving key.
+pub const GATHER_CU: &str = include_str!("kernels/gather.cu");
+
+/// Stages 1 to 3: the six transforms, iNTT then coset shift then forward NTT.
+pub const NTT_CU: &str = include_str!("kernels/ntt.cu");
+
+/// Stage 4: `H = A*B - C`, fused into the tail of the last transform where possible.
+pub const POINTWISE_CU: &str = include_str!("kernels/pointwise.cu");
+
+/// Stages 5 to 9: Fq, Fq2, the curve, and the CSR Pippenger MSM.
+pub const MSM_CU: &str = include_str!("kernels/msm.cu");
+
 /// Field correctness probe. Test-only, but compiled the same way as everything else so
 /// that a change which breaks compilation cannot hide behind a `cfg(test)`.
 pub const FIELD_PROBE_CU: &str = include_str!("kernels/field_probe.cu");
+
+/// Stages 0 to 4, one translation unit. They share `Fr` and nothing else, and compiling
+/// them together means one NVRTC invocation instead of three.
+pub fn unit_stages() -> String {
+    format!("{FR_CUH}\n{GATHER_CU}\n{NTT_CU}\n{POINTWISE_CU}")
+}
+
+/// Stages 5 to 9. Separate from the stages unit because it is by far the largest and
+/// compiling it is most of the prepare cost.
+pub fn unit_msm() -> String {
+    format!("{FR_CUH}\n{MSM_CU}")
+}
 
 /// The `fr_probe` / `fr_constants` translation unit.
 pub fn unit_field_probe() -> String {

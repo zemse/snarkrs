@@ -36,4 +36,8 @@ hex.workspace = true
 default = ["cpu"]
 cpu = []
 metal = ["dep:g16-metal"]
-cuda = ["dep:g16-cuda"]
+# `dep:g16-cuda` alone is not enough: g16-cuda gates its whole backend behind its own
+# `cuda` feature so that a default macOS workspace build never pulls cudarc. Without
+# forwarding the feature the crate compiles to an empty shell and `CudaBackend` is
+# "configured out", which rustc reports as a missing item rather than a missing feature.
+cuda = ["dep:g16-cuda", "g16-cuda/cuda"]

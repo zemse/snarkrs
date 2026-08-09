@@ -448,10 +448,17 @@ fn locate(bytes: &[u8]) -> Header2 {
     }
 }
 
-fn load_mutated(name: &str, base: &std::path::Path, edit: impl Fn(&mut Vec<u8>)) -> Result<(), ZkeyError> {
+fn load_mutated(
+    name: &str,
+    base: &std::path::Path,
+    edit: impl Fn(&mut Vec<u8>),
+) -> Result<(), ZkeyError> {
     let mut bytes = std::fs::read(base.join("circuit.zkey")).unwrap();
     edit(&mut bytes);
-    let path = std::env::temp_dir().join(format!("g16-zkey-regression-{name}-{}.zkey", std::process::id()));
+    let path = std::env::temp_dir().join(format!(
+        "g16-zkey-regression-{name}-{}.zkey",
+        std::process::id()
+    ));
     std::fs::write(&path, &bytes).unwrap();
     let r = ProvingKey::load(&path).map(|_| ());
     let _ = std::fs::remove_file(&path);
@@ -467,7 +474,10 @@ fn load_mutated(name: &str, base: &std::path::Path, edit: impl Fn(&mut Vec<u8>))
 fn a_zeroed_toxic_waste_point_is_rejected() {
     for_each_artifact("a_zeroed_toxic_waste_point_is_rejected", |a| {
         for (what, pick) in [
-            ("beta_g1", (|h: &Header2| h.beta_g1_at) as fn(&Header2) -> usize),
+            (
+                "beta_g1",
+                (|h: &Header2| h.beta_g1_at) as fn(&Header2) -> usize,
+            ),
             ("delta_g1", |h: &Header2| h.delta_g1_at),
         ] {
             let err = load_mutated(what, &a.dir, |b| {
@@ -481,7 +491,11 @@ fn a_zeroed_toxic_waste_point_is_rejected() {
             ));
             let msg = err.to_string();
             assert!(msg.contains(what), "{}: unhelpful error: {msg}", a.name);
-            assert!(msg.contains("infinity"), "{}: unhelpful error: {msg}", a.name);
+            assert!(
+                msg.contains("infinity"),
+                "{}: unhelpful error: {msg}",
+                a.name
+            );
         }
     });
 }
@@ -491,10 +505,13 @@ fn a_zeroed_toxic_waste_point_is_rejected() {
 /// which is why the query check is ALL and not ANY.
 #[test]
 fn the_genuine_key_still_loads_after_the_infinity_gates() {
-    for_each_artifact("the_genuine_key_still_loads_after_the_infinity_gates", |a| {
-        ProvingKey::load(&a.dir.join("circuit.zkey"))
-            .unwrap_or_else(|e| panic!("{}: genuine key rejected: {e}", a.name));
-    });
+    for_each_artifact(
+        "the_genuine_key_still_loads_after_the_infinity_gates",
+        |a| {
+            ProvingKey::load(&a.dir.join("circuit.zkey"))
+                .unwrap_or_else(|e| panic!("{}: genuine key rejected: {e}", a.name));
+        },
+    );
 }
 
 /// The allocation bomb. A four kilobyte file claiming `domainSize = 2^31` used to cost
@@ -503,30 +520,35 @@ fn the_genuine_key_still_loads_after_the_infinity_gates() {
 /// parse error with nothing allocated.
 #[test]
 fn a_lying_domain_size_is_refused_before_anything_is_allocated() {
-    for_each_artifact("a_lying_domain_size_is_refused_before_anything_is_allocated", |a| {
-        for claim in [1u32 << 31, 1 << 29, 1 << 24] {
-            let t = std::time::Instant::now();
-            let err = load_mutated("bomb", &a.dir, |b| {
-                let at = locate(b).domain_size_at;
-                b[at..at + 4].copy_from_slice(&claim.to_le_bytes());
-            })
-            .expect_err(&format!("{}: domainSize {claim} must be rejected", a.name));
-            // The point is not only that it errors but that it errors cheaply. Ten seconds
-            // is a very loose bound; the real figure is milliseconds. A regression that
-            // reintroduces the allocation shows up as tens of seconds and tens of GB.
-            assert!(
-                t.elapsed().as_secs() < 10,
-                "{}: rejecting domainSize {claim} took {:?}, which means something was \
+    for_each_artifact(
+        "a_lying_domain_size_is_refused_before_anything_is_allocated",
+        |a| {
+            for claim in [1u32 << 31, 1 << 29, 1 << 24] {
+                let t = std::time::Instant::now();
+                let err = load_mutated("bomb", &a.dir, |b| {
+                    let at = locate(b).domain_size_at;
+                    b[at..at + 4].copy_from_slice(&claim.to_le_bytes());
+                })
+                .expect_err(&format!("{}: domainSize {claim} must be rejected", a.name));
+                // The point is not only that it errors but that it errors cheaply. Ten seconds
+                // is a very loose bound; the real figure is milliseconds. A regression that
+                // reintroduces the allocation shows up as tens of seconds and tens of GB.
+                assert!(
+                    t.elapsed().as_secs() < 10,
+                    "{}: rejecting domainSize {claim} took {:?}, which means something was \
                  allocated from the header before it was validated",
-                a.name,
-                t.elapsed()
-            );
-            let msg = err.to_string();
-            assert!(
-                msg.contains("two-adicity") || msg.contains("section 9") || msg.contains("records"),
-                "{}: expected a two-adicity or section-length error, got: {msg}",
-                a.name
-            );
-        }
-    });
+                    a.name,
+                    t.elapsed()
+                );
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("two-adicity")
+                        || msg.contains("section 9")
+                        || msg.contains("records"),
+                    "{}: expected a two-adicity or section-length error, got: {msg}",
+                    a.name
+                );
+            }
+        },
+    );
 }

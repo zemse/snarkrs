@@ -26,10 +26,18 @@
 //! hardware and no CUDA toolkit. Only running the tests needs a card.
 
 #[cfg(feature = "cuda")]
+mod backend;
+#[cfg(feature = "cuda")]
 mod context;
 #[cfg(feature = "cuda")]
 pub mod kernels;
+#[cfg(feature = "cuda")]
+pub mod msm;
+#[cfg(feature = "cuda")]
+pub mod stages;
 
+#[cfg(feature = "cuda")]
+pub use backend::{CudaBackend, CudaCircuit, PrepareCost};
 #[cfg(feature = "cuda")]
 pub use context::{Cuda, CudaError};
 
