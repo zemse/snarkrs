@@ -64,10 +64,19 @@ that makes the GPU backend possible at all.
 ```sh
 cargo build --release                      # CPU only
 cargo build --release --features metal     # + Apple Metal
+cargo build --release --features cuda      # + NVIDIA CUDA
 ```
 
-Metal needs no offline toolchain: MSL is compiled at runtime through
-`MTLDevice::newLibraryWithSource`, which uses the compiler shipped with the OS.
+Neither GPU backend needs an offline toolchain. Metal compiles MSL at runtime through
+`MTLDevice::newLibraryWithSource`; CUDA compiles its kernels at runtime through NVRTC. The
+CUDA crate uses `cudarc` with `dynamic-loading`, so `--features cuda` **builds on a machine
+with no NVIDIA driver and no CUDA toolkit at all**, including this MacBook. Only running it
+needs a card. That is what made it possible to develop the backend here and test it on a
+rented T4.
+
+One caveat specific to CUDA, in full: the first run on a fresh machine spends 270 to 300
+seconds compiling kernels before it proves anything, in two stages that are both cached in
+`~/.nv/ComputeCache` afterwards. See `bench/results/device-microbench.md`.
 
 ## Benchmarks
 
@@ -75,7 +84,13 @@ Metal needs no offline toolchain: MSL is compiled at runtime through
 bench/scripts/gen-artifacts.sh      # circuits, keys, witnesses (needs circom + snarkjs)
 bench/scripts/build-rapidsnark.sh   # the CPU baseline, plus a warm-mode wrapper
 bench/scripts/run-comparison.py     # cold and warm, every prover, same artifacts
+bench/aws/provision.sh              # a Tesla T4 box, with a dead-man switch
+bench/aws/run-gpu-bench.sh          # sync, build, warm the kernel cache, benchmark, pull
+bench/aws/terminate.sh              # and prove it is gone
 ```
+
+Results and the full write-up are in [`bench/results/`](bench/results/). Two machines, one
+file each, never merged: an M2 Max MacBook Pro and an EC2 g4dn.2xlarge with a Tesla T4.
 
 **Cold and warm each mean exactly one thing here.** Cold is one fresh process per proof,
 so the zkey parse and, on GPU, the upload sit inside the timed region; that is what every
@@ -104,4 +119,32 @@ verify` (is the JSON encoding ecosystem-compatible).
   different circom and circomlib. Numbers here are therefore **not** directly comparable
   to that earlier data; what matters is that every prover in a given run proves the same
   artifact.
-- No CUDA backend exists and none can be tested on this machine.
+- **A large speedup multiplier over a CPU baseline mostly measures the baseline.** Warm at
+  140K constraints the CUDA backend is 10.34x rapidsnark on the EC2 box and Metal is 4.31x
+  on the Mac, but in absolute milliseconds the Mac's GPU is the faster of the two (128.8
+  against 152.7). rapidsnark is 2.8x slower on the Xeon than on the M2 Max for identical
+  work. Read `bench/results/README.md` before quoting any ratio from here.
+- **The CUDA MSM is not tuned.** It is 92% of the proof at every size, and a forced window
+  width beats the automatic choice by 9% at 2^18. The window cost model still carries
+  constants measured on Apple silicon.
+- **This prover is not constant time with respect to the witness.** The MSM skips zero and
+  one scalars, which makes running time and allocation size a function of witness sparsity.
+  That is the optimisation exploited against Zcash in USENIX Security 2020. It is kept
+  because it is worth about 5.1x and every production Groth16 prover does it, but it means
+  zero knowledge holds for the proof and not for the process that produced it.
+- **A `.zkey` is trusted input.** Only the O(1) points are validated on load; the query
+  sections are millions of points and a subgroup check each would dominate key load. If the
+  key and the witness have different owners, which is exactly proving-as-a-service, run
+  `snarkjs zkey verify <r1cs> <ptau> <zkey>` first. That is the only non-circular check:
+  deriving a vkey from the zkey and verifying against it proves nothing about the zkey.
+
+## Security
+
+The audit ran four threat-research notes, four code audits, and
+the adversarial suites they produced. Roughly 3,200 proofs over 200 distinct statements found
+no defect in the prover itself, and CPU and Metal are bit-identical at pinned blinders.
+
+The findings were in key handling, and the two serious ones are fixed: a malicious `.zkey`
+could silently switch zero knowledge off while proofs still verified against the genuine
+verification key, and a 4 KB file could trigger a 34 GB allocation. Both are pinned by
+regression tests.
