@@ -35,25 +35,38 @@ Four consequences, all visible in the end-to-end numbers:
    even though the M2 Max wins by 1.6x at 2^22. This is a second, independent reason the
    Metal backend does badly on small circuits.
 
-## The NVRTC compile time, and the cache nobody tells you about
+## Getting the kernels onto the card the first time costs about five minutes
 
-The first NVRTC compile of the MSM translation unit for `sm_75` takes **113.6 seconds**. The
-second takes **0.18 seconds**. The difference is not our cache and not warm page cache: the
-NVIDIA driver transparently caches NVRTC output in `~/.nv/ComputeCache`. Deleting that
-directory reproduces the 113.6 s exactly, and leaves a 30 MB entry behind afterwards.
+The first run of the CUDA backend on a fresh machine spends roughly **270 to 300 seconds**
+before it proves anything. Where that goes is worth being precise about, because the obvious
+one-line summary is wrong.
 
-This matters for anyone reading a CUDA prover benchmark. A cold-start number taken on a
-machine that has run the prover before is measuring a cache hit, and the same number taken on
-a fresh CI runner is two minutes worse. Ours is reported both ways.
+There are two expensive stages, not one, and both are cached by the same place:
+
+| stage | cold | warm |
+|---|---:|---:|
+| NVRTC, source to PTX | 113.6 s | 0.18 s |
+| driver JIT, PTX to SASS, inside `cuModuleLoad` | about 175 s | 0.12 s |
+| stages unit, source to PTX | 1.3 s | — |
+
+The NVRTC figure is corroborated offline: `nvcc -arch=compute_75 -ptx` on identical source
+takes 108 s and emits byte-identical PTX.
+
+**`~/.nv/ComputeCache` caches both stages, not just the JIT.** Delete it and the next NVRTC
+compile takes 113.6 s again; the one after takes 0.18 s. This is the fact that matters when
+reading anyone's CUDA prover benchmark, ours included: a cold-start number measured on a
+machine that has run the prover before is measuring a cache hit, and the same number on a
+fresh CI runner with no persistent `$HOME` is five minutes worse. Ours is reported both ways.
+
+For comparison, Metal's whole kernel library compiles in 53.9 ms through
+`newLibraryWithSource`, with no equivalent cliff. This is the one place CUDA is structurally
+worse than Metal in this project, and it is entirely a consequence of how much code the
+inlining generates.
 
 | | value |
 |---|---:|
-| MSM unit, first compile (`~/.nv` cleared) | 113.6 s |
-| MSM unit, subsequent compiles | 0.18 s |
-| stages unit, first compile | 1.3 s |
 | PTX emitted for the MSM unit | 787,873 lines / 30.8 MB |
-| driver JIT of that PTX (PTX to SASS) | 120 ms |
-| Metal equivalent (`newLibraryWithSource`, whole library) | 53.9 ms |
+| Metal equivalent, whole library | 53.9 ms, no disk cache needed |
 
 The size comes from `__forceinline__` on 60 functions and 18 templates instantiated over both
 `Fq` and `Fq2`. Two ways to shrink it were measured and neither is worth taking:
@@ -61,13 +74,14 @@ The size comes from `__forceinline__` on 60 functions and 18 templates instantia
 - **Removing every `#pragma unroll` changes nothing:** 109.7 s against 108.0 s.
 - **Demoting `__forceinline__` to `__inline__` is a trap.** It cuts NVRTC to 25.7 s and the
   PTX to 235,000 lines, but leaves 4 functions out of line with 350 call sites, and the
-  driver's PTX-to-SASS JIT then takes **29.6 seconds** to load it, against 120 ms for the
-  fully inlined version. Fully inlined PTX is straight-line code the JIT merely assembles;
-  PTX with calls makes the JIT redo the interprocedural work itself. Total cost is worse and
-  the generated code is worse, so the inlining stays and the result is cached instead.
+  driver JIT then takes **29.6 seconds** on a warm cache where the fully inlined version
+  takes **120 ms**. Fully inlined PTX is straight-line code the JIT merely assembles; PTX
+  with calls makes it redo the interprocedural work itself. Total cost is worse and the
+  generated code is worse.
 
-`g16-cuda` therefore keeps its own PTX cache keyed by source and architecture. It is not
-redundant with the driver's: the driver's is a fixed-size LRU shared by every CUDA process on
-the machine (`CUDA_CACHE_MAXSIZE`, one gigabyte by default), so a 30 MB entry in it can be
-evicted by unrelated work and reintroduce a two minute stall months later on a machine that
-has been fine all along.
+`g16-cuda` keeps its own PTX cache, and it is worth being honest about what that buys: it
+covers the NVRTC stage only. With `~/.nv` warm it saves nothing measurable, 0.30 s either
+way. With `~/.nv` cold it removes 113 s of the 283, and the remaining 175 s of driver JIT is
+not cacheable by a process through that API. It is kept because the driver's cache is a
+fixed-size LRU shared by every CUDA process on the machine (`CUDA_CACHE_MAXSIZE`, one
+gigabyte by default), so a 30 MB entry in it is evictable by unrelated work.
