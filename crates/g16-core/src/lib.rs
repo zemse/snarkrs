@@ -45,6 +45,25 @@ pub enum ProveError {
 
 /// A Groth16 proof. Serialises to snarkjs' `proof.json` shape so `snarkjs groth16 verify`
 /// can be used as an independent oracle against our own verifier.
+///
+/// # A proof is not an identity
+///
+/// Groth16 proofs are malleable, and this is a property of the scheme rather than a defect
+/// in this implementation. Anyone holding a valid `(A, B, C)` can produce a different,
+/// equally valid proof of the same statement without knowing the witness: pick any nonzero
+/// `z` in `Fr` and take `(A * z^-1, B * z, C)`. The pairing check is
+/// `e(A, B) = e(alpha, beta) e(L_bar, gamma) e(C, delta)` and `e(A z^-1, B z) = e(A, B)` by
+/// bilinearity, so the left side is unchanged and the right side never mentioned `A` or `B`.
+/// There are roughly `r` such proofs for every proof, and this crate cannot prevent it.
+///
+/// The consequence is for the caller, not for the verifier. **Never use proof bytes as a
+/// nullifier, a replay key, a deduplication key, or any kind of identity.** An attacker who
+/// observes a proof can mint unlimited distinct encodings of it that all verify. Key on
+/// `(verifying key, public inputs)` instead, which is what the proof actually attests to.
+///
+/// This is pinned by a regression test rather than left as folklore, because it is the sort
+/// of property that reads as a bug and gets "fixed" by someone adding a uniqueness check
+/// that does not work.
 #[derive(Clone, Debug)]
 pub struct Proof {
     pub a: G1Affine,

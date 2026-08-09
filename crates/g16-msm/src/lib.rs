@@ -174,6 +174,29 @@ struct Prescan<P: SWCurveConfig> {
 /// `into_bigint` is a Montgomery reduction; calling it per window instead of per scalar is
 /// the classic way to make an MSM twice as slow. It is called here and nowhere else, and
 /// not at all for a scalar that turns out to be 0 or 1.
+///
+/// # This is a deliberate privacy for performance trade, and it is not free
+///
+/// Skipping zero and one scalars makes the running time, the number of Montgomery
+/// reductions, and the length of `idx` and `bigints` all functions of how many witness
+/// entries are zero or one. That is witness-dependent, and it is observable: as wall clock,
+/// as allocation size in RSS, and on a GPU backend as dispatch size, because the kernel
+/// launch geometry is derived from the general-scalar count.
+///
+/// This is not a hypothetical. It is the same optimisation exploited in "Remote
+/// Side-Channel Attacks on Anonymous Transactions" (USENIX Security 2020), which recovered
+/// information about Zcash shielded transactions by timing the prover. The measured effect
+/// there was a correlation between proving time and the sparsity of the witness.
+///
+/// It is kept because every production Groth16 prover does it and the speedup is large: on
+/// witness-shaped scalars the 0 and 1 fast path is worth about 5.1x on this workload. But
+/// it means **this prover is not constant time with respect to the witness**, and a
+/// deployment where an attacker can measure proving time or memory must treat that as part
+/// of its threat model rather than assuming zero-knowledge covers it. Zero-knowledge is a
+/// property of the proof, not of the process that produced it.
+///
+/// A constant-time variant would have to process every scalar through the general path,
+/// giving up both fast paths and the compaction.
 fn prescan<P: SWCurveConfig>(bases: &[Affine<P>], scalars: &[Fr], n: usize) -> Prescan<P>
 where
     P::BaseField: Send + Sync,
