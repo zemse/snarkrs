@@ -1,4 +1,9 @@
 instance_type,arch,vcpu,cores,mem_gib,gpu,gpu_gib,usd_per_hour
+c7g.medium,arm64,1,1,2,,,0.0363
+c8g.medium,arm64,1,1,2,,,0.0399
+c7g.large,arm64,2,2,4,,,0.0725
+c8g.large,arm64,2,2,4,,,0.0798
+c7a.large,x86_64,2,2,4,,,0.1026
 c7g.xlarge,arm64,4,4,8,,,0.1450
 c8g.xlarge,arm64,4,4,8,,,0.1595
 c7i.xlarge,x86_64,4,2,8,,,0.1785

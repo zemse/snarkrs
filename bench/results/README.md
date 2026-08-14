@@ -49,6 +49,48 @@ could not be told apart from a difference between two machines. Round 2 measures
   the gate publishes nothing. This is roughly 40% of each box's billed time and it is the
   reason the numbers can be put next to each other at all.
 
+## The answer
+
+At 140,261 constraints, warm, on-demand:
+
+| | machine | accelerator | ms / proof | $ / 1000 proofs |
+|---|---|---|---:|---:|
+| **cheapest** | `g6.xlarge` | NVIDIA L4 (Ada) | 77.3 | **$0.017** |
+| **fastest** | `g6e.xlarge` | NVIDIA L40S (Ada) | **66.0** | $0.034 |
+| best CPU | `c8g.xlarge` | Graviton4 | 1,826.8 | $0.081 |
+
+**The GPU wins the cost axis, not just the latency axis, and that was not the expected
+result.** The best CPU machine rents for a fifth of the L4 box's hourly price and still
+costs 4.7x more per proof, because the L4 finishes 24x sooner. Renting a more expensive
+machine for a twenty-fourth of the time is cheaper, and no amount of picking the right CPU
+closes that gap.
+
+The CPU findings from the first half of the sweep survive intact and are now visibly second
+order. Scaling efficiency falls from 100% at 4 cores to 96% at 8 and 87% at 16 within the
+c7a family (91% for c8g at 16), and AWS charges strictly linearly per core, so a small box
+is a few percent cheaper per proof than a large one in the same family. That is a real
+effect worth a few percent, sitting inside an effect worth 4.7x.
+
+Three things only a wide matrix shows:
+
+- **Spot reorders it.** The discount is not uniform: 65% on the T4G, 53% on the A10G, 22%
+  on the Ada cards. At spot prices the cheapest machine is `g5g.xlarge`, a T4G on a
+  Graviton2 host, at **$0.007 per 1000 proofs** -- roughly half the L4's spot price and a
+  twelfth of the best CPU's.
+- **Circuit size changes the winner.** Below about 20k constraints the T4G is cheapest
+  on-demand too, because the faster Ada cards cannot amortise their fixed per-proof cost
+  over a small circuit.
+- **Renting a card and not using it is the most expensive thing here.** Running the CPU
+  backend on the GPU boxes costs $0.43 to $1.40 per 1000 proofs, up to 80x the cheapest
+  option and 17x the best dedicated CPU box.
+
+**What to actually run.** For a saturated prover, a current-generation GPU, and the mid-tier
+one rather than the top: the L40S is 17% faster than the L4 and exactly twice the cost per
+proof. If the workload tolerates interruption, the T4G on spot is cheaper again by a factor
+of two. Choose a CPU box only when no GPU is available, and then Graviton4 at the smallest
+size that fits -- the whole 140k-constraint proof peaks at 215 MB, so memory never forces a
+larger instance.
+
 ## The two rounds do not define "cold" the same way
 
 Worth knowing before comparing a number here against a number in Round 1, because the same

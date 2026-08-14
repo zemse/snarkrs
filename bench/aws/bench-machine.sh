@@ -37,7 +37,10 @@ ARCH="$(machine_field "$TYPE" arch)"
 GPU="$(machine_field "$TYPE" gpu)"
 PRICE="$(machine_field "$TYPE" usd_per_hour)"
 VCPU="$(machine_field "$TYPE" vcpu)"
-OUT="$REPO_ROOT/bench/results/sweep/$TYPE"
+# G16_OUT_SUFFIX keeps a special-purpose run (a cold-kernel probe, a one-off re-measure)
+# from overwriting the sweep result for the same instance type. Without it, a probe run
+# with G16_TESTS=none would replace a fully gated machine's data with an ungated one.
+OUT="$REPO_ROOT/bench/results/sweep/$TYPE${G16_OUT_SUFFIX:-}"
 mkdir -p "$OUT"
 LOG="$OUT/run.log"
 : > "$LOG"
