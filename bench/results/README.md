@@ -68,11 +68,28 @@ costs 4.7x more per proof, because the L4 finishes 24x sooner. Renting a more ex
 machine for a twenty-fourth of the time is cheaper, and no amount of picking the right CPU
 closes that gap.
 
-The CPU findings from the first half of the sweep survive intact and are now visibly second
-order. Scaling efficiency falls from 100% at 4 cores to 96% at 8 and 87% at 16 within the
-c7a family (91% for c8g at 16), and AWS charges strictly linearly per core, so a small box
-is a few percent cheaper per proof than a large one in the same family. That is a real
-effect worth a few percent, sitting inside an effect worth 4.7x.
+The CPU findings from the first half of the sweep survive and are now visibly second order.
+Scaling efficiency falls from 100% at 4 cores to 96% at 8 and 87% at 16 within the c7a
+family (92% for c8g at 16), and AWS charges strictly linearly per core, so **above four
+cores, cost per proof clearly rises with instance size**.
+
+**Below four cores it is flat, and the sweep cannot say where the exact minimum is.** Every
+size from one to four cores lands within 2-6% of the others, and the ordering is not even
+consistent between families -- c7g is cheapest at one core, c8g at four, and c7g's two-core
+size is worse than both of its neighbours:
+
+| family | 1 core | 2 cores | 4 cores | 8 cores | 16 cores |
+|---|---:|---:|---:|---:|---:|
+| c7g | **$0.0861** | $0.0914 | $0.0883 | — | — |
+| c8g | — | $0.0826 | **$0.0809** | — | $0.0894 |
+| c7a | — | — | **$0.0946** | $0.0983 | $0.1089 |
+
+A 2-6% spread is at or below the instance-to-instance variance measured elsewhere in this
+round (5.4% between two runs of the same instance type on the CPU side). An earlier draft
+of this section claimed a minimum at four cores on the strength of two families before the
+one-core box had run; that claim is withdrawn. What the data supports is the weaker and
+more useful statement: **do not buy more than four cores per prover process, and below that
+the size does not matter much.**
 
 Three things only a wide matrix shows:
 

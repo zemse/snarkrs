@@ -436,9 +436,16 @@ def main():
         f'<div class="note"><h3>{esc(t)}</h3><p>{esc(p)}</p></div>' for t, p in NOTES)
 
     same = ch["machine"] == fa["machine"] and ch["backend"] == fa["backend"]
-    n_mach = len(b["machines"])
+    # Count only the rented machines as "EC2 machines". The M2 Max is in the sweep for its
+    # Metal numbers but it is not an instance type and must not be counted as one.
+    rental = [m for m, meta in b["machines"].items() if not meta.get("price_basis")]
+    owned = [m for m in b["machines"] if m not in rental]
+    n_mach = len(rental)
     cpu_best = min((c for c in b["chart"] if c["b"] == "cpu"),
                    key=lambda c: c["cost"], default=None)
+    tail = (f" The {b['machines'][owned[0]].get('gpu','')} is measured alongside them for "
+            f"latency, but it is bought rather than rented and is kept out of every cost "
+            f"ranking here.") if owned else ""
     if same:
         lede = (f"{n_mach} EC2 machines, one Groth16 prover, the same commit compiled on "
                 f"every one of them. One machine is both the cheapest and the fastest, "
@@ -448,13 +455,13 @@ def main():
                      f"{cpu_best['cost']/ch['usd_per_k']:.1f}x more per proof than "
                      f"{esc(ch['machine'])} and takes "
                      f"{cpu_best['ms']/fa['ms']:.1f}x as long")
-        lede += "."
+        lede += "." + tail
     else:
         lede = (f"{n_mach} EC2 machines, one Groth16 prover, the same commit compiled on "
                 f"every one of them. The cheapest machine and the fastest machine are not "
                 f"the same machine: {esc(ch['machine'])} costs "
                 f"{fa['usd_per_k']/ch['usd_per_k']:.1f}x less per proof, "
-                f"{esc(fa['machine'])} is {ch['ms']/fa['ms']:.1f}x faster.")
+                f"{esc(fa['machine'])} is {ch['ms']/fa['ms']:.1f}x faster." + tail)
     nfront = len(b["front"])
     if nfront <= 1:
         frontier = ("Only one machine is on the Pareto frontier, which means it is not a "
