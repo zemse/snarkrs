@@ -154,6 +154,34 @@ def main():
             add(f"| {i} | `{m}` <br><sub>{acc}</sub> | {b} | {ms:,.1f} | {per_k(c)} | "
                 f"{ms/fastest:.2f}x |")
 
+    # ---- does the answer change with circuit size? --------------------------------------
+    # It does, and reporting only the largest circuit would hide it. A GPU has a fixed cost
+    # per proof that a small circuit cannot amortise, so the cheapest machine at 3k
+    # constraints need not be the cheapest at 140k.
+    for mode in ("warm", "cold"):
+        lines = []
+        for vv in variants:
+            cand = []
+            for (m, b, md, v2), d in data.items():
+                if md != mode or v2 != vv:
+                    continue
+                price = od.get(m) or metas.get(m, {}).get("usd_per_hour")
+                if not price:
+                    continue
+                cand.append((m, b, d["ms"], price * (d["ms"] / 1000.0) / 3600))
+            if not cand:
+                continue
+            nc = next((d["constraints"] for k, d in data.items() if k[3] == vv), -1)
+            cheap = min(cand, key=lambda x: x[3])
+            fast = min(cand, key=lambda x: x[2])
+            lines.append(f"| {vv} | {nc:,} | `{cheap[0]}` / {cheap[1]} | {per_k(cheap[3])} | "
+                         f"`{fast[0]}` / {fast[1]} | {fast[2]:,.1f} ms |")
+        if lines:
+            add(f"\n## Cheapest and fastest at every size ({mode})\n")
+            add("| circuit | constraints | cheapest machine | $/1k proofs | fastest machine | ms |")
+            add("|---|---:|---|---:|---|---:|")
+            L.extend(lines)
+
     # ---- what the one-time kernel build costs -------------------------------------------
     # A GPU box cannot prove anything until NVRTC and the driver JIT have turned the kernel
     # source into SASS, and on a fresh instance that is minutes. It is not a per-proof cost
