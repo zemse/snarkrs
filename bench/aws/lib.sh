@@ -50,7 +50,13 @@ resolve_ami() {  # resolve_ami <instance-type>
   local name
   if has_gpu "$1"; then
     if [ "$arch" = arm64 ]; then
-      name='Deep Learning ARM64 Base OSS Nvidia Driver GPU AMI (Ubuntu*'
+      # Pinned to 22.04, not "newest Ubuntu". The 26.04 arm64 DLAMI ships an NVRTC newer
+      # than its own driver (both boxes carried driver 595.91.07, but the arm64 image had
+      # 4 nvrtc libraries against 28 on the x86 one), so every module load failed with
+      # CUDA_ERROR_UNSUPPORTED_PTX_VERSION: "the provided PTX was compiled with an
+      # unsupported toolchain". Matching the x86 side's 22.04 also keeps the two
+      # architectures on the same OS, which is one less difference between them.
+      name='Deep Learning ARM64 Base OSS Nvidia Driver GPU AMI (Ubuntu 22.04)*'
     else
       name='Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 22.04)*'
     fi

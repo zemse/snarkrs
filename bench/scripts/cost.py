@@ -199,10 +199,16 @@ def main():
         c = price * (d["ms"] / 1000.0) / 3600
         if cheapest_cpu is None or c < cheapest_cpu[1]:
             cheapest_cpu = (m, c)
+    # Anything this small is not a kernel build, it is a cache hit: the sweep's correctness
+    # gate runs the CUDA suite before this is timed, and that fills ~/.nv/ComputeCache. A
+    # genuinely cold build on a T4 is minutes. Reporting a 3-second cache hit as the cost of
+    # standing up a GPU box would understate it by two orders of magnitude, so it is dropped
+    # rather than shown. Real figures come from a G16_FIRST_COMPILE=1 run.
+    COLD_KERNEL_FLOOR = 30.0
     rows = []
     for m, meta in metas.items():
         fc = meta.get("first_compile_s")
-        if not fc:
+        if not fc or float(fc) < COLD_KERNEL_FLOOR:
             continue
         price = od.get(m) or meta.get("usd_per_hour")
         d = data.get((m, "cuda", "warm", v))

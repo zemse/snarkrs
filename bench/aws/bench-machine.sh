@@ -229,18 +229,24 @@ if [ -n "$GPU" ] && [ "$FIRST_COMPILE" = 1 ]; then
 fi
 
 if [ -n "$GPU" ]; then
-  # This box has never run the prover, so ~/.nv and ~/.cache/g16-cuda are both empty and
-  # this first proof pays the whole kernel pipeline: NVRTC source-to-PTX, then the driver's
-  # PTX-to-SASS JIT inside cuModuleLoad. On a T4 that was measured at 113 s + 175 s. It is
-  # a genuine deployment cost, it is per machine and not per proof, and it must not land
-  # inside rep 1 of a benchmark. So it is paid here, timed here, and reported on its own.
-  say "first CUDA run on a fresh box: paying NVRTC + driver JIT, outside the timed region"
+  # WARNING: this is NOT the cold kernel build unless the gate was skipped.
+  #
+  # The intent was to time the first CUDA run on a fresh box, where ~/.nv/ComputeCache and
+  # ~/.cache/g16-cuda are both empty and the run pays NVRTC source-to-PTX plus the driver's
+  # PTX-to-SASS JIT. But the correctness gate above runs the CUDA test suite first, and that
+  # populates ~/.nv itself. Measured on g4dn.2xlarge: this step reported 3 s, against the
+  # 113 s + 175 s the same card needs from genuinely cold caches.
+  #
+  # So the number is only meaningful with G16_TESTS=none, and cost.py ignores anything under
+  # COLD_KERNEL_FLOOR. For the real figure run with G16_FIRST_COMPILE=1, which clears both
+  # caches explicitly and is therefore order-independent.
+  say "first CUDA run after the gate (warm ~/.nv unless tests were skipped)"
   W0=$(date +%s)
   rsh "$IP" 'source ~/.cargo/env; cd ~/g16 && ./target/release/g16 prove \
     --zkey bench/artifacts/tiny_mul/circuit.zkey --witness bench/artifacts/tiny_mul/circuit.wtns \
     --proof /tmp/w.json --public /tmp/wp.json --backend cuda >/dev/null 2>&1 && echo ok' 2>&1 | tee -a "$LOG"
   [ -z "$FIRST_COMPILE_S" ] && FIRST_COMPILE_S=$(( $(date +%s) - W0 ))
-  say "first kernel build took ${FIRST_COMPILE_S}s (paid once per machine, not per proof)"
+  say "first kernel build took ${FIRST_COMPILE_S}s (meaningful only if the gate was skipped)"
   rsh "$IP" 'source ~/.cargo/env; cd ~/g16 && ./target/release/g16 prove \
     --zkey bench/artifacts/tiny_mul/circuit.zkey --witness bench/artifacts/tiny_mul/circuit.wtns \
     --proof /tmp/w.json --public /tmp/wp.json --backend cuda >/dev/null 2>&1 && echo warmed' 2>&1 | tee -a "$LOG"
