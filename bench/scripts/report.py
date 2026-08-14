@@ -24,10 +24,16 @@ def build(d, headline=HEADLINE):
     by = {(c["machine"], c["backend"], c["mode"], c["variant"]): c for c in cells}
     variants = sorted({(c["constraints"], c["variant"]) for c in cells})
 
-    def rows(mode, variant):
+    # An amortised purchase price is not an hourly rate. Owned hardware is kept out of the
+    # cost ranking and the frontier, and compared only on latency, where milliseconds mean
+    # the same thing regardless of how the machine was paid for.
+    def is_rental(m):
+        return not machines.get(m, {}).get("price_basis")
+
+    def rows(mode, variant, rentals_only=True):
         out = []
         for (m, b, md, v), c in by.items():
-            if md == mode and v == variant:
+            if md == mode and v == variant and (not rentals_only or is_rental(m)):
                 out.append(c)
         return out
 
@@ -403,10 +409,18 @@ NOTES = [
      "driver's JIT to machine code. On a T4 that was measured at 113 s plus roughly 175 s. "
      "It is per machine, not per proof, so it is outside every timing here, but an "
      "autoscaled fleet pays it on every new instance."),
-    ("One machine failed and published nothing",
-     "The arm64 GPU box failed its correctness gate: its AMI shipped an NVRTC newer than "
-     "its own driver, and every MSM module load was rejected. Its timings were discarded "
-     "rather than reported, which is the point of gating on the suite."),
+    ("The gate caught a machine that would have reported nonsense",
+     "The arm64 GPU box failed its correctness gate on the first attempt: its AMI shipped "
+     "an NVRTC newer than its own driver, so every MSM module load was rejected with "
+     "CUDA_ERROR_UNSUPPORTED_PTX_VERSION. It published no timings. Pinning the image to "
+     "the same Ubuntu release the x86 boxes use fixed it and the machine re-ran clean, "
+     "which is why it appears here. The numbers on this page come only from machines that "
+     "passed their suite."),
+    ("Cost per proof has a minimum, not a slope",
+     "Within a family AWS charges strictly linearly per core, so it is tempting to assume "
+     "the smallest instance is cheapest. It is not. Scaling is slightly superlinear from "
+     "two cores to four and decays to 87-92% by sixteen, so cost per proof falls then "
+     "rises, with the minimum at four cores on both Graviton generations tested."),
 ]
 
 

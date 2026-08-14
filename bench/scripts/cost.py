@@ -110,6 +110,15 @@ def main():
     L = []
     add = L.append
 
+    # An hourly rate you can transact at and an amortised purchase price are not the same
+    # kind of number, and ranking them together invites the wrong conclusion. The M2 Max
+    # tops a naive cost ranking at $0.005 per 1000 proofs purely because its imputed rate
+    # assumes a bought machine kept busy for three years, with no power, ops or
+    # replacement risk priced in. Rentals are ranked against each other; owned hardware is
+    # reported separately, and only its latency is compared directly.
+    def is_rental(m):
+        return not metas.get(m, {}).get("price_basis")
+
     machines = sorted(metas)
     variants = sorted({k[3] for k in data}, key=lambda v: next(
         (d["constraints"] for k, d in data.items() if k[3] == v), 0))
@@ -123,17 +132,17 @@ def main():
     for mode in ("warm", "cold"):
         rows = []
         for (m, b, md, vv), d in data.items():
-            if md != mode or vv != v:
+            if md != mode or vv != v or not is_rental(m):
                 continue
             price = od.get(m)
             meta = metas.get(m, {})
-            if price is None:              # owned hardware: no rental price exists
+            if price is None:
                 price = meta.get("usd_per_hour")
             if not price:
                 continue
             s = d["ms"] / 1000.0
             rows.append((m, b, d["ms"], price * s / 3600,
-                         (spot.get(m) or price) * s / 3600,
+                         (spot[m] * s / 3600) if spot.get(m) else None,
                          3600 / s, meta))
         if not rows:
             continue
@@ -147,16 +156,23 @@ def main():
             m, b, ms, c, cs, ph, meta = r
             acc = meta.get("gpu") or meta.get("cpu_model", "")[:28]
             add(f"| {i} | `{m}` <br><sub>{acc}</sub> | {b} | {ms:,.1f} | {per_k(c)} | "
-                f"{per_k(cs)} | {1/c:,.0f} | {ph:,.0f} |")
+                f"{per_k(cs) if cs is not None else '—'} | {1/c:,.0f} | {ph:,.0f} |")
         add("")
         add("**Fastest first.**\n")
+        add("Milliseconds are comparable across everything; owned hardware is included here "
+            "and marked, because latency does not depend on how the machine was paid for.\n")
         add("| # | machine | backend | ms/proof | $/1k proofs | vs fastest |")
         add("|---|---|---|---:|---:|---:|")
-        fastest = min(x[2] for x in rows)
-        for i, r in enumerate(sorted(rows, key=lambda x: x[2]), 1):
+        srows = rows + [
+            (m, b, d["ms"], None, None, None, metas[m])
+            for (m, b, md, vv), d in data.items()
+            if md == mode and vv == v and not is_rental(m)]
+        fastest = min(x[2] for x in srows)
+        for i, r in enumerate(sorted(srows, key=lambda x: x[2]), 1):
             m, b, ms, c, cs, ph, meta = r
             acc = meta.get("gpu") or meta.get("cpu_model", "")[:28]
-            add(f"| {i} | `{m}` <br><sub>{acc}</sub> | {b} | {ms:,.1f} | {per_k(c)} | "
+            cost = per_k(c) if c is not None else "not rented"
+            add(f"| {i} | `{m}` <br><sub>{acc}</sub> | {b} | {ms:,.1f} | {cost} | "
                 f"{ms/fastest:.2f}x |")
 
     # ---- does the answer change with circuit size? --------------------------------------
@@ -265,10 +281,10 @@ def main():
                         continue
                     s = d["ms"] / 1000.0
                     c = price * s / 3600
-                    cs = (spot.get(m) or price) * s / 3600
+                    cs = (spot[m] * s / 3600) if spot.get(m) else None
                     warn = f" ⚠{d['unverified']} unverified" if d["unverified"] else ""
                     add(f"| {vv} | {d['constraints']:,} | {b} | {md} | {d['ms']:,.1f} | "
-                        f"{per_k(c)} | {per_k(cs)}{warn} |")
+                        f"{per_k(c)} | {per_k(cs) if cs is not None else 'not sampled'}{warn} |")
 
     Path(args.out).write_text("\n".join(L) + "\n")
     print(f"wrote {args.out}  ({len(machines)} machines, {len(data)} cells)")
