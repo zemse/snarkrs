@@ -58,7 +58,7 @@ shutdown -h +$((HOURS * 60))
 exec > /var/log/g16-bootstrap.log 2>&1
 set -x
 # Delimiter is # not |: the alternation contains a | and sed would read it as the end
-# of the pattern, failing with unbalanced parentheses behind the `|| true`.
+# of the pattern, failing with unbalanced parentheses behind the trailing || true.
 sed -i -E 's#http://[a-z0-9-]+\\.ec2\\.(archive|ports)\\.ubuntu\\.com#http://\\1.ubuntu.com#g' \
   /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
 export DEBIAN_FRONTEND=noninteractive

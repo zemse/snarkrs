@@ -154,6 +154,49 @@ def main():
             add(f"| {i} | `{m}` <br><sub>{acc}</sub> | {b} | {ms:,.1f} | {per_k(c)} | "
                 f"{ms/fastest:.2f}x |")
 
+    # ---- what the one-time kernel build costs -------------------------------------------
+    # A GPU box cannot prove anything until NVRTC and the driver JIT have turned the kernel
+    # source into SASS, and on a fresh instance that is minutes. It is not a per-proof cost
+    # and it does not belong in any per-proof table, but it is not free either: it is billed
+    # at the same hourly rate as proving, and it is paid again on every new instance. For an
+    # autoscaled fleet that scales to zero, it is paid constantly.
+    v = args.variant
+    cheapest_cpu = None
+    for (m, b, md, vv), d in data.items():
+        if md != "warm" or vv != v or b != "cpu":
+            continue
+        price = od.get(m) or metas.get(m, {}).get("usd_per_hour")
+        if not price:
+            continue
+        c = price * (d["ms"] / 1000.0) / 3600
+        if cheapest_cpu is None or c < cheapest_cpu[1]:
+            cheapest_cpu = (m, c)
+    rows = []
+    for m, meta in metas.items():
+        fc = meta.get("first_compile_s")
+        if not fc:
+            continue
+        price = od.get(m) or meta.get("usd_per_hour")
+        d = data.get((m, "cuda", "warm", v))
+        if not (price and d and cheapest_cpu):
+            continue
+        fixed = price * float(fc) / 3600
+        saving = cheapest_cpu[1] - price * (d["ms"] / 1000.0) / 3600
+        rows.append((m, float(fc), fixed, saving,
+                     (fixed / saving) if saving > 0 else None))
+    if rows:
+        add(f"\n## The one-time kernel build\n")
+        add(f"Break-even is against the cheapest CPU machine in this sweep "
+            f"(`{cheapest_cpu[0]}`, {per_k(cheapest_cpu[1])} per 1000 proofs, warm, "
+            f"{v}). Below that many proofs on one instance, the GPU box has not repaid the "
+            f"minutes it spent compiling kernels before it could prove anything.\n")
+        add("| machine | first kernel build | what that costs | saved per proof | break-even proofs |")
+        add("|---|---:|---:|---:|---:|")
+        for m, fc, fixed, saving, be in sorted(rows, key=lambda r: r[2]):
+            add(f"| `{m}` | {fc:,.0f} s | ${fixed:.4f} | "
+                + (f"${saving*1000:,.3f} /1k | {be:,.0f} |" if be else
+                   f"{'(none, it is dearer)' if saving<=0 else ''} | never |"))
+
     # ---- full grid --------------------------------------------------------------------
     add("\n## Full grid\n")
     add("Costs are dollars per 1000 proofs, at 100% utilisation.\n")

@@ -87,7 +87,7 @@ set -x
 # Graviton box on the slow mirror.
 # Delimiter is # and not |, because the alternation below contains a | and sed would
 # otherwise read it as the end of the pattern and fail with unbalanced parentheses --
-# silently, behind the `|| true`, leaving every Graviton box on the slow mirror.
+# silently, behind the trailing || true, leaving every Graviton box on the slow mirror.
 sed -i -E 's#http://[a-z0-9-]+\\.ec2\\.(archive|ports)\\.ubuntu\\.com#http://\\1.ubuntu.com#g' \
   /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
 # The Deep Learning AMIs already carry a toolchain and CUDA; only the plain Ubuntu images
@@ -258,7 +258,19 @@ for b in $BACKENDS; do
     && say "pulled $OUT/$b.csv ($(wc -l < "$OUT/$b.csv" | tr -d ' ') lines)"
 done
 
-CPUMODEL="$(rsh "$IP" 'lscpu | sed -n "s/^Model name: *//p" | head -1' 2>/dev/null | tr -d '\r')"
+# lscpu prints no "Model name" on Graviton, so aarch64 boxes fall back to the MIDR part
+# number, which the kernel always exposes, mapped through ARM's published core IDs:
+# 0xd0c Neoverse-N1 (Graviton2), 0xd40 Neoverse-V1 (Graviton3), 0xd4f Neoverse-V2
+# (Graviton4). Read from the CPU rather than assumed from the instance name.
+CPUMODEL="$(rsh "$IP" 'm=$(lscpu | sed -n "s/^Model name: *//p" | head -1)
+  if [ -z "$m" ]; then
+    part=$(sed -n "s/^CPU part[[:space:]]*: *//p" /proc/cpuinfo | head -1)
+    case "$part" in
+      0xd0c) m="ARM Neoverse-N1";; 0xd40) m="ARM Neoverse-V1";;
+      0xd4f) m="ARM Neoverse-V2";; *) m="aarch64 (MIDR part $part)";;
+    esac
+  fi
+  echo "$m"' 2>/dev/null | tr -d '\r')"
 GPUNAME="$(rsh "$IP" 'nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1' 2>/dev/null | tr -d '\r')"
 python3 - "$OUT/meta.json" <<PY
 import json,sys
