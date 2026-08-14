@@ -82,7 +82,13 @@ set -x
 # 486 kB/s and timed out repeatedly, while archive.ubuntu.com served the same object from
 # the same instance in 69 ms. That cost ten minutes of billed boot before anything was
 # built, on a box that only needs one package.
-sed -i 's|http://[a-z0-9-]*\\.ec2\\.archive\\.ubuntu\\.com|http://archive.ubuntu.com|g' \
+# arm64 Ubuntu does not use archive.ubuntu.com at all: it uses ports.ubuntu.com, behind
+# us-east-1.ec2.ports.ubuntu.com. Rewriting only the archive host silently left every
+# Graviton box on the slow mirror.
+# Delimiter is # and not |, because the alternation below contains a | and sed would
+# otherwise read it as the end of the pattern and fail with unbalanced parentheses --
+# silently, behind the `|| true`, leaving every Graviton box on the slow mirror.
+sed -i -E 's#http://[a-z0-9-]+\\.ec2\\.(archive|ports)\\.ubuntu\\.com#http://\\1.ubuntu.com#g' \
   /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
 # The Deep Learning AMIs already carry a toolchain and CUDA; only the plain Ubuntu images
 # need apt at all, and then only for a C compiler to link Rust against.
@@ -92,7 +98,16 @@ if ! command -v cc >/dev/null 2>&1; then
   apt-get install -y build-essential
 fi
 sudo -u ubuntu bash -lc 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal'
-touch /home/ubuntu/BOOTSTRAP_DONE
+# Write the ready marker only if the box is actually ready. The first version of this
+# touched it unconditionally, so a Graviton box whose apt had failed still announced itself
+# as bootstrapped, then failed to compile libc four seconds later.
+if command -v cc >/dev/null 2>&1 && [ -x /home/ubuntu/.cargo/bin/cargo ]; then
+  touch /home/ubuntu/BOOTSTRAP_DONE
+else
+  { echo "cc: \$(command -v cc || echo MISSING)"
+    echo "cargo: \$(ls /home/ubuntu/.cargo/bin/cargo 2>/dev/null || echo MISSING)"; } \
+    > /home/ubuntu/BOOTSTRAP_FAILED
+fi
 EOF
 
 T_LAUNCH=$(date +%s)
@@ -132,8 +147,16 @@ for i in $(seq 1 60); do rsh "$IP" true 2>/dev/null && break; sleep 10; done
 rsh "$IP" true || { say "ssh never came up"; exit 1; }
 
 say "waiting for bootstrap (apt + rustup)"
-for i in $(seq 1 90); do rsh "$IP" 'test -f ~/BOOTSTRAP_DONE' 2>/dev/null && break; sleep 10; done
-rsh "$IP" 'test -f ~/BOOTSTRAP_DONE' || { say "bootstrap never finished"; rsh "$IP" 'sudo tail -40 /var/log/g16-bootstrap.log' | tee -a "$LOG"; exit 1; }
+for i in $(seq 1 90); do
+  rsh "$IP" 'test -f ~/BOOTSTRAP_DONE || test -f ~/BOOTSTRAP_FAILED' 2>/dev/null && break
+  sleep 10
+done
+if rsh "$IP" 'test -f ~/BOOTSTRAP_FAILED' 2>/dev/null; then
+  say "bootstrap finished but the box is not usable:"
+  rsh "$IP" 'cat ~/BOOTSTRAP_FAILED; sudo tail -30 /var/log/g16-bootstrap.log' 2>&1 | tee -a "$LOG"
+  exit 1
+fi
+rsh "$IP" 'test -f ~/BOOTSTRAP_DONE' || { say "bootstrap never finished"; rsh "$IP" 'sudo tail -40 /var/log/g16-bootstrap.log' 2>&1 | tee -a "$LOG"; exit 1; }
 say "bootstrap done after $(( ($(date +%s) - T_LAUNCH) / 60 )) min"
 
 SRC_URL="$(presign src.tgz)"
@@ -155,21 +178,41 @@ rsh "$IP" 'source ~/.cargo/env
   command -v nvidia-smi >/dev/null && { echo "--- gpu"; nvidia-smi --query-gpu=name,driver_version,memory.total,compute_cap --format=csv,noheader | sed "s/^/    /"; }
   echo "--- nvrtc"; (ldconfig -p | grep -c nvrtc) 2>/dev/null || echo 0' 2>&1 | tee -a "$LOG"
 
+# Capture to a file and test the real exit status. Piping cargo into `tail` hands the
+# pipeline `tail`'s status, which is always 0, so the first version of this cheerfully
+# carried on past a build that had failed to compile libc.
 say "building (release${FEATURES:+, cuda})"
 BUILD_T0=$(date +%s)
-rsh "$IP" "source ~/.cargo/env; cd ~/g16 && cargo build --release -p g16-cli $FEATURES 2>&1 | tail -3" 2>&1 | tee -a "$LOG"
+if ! rsh "$IP" "set -o pipefail; source ~/.cargo/env; cd ~/g16 && cargo build --release -p g16-cli $FEATURES" > "$OUT/build.log" 2>&1; then
+  say "BUILD FAILED after $(( $(date +%s) - BUILD_T0 ))s:"
+  tail -25 "$OUT/build.log" | tee -a "$LOG"
+  exit 1
+fi
+tail -2 "$OUT/build.log" | tee -a "$LOG"
 say "build took $(( $(date +%s) - BUILD_T0 ))s"
 
-TESTS_RESULT=skipped
+TESTS_RESULT=skipped; TESTS_OK=0; TESTS_SUITES=0
 if [ "$TESTS" = full ]; then
-  say "correctness gate: cargo test --release $FEATURES"
+  say "correctness gate: cargo test --release --workspace $FEATURES"
   TEST_T0=$(date +%s)
-  if rsh "$IP" "source ~/.cargo/env; cd ~/g16 && cargo test --release --workspace $FEATURES 2>&1 | grep -E '^test result|^error|panicked' | tail -40" 2>&1 | tee -a "$LOG" | grep -q 'FAILED\|error\[' ; then
-    TESTS_RESULT=FAILED; say "CORRECTNESS GATE FAILED -- timings from this box are not trustworthy"
-  else
-    TESTS_RESULT=passed
+  # `set -e` is on, so this must run inside an `if` or a failing test run would abort the
+  # script here and never reach the reporting below.
+  if rsh "$IP" "source ~/.cargo/env; cd ~/g16 && cargo test --release --workspace $FEATURES" \
+       > "$OUT/tests.log" 2>&1; then RC=0; else RC=$?; fi
+  # A gate must require positive evidence, not the absence of bad news. The first version
+  # grepped for the word FAILED and called an empty result a pass, so a box whose tests
+  # never compiled scored the same as a box that passed all 163 of them.
+  TESTS_SUITES=$(grep -c '^test result: ok' "$OUT/tests.log" 2>/dev/null || true)
+  TESTS_OK=$(awk '/^test result: ok/{n+=$4} END{print n+0}' "$OUT/tests.log" 2>/dev/null || echo 0)
+  BADSUITES=$(grep -c '^test result: FAILED' "$OUT/tests.log" 2>/dev/null || true)
+  if [ "$RC" -ne 0 ] || [ "${BADSUITES:-0}" -gt 0 ] || [ "${TESTS_SUITES:-0}" -lt 1 ]; then
+    TESTS_RESULT=FAILED
+    say "CORRECTNESS GATE FAILED (rc=$RC, suites ok=$TESTS_SUITES failed=$BADSUITES) -- this box's timings are not trustworthy"
+    grep -E '^test result|^error|panicked at' "$OUT/tests.log" | tail -20 | tee -a "$LOG"
+    exit 1
   fi
-  say "tests took $(( $(date +%s) - TEST_T0 ))s -> $TESTS_RESULT"
+  TESTS_RESULT=passed
+  say "tests took $(( $(date +%s) - TEST_T0 ))s -> passed: $TESTS_OK tests across $TESTS_SUITES suites"
 fi
 
 FIRST_COMPILE_S=""
@@ -223,7 +266,7 @@ json.dump(dict(instance_type="$TYPE", arch="$ARCH", vcpu=$VCPU,
                cores=$(machine_field "$TYPE" cores), mem_gib=$(machine_field "$TYPE" mem_gib),
                gpu="$GPUNAME", gpu_sku="$GPU", cpu_model="""$CPUMODEL""",
                usd_per_hour=$PRICE, region="$REGION", reps=$REPS,
-               tests="$TESTS_RESULT",
+               tests="$TESTS_RESULT", tests_passed=$TESTS_OK, test_suites=$TESTS_SUITES,
                first_compile_s=${FIRST_COMPILE_S:-None},
                git="$(cd "$REPO_ROOT" && git rev-parse --short HEAD)",
                dirty=$( [ -n "$(cd "$REPO_ROOT" && git status --porcelain)" ] && echo True || echo False )),
