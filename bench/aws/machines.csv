@@ -1,0 +1,14 @@
+instance_type,arch,vcpu,cores,mem_gib,gpu,gpu_gib,usd_per_hour
+c7g.xlarge,arm64,4,4,8,,,0.1450
+c8g.xlarge,arm64,4,4,8,,,0.1595
+c7i.xlarge,x86_64,4,2,8,,,0.1785
+c7a.xlarge,x86_64,4,4,8,,,0.2053
+c7a.2xlarge,x86_64,8,8,16,,,0.4106
+c8g.4xlarge,arm64,16,16,32,,,0.6381
+c7a.4xlarge,x86_64,16,16,32,,,0.8211
+g5g.xlarge,arm64,4,4,8,T4g,16,0.4200
+g4dn.xlarge,x86_64,4,2,16,T4,16,0.5260
+g4dn.2xlarge,x86_64,8,4,32,T4,16,0.7520
+g6.xlarge,x86_64,4,2,16,L4,22,0.8048
+g5.xlarge,x86_64,4,2,16,A10G,22,1.0060
+g6e.xlarge,x86_64,4,2,32,L40S,45,1.8610
