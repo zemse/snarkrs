@@ -39,12 +39,15 @@ wave() {
   local boxes=("$@")
   [ ${#boxes[@]} -eq 0 ] && return 0
   echo "=== wave: $name (${#boxes[@]} boxes, $PAR at a time) ==="
-  local running=0
+  # A rolling pool, not a batch-and-join. macOS ships bash 3.2, which has no `wait -n`, so
+  # the usual one-liner degrades into "start N, wait for ALL N, start N more" -- and with a
+  # naive counter it degrades further into nearly serial. Polling `jobs -pr` is the portable
+  # way to keep exactly $PAR lanes busy. It matters: the slowest box in a batch would
+  # otherwise hold three idle slots for twenty minutes.
   for t in "${boxes[@]}"; do
+    while [ "$(jobs -pr | wc -l | tr -d ' ')" -ge "$PAR" ]; do sleep 5; done
     "$HERE/bench-machine.sh" "$t" "$REPS" >"$REPO_ROOT/bench/results/sweep/$t.out" 2>&1 &
-    running=$((running+1))
-    echo "  started $t (pid $!)"
-    if [ "$running" -ge "$PAR" ]; then wait -n 2>/dev/null || wait; running=$((running-1)); fi
+    echo "  started $t (pid $!)  [$(date +%H:%M:%S)]"
   done
   wait
   echo "=== wave $name complete ==="

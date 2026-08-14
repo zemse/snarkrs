@@ -109,7 +109,7 @@ launch_once() {
 # VcpuLimitExceeded and InsufficientInstanceCapacity are both transient in a sweep: the
 # first clears when a sibling lane finishes, the second when the AZ frees a card. Losing a
 # machine from the matrix because of either would leave a hole in the comparison, so retry.
-for attempt in 1 2 3 4 5 6 7 8 9 10; do
+for attempt in $(seq 1 20); do
   if INSTANCE="$(launch_once 2>"$OUT/launch.err")"; then break; fi
   err="$(tr -d '\n' < "$OUT/launch.err" | cut -c1-160)"
   case "$err" in
@@ -119,7 +119,7 @@ for attempt in 1 2 3 4 5 6 7 8 9 10; do
   esac
 done
 rm -f "$UD"
-[ -n "$INSTANCE" ] || { say "could not launch after 10 attempts"; exit 1; }
+[ -n "$INSTANCE" ] || { say "could not launch after 20 attempts"; exit 1; }
 say "launched $INSTANCE"
 
 aws_ ec2 wait instance-running --instance-ids "$INSTANCE"
