@@ -31,6 +31,10 @@ def load():
         if not mf.exists():
             continue
         meta = json.loads(mf.read_text())
+        # GATE: only machines that passed their suite contribute timings. Keeps the
+        # ungated cold-kernel probe runs out of every ranking.
+        if meta.get("tests") not in ("passed", None):
+            continue
         m = meta["instance_type"]
         price = od.get(m) or meta.get("usd_per_hour")
         meta["usd_per_hour"] = price

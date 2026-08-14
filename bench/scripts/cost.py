@@ -56,6 +56,11 @@ def load_sweep():
             continue
         mf = d / "meta.json"
         meta = json.loads(mf.read_text()) if mf.exists() else {"instance_type": d.name}
+        # GATE: a machine that did not pass its test suite does not contribute timings.
+        # This also excludes the deliberately ungated probe runs (cold-kernel measurements
+        # run with G16_TESTS=none), whose numbers are real but whose runs were not verified.
+        if meta.get("tests") not in ("passed", None):
+            continue
         metas[d.name] = meta
         for f in d.glob("*.csv"):
             if f.stem in ("meta",):
