@@ -27,7 +27,10 @@ to compiler-generated field arithmetic and on the Xeon only one of them does. Ou
 measured 0.92-1.19x of rapidsnark on the Mac and 1.35-1.49x *slower* on the Xeon. That was
 attributed to the assembly, but it was an inference from two machines that differed in four
 other ways, including 12 physical cores against 4. Round 2 settles it on a single box by
-building rapidsnark twice from one source tree, `USE_ASM=YES` and `USE_ASM=NO`.
+building rapidsnark twice from one source tree, `USE_ASM=YES` and `USE_ASM=NO`, **and the
+attribution turns out to be wrong**: the assembly is worth 2.52x to rapidsnark, but with it
+switched on our prover still lands within 3% of it on an AMD box, so it cannot be what made
+us slower on the Xeon.
 
 **One GPU SKU is not a GPU result.** A 2018 Turing T4 was the only NVIDIA part measured.
 Round 2 spans four generations: Turing (T4, T4G), Ampere (A10G) and Ada (L4, L40S).
@@ -90,6 +93,37 @@ proof. If the workload tolerates interruption, the T4G on spot is cheaper again 
 of two. Choose a CPU box only when no GPU is available, and then Graviton4 at the smallest
 size that fits -- the whole 140k-constraint proof peaks at 215 MB, so memory never forces a
 larger instance.
+
+## rapidsnark's assembly, settled on one box, and a Round 1 claim withdrawn
+
+Round 1 observed that our CPU prover ran at 0.92-1.19x of rapidsnark on the M2 Max but
+1.35-1.49x *slower* on the g4dn's Xeon, and attributed the difference to rapidsnark's
+hand-written x86_64 assembly for `Fr` and `Fq`, which has no aarch64 counterpart. That was
+an inference from two machines that differed in four other ways.
+
+rapidsnark ships two build targets that differ in exactly one cmake flag, so the question
+can be answered on a single machine, in a single run, with the same compiler and the same
+source tree: `make host` (`USE_ASM=YES`) against `make host_noasm` (`USE_ASM=NO`).
+
+On `c7a.2xlarge`, AMD EPYC 9R14, 8 cores, warm:
+
+| circuit | rapidsnark, asm | rapidsnark, no asm | ours | what the asm buys |
+|---|---:|---:|---:|---:|
+| js_2x2_d32 | 101.0 ms | 276.0 ms | — | 2.73x |
+| js_8x8_d32 | 432.0 ms | 1,145.0 ms | — | 2.65x |
+| js_16x16_d32 | 832.0 ms | 2,099.5 ms | 856.9 ms | 2.52x |
+
+**Half the Round 1 claim is confirmed and half is withdrawn.**
+
+Confirmed: the assembly is enormous, worth **2.52x to 2.73x**. Against a rapidsnark built
+from the same source without it, our Rust prover is **2.45x faster**.
+
+Withdrawn: the assembly is *not* why we trailed on the Xeon. On this box the assembly is
+fully enabled and our prover still lands within **3%** of it (856.9 ms against 832.0 ms).
+If the assembly were the explanation, we would trail here too, and we do not. The Round 1
+gap was specific to that Xeon -- a Skylake-SP 8259CL with 4 physical cores -- and not a
+property of x86 or of rapidsnark's build. The honest summary is that rapidsnark's assembly
+is what makes rapidsnark competitive with us, rather than what makes us slower than it.
 
 ## The two rounds do not define "cold" the same way
 
@@ -225,11 +259,17 @@ takes 554 ms on the Mac and 1579 ms on the Xeon for identical work.
 
 The same effect shows in our CPU backend, and it is worth stating because it cuts against us.
 Our CPU prover is within 0.92x to 1.19x of rapidsnark on the M2 Max, and 1.35x to 1.49x
-*slower* on the Xeon. Same Rust, same arkworks. The difference is rapidsnark's hand-written
-x86_64 assembly for `Fr` and `Fq`, which has no aarch64 counterpart, so on Apple silicon both
-provers fall back to compiler-generated field arithmetic and we are competitive. Anyone
-quoting a single-machine CPU comparison as a statement about a prover is quoting a statement
-about the host.
+*slower* on the Xeon. Same Rust, same arkworks. Anyone quoting a single-machine CPU
+comparison as a statement about a prover is quoting a statement about the host.
+
+> **Corrected by Round 2.** The sentence that stood here blamed rapidsnark's hand-written
+> x86_64 assembly, on the reasoning that Apple silicon has no such path so both provers fall
+> back to compiler-generated arithmetic there. Round 2 tested that directly, by building
+> rapidsnark twice on one AMD box from one source tree with `USE_ASM=YES` and `USE_ASM=NO`.
+> The assembly is worth 2.52x to rapidsnark, but with it fully enabled our prover still lands
+> within 3% of rapidsnark on that box. So the assembly is not what made us slower on the
+> Xeon; that gap was specific to the 8259CL. See "rapidsnark's assembly, settled on one box"
+> above.
 
 ## Where the time goes, and three predictions that were wrong
 

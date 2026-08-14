@@ -139,7 +139,12 @@ rsh "$IP" "set -e; source ~/.cargo/env; cd ~/g16
       fi
     done
   done
-  ./target/release/g16 bench --artifacts bench/artifacts $(for v in $VARIANTS; do printf -- '--variant %s ' "\$v"; done) \\
+  # Build the --variant list on the REMOTE side. Written as a local \$(...) it expanded
+  # here, where the escaped \$v was literal, so the box received '--variant \$v' three
+  # times and \$v still held the last value of the loop above: three runs of one circuit
+  # instead of one run of three.
+  VARGS=''; for v in $VARIANTS; do VARGS="\$VARGS --variant \$v"; done
+  ./target/release/g16 bench --artifacts bench/artifacts \$VARGS \\
     --reps $REPS --backend cpu --mode both --csv /tmp/ours.csv >/dev/null
   wc -l /tmp/asm.csv /tmp/ours.csv" 2>&1 | tail -5 | tee -a "$LOG"
 
