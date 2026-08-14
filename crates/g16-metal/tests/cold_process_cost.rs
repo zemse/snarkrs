@@ -1,3 +1,9 @@
+// The `metal` crate is a macOS-only dependency, so on any other target `g16_metal`
+// exports nothing and this file cannot compile. Gate the whole test crate rather
+// than each test: `cargo test --workspace` is run on Linux by the EC2 sweep, and a
+// macOS-only test crate breaking it there hides real failures behind a build error.
+#![cfg(target_os = "macos")]
+
 //! Where the ~20 ms Metal prepare floor actually goes, measured in a FRESH process.
 //!
 //! `startup_cost.rs` reports `MetalBackend::new()` at ~2.7 ms, but it runs after another

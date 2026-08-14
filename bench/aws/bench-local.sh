@@ -27,9 +27,14 @@ echo "==> building"
 cargo build --release -p g16-cli $FEATURES 2>&1 | tail -2
 
 echo "==> correctness gate"
+# Run once, keep the output, decide from it. Running the suite twice -- once to show and
+# once to grep -- doubles the wall clock and, worse, lets the two runs disagree.
+TLOG="$(mktemp)"
+cargo test --release --workspace $FEATURES > "$TLOG" 2>&1 || true
+grep -E '^test result' "$TLOG" | tail -20
 TESTS=passed
-cargo test --release --workspace $FEATURES 2>&1 | grep -E '^test result' | tail -20
-cargo test --release --workspace $FEATURES 2>&1 | grep -qE 'FAILED|error\[' && TESTS=FAILED
+grep -qE 'FAILED|^error\[|^error:' "$TLOG" && TESTS=FAILED
+rm -f "$TLOG"
 echo "    -> $TESTS"
 
 for b in $BACKENDS; do

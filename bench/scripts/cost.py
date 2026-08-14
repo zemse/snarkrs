@@ -80,11 +80,14 @@ def load_sweep():
     return out, metas
 
 
-def fmt_cost(usd):
-    """Per-proof costs run from cents to microdollars; one unit for all of them is unreadable."""
-    if usd >= 0.01:
-        return f"${usd:.4f}"
-    return f"{usd*1000:.3f}m"       # millidollars, i.e. $ per 1000 proofs
+def per_k(usd):
+    """Dollars per 1000 proofs.
+
+    Everything here costs a fraction of a cent per proof, so a per-proof column is a row of
+    leading zeros that no one can compare at a glance. Per 1000 proofs puts every machine in
+    the same readable range and is the unit anyone sizing a prover fleet actually thinks in.
+    """
+    return f"${usd*1000:,.3f}"
 
 
 def main():
@@ -131,25 +134,29 @@ def main():
             continue
         nc = next((d["constraints"] for k, d in data.items() if k[3] == v), -1)
         add(f"\n## {mode.capitalize()}: {v} ({nc:,} constraints)\n")
-        add("| rank by cost | machine | backend | ms/proof | $/proof (on-demand) | "
-            "$/proof (spot) | proofs/hour |")
-        add("|---|---|---|---:|---:|---:|---:|")
+        add("**Cheapest first.** Cost assumes the box proves continuously; idle time is "
+            "not modelled and would raise every row.\n")
+        add("| # | machine | backend | ms/proof | $/1k proofs | $/1k spot | proofs per $ | proofs/hour |")
+        add("|---|---|---|---:|---:|---:|---:|---:|")
         for i, r in enumerate(sorted(rows, key=lambda x: x[3]), 1):
             m, b, ms, c, cs, ph, meta = r
             acc = meta.get("gpu") or meta.get("cpu_model", "")[:28]
-            add(f"| {i} | `{m}` <br><sub>{acc}</sub> | {b} | {ms:,.1f} | {fmt_cost(c)} | "
-                f"{fmt_cost(cs)} | {ph:,.0f} |")
+            add(f"| {i} | `{m}` <br><sub>{acc}</sub> | {b} | {ms:,.1f} | {per_k(c)} | "
+                f"{per_k(cs)} | {1/c:,.0f} | {ph:,.0f} |")
         add("")
-        add("| rank by speed | machine | backend | ms/proof | $/proof (on-demand) |")
-        add("|---|---|---|---:|---:|")
+        add("**Fastest first.**\n")
+        add("| # | machine | backend | ms/proof | $/1k proofs | vs fastest |")
+        add("|---|---|---|---:|---:|---:|")
+        fastest = min(x[2] for x in rows)
         for i, r in enumerate(sorted(rows, key=lambda x: x[2]), 1):
             m, b, ms, c, cs, ph, meta = r
             acc = meta.get("gpu") or meta.get("cpu_model", "")[:28]
-            add(f"| {i} | `{m}` <br><sub>{acc}</sub> | {b} | {ms:,.1f} | {fmt_cost(c)} |")
+            add(f"| {i} | `{m}` <br><sub>{acc}</sub> | {b} | {ms:,.1f} | {per_k(c)} | "
+                f"{ms/fastest:.2f}x |")
 
     # ---- full grid --------------------------------------------------------------------
     add("\n## Full grid\n")
-    add("`m` suffix means millidollars, i.e. dollars per 1000 proofs.\n")
+    add("Costs are dollars per 1000 proofs, at 100% utilisation.\n")
     for m in machines:
         meta = metas[m]
         price = od.get(m) or meta.get("usd_per_hour")
@@ -166,7 +173,7 @@ def main():
             + (f" First kernel build on a fresh box: "
                f"{float(meta['first_compile_s']):.0f} s (once per machine, not per proof)."
                if meta.get("first_compile_s") else "") + "\n")
-        add("| circuit | constraints | backend | mode | ms | $/proof | $/proof spot |")
+        add("| circuit | constraints | backend | mode | ms | $/1k proofs | $/1k spot |")
         add("|---|---:|---|---|---:|---:|---:|")
         for vv in variants:
             for b in backends:
@@ -179,7 +186,7 @@ def main():
                     cs = (spot.get(m) or price) * s / 3600
                     warn = f" ⚠{d['unverified']} unverified" if d["unverified"] else ""
                     add(f"| {vv} | {d['constraints']:,} | {b} | {md} | {d['ms']:,.1f} | "
-                        f"{fmt_cost(c)} | {fmt_cost(cs)}{warn} |")
+                        f"{per_k(c)} | {per_k(cs)}{warn} |")
 
     Path(args.out).write_text("\n".join(L) + "\n")
     print(f"wrote {args.out}  ({len(machines)} machines, {len(data)} cells)")
