@@ -34,6 +34,17 @@ teardown() {
 }
 trap teardown EXIT INT TERM
 
+# Under `set -u`, bash 3.2 (which macOS ships) treats "${EMPTY[@]}" as an unbound
+# variable rather than as zero words, so a wave with no boxes -- which is exactly what
+# G16_ONLY produces when every named machine is in the other wave -- aborts the script.
+# Callers pass the array through this guard instead of expanding it directly.
+wave_or_skip() {  # wave_or_skip <name> <array-name>
+  local name="$1" arr="$2" n
+  eval "n=\${#${arr}[@]}"
+  [ "$n" -eq 0 ] && { echo "=== wave: $name (none selected, skipped) ==="; return 0; }
+  eval "wave \"\$name\" \"\${${arr}[@]}\""
+}
+
 wave() {
   local name="$1"; shift
   local boxes=("$@")
@@ -57,8 +68,8 @@ wave() {
 }
 
 mkdir -p "$REPO_ROOT/bench/results/sweep"
-wave CPU "${CPU_BOXES[@]}"
-wave GPU "${GPU_BOXES[@]}"
+wave_or_skip CPU CPU_BOXES
+wave_or_skip GPU GPU_BOXES
 
 echo
 echo "=== results collected ==="
