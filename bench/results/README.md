@@ -49,6 +49,34 @@ could not be told apart from a difference between two machines. Round 2 measures
   the gate publishes nothing. This is roughly 40% of each box's billed time and it is the
   reason the numbers can be put next to each other at all.
 
+## The two rounds do not define "cold" the same way
+
+Worth knowing before comparing a number here against a number in Round 1, because the same
+word means two different things.
+
+Round 1's cold spawned a fresh **process** per rep and timed the whole `g16 prove`
+invocation: process start, dynamic linking, key parse, prove, JSON write, exit. Round 2's
+cold rebuilds the backend and reparses the key per rep **inside one process**. On the same
+instance type, at 140,261 constraints:
+
+| | round 1 cold | round 2 cold | difference |
+|---|---:|---:|---:|
+| ours/cpu | 2301.2 ms | 2109.8 ms | 191 ms |
+| ours/cuda | 695.6 ms | 473.2 ms | 222 ms |
+
+The gap is about 200 ms on both backends, so it is process startup rather than anything
+CUDA-specific. Neither definition is wrong: the first is what a CLI invocation costs, the
+second is what a worker that re-prepares per job costs. They are just not the same
+measurement, and quoting one against the other would invent a 1.5x improvement that does
+not exist.
+
+The warm numbers give a second, sharper reading of the same pair of runs. Between the two
+rounds, on the same instance type, **CUDA warm differed by 0.9 ms (0.6%) and CPU warm by
+118 ms (5.4%)**. The GPU is a passthrough device; the host CPU shares a socket with
+whatever else the hypervisor put there. Instance-to-instance variance is real, it is
+roughly six times larger on the CPU side, and Round 1 never measured it. Two separate
+`c7a.xlarge` instances launched forty minutes apart agreed to 0.6%.
+
 ## What the cost model does not include
 
 - Cost per proof assumes the machine proves **continuously**. Idle time is not modelled and
