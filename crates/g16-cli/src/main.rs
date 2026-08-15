@@ -47,6 +47,10 @@ enum Cmd {
         /// Print the per-stage split of the proving time.
         #[arg(long)]
         stage_timings: bool,
+        /// Verify the proof before writing it, and fail rather than emit one that does not
+        /// verify. On by default; the cost is under 3% of a proof.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        self_verify: bool,
     },
     /// Verify a proof against snarkjs' verification_key.json.
     Verify {
@@ -70,7 +74,16 @@ fn main() -> Result<()> {
             public,
             backend,
             stage_timings,
-        } => run_prove(&zkey, &witness, &proof, &public, backend, stage_timings),
+            self_verify,
+        } => run_prove(
+            &zkey,
+            &witness,
+            &proof,
+            &public,
+            backend,
+            stage_timings,
+            self_verify,
+        ),
         Cmd::Verify {
             vkey,
             proof,
@@ -87,6 +100,7 @@ fn run_prove(
     public_out: &std::path::Path,
     backend: BackendKind,
     stage_timings: bool,
+    self_verify: bool,
 ) -> Result<()> {
     let pk = ProvingKey::load(zkey).with_context(|| format!("loading {}", zkey.display()))?;
     let n_public = pk.n_public;
@@ -112,8 +126,28 @@ fn run_prove(
         "witness has {} entries, too short for {n_public} public signals",
         w.len()
     );
+    // Verify before writing, not after, so a bad proof never reaches the filesystem where
+    // something downstream might pick it up. `bench` has verified every timed rep since it
+    // was written, on the grounds that timing a broken prover is worse than not timing one;
+    // `prove` is the command people actually ship with and it was the one path that skipped
+    // the check. A dropped GPU kernel error or a stale pooled buffer fails exactly here.
+    let public = &w[1..=n_public];
+    if self_verify {
+        let vk = &circuit.key().vk;
+        match verify(vk, public, &proof) {
+            Ok(()) => {}
+            Err(e) => anyhow::bail!(
+                "the proof this run produced does not verify against the key it was proved \
+                 with ({e}). Nothing has been written. This is a bug in the prover or a sign \
+                 of a faulty accelerator, not a bad witness: an inconsistent witness yields a \
+                 proof that fails verification elsewhere, not one that fails against its own \
+                 key. Re-run with --self-verify=false to write it anyway."
+            ),
+        }
+    }
+
     json::write_proof(proof_out, &proof)?;
-    json::write_public(public_out, &w[1..=n_public])?;
+    json::write_public(public_out, public)?;
 
     if stage_timings {
         let total = elapsed.as_micros() as u64;
