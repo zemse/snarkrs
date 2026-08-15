@@ -629,7 +629,14 @@ cargo run --release -p g16-core --features hotpath --example hotpath_prove -- \
   bench/artifacts/js_8x8_d32 12                                   # section 8
 ```
 
-`cargo flamegraph` was not run: on macOS it needs `dtrace` under `sudo`. `samply` needs
-neither and resolves Rust inline frames better, and `bench/scripts/samply-report.py
---folded=FILE` writes collapsed stacks from the same recording, which is the input format
-a flame graph is drawn from.
+`cargo flamegraph` was not run: on macOS it needs `dtrace` under `sudo`, and this lane was
+told to report rather than run anything needing sudo. `samply` needs neither and resolves
+Rust inline frames better. For a flame graph from the same recording:
+
+```sh
+python3 bench/scripts/samply-report.py   bench/results/profiling/samply-js_16x16_d32.json.gz   --folded=/tmp/folded.txt --top=1
+inferno-flamegraph /tmp/folded.txt > /tmp/g16.svg   # or flamegraph.pl
+```
+
+The collapsed-stack files are not committed: they are 2.5 MB each and one command away
+from the `.json.gz` recordings that are.
