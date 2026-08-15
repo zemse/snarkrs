@@ -634,7 +634,7 @@ impl MetalMsm {
         dispatch_1d(enc, &self.pipelines.mont_to_std, len, 64);
         enc.end_encoding();
         cb.commit();
-        cb.wait_until_completed();
+        crate::cb::wait_ok(cb, "stage 9 scalar conversion (mont_to_std)")?;
         Ok(ScalarBuf {
             buf: out,
             len,
@@ -744,7 +744,10 @@ impl MetalMsm {
         }
         enc.end_encoding();
         cb.commit();
-        cb.wait_until_completed();
+        // Before this check the next statement reinterpreted pooled buffers regardless of
+        // whether the GPU had actually written them, so a fault returned the previous
+        // proof's window sums with an Ok.
+        crate::cb::wait_ok(cb, "MSM batch")?;
 
         // ---- combine ----
         let mut results = Vec::with_capacity(jobs.len());

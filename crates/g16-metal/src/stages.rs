@@ -515,7 +515,7 @@ impl HResident {
 
         let profile = std::env::var_os("G16_METAL_PROFILE").is_some();
         if profile {
-            self.run_profiled(st, &sc, n, t, pack_us);
+            self.run_profiled(st, &sc, n, t, pack_us)?;
         } else {
             t.gather_us += pack_us;
             let start = Instant::now();
@@ -525,7 +525,7 @@ impl HResident {
             self.encode_transforms(st, enc, &sc, n, true);
             enc.end_encoding();
             cb.commit();
-            cb.wait_until_completed();
+            crate::cb::wait_ok(cb, "stages 0-4 (gather and transforms)")?;
             t.ntt_us += start.elapsed().as_micros() as u64;
         }
 
@@ -549,14 +549,14 @@ impl HResident {
         n: usize,
         t: &mut StageTimings,
         pack_us: u64,
-    ) {
+    ) -> Result<(), ProveError> {
         let start = Instant::now();
         let cb = st.queue.new_command_buffer();
         let enc = cb.new_compute_command_encoder();
         self.encode_gather(st, enc, sc, n);
         enc.end_encoding();
         cb.commit();
-        cb.wait_until_completed();
+        crate::cb::wait_ok(cb, "stage 0-1 gather (profiled)")?;
         t.gather_us += pack_us + start.elapsed().as_micros() as u64;
 
         let start = Instant::now();
@@ -565,7 +565,7 @@ impl HResident {
         self.encode_transforms(st, enc, sc, n, false);
         enc.end_encoding();
         cb.commit();
-        cb.wait_until_completed();
+        crate::cb::wait_ok(cb, "stages 2-3 transforms (profiled)")?;
         t.ntt_us += start.elapsed().as_micros() as u64;
 
         let start = Instant::now();
@@ -583,8 +583,9 @@ impl HResident {
         enc.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(tg, 1, 1));
         enc.end_encoding();
         cb.commit();
-        cb.wait_until_completed();
+        crate::cb::wait_ok(cb, "stage 4 h_join (profiled)")?;
         t.pointwise_us += start.elapsed().as_micros() as u64;
+        Ok(())
     }
 
     fn encode_gather(

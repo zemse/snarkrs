@@ -14,7 +14,13 @@ thiserror.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = "0.29"
-objc = "0.2"
 
 [features]
 default = []
+
+[lints.rust]
+# objc 0.2's `sel_impl!` expands to a `cfg(feature = "cargo-clippy")` test, which stopped
+# being a real cfg in Rust 1.78. Declaring it expected keeps the lint on for everything
+# else rather than switching it off crate-wide; the selector calls in src/cb.rs are the
+# only place the macro is used.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
