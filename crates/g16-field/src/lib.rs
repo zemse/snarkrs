@@ -4,7 +4,9 @@
 //! exists so the rest of the workspace never names `ark_bn254` directly, which keeps
 //! a future from-scratch field backend a one-file swap.
 
-pub use ark_bn254::{Bn254, Fq, Fq2, Fr, G1Affine, G1Projective, G2Affine, G2Projective};
+pub mod raw;
+
+pub use ark_bn254::{g1, g2, Bn254, Fq, Fq2, Fr, G1Affine, G1Projective, G2Affine, G2Projective};
 pub use ark_ec::{pairing::Pairing, AffineRepr, CurveGroup, PrimeGroup};
 pub use ark_ff::{BigInteger, FftField, Field, One, PrimeField, UniformRand, Zero};
 

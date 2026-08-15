@@ -18,6 +18,10 @@ use rayon::prelude::*;
 
 use g16_field::{Fr, G1Affine, G1Projective, G2Affine, G2Projective};
 
+pub mod xyzz;
+use g16_field::raw::RawField;
+use xyzz::{to_projective, RawCurve, Xyzz};
+
 pub trait MsmBackend: Send + Sync {
     fn name(&self) -> &'static str;
     fn msm_g1(&self, bases: &[G1Affine], scalars: &[Fr]) -> G1Projective;
@@ -211,6 +215,15 @@ where
                 // No bucket touched, no Montgomery reduction, no base read.
                 continue;
             }
+            // A base at infinity contributes nothing whatever its scalar. This is not a
+            // rare key quirk: 34% of the B query bases are the point at infinity on
+            // every measured circuit (a wire that appears in no B-side linear
+            // combination), and letting them through would cost a madd call per window
+            // each. Filtering here also lets the bucket loop's madd skip its own
+            // infinity test entirely.
+            if bases[i].infinity {
+                continue;
+            }
             if s.is_one() {
                 // One mixed addition, total, for the whole scalar.
                 ones_sum += &bases[i];
@@ -253,7 +266,16 @@ where
 
 /// Bucket accumulation and reduction for one window over one contiguous slice of the
 /// prescanned scalars. Returns `sum_j j * B_j` for that slice.
-fn window_chunk<P: SWCurveConfig>(
+///
+/// The buckets are XYZZ over the branch-free raw field layer (`crate::xyzz`), not ark
+/// Jacobian. Two reasons, both measured: madd-2008-s is 7M + 2S against ark's Jacobian
+/// madd at 7M + 4S, and `ark-ff` ends every field operation in a compare-and-branch
+/// reduction that profiling showed costs a G1 mixed add 247 ns against its 148 ns
+/// multiply floor. This loop is 15.5 million additions per 140k-constraint proof; it is
+/// the single hottest loop in the CPU prover and the reason `g16_field::raw` exists.
+///
+/// The conversion back to ark happens once per chunk, multiplication-only.
+fn window_chunk<P: RawCurve>(
     bases: &[Affine<P>],
     scan: &Prescan<P>,
     range: core::ops::Range<usize>,
@@ -263,7 +285,7 @@ fn window_chunk<P: SWCurveConfig>(
 ) -> Projective<P> {
     // 2^(c-1) buckets for |d| in [1, 2^(c-1)], plus one for the digit that the
     // carry-free recoding pushes to exactly 2^(c-1).
-    let mut buckets = vec![Projective::<P>::zero(); n_buckets];
+    let mut buckets = vec![Xyzz::<P::RF>::ZERO; n_buckets];
     for k in range {
         let d = signed_digit(scan.bigints[k].as_ref(), window, c);
         // The zero digit must not touch a bucket. It is not a rare case: a random scalar
@@ -272,33 +294,30 @@ fn window_chunk<P: SWCurveConfig>(
         if d == 0 {
             continue;
         }
-        let base = &bases[scan.idx[k] as usize];
+        // Never infinity: prescan filtered those, so raw_xy is total here.
+        let (x, y) = P::raw_xy(&bases[scan.idx[k] as usize]);
         if d > 0 {
-            buckets[(d - 1) as usize] += base;
+            buckets[(d - 1) as usize].madd(x, y);
         } else {
             // Subtraction negates y and does a mixed add, which is the entire reason
             // signed digits are worth the recoding: half the buckets, same cost.
-            buckets[(-d - 1) as usize] -= base;
+            buckets[(-d - 1) as usize].madd(x, y.neg());
         }
     }
 
-    // Running sum: sum_j j*B_j in 2 * 2^(c-1) additions rather than sum_j j additions.
-    //
-    // The buckets stay Jacobian. Batch-normalising them first would turn half of these
-    // additions mixed, saving about 5M each, but a batched inversion costs about 3M per
-    // point plus another 5M to finish the conversion, so it is a wash on paper and it
-    // measured inside the noise at 2^16 and 2^18. The batch inversion that does pay for
-    // itself is affine bucket accumulation, which is a different algorithm.
-    let mut running = Projective::<P>::zero();
-    let mut total = Projective::<P>::zero();
+    // Running sum: sum_j j*B_j in 2 * 2^(c-1) additions rather than sum_j j additions,
+    // in XYZZ (add-2008-s, 12M + 2S, against ark's Jacobian add at 11M + 5S plus the
+    // branchy reductions).
+    let mut running = Xyzz::<P::RF>::ZERO;
+    let mut total = Xyzz::<P::RF>::ZERO;
     for b in buckets.iter().rev() {
-        running += b;
-        total += &running;
+        running.add_assign(b);
+        total.add_assign(&running);
     }
-    total
+    to_projective(&total)
 }
 
-fn pippenger<P: SWCurveConfig>(bases: &[Affine<P>], scalars: &[Fr], threads: usize) -> Projective<P>
+fn pippenger<P: RawCurve>(bases: &[Affine<P>], scalars: &[Fr], threads: usize) -> Projective<P>
 where
     P::BaseField: Send + Sync,
 {
