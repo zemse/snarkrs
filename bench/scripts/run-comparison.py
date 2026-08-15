@@ -28,7 +28,21 @@ ART = HERE / "artifacts"
 
 
 def sh(cmd, **kw):
-    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+    # A probe for a tool that may not exist is a normal outcome, not a crash. `nvidia-smi`
+    # is absent on every Mac, and letting the FileNotFoundError escape made detect_gpu()
+    # kill the whole run before its own Darwin fallback could be reached.
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, **kw)
+    except FileNotFoundError:
+        return subprocess.CompletedProcess(cmd, 127, stdout="", stderr=f"{cmd[0]}: not found")
+
+
+def load_average():
+    """One-minute load average, or None where the platform will not say."""
+    try:
+        return os.getloadavg()[0]
+    except (AttributeError, OSError):
+        return None
 
 
 def verify_fast(vkey, public, proof):
@@ -122,6 +136,12 @@ def main():
     ap.add_argument("--machine", default=None,
                     help="label for this box, recorded in every row (default: autodetected)")
     ap.add_argument("--skip-rapidsnark", action="store_true")
+    ap.add_argument("--max-load", type=float, default=None,
+                    help="refuse to run when the 1-minute load average is above this "
+                         "(default: cores/4). A timing taken on a busy box is not a "
+                         "measurement of this program.")
+    ap.add_argument("--allow-loaded", action="store_true",
+                    help="run anyway, and mark every row loaded=yes")
     args = ap.parse_args()
 
     machine = args.machine or detect_machine()
@@ -142,7 +162,27 @@ def main():
     rows, notes = [], []
     print(f"machine: {machine}   gpu: {gpu or '(none)'}   cores: {cores}   "
           f"snarkjs: {'yes' if HAVE_SNARKJS else 'NOT INSTALLED, encoding cross-check skipped'}")
-    stamp = dict(machine=machine, gpu=gpu, host=host, os=os_name, arch=arch, cores=cores)
+    # A benchmark run on a loaded machine measures the other tenant, not the prover. This
+    # round found a local run at load average 20 where the 70k-constraint CPU proof came out
+    # SLOWER than the 140k one, which is arithmetically impossible and was the only reason
+    # the contamination was noticed at all. Refuse by default rather than rely on noticing.
+    load = load_average()
+    ceiling = args.max_load if args.max_load is not None else (cores or 4) / 4
+    loaded = load is not None and load > ceiling
+    if loaded and not args.allow_loaded:
+        sys.exit(
+            f"load average is {load:.2f}, above the ceiling of {ceiling:.2f} for a "
+            f"{cores}-core box.\nA timing taken now measures whatever else is running. "
+            f"Wait for the box to go idle, or pass --allow-loaded to record anyway "
+            f"(every row will be marked loaded=yes so the numbers can never be mistaken "
+            f"for clean ones)."
+        )
+    if load is not None:
+        print(f"load average: {load:.2f} (ceiling {ceiling:.2f})"
+              + ("  MARKED LOADED" if loaded else ""))
+    stamp = dict(machine=machine, gpu=gpu, host=host, os=os_name, arch=arch, cores=cores,
+                 load1=("" if load is None else round(load, 2)),
+                 loaded=("yes" if loaded else "no"))
 
     for v in variants:
         d = ART / v
