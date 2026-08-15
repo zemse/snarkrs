@@ -302,8 +302,19 @@ fn pippenger<P: SWCurveConfig>(bases: &[Affine<P>], scalars: &[Fr], threads: usi
 where
     P::BaseField: Send + Sync,
 {
-    debug_assert_eq!(bases.len(), scalars.len(), "MSM length mismatch");
-    let n = bases.len().min(scalars.len());
+    // A hard assert, not a debug one. A malformed or hand-built proving key with
+    // mismatched lengths must fail loudly in release too: the previous
+    // `debug_assert!` + `min()` combination silently dropped the tail of the longer
+    // side, which turns a bad key into a wrong-but-plausible MSM instead of a panic
+    // pointing at the key.
+    assert_eq!(
+        bases.len(),
+        scalars.len(),
+        "MSM length mismatch: {} bases, {} scalars",
+        bases.len(),
+        scalars.len()
+    );
+    let n = bases.len();
     if n == 0 {
         return Projective::zero();
     }

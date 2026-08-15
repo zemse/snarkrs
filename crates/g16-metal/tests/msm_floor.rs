@@ -15,7 +15,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use g16_core::{cpu::CpuBackend, Backend, PreparedCircuit, StageTimings};
+use g16_core::{cpu::CpuBackend, Backend, StageTimings};
 use g16_metal::MetalBackend;
 use g16_zkey::{wtns::Witness, ProvingKey};
 

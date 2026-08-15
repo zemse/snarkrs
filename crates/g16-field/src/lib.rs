@@ -8,11 +8,17 @@ pub use ark_bn254::{Bn254, Fq, Fq2, Fr, G1Affine, G1Projective, G2Affine, G2Proj
 pub use ark_ec::{pairing::Pairing, AffineRepr, CurveGroup, PrimeGroup};
 pub use ark_ff::{BigInteger, FftField, Field, One, PrimeField, UniformRand, Zero};
 
-/// A radix-2 evaluation domain over `Fr`, plus the coset generator used by Jordi's trick.
+/// A radix-2 evaluation domain over `Fr`.
 ///
-/// The prover needs three things from a domain: the `size`-th roots of unity for the
-/// NTT, their inverses for the iNTT, and a generator of a *disjoint* coset so that
-/// `H(X)*Z(X)` can be evaluated where `Z` is nonzero. See the article's Proving section.
+/// The prover needs the `size`-th roots of unity for the NTT and their inverses for the
+/// iNTT. It does NOT get a coset generator from here, on purpose: the snarkjs-compatible
+/// H coset is the odd half of the `2*size`-th roots of unity, so each backend derives its
+/// shift as a primitive `2*size`-th root whose square is `group_gen` (see
+/// `CpuCircuit::new` in g16-core for the full argument). An earlier version of this type
+/// exposed `coset_gen = Fr::GENERATOR` and `vanishing_on_coset()`, which describe a
+/// mathematically valid but snarkjs-INCOMPATIBLE coset: nothing on the proving path used
+/// them, and pairing them with section-9 H bases would produce proofs that fail to
+/// verify, so the footgun was removed rather than documented around.
 #[derive(Clone, Debug)]
 pub struct Domain {
     pub size: usize,
@@ -22,8 +28,6 @@ pub struct Domain {
     pub group_gen_inv: Fr,
     /// `Fr::from(size).inverse()`, the iNTT normalisation factor.
     pub size_inv: Fr,
-    /// Multiplicative generator of `Fr*`, used to shift onto a disjoint coset.
-    pub coset_gen: Fr,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -67,9 +71,6 @@ impl Domain {
             size_inv: Fr::from(size as u64)
                 .inverse()
                 .expect("domain size is nonzero mod r"),
-            // GENERATOR generates all of Fr*, whose order 2^28 * t never divides
-            // `size`, so it can never land inside the domain subgroup.
-            coset_gen: Fr::GENERATOR,
         })
     }
 
@@ -81,12 +82,6 @@ impl Domain {
     /// Inverse twiddles, for the iNTT.
     pub fn twiddles_inv(&self) -> Vec<Fr> {
         powers(self.group_gen_inv, self.size / 2)
-    }
-
-    /// `Z(coset_gen) = coset_gen^size - 1`, the vanishing polynomial evaluated on the
-    /// coset. Constant across the whole coset, which is exactly why the trick works.
-    pub fn vanishing_on_coset(&self) -> Fr {
-        self.coset_gen.pow([self.size as u64]) - Fr::ONE
     }
 }
 
@@ -187,11 +182,12 @@ mod tests {
     }
 
     #[test]
-    fn coset_is_disjoint_from_the_domain() {
+    fn subgroup_has_size_distinct_elements() {
         for d in domains() {
             let subgroup: Vec<Fr> = powers(d.group_gen, d.size);
-            // The subgroup must actually have `size` distinct elements, otherwise
-            // "disjoint" would be vacuous.
+            // `size` distinct elements is what "group of order size" means; a root of
+            // too-small order would fold the subgroup onto itself and every NTT built
+            // from it would silently alias.
             for i in 0..subgroup.len() {
                 for j in (i + 1)..subgroup.len() {
                     assert_ne!(
@@ -200,29 +196,6 @@ mod tests {
                         d.size
                     );
                 }
-            }
-            for (i, &h) in subgroup.iter().enumerate() {
-                let shifted = d.coset_gen * h;
-                assert!(
-                    !subgroup.contains(&shifted),
-                    "size {} coset point {i} landed back in the domain",
-                    d.size
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn vanishing_on_coset_is_nonzero_and_constant() {
-        for d in domains() {
-            let z = d.vanishing_on_coset();
-            assert!(!z.is_zero(), "size {}", d.size);
-            assert_eq!(z, d.coset_gen.pow([d.size as u64]) - Fr::ONE);
-            // Z(x) = x^size - 1 is the same value at every point of the coset, which
-            // is what lets compute_h divide by a scalar instead of a polynomial.
-            for h in powers(d.group_gen, d.size) {
-                let x = d.coset_gen * h;
-                assert_eq!(x.pow([d.size as u64]) - Fr::ONE, z, "size {}", d.size);
             }
         }
     }
