@@ -765,18 +765,26 @@ impl MetalMsm {
         // stderr. Strictly a measurement aid: it adds one ~0.15 ms submission floor per
         // piece, so the sum reads slightly worse than the production path it explains.
         if std::env::var_os("G16_METAL_MSM_PHASES").is_some() {
-            let run = |label: String, f: &mut dyn FnMut(&ComputeCommandEncoderRef)| {
+            let run = |label: String,
+                       f: &mut dyn FnMut(&ComputeCommandEncoderRef)|
+             -> Result<(), ProveError> {
                 let t = std::time::Instant::now();
                 let cb = self.queue.new_command_buffer();
                 let enc = cb.new_compute_command_encoder();
                 f(enc);
                 enc.end_encoding();
                 cb.commit();
-                cb.wait_until_completed();
+                // The production path below checks status; this one must too. A timing
+                // read off a faulted command buffer is not a slow result, it is a
+                // measurement of how long the GPU took to fail, reported as if it were
+                // work. This path exists to explain timings, so a wrong one is worse here
+                // than anywhere.
+                crate::cb::wait_ok(cb, "MSM phase")?;
                 eprintln!(
                     "[msm-phase] {label}: {:.2} ms",
                     t.elapsed().as_secs_f64() * 1e3
                 );
+                Ok(())
             };
             for (pi, p) in plans.iter().enumerate() {
                 run(
@@ -785,7 +793,7 @@ impl MetalMsm {
                         p.n, p.cap, p.c, p.n_windows
                     ),
                     &mut |enc| p.encode(self, enc),
-                );
+                )?;
             }
             for (i, (job, out)) in jobs.iter().zip(&outs).enumerate() {
                 let p = &plans[job_plan[i]];
@@ -793,7 +801,7 @@ impl MetalMsm {
                 run(
                     format!("points job{i} {kind} n={} cap={} c={}", p.n, p.cap, p.c),
                     &mut |enc| out.encode(self, enc, job, p),
-                );
+                )?;
             }
         } else {
             let cb = self.queue.new_command_buffer();
