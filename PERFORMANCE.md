@@ -4,12 +4,21 @@ Proving latency per machine, per backend, per circuit. Generated from
 `bench/results/history.csv` by `bench/scripts/perf_history.py render`.
 Do not edit by hand; add a measurement with `perf_history.py ingest`.
 
-`baseline` is the state of the tree before the optimisation round that
-began on 2026-08-13. `current` is the newest measurement for that
-configuration. A negative delta is a speedup.
+`baseline` is the `round3-before` measurement where the machine has
+one, and the generic `baseline` label otherwise. `current` is the newest
+measurement for that configuration. A negative delta is a speedup.
 
 Every timing is the median over the run's reps, and every proof behind a
 timing was verified before it was recorded.
+
+**A delta is only meaningful between two runs taken under the same
+conditions.** The original `baseline` rows are a different session on a
+different day, and on the M2 Max they disagreed with a controlled
+re-measurement of the *unchanged* tree by 6%, which is larger than most
+wins worth reporting. Rows compared against that label are therefore an
+indication and not a result. The `round3-before` / `round3-after` pair was
+taken interleaved in one session, alternating order each round, and is the
+only comparison here that isolates a code change from the machine.
 
 ## Circuits
 
@@ -30,35 +39,35 @@ timing was verified before it was recorded.
 
 | backend | circuit | baseline ms | current ms | delta | baseline msm us | current msm us | msm delta |
 |---|---|---:|---:|---:|---:|---:|---:|
-| cpu | tiny_mul | 1.0 | 0.9 | -6.6% | 214 | 208 | -2.6% |
-| cpu | js_1x1_d8 | 23.7 | 22.8 | -3.9% | 18898 | 18054 | -4.5% |
-| cpu | js_2x2_d16 | 60.1 | 57.8 | -3.8% | 51382 | 49388 | -3.9% |
-| cpu | js_2x2_d32 | 99.6 | 96.8 | -2.8% | 86531 | 84072 | -2.8% |
-| cpu | js_8x8_d32 | 326.3 | 323.7 | -0.8% | 285866 | 285240 | -0.2% |
-| cpu | js_16x16_d32 | 614.4 | 611.9 | -0.4% | 536562 | 536790 | +0.0% |
-| metal | tiny_mul | 3.9 | 4.7 | +21.2% | 2580 | 3438 | +33.2% |
-| metal | js_1x1_d8 | 18.9 | 18.9 | -0.2% | 17211 | 17152 | -0.3% |
-| metal | js_2x2_d16 | 22.1 | 22.2 | +0.5% | 20197 | 20296 | +0.5% |
-| metal | js_2x2_d32 | 26.8 | 27.0 | +1.0% | 24452 | 24670 | +0.9% |
-| metal | js_8x8_d32 | 74.1 | 74.3 | +0.3% | 69346 | 69373 | +0.0% |
-| metal | js_16x16_d32 | 128.8 | 127.4 | -1.1% | 120652 | 119092 | -1.3% |
+| cpu | tiny_mul | 1.1 | 1.1 | +4.1% | 206 | 212 | +2.9% |
+| cpu | js_1x1_d8 | 25.7 | 22.3 | -13.0% | 20634 | 17084 | -17.2% |
+| cpu | js_2x2_d16 | 66.0 | 55.7 | -15.5% | 56920 | 46776 | -17.8% |
+| cpu | js_2x2_d32 | 109.8 | 94.3 | -14.1% | 96610 | 81010 | -16.1% |
+| cpu | js_8x8_d32 | 370.2 | 312.6 | -15.6% | 327730 | 270159 | -17.6% |
+| cpu | js_16x16_d32 | 705.0 | 587.8 | -16.6% | 619032 | 503726 | -18.6% |
+| metal | tiny_mul | 4.6 | 3.9 | -14.5% | 3154 | 2436 | -22.8% |
+| metal | js_1x1_d8 | 20.2 | 19.6 | -3.2% | 18310 | 17620 | -3.8% |
+| metal | js_2x2_d16 | 23.3 | 22.9 | -1.7% | 20816 | 20592 | -1.1% |
+| metal | js_2x2_d32 | 27.4 | 27.2 | -1.0% | 24820 | 24560 | -1.0% |
+| metal | js_8x8_d32 | 77.7 | 77.7 | +0.1% | 71904 | 72036 | +0.2% |
+| metal | js_16x16_d32 | 131.4 | 131.4 | +0.0% | 122737 | 122812 | +0.1% |
 
 ### cold
 
 | backend | circuit | baseline ms | current ms | delta | baseline msm us | current msm us | msm delta |
 |---|---|---:|---:|---:|---:|---:|---:|
-| cpu | tiny_mul | 6.0 | 6.9 | +15.6% | - | - | - |
-| cpu | js_1x1_d8 | 29.6 | 31.0 | +4.8% | - | - | - |
-| cpu | js_2x2_d16 | 70.5 | 68.2 | -3.4% | - | - | - |
-| cpu | js_2x2_d32 | 133.6 | 109.9 | -17.8% | - | - | - |
-| cpu | js_8x8_d32 | 348.6 | 342.7 | -1.7% | - | - | - |
-| cpu | js_16x16_d32 | 650.0 | 651.6 | +0.3% | - | - | - |
-| metal | tiny_mul | 37.1 | 38.4 | +3.3% | - | - | - |
-| metal | js_1x1_d8 | 62.2 | 58.6 | -5.8% | - | - | - |
-| metal | js_2x2_d16 | 70.8 | 66.2 | -6.5% | - | - | - |
-| metal | js_2x2_d32 | 74.9 | 74.3 | -0.8% | - | - | - |
-| metal | js_8x8_d32 | 151.9 | 149.5 | -1.6% | - | - | - |
-| metal | js_16x16_d32 | 228.5 | 243.1 | +6.4% | - | - | - |
+| cpu | tiny_mul | 1.9 | 1.9 | +1.1% | 216 | 222 | +2.5% |
+| cpu | js_1x1_d8 | 27.7 | 24.2 | -12.7% | 20850 | 17014 | -18.4% |
+| cpu | js_2x2_d16 | 68.1 | 59.0 | -13.4% | 56016 | 46458 | -17.1% |
+| cpu | js_2x2_d32 | 114.8 | 98.2 | -14.5% | 96294 | 80316 | -16.6% |
+| cpu | js_8x8_d32 | 384.8 | 326.9 | -15.1% | 327967 | 270142 | -17.6% |
+| cpu | js_16x16_d32 | 732.9 | 615.0 | -16.1% | 620419 | 504598 | -18.7% |
+| metal | tiny_mul | 14.1 | 13.9 | -1.6% | 9135 | 8830 | -3.3% |
+| metal | js_1x1_d8 | 34.5 | 34.1 | -1.0% | 23968 | 23790 | -0.7% |
+| metal | js_2x2_d16 | 41.9 | 41.8 | -0.3% | 28775 | 28619 | -0.5% |
+| metal | js_2x2_d32 | 50.2 | 50.4 | +0.4% | 33624 | 33338 | -0.9% |
+| metal | js_8x8_d32 | 119.7 | 118.9 | -0.6% | 81770 | 81202 | -0.7% |
+| metal | js_16x16_d32 | 198.4 | 196.0 | -1.2% | 134002 | 133046 | -0.7% |
 
 ## aws-g4dn.2xlarge-Tesla-T4
 
@@ -629,5 +638,6 @@ timing was verified before it was recorded.
 | label | machines | rows |
 |---|---|---:|
 | baseline | Apple-M2-Max, aws-g4dn.2xlarge-Tesla-T4, c7a.2xlarge, c7a.4xlarge +15 more | 336 |
-| round3-reference | Apple-M2-Max | 24 |
+| round3-before | Apple-M2-Max | 24 |
+| round3-after | Apple-M2-Max | 24 |
 

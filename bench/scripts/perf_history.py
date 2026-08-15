@@ -179,12 +179,21 @@ def cmd_render(args):
     L.append("`bench/results/history.csv` by `bench/scripts/perf_history.py render`.")
     L.append("Do not edit by hand; add a measurement with `perf_history.py ingest`.")
     L.append("")
-    L.append("`baseline` is the state of the tree before the optimisation round that")
-    L.append("began on 2026-08-13. `current` is the newest measurement for that")
-    L.append("configuration. A negative delta is a speedup.")
+    L.append(f"`baseline` is the `{args.baseline_label}` measurement where the machine has")
+    L.append("one, and the generic `baseline` label otherwise. `current` is the newest")
+    L.append("measurement for that configuration. A negative delta is a speedup.")
     L.append("")
     L.append("Every timing is the median over the run's reps, and every proof behind a")
     L.append("timing was verified before it was recorded.")
+    L.append("")
+    L.append("**A delta is only meaningful between two runs taken under the same")
+    L.append("conditions.** The original `baseline` rows are a different session on a")
+    L.append("different day, and on the M2 Max they disagreed with a controlled")
+    L.append("re-measurement of the *unchanged* tree by 6%, which is larger than most")
+    L.append("wins worth reporting. Rows compared against that label are therefore an")
+    L.append("indication and not a result. The `round3-before` / `round3-after` pair was")
+    L.append("taken interleaved in one session, alternating order each round, and is the")
+    L.append("only comparison here that isolates a code change from the machine.")
     L.append("")
     L.append("## Circuits")
     L.append("")
@@ -218,7 +227,15 @@ def cmd_render(args):
                           key=lambda k: (k[0], k[1]))
             for backend, _c, variant in keys:
                 s = series[(m, backend, mode, variant)]
-                base = next((r for r in s if r["label"] == "baseline"), s[0])
+                # Prefer an explicitly named baseline when this machine has one. A delta is
+                # only meaningful between two measurements taken under the same conditions,
+                # and the generic `baseline` label is a different session on a different
+                # day. On this machine it disagreed with a controlled re-measurement of the
+                # unchanged tree by 6%, which is larger than most wins worth reporting, and
+                # rendering against it turned a flat Metal result into a 4.9% regression.
+                # Falling back to `baseline` keeps every machine that has only that one.
+                base = (next((r for r in s if r["label"] == args.baseline_label), None)
+                        or next((r for r in s if r["label"] == "baseline"), s[0]))
                 cur = s[-1]
                 L.append(
                     f"| {backend} | {variant} | {fmt(base['ms_median'])} | {fmt(cur['ms_median'])} | "
@@ -248,6 +265,11 @@ def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("seed"); s.add_argument("--date"); s.set_defaults(fn=cmd_seed)
+    r = sub.add_parser("render")
+    r.add_argument("--baseline-label", default="baseline",
+                   help="label to treat as the before-arm when a machine has it; "
+                        "falls back to `baseline` for machines that do not")
+    r.set_defaults(fn=cmd_render)
     i = sub.add_parser("ingest")
     i.add_argument("csv")
     i.add_argument("--machine", required=True)
@@ -255,7 +277,6 @@ def main():
     i.add_argument("--commit"); i.add_argument("--date")
     i.add_argument("--gpu"); i.add_argument("--note")
     i.set_defaults(fn=cmd_ingest)
-    r = sub.add_parser("render"); r.set_defaults(fn=cmd_render)
     a = ap.parse_args()
     sys.exit(a.fn(a) or 0)
 
