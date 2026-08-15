@@ -638,6 +638,7 @@ only comparison here that isolates a code change from the machine.
 | label | machines | rows |
 |---|---|---:|
 | baseline | Apple-M2-Max, aws-g4dn.2xlarge-Tesla-T4, c7a.2xlarge, c7a.4xlarge +15 more | 336 |
+| round3-reference | Apple-M2-Max | 24 |
 | round3-before | Apple-M2-Max | 24 |
 | round3-after | Apple-M2-Max | 24 |
 
