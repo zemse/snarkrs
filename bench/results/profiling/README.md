@@ -320,9 +320,11 @@ One forward NTT and one G1 MSM at n = 2^18, each run inside a fixed-size rayon p
 | 12 | 10.6 | 5.95x | 175.2 | 7.26x |
 
 Both saturate well short of 12. The honest ceiling on this machine is not 12x either: an
-M2 Max has 8 performance and 4 efficiency cores, and the E-cores run this workload at
-roughly a third of P-core throughput, so about **9.3x** is the most any perfectly balanced
-workload can get. Against that ceiling the MSM reaches 78% and the NTT 64%.
+M2 Max has 8 performance and 4 efficiency cores, and E-cores run integer work at roughly a
+third of P-core throughput, which puts the ceiling near **9.3x**. That third is a
+platform figure, not something this lane measured -- macOS gives no core affinity control,
+so it could not be. Treat 9.3x as approximate. Against it the MSM reaches 78% and the NTT
+64%, and the direction of the gap does not depend on the exact ratio.
 
 The whole-proof number agrees: 9.41 cores busy out of 12 (section 1), of which the CPU
 profile attributes 7.85% to spinning and waiting. Net, roughly **28% of the machine is not
