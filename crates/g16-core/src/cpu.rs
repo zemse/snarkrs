@@ -171,12 +171,17 @@ impl PreparedCircuit for CpuCircuit {
         // multiplying the A and B evaluations pointwise, which is exact because the R1CS
         // constraint *is* a*b = c, so on the domain the C evaluations are that product.
         let start = Instant::now();
-        let (mut a, mut b) = rayon::join(|| self.gather(0, witness), || self.gather(1, witness));
-        let mut c: Vec<Fr> = a
-            .par_iter()
-            .zip(b.par_iter())
-            .map(|(x, y)| *x * y)
-            .collect();
+        let (mut a, mut b) = stage!(
+            "s0 gather A and B (concurrent)",
+            rayon::join(|| self.gather(0, witness), || self.gather(1, witness))
+        );
+        let mut c: Vec<Fr> = stage!(
+            "s0 build C = A*B pointwise",
+            a.par_iter()
+                .zip(b.par_iter())
+                .map(|(x, y)| *x * y)
+                .collect()
+        );
         t.gather_us += start.elapsed().as_micros() as u64;
 
         // Stages 1-3, three vectors through iNTT -> coset shift -> NTT. Each transform is
@@ -186,15 +191,18 @@ impl PreparedCircuit for CpuCircuit {
         let mut pointwise_us = 0u64;
         for v in [&mut a, &mut b, &mut c] {
             let start = Instant::now();
-            self.ntt.ntt(&self.domain, v, Direction::Inverse);
+            stage!("s1 iNTT", self.ntt.ntt(&self.domain, v, Direction::Inverse));
             ntt_us += start.elapsed().as_micros() as u64;
 
             let start = Instant::now();
-            self.ntt.distribute_powers(v, self.coset_shift);
+            stage!(
+                "s2 coset shift (distribute_powers)",
+                self.ntt.distribute_powers(v, self.coset_shift)
+            );
             pointwise_us += start.elapsed().as_micros() as u64;
 
             let start = Instant::now();
-            self.ntt.ntt(&self.domain, v, Direction::Forward);
+            stage!("s3 NTT", self.ntt.ntt(&self.domain, v, Direction::Forward));
             ntt_us += start.elapsed().as_micros() as u64;
         }
         t.ntt_us += ntt_us;
@@ -206,12 +214,14 @@ impl PreparedCircuit for CpuCircuit {
         // rows), so `sum_i P(inc^(2i+1)) * hExps[i]` already equals `[P(tau)]_1`, which
         // is `[H(tau) * Z(tau)]_1`. Dividing here as well would double-count the Z.
         let start = Instant::now();
-        let h: Vec<Fr> = a
-            .par_iter()
-            .zip(b.par_iter())
-            .zip(c.par_iter())
-            .map(|((x, y), z)| *x * y - z)
-            .collect();
+        let h: Vec<Fr> = stage!(
+            "s4 H = A*B - C",
+            a.par_iter()
+                .zip(b.par_iter())
+                .zip(c.par_iter())
+                .map(|((x, y), z)| *x * y - z)
+                .collect()
+        );
         pointwise_us += start.elapsed().as_micros() as u64;
         t.pointwise_us += pointwise_us;
 
@@ -262,25 +272,44 @@ impl PreparedCircuit for CpuCircuit {
         // pool on its own, so the win is not throughput on a big circuit, it is keeping
         // the pool busy while the four cheap witness MSMs (mostly 0/1 scalars) drain and
         // leave the dense H MSM running alone.
+        // The five annotations below overlap: these MSMs run at the same time. Their
+        // durations are wall-clock windows, not disjoint costs, and they will sum to more
+        // than the enclosing region. `examples/msm_shape.rs` measures them one at a time
+        // when the disjoint cost is what is wanted.
         let ((a_g1, b_g2), ((b_g1, l_g1), h_g1)) = rayon::join(
             || {
                 rayon::join(
-                    || self.msm.msm_g1(&self.pk.a_query, witness),
-                    || self.msm.msm_g2(&self.pk.b_g2_query, witness),
+                    || stage!("s5 MSM A -> G1", self.msm.msm_g1(&self.pk.a_query, witness)),
+                    || {
+                        stage!(
+                            "s6 MSM B -> G2",
+                            self.msm.msm_g2(&self.pk.b_g2_query, witness)
+                        )
+                    },
                 )
             },
             || {
                 rayon::join(
                     || {
                         rayon::join(
-                            || self.msm.msm_g1(&self.pk.b_g1_query, witness),
-                            || self.msm.msm_g1(&self.pk.l_query, l_scalars),
+                            || {
+                                stage!(
+                                    "s7 MSM B -> G1",
+                                    self.msm.msm_g1(&self.pk.b_g1_query, witness)
+                                )
+                            },
+                            || {
+                                stage!(
+                                    "s8 MSM L -> G1",
+                                    self.msm.msm_g1(&self.pk.l_query, l_scalars)
+                                )
+                            },
                         )
                     },
                     // Every one of the `domain_size` bases is used. The "only n-1 are
                     // nonzero" rule belongs to the coefficient-form convention; in
                     // snarkjs' evaluation form all n entries are generically nonzero.
-                    || self.msm.msm_g1(&self.pk.h_query, h),
+                    || stage!("s9 MSM H -> G1", self.msm.msm_g1(&self.pk.h_query, h)),
                 )
             },
         );

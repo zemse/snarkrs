@@ -25,6 +25,36 @@
 //! queues. A per-primitive trait would force a host round trip between every step and
 //! measure the bus instead of the arithmetic.
 
+/// Wraps a region of the proving path in a hotpath annotation, or expands to the region
+/// unchanged when the `hotpath` feature is off.
+///
+/// `StageTimings` already reports the five stage groups, and a sampling profile already
+/// reports which functions the CPU is in. Neither can answer "of the six transforms in
+/// `compute_h`, which one", because all six are the same function on the same data and a
+/// sampler folds them into one line. That is what these annotations are for, and it is why
+/// they sit at region boundaries rather than on functions.
+///
+/// Two things to keep in mind when reading the report they produce:
+///
+/// * Several of these regions run concurrently under `rayon::join`, so their durations
+///   overlap and do not sum to the proof. The five MSM annotations in particular are
+///   wall-clock windows on five things running at once.
+/// * The annotation itself costs something. It is off by default for that reason, and any
+///   number quoted as a timing should come from a build without it.
+#[cfg(feature = "hotpath")]
+macro_rules! stage {
+    ($label:expr, $body:expr) => {
+        hotpath::measure_block!($label, $body)
+    };
+}
+
+#[cfg(not(feature = "hotpath"))]
+macro_rules! stage {
+    ($label:expr, $body:expr) => {
+        $body
+    };
+}
+
 pub mod cpu;
 pub mod prove;
 pub mod verify;

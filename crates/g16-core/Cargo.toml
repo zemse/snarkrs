@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Per-annotation timing of the proving path. Off by default and optional, so a release
+# build neither links hotpath nor pays its instrumentation.
+hotpath = ["dep:hotpath", "hotpath/hotpath"]
+
 [dependencies]
 g16-field.workspace = true
 g16-zkey.workspace = true
@@ -19,3 +25,10 @@ thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 num-bigint.workspace = true
+hotpath = { workspace = true, optional = true }
+
+# Needs the feature that supplies the `hotpath` dependency, so it is not a build target
+# without it and a default `cargo check --all-targets` never sees it.
+[[example]]
+name = "hotpath_prove"
+required-features = ["hotpath"]

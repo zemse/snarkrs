@@ -30,8 +30,8 @@ pub fn prove_with_blinders(
     s: Fr,
     timings: &mut StageTimings,
 ) -> Result<Proof, ProveError> {
-    let h = circuit.compute_h(witness, timings)?;
-    let m = circuit.msms(witness, &h, timings)?;
+    let h = stage!("stages 0-4 compute_h", circuit.compute_h(witness, timings))?;
+    let m = stage!("stages 5-9 msms", circuit.msms(witness, &h, timings))?;
 
     let start = Instant::now();
     let pk = circuit.key();
@@ -42,14 +42,21 @@ pub fn prove_with_blinders(
     // r*B1 with the double-counted r*s*delta subtracted back off. The one place a
     // transcription can go wrong is `s * pi_a`: that is the *blinded* A, not the raw
     // MSM, because the s*A term has to carry the alpha and r*delta pieces too.
-    let pi_a = m.a_g1 + pk.alpha_g1 + pk.delta_g1 * r;
-    let pi_b = m.b_g2 + pk.beta_g2 + pk.delta_g2 * s;
-    let pib1 = m.b_g1 + pk.beta_g1 + pk.delta_g1 * s;
-    let pi_c = m.l_g1 + m.h_g1 + pi_a * s + pib1 * r - pk.delta_g1 * (r * s);
+    let (pi_a, pi_b, pi_c) = stage!("s11 blind (6 scalar multiplications)", {
+        let pi_a = m.a_g1 + pk.alpha_g1 + pk.delta_g1 * r;
+        let pi_b = m.b_g2 + pk.beta_g2 + pk.delta_g2 * s;
+        let pib1 = m.b_g1 + pk.beta_g1 + pk.delta_g1 * s;
+        let pi_c = m.l_g1 + m.h_g1 + pi_a * s + pib1 * r - pk.delta_g1 * (r * s);
+        (pi_a, pi_b, pi_c)
+    });
 
     // Two batch normalisations rather than three separate inversions.
-    let g1 = G1Projective::normalize_batch(&[pi_a, pi_c]);
-    let g2 = G2Projective::normalize_batch(&[pi_b]);
+    let (g1, g2) = stage!("s11 normalise (2 batch inversions)", {
+        (
+            G1Projective::normalize_batch(&[pi_a, pi_c]),
+            G2Projective::normalize_batch(&[pi_b]),
+        )
+    });
     timings.assemble_us += start.elapsed().as_micros() as u64;
 
     Ok(Proof {
