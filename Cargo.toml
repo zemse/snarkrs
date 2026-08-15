@@ -37,6 +37,12 @@ serde_json   = "1"
 clap         = { version = "4", features = ["derive"] }
 hex          = "0.4"
 
+# Measurement only. None of these are reachable from a release build: dhat and
+# hotpath sit behind cargo features that default off, criterion is a dev-dependency.
+dhat         = "0.3"
+hotpath      = "0.23"
+criterion    = { version = "0.8", features = ["html_reports"] }
+
 g16-field = { path = "crates/g16-field" }
 g16-zkey  = { path = "crates/g16-zkey" }
 g16-ntt   = { path = "crates/g16-ntt" }
@@ -55,3 +61,8 @@ panic = "abort"
 [profile.bench]
 inherits = "release"
 panic = "unwind"
+
+[profile.profiling]
+inherits = "release"
+debug = 2
+strip = false
