@@ -765,7 +765,7 @@ impl MetalMsm {
         // stderr. Strictly a measurement aid: it adds one ~0.15 ms submission floor per
         // piece, so the sum reads slightly worse than the production path it explains.
         if std::env::var_os("G16_METAL_MSM_PHASES").is_some() {
-            let mut run = |label: String, f: &mut dyn FnMut(&ComputeCommandEncoderRef)| {
+            let run = |label: String, f: &mut dyn FnMut(&ComputeCommandEncoderRef)| {
                 let t = std::time::Instant::now();
                 let cb = self.queue.new_command_buffer();
                 let enc = cb.new_compute_command_encoder();
