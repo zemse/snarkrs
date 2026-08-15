@@ -759,20 +759,58 @@ impl MetalMsm {
         }
 
         // ---- encode, once ----
-        let cb = self.queue.new_command_buffer();
-        let enc = cb.new_compute_command_encoder();
-        for p in &plans {
-            p.encode(self, enc);
+        //
+        // `G16_METAL_MSM_PHASES=1` splits the single command buffer into one per digit
+        // pipeline and one per point pipeline, waiting on each, and prints wall times to
+        // stderr. Strictly a measurement aid: it adds one ~0.15 ms submission floor per
+        // piece, so the sum reads slightly worse than the production path it explains.
+        if std::env::var_os("G16_METAL_MSM_PHASES").is_some() {
+            let mut run = |label: String, f: &mut dyn FnMut(&ComputeCommandEncoderRef)| {
+                let t = std::time::Instant::now();
+                let cb = self.queue.new_command_buffer();
+                let enc = cb.new_compute_command_encoder();
+                f(enc);
+                enc.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+                eprintln!(
+                    "[msm-phase] {label}: {:.2} ms",
+                    t.elapsed().as_secs_f64() * 1e3
+                );
+            };
+            for (pi, p) in plans.iter().enumerate() {
+                run(
+                    format!(
+                        "digits plan{pi} n={} cap={} c={} w={}",
+                        p.n, p.cap, p.c, p.n_windows
+                    ),
+                    &mut |enc| p.encode(self, enc),
+                );
+            }
+            for (i, (job, out)) in jobs.iter().zip(&outs).enumerate() {
+                let p = &plans[job_plan[i]];
+                let kind = if out.is_g2 { "g2" } else { "g1" };
+                run(
+                    format!("points job{i} {kind} n={} cap={} c={}", p.n, p.cap, p.c),
+                    &mut |enc| out.encode(self, enc, job, p),
+                );
+            }
+        } else {
+            let cb = self.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            for p in &plans {
+                p.encode(self, enc);
+            }
+            for (i, (job, out)) in jobs.iter().zip(&outs).enumerate() {
+                out.encode(self, enc, job, &plans[job_plan[i]]);
+            }
+            enc.end_encoding();
+            cb.commit();
+            // Before this check the next statement reinterpreted pooled buffers regardless
+            // of whether the GPU had actually written them, so a fault returned the
+            // previous proof's window sums with an Ok.
+            crate::cb::wait_ok(cb, "MSM batch")?;
         }
-        for (i, (job, out)) in jobs.iter().zip(&outs).enumerate() {
-            out.encode(self, enc, job, &plans[job_plan[i]]);
-        }
-        enc.end_encoding();
-        cb.commit();
-        // Before this check the next statement reinterpreted pooled buffers regardless of
-        // whether the GPU had actually written them, so a fault returned the previous
-        // proof's window sums with an Ok.
-        crate::cb::wait_ok(cb, "MSM batch")?;
 
         // ---- combine ----
         let mut results = Vec::with_capacity(jobs.len());
