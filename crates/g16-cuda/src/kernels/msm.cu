@@ -235,9 +235,18 @@ __device__ __forceinline__ Fq fq_neg(Fq a) {
 }
 
 // CIOS Montgomery product, identical in shape to fr_mul. See the prelude for the
-// justification of the 32-bit limb with a 64-bit accumulator, and for why the obvious
-// PTX carry-chain specialisation is deliberately not taken yet.
+// justification of the 32-bit limb with a 64-bit accumulator, and for the status of the
+// PTX carry-chain specialisation this shares with fr_mul behind `G16_FF_PTX`.
+#ifdef G16_FF_PTX
 __device__ __forceinline__ Fq fq_mul(Fq a, Fq b) {
+    Fq out;
+    u32 hi = g16_mont_mul_ptx(a.v, b.v, FQ_N, FQ_N0, out.v);
+    return fq_cond_sub_n(out, hi);
+}
+__device__ __forceinline__ Fq fq_mul_portable(Fq a, Fq b) {
+#else
+__device__ __forceinline__ Fq fq_mul(Fq a, Fq b) {
+#endif
     u32 t[FQ_LIMBS + 2];
 #pragma unroll
     for (u32 i = 0; i < FQ_LIMBS + 2; i++) {

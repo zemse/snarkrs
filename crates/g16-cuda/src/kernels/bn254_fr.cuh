@@ -33,9 +33,12 @@
 // The one thing NVIDIA offers that Metal does not is an addressable carry flag:
 // mad.lo.cc.u32 / madc.hi.cc.u32 chains written as inline PTX remove the explicit
 // shift-and-mask carry propagation entirely and are what sppark and the other fast CUDA
-// MSM libraries use. That is a real further win and it is deliberately not taken here.
-// This file is the portable, auditable version; a PTX specialisation belongs behind a
-// benchmark that shows it matters, not in the first correct implementation.
+// MSM libraries use. That path now exists in this file, behind `G16_FF_PTX` (defined by
+// the host when `G16_CUDA_FF_PTX=1`, see kernels.rs), OFF by default: it has been
+// checked against a bit-exact host simulation of the exact chain shape, but it has NOT
+// run on an NVIDIA card yet, and it stays opt-in until `fr_probe` has validated it and
+// `bench_chain` has priced it on real hardware. The portable version below remains the
+// default and the reference.
 //
 // R = 2^(32*8) = 2^256 is exactly arkworks' Montgomery radix, so a host-side Fr is
 // handed to a kernel with no conversion in either direction.
@@ -196,12 +199,110 @@ __device__ __forceinline__ Fr fr_neg(Fr a) {
     return fr_sub(fr_zero(), a);
 }
 
+// ---------------------------------------------------------------------------
+// Optional PTX carry-chain CIOS round, shared by fr_mul here and fq_mul in msm.cu.
+//
+// One outer CIOS round as a single asm block: multiply pass (lo chain, then hi chain,
+// both propagating through t8 into t9), m = t0 * n0', reduction pass (same two chains).
+// The caller shifts the accumulator down one word in C between rounds; ptxas erases
+// register-to-register moves, so the shift costs nothing in SASS.
+//
+// This is EXACTLY the arithmetic of the portable 10-word CIOS below, checked against a
+// bit-exact host simulation of this chain shape (including that t9 never overflows, and
+// that the reduction annihilates t0) over the edge vectors and tens of thousands of
+// random and biased-high operands on both BN254 fields. It has NOT yet executed on an
+// NVIDIA GPU. Validation on real hardware is `fr_probe` / `fq2_probe` with
+// `G16_CUDA_FF_PTX=1`; the measurement that would justify making it the default is
+// `bench_chain` in the same configuration.
+//
+// Operand map: %0-%9 = t0..t9 (read-write), %10-%17 = a limbs, %18 = b's current limb,
+// %19 = -N^{-1} mod 2^32, %20-%27 = modulus limbs.
+// ---------------------------------------------------------------------------
+#ifdef G16_FF_PTX
+#define G16_MONT_ROUND_PTX(t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, A, BI, N0, Q)       \
+    asm("{\n\t"                                                                        \
+        ".reg .u32 m;\n\t"                                                             \
+        "mad.lo.cc.u32  %0, %10, %18, %0;\n\t"                                         \
+        "madc.lo.cc.u32 %1, %11, %18, %1;\n\t"                                         \
+        "madc.lo.cc.u32 %2, %12, %18, %2;\n\t"                                         \
+        "madc.lo.cc.u32 %3, %13, %18, %3;\n\t"                                         \
+        "madc.lo.cc.u32 %4, %14, %18, %4;\n\t"                                         \
+        "madc.lo.cc.u32 %5, %15, %18, %5;\n\t"                                         \
+        "madc.lo.cc.u32 %6, %16, %18, %6;\n\t"                                         \
+        "madc.lo.cc.u32 %7, %17, %18, %7;\n\t"                                         \
+        "addc.cc.u32    %8, %8, 0;\n\t"                                                \
+        "addc.u32       %9, %9, 0;\n\t"                                                \
+        "mad.hi.cc.u32  %1, %10, %18, %1;\n\t"                                         \
+        "madc.hi.cc.u32 %2, %11, %18, %2;\n\t"                                         \
+        "madc.hi.cc.u32 %3, %12, %18, %3;\n\t"                                         \
+        "madc.hi.cc.u32 %4, %13, %18, %4;\n\t"                                         \
+        "madc.hi.cc.u32 %5, %14, %18, %5;\n\t"                                         \
+        "madc.hi.cc.u32 %6, %15, %18, %6;\n\t"                                         \
+        "madc.hi.cc.u32 %7, %16, %18, %7;\n\t"                                         \
+        "madc.hi.cc.u32 %8, %17, %18, %8;\n\t"                                         \
+        "addc.u32       %9, %9, 0;\n\t"                                                \
+        "mul.lo.u32     m, %0, %19;\n\t"                                               \
+        "mad.lo.cc.u32  %0, m, %20, %0;\n\t"                                           \
+        "madc.lo.cc.u32 %1, m, %21, %1;\n\t"                                           \
+        "madc.lo.cc.u32 %2, m, %22, %2;\n\t"                                           \
+        "madc.lo.cc.u32 %3, m, %23, %3;\n\t"                                           \
+        "madc.lo.cc.u32 %4, m, %24, %4;\n\t"                                           \
+        "madc.lo.cc.u32 %5, m, %25, %5;\n\t"                                           \
+        "madc.lo.cc.u32 %6, m, %26, %6;\n\t"                                           \
+        "madc.lo.cc.u32 %7, m, %27, %7;\n\t"                                           \
+        "addc.cc.u32    %8, %8, 0;\n\t"                                                \
+        "addc.u32       %9, %9, 0;\n\t"                                                \
+        "mad.hi.cc.u32  %1, m, %20, %1;\n\t"                                           \
+        "madc.hi.cc.u32 %2, m, %21, %2;\n\t"                                           \
+        "madc.hi.cc.u32 %3, m, %22, %3;\n\t"                                           \
+        "madc.hi.cc.u32 %4, m, %23, %4;\n\t"                                           \
+        "madc.hi.cc.u32 %5, m, %24, %5;\n\t"                                           \
+        "madc.hi.cc.u32 %6, m, %25, %6;\n\t"                                           \
+        "madc.hi.cc.u32 %7, m, %26, %7;\n\t"                                           \
+        "madc.hi.cc.u32 %8, m, %27, %8;\n\t"                                           \
+        "addc.u32       %9, %9, 0;\n\t"                                                \
+        "}\n\t"                                                                        \
+        : "+r"(t0), "+r"(t1), "+r"(t2), "+r"(t3), "+r"(t4), "+r"(t5), "+r"(t6),        \
+          "+r"(t7), "+r"(t8), "+r"(t9)                                                 \
+        : "r"((A)[0]), "r"((A)[1]), "r"((A)[2]), "r"((A)[3]), "r"((A)[4]),             \
+          "r"((A)[5]), "r"((A)[6]), "r"((A)[7]), "r"(BI), "r"(N0), "r"((Q)[0]),        \
+          "r"((Q)[1]), "r"((Q)[2]), "r"((Q)[3]), "r"((Q)[4]), "r"((Q)[5]),             \
+          "r"((Q)[6]), "r"((Q)[7]))
+
+// Full 8-round Montgomery product over an arbitrary 8-limb modulus with the chain
+// above. `q` and `n0` are the modulus limbs and -q^{-1} mod 2^32; the result is the
+// 9-word value (carry:out), reduced by the caller's conditional subtraction.
+__device__ __forceinline__ u32 g16_mont_mul_ptx(const u32* a, const u32* b, const u32* q,
+                                                u32 n0, u32* out) {
+    u32 t0 = 0, t1 = 0, t2 = 0, t3 = 0, t4 = 0, t5 = 0, t6 = 0, t7 = 0, t8 = 0, t9 = 0;
+#pragma unroll
+    for (u32 i = 0; i < 8; i++) {
+        G16_MONT_ROUND_PTX(t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, a, b[i], n0, q);
+        // Shift the zero low word off: register renames, free after ptxas.
+        t0 = t1; t1 = t2; t2 = t3; t3 = t4; t4 = t5; t5 = t6; t6 = t7; t7 = t8;
+        t8 = t9; t9 = 0;
+    }
+    out[0] = t0; out[1] = t1; out[2] = t2; out[3] = t3;
+    out[4] = t4; out[5] = t5; out[6] = t6; out[7] = t7;
+    return t8;
+}
+#endif // G16_FF_PTX
+
 // Montgomery product: returns a * b * R^{-1} mod r, so Montgomery in, Montgomery out.
 //
 // CIOS, interleaving one multiply pass and one reduction pass per outer limb of b. The
 // accumulator is 10 words: 8 for the residue, 1 for the carry out of the multiply pass,
 // and 1 more because that carry pass can itself carry.
+#ifdef G16_FF_PTX
 __device__ __forceinline__ Fr fr_mul(Fr a, Fr b) {
+    Fr out;
+    u32 hi = g16_mont_mul_ptx(a.v, b.v, FR_N, FR_N0, out.v);
+    return fr_cond_sub_n(out, hi);
+}
+__device__ __forceinline__ Fr fr_mul_portable(Fr a, Fr b) {
+#else
+__device__ __forceinline__ Fr fr_mul(Fr a, Fr b) {
+#endif
     u32 t[FR_LIMBS + 2];
 #pragma unroll
     for (u32 i = 0; i < FR_LIMBS + 2; i++) {
