@@ -458,6 +458,27 @@ impl<'a> Scalars<'a> {
         })
     }
 
+    /// Like [`Self::device_std`], but with the host-side zero/one classification the
+    /// producer built while it still had the scalars in hand. This is the witness-reuse
+    /// entry point: `compute_h` uploads the witness once, converts it to standard form on
+    /// device, and hands both the buffer and the prefix here through `stages::HHandle`.
+    pub fn device_std_with_prefix(
+        buf: &'a CudaSlice<u32>,
+        len: usize,
+        prefix: &'a [u32],
+    ) -> Result<Self, ProveError> {
+        if prefix.len() != len + 1 {
+            return Err(bad(format!(
+                "general prefix holds {} entries; {len} scalars need {}",
+                prefix.len(),
+                len + 1
+            )));
+        }
+        let mut s = Self::device_std(buf, len)?;
+        s.general_prefix = Some(prefix);
+        Ok(s)
+    }
+
     pub fn len(&self) -> usize {
         self.len
     }
@@ -1020,7 +1041,25 @@ impl CudaMsm {
         }
 
         let t0 = Instant::now();
-        let w = self.upload_scalars(witness)?;
+        // The witness the gather already uploaded is reused when `h` is our own device
+        // handle and can vouch (length + limb fold) that it was computed from this very
+        // witness; then the standard-form copy `compute_h` converted on device serves
+        // stages 5-8 with no second PCIe transfer and no host-side re-pack. Any doubt
+        // falls back to the plain upload. `G16_CUDA_WITNESS_REUSE=0` forces the fallback.
+        // `w_owned` exists only to give the fallback upload an owner that outlives the
+        // batch; the reuse arm borrows straight from the handle inside `h`.
+        let reused = h
+            .device_handle::<HHandle>(TAG)
+            .and_then(|hd| hd.witness_std_for(witness));
+        let w_owned: Option<ScalarBuf> = if reused.is_none() {
+            Some(self.upload_scalars(witness)?)
+        } else {
+            None
+        };
+        let w = match reused {
+            Some((buf, prefix)) => Scalars::device_std_with_prefix(buf, witness.len(), prefix)?,
+            None => w_owned.as_ref().expect("uploaded above").as_scalars(),
+        };
         // Held only so the borrow in `h_scalars` outlives the batch.
         let h_owned: Option<ScalarBuf>;
         let h_scalars = match h {
@@ -1058,28 +1097,28 @@ impl CudaMsm {
             Job::G1(JobG1 {
                 bases: &self.a,
                 base_off: 0,
-                scalars: w.as_scalars(),
+                scalars: w,
                 scalar_off: 0,
                 n,
             }),
             Job::G2(JobG2 {
                 bases: &self.b_g2,
                 base_off: 0,
-                scalars: w.as_scalars(),
+                scalars: w,
                 scalar_off: 0,
                 n,
             }),
             Job::G1(JobG1 {
                 bases: &self.b_g1,
                 base_off: 0,
-                scalars: w.as_scalars(),
+                scalars: w,
                 scalar_off: 0,
                 n,
             }),
             Job::G1(JobG1 {
                 bases: &self.l,
                 base_off: 0,
-                scalars: w.as_scalars(),
+                scalars: w,
                 scalar_off: l_off,
                 n: l_n,
             }),

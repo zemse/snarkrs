@@ -223,6 +223,10 @@ struct Scratch {
     /// Page-locked host staging for the witness. Written by the packer, DMA'd from.
     host_witness: PinnedHostSlice<u32>,
     witness: CudaSlice<u32>,
+    /// The same witness in standard (non-Montgomery) limbs, written on device by
+    /// `g16_mont_to_std` during `compute_h` and consumed by the MSM stage through
+    /// [`HHandle::witness_std_for`], so the witness crosses PCIe exactly once per proof.
+    witness_std: CudaSlice<u32>,
     a: CudaSlice<u32>,
     b: CudaSlice<u32>,
     c: CudaSlice<u32>,
@@ -258,6 +262,7 @@ pub struct CudaStages {
     head: CudaFunction,
     tail: CudaFunction,
     h_join: CudaFunction,
+    mont_to_std: CudaFunction,
 
     /// Largest number of NTT passes one launch can fuse, from the device's own shared
     /// memory attribute rather than hardcoded.
@@ -325,6 +330,7 @@ impl CudaStages {
         let head = func("g16_ntt_head")?;
         let tail = func("g16_ntt_tail")?;
         let h_join = func("g16_h_join")?;
+        let mont_to_std = func("g16_mont_to_std")?;
 
         let ctx = cuda.context().clone();
         let stream = cuda.stream().clone();
@@ -449,6 +455,7 @@ impl CudaStages {
             head,
             tail,
             h_join,
+            mont_to_std,
             max_fused,
             block,
             pool: Arc::new(Mutex::new(Vec::new())),
@@ -560,6 +567,10 @@ impl CudaStages {
             };
             PackedFr::pack_into(witness, dst);
         }
+        // Classify and fingerprint while the witness is hot in cache. The prefix is what
+        // lets the MSM stage size its windows for the general scalars only; the fold is
+        // what lets it prove the witness it was handed is the one this scratch holds.
+        let (witness_prefix, witness_fold) = classify_witness(witness);
         let pack_us = start.elapsed().as_micros() as u64;
 
         let fused = std::env::var_os("G16_CUDA_UNFUSED").is_none();
@@ -578,6 +589,12 @@ impl CudaStages {
             .upload
             .record(&self.stream)
             .map_err(|e| drv("record upload event", e))?;
+
+        // Standard-form witness for stage 5-8, written on device so the MSM never
+        // re-packs or re-uploads the witness. Costs one elementwise kernel over n_vars;
+        // its time lands in the gather bucket, which is where the witness plumbing is
+        // accounted anyway.
+        self.launch_mont_to_std(&sc, self.n_vars)?;
 
         self.launch_gather(&sc, n)?;
         sc.ev
@@ -622,6 +639,9 @@ impl CudaStages {
                 pool: Arc::clone(&self.pool),
                 stream: Arc::clone(&self.stream),
                 len: n,
+                witness_prefix,
+                witness_fold,
+                n_vars: self.n_vars,
             }),
         })
     }
@@ -629,6 +649,25 @@ impl CudaStages {
     // -----------------------------------------------------------------------
     // Launches
     // -----------------------------------------------------------------------
+
+    /// Stage 0.5: the on-device Montgomery-to-standard conversion of the witness. One
+    /// thread per element, no sharing; see `g16_mont_to_std` in pointwise.cu.
+    fn launch_mont_to_std(&self, sc: &Scratch, n: usize) -> Result<(), ProveError> {
+        let nn = n as u32;
+        let block = self.block.min(nn.max(1));
+        let cfg = LaunchConfig {
+            grid_dim: (nn.div_ceil(block).max(1), 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut lb = self.stream.launch_builder(&self.mont_to_std);
+        lb.arg(&sc.witness).arg(&sc.witness_std).arg(&nn);
+        // SAFETY: three parameters bound in order with matching types; both buffers hold
+        // exactly `n_vars` packed elements and the kernel's `gid >= n` guard covers the
+        // tail block.
+        unsafe { lb.launch(cfg) }.map_err(|e| drv("launch g16_mont_to_std", e))?;
+        Ok(())
+    }
 
     /// Stage 0. One thread per output row; see the mapping argument at the top of
     /// `kernels/gather.cu`.
@@ -873,6 +912,7 @@ impl CudaStages {
         Ok(Scratch {
             host_witness,
             witness: words(self.n_vars)?,
+            witness_std: words(self.n_vars)?,
             a: words(n)?,
             b: words(n)?,
             c: words(n)?,
@@ -928,6 +968,31 @@ fn elapsed_us(start: &CudaEvent, end: &CudaEvent) -> Result<u64, ProveError> {
 /// drops the `HPoly`: the scratch goes back into the pool at that point and not before, so a
 /// second concurrent proof cannot be handed buffers stage 9 is still reading.
 ///
+/// General-scalar prefix counts plus an order-dependent fold of the raw limbs.
+///
+/// The fold is an integrity tag, not a cryptographic hash: it exists to catch the caller
+/// handing `msms` a different witness than the one `compute_h` converted (an API misuse
+/// that would otherwise silently prove the wrong statement), and an accidental collision
+/// under random data is a 2^-64 event. An adversary who controls the witness controls
+/// both sides of the comparison anyway, so nothing is entrusted to it.
+fn classify_witness(witness: &[g16_field::Fr]) -> (Vec<u32>, u64) {
+    use ark_ff::{One, Zero};
+    let mut prefix = Vec::with_capacity(witness.len() + 1);
+    let mut general = 0u32;
+    let mut fold = 0xcbf29ce484222325u64;
+    prefix.push(0);
+    for s in witness {
+        if !(s.is_zero() || s.is_one()) {
+            general += 1;
+        }
+        prefix.push(general);
+        for &l in &s.0 .0 {
+            fold = (fold.rotate_left(5) ^ l).wrapping_mul(0x100000001b3);
+        }
+    }
+    (prefix, fold)
+}
+
 /// The work that produced these buffers was synchronized before `compute_h` returned, so a
 /// consumer on any stream may read them with no further ordering.
 pub struct HHandle {
@@ -935,6 +1000,13 @@ pub struct HHandle {
     pool: Pool,
     stream: Arc<CudaStream>,
     len: usize,
+    /// `witness_prefix[i]` = how many of the first `i` witness scalars are neither 0 nor
+    /// 1, built during the `compute_h` pack. Consumed by [`Self::witness_std_for`].
+    witness_prefix: Vec<u32>,
+    /// Order-dependent fold of the witness limbs, the cheap identity check behind
+    /// [`Self::witness_std_for`].
+    witness_fold: u64,
+    n_vars: usize,
 }
 
 impl HHandle {
@@ -963,6 +1035,27 @@ impl HHandle {
     /// For further field arithmetic and for host comparisons.
     pub fn h_mont(&self) -> &CudaSlice<u32> {
         &self.sc().h_mont
+    }
+
+    /// The standard-form witness this handle's `compute_h` left on the device, plus its
+    /// general-scalar prefix, IF `witness` is the same vector it was computed from.
+    ///
+    /// `None` when the length or the limb fold disagrees, in which case the caller must
+    /// fall back to uploading `witness` itself; using the buffer anyway would prove a
+    /// different statement than the caller asked for. `G16_CUDA_WITNESS_REUSE=0` forces
+    /// the fallback, as the A/B lever for measuring what the reuse is worth.
+    pub fn witness_std_for(&self, witness: &[g16_field::Fr]) -> Option<(&CudaSlice<u32>, &[u32])> {
+        if std::env::var("G16_CUDA_WITNESS_REUSE").as_deref() == Ok("0") {
+            return None;
+        }
+        if witness.len() != self.n_vars {
+            return None;
+        }
+        let (_, fold) = classify_witness(witness);
+        if fold != self.witness_fold {
+            return None;
+        }
+        Some((&self.sc().witness_std, &self.witness_prefix))
     }
 
     /// Copies H down to the host. Tests and cross-checks want this; the proving path must

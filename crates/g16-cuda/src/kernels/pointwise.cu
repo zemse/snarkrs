@@ -87,4 +87,22 @@ extern "C" __global__ void g16_h_join(
     g16_store_h(h_mont, h_std, gid, fr_sub(fr_mul(a[gid], b[gid]), c[gid]));
 }
 
+// Montgomery limbs to standard limbs, element-wise. Stage 0.5 of the witness path: the
+// witness is uploaded once, in Montgomery form for the gather, and this converts it in
+// place on the device into the standard-form copy the MSM digit decomposition needs, so
+// the MSM stage never packs or uploads the witness a second time (that used to be a
+// second full PCIe transfer plus a host-side Montgomery reduction per element, per
+// proof). One thread per element, no sharing, tail-guarded like everything else.
+extern "C" __global__ void g16_mont_to_std(
+    const Fr* in,
+    Fr*       out,
+    const u32 n)
+{
+    u32 gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= n) {
+        return;
+    }
+    out[gid] = fr_from_mont(in[gid]);
+}
+
 #endif // G16_POINTWISE_CU
