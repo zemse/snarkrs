@@ -268,10 +268,20 @@ impl PreparedCircuit for CpuCircuit {
         }
 
         let start = Instant::now();
-        // The five MSMs overlap through nested joins. Each one already saturates the
-        // pool on its own, so the win is not throughput on a big circuit, it is keeping
-        // the pool busy while the four cheap witness MSMs (mostly 0/1 scalars) drain and
-        // leave the dense H MSM running alone.
+        // The five MSMs overlap through nested joins. Keep the nesting, but not for the
+        // reason this comment used to give: it claimed four of the MSMs were cheap
+        // because their scalars are mostly 0 or 1, leaving the dense H MSM running alone.
+        // Both halves are false, and bench/results/profiling/ has the numbers.
+        //
+        // Only 1.80% of witness scalars are 0 or 1 on the two largest circuits, 4.12% at
+        // the sparsest point on the ladder. So no witness MSM is cheap and none of them
+        // drains early. The nesting itself is worth 1.01x at 140,261 constraints, not the
+        // structural win implied here. It earns its keep at the bottom of the ladder
+        // instead, 1.77x at 2 constraints, and by lifting occupancy on a pool that
+        // otherwise idles: a proof measures 9.41 busy cores out of 12.
+        //
+        // It therefore stays because it raises occupancy and costs nothing, which is a
+        // much weaker claim than the one it replaces.
         // The five annotations below overlap: these MSMs run at the same time. Their
         // durations are wall-clock windows, not disjoint costs, and they will sum to more
         // than the enclosing region. `examples/msm_shape.rs` measures them one at a time

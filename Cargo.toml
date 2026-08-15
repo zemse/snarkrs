@@ -22,6 +22,11 @@ repository = "https://github.com/zemse/gpu-snark"
 
 [workspace.dependencies]
 ark-bn254    = { version = "0.5", default-features = false, features = ["curve"] }
+# `asm` is x86_64-only inside ark-ff. It does nothing on any Apple machine and
+# everything on the EC2 boxes we benchmark against, so the two are not comparing the
+# same field implementation. Keep it, but never read a Mac number as though arkworks
+# were running hand-written assembly there: on aarch64 the Montgomery multiply is
+# generic Rust, which is part of why profiling ranks field arithmetic so high here.
 ark-ff       = { version = "0.5", default-features = false, features = ["asm"] }
 ark-ec       = { version = "0.5", default-features = false }
 ark-serialize = { version = "0.5", default-features = false }
