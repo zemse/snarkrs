@@ -88,11 +88,23 @@ impl Fixture {
 }
 
 fn artifact_dirs() -> Vec<(String, PathBuf)> {
-    let Ok(root) = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../bench/artifacts")
-        .canonicalize()
-    else {
-        return Vec::new();
+    // `G16_ARTIFACTS` first, because CARGO_MANIFEST_DIR is baked in at compile time and
+    // this binary is cross-compiled on a Mac to be run on a rented GPU box, where that
+    // path does not exist. Without the override the canonicalize below fails, this
+    // returns nothing, and every test that iterates it passes having checked nothing.
+    // A GPU correctness suite that silently tests zero artifacts is worse than one that
+    // does not run, because it reports success.
+    let root = match std::env::var_os("G16_ARTIFACTS") {
+        Some(p) => PathBuf::from(p).canonicalize().unwrap_or_else(|e| {
+            panic!("G16_ARTIFACTS is set but unusable: {e}")
+        }),
+        None => match Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../bench/artifacts")
+            .canonicalize()
+        {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        },
     };
     let Ok(entries) = std::fs::read_dir(&root) else {
         return Vec::new();
