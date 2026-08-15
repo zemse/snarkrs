@@ -451,11 +451,17 @@ impl VerifyingKey {
             .and_then(|n| n.as_u64())
             .ok_or_else(|| ZkeyError::BadJson("nPublic is missing".into()))?
             as usize;
-        if ic_json.len() != n_public + 1 {
+        // `n_public` is attacker-supplied and `+ 1` is not free: in release, where overflow
+        // checks are off, `usize::MAX + 1` wraps to 0 and an empty IC then satisfies this
+        // guard. That produced a key with no points at all, which `aggregate_public` indexed
+        // and died on.
+        let want_ic = n_public.checked_add(1).ok_or_else(|| {
+            ZkeyError::BadJson(format!("nPublic {n_public} is impossibly large"))
+        })?;
+        if ic_json.len() != want_ic {
             return Err(ZkeyError::BadJson(format!(
-                "IC has {} entries, nPublic {n_public} implies {}",
+                "IC has {} entries, nPublic {n_public} implies {want_ic}",
                 ic_json.len(),
-                n_public + 1
             )));
         }
 

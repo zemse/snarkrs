@@ -12,6 +12,8 @@ use g16_zkey::VerifyingKey;
 pub enum VerifyError {
     #[error("expected {want} public inputs, got {got}")]
     PublicInputCount { got: usize, want: usize },
+    #[error("verifying key has an empty IC; it must carry at least the constant-wire point")]
+    EmptyVerifyingKey,
     #[error("pairing check failed")]
     PairingFailed,
 }
@@ -56,9 +58,16 @@ pub fn verify(vk: &VerifyingKey, public: &[Fr], proof: &Proof) -> Result<(), Ver
 /// Aggregate the public inputs: `L_bar = sum_i w_i * IC[i]`. An MSM over `n_public + 1`
 /// points, small enough that a plain double-and-add loop is the right choice.
 pub fn aggregate_public(vk: &VerifyingKey, public: &[Fr]) -> Result<G1Projective, VerifyError> {
+    // `VerifyingKey`'s fields are public, so a key reaching here need not have come through
+    // `from_json`: it can be built by hand or over FFI. An empty `ic` has no constant-wire
+    // point, and `saturating_sub` would quietly turn that into "expects zero public inputs"
+    // and then index `vk.ic[0]`.
+    if vk.ic.is_empty() {
+        return Err(VerifyError::EmptyVerifyingKey);
+    }
     // IC[0] is the coefficient of the constant wire, which is fixed at 1 and therefore
     // never transmitted, so the caller supplies one fewer scalar than there are points.
-    let want = vk.ic.len().saturating_sub(1);
+    let want = vk.ic.len() - 1;
     if public.len() != want {
         return Err(VerifyError::PublicInputCount {
             got: public.len(),
@@ -71,4 +80,35 @@ pub fn aggregate_public(vk: &VerifyingKey, public: &[Fr]) -> Result<G1Projective
         acc += *point * *scalar;
     }
     Ok(acc)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use g16_field::{G1Affine, G2Affine};
+
+    /// `VerifyingKey`'s fields are public, so this crate cannot assume a key came through
+    /// `g16-zkey`'s JSON reader. A hand-built key with an empty `ic` used to reach
+    /// `vk.ic[0]` by way of `saturating_sub(1)`, and the release profile's `panic = "abort"`
+    /// turned that bounds check into a SIGABRT. It must be an error instead.
+    #[test]
+    fn an_empty_ic_is_an_error_and_not_a_panic() {
+        let vk = VerifyingKey {
+            alpha_g1: G1Affine::identity(),
+            beta_g2: G2Affine::identity(),
+            gamma_g2: G2Affine::identity(),
+            delta_g2: G2Affine::identity(),
+            ic: Vec::new(),
+        };
+        // The empty public vector is the case that used to slip through: `want` computed as
+        // 0, the length check passed, and the indexing killed the process.
+        assert!(matches!(
+            aggregate_public(&vk, &[]),
+            Err(VerifyError::EmptyVerifyingKey)
+        ));
+        assert!(matches!(
+            aggregate_public(&vk, &[Fr::from(1u64)]),
+            Err(VerifyError::EmptyVerifyingKey)
+        ));
+    }
 }

@@ -552,3 +552,59 @@ fn a_lying_domain_size_is_refused_before_anything_is_allocated() {
         },
     );
 }
+
+/// `nPublic + 1` used to be an unchecked add on a `usize` that came straight from an
+/// attacker-supplied `u64`. In release, where overflow checks are off, `usize::MAX + 1`
+/// wraps to 0, so `"nPublic": 18446744073709551615` paired with `"IC": []` satisfied the
+/// length guard and produced a key with an empty `ic`. `aggregate_public` then indexed
+/// `vk.ic[0]` and the process died on a bounds check, which the release profile turns into
+/// a SIGABRT because it sets `panic = "abort"`.
+///
+/// Two hundred bytes of JSON, one dead verifier. Same family as gnark-crypto#355 and #730.
+///
+/// Built by mutating a genuine vkey so every other field parses and the test reaches the
+/// guard it is actually about.
+#[test]
+fn a_vkey_claiming_an_impossible_npublic_is_refused() {
+    for_each_artifact("a_vkey_claiming_an_impossible_npublic_is_refused", |a| {
+        let genuine = a.dir.join("vkey.json");
+        if !genuine.exists() {
+            eprintln!("  {}: no vkey.json, skipped", a.name);
+            return;
+        }
+        // nPublic = u64::MAX is the wrap; nPublic = 0 against an empty IC is the same guard
+        // approached from the other side, and must be refused because IC always carries the
+        // constant-wire point even when there are no public inputs.
+        for (label, n_public) in [("u64::MAX", u64::MAX), ("zero", 0u64)] {
+            let mut v = json(&genuine);
+            v["nPublic"] = serde_json::json!(n_public);
+            v["IC"] = serde_json::json!([]);
+
+            let dir = std::env::temp_dir().join(format!(
+                "g16-vkey-{}-{label}-{}",
+                a.name,
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("vkey.json");
+            std::fs::write(&path, serde_json::to_string(&v).unwrap()).unwrap();
+
+            let got = VerifyingKey::from_json(&path);
+            let _ = std::fs::remove_dir_all(&dir);
+
+            let err = match got {
+                Err(e) => e,
+                Ok(_) => panic!(
+                    "{}: nPublic = {label} with an empty IC must be refused, not accepted",
+                    a.name
+                ),
+            };
+            let msg = err.to_string();
+            assert!(
+                msg.contains("nPublic") || msg.contains("IC"),
+                "{}: expected the error to name nPublic or IC, got: {msg}",
+                a.name
+            );
+        }
+    });
+}
