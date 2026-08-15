@@ -156,6 +156,10 @@ fn legacy_accumulate() -> bool {
 /// `W * c` overshoots 255 by up to `c - 1`, so the top window has only
 /// `255 - (W - 1) * c` meaningful bits and its digits crowd into `2^(top_bits - 1)` buckets
 /// instead of `2^(c-1)`.
+/// The widest window the T4 sweep found worth using. Distinct from `MAX_WINDOW`, which
+/// is what the kernels can physically address: this is what is fast, and it is smaller.
+const MEASURED_MAX_WINDOW: u32 = 8;
+
 fn top_bits(c: u32) -> u32 {
     let w = RECODE_BITS.div_ceil(c as usize);
     (RECODE_BITS - (w - 1) * c as usize).min(c as usize) as u32
@@ -168,7 +172,27 @@ fn top_bits(c: u32) -> u32 {
 /// window for 140k would allocate 16384 buckets per window and spend half a million point
 /// additions reducing buckets that 34k additions filled.
 ///
-/// # This default is a placeholder and has NOT been measured on NVIDIA
+/// # Measured on a Tesla T4
+///
+/// The sweep this comment used to ask for has been run: `G16_CUDA_MSM_C` over 6..=16, warm,
+/// median of 6, on the two circuits that dominate the cost curve. `c = 8` won both, and the
+/// landscape is as violent as predicted, a 2.9x spread across the range:
+///
+/// ```text
+///   c        6      7      8      9     10     11     12     13     14     15     16
+///   70,357  155.5  145.8   73.1  134.3   80.5  212.0  145.0   88.7  182.5  164.9  271.9
+///  140,261  307.8  291.0  138.3  262.8  154.4  403.4  261.9  140.0  302.3  211.5  322.1
+/// ```
+///
+/// Against the heuristic's own pick that is 88.7 -> 73.1 ms at 70,357 (1.21x) and
+/// 150.5 -> 138.3 ms at 140,261 (1.09x). So the pick is capped at 8 below.
+///
+/// **What that cap is NOT.** It is two circuit sizes on one card of one architecture,
+/// measured through whole-proof time with every MSM forced to the same width, not per-MSM.
+/// It changes the pick for every `m` above ~10k, and of those only 70,357 and 140,261 were
+/// measured; 10,153 and 17,929 move from 10 to 8 on inference, not evidence. The mechanism
+/// below argues the shape is architectural rather than Turing-specific, but that is an
+/// argument and the table is a measurement. See TASKS.md.
 ///
 /// The Metal twin picks `c` from a three-term cost model whose coefficients (`MADD_US`,
 /// `ROW_US`, `MERGE_US`) were fitted to an M2 Max by forcing five window widths on two
@@ -206,7 +230,11 @@ pub fn window_size(m: usize) -> u32 {
     }
     // floor(log2(m)) + 1 for m >= 1, so `bits - 4` is the usual `log2(m) - 3`.
     let bits = usize::BITS - m.max(1).leading_zeros();
-    let base = bits.saturating_sub(4).clamp(3, MAX_WINDOW);
+    // Capped at the measured optimum. The textbook heuristic keeps growing `c` with `m`
+    // and the T4 sweep says that is simply wrong here: it picked 13 at 140k where 8 is
+    // 1.09x faster, and 13 at 70k where 8 is 1.21x faster. Below ~10k general scalars the
+    // heuristic already returns 8 or less, so this only ever steps large problems down.
+    let base = bits.saturating_sub(4).clamp(3, MEASURED_MAX_WINDOW);
     // `2 * top_bits >= c` reads as "the top window keeps at least half its bits", so its
     // fattest bucket is at most about sqrt(2^c) times fatter than a uniform one rather than
     // 2^(c-3) times.
