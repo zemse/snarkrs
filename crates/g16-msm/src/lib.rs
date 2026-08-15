@@ -9,8 +9,15 @@
 //!   * a scalar of 0 must cost nothing beyond the digit scan,
 //!   * a scalar of 1 must cost exactly one mixed addition, not a full bucket round trip.
 //!
-//! In bit-decomposition-heavy circuits over 99% of witness scalars are 0 or 1, so these
-//! two paths are not micro-optimisations, they are most of the work.
+//! How much those paths matter is circuit-shaped, and an earlier version of this comment
+//! overclaimed it: "in bit-decomposition-heavy circuits over 99% of witness scalars are
+//! 0 or 1". Measured on the benchmark ladder (round-4 profiling), 0/1 scalars are 1.80%
+//! of the witness on the two largest circuits and 4.12% at the sparsest point, worth
+//! about 1.02x, not the 5x once asserted. The paths stay because they are nearly free
+//! and a genuinely bit-heavy circuit still benefits, but on this ladder the MSMs are
+//! dense and the bucket loop is the whole game. What IS a measured, structural win on
+//! every circuit here: 34% of the B query bases are the point at infinity, and the
+//! prescan drops them before they cost a single window visit.
 
 use ark_ec::short_weierstrass::{Affine, Projective, SWCurveConfig};
 use ark_ff::{AdditiveGroup, One, PrimeField, Zero};
@@ -192,8 +199,10 @@ struct Prescan<P: SWCurveConfig> {
 /// information about Zcash shielded transactions by timing the prover. The measured effect
 /// there was a correlation between proving time and the sparsity of the witness.
 ///
-/// It is kept because every production Groth16 prover does it and the speedup is large: on
-/// witness-shaped scalars the 0 and 1 fast path is worth about 5.1x on this workload. But
+/// It is kept because every production Groth16 prover does it and the cost is nil; on
+/// this benchmark ladder the measured gain is small (0/1 scalars are 1.8-4.1% of the
+/// witness, about 1.02x; an earlier comment claimed 5.1x from a synthetic sparse
+/// workload), but on a genuinely bit-heavy witness it grows with the sparsity. But
 /// it means **this prover is not constant time with respect to the witness**, and a
 /// deployment where an attacker can measure proving time or memory must treat that as part
 /// of its threat model rather than assuming zero-knowledge covers it. Zero-knowledge is a
