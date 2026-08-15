@@ -642,6 +642,31 @@ impl MetalMsm {
         })
     }
 
+    /// Wraps a device-resident buffer that already holds **standard-form** scalars
+    /// (`layout::PackedScalar`), without dispatching anything.
+    ///
+    /// Stage 4 writes H in both forms precisely so stage 9 can read the standard copy
+    /// directly; going through [`Self::scalars_from_device_mont`] instead re-runs
+    /// `fr_mont_to_std` over the whole domain in an extra command buffer, duplicating
+    /// work the pointwise kernel already did.
+    ///
+    /// The clone retains the `MTLBuffer`, but the *contents* stay owned by whoever
+    /// allocated them (for H, the pooled stage scratch). The caller must keep the
+    /// producing handle alive until every MSM reading this buffer has completed, or a
+    /// recycled scratch could overwrite the scalars mid-flight. The proving path does:
+    /// `MetalCircuit::msms` borrows the `HPoly` for its whole duration.
+    ///
+    /// Like the Montgomery entry point, no host classification is possible without a
+    /// readback, so every scalar reports as general. Right for H, whose evaluations are
+    /// dense.
+    pub fn scalars_from_device_std(&self, std: &Buffer, len: usize) -> ScalarBuf {
+        ScalarBuf {
+            buf: std.clone(),
+            len,
+            general_prefix: None,
+        }
+    }
+
     /// One MSM on its own command buffer. Convenience for tests; the proving path should
     /// call [`Self::msm_batch`], because five separate command buffers cost five times
     /// the 0.16 ms submission floor.

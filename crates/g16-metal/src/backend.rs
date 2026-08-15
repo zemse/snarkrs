@@ -295,15 +295,15 @@ impl PreparedCircuit for MetalCircuit {
                         self.pk.domain_size
                     )));
                 }
-                // `h_mont`, not `h_std`, because `ScalarBuf` cannot be built around a
-                // buffer this module did not allocate: its fields are private to
-                // `crate::msm`. So the standard-form copy stage 4 already wrote is
-                // recomputed by one `fr_mont_to_std` dispatch in its own command buffer.
-                // Correct, and small, but it is real duplicated work and one extra
-                // submission; closing it needs an MSM entry point that accepts an
-                // already-standard-form device buffer.
+                // Stage 4 wrote H in both Montgomery and standard form; the MSM reads
+                // the standard copy directly. Re-deriving it from `h_mont` through
+                // `scalars_from_device_mont` was the old path here, and it cost one
+                // extra command buffer plus a full-domain Montgomery reduction that the
+                // pointwise kernel had already performed. `handle` (and with it the
+                // scratch that owns the buffer) outlives the `msm_batch` below, which
+                // is the lifetime `scalars_from_device_std` requires.
                 self.msm
-                    .scalars_from_device_mont(handle.h_mont(), handle.len())?
+                    .scalars_from_device_std(handle.h_std(), handle.len())
             }
             None => {
                 let host = h.to_host().ok_or_else(|| {

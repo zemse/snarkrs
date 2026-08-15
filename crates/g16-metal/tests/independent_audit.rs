@@ -181,15 +181,17 @@ fn gpu_output_is_load_bearing() {
             m.h_g1
         };
 
-        // Now scribble one bit on the H buffer the MSM reads. Note this is `h_mont`,
-        // not `h_std`: `MetalCircuit::msms` re-derives standard form from the Montgomery
-        // copy with its own `fr_mont_to_std` dispatch, so stage 4's `h_std` output is
-        // never read on the proving path. Corrupting `h_std` changes nothing, which was
-        // measured before this line was written the way it is.
+        // Now scribble one bit on the H buffer the MSM reads. Note this is `h_std`,
+        // not `h_mont`: `MetalCircuit::msms` wraps stage 4's standard-form output
+        // directly through `scalars_from_device_std`, so the Montgomery copy is never
+        // read on the proving path any more. (It used to be the other way around, when
+        // `msms` re-derived standard form from `h_mont` with its own `fr_mont_to_std`
+        // dispatch; this test flipped the corrupted buffer the day that dispatch was
+        // removed, which is exactly the drift it exists to catch.)
         let h = c.compute_h(&witness, &mut t).unwrap();
         {
             let handle = h.device_handle::<HHandle>(TAG).unwrap();
-            let buf = handle.h_mont();
+            let buf = handle.h_std();
             // SAFETY: shared storage, no GPU work in flight against this scratch, and a
             // u32 has no invalid bit patterns.
             unsafe {
