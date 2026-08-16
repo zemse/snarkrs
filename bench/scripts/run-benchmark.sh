@@ -38,12 +38,48 @@ while [ $# -gt 0 ]; do
     --skip-external) EXTERNAL=0; shift ;;
     --out)          OUT_OVERRIDE="$2"; shift 2 ;;
     --note)         NOTE="$2"; shift 2 ;;
+    --max-load)     MAX_LOAD="$2"; shift 2 ;;
+    --allow-loaded) ALLOW_LOADED=1; shift ;;
     -h|--help)      sed -n '2,13p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 
 log() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
+
+# ---------------------------------------------------------------- load guard
+# A timing taken on a busy box measures the other tenant. run-comparison.py has refused to
+# run above cores/4 since a local run at load average 20 turned a 70k-constraint CPU proof
+# into fiction, and this harness needs the same refusal for the same reason.
+#
+# It checks repeatedly, not just at startup, because the failure that motivated it arrived
+# mid-run: another session started while our own backends were being measured, and since
+# the external provers are timed last, rapidsnark absorbed all of it and came out ~2x slow.
+# That does not look like contamination in the output, it looks like our prover winning.
+# A partly contaminated table is worse than no table, so a mid-run spike aborts.
+CORES="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
+MAX_LOAD="${MAX_LOAD:-$(awk -v c="$CORES" 'BEGIN{print c/4}')}"
+ALLOW_LOADED="${ALLOW_LOADED:-0}"
+LOADED_ANYWAY=0
+
+load_now() { uptime | sed 's/.*averages*: *//' | awk '{print $1}' | tr -d ','; }
+
+check_load() {
+  local la; la="$(load_now)"
+  local over; over="$(awk -v a="$la" -v m="$MAX_LOAD" 'BEGIN{print (a>m)?1:0}')"
+  [ "$over" = "1" ] || return 0
+  if [ "$ALLOW_LOADED" = "1" ]; then
+    LOADED_ANYWAY=1
+    echo "    WARNING: load average $la is above $MAX_LOAD during: $1" >&2
+    return 0
+  fi
+  echo >&2
+  echo "load average is $la, above the ceiling of $MAX_LOAD for a ${CORES}-core box." >&2
+  echo "Stopped during: $1" >&2
+  echo "A timing taken now measures whatever else is running. Wait for the box to go" >&2
+  echo "idle, or pass --allow-loaded to record anyway and mark the run as suspect." >&2
+  exit 3
+}
 
 # ---------------------------------------------------------------- machine identity
 # Same labels bench/scripts/run-comparison.py uses, so results from the two harnesses
@@ -210,6 +246,7 @@ trap 'rm -rf "$TMP"' EXIT
 for b in $BACKENDS; do
   for c in $READY; do
     log "$c on $b"
+    check_load "$c on $b"
     "$G16" bench --artifacts "$ARTIFACTS" --variant "$c" --backend "$b" \
                  --mode both --reps "$REPS" --csv "$TMP/${b}-${c}.csv" || \
       echo "    $c on $b failed, leaving it out of the table"
@@ -222,6 +259,7 @@ done
 if [ -n "$PROVERS" ]; then
   for c in $READY; do
     log "$c on external provers ($PROVERS)"
+    check_load "$c on external provers"
     python3 "$BENCH/scripts/bench_external.py" \
       --artifacts "$ARTIFACTS" --variant "$c" --csv "$TMP/external-${c}.csv" \
       --reps "$REPS" --snarkjs-reps "$SNARKJS_REPS" \
@@ -235,6 +273,12 @@ fi
 
 # ---------------------------------------------------------------- report
 mkdir -p "$(dirname "$OUT")"
+# A run that was allowed through the load guard has to say so in the file itself. The
+# person reading the table months from now is not the person who typed --allow-loaded.
+if [ "$LOADED_ANYWAY" = "1" ]; then
+  NOTE="SUSPECT: recorded with --allow-loaded while the 1-minute load average was above ${MAX_LOAD} on this ${CORES}-core box. Timings here include whatever else was running and should not be compared against a run taken on an idle machine.${NOTE:+ }${NOTE}"
+fi
+
 python3 "$BENCH/scripts/render_machine.py" \
   --csv-dir "$TMP" --machine "$MACHINE" --reps "$REPS" \
   --snarkjs-reps "$SNARKJS_REPS" \
