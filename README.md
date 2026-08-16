@@ -64,8 +64,10 @@ which is what a CLI does:
 | `anon-aadhaar` | 1,115,080 | aws-g4dn.2xlarge-tesla-t4 | 6296.8 |  | 1735.9 | 5627.8 | 44888.9 |
 
 A blank cell is a comparison that machine could not make: the backend does not exist there,
-or the prover has no such mode. It is not a zero. snarkjs has no warm mode to measure
-because its CLI is the only interface it offers.
+or the prover has no such mode. It is not a zero. snarkjs has no warm mode to measure: its
+`groth16.prove(zkeyFileName, witnessFileName)` opens and re-reads the zkey inside the call,
+so a resident process reparses the key on every proof exactly as the CLI does, and there is
+nothing to amortise without patching snarkjs.
 
 The circuits are compiled from their upstream sources rather than reimplemented, so the
 constraint counts are the ones those projects actually ship:

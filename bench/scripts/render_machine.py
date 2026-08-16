@@ -165,9 +165,14 @@ def main():
         L.append("Not available on this machine, left blank above: "
                  + ", ".join("`" + m + "`" for m in missing) + ".")
         L.append("")
-    L.append("`snarkjs` has no warm mode to measure: its CLI is the only interface it "
-             "offers, so that")
-    L.append("cell is blank on every machine.")
+    # Not "the CLI is its only interface", which is false: snarkjs is an npm library too.
+    # The reason is narrower and worth stating exactly, because it is the thing that makes a
+    # warm number impossible rather than merely inconvenient. groth16.prove takes the zkey as
+    # a FILE NAME and calls readBinFile on it inside the call, so a long-lived process that
+    # proves in a loop still reparses the whole key every time. There is nothing to amortise.
+    L.append("`snarkjs` has no warm mode to measure: `groth16.prove` takes the zkey as a file")
+    L.append("name and re-reads it inside the call, so a resident process reparses the key on")
+    L.append("every proof exactly as the CLI does. That cell is blank on every machine.")
     L.append("")
 
     os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".", exist_ok=True)
