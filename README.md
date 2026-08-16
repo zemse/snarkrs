@@ -31,7 +31,7 @@ circuits: interleaving them would put numbers that differ by 5x on adjacent rows
 reading down a column that compares nothing. Within a machine, the row is a fair comparison
 of provers on identical artifacts.
 
-### Apple M2 Max
+### apple-m2-max
 
 `arm64`, 12 logical cores, Darwin. Measured at commit `44a41f6`.
 
@@ -59,9 +59,9 @@ of provers on identical artifacts.
 | `keccak256` | 239,176 | 231.2 | 87.3 |  | 308.3 | 3380.8 |
 | `anon-aadhaar` | 1,115,080 | 1894.5 | 523.1 |  | 2195.3 | 22392.5 |
 
-### AWS g4dn.2xlarge, NVIDIA Tesla T4
+### g4dn.2xlarge
 
-`x86_64`, 8 logical cores, Linux. Measured at commit `60d417c`.
+`x86_64`, 8 logical cores, Linux, Tesla T4. Measured at commit `60d417c`.
 
 **Warm**, setup paid once then proving in a loop, which is what a resident service sees:
 

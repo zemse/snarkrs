@@ -100,8 +100,13 @@ def detect_machine():
                     "http://169.254.169.254/latest/meta-data/instance-type",
                     "-H", f"X-aws-ec2-metadata-token: {tok.stdout.strip()}"])
             if r.returncode == 0 and r.stdout.strip():
-                gpu = detect_gpu().replace(" ", "-")
-                return f"aws-{r.stdout.strip()}" + (f"-{gpu}" if gpu else "")
+                # The bare EC2 instance type. It is the canonical name for the box and
+                # the string you type to rent the same one again. An earlier version
+                # appended the GPU, giving aws-g4dn.2xlarge-Tesla-T4, which buries a proper
+                # slug inside a compound a reader cannot parse: there is no way to tell
+                # where the instance type ends and the accelerator begins. The GPU is
+                # already recorded separately in the run stamp's `gpu` field.
+                return r.stdout.strip()
     if platform.system() == "Darwin":
         return detect_gpu().replace(" ", "-") or platform.node()
     return platform.node()

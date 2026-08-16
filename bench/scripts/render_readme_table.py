@@ -23,16 +23,6 @@ import sys
 
 COLUMNS = ["gpu-snark cpu", "gpu-snark metal", "gpu-snark cuda", "rapidsnark", "snarkjs"]
 
-# Presentation only, and only a fallback. Machine files now record `cpu:` and `accelerator:`
-# as their own fields, and when those are present the heading is built from them. These
-# entries exist for files recorded before those fields did, where the hardware survives only
-# inside the slug and cannot be recovered from it without knowing where the name ends.
-# Nothing here invents a fact: each value restates what its slug already encodes.
-LEGACY_LABELS = {
-    "apple-m2-max": "Apple M2 Max",
-    "aws-g4dn.2xlarge-tesla-t4": "AWS g4dn.2xlarge, NVIDIA Tesla T4",
-}
-
 
 def parse_machine_file(path):
     text = open(path).read()
@@ -84,11 +74,20 @@ def parse_machine_file(path):
     }
 
 
-def heading(info):
-    if info["cpu"] or info["gpu"]:
-        parts = [p for p in (info["cpu"], info["gpu"]) if p]
-        return ", ".join(parts)
-    return LEGACY_LABELS.get(info["machine"], info["machine"])
+def describe(info):
+    """The line under the heading: what this machine is, in the machine's own words.
+
+    The heading itself is the slug, which for EC2 is the bare instance type. That is the
+    canonical name for the box and the string you type to rent the same one again, so it
+    should not be decorated. Everything else the run detected goes here instead of being
+    concatenated into the slug.
+    """
+    bits = [f"`{info['arch']}`", f"{info['cores']} logical cores", info["os"]]
+    if info["cpu"]:
+        bits.append(info["cpu"])
+    if info["gpu"]:
+        bits.append(info["gpu"])
+    return ", ".join(bits) + f". Measured at commit `{info['commit']}`."
 
 
 def table(rows):
@@ -119,10 +118,9 @@ def main():
             continue
         if not info["modes"]:
             continue
-        L.append(f"### {heading(info)}")
+        L.append(f"### {info['machine']}")
         L.append("")
-        L.append(f"`{info['arch']}`, {info['cores']} logical cores, {info['os']}. "
-                 f"Measured at commit `{info['commit']}`.")
+        L.append(describe(info))
         L.append("")
         for mode, blurb in (
             ("warm", "**Warm**, setup paid once then proving in a loop, which is what a "

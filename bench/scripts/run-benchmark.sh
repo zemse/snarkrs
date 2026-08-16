@@ -123,8 +123,12 @@ detect_machine() {
       it=$(curl -s -m 1 "http://169.254.169.254/latest/meta-data/instance-type" \
            -H "X-aws-ec2-metadata-token: $tok" 2>/dev/null || true)
       if [ -n "$it" ]; then
-        g=$(detect_gpu | tr ' ' '-')
-        [ -n "$g" ] && echo "aws-${it}-${g}" || echo "aws-${it}"
+        # The EC2 instance type on its own. It is the canonical name for the machine, it is
+        # what you type to rent the same box again, and it already implies the accelerator.
+        # An earlier version emitted aws-g4dn.2xlarge-tesla-t4, which buried a proper slug
+        # inside a compound nobody can parse: a reader cannot tell where the instance type
+        # ends and the GPU begins. The GPU is recorded as its own `accelerator:` field.
+        echo "$it"
         return
       fi
     fi
