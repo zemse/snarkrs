@@ -38,7 +38,7 @@ while [ $# -gt 0 ]; do
     --skip-external) EXTERNAL=0; shift ;;
     --out)          OUT_OVERRIDE="$2"; shift 2 ;;
     --note)         NOTE="$2"; shift 2 ;;
-    --max-load)     MAX_LOAD="$2"; shift 2 ;;
+    --max-foreign)  MAX_FOREIGN="$2"; shift 2 ;;
     --allow-loaded) ALLOW_LOADED=1; shift ;;
     -h|--help)      sed -n '2,13p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
@@ -47,34 +47,51 @@ done
 
 log() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 
-# ---------------------------------------------------------------- load guard
-# A timing taken on a busy box measures the other tenant. run-comparison.py has refused to
-# run above cores/4 since a local run at load average 20 turned a 70k-constraint CPU proof
-# into fiction, and this harness needs the same refusal for the same reason.
+# ---------------------------------------------------------------- contention guard
+# A timing taken while another tenant is on the box measures the other tenant. That is not
+# hypothetical here: a parallel session started partway through a run, and because the
+# external provers are timed last, rapidsnark absorbed nearly all of the interference and
+# came out about 2x slow while our own number, taken minutes earlier, barely moved. The
+# resulting table does not look contaminated. It looks like this prover winning by a mile,
+# which is the most dangerous shape a wrong benchmark can take.
 #
-# It checks repeatedly, not just at startup, because the failure that motivated it arrived
-# mid-run: another session started while our own backends were being measured, and since
-# the external provers are timed last, rapidsnark absorbed all of it and came out ~2x slow.
-# That does not look like contamination in the output, it looks like our prover winning.
-# A partly contaminated table is worse than no table, so a mid-run spike aborts.
+# The obvious guard, a load average ceiling, does not work mid-run. Proving saturates every
+# core by design, so the run drives the load average above any sane ceiling within seconds
+# and then trips on itself. run-comparison.py gets away with checking load once at startup;
+# checking it repeatedly needs a measure that can tell our own work apart from somebody
+# else's.
+#
+# So this counts CPU belonging to processes outside our own process group. Our children
+# inherit it and everyone else's work does not, which is exactly the distinction the load
+# average cannot make. The threshold is in percent of a single core, so 200 means two other
+# cores' worth of foreign work.
+#
+# 200 rather than something tighter because a desktop is never actually at zero: the window
+# server, the terminal and the editor together idle around 70% of a core here, and a ceiling
+# below that can never pass. This is deliberately a coarse guard. It is not trying to detect
+# a stray 5% background daemon, whose effect is inside the noise anyway. It is trying to
+# catch the case that actually ruined a run, which was a parallel build sitting on ten of
+# the twelve cores at over 1000%.
 CORES="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
-MAX_LOAD="${MAX_LOAD:-$(awk -v c="$CORES" 'BEGIN{print c/4}')}"
+MAX_FOREIGN="${MAX_FOREIGN:-200}"
 ALLOW_LOADED="${ALLOW_LOADED:-0}"
 LOADED_ANYWAY=0
+MY_PGID="$(ps -o pgid= -p $$ | tr -d ' ')"
 
-load_now() { uptime | sed 's/.*averages*: *//' | awk '{print $1}' | tr -d ','; }
+foreign_cpu() {
+  ps -Ao pcpu=,pgid= | awk -v me="$MY_PGID" '$2 != me { s += $1 } END { printf "%.0f", s+0 }'
+}
 
 check_load() {
-  local la; la="$(load_now)"
-  local over; over="$(awk -v a="$la" -v m="$MAX_LOAD" 'BEGIN{print (a>m)?1:0}')"
-  [ "$over" = "1" ] || return 0
+  local fc; fc="$(foreign_cpu)"
+  [ "$fc" -gt "$MAX_FOREIGN" ] || return 0
   if [ "$ALLOW_LOADED" = "1" ]; then
     LOADED_ANYWAY=1
-    echo "    WARNING: load average $la is above $MAX_LOAD during: $1" >&2
+    echo "    WARNING: ${fc}% of a core in use by other processes during: $1" >&2
     return 0
   fi
   echo >&2
-  echo "load average is $la, above the ceiling of $MAX_LOAD for a ${CORES}-core box." >&2
+  echo "another process is using ${fc}% of a core (ceiling ${MAX_FOREIGN}%) on this ${CORES}-core box." >&2
   echo "Stopped during: $1" >&2
   echo "A timing taken now measures whatever else is running. Wait for the box to go" >&2
   echo "idle, or pass --allow-loaded to record anyway and mark the run as suspect." >&2
@@ -276,7 +293,7 @@ mkdir -p "$(dirname "$OUT")"
 # A run that was allowed through the load guard has to say so in the file itself. The
 # person reading the table months from now is not the person who typed --allow-loaded.
 if [ "$LOADED_ANYWAY" = "1" ]; then
-  NOTE="SUSPECT: recorded with --allow-loaded while the 1-minute load average was above ${MAX_LOAD} on this ${CORES}-core box. Timings here include whatever else was running and should not be compared against a run taken on an idle machine.${NOTE:+ }${NOTE}"
+  NOTE="SUSPECT: recorded with --allow-loaded while other processes were using more than ${MAX_FOREIGN}% of a core on this ${CORES}-core box. Timings here include whatever else was running and should not be compared against a run taken on an idle machine.${NOTE:+ }${NOTE}"
 fi
 
 python3 "$BENCH/scripts/render_machine.py" \
