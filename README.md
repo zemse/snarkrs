@@ -223,11 +223,14 @@ key load that makes the GPU backend possible at all.
   the machine in every row rather than collapsing to a single "Nx faster" headline.
 - **This prover is not constant time with respect to the witness.** The MSM skips zero and
   one scalars, which makes running time and allocation size a function of witness sparsity.
-  That is the optimisation exploited against Zcash in USENIX Security 2020. It is kept
-  because every production Groth16 prover does it, but note the payoff is modest and easy to
-  overstate: measured on this benchmark ladder, 0/1 scalars are 1.8% to 4.1% of the MSM
-  workload. It grows with sparsity on genuinely bit-heavy witnesses. Zero knowledge holds
-  for the proof and not for the process that produced it.
+  That is the same optimisation exploited in "Remote Side-Channel Attacks on Anonymous
+  Transactions" (USENIX Security 2020), which recovered information about Zcash shielded
+  transactions by timing the prover. It is kept because every production Groth16 prover does
+  it and the cost is nil, but the payoff is easy to overstate: on this benchmark ladder 0/1
+  scalars are 1.8% to 4.1% of the witness, worth about 1.02x. It grows with sparsity on a
+  genuinely bit-heavy witness. A deployment where an attacker can measure proving time or
+  memory must treat that as part of its threat model: zero knowledge is a property of the
+  proof, not of the process that produced it.
 - **A `.zkey` is trusted input.** Only the O(1) points are validated on load; the query
   sections are millions of points and a subgroup check each would dominate key load. If the
   key and the witness have different owners, which is exactly proving-as-a-service, run
@@ -273,5 +276,8 @@ Things actually leaned on while building this, not a reading list.
   thread, both of which fed the adversarial test suite.
 - ["Zero-knowledge proofs of non-knowledge"](https://github.com/cryptosubtlety/00/blob/main/00.pdf),
   on why a prover that emits a valid proof is not the same as a prover that is correct.
+- Tramer, Boneh, Paterson, [**Remote Side-Channel Attacks on Anonymous
+  Transactions**](https://crypto.stanford.edu/timings/paper.pdf), USENIX Security 2020. Why
+  the MSM's zero and one fast paths are a privacy trade and not a free win.
 - [Perpetual Powers of Tau](https://github.com/privacy-ethereum/perpetualpowersoftau), the
   source of the phase 1 parameters.
