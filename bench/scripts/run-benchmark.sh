@@ -4,6 +4,8 @@
 #   bench/scripts/run-benchmark.sh [--reps N] [--circuits "a b c"] [--no-download]
 #                                  [--snarkjs-reps N] [--skip-external]
 #                                  [--out FILE] [--note TEXT]
+#                                  [--no-build] [--commit SHA]
+#                                  [--max-foreign PCT] [--allow-loaded]
 #
 # It works out what backends the box can actually run, builds only those, fetches any
 # missing proving keys from S3, benchmarks every circuit it has a complete artifact set
@@ -40,6 +42,8 @@ while [ $# -gt 0 ]; do
     --note)         NOTE="$2"; shift 2 ;;
     --max-foreign)  MAX_FOREIGN="$2"; shift 2 ;;
     --allow-loaded) ALLOW_LOADED=1; shift ;;
+    --commit)       COMMIT_OVERRIDE="$2"; shift 2 ;;
+    --no-build)     NO_BUILD=1; shift ;;
     -h|--help)      sed -n '2,13p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -138,9 +142,19 @@ MACHINE="$(detect_machine | tr '[:upper:]' '[:lower:]')"
 # being re-runnable: a rented GPU box goes away, a laptop gets replaced, a circuit gets
 # regenerated. Keying the file by commit means an old machine's numbers stay on disk and
 # stay attributable instead of being overwritten by whatever ran last.
-COMMIT="$(cd "$HERE" && git rev-parse --short HEAD 2>/dev/null || echo nogit)"
-if [ -n "$(cd "$HERE" && git status --porcelain 2>/dev/null)" ]; then
-  COMMIT="${COMMIT}-dirty"
+#
+# --commit exists because the interesting machines are the ones without a checkout. A rented
+# GPU box gets a cross-compiled binary shipped to it and no source and no .git, and the first
+# run on one of those had to be coaxed through with a fake `git` on PATH answering
+# `rev-parse`. Shimming git to get provenance right is a bad trade, so pass the commit the
+# binary was built from instead.
+if [ -n "${COMMIT_OVERRIDE:-}" ]; then
+  COMMIT="$COMMIT_OVERRIDE"
+else
+  COMMIT="$(cd "$HERE" && git rev-parse --short HEAD 2>/dev/null || echo nogit)"
+  if [ -n "$(cd "$HERE" && git status --porcelain 2>/dev/null)" ]; then
+    COMMIT="${COMMIT}-dirty"
+  fi
 fi
 OUT="$OUTDIR/${MACHINE}-${COMMIT}.md"
 if [ -n "$OUT_OVERRIDE" ]; then OUT="$OUT_OVERRIDE"; fi
@@ -207,13 +221,21 @@ echo "    snarkjs:            ${SNARKJS:-<missing>}"
 echo "    reps:               $REPS (snarkjs $SNARKJS_REPS)"
 
 # ---------------------------------------------------------------- build
-log "building"
-if [ -n "$FEATURES" ]; then
-  ( cd "$HERE" && cargo build --release -p g16-cli --features "$FEATURES" )
-else
-  ( cd "$HERE" && cargo build --release -p g16-cli )
-fi
+# --no-build for the same reason as --commit: a box holding a prebuilt binary has no source
+# to build from, and running cargo there either fails or, worse, silently rebuilds something
+# other than the binary that is about to be measured.
 G16="$HERE/target/release/g16"
+if [ "${NO_BUILD:-0}" = "1" ]; then
+  log "using the prebuilt binary, not building"
+  [ -x "$G16" ] || { echo "--no-build given but $G16 is not executable" >&2; exit 1; }
+else
+  log "building"
+  if [ -n "$FEATURES" ]; then
+    ( cd "$HERE" && cargo build --release -p g16-cli --features "$FEATURES" )
+  else
+    ( cd "$HERE" && cargo build --release -p g16-cli )
+  fi
+fi
 
 # ---------------------------------------------------------------- artifacts
 # Proving keys are hundreds of megabytes and are not in git. Fetch only what is missing,
