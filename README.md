@@ -23,45 +23,69 @@ and is measured against rapidsnark and snarkjs on identical artifacts.
 
 ## Benchmarks
 
-Median milliseconds, lower is better. **Warm**: setup paid once, then proving in a loop,
-which is what a resident service sees.
+Median milliseconds, lower is better. Ten reps per cell, three for snarkjs. Every timing
+belongs to a proof that was verified before the timing was kept.
 
-| program | constraints | machine | gpu-snark cpu | gpu-snark metal | gpu-snark cuda | rapidsnark | snarkjs |
-|---|---:|---|---:|---:|---:|---:|---:|
-| `railgun-01x01` | 20,135 | apple-m2-max | 65.4 | 29.1 |  | 72.0 |  |
-| `railgun-01x01` | 20,135 | aws-g4dn.2xlarge-tesla-t4 | 231.0 |  | 23.7 | 170.0 |  |
-| `tornado` | 28,275 | apple-m2-max | 102.9 | 40.2 |  | 117.5 |  |
-| `tornado` | 28,275 | aws-g4dn.2xlarge-tesla-t4 | 396.1 |  | 32.0 | 300.0 |  |
-| `sha256` | 59,281 | apple-m2-max | 57.3 | 21.0 |  | 72.0 |  |
-| `sha256` | 59,281 | aws-g4dn.2xlarge-tesla-t4 | 193.6 |  | 18.0 | 175.0 |  |
-| `railgun-13x01` | 141,276 | apple-m2-max | 390.3 | 125.2 |  | 421.0 |  |
-| `railgun-13x01` | 141,276 | aws-g4dn.2xlarge-tesla-t4 | 1447.7 |  | 135.3 | 1191.5 |  |
-| `rsa2048` | 190,945 | apple-m2-max | 225.4 | 56.8 |  | 344.5 |  |
-| `rsa2048` | 190,945 | aws-g4dn.2xlarge-tesla-t4 | 776.9 |  | 64.7 | 790.5 |  |
-| `keccak256` | 239,176 | apple-m2-max | 216.1 | 38.8 |  | 289.0 |  |
-| `keccak256` | 239,176 | aws-g4dn.2xlarge-tesla-t4 | 758.1 |  | 51.4 | 682.0 |  |
-| `anon-aadhaar` | 1,115,080 | apple-m2-max | 1764.5 | 263.2 |  | 2120.0 |  |
-| `anon-aadhaar` | 1,115,080 | aws-g4dn.2xlarge-tesla-t4 | 5925.0 |  | 406.5 | 5774.0 |  |
+One table per machine, because proving time varies more between machines than between
+circuits: interleaving them would put numbers that differ by 5x on adjacent rows and invite
+reading down a column that compares nothing. Within a machine, the row is a fair comparison
+of provers on identical artifacts.
 
-**Cold**, one fresh process per proof, key parse and GPU upload inside the timed region,
-which is what a CLI does:
+### Apple M2 Max
 
-| program | constraints | machine | gpu-snark cpu | gpu-snark metal | gpu-snark cuda | rapidsnark | snarkjs |
-|---|---:|---|---:|---:|---:|---:|---:|
-| `railgun-01x01` | 20,135 | apple-m2-max | 65.1 | 46.3 |  | 77.0 | 879.7 |
-| `railgun-01x01` | 20,135 | aws-g4dn.2xlarge-tesla-t4 | 238.8 |  | 266.5 | 171.0 | 1757.4 |
-| `tornado` | 28,275 | apple-m2-max | 107.3 | 59.0 |  | 123.1 | 1260.3 |
-| `tornado` | 28,275 | aws-g4dn.2xlarge-tesla-t4 | 407.2 |  | 281.2 | 298.2 | 2517.4 |
-| `sha256` | 59,281 | apple-m2-max | 64.9 | 46.5 |  | 80.4 | 1141.2 |
-| `sha256` | 59,281 | aws-g4dn.2xlarge-tesla-t4 | 214.9 |  | 269.1 | 183.4 | 2318.1 |
-| `railgun-13x01` | 141,276 | apple-m2-max | 401.7 | 168.9 |  | 436.8 | 4340.2 |
-| `railgun-13x01` | 141,276 | aws-g4dn.2xlarge-tesla-t4 | 1496.9 |  | 429.8 | 1187.4 | 8157.4 |
-| `rsa2048` | 190,945 | apple-m2-max | 244.9 | 110.8 |  | 360.4 | 3928.5 |
-| `rsa2048` | 190,945 | aws-g4dn.2xlarge-tesla-t4 | 846.2 |  | 401.2 | 797.9 | 6904.7 |
-| `keccak256` | 239,176 | apple-m2-max | 231.2 | 87.3 |  | 308.3 | 3380.8 |
-| `keccak256` | 239,176 | aws-g4dn.2xlarge-tesla-t4 | 788.1 |  | 388.8 | 703.3 | 6807.9 |
-| `anon-aadhaar` | 1,115,080 | apple-m2-max | 1894.5 | 523.1 |  | 2195.3 | 22392.5 |
-| `anon-aadhaar` | 1,115,080 | aws-g4dn.2xlarge-tesla-t4 | 6296.8 |  | 1735.9 | 5627.8 | 44888.9 |
+`arm64`, 12 logical cores, Darwin. Measured at commit `44a41f6`.
+
+**Warm**, setup paid once then proving in a loop, which is what a resident service sees:
+
+| program | constraints | gpu-snark cpu | gpu-snark metal | gpu-snark cuda | rapidsnark | snarkjs |
+|---|---:|---:|---:|---:|---:|---:|
+| `railgun-01x01` | 20,135 | 65.4 | 29.1 |  | 72.0 |  |
+| `tornado` | 28,275 | 102.9 | 40.2 |  | 117.5 |  |
+| `sha256` | 59,281 | 57.3 | 21.0 |  | 72.0 |  |
+| `railgun-13x01` | 141,276 | 390.3 | 125.2 |  | 421.0 |  |
+| `rsa2048` | 190,945 | 225.4 | 56.8 |  | 344.5 |  |
+| `keccak256` | 239,176 | 216.1 | 38.8 |  | 289.0 |  |
+| `anon-aadhaar` | 1,115,080 | 1764.5 | 263.2 |  | 2120.0 |  |
+
+**Cold**, one fresh process per proof so the key parse and any GPU upload sit inside the timed region, which is what a CLI does:
+
+| program | constraints | gpu-snark cpu | gpu-snark metal | gpu-snark cuda | rapidsnark | snarkjs |
+|---|---:|---:|---:|---:|---:|---:|
+| `railgun-01x01` | 20,135 | 65.1 | 46.3 |  | 77.0 | 879.7 |
+| `tornado` | 28,275 | 107.3 | 59.0 |  | 123.1 | 1260.3 |
+| `sha256` | 59,281 | 64.9 | 46.5 |  | 80.4 | 1141.2 |
+| `railgun-13x01` | 141,276 | 401.7 | 168.9 |  | 436.8 | 4340.2 |
+| `rsa2048` | 190,945 | 244.9 | 110.8 |  | 360.4 | 3928.5 |
+| `keccak256` | 239,176 | 231.2 | 87.3 |  | 308.3 | 3380.8 |
+| `anon-aadhaar` | 1,115,080 | 1894.5 | 523.1 |  | 2195.3 | 22392.5 |
+
+### AWS g4dn.2xlarge, NVIDIA Tesla T4
+
+`x86_64`, 8 logical cores, Linux. Measured at commit `60d417c`.
+
+**Warm**, setup paid once then proving in a loop, which is what a resident service sees:
+
+| program | constraints | gpu-snark cpu | gpu-snark metal | gpu-snark cuda | rapidsnark | snarkjs |
+|---|---:|---:|---:|---:|---:|---:|
+| `railgun-01x01` | 20,135 | 231.0 |  | 23.7 | 170.0 |  |
+| `tornado` | 28,275 | 396.1 |  | 32.0 | 300.0 |  |
+| `sha256` | 59,281 | 193.6 |  | 18.0 | 175.0 |  |
+| `railgun-13x01` | 141,276 | 1447.7 |  | 135.3 | 1191.5 |  |
+| `rsa2048` | 190,945 | 776.9 |  | 64.7 | 790.5 |  |
+| `keccak256` | 239,176 | 758.1 |  | 51.4 | 682.0 |  |
+| `anon-aadhaar` | 1,115,080 | 5925.0 |  | 406.5 | 5774.0 |  |
+
+**Cold**, one fresh process per proof so the key parse and any GPU upload sit inside the timed region, which is what a CLI does:
+
+| program | constraints | gpu-snark cpu | gpu-snark metal | gpu-snark cuda | rapidsnark | snarkjs |
+|---|---:|---:|---:|---:|---:|---:|
+| `railgun-01x01` | 20,135 | 238.8 |  | 266.5 | 171.0 | 1757.4 |
+| `tornado` | 28,275 | 407.2 |  | 281.2 | 298.2 | 2517.4 |
+| `sha256` | 59,281 | 214.9 |  | 269.1 | 183.4 | 2318.1 |
+| `railgun-13x01` | 141,276 | 1496.9 |  | 429.8 | 1187.4 | 8157.4 |
+| `rsa2048` | 190,945 | 846.2 |  | 401.2 | 797.9 | 6904.7 |
+| `keccak256` | 239,176 | 788.1 |  | 388.8 | 703.3 | 6807.9 |
+| `anon-aadhaar` | 1,115,080 | 6296.8 |  | 1735.9 | 5627.8 | 44888.9 |
 
 A blank cell is a comparison that machine could not make: the backend does not exist there,
 or the prover has no such mode. It is not a zero. snarkjs has no warm mode to measure: its

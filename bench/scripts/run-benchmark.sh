@@ -318,8 +318,21 @@ if [ "$LOADED_ANYWAY" = "1" ]; then
   NOTE="SUSPECT: recorded with --allow-loaded while other processes were using more than ${MAX_FOREIGN}% of a core on this ${CORES}-core box. Timings here include whatever else was running and should not be compared against a run taken on an idle machine.${NOTE:+ }${NOTE}"
 fi
 
+# Detected once and recorded, so the file says what it ran on rather than leaving a reader
+# to decode the slug.
+GPU_NAME="$(detect_gpu)"
+if [ "$(uname -s)" = Darwin ]; then
+  CPU_NAME="$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo "")"
+else
+  CPU_NAME="$(awk -F': ' '/^model name/{print $2; exit}' /proc/cpuinfo 2>/dev/null || echo "")"
+fi
+# On a Mac detect_gpu falls back to the CPU brand string, which would make the two fields
+# duplicates and imply a discrete accelerator that is not there.
+[ "$GPU_NAME" = "$CPU_NAME" ] && GPU_NAME=""
+
 python3 "$BENCH/scripts/render_machine.py" \
   --csv-dir "$TMP" --machine "$MACHINE" --reps "$REPS" \
+  --gpu "$GPU_NAME" --cpu "$CPU_NAME" \
   --snarkjs-reps "$SNARKJS_REPS" \
   --backends "$BACKENDS" --provers "$PROVERS" --commit "$COMMIT" \
   --note "$NOTE" \
