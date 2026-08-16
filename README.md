@@ -29,12 +29,19 @@ which is what a resident service sees.
 | program | constraints | machine | gpu-snark cpu | gpu-snark metal | gpu-snark cuda | rapidsnark | snarkjs |
 |---|---:|---|---:|---:|---:|---:|---:|
 | `railgun-01x01` | 20,135 | apple-m2-max | 65.4 | 29.1 |  | 72.0 |  |
+| `railgun-01x01` | 20,135 | aws-g4dn.2xlarge-tesla-t4 | 231.0 |  | 23.7 | 170.0 |  |
 | `tornado` | 28,275 | apple-m2-max | 102.9 | 40.2 |  | 117.5 |  |
+| `tornado` | 28,275 | aws-g4dn.2xlarge-tesla-t4 | 396.1 |  | 32.0 | 300.0 |  |
 | `sha256` | 59,281 | apple-m2-max | 57.3 | 21.0 |  | 72.0 |  |
+| `sha256` | 59,281 | aws-g4dn.2xlarge-tesla-t4 | 193.6 |  | 18.0 | 175.0 |  |
 | `railgun-13x01` | 141,276 | apple-m2-max | 390.3 | 125.2 |  | 421.0 |  |
+| `railgun-13x01` | 141,276 | aws-g4dn.2xlarge-tesla-t4 | 1447.7 |  | 135.3 | 1191.5 |  |
 | `rsa2048` | 190,945 | apple-m2-max | 225.4 | 56.8 |  | 344.5 |  |
+| `rsa2048` | 190,945 | aws-g4dn.2xlarge-tesla-t4 | 776.9 |  | 64.7 | 790.5 |  |
 | `keccak256` | 239,176 | apple-m2-max | 216.1 | 38.8 |  | 289.0 |  |
+| `keccak256` | 239,176 | aws-g4dn.2xlarge-tesla-t4 | 758.1 |  | 51.4 | 682.0 |  |
 | `anon-aadhaar` | 1,115,080 | apple-m2-max | 1764.5 | 263.2 |  | 2120.0 |  |
+| `anon-aadhaar` | 1,115,080 | aws-g4dn.2xlarge-tesla-t4 | 5925.0 |  | 406.5 | 5774.0 |  |
 
 **Cold**, one fresh process per proof, key parse and GPU upload inside the timed region,
 which is what a CLI does:
@@ -42,12 +49,19 @@ which is what a CLI does:
 | program | constraints | machine | gpu-snark cpu | gpu-snark metal | gpu-snark cuda | rapidsnark | snarkjs |
 |---|---:|---|---:|---:|---:|---:|---:|
 | `railgun-01x01` | 20,135 | apple-m2-max | 65.1 | 46.3 |  | 77.0 | 879.7 |
+| `railgun-01x01` | 20,135 | aws-g4dn.2xlarge-tesla-t4 | 238.8 |  | 266.5 | 171.0 | 1757.4 |
 | `tornado` | 28,275 | apple-m2-max | 107.3 | 59.0 |  | 123.1 | 1260.3 |
+| `tornado` | 28,275 | aws-g4dn.2xlarge-tesla-t4 | 407.2 |  | 281.2 | 298.2 | 2517.4 |
 | `sha256` | 59,281 | apple-m2-max | 64.9 | 46.5 |  | 80.4 | 1141.2 |
+| `sha256` | 59,281 | aws-g4dn.2xlarge-tesla-t4 | 214.9 |  | 269.1 | 183.4 | 2318.1 |
 | `railgun-13x01` | 141,276 | apple-m2-max | 401.7 | 168.9 |  | 436.8 | 4340.2 |
+| `railgun-13x01` | 141,276 | aws-g4dn.2xlarge-tesla-t4 | 1496.9 |  | 429.8 | 1187.4 | 8157.4 |
 | `rsa2048` | 190,945 | apple-m2-max | 244.9 | 110.8 |  | 360.4 | 3928.5 |
+| `rsa2048` | 190,945 | aws-g4dn.2xlarge-tesla-t4 | 846.2 |  | 401.2 | 797.9 | 6904.7 |
 | `keccak256` | 239,176 | apple-m2-max | 231.2 | 87.3 |  | 308.3 | 3380.8 |
+| `keccak256` | 239,176 | aws-g4dn.2xlarge-tesla-t4 | 788.1 |  | 388.8 | 703.3 | 6807.9 |
 | `anon-aadhaar` | 1,115,080 | apple-m2-max | 1894.5 | 523.1 |  | 2195.3 | 22392.5 |
+| `anon-aadhaar` | 1,115,080 | aws-g4dn.2xlarge-tesla-t4 | 6296.8 |  | 1735.9 | 5627.8 | 44888.9 |
 
 A blank cell is a comparison that machine could not make: the backend does not exist there,
 or the prover has no such mode. It is not a zero. snarkjs has no warm mode to measure
@@ -66,19 +80,51 @@ constraint counts are the ones those projects actually ship:
 | `keccak256` | Ethereum keccak256 over one 135-byte block | [vocdoni/keccak256-circom](https://github.com/vocdoni/keccak256-circom) |
 | `anon-aadhaar` | Aadhaar QR signature, RSA-2048 plus SHA-256, with selective disclosure | [anon-aadhaar/anon-aadhaar](https://github.com/anon-aadhaar/anon-aadhaar) |
 
-Two things worth reading before quoting any of this.
+Three things worth reading before quoting any of this.
 
-**Constraint count is a poor predictor of proving time.** `keccak256` has 25% more
-constraints than `rsa2048` and proves faster on every backend here. The MSM dominates, and
-its cost tracks how many witness scalars are neither 0 nor 1, not how many constraints there
-are. A bit-decomposition-heavy circuit carries a witness full of scalars that never reach a
-bucket.
+**Constraint count is a poor predictor of proving time, and the error is large.**
+`railgun-13x01` has 41% fewer constraints than `keccak256` and takes 2.6x as long on CUDA.
+That is not an artifact of our prover: it holds on every backend, and for rapidsnark and
+snarkjs too, so it is a property of the circuit.
 
-**The GPU margin is a function of circuit size.** At 20k constraints cold, Metal is about
-1.4x the CPU backend: the key upload sits inside the timed region and there is not enough
-arithmetic to pay for it. At 1.1M warm it is 6.7x the CPU backend and 8.1x rapidsnark. A
-single headline multiplier taken from either end would misrepresent the other, which is why
-there is no headline multiplier here.
+The reason is visible in what the five MSMs are made of
+(`cargo run --release -p g16-core --example msm_shape -- bench/artifacts`):
+
+| circuit | constraints | domain | witness scalars that are 0 or 1 | witness MSM (A) | H MSM | serial MSM |
+|---|---:|---:|---:|---:|---:|---:|
+| `sha256` | 59,281 | 2^16 | 100.00% | 0.6 ms | 35.7 ms | 39.4 ms |
+| `tornado` | 28,275 | 2^15 | 2.49% | 17.4 ms | 20.0 ms | 105.6 ms |
+| `railgun-13x01` | 141,276 | 2^18 | 1.48% | 38.5 ms | 124.8 ms | 345.1 ms |
+| `rsa2048` | 190,945 | 2^18 | 97.24% | 3.4 ms | 139.3 ms | 163.8 ms |
+| `keccak256` | 239,176 | 2^18 | 100.00% | 2.2 ms | 123.3 ms | 135.7 ms |
+
+Two effects, and constraint count predicts neither.
+
+Four of the five MSMs take the witness, and the MSM skips scalars that are 0 or 1. A hash
+circuit is bit decomposition nearly all the way down, so `keccak256`'s witness is *entirely*
+zeros and ones and its witness MSM costs 2.2 ms. Railgun's joinsplit is Poseidon and EdDSA
+over full field elements, so 98.5% of its witness reaches a bucket and the same MSM costs
+38.5 ms, seventeen times more, on a circuit 41% smaller.
+
+The fifth MSM takes H and is sized by the domain, which is the next power of two above the
+constraint count. 141,276 and 239,176 both round up to 262,144, so `keccak256` and
+`railgun-13x01` pay the same H cost, 123 ms against 125 ms, though one is 69% larger.
+Crossing a power of two is what makes proving slower, not adding constraints.
+
+**A GPU is not automatically faster, and on small circuits it is often slower.** Cold on the
+T4, CUDA loses to rapidsnark on two of the three smallest circuits and to our own CPU backend
+on two of them: the key upload and the kernel launches sit inside the timed region and there
+is not enough arithmetic to pay for them. The crossover sits between 59k and 141k
+constraints. Above it the picture inverts, and at 1.1M warm CUDA is 14.6x our CPU backend
+and 14.2x rapidsnark on the same box.
+
+**A speedup multiplier without a machine attached is close to meaningless.** rapidsnark beats
+our CPU backend on six of the seven circuits on the T4's Xeon, and loses to it on all seven
+on the M2 Max, for identical work. `ark-ff`'s assembly path is x86-only, so on Apple silicon
+arkworks runs a generic Rust Montgomery multiply while rapidsnark carries hand-written
+assembly for both architectures. Our CPU backend therefore looks better than it is on the Mac
+and worse than it is on the Xeon. That is why every row names its machine and why there is no
+headline multiplier anywhere in this README.
 
 Reproduce any row:
 
