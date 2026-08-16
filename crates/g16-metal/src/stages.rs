@@ -62,6 +62,11 @@ pub const TAG: &str = "metal";
 /// 896 was measured for a bare multiply kernel on this machine and 512 for a kernel doing
 /// point arithmetic. Metal rejects a threadgroup larger than the pipeline's limit, so the
 /// preference is always `min`ed against `max_total_threads_per_threadgroup`.
+/// A, B and C: the three witness-evaluation vectors that go round the transform pipeline
+/// together. Named rather than written as a bare 3 because it is also the number of
+/// command buffers `compute_h` splits the transforms across, and the two must agree.
+const N_DOMAIN_VECTORS: usize = 3;
+
 const PREFERRED_THREADS: u64 = 256;
 
 /// Hard cap on passes fused into one dispatch, independent of the memory budget.
@@ -519,13 +524,49 @@ impl HResident {
         } else {
             t.gather_us += pack_us;
             let start = Instant::now();
+
+            // One command buffer per stage group, not one for all of them.
+            //
+            // An Apple GPU can be preempted between command buffers but not between
+            // dispatches inside a single encoder. Gather plus all six transforms in one
+            // buffer is 10 to 15 ms of back-to-back work at 2^18, which is longer than a
+            // 120 Hz frame, so macOS aborts it with
+            // kIOGPUCommandBufferCallbackErrorImpactingInteractivity rather than let it
+            // hold the display. That is not hypothetical: it killed roughly one proof in
+            // three on the larger circuits, and because `wait_ok` refuses to read the
+            // output of a faulted buffer it surfaced as a failed proof rather than a
+            // wrong one.
+            //
+            // Splitting per domain vector gives the compositor four places to get in.
+            // Nothing is serialised on the CPU to buy that: all four are committed back
+            // to back and only then waited on, and a queue runs its buffers in submission
+            // order, so the cost is four submissions instead of one and not four round
+            // trips. The stage 4 fusion survives because it rides out on the last store
+            // of vector 2, which is inside that vector's own buffer.
+            let mut cbs = Vec::with_capacity(1 + N_DOMAIN_VECTORS);
+
             let cb = st.queue.new_command_buffer();
             let enc = cb.new_compute_command_encoder();
             self.encode_gather(st, enc, &sc, n);
-            self.encode_transforms(st, enc, &sc, n, true);
             enc.end_encoding();
             cb.commit();
-            crate::cb::wait_ok(cb, "stages 0-4 (gather and transforms)")?;
+            cbs.push(("stages 0-1 (gather)", cb));
+
+            for vi in 0..N_DOMAIN_VECTORS {
+                let cb = st.queue.new_command_buffer();
+                let enc = cb.new_compute_command_encoder();
+                self.encode_transforms_vector(st, enc, &sc, n, vi, true);
+                enc.end_encoding();
+                cb.commit();
+                cbs.push(("stages 2-4 (transforms)", cb));
+            }
+
+            // In submission order, so the first failure reported is the first that
+            // happened. Waiting on an earlier buffer after a later one has completed
+            // returns immediately.
+            for (context, cb) in cbs {
+                crate::cb::wait_ok(cb, context)?;
+            }
             t.ntt_us += start.elapsed().as_micros() as u64;
         }
 
@@ -624,11 +665,30 @@ impl HResident {
         n: usize,
         fuse_h: bool,
     ) {
+        for vi in 0..N_DOMAIN_VECTORS {
+            self.encode_transforms_vector(st, enc, sc, n, vi, fuse_h);
+        }
+    }
+
+    /// The iNTT, the coset shift and the forward NTT for one of the three domain vectors.
+    ///
+    /// Split out of `encode_transforms` so each vector can be given its own command
+    /// buffer. See the comment in `compute_h` for why that matters.
+    fn encode_transforms_vector(
+        &self,
+        st: &HStages,
+        enc: &metal::ComputeCommandEncoderRef,
+        sc: &Scratch,
+        n: usize,
+        vi: usize,
+        fuse_h: bool,
+    ) {
         let log_n = self.domain.log_size;
         let last = self.batches.len() - 1;
         let size_inv = PackedFr::from_fr(&self.domain.size_inv);
 
-        for (vi, v) in [&sc.a, &sc.b, &sc.c].into_iter().enumerate() {
+        {
+            let v = [&sc.a, &sc.b, &sc.c][vi];
             // Stage 1, the iNTT. Out of place v -> t for the head, then in place on t.
             // The 1/n normalisation rides in on the load.
             for (bi, b) in self.batches.iter().enumerate() {
