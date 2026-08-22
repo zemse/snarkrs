@@ -64,6 +64,24 @@ fn floor() -> &'static WgpuBackend {
     })
 }
 
+/// Serialises every test in this binary against the one device they share.
+///
+/// Three tests here assert on `WgpuBackend::submits()`, and that counter lives on the
+/// backend, not on the call. `floor()` is a process-wide `OnceLock`, so under the default
+/// (parallel) `cargo test` another test's proof is counted into theirs and
+/// `compute_h_matches_the_cpu_backend_on_every_artifact`,
+/// `compute_h_matches_the_cpu_backend_at_every_small_domain` and
+/// `stages_zero_to_four_are_exactly_one_submit` fail outright: `cargo test -p g16-wgpu` was
+/// red and only `--test-threads=1` was green, which nothing in the file said and nothing
+/// enforced. This is what enforces it.
+///
+/// A poisoned lock is taken anyway. The test that panicked has already failed; making every
+/// later test fail as well would bury the first message.
+fn exclusive() -> std::sync::MutexGuard<'static, ()> {
+    static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GPU.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn artifacts() -> Vec<(String, PathBuf)> {
     let Ok(root) = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../bench/artifacts")
@@ -210,6 +228,7 @@ fn check_both_encodings(what: &str, run: &Run, want: &[Fr], expect_nonzero: bool
 
 #[test]
 fn compute_h_matches_the_cpu_backend_on_every_artifact() {
+    let _gpu = exclusive();
     let b = floor();
     let found = artifacts();
     assert!(
@@ -365,6 +384,7 @@ fn witness(rng: &mut SplitMix64, n: usize) -> Vec<Fr> {
 
 #[test]
 fn compute_h_matches_the_cpu_backend_at_every_small_domain() {
+    let _gpu = exclusive();
     let b = floor();
     // From 2^0 up. A one-point domain is `split_passes(0, _) == [(s0 0, k 0)]`, so it is
     // the only thing that ever compiles and dispatches the `k = 0` entry points, which U6
@@ -454,6 +474,7 @@ fn compute_h_matches_the_cpu_backend_at_every_small_domain() {
 /// validation error that `WgpuBackend::take_error` turns into an `Err`.
 #[test]
 fn a_key_with_no_coefficients_still_binds() {
+    let _gpu = exclusive();
     let b = floor();
     for empty_a in [false, true] {
         let mut rng = SplitMix64(0x00e3_0000 ^ u64::from(empty_a));
@@ -517,6 +538,7 @@ fn a_key_with_no_coefficients_still_binds() {
 
 #[test]
 fn stages_zero_to_four_are_exactly_one_submit() {
+    let _gpu = exclusive();
     let b = floor();
     let mut rng = SplitMix64(0x0517_0000);
     // 2^10 needs two NTT batches at the shipped tile, so this counts the multi-dispatch
@@ -576,6 +598,7 @@ fn stages_zero_to_four_are_exactly_one_submit() {
 
 #[test]
 fn the_pooled_scratch_is_exclusive_per_handle_and_returns_on_drop() {
+    let _gpu = exclusive();
     let b = floor();
     let mut rng = SplitMix64(0x9001);
     let (n, n_vars) = (256usize, 200usize);
@@ -644,6 +667,7 @@ fn the_pooled_scratch_is_exclusive_per_handle_and_returns_on_drop() {
 
 #[test]
 fn one_circuit_computes_h_concurrently() {
+    let _gpu = exclusive();
     let b = floor();
     let mut rng = SplitMix64(0x00c0_11de);
     let (n, n_vars) = (512usize, 400usize);
@@ -756,6 +780,7 @@ fn compare_modes(stages: &HStages, w: &[Fr], reps: usize) -> [(u64, u64); 2] {
 /// `TASKS.md`.
 #[test]
 fn the_fusion_is_measured_and_not_assumed() {
+    let _gpu = exclusive();
     let b = floor();
     let found = artifacts();
     assert!(!found.is_empty(), "no artifacts under bench/artifacts");
@@ -828,6 +853,7 @@ fn empty_submit_us() -> u64 {
 
 #[test]
 fn the_h_join_pipeline_layout_declares_at_most_eight_storage_buffers() {
+    let _gpu = exclusive();
     let b = floor();
     let entries = HJoin::bind_group_layout_entries();
     let storage = HJoin::storage_buffer_count();
@@ -895,6 +921,7 @@ const SENTINEL: u32 = 0xffff_ffff;
 /// A round element count is what makes a bounds guard never get asked a question.
 #[test]
 fn the_standalone_join_writes_exactly_the_range_it_was_given() {
+    let _gpu = exclusive();
     let b = floor();
     const N: u32 = 1000;
     let mut rng = SplitMix64(0x5_1ac);
@@ -1046,6 +1073,7 @@ fn join_us(
 
 #[test]
 fn the_standalone_join_workgroup_size_is_measured() {
+    let _gpu = exclusive();
     let b = floor();
     const SIZES: [u32; 4] = [32, 64, 128, 256];
     let mut totals = [0.0f64; SIZES.len()];
@@ -1113,6 +1141,7 @@ fn the_standalone_join_workgroup_size_is_measured() {
 
 #[test]
 fn a_handle_under_another_tag_is_not_a_wgpu_handle() {
+    let _gpu = exclusive();
     let b = floor();
     let mut rng = SplitMix64(0x7a6);
     let (n, n_vars) = (64usize, 40usize);
