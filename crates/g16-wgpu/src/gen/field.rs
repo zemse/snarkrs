@@ -27,7 +27,7 @@
 //! lines to catch a copy drifting. `g16-wgpu` needs no such test because there is nothing to
 //! drift. The Montgomery constants `R` and `R^2` that the shader also needs are *derived*
 //! from the same modulus by [`pow2_mod`] rather than retyped, and
-//! [`tests::derived_montgomery_constants_match_ark`] checks that derivation against `ark-ff`.
+//! `tests::derived_montgomery_constants_match_ark` checks that derivation against `ark-ff`.
 //!
 //! # What is emitted
 //!
@@ -39,15 +39,39 @@
 //!
 //! # Carry bounds, stated exactly rather than "comfortably"
 //!
-//! `mul64` fits in `u32` with **zero** headroom: `p11 <= 2^32 - 2^17 + 1`, plus two terms of
-//! at most `2^16 - 2`, plus `mid >> 16 <= 2`, sums to exactly `2^32 - 1`. No rearrangement of
-//! it is safe without redoing that sum.
+//! Every operand of every routine here must be a **canonical** representative, `< m`. Nothing
+//! checks it, and the bounds below all rest on it.
+//!
+//! `mul64`'s high word fits in `u32` with **zero** headroom: `p11 <= 2^32 - 2^17 + 1`, plus two
+//! terms of at most `2^16 - 2`, plus `mid >> 16 <= 2`, sums to exactly `2^32 - 1`. The largest
+//! value actually attainable is `2^32 - 2`, at `mul64(0xffffffff, 0xffffffff)`, which
+//! `tests/field_adversarial.rs::mul64_is_exact_including_at_its_true_maximum` runs on the
+//! device. Both limbs really can be all ones: BN254's top modulus limb is `0x30644e72`, so
+//! `0x30644e71_ffffffff...ffffffff` is a legal element of either field. No rearrangement of
+//! `mul64` is safe without redoing that sum.
+//!
+//! **The CIOS carry word `c = p.y + cy + cy2` does not wrap, but not for the reason it is
+//! tempting to give.** `p.y` reaches `2^32 - 2` and the carry out of `t[j] + p.x + c` reaches
+//! **2**, both measured over 20,009 pairs by
+//! `tests/field_adversarial.rs::the_cios_carry_word_never_wraps_and_has_exactly_zero_headroom`,
+//! so "`p.y` is small, the two carry bits fit" is not an argument. What holds is the joint
+//! bound: one inner step computes `a[j]*b_i + t[j] + c` with all of `a[j]`, `b_i`, `t[j]`, `c`
+//! at most `2^32 - 1`, so the whole quantity is at most
+//! `(2^32-1)^2 + 2*(2^32-1) = 2^64 - 1`. That is a 64-bit value whose low word is the new
+//! `t[j]` and whose high word is the new `c`, so `c <= 2^32 - 1` by construction, inductively,
+//! from `c = 0`. The same sum bounds the second inner loop with `m` in place of `a`. The
+//! measured maximum of `c` is exactly `0xffffffff`, so the headroom is zero rather than merely
+//! thin.
 //!
 //! CIOS needs `s + 2 = 10` accumulator words. At the start of outer round `i` the running
 //! value satisfies `T < 2m`; the round forms `T + a*b_i + m*q_i < 2m*(1 + 2^32) < 2^288`,
-//! which is nine words, and the tenth holds the single bit the second inner loop's carry chain
-//! can push out of the ninth before the round's shift by `2^32` restores `T < 2m`. That is the
-//! Koc-Acar-Kaliski bound and it is why [`Field::mul_cios32`] emits `t0 .. t9`.
+//! which is nine words. `t9` is the tenth: it catches the carry out of the ninth word during
+//! the *first* inner loop, and the second inner loop's own carry out of the ninth word is then
+//! added to it to form the ninth word after the round's shift by `2^32`, which restores
+//! `T < 2m`. That is the Koc-Acar-Kaliski bound and it is why `Field::mul_cios32` emits
+//! `t0 .. t9`. Since `m < 2^255` is asserted before emission, `2m - 1 < 2^256` and the ninth
+//! word is zero at the end, which is what makes one conditional subtraction the right
+//! reduction and not just a cheap one.
 
 use std::fmt::Write as _;
 
@@ -450,7 +474,11 @@ impl Field {
             writeln!(s, "    {{").unwrap();
             writeln!(s, "    let bi = b[{i}];").unwrap();
             writeln!(s, "    var c: u32 = 0u;").unwrap();
-            // t += a * b[i]. `p.y <= 2^32 - 2^17` leaves room for the two carry bits.
+            // t += a * b[i]. The carry word `c = p.y + cy + cy2` cannot wrap, because
+            // a[j]*b_i + t[j] + c <= (2^32-1)^2 + 2*(2^32-1) = 2^64 - 1 and (c, t[j]) is
+            // exactly that 64-bit value. Not because p.y is small: it reaches 2^32 - 2, and
+            // cy + cy2 reaches 2. See the module docs and
+            // tests/field_adversarial.rs, which measures both maxima.
             for j in 0..8 {
                 writeln!(
                     s,
@@ -492,10 +520,12 @@ impl Field {
             .unwrap();
             writeln!(s, "    }}").unwrap();
         }
-        // t8 is zero here and is therefore not tested: the round bound gives T <= 2m, and the
-        // `modulus < 2^255` assertion above makes 2m < 2^256. Testing it would be worse than
-        // useless, because if it could ever be nonzero one subtraction would not be enough
-        // and the honest fix would be a different reduction, not an extra `||`.
+        // t8 is zero here and is therefore not tested: the round bound gives T < 2m (strictly,
+        // T <= 2m - 1), and the `modulus < 2^255` assertion above makes 2m - 1 < 2^256.
+        // Testing it would be worse than useless, because if it could ever be nonzero one
+        // subtraction would not be enough and the honest fix would be a different reduction,
+        // not an extra `||`. The host mirror in tests/field_adversarial.rs asserts t8 == 0 and
+        // T < 2m on every pair it runs, including the all-ones operands.
         writeln!(s, "    var borrow: u32 = 0u;").unwrap();
         for j in 0..8 {
             writeln!(
@@ -507,8 +537,10 @@ impl Field {
         }
         // `borrow == 0` means t >= m, so take the reduced form. Note `>=`, not `>`: research
         // file 02 flags ICME's `conditional_reduce` for using a strict `bigint_gt`. See
-        // `tests/field.rs::the_conditional_subtraction_triggers_at_the_boundary` for what that
-        // bug can and cannot reach.
+        // `tests/field.rs::the_conditional_subtraction_triggers_at_the_boundary` and its `Fq`
+        // twin in `tests/field_adversarial.rs` for what that bug can and cannot reach. The
+        // multiply can never produce t == m exactly, so the strict form is only wrong here at
+        // t == m + 1 and above; `add` is where `>` really breaks, and it is tested there too.
         writeln!(s, "    let take = borrow == 0u;").unwrap();
         let sel = (0..8)
             .map(|j| format!("select(t{j}, f{j}, take)"))

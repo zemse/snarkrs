@@ -46,8 +46,8 @@ const ITERS: u32 = 256;
 /// `take = false` into the generated `fr_mul` was measured passing an 8-element check in
 /// Chrome while running 1.6% faster. At 256 elements the miss probability is 4e-20.
 ///
-/// The native sweep in `benches/limb_sweep/main.rs` and the wasm one both still check 8,
-/// so both carry that 24% hole.
+/// The native sweep in `benches/limb_sweep/main.rs` and the wasm one were raised to 256 in
+/// the same commit, so no harness in the tree still carries that 24% hole.
 const CHECK: usize = 256;
 /// SplitMix64 seed, the same constant `benches/limb_sweep/main.rs` uses.
 const SEED: u64 = 0xC0FF_EE11;

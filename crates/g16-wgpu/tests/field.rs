@@ -557,7 +557,12 @@ fn fr_pairs(n: usize) -> (Vec<Fr>, Vec<Fr>) {
     (a, b)
 }
 
-fn fq_pairs(n: usize) -> (Vec<Fq>, Vec<Fq>) {
+/// `seed` is a parameter and not a constant because this is called twice to build the `Fq2`
+/// inputs, and with a fixed seed both calls return the same vectors: `a == b` for every pair,
+/// `fq2_sub` is only ever asked for zero, and `fq2_mul` collapses into `fq2_sqr` because
+/// Karatsuba's cross term `(a0+a1)(b0+b1) - a0 b0 - a1 b1` is `2 a0 a1` when `b == a`. An
+/// operand swap inside `fq2_mul` was measured passing this whole file with the seed shared.
+fn fq_pairs(n: usize, seed: u64) -> (Vec<Fq>, Vec<Fq>) {
     let m = big(&FQ_MODULUS);
     let edges: Vec<Fq> = edge_reps(&m).into_iter().map(fq_of).collect();
     let mut a = Vec::new();
@@ -568,7 +573,7 @@ fn fq_pairs(n: usize) -> (Vec<Fq>, Vec<Fq>) {
             b.push(*y);
         }
     }
-    let mut rng = SplitMix64(0xBF58_476D_1CE4_E5B9);
+    let mut rng = SplitMix64(seed);
     while a.len() < n + edges.len() * edges.len() {
         let mut bytes = [0u8; 32];
         for c in bytes.chunks_mut(8) {
@@ -679,7 +684,7 @@ fn fr_matches_ark_on_random_and_edge_inputs() {
 #[test]
 fn fq_matches_ark_on_random_and_edge_inputs() {
     let g = gpu();
-    let (a, b) = fq_pairs(4096);
+    let (a, b) = fq_pairs(4096, 0xBF58_476D_1CE4_E5B9);
     let n = a.len();
     let fa = flat_fq(&a);
     let fb = flat_fq(&b);
@@ -740,8 +745,11 @@ fn fq_matches_ark_on_random_and_edge_inputs() {
 #[test]
 fn fq2_matches_ark_on_random_and_edge_inputs() {
     let g = gpu();
-    let (c0a, c1a) = fq_pairs(2048);
-    let (c0b, c1b) = fq_pairs(2048);
+    // Two seeds, not one. The edge block at the head of each vector is still the same 121
+    // ordered pairs either way, so the a == b cases are not lost, only stopped from being the
+    // only cases.
+    let (c0a, c1a) = fq_pairs(2048, 0xBF58_476D_1CE4_E5B9);
+    let (c0b, c1b) = fq_pairs(2048, 0x94D0_49BB_1331_11EB);
     let n = c0a.len();
     let a: Vec<Fq2> = c0a
         .iter()
