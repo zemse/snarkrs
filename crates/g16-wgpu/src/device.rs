@@ -1,0 +1,404 @@
+//! Adapter, device and limits profile: the one place that decides what this backend is
+//! allowed to assume about the hardware.
+//!
+//! # Why the default profile is the browser floor and not the adapter's own limits
+//!
+//! A WebGPU device created without `requiredLimits` gets the spec defaults even on an
+//! adapter advertising far more, with no warning anywhere. The gap measured on this M2 Max:
+//! 4 GiB of storage-buffer binding against the spec's
+//! 128 MiB (32x), 32 KiB of workgroup storage against 16 KiB (2x), 1024 invocations per
+//! workgroup against 256 (4x), and one extra storage buffer per stage, 9 against 8 (see the
+//! correction below). Every one is a cliff a kernel can be written off the edge of, and
+//! native `cargo test` will not notice: `SHADER_INT64` is even reported as available on
+//! native Metal through wgpu and does not exist in the WebGPU specification at all.
+//!
+//! Prior art records heliax shipping exactly that bug
+//! twice. So [`LimitsProfile::Floor`] is the default, it is what tests use, and
+//! [`LimitsProfile::Raised`] is opt-in through `G16_WGPU_LIMITS=raised` and buys throughput
+//! only, never correctness.
+//!
+//! # Three limits that are physics
+//!
+//! `maxComputeWorkgroupsPerDimension` is 65535, `maxBindGroups` is 4 and
+//! `minStorageBufferOffsetAlignment` is 256 at every tier of every browser, so no browser
+//! profile ever improves them. Kernels are designed against those three as constants. Native
+//! Metal does report a finer 32-byte storage alignment here, which is exactly the kind of
+//! headroom that must not be leaned on.
+//!
+//! # Measured here, and it corrects that: `Raised` buys almost nothing on storage buffers
+//!
+//! An earlier probe recorded 29 storage buffers per shader stage on
+//! this M2 Max, 3.6x the spec's 8, which would make design §4's 8-buffer squeeze look like a
+//! Floor-only problem. It is not. That 29 was measured on an instance without
+//! `STRICT_WEBGPU_COMPLIANCE`. With the flag on, which is unconditional here and in every
+//! test, `adapter.limits()` reports **9**, so `Raised` is worth exactly one extra storage
+//! buffer per stage. Both numbers taken back to back on this machine, wgpu 30.0.1, Metal:
+//!
+//! ```text
+//! strict=false: storage_buffers_per_shader_stage 29
+//! strict=true:  storage_buffers_per_shader_stage  9
+//! ```
+//!
+//! Nothing else in the table moves with the flag. Plan the kernels for 8 and treat the
+//! ninth as slack, not as headroom.
+//!
+//! `RequestAdapterOptions::apply_limit_buckets`, wgpu's anti-fingerprinting rounding that
+//! browsers apply to adapter limits, changes nothing at all on this adapter (every field
+//! identical with it on and off), so it is left off and the adapter column stays raw.
+//!
+//! # What "granted" means, and why the native column is a tautology
+//!
+//! `wgpu::DeviceDescriptor::required_limits` is documented as "exactly the specified limits,
+//! and no better or worse, will be allowed in validation", and `Device::limits()` echoes the
+//! request back. So on native the granted column always equals the requested column and
+//! proves nothing. The column that carries information is the adapter's, which is why
+//! [`WgpuBackend::limits_table`] prints all three.
+
+use std::sync::{Arc, Mutex};
+
+use g16_core::ProveError;
+
+use crate::pipelines::PrepareCost;
+
+pub(crate) fn bad(reason: impl Into<String>) -> ProveError {
+    ProveError::Backend {
+        backend: "wgpu",
+        reason: reason.into(),
+    }
+}
+
+/// Which set of limits the device is requested with.
+///
+/// Not a performance knob with a safe default: picking [`Self::Raised`] changes what will
+/// compile, and a kernel that only fits `Raised` is a kernel that fails in a stock browser.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LimitsProfile {
+    /// `wgpu::Limits::default()`, which is the WebGPU specification's defaults verbatim:
+    /// 128 MiB storage binding, 256 MiB buffer, 64 KiB uniform binding, 16 KiB workgroup
+    /// storage, 256 invocations per workgroup, 8 storage buffers per shader stage, 4 bind
+    /// groups, 65535 workgroups per dimension, 256-byte binding alignment.
+    #[default]
+    Floor,
+    /// Whatever the adapter reports. Larger buffers and wider workgroups, and nothing this
+    /// backend needs in order to be correct. On this M2 Max, with strict WebGPU compliance
+    /// on: 4 GiB buffer and storage binding against 256 MiB and 128 MiB, 32 KiB workgroup
+    /// storage against 16 KiB, 1024 invocations against 256, and 9 storage buffers per stage
+    /// against 8. That last one is the correction in the module docs, and it is why no
+    /// kernel is allowed to need a ninth.
+    Raised,
+}
+
+impl LimitsProfile {
+    /// Reads `G16_WGPU_LIMITS`, defaulting to [`Self::Floor`].
+    ///
+    /// `std::env::var` is not a `cfg` hazard here: on `wasm32-unknown-unknown` std compiles
+    /// it against an empty environment and it returns `NotPresent`, so the browser build
+    /// gets `Floor` and never has to be special-cased. A browser that wants `Raised` will
+    /// get an explicit constructor at U13, not an environment variable it cannot set.
+    pub fn from_env() -> Result<Self, ProveError> {
+        match std::env::var("G16_WGPU_LIMITS") {
+            Ok(v) => Self::parse(&v),
+            Err(_) => Ok(Self::Floor),
+        }
+    }
+
+    /// Rejects an unrecognised value rather than falling back to `Floor`.
+    ///
+    /// A typo that silently selects the default would make `G16_WGPU_LIMITS=rasied` report a
+    /// Floor number as a Raised one, which is the class of measurement error this repo keeps
+    /// finding.
+    pub fn parse(v: &str) -> Result<Self, ProveError> {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "floor" | "" => Ok(Self::Floor),
+            "raised" => Ok(Self::Raised),
+            other => Err(bad(format!(
+                "G16_WGPU_LIMITS={other:?} is not a profile, expected \"floor\" or \"raised\""
+            ))),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Floor => "floor",
+            Self::Raised => "raised",
+        }
+    }
+
+    /// The limits to request from this adapter under this profile.
+    pub fn required_limits(self, adapter: &wgpu::Adapter) -> wgpu::Limits {
+        match self {
+            Self::Floor => wgpu::Limits::default(),
+            Self::Raised => adapter.limits(),
+        }
+    }
+}
+
+/// One adapter, one device, one queue, and the running total of what compiling cost.
+///
+/// Built once per process. There is no `Clone`: what makes it expensive is the pipeline
+/// compiles hanging off it, and U11 will share those by handing every circuit an `Arc` of
+/// the same [`crate::pipelines::Kernels`] rather than by duplicating anything.
+///
+/// This is not yet a `g16_core::Backend`. Stages 0 to 9 do not exist, so an implementation
+/// would have to either lie or panic; U11 adds it once there is something to run.
+pub struct WgpuBackend {
+    // Held because dropping the instance while a device is alive is not something wgpu
+    // promises anything about, and on wasm it owns the `GPU` handle.
+    _instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    info: wgpu::AdapterInfo,
+    profile: LimitsProfile,
+    requested: wgpu::Limits,
+    /// First uncaptured device error, if any. See [`Self::take_error`].
+    error: Arc<Mutex<Option<String>>>,
+    cost: Mutex<PrepareCost>,
+}
+
+/// `g16_core::Backend` and `PreparedCircuit` are both `Send + Sync`, so U11 cannot land
+/// unless this holds. On wasm it holds only through wgpu's `fragile-send-sync-non-atomic-wasm`
+/// feature, whose own cfg is `not(target_feature = "atomics")`, so dropping the feature or
+/// turning on browser threads breaks it. Checking it here makes that a compile error in this
+/// crate rather than a trait-bound error five units later.
+const fn assert_send_sync<T: Send + Sync>() {}
+const _: () = assert_send_sync::<WgpuBackend>();
+
+impl WgpuBackend {
+    /// Opens an adapter and a device at the profile named by `G16_WGPU_LIMITS`.
+    ///
+    /// Fails rather than falling back to anything: a benchmark that quietly measures a
+    /// different backend is the exact failure this repo exists to avoid.
+    pub async fn new() -> Result<Self, ProveError> {
+        Self::with_profile(LimitsProfile::from_env()?).await
+    }
+
+    /// Same, at a caller-chosen profile.
+    pub async fn with_profile(profile: LimitsProfile) -> Result<Self, ProveError> {
+        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
+        // The same switch as `WGPU_STRICT_WEBGPU_COMPLIANCE=1`, set here so a run that forgot
+        // the variable still fails on a Metal-only construct instead of passing natively and
+        // failing in Chrome at U13. It is on under `Raised` too: `Raised` widens limits, it
+        // does not license a kernel that only one implementation can compile.
+        desc.flags |= wgpu::InstanceFlags::STRICT_WEBGPU_COMPLIANCE;
+        let instance = wgpu::Instance::new(desc);
+
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                force_fallback_adapter: false,
+                compatible_surface: None,
+                apply_limit_buckets: false,
+            })
+            .await
+            .map_err(|e| bad(format!("no wgpu adapter on this machine: {e}")))?;
+        let info = adapter.get_info();
+        let requested = profile.required_limits(&adapter);
+
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("g16-wgpu"),
+                // Empty on purpose and at both profiles. Every feature beyond the WebGPU
+                // core set is one no browser has, and `SHADER_INT64` in particular is
+                // reported as present on native Metal here while not existing in the
+                // specification at all.
+                required_features: wgpu::Features::empty(),
+                required_limits: requested.clone(),
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| {
+                bad(format!(
+                    "adapter {:?} refused a device at the {} profile: {e}",
+                    info.name,
+                    profile.as_str()
+                ))
+            })?;
+
+        // wgpu's default uncaptured-error handler panics on native and logs to the console on
+        // the web, and the web half is the problem: a shader that fails validation in Chrome
+        // otherwise leaves no trace in Rust and the dispatch simply produces garbage.
+        // Recording the first one makes it a `ProveError` on both targets.
+        //
+        // The trade is that a native validation error stops being an immediate panic, so it
+        // is also written to stderr here. That keeps the loud native behaviour (the message
+        // appears in test output at the moment it happens) while still letting
+        // [`Self::take_error`] turn it into a returned error. `eprintln!` is a no-op on
+        // wasm32-unknown-unknown rather than a compile error, so no `cfg` is needed.
+        let error = Arc::new(Mutex::new(None::<String>));
+        let sink = error.clone();
+        device.on_uncaptured_error(Arc::new(move |e: wgpu::Error| {
+            eprintln!("wgpu device error: {e}");
+            let mut slot = sink.lock().unwrap();
+            if slot.is_none() {
+                *slot = Some(e.to_string());
+            }
+        }));
+
+        Ok(Self {
+            _instance: instance,
+            adapter,
+            device,
+            queue,
+            info,
+            profile,
+            requested,
+            error,
+            cost: Mutex::new(PrepareCost::default()),
+        })
+    }
+
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
+    pub fn adapter_info(&self) -> &wgpu::AdapterInfo {
+        &self.info
+    }
+
+    pub fn profile(&self) -> LimitsProfile {
+        self.profile
+    }
+
+    /// What was asked for. Under [`LimitsProfile::Floor`] this is `wgpu::Limits::default()`
+    /// field for field, which is what `tests/device.rs` asserts.
+    pub fn requested_limits(&self) -> &wgpu::Limits {
+        &self.requested
+    }
+
+    /// What the device says it has. Equal to [`Self::requested_limits`] by construction on
+    /// native wgpu; see the module docs.
+    pub fn granted_limits(&self) -> wgpu::Limits {
+        self.device.limits()
+    }
+
+    /// What the hardware offers, which is the only one of the three that carries information
+    /// on native.
+    pub fn adapter_limits(&self) -> wgpu::Limits {
+        self.adapter.limits()
+    }
+
+    /// Takes the first uncaptured device error since the last call, if there was one.
+    ///
+    /// Errors arrive asynchronously on both targets, so this is a poll and not a barrier:
+    /// call it after a submit has been waited on, not immediately after encoding.
+    pub fn take_error(&self) -> Option<String> {
+        self.error.lock().unwrap().take()
+    }
+
+    pub(crate) fn charge(&self, cost: PrepareCost) {
+        self.cost.lock().unwrap().add(cost);
+    }
+
+    /// Everything [`crate::pipelines::Kernels::build`] has cost on this device so far.
+    ///
+    /// Tracked from this unit rather than discovered at the end:
+    /// An earlier measurement records 129 s of pipeline creation for one
+    /// monolithic shader with an unrolled 20-limb multiply inlined at a dozen sites, which is
+    /// precisely the shape the MSM kernels take at U9 and U10.
+    pub fn prepare_cost(&self) -> PrepareCost {
+        *self.cost.lock().unwrap()
+    }
+
+    /// The limits that matter to this backend, as requested / granted / adapter.
+    ///
+    /// Twelve rows out of the roughly sixty fields in `wgpu::Limits`, chosen as the ones
+    /// measured to differ from the spec floor, plus the two alignments
+    /// the parameter ring is built around. Printing all sixty would bury them.
+    pub fn limits_table(&self) -> String {
+        let (r, g, a) = (
+            self.requested_limits(),
+            self.granted_limits(),
+            self.adapter_limits(),
+        );
+        let rows: [(&str, u64, u64, u64); 12] = [
+            (
+                "max_buffer_size",
+                r.max_buffer_size,
+                g.max_buffer_size,
+                a.max_buffer_size,
+            ),
+            (
+                "max_storage_buffer_binding_size",
+                r.max_storage_buffer_binding_size,
+                g.max_storage_buffer_binding_size,
+                a.max_storage_buffer_binding_size,
+            ),
+            (
+                "max_uniform_buffer_binding_size",
+                r.max_uniform_buffer_binding_size,
+                g.max_uniform_buffer_binding_size,
+                a.max_uniform_buffer_binding_size,
+            ),
+            (
+                "max_compute_workgroup_storage_size",
+                r.max_compute_workgroup_storage_size as u64,
+                g.max_compute_workgroup_storage_size as u64,
+                a.max_compute_workgroup_storage_size as u64,
+            ),
+            (
+                "max_compute_invocations_per_workgroup",
+                r.max_compute_invocations_per_workgroup as u64,
+                g.max_compute_invocations_per_workgroup as u64,
+                a.max_compute_invocations_per_workgroup as u64,
+            ),
+            (
+                "max_compute_workgroup_size_x",
+                r.max_compute_workgroup_size_x as u64,
+                g.max_compute_workgroup_size_x as u64,
+                a.max_compute_workgroup_size_x as u64,
+            ),
+            (
+                "max_compute_workgroups_per_dimension",
+                r.max_compute_workgroups_per_dimension as u64,
+                g.max_compute_workgroups_per_dimension as u64,
+                a.max_compute_workgroups_per_dimension as u64,
+            ),
+            (
+                "max_storage_buffers_per_shader_stage",
+                r.max_storage_buffers_per_shader_stage as u64,
+                g.max_storage_buffers_per_shader_stage as u64,
+                a.max_storage_buffers_per_shader_stage as u64,
+            ),
+            (
+                "max_bind_groups",
+                r.max_bind_groups as u64,
+                g.max_bind_groups as u64,
+                a.max_bind_groups as u64,
+            ),
+            (
+                "max_dynamic_uniform_buffers_per_pipeline_layout",
+                r.max_dynamic_uniform_buffers_per_pipeline_layout as u64,
+                g.max_dynamic_uniform_buffers_per_pipeline_layout as u64,
+                a.max_dynamic_uniform_buffers_per_pipeline_layout as u64,
+            ),
+            (
+                "min_uniform_buffer_offset_alignment",
+                r.min_uniform_buffer_offset_alignment as u64,
+                g.min_uniform_buffer_offset_alignment as u64,
+                a.min_uniform_buffer_offset_alignment as u64,
+            ),
+            (
+                "min_storage_buffer_offset_alignment",
+                r.min_storage_buffer_offset_alignment as u64,
+                g.min_storage_buffer_offset_alignment as u64,
+                a.min_storage_buffer_offset_alignment as u64,
+            ),
+        ];
+        let mut s = format!(
+            "{:47} {:>12} {:>12} {:>12}\n",
+            format!("limit ({})", self.profile.as_str()),
+            "requested",
+            "granted",
+            "adapter"
+        );
+        for (name, req, got, adp) in rows {
+            s.push_str(&format!("{name:47} {req:>12} {got:>12} {adp:>12}\n"));
+        }
+        s
+    }
+}
