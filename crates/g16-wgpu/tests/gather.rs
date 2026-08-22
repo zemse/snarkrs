@@ -44,6 +44,9 @@ use g16_wgpu::gen::gather as wgsl;
 use g16_wgpu::{CsrHost, CsrTables, GatherAbc, LimitsProfile, ParamRing, Readback, WgpuBackend};
 use g16_zkey::{wtns::Witness, Coefficients, ProvingKey};
 
+#[path = "gpulock/mod.rs"]
+mod gpulock;
+
 // ---------------------------------------------------------------------------
 // Device, built once for the whole binary
 // ---------------------------------------------------------------------------
@@ -697,6 +700,57 @@ fn an_output_buffer_too_short_for_the_domain_is_refused_before_the_dispatch() {
 /// is wrong fails rather than wins.
 #[test]
 fn the_design_picked_the_workgroup_size_that_wins() {
+    // Timing, so it takes the cross-process lock: cargo runs each tests/*.rs as its own
+    // process and the per-process Mutex this file used could never have serialised it
+    // against them. See tests/gpulock.
+    //
+    // The lock keeps the timing tests off each other, and that is all it can do. The
+    // correctness tests are not locked, on purpose, because serialising 40 of them to make
+    // one measurement tidy is a bad trade, so this sweep still runs while a sibling binary
+    // is proving at 2^16. That is why the hard bar is retried rather than trusted first
+    // time: contention inflates one size and not another, and the ratio it produces is
+    // fiction. A real regression reproduces on every attempt, noise does not.
+    let _gpu_timing = gpulock::exclusive_gpu();
+    let mut worst = f64::INFINITY;
+    let mut at = String::new();
+    let mut judged_any = 0usize;
+    for attempt in 1..=3 {
+        let (ratio, name, judged) = sweep_once();
+        if judged == 0 {
+            return;
+        }
+        judged_any = judged;
+        if ratio < worst {
+            worst = ratio;
+            at = name;
+        }
+        if worst <= 1.5 {
+            break;
+        }
+        println!(
+            "attempt {attempt}: worst ratio {:.2}x is over the 1.5x bar; re-measuring, \
+             because contention from an unlocked sibling binary looks exactly like this",
+            worst
+        );
+    }
+    assert!(
+        worst <= 1.5,
+        "workgroup {} is {:.0}% worse than the best size on {at}, reproduced over 3 \
+         measurements; change gen::gather::WORKGROUP and say so",
+        wgsl::WORKGROUP,
+        (worst - 1.0) * 100.0
+    );
+    println!(
+        "worst case for the shipped size {} over {judged_any} artifacts: {:+.1}% on {at} \
+         (best of 3 measurements)",
+        wgsl::WORKGROUP,
+        (worst - 1.0) * 100.0
+    );
+}
+
+/// One pass of the sweep. Returns the worst shipped-against-best ratio, where it happened,
+/// and how many artifacts produced a usable timing.
+fn sweep_once() -> (f64, String, usize) {
     let found = artifacts();
     assert!(!found.is_empty(), "no artifacts under bench/artifacts");
     const SIZES: [u32; 4] = [32, 64, 128, 256];
@@ -767,7 +821,7 @@ fn the_design_picked_the_workgroup_size_that_wins() {
 
     if judged == 0 {
         println!("every artifact's timing was discarded; run with --test-threads=1 to get a sweep");
-        return;
+        return (0.0, String::new(), 0);
     }
 
     // Two bars, because this is a timing test inside a binary of other GPU tests.
@@ -791,16 +845,5 @@ fn the_design_picked_the_workgroup_size_that_wins() {
             (worst_ratio - 1.0) * 100.0
         );
     }
-    assert!(
-        worst_ratio <= 1.5,
-        "workgroup {} is {:.0}% worse than the best size on {worst_at}; \
-         change gen::gather::WORKGROUP and say so",
-        wgsl::WORKGROUP,
-        (worst_ratio - 1.0) * 100.0
-    );
-    println!(
-        "worst case for the shipped size {} over {judged} artifacts: {:+.1}% on {worst_at}",
-        wgsl::WORKGROUP,
-        (worst_ratio - 1.0) * 100.0
-    );
+    (worst_ratio, worst_at, judged)
 }

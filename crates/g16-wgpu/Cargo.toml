@@ -58,6 +58,10 @@ wgpu = { version = "30.0.1", default-features = false, features = [
 # compile time.
 
 [dev-dependencies]
+# `flock`, for the cross-process GPU lock in tests/gpulock. `cargo test` runs each test
+# binary as its own process, so the per-process Mutex the timing tests used could never have
+# serialised them against each other. Test-only and never reaches wasm.
+libc = "0.2"
 # The NTT oracle. U6 checks the device transform against `g16_ntt::CpuNtt` elementwise, and
 # that crate is deliberately not a runtime dependency: the production GPU path implements
 # `compute_h` directly and never goes through `NttBackend`, because round-tripping every one

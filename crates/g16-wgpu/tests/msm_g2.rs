@@ -45,6 +45,9 @@ use g16_wgpu::msm::{pack_scalars, DigitBuffers, DigitPlan, MsmDigits};
 use g16_wgpu::points::{MsmPointsG2, PointBuffers, PointPlan};
 use g16_wgpu::{LimitsProfile, ParamRing, Readback, WgpuBackend};
 
+#[path = "gpulock/mod.rs"]
+mod gpulock;
+
 // ---------------------------------------------------------------------------
 // Device and pipelines, built once for the whole binary
 // ---------------------------------------------------------------------------
@@ -979,6 +982,9 @@ fn argmin(xs: &[f64]) -> usize {
 
 #[test]
 fn the_reduction_threadgroup_is_measured() {
+    // Timing. Takes the cross-process lock, because cargo runs the test binaries in
+    // parallel and a sibling binary saturating the GPU makes every number here fiction.
+    let _gpu_timing = gpulock::exclusive_gpu();
     let _gpu = exclusive();
     let bench = Bench::new(32_768, 12);
     let curve = wgsl::G2;
@@ -1033,6 +1039,9 @@ fn the_reduction_threadgroup_is_measured() {
 
 #[test]
 fn the_slice_length_is_measured() {
+    // Timing. Takes the cross-process lock, because cargo runs the test binaries in
+    // parallel and a sibling binary saturating the GPU makes every number here fiction.
+    let _gpu_timing = gpulock::exclusive_gpu();
     let _gpu = exclusive();
     let bench = Bench::new(32_768, 12);
     let p = points();
@@ -1164,6 +1173,9 @@ fn a_plan_built_for_the_wrong_reduction_width_is_refused() {
 /// and an input description honest enough to reproduce.
 #[test]
 fn what_one_g2_msm_costs_against_the_cpu() {
+    // Timing. Takes the cross-process lock, because cargo runs the test binaries in
+    // parallel and a sibling binary saturating the GPU makes every number here fiction.
+    let _gpu_timing = gpulock::exclusive_gpu();
     let _gpu = exclusive();
     let p = points();
     let cpu = CpuMsm::new();

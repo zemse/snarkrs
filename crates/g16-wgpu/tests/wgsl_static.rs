@@ -644,6 +644,10 @@ fn every_uniform_parameter_struct_matches_its_host_mirror() {
             msmgen::fused_module_at(v, Workgroups::default(), LimbPick::default()),
             "MsmParams",
             std::mem::size_of::<g16_wgpu::MsmParams>(),
+            // The last four are the point stages'. They were added to both sides when the
+            // G2 MSM landed and this list was not, which is precisely the drift this test
+            // exists to catch: the host struct and the WGSL struct agreed with each other
+            // and disagreed with the expectation written here.
             &[
                 "n",
                 "c",
@@ -652,6 +656,10 @@ fn every_uniform_parameter_struct_matches_its_host_mirror() {
                 "cap",
                 "scalar_off",
                 "lo",
+                "base_off",
+                "ones_groups",
+                "slice_len",
+                "slices",
                 "pad0",
             ],
         ),

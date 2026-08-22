@@ -41,6 +41,9 @@ use g16_wgpu::gen::ntt::Mode;
 use g16_wgpu::{Direction, Epilogue, LimitsProfile, Ntt, NttTables, ParamRing, Readback};
 use g16_wgpu::{Scale, Transform, WgpuBackend};
 
+#[path = "gpulock/mod.rs"]
+mod gpulock;
+
 // ---------------------------------------------------------------------------
 // Device, built once for the whole binary
 // ---------------------------------------------------------------------------
@@ -790,6 +793,9 @@ const SWEEP_DOMAINS: [u32; 4] = [12, 14, 16, 18];
 /// and the tile decides how many butterflies a workgroup has to share out.
 #[test]
 fn the_ntt_shape_is_measured_and_not_inherited() {
+    // Timing. Takes the cross-process lock, because cargo runs the test binaries in
+    // parallel and a sibling binary saturating the GPU makes every number here fiction.
+    let _gpu_timing = gpulock::exclusive_gpu();
     let b = floor();
     let inputs: Vec<(u32, Vec<Fr>)> = SWEEP_DOMAINS
         .iter()

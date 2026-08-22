@@ -52,6 +52,9 @@ use g16_wgpu::{
 };
 use g16_zkey::{wtns::Witness, Coefficients, ProvingKey, VerifyingKey};
 
+#[path = "gpulock/mod.rs"]
+mod gpulock;
+
 // ---------------------------------------------------------------------------
 // Device, built once for the whole binary
 // ---------------------------------------------------------------------------
@@ -780,6 +783,9 @@ fn compare_modes(stages: &HStages, w: &[Fr], reps: usize) -> [(u64, u64); 2] {
 /// `TASKS.md`.
 #[test]
 fn the_fusion_is_measured_and_not_assumed() {
+    // Timing. Takes the cross-process lock, because cargo runs the test binaries in
+    // parallel and a sibling binary saturating the GPU makes every number here fiction.
+    let _gpu_timing = gpulock::exclusive_gpu();
     let _gpu = exclusive();
     let b = floor();
     let found = artifacts();
@@ -1073,6 +1079,9 @@ fn join_us(
 
 #[test]
 fn the_standalone_join_workgroup_size_is_measured() {
+    // Timing. Takes the cross-process lock, because cargo runs the test binaries in
+    // parallel and a sibling binary saturating the GPU makes every number here fiction.
+    let _gpu_timing = gpulock::exclusive_gpu();
     let _gpu = exclusive();
     let b = floor();
     const SIZES: [u32; 4] = [32, 64, 128, 256];

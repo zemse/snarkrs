@@ -50,6 +50,9 @@ use g16_wgpu::{LimitsProfile, ParamRing, Readback, WgpuBackend};
 use num_bigint::{BigInt, BigUint};
 use num_traits::{One as _, Zero as _};
 
+#[path = "gpulock/mod.rs"]
+mod gpulock;
+
 // ---------------------------------------------------------------------------
 // Device, built once for the whole binary
 // ---------------------------------------------------------------------------
@@ -1251,6 +1254,9 @@ fn the_digit_workgroup_sizes_are_measured() {
 
 #[test]
 fn the_limb_pick_strategy_is_measured() {
+    // Timing. Takes the cross-process lock, because cargo runs the test binaries in
+    // parallel and a sibling binary saturating the GPU makes every number here fiction.
+    let _gpu_timing = gpulock::exclusive_gpu();
     let n = 1u32 << 16;
     let wg = wgsl::Workgroups::default();
     let mut out = String::new();
