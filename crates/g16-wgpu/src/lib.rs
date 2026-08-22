@@ -1,6 +1,6 @@
 //! A WebGPU backend for the BN254 Groth16 prover, through `wgpu`, on native and in a browser.
 //!
-//! # State: the field layer, the device layer, stage 0 and the NTT
+//! # State: stages 0 to 4, and the front half of the MSM
 //!
 //! [`gen::field`] emits the whole BN254
 //! field prelude (`Fr`, `Fq`, `Fq2`) as WGSL text. [`device`], [`pipelines`], [`params`] and
@@ -14,10 +14,13 @@
 //! and hands back [`g16_core::HPoly::Device`] carrying a [`stages::WgpuHandle`], so `H`
 //! never touches the host. [`pointwise`] and [`gen::pointwise`] are stage 4, and they are
 //! what the prover dispatches: the fused NTT epilogue the design specifies is implemented
-//! and tested here too, and it measured slower. See [`stages::Stage4`].
+//! and tested here too, and it measured slower. See [`stages::Stage4`]. [`msm`] and
+//! [`gen::msm`] are U8, the front half of stages 5 to 9: the signed-digit recoding, the 0/1
+//! classification and the counting sort that makes one thread own one bucket by construction,
+//! so no 64-bit atomic is ever needed. It touches no curve arithmetic.
 //!
-//! There is still no `Backend` implementation and no proof. The MSM is U8 to U10, and U11
-//! is where they become a backend.
+//! There is still no `Backend` implementation and no proof. The point stages are U9 and U10,
+//! and U11 is where they become a backend.
 //!
 //! # Why a fourth backend exists at all
 //!
@@ -38,13 +41,19 @@
 //! `g16-gpu-layout` at run time rather than from a second copy in shader source. See
 //! [`gen::field`].
 //!
-//! **Nothing inherited from `g16-metal` is trusted without a measurement.** Four of the four
+//! **Nothing inherited from `g16-metal` is trusted without a measurement.** Five of the six
 //! shape decisions ported from MSL so far have been wrong here: `gather_abc`'s workgroup size
 //! by up to 24%, the NTT's by up to 7.8x, the NTT's "fuse as many passes as the workgroup
-//! budget allows" by 5x, and stage 4's fusion into the NTT store by 5% to 9%. MSL and WGSL are
-//! different compilers targeting the
-//! same silicon, and none of Metal's occupancy reasoning survives the trip. Every such
-//! constant in this crate carries the table it was measured from and re-runs as a test.
+//! budget allows" by 5x, stage 4's fusion into the NTT store by 5% to 9%, and four of the five
+//! digit-pipeline workgroup sizes, though only by 2% to 7% ([`gen::msm::Workgroups`]). MSL and
+//! WGSL are different compilers targeting the same silicon, and almost none of Metal's
+//! occupancy reasoning survives the trip. Every such constant in this crate carries the table
+//! it was measured from and re-runs as a test.
+//!
+//! **The design is not trusted either, and it has now been wrong about a mitigation rather
+//! than just a constant.** §4's "one shader module per group of kernels" is 17% *slower* cold
+//! than putting all five MSM digit kernels in one module, because Metal compiles a pipeline
+//! per entry point and dead-strips the module around it. See [`msm::ModuleShape`].
 //!
 //! **Everything is sized for the browser floor.** The default device profile is
 //! [`device::LimitsProfile::Floor`], the WebGPU spec defaults, not what this Mac's adapter
@@ -54,6 +63,7 @@
 pub mod device;
 pub mod gather;
 pub mod gen;
+pub mod msm;
 pub mod ntt;
 pub mod params;
 pub mod pipelines;
@@ -63,6 +73,7 @@ pub mod stages;
 
 pub use device::{LimitsProfile, WgpuBackend};
 pub use gather::{CsrHost, CsrTables, GatherAbc, GatherParams};
+pub use msm::{window_size, DigitBuffers, DigitPlan, MsmDigits, MsmParams, SortBinds, SortOffsets};
 pub use ntt::{
     split_passes, Batch, Direction, Epilogue, Ntt, NttParams, NttTables, Planned, Scale, Transform,
 };
