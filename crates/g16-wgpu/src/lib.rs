@@ -67,6 +67,7 @@ pub mod msm;
 pub mod ntt;
 pub mod params;
 pub mod pipelines;
+pub mod points;
 pub mod pointwise;
 pub mod readback;
 pub mod stages;
@@ -79,6 +80,7 @@ pub use ntt::{
 };
 pub use params::ParamRing;
 pub use pipelines::{Kernels, PrepareCost};
+pub use points::{MsmPointsG2, PointBinds, PointBuffers, PointOffsets, PointPlan};
 pub use pointwise::{HJoin, HJoinParams};
 pub use readback::Readback;
 pub use stages::{HStages, Stage4, WgpuHandle};

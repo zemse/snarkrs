@@ -427,14 +427,24 @@ fn fr_prelude(v: Variant) -> String {
     s
 }
 
-/// The `MsmParams` fields, shared verbatim by both modules so the two declarations of the
-/// struct cannot drift.
+/// The `MsmParams` fields, shared verbatim by every module that dispatches part of an MSM,
+/// so the declarations cannot drift.
 ///
-/// Eight `u32`, 32 bytes, already a multiple of the 16 WGSL rounds every uniform struct up
-/// to, so there is no invisible tail padding for `crate::msm::MsmParams` to disagree with.
+/// **Twelve `u32`, 48 bytes, and the last four are U10's.** The digit kernels here ignore
+/// `base_off`, `ones_groups`, `slice_len` and `slices` entirely; they are in this struct
+/// rather than in a second one because `g16-metal` has exactly one `MsmParams` covering both
+/// halves, because design §3 puts every parameter block for a proof in one uniform ring, and
+/// because two structs would be two host mirrors for
+/// `tests/wgsl_static.rs::every_uniform_parameter_struct_matches_its_host_mirror` to check
+/// and one more place for a field to be added on one side only.
+///
+/// 48 is a multiple of the 16 WGSL rounds every uniform struct up to, so there is no
+/// invisible tail padding for `crate::msm::MsmParams` to disagree with, and it is well under
+/// the 256-byte ring slot.
 const PARAM_FIELDS: &str = "\
-    // Elements this kernel's domain holds: scalars for count and scatter, words for\n\
-    // zero_u32, field elements for fr_mont_to_std.\n\
+    // Elements this kernel's domain holds: scalars for count, scatter and the ones pass,\n\
+    // words for zero_u32, field elements for fr_mont_to_std. The point kernels compute\n\
+    // their own domain from n_windows, n_buckets and slices instead.\n\
     n: u32,\n\
     // Window width in bits, 2..=16.\n\
     c: u32,\n\
@@ -453,10 +463,22 @@ const PARAM_FIELDS: &str = "\
     // tier of every browser, so a domain past workgroup * 65535 needs more than one\n\
     // dispatch and each has to know where it starts.\n\
     lo: u32,\n\
+    // Element offset into the base vector. Independent of scalar_off: the L MSM reads\n\
+    // scalars from n_public + 1 and bases from 0.\n\
+    base_off: u32,\n\
+    // Workgroups in msm_ones_*, which is also the stride its grid walks the scalars with.\n\
+    ones_groups: u32,\n\
+    // Entries one thread of msm_segmented_* owns.\n\
+    slice_len: u32,\n\
+    // ceil(cap / slice_len), threads per window in msm_segmented_*.\n\
+    slices: u32,\n\
     pad0: u32,\n";
 
 /// The parameter struct and its uniform binding. One copy per module, whichever module.
-fn params_struct() -> String {
+///
+/// Public because [`crate::gen::points`] emits the same declaration in front of the point
+/// kernels, and a second copy of the field list is a second thing to keep in step.
+pub fn params_struct() -> String {
     let mut s = String::new();
     let _ = write!(
         s,

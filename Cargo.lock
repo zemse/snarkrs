@@ -854,11 +854,13 @@ name = "g16-wgpu"
 version = "0.1.0"
 dependencies = [
  "ark-ff",
+ "ark-std",
  "bytemuck",
  "flume",
  "g16-core",
  "g16-field",
  "g16-gpu-layout",
+ "g16-msm",
  "g16-ntt",
  "g16-zkey",
  "num-bigint",

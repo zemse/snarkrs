@@ -23,6 +23,10 @@ g16-core.workspace = true
 g16-zkey.workspace = true
 # `Fr`. The gather packs and unpacks Montgomery limbs, which is arkworks' own representation.
 g16-field.workspace = true
+# `AdditiveGroup::double_in_place`, for the Horner tail of an MSM. Reached through g16-field
+# until now, which is exactly the transitive dependency the house rules forbid: g16-field
+# re-exports seven ark-ff traits and this is not one of them.
+ark-ff.workspace = true
 bytemuck = { version = "1", features = ["derive"] }
 # The readback channel. `default-features = false` on purpose: flume's default set pulls
 # `eventual-fairness`, which pulls nanorand, which pulls getrandom 0.2, which panics at run
@@ -61,7 +65,12 @@ wgpu = { version = "30.0.1", default-features = false, features = [
 g16-ntt.workspace = true
 num-bigint.workspace = true
 num-traits = "0.2"
-ark-ff.workspace = true
+# `g16-msm`'s CPU Pippenger is the oracle U10's G2 MSM is checked against, elementwise, on
+# every shape. Deliberately not a runtime dependency: the point of this backend is that the
+# device does the MSM.
+g16-msm.workspace = true
+# `test_rng` and `UniformRand`, for random G2 bases. Tests only, exactly as g16-msm uses it.
+ark-std.workspace = true
 # g16-core (the stage 0 oracle and the artifact loader), g16-zkey and g16-field are all in
 # [dependencies] now, and dev targets inherit those, so they are not repeated here.
 

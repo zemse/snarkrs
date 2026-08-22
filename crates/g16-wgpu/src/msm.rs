@@ -119,9 +119,15 @@ pub fn window_size(m: usize) -> u32 {
 // The parameter block
 // ---------------------------------------------------------------------------
 
-/// Mirrors `struct MsmParams` in [`crate::gen::msm`]. 32 bytes, which is already a multiple
+/// Mirrors `struct MsmParams` in [`crate::gen::msm`]. 48 bytes, which is already a multiple
 /// of the 16 WGSL rounds every uniform struct up to, so there is no invisible tail padding
 /// for the two declarations to disagree about.
+///
+/// The last four fields are the point stages', and nothing in this file reads them. They live
+/// here rather than in a second struct because `g16-metal` has one `MsmParams` covering both
+/// halves of an MSM, because design §3 puts every parameter block for a proof in one uniform
+/// ring, and because a second struct is a second host mirror to keep in step. See
+/// [`crate::points::PointPlan`], which fills them.
 ///
 /// `ParamRing::push` cannot check the correspondence and nothing else will either: a
 /// mismatch reads plausible garbage with no validation error anywhere.
@@ -142,10 +148,18 @@ pub struct MsmParams {
     pub scalar_off: u32,
     /// First element of this dispatch.
     pub lo: u32,
+    /// Element offset into the base vector. Zero for every digit kernel.
+    pub base_off: u32,
+    /// Workgroups in `msm_ones_*`. Zero for every digit kernel.
+    pub ones_groups: u32,
+    /// Entries one thread of `msm_segmented_*` owns. Zero for every digit kernel.
+    pub slice_len: u32,
+    /// `ceil(cap / slice_len)`. Zero for every digit kernel.
+    pub slices: u32,
     pub pad0: u32,
 }
 
-const _: () = assert!(core::mem::size_of::<MsmParams>() == 32);
+const _: () = assert!(core::mem::size_of::<MsmParams>() == 48);
 
 // ---------------------------------------------------------------------------
 // One digit pipeline's shape
@@ -272,7 +286,9 @@ impl DigitPlan {
         self.n_windows * self.cap
     }
 
-    fn params(&self, n: u32, lo: u32) -> MsmParams {
+    /// The parameter block the digit kernels read, with the four point-stage fields left at
+    /// zero. [`crate::points::PointPlan::params`] is the one that fills them.
+    pub fn params(&self, n: u32, lo: u32) -> MsmParams {
         MsmParams {
             n,
             c: self.c,
@@ -281,6 +297,10 @@ impl DigitPlan {
             cap: self.cap,
             scalar_off: self.scalar_off,
             lo,
+            base_off: 0,
+            ones_groups: 0,
+            slice_len: 0,
+            slices: 0,
             pad0: 0,
         }
     }
@@ -320,7 +340,7 @@ impl DigitBuffers {
     }
 }
 
-fn storage_buffer(
+pub(crate) fn storage_buffer(
     backend: &WgpuBackend,
     label: &str,
     bytes: u64,
