@@ -154,8 +154,11 @@ pub enum Epilogue<'a> {
     /// and do not write the transform's own buffer at all.
     ///
     /// Legal only on the last transform of the three, because `a` and `b` must already hold
-    /// their coset evaluations by then. U7 owns that ordering; this unit only provides the
-    /// kernel and checks it against a host oracle.
+    /// their coset evaluations by then. [`crate::stages`] owns that ordering; this module
+    /// only provides the kernel and checks it against a host oracle.
+    ///
+    /// Not the path the prover takes. The standalone `crate::pointwise::HJoin` measured 5% to
+    /// 9% faster on every artifact; see [`crate::stages::Stage4`].
     Join {
         a: &'a wgpu::Buffer,
         b: &'a wgpu::Buffer,

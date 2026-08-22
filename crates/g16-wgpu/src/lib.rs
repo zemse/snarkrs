@@ -10,10 +10,14 @@
 //! stage 0, the CSR gather, restructured onto 7 storage buffers because the Metal original
 //! binds 10 and the browser floor allows 8. [`ntt`] and [`gen::ntt`] are stages 1 to 3, the
 //! six transforms with the bit-reverse, the `1/n` normalisation and the coset shift fused
-//! into their loads, plus the stage 4 epilogue U7 fuses into the last of them.
+//! into their loads. [`stages`] is U7: it drives all of stages 0 to 4 into **one submit**
+//! and hands back [`g16_core::HPoly::Device`] carrying a [`stages::WgpuHandle`], so `H`
+//! never touches the host. [`pointwise`] and [`gen::pointwise`] are stage 4, and they are
+//! what the prover dispatches: the fused NTT epilogue the design specifies is implemented
+//! and tested here too, and it measured slower. See [`stages::Stage4`].
 //!
-//! There is still no `Backend` implementation and no proof. Stage 4 is U7, the
-//! MSM is U8 to U10, and U11 is where they become a backend.
+//! There is still no `Backend` implementation and no proof. The MSM is U8 to U10, and U11
+//! is where they become a backend.
 //!
 //! # Why a fourth backend exists at all
 //!
@@ -34,10 +38,11 @@
 //! `g16-gpu-layout` at run time rather than from a second copy in shader source. See
 //! [`gen::field`].
 //!
-//! **Nothing inherited from `g16-metal` is trusted without a measurement.** Three of the
-//! three shape constants ported from MSL so far have been wrong here: `gather_abc`'s
-//! workgroup size by up to 24%, the NTT's by up to 7.8x, and the NTT's "fuse as many passes
-//! as the workgroup budget allows" by 5x. MSL and WGSL are different compilers targeting the
+//! **Nothing inherited from `g16-metal` is trusted without a measurement.** Four of the four
+//! shape decisions ported from MSL so far have been wrong here: `gather_abc`'s workgroup size
+//! by up to 24%, the NTT's by up to 7.8x, the NTT's "fuse as many passes as the workgroup
+//! budget allows" by 5x, and stage 4's fusion into the NTT store by 5% to 9%. MSL and WGSL are
+//! different compilers targeting the
 //! same silicon, and none of Metal's occupancy reasoning survives the trip. Every such
 //! constant in this crate carries the table it was measured from and re-runs as a test.
 //!
@@ -52,7 +57,9 @@ pub mod gen;
 pub mod ntt;
 pub mod params;
 pub mod pipelines;
+pub mod pointwise;
 pub mod readback;
+pub mod stages;
 
 pub use device::{LimitsProfile, WgpuBackend};
 pub use gather::{CsrHost, CsrTables, GatherAbc, GatherParams};
@@ -61,4 +68,6 @@ pub use ntt::{
 };
 pub use params::ParamRing;
 pub use pipelines::{Kernels, PrepareCost};
+pub use pointwise::{HJoin, HJoinParams};
 pub use readback::Readback;
+pub use stages::{HStages, Stage4, WgpuHandle};

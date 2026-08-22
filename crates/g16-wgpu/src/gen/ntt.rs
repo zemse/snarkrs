@@ -1,5 +1,10 @@
 //! Stages 1 to 3 in WGSL: the six NTTs, the bit-reverse, the `1/n` normalisation and the
-//! coset shift, plus the stage 4 epilogue U7 fuses into the last of them.
+//! coset shift, plus the stage 4 epilogue.
+//!
+//! The `*_join_*` entry points are generated, tested and **not what the prover dispatches**.
+//! U7 measured the fusion against the standalone `h_join` kernel and it lost by 5% to 9% on
+//! every artifact; the table and the mechanism are on [`crate::stages::Stage4`]. They stay
+//! because the ranking is one machine's naga-to-MSL measurement and U14 re-runs it in Chrome.
 //!
 //! The algorithm is `g16-metal/src/shaders/ntt.metal`'s, which is in turn
 //! `g16_ntt::CpuNtt`'s: decimation in time, bit-reverse then `log n` passes with

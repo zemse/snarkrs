@@ -54,6 +54,7 @@
 //! proves nothing. The column that carries information is the adapter's, which is why
 //! [`WgpuBackend::limits_table`] prints all three.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use g16_core::ProveError;
@@ -154,6 +155,9 @@ pub struct WgpuBackend {
     /// First uncaptured device error, if any. See [`Self::take_error`].
     error: Arc<Mutex<Option<String>>>,
     cost: Mutex<PrepareCost>,
+    /// Command buffers handed to [`WgpuBackend::submit`] since this backend was created.
+    /// See that method for why the count exists and what it cannot see.
+    submits: AtomicU64,
 }
 
 /// `g16_core::Backend` and `PreparedCircuit` are both `Send + Sync`, so U11 cannot land
@@ -245,6 +249,7 @@ impl WgpuBackend {
             requested,
             error,
             cost: Mutex::new(PrepareCost::default()),
+            submits: AtomicU64::new(0),
         })
     }
 
@@ -288,6 +293,69 @@ impl WgpuBackend {
     /// call it after a submit has been waited on, not immediately after encoding.
     pub fn take_error(&self) -> Option<String> {
         self.error.lock().unwrap().take()
+    }
+
+    /// `queue.submit`, counted.
+    ///
+    /// Design §3 puts a whole proof in **two** submits, one for `compute_h` and one for
+    /// `msms`, because an empty submit plus its fence measured 0.1 to 0.3 ms on this
+    /// platform against 2 to 3 microseconds for an extra dispatch in an already open
+    /// encoder. That is a claim about the code, so it is counted rather than asserted in a
+    /// comment: `tests/stages.rs` reads [`Self::submits`] either side of `compute_h` and
+    /// requires the difference to be exactly one.
+    ///
+    /// What the counter cannot see, stated plainly: [`Self::queue`] is public and a caller
+    /// that submits through it directly is invisible here. The counter is a regression
+    /// guard on code that already routes through this method, not a sandbox. Everything in
+    /// `stages.rs` and `readback.rs` does route through it; the older tests submit
+    /// directly and are not counted, which is harmless because they are not the thing being
+    /// measured.
+    ///
+    /// `queue.write_buffer` is deliberately not counted. It is a queue *write*, staged and
+    /// flushed with the next submit rather than a submission of its own, so counting it
+    /// would report a number the design's budget is not in terms of.
+    pub fn submit(
+        &self,
+        buffers: impl IntoIterator<Item = wgpu::CommandBuffer>,
+    ) -> wgpu::SubmissionIndex {
+        self.submits.fetch_add(1, Ordering::Relaxed);
+        self.queue.submit(buffers)
+    }
+
+    /// Submissions made through [`Self::submit`] since this backend was created.
+    pub fn submits(&self) -> u64 {
+        self.submits.load(Ordering::Relaxed)
+    }
+
+    /// Waits until everything submitted so far has finished on the GPU.
+    ///
+    /// The same two-target shape as [`crate::readback::Readback::submit_and_read`] and for
+    /// the same reason: `on_submitted_work_done`'s own documentation says the callback runs
+    /// only when `submit`, `poll_all` or `device.poll` is called elsewhere, so the `poll`
+    /// below is what fires it on native, and on the web it is a documented no-op and the
+    /// browser event loop fires it while this future is suspended. One function, no `cfg`.
+    ///
+    /// `compute_h` awaits this so that its `ntt_us` is a GPU wall time rather than an
+    /// encode time. The cost is one fence, measured at 22 to 24 microseconds in release and
+    /// about 70 in debug by
+    /// `tests/stages.rs::the_fusion_is_measured_and_not_assumed`, against 0.7 ms of GPU work
+    /// at the smallest artifact and 21 ms at the largest. So it is 0.1% to 3% of the number
+    /// it makes honest, and design §3's 0.1 to 0.3 ms for the same thing is pessimistic by
+    /// about 4x. U11 can drop the wait once GPU timestamp queries land, at which point the
+    /// number stops being a wall clock at all.
+    pub async fn wait_for_submitted_work(&self) -> Result<(), ProveError> {
+        // flume and not std::sync::mpsc: the receiver has to be awaited rather than blocked
+        // on, and `mpsc::Receiver` has no async form. Same choice as `readback.rs`.
+        let (tx, rx) = flume::bounded(1);
+        self.queue.on_submitted_work_done(move || {
+            let _ = tx.send(());
+        });
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|e| bad(format!("waiting for the GPU failed: {e}")))?;
+        rx.recv_async()
+            .await
+            .map_err(|_| bad("the submitted-work callback was dropped before it fired"))
     }
 
     pub(crate) fn charge(&self, cost: PrepareCost) {

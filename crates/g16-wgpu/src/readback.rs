@@ -137,7 +137,8 @@ impl Readback {
         enc.map_buffer_on_submit(&self.staging, wgpu::MapMode::Read, 0..bytes, move |r| {
             let _ = tx.send(r);
         });
-        backend.queue().submit([enc.finish()]);
+        // Counted, so `tests/stages.rs` can hold `compute_h` to design §3's one submit.
+        backend.submit([enc.finish()]);
 
         // Native: this is what runs the callback, and without it the await below never
         // resolves. Web: a documented no-op, and the browser event loop runs the callback

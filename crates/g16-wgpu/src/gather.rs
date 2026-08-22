@@ -280,7 +280,21 @@ impl CsrTables {
 
         let row_ptr = storage_u32(backend, "g16 csr row_ptr", &host.row_ptr)?;
         let signal = storage_u32(backend, "g16 csr signal", &host.signal)?;
-        let value = storage_u32(backend, "g16 csr value", &host.value)?;
+        // Padded to a whole `Fr` and not to one word, which is what `storage_u32` does and
+        // what this call site used to rely on.
+        //
+        // Found at U7 by a 2^0 synthetic key whose B matrix has no nonzeros: WebGPU sizes a
+        // runtime-sized array binding by its element stride, so binding a 4-byte buffer as
+        // `array<Fr>` is a hard validation error, "the buffer bound at binding index 3 is
+        // bound with size 4 where the shader expects 32", and the whole dispatch is dropped.
+        // `signal` and `row_ptr` are `array<u32>` and one word really is enough for them.
+        // `crate::ntt::NttTables` already pads its `Fr` tables to `LIMBS` words for the same
+        // reason; this was the one place that did not.
+        let value = if host.value.is_empty() {
+            storage_u32(backend, "g16 csr value", &[0u32; LIMBS])?
+        } else {
+            storage_u32(backend, "g16 csr value", &host.value)?
+        };
         let bytes = row_ptr.size() + signal.size() + value.size();
 
         Ok(Self {
@@ -336,6 +350,10 @@ impl CsrTables {
 /// A zero-length allocation is illegal in WebGPU and does happen here: a key whose B matrix
 /// has no nonzeros at all gives an empty `signal` array. One padding word costs nothing and
 /// the kernel never reads it, because `lo == hi` for every row of such a matrix.
+///
+/// One word is enough only for an `array<u32>` binding. A buffer bound as `array<Fr>` must
+/// be at least one 32-byte element or bind-group creation fails outright, so the caller
+/// pads those itself; see `CsrTables::upload` and `NttTables::new`.
 pub(crate) fn storage_u32(
     backend: &WgpuBackend,
     label: &str,
@@ -670,7 +688,12 @@ impl GatherAbc {
     }
 }
 
-fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
+/// The layout entry for one storage binding.
+///
+/// `pub(crate)` so `crate::pointwise` builds its layout from the same helper: a
+/// `read_only: false` entry and a `var<storage, read>` declaration are not interchangeable
+/// in WebGPU, and having one helper is one fewer place for the two to disagree.
+pub(crate) fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::COMPUTE,
