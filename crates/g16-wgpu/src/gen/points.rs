@@ -61,7 +61,9 @@
 //! recoding puts a point and its negation in *different* buckets, so it is tempting to call
 //! this dead. It is not: two *different* base indices in one bucket can still hold equal or
 //! opposite points, and nothing in a zkey guarantees the query vectors have distinct entries.
-//! `tests/msm_g2.rs` builds both cases on purpose rather than hoping a random draw hits them.
+//! `tests/msm_g1.rs` and `tests/msm_g2.rs` build both cases on purpose rather than hoping a
+//! random draw hits them, and a mutation that deleted the doubling arm passed every other
+//! test in the G1 suite.
 //!
 //! # Uniformity
 //!
@@ -217,17 +219,6 @@ impl Curve {
         Workgroups { tg, ..self.wg }
     }
 
-    /// This curve's shipped `tg` with the three 1D kernels forced to one size, for the
-    /// workgroup sweep.
-    pub const fn uniform(&self, n: u32) -> Workgroups {
-        Workgroups {
-            clear: n,
-            segmented: n,
-            merge: n,
-            tg: self.wg.tg,
-        }
-    }
-
     // ---- entry point names ----
     //
     // Derived from the suffix rather than written out, because U10 wrote them out as five
@@ -298,9 +289,10 @@ pub const BIND_ONES: u32 = 10;
 
 /// Storage buffers each entry point's pipeline layout declares. The browser floor allows 8
 /// and this adapter reports 9 under strict compliance, so a kernel at 9 passes here and
-/// fails in Chrome. `tests/msm_g2.rs` asserts these against the layouts the host builds and
-/// `tests/wgsl_static.rs` asserts them against the emitted text, which are different
-/// questions: the first is what the device enforces, the second is what a browser would.
+/// fails in Chrome. `tests/msm_g1.rs` and `tests/msm_g2.rs` assert these against the layouts
+/// the host builds and `tests/wgsl_static.rs` asserts them against the emitted text, which
+/// are different questions: the first is what the device enforces, the second is what a
+/// browser would. Curve-independent: the same eleven resources over either group.
 pub const STORAGE_CLEAR: u32 = 1;
 pub const STORAGE_SEGMENTED: u32 = 6;
 pub const STORAGE_MERGE: u32 = 5;
