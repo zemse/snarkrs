@@ -11,3 +11,21 @@ ark-ec.workspace = true
 ark-std.workspace = true
 ark-serialize.workspace = true
 thiserror.workspace = true
+
+# ark-ff's hand-written assembly, declared where it can actually be target gated. All eight
+# other workspace crates depend on g16-field directly, so cargo's feature unification carries
+# this to the whole graph on x86_64 and to nothing on aarch64 or wasm32.
+#
+# Read this before quoting it as a speedup: this line does not, on its own, buy a single
+# instruction of assembly on any machine we have benchmarked. ark-ff 0.5 gates the asm
+# multiply on `all(feature = "asm", target_feature = "bmi2", target_feature = "adx",
+# target_arch = "x86_64")` (montgomery_backend.rs:157-160, 230-240), and bmi2 and adx are
+# Haswell and Broadwell era features that are NOT in the default x86-64 baseline. Checked:
+# `rustc --print cfg --target x86_64-unknown-linux-gnu` reports only fxsr, sse and sse2,
+# while adding `-C target-cpu=broadwell` is what makes bmi2 and adx appear. We set no
+# RUSTFLAGS and no target-cpu anywhere in this repo, so the asm path has been compiled out
+# on the x86_64 boxes in PERFORMANCE.md just as it has on this M2 Max. Turning it on means
+# building with `-C target-cpu=native` (or `+bmi2,+adx`) as well, and that is a separate,
+# unmeasured change.
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+ark-ff = { workspace = true, features = ["asm"] }

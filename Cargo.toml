@@ -22,12 +22,18 @@ repository = "https://github.com/zemse/gpu-snark"
 
 [workspace.dependencies]
 ark-bn254    = { version = "0.5", default-features = false, features = ["curve"] }
-# `asm` is x86_64-only inside ark-ff. It does nothing on any Apple machine and
-# everything on the EC2 boxes we benchmark against, so the two are not comparing the
-# same field implementation. Keep it, but never read a Mac number as though arkworks
-# were running hand-written assembly there: on aarch64 the Montgomery multiply is
-# generic Rust, which is part of why profiling ranks field arithmetic so high here.
-ark-ff       = { version = "0.5", default-features = false, features = ["asm"] }
+# No `asm` here on purpose. A workspace dependency table cannot be target gated, and
+# ark-ff's assembly is x86_64 only, so declaring it here made the manifest claim an
+# optimisation that aarch64 and wasm32 never had. g16-field re-declares it under
+# `cfg(target_arch = "x86_64")` and the read-this-first caveat lives there.
+#
+# Two things to keep in mind, and the second is measured rather than assumed. On aarch64
+# the Montgomery multiply is generic Rust, which is part of why profiling ranks field
+# arithmetic so high on the Mac. And ark-ff 0.5 also requires `target_feature = "bmi2"`
+# and `"adx"` (montgomery_backend.rs:157-160), neither of which is in the baseline
+# x86-64 target, and this repo sets no `target-cpu`, so the EC2 boxes were not running
+# the assembly either. See the entry in TASKS.md before quoting any x86 CPU row.
+ark-ff       = { version = "0.5", default-features = false }
 ark-ec       = { version = "0.5", default-features = false }
 ark-serialize = { version = "0.5", default-features = false }
 ark-std      = { version = "0.5", default-features = false }
