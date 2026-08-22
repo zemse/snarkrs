@@ -250,12 +250,7 @@ fn run_msm(
     for buf in [&sort.counts, &sort.cursor, &sort.entries] {
         fill(buf, SENTINEL);
     }
-    for buf in [
-        &pts.buckets,
-        &pts.spill_pts,
-        &pts.spill_rows,
-        &pts.results,
-    ] {
+    for buf in [&pts.buckets, &pts.spill_pts, &pts.spill_rows, &pts.results] {
         fill(buf, SENTINEL);
     }
 
@@ -354,7 +349,9 @@ fn assert_matches_cpu(run: &Run, bases: &[G2Affine], scalars: &[Fr], what: &str)
 fn the_g2_msm_matches_cpu_pippenger_at_every_length() {
     let mut rng = test_rng();
     let mut checked = 0;
-    for n in [1usize, 2, 3, 63, 64, 65, 127, 128, 129, 130, 200, 256, 257, 1000] {
+    for n in [
+        1usize, 2, 3, 63, 64, 65, 127, 128, 129, 130, 200, 256, 257, 1000,
+    ] {
         let bases = rand_bases(n, &mut rng);
         let scalars = general_scalars(n, &mut rng);
         let run = run_msm(&bases, &scalars, 0, 0, n as u32, None, 3);
@@ -426,7 +423,10 @@ fn the_degenerate_scalar_vectors_a_real_witness_contains() {
     // which is why the sentinel check below matters more here than anywhere else.
     let zeros = vec![Fr::zero(); n];
     let run = run_msm(&bases, &zeros, 0, 0, n as u32, None, 2);
-    assert!(run.result.is_zero(), "all-zero scalars gave a nonzero point");
+    assert!(
+        run.result.is_zero(),
+        "all-zero scalars gave a nonzero point"
+    );
     assert_matches_cpu(&run, &bases, &zeros, "all zero");
     run.assert_no_overrun(2, "all zero");
 
@@ -435,7 +435,10 @@ fn the_degenerate_scalar_vectors_a_real_witness_contains() {
     let ones = vec![Fr::one(); n];
     let run = run_msm(&bases, &ones, 0, 0, n as u32, None, 2);
     let want: G2Projective = bases.iter().map(|b| G2Projective::from(*b)).sum();
-    assert_eq!(run.result, want, "all-one scalars are not the sum of the bases");
+    assert_eq!(
+        run.result, want,
+        "all-one scalars are not the sum of the bases"
+    );
     assert_matches_cpu(&run, &bases, &ones, "all one");
 
     // The real shape: 1% general, the rest split between 0 and 1, so the bucket path and the
@@ -550,7 +553,10 @@ fn a_nonzero_scalar_offset_and_base_offset_read_the_right_windows() {
         &bases[scalar_off as usize..(scalar_off + n) as usize],
         &scalars[base_off as usize..(base_off + n) as usize],
     );
-    assert_ne!(want, other, "the two offsets happened to select the same thing");
+    assert_ne!(
+        want, other,
+        "the two offsets happened to select the same thing"
+    );
     println!("scalar_off {scalar_off} and base_off {base_off} over {n} of {total}");
 }
 
@@ -636,7 +642,11 @@ fn every_g2_entry_point_fits_the_workgroup_storage_floor() {
         widest = widest.max(bytes);
         println!("tg {tg:3}  array<{}, {tg}> = {bytes:5} B", curve.pt);
     }
-    assert_eq!(widest, wgsl::FLOOR_WORKGROUP_BYTES, "tg = 64 should be exactly the floor");
+    assert_eq!(
+        widest,
+        wgsl::FLOOR_WORKGROUP_BYTES,
+        "tg = 64 should be exactly the floor"
+    );
 
     // And past the floor the generator refuses rather than emitting a module that compiles
     // here and fails in Chrome.
@@ -716,8 +726,8 @@ impl Bench {
 
         // The counting sort runs once and its output is reused by every timed repetition,
         // because none of the five point kernels writes any of it.
-        let mut ring = ParamRing::new(b, "u10 bench sort ring", d.sort_slots(&dplan) + 4)
-            .expect("ring");
+        let mut ring =
+            ParamRing::new(b, "u10 bench sort ring", d.sort_slots(&dplan) + 4).expect("ring");
         let soff = d.plan_sort(&dplan, &mut ring).expect("plan");
         ring.flush(b);
         let sbind = d
@@ -726,10 +736,13 @@ impl Bench {
         let mut enc = b.device().create_command_encoder(&Default::default());
         {
             let mut pass = enc.begin_compute_pass(&Default::default());
-            d.encode_sort(&mut pass, &dplan, &sbind, &soff).expect("encode");
+            d.encode_sort(&mut pass, &dplan, &sbind, &soff)
+                .expect("encode");
         }
         b.submit([enc.finish()]);
-        b.device().poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+        b.device()
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
 
         Self {
             scalars: sbuf,
@@ -745,8 +758,8 @@ impl Bench {
         let pplan =
             PointPlan::with_slice_len(&self.dplan, 0, p.workgroups().tg, slice_len).expect("plan");
         let pts = PointBuffers::new(b, &self.dplan, &pplan, 0, p.curve()).expect("buffers");
-        let mut ring = ParamRing::new(b, "u10 bench ring", p.slots(&self.dplan, &pplan) + 4)
-            .expect("ring");
+        let mut ring =
+            ParamRing::new(b, "u10 bench ring", p.slots(&self.dplan, &pplan) + 4).expect("ring");
         let poff = p.plan(&self.dplan, &pplan, &mut ring).expect("plan");
         ring.flush(b);
         let bind = p
@@ -815,7 +828,9 @@ impl Bench {
             }
             let t = std::time::Instant::now();
             b.submit([enc.finish()]);
-            b.device().poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+            b.device()
+                .poll(wgpu::PollType::wait_indefinitely())
+                .expect("poll");
             t.elapsed().as_secs_f64() * 1e6
         };
         // Warm, then difference `reps` extra repetitions against zero extra.
@@ -925,7 +940,11 @@ fn the_g2_workgroup_sizes_are_measured() {
         let best = argmin(row);
         let at_shipped = row[sizes.iter().position(|&s| s == ships).unwrap()];
         let regret = at_shipped / row[best] - 1.0;
-        println!("{name}: ships {ships}, best {} ({:+.1}%)", sizes[best], regret * 100.0);
+        println!(
+            "{name}: ships {ships}, best {} ({:+.1}%)",
+            sizes[best],
+            regret * 100.0
+        );
         // Relative for the two kernels that cost milliseconds, absolute for `msm_clear_g2`,
         // whose whole row is under 20 microseconds and moves by 2x between runs. A 3%
         // bound on a 10-microsecond row would be a coin flip in CI.
@@ -1022,7 +1041,9 @@ fn the_slice_length_is_measured() {
     let mut row = Vec::new();
     for &l in &lens {
         row.push(median(
-            (0..3).map(|_| bench.time(p, l, 3, Stage::Accumulate)).collect(),
+            (0..3)
+                .map(|_| bench.time(p, l, 3, Stage::Accumulate))
+                .collect(),
         ));
     }
     print!("{:12}", "slice_len");
@@ -1057,7 +1078,11 @@ fn the_slice_length_is_measured() {
         g16_wgpu::points::SLICE_LEN,
         "the shipped slice_len is not the measured winner; points::SLICE_LEN is stale"
     );
-    assert!(regret < 0.01, "shipped slice_len regret {:.1}%", regret * 100.0);
+    assert!(
+        regret < 0.01,
+        "shipped slice_len regret {:.1}%",
+        regret * 100.0
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1115,7 +1140,10 @@ fn a_plan_built_for_the_wrong_reduction_width_is_refused() {
     let bases = storage_words("u10 bases", &vec![0u32; 64 * 32]);
     let err = match p.bind_all(b, &ring, &d, &pplan, &scalars, &bases, &sort, &pts) {
         Err(e) => e,
-        Ok(_) => panic!("a plan built for tg = {wrong} bound against a tg = {} module", p.workgroups().tg),
+        Ok(_) => panic!(
+            "a plan built for tg = {wrong} bound against a tg = {} module",
+            p.workgroups().tg
+        ),
     };
     let msg = format!("{err}");
     assert!(
@@ -1124,7 +1152,6 @@ fn a_plan_built_for_the_wrong_reduction_width_is_refused() {
     );
     println!("tg mismatch refused: {msg}");
 }
-
 
 // ---------------------------------------------------------------------------
 // 9. What it actually costs, against the CPU it has to beat
@@ -1149,7 +1176,11 @@ fn what_one_g2_msm_costs_against_the_cpu() {
         "{:>8} {:>9} {:>4} {:>10} {:>10} {:>8}",
         "n", "general", "c", "device ms", "cpu ms", "ratio"
     );
-    for (n, ppm) in [(4_096usize, 1_000_000u32), (32_768, 1_000_000), (65_536, 50_000)] {
+    for (n, ppm) in [
+        (4_096usize, 1_000_000u32),
+        (32_768, 1_000_000),
+        (65_536, 50_000),
+    ] {
         let mut rng = test_rng();
         let bases = walk_bases(n, &mut rng);
         let scalars = if ppm == 1_000_000 {
@@ -1157,7 +1188,10 @@ fn what_one_g2_msm_costs_against_the_cpu() {
         } else {
             witness_shaped(n, ppm, &mut rng)
         };
-        let general = scalars.iter().filter(|x| !(x.is_zero() || x.is_one())).count();
+        let general = scalars
+            .iter()
+            .filter(|x| !(x.is_zero() || x.is_one()))
+            .count();
 
         let t = std::time::Instant::now();
         let run = run_msm(&bases, &scalars, 0, 0, n as u32, None, 0);
@@ -1166,7 +1200,10 @@ fn what_one_g2_msm_costs_against_the_cpu() {
         let t = std::time::Instant::now();
         let want = cpu.msm_g2(&bases, &scalars);
         let cpu_ms = t.elapsed().as_secs_f64() * 1e3;
-        assert_eq!(run.result, want, "n = {n}: the timed run disagreed with the CPU");
+        assert_eq!(
+            run.result, want,
+            "n = {n}: the timed run disagreed with the CPU"
+        );
 
         println!(
             "{n:>8} {general:>9} {:>4} {device_ms:>10.1} {cpu_ms:>10.1} {:>7.2}x",
@@ -1193,8 +1230,19 @@ fn scratch_probe() {
     let p = points();
     let bench = Bench::new(32_768, 12);
     for sl in [32u32, 64, 128, 256, 512, 1024, 2048] {
-        let m = median((0..3).map(|_| bench.time(p, sl, 10, Stage::Merge)).collect());
-        let g = median((0..3).map(|_| bench.time(p, sl, 4, Stage::Segmented)).collect());
-        println!("slice_len {sl:5}  slices {:5}  merge {m:9.1} us  seg {g:9.1} us", 32768u32.div_ceil(sl));
+        let m = median(
+            (0..3)
+                .map(|_| bench.time(p, sl, 10, Stage::Merge))
+                .collect(),
+        );
+        let g = median(
+            (0..3)
+                .map(|_| bench.time(p, sl, 4, Stage::Segmented))
+                .collect(),
+        );
+        println!(
+            "slice_len {sl:5}  slices {:5}  merge {m:9.1} us  seg {g:9.1} us",
+            32768u32.div_ceil(sl)
+        );
     }
 }

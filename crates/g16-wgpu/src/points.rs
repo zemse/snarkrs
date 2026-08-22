@@ -34,8 +34,8 @@
 //! bind function checks every buffer against the plan it was built from, and
 //! `tests/msm_g2.rs` pre-fills every output with a sentinel and asserts the slack survives.
 
-use g16_core::ProveError;
 use ark_ff::AdditiveGroup as _;
+use g16_core::ProveError;
 use g16_field::{Fq2, G2Projective, Zero};
 use g16_gpu_layout::{PackedFq, PackedFq2, LIMBS};
 

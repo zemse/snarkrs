@@ -691,7 +691,12 @@ fn {ENTRY_MERGE}(@builtin(global_invocation_id) gid: vec3<u32>) {{
     let start = CURSOR[row] - cnt - base;
     let end = CURSOR[row] - base;
     let k_lo = start / P.slice_len;
-    let k_hi = k_lo; // PROBE
+    // The last slice this bucket's run reaches. `cnt > 0` was checked above so `end >= 1`
+    // and the subtraction cannot wrap; `end` is one past the run, so `end - 1` is its last
+    // entry. Setting this to `k_lo` looks harmless when a run fits inside one slice and
+    // silently drops every spill past the first boundary when it does not, which is correct
+    // for every n up to slice_len and wrong for every n above it.
+    let k_hi = (end - 1u) / P.slice_len;
 
     // Spills first, into a local identity, and the bucket is touched only if there were any.
     //
