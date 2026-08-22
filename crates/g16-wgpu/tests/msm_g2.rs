@@ -244,7 +244,7 @@ fn run_msm(
         None => DigitPlan::new(n, scalar_off, Some(general)),
     }
     .expect("digit plan");
-    let pplan = PointPlan::new(&dplan, base_off, p.workgroups().tg).expect("point plan");
+    let pplan = PointPlan::new(&dplan, base_off, p.workgroups().tg, p.curve()).expect("point plan");
 
     let scalars = storage_words("u10 scalars", &words);
     let bases_buf = storage_words("u10 bases", &base_words(bases));
@@ -398,7 +398,7 @@ fn a_g2_bucket_array_wider_than_the_storage_binding_floor_is_rejected_by_name() 
     // one slack element is what puts it over. Use two windows' worth of slack so the message
     // is about the curve and not about rounding.
     let dplan = DigitPlan::with_c(1 << 16, 0, Some(1 << 16), 16).expect("plan");
-    let pplan = PointPlan::new(&dplan, 0, p.workgroups().tg).expect("point plan");
+    let pplan = PointPlan::new(&dplan, 0, p.workgroups().tg, p.curve()).expect("point plan");
     let err = match PointBuffers::new(b, &dplan, &pplan, 1, p.curve()) {
         Err(e) => e,
         Ok(_) => panic!("a 134 MB G2 bucket array was accepted at the 128 MiB floor"),
@@ -594,11 +594,11 @@ fn every_g2_pipeline_layout_declares_at_most_eight_storage_buffers() {
     // fails in a browser. Counted from the entry lists the layouts are actually built from,
     // not from a second copy.
     let want = [
-        (wgsl::ENTRY_CLEAR, wgsl::STORAGE_CLEAR),
-        (wgsl::ENTRY_SEGMENTED, wgsl::STORAGE_SEGMENTED),
-        (wgsl::ENTRY_MERGE, wgsl::STORAGE_MERGE),
-        (wgsl::ENTRY_REDUCE, wgsl::STORAGE_REDUCE),
-        (wgsl::ENTRY_ONES, wgsl::STORAGE_ONES),
+        (wgsl::G2.entry_clear(), wgsl::STORAGE_CLEAR),
+        (wgsl::G2.entry_segmented(), wgsl::STORAGE_SEGMENTED),
+        (wgsl::G2.entry_merge(), wgsl::STORAGE_MERGE),
+        (wgsl::G2.entry_reduce(), wgsl::STORAGE_REDUCE),
+        (wgsl::G2.entry_ones(), wgsl::STORAGE_ONES),
     ];
     let got = MsmPointsG2::storage_buffer_counts();
     assert_eq!(got.len(), want.len());
@@ -628,7 +628,7 @@ fn every_g2_entry_point_fits_the_workgroup_storage_floor() {
         let src = wgsl::points_module_at(
             g16_wgpu::gen::field::Variant::default(),
             curve,
-            wgsl::Workgroups::with_tg(tg),
+            wgsl::G2.with_tg(tg),
         );
         let bytes = curve.workgroup_bytes(tg);
         assert!(
@@ -657,7 +657,7 @@ fn every_g2_entry_point_fits_the_workgroup_storage_floor() {
         wgsl::points_module_at(
             g16_wgpu::gen::field::Variant::default(),
             curve,
-            wgsl::Workgroups::with_tg(128),
+            wgsl::G2.with_tg(128),
         )
     })
     .unwrap_err();
@@ -882,20 +882,20 @@ fn the_g2_workgroup_sizes_are_measured() {
     let _gpu = exclusive();
     let bench = Bench::new(32_768, 12);
     let sizes = [16u32, 32, 64, 128, 256];
-    let shipped = wgsl::Workgroups::default();
+    let shipped = wgsl::G2.wg;
 
     // Each kernel timed ALONE. The first version of this sweep timed all five together and
     // reported every row as noise, because `msm_segmented_g2` is 97% of the accumulation and
     // `msm_clear_g2` is 0.2% of it: a 20% swing on the clear moves the total by 0.04%.
     // Repetition counts differ per kernel for the same reason, so every cell is a few
     // milliseconds of GPU time rather than a few microseconds.
-    let cases: [(&str, Stage, u32); 3] = [
-        (wgsl::ENTRY_CLEAR, Stage::Clear, 400),
-        (wgsl::ENTRY_SEGMENTED, Stage::Segmented, 4),
-        (wgsl::ENTRY_MERGE, Stage::Merge, 20),
+    let cases: [(String, Stage, u32); 3] = [
+        (wgsl::G2.entry_clear(), Stage::Clear, 400),
+        (wgsl::G2.entry_segmented(), Stage::Segmented, 4),
+        (wgsl::G2.entry_merge(), Stage::Merge, 20),
     ];
 
-    let mut rows: Vec<(&str, Vec<f64>)> = Vec::new();
+    let mut rows: Vec<(String, Vec<f64>)> = Vec::new();
     for (name, stage, reps) in cases {
         let mut row = Vec::new();
         for &sz in &sizes {
@@ -908,7 +908,7 @@ fn the_g2_workgroup_sizes_are_measured() {
             let p = MsmPointsG2::with_shape(floor(), wg, 65535).expect("pipelines");
             row.push(median(
                 (0..5)
-                    .map(|_| bench.time(&p, g16_wgpu::points::SLICE_LEN, reps, stage))
+                    .map(|_| bench.time(&p, wgsl::G2.slice_len, reps, stage))
                     .collect(),
             ));
         }
@@ -917,7 +917,7 @@ fn the_g2_workgroup_sizes_are_measured() {
 
     println!(
         "32,768 general scalars, c = 12, slice_len {}, each kernel alone, medians of five, us",
-        g16_wgpu::points::SLICE_LEN
+        wgsl::G2.slice_len
     );
     print!("{:20}", "kernel");
     for s in sizes {
@@ -963,9 +963,9 @@ fn the_g2_workgroup_sizes_are_measured() {
 }
 
 fn shipped_size(wg: &wgsl::Workgroups, entry: &str) -> u32 {
-    if entry == wgsl::ENTRY_CLEAR {
+    if entry == wgsl::G2.entry_clear() {
         wg.clear
-    } else if entry == wgsl::ENTRY_SEGMENTED {
+    } else if entry == wgsl::G2.entry_segmented() {
         wg.segmented
     } else {
         wg.merge
@@ -994,25 +994,24 @@ fn the_reduction_threadgroup_is_measured() {
     let mut best = (f64::MAX, 0u32);
     let mut shipped_us = 0.0;
     for tg in [8u32, 16, 32, 64] {
-        let p = MsmPointsG2::with_shape(floor(), wgsl::Workgroups::with_tg(tg), 65535)
-            .expect("pipelines");
+        let p = MsmPointsG2::with_shape(floor(), wgsl::G2.with_tg(tg), 65535).expect("pipelines");
         let us = median(
             (0..5)
-                .map(|_| bench.time(&p, g16_wgpu::points::SLICE_LEN, 5, Stage::Reduction))
+                .map(|_| bench.time(&p, wgsl::G2.slice_len, 5, Stage::Reduction))
                 .collect(),
         );
         println!("{tg:>4} {:>10} {us:>10.1}", curve.workgroup_bytes(tg));
         if us < best.0 {
             best = (us, tg);
         }
-        if tg == wgsl::Workgroups::default().tg {
+        if tg == wgsl::G2.wg.tg {
             shipped_us = us;
         }
     }
     let regret = shipped_us / best.0 - 1.0;
     println!(
         "ships tg = {} at {shipped_us:.1} us, best tg = {} at {:.1} us ({:+.1}%)",
-        wgsl::Workgroups::default().tg,
+        wgsl::G2.wg.tg,
         best.1,
         best.0,
         regret * 100.0
@@ -1026,7 +1025,7 @@ fn the_reduction_threadgroup_is_measured() {
     // says to accept that: the alternative costs 72%.
     assert_eq!(
         best.1,
-        wgsl::Workgroups::default().tg,
+        wgsl::G2.wg.tg,
         "the shipped tg is not the measured winner; gen::points::Workgroups::tg is stale"
     );
     assert!(regret < 0.01, "shipped tg regret {:.1}%", regret * 100.0);
@@ -1071,20 +1070,17 @@ fn the_slice_length_is_measured() {
         .min_by(|a, b| a.1.partial_cmp(b.1).unwrap())
         .unwrap()
         .0;
-    let at_shipped = row[lens
-        .iter()
-        .position(|&l| l == g16_wgpu::points::SLICE_LEN)
-        .unwrap()];
+    let at_shipped = row[lens.iter().position(|&l| l == wgsl::G2.slice_len).unwrap()];
     let regret = at_shipped / row[best] - 1.0;
     println!(
         "ships {}, best {} ({:+.1}%)",
-        g16_wgpu::points::SLICE_LEN,
+        wgsl::G2.slice_len,
         lens[best],
         regret * 100.0
     );
     assert_eq!(
         lens[best],
-        g16_wgpu::points::SLICE_LEN,
+        wgsl::G2.slice_len,
         "the shipped slice_len is not the measured winner; points::SLICE_LEN is stale"
     );
     assert!(
@@ -1101,21 +1097,24 @@ fn the_slice_length_is_measured() {
 #[test]
 fn the_point_plan_derives_its_shape_once() {
     let d = DigitPlan::with_c(1000, 0, Some(1000), 12).expect("plan");
-    let p = PointPlan::new(&d, 0, 32).expect("point plan");
-    assert_eq!(p.slice_len(), g16_wgpu::points::SLICE_LEN);
-    assert_eq!(p.slices(), 1000u32.div_ceil(g16_wgpu::points::SLICE_LEN));
+    let p = PointPlan::new(&d, 0, 32, wgsl::G2).expect("point plan");
+    assert_eq!(p.slice_len(), wgsl::G2.slice_len);
+    assert_eq!(p.slices(), 1000u32.div_ceil(wgsl::G2.slice_len));
     assert_eq!(p.seg_threads(&d), d.n_windows() * p.slices());
     assert_eq!(p.spill_slots(&d), 2 * p.seg_threads(&d));
     // ceil(1000 / (32 * SLICE_LEN)) = 1, and it is never zero: a dispatch of zero workgroups writes
     // nothing and the host would then add a stale slot.
     assert_eq!(p.ones_groups(), 1);
-    assert_eq!(PointPlan::new(&d, 0, 32).unwrap().ones_groups(), 1);
+    assert_eq!(
+        PointPlan::new(&d, 0, 32, wgsl::G2).unwrap().ones_groups(),
+        1
+    );
 
     // An empty window still gets one slice, because the segmented pass tags its spill slots
     // before it tests for an empty window.
     let empty = DigitPlan::with_c(500, 0, Some(0), 12).expect("plan");
     assert_eq!(empty.cap(), 1);
-    assert_eq!(PointPlan::new(&empty, 0, 32).unwrap().slices(), 1);
+    assert_eq!(PointPlan::new(&empty, 0, 32, wgsl::G2).unwrap().slices(), 1);
 
     // The parameter block carries both halves, and the digit half is untouched.
     let params = p.params(&d, 7);
@@ -1131,7 +1130,7 @@ fn the_point_plan_derives_its_shape_once() {
     // And a caller that mixes a plan built for one reduction width with a module built for
     // another is refused, because ones_groups would not match the stride the kernel walks.
     assert!(PointPlan::with_slice_len(&d, 0, 32, 0).is_err());
-    assert!(PointPlan::new(&d, 0, 0).is_err());
+    assert!(PointPlan::new(&d, 0, 0, wgsl::G2).is_err());
     println!("the point plan's five derived numbers agree with their definitions");
 }
 
@@ -1141,7 +1140,7 @@ fn a_plan_built_for_the_wrong_reduction_width_is_refused() {
     let p = points();
     let d = DigitPlan::with_c(64, 0, Some(64), 8).expect("plan");
     let wrong = p.workgroups().tg * 2;
-    let pplan = PointPlan::new(&d, 0, wrong).expect("point plan");
+    let pplan = PointPlan::new(&d, 0, wrong, wgsl::G2).expect("point plan");
     let sort = DigitBuffers::new(b, &d, 0).expect("digit buffers");
     let pts = PointBuffers::new(b, &d, &pplan, 0, p.curve()).expect("point buffers");
     let ring = ParamRing::new(b, "u10 ring", 8).expect("ring");
@@ -1181,7 +1180,7 @@ fn what_one_g2_msm_costs_against_the_cpu() {
     let cpu = CpuMsm::new();
     println!(
         "one G2 MSM, M2 Max, wgpu through naga to MSL, release. slice_len {}, tg {}.",
-        g16_wgpu::points::SLICE_LEN,
+        wgsl::G2.slice_len,
         p.workgroups().tg
     );
     println!(

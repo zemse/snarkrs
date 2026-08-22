@@ -33,7 +33,7 @@
 
 use g16_wgpu::gen::field::{field_module, Variant};
 use g16_wgpu::gen::msm::{self as msmgen, LimbPick, Workgroups};
-use g16_wgpu::gen::{gather as gathergen, ntt as nttgen, pointwise as pwgen};
+use g16_wgpu::gen::{gather as gathergen, ntt as nttgen, points as pointsgen, pointwise as pwgen};
 
 // ---------------------------------------------------------------------------
 // A very small WGSL reader
@@ -87,6 +87,12 @@ fn type_bytes(ty: &str) -> Option<u64> {
         "u32" | "i32" | "f32" => Some(4),
         // `struct Fr { v0: u32, ... }` in gen::field is eight u32.
         "Fr" | "Scalar" => Some(32),
+        // The XYZZ accumulators the two reductions hold in workgroup storage: four
+        // coordinates of `Fq` or of `Fq2`. Taken from the generator rather than retyped, so
+        // this reader cannot disagree with the module it is auditing about the one number
+        // that decides whether `msm_reduce_*` fits the browser floor.
+        "PtG1" => Some(pointsgen::G1.point_bytes),
+        "PtG2" => Some(pointsgen::G2.point_bytes),
         _ => None,
     }
 }
@@ -302,6 +308,21 @@ fn all_modules() -> Vec<Module> {
     // at log_n % batches != 0 builds.
     out.push(parse("ntt k=6,7", &nttgen::ntt_module(v, &[6, 7])));
     out.push(parse("ntt k=8,9", &nttgen::ntt_module(v, &[8, 9])));
+    // Both curves' point modules, at the shipped reduction width and at the widest one the
+    // generator will accept. The widest is the interesting one: `array<PtG2, 64>` and
+    // `array<PtG1, 128>` are both 16384 bytes, exactly `maxComputeWorkgroupStorageSize` at
+    // the floor, so if either reduction ever grows a second workgroup array this is where it
+    // fails rather than in Chrome.
+    for c in pointsgen::CURVES {
+        let mut tgs = vec![c.wg.tg, c.max_tg()];
+        tgs.dedup();
+        for tg in tgs {
+            out.push(parse(
+                &format!("points {} tg={tg}", c.suffix),
+                &pointsgen::points_module_at(v, c, c.with_tg(tg)),
+            ));
+        }
+    }
     out
 }
 

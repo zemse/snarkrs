@@ -1,8 +1,17 @@
-//! Stages 5 to 9, back half: the five G2 point kernels, their buffers, and the host tail.
+//! Stages 5 to 9, back half: the five point kernels of one curve, their buffers, and the
+//! host tail.
 //!
 //! [`crate::gen::points`] is the WGSL and carries the algorithm. This file owns the shapes:
 //! how big a bucket array is, where the spill slots live, how many `ones` groups to run, and
 //! the Horner combination the device deliberately does not do.
+//!
+//! # One implementation, two groups
+//!
+//! [`MsmPointsG1`] and [`MsmPointsG2`] are two instantiations of [`MsmPoints`], not two
+//! copies of it. The only things that differ are the WGSL the generator emits, the byte
+//! strides that come with it, and the arkworks projective type the readback decodes into,
+//! which is what [`PointCurve`] carries. Four of a proof's five MSMs are G1 (A, B-G1, L and
+//! H) and one is G2, so a bug fixed in one place is a bug fixed for all five.
 //!
 //! # What the device does and what the host does
 //!
@@ -16,10 +25,10 @@
 //!
 //! # One readback, and G2's 256-byte point makes it free
 //!
-//! `msm_reduce_g2` writes `n_windows` points and `msm_ones_g2` writes `ones_groups` points,
-//! and both go into **one** buffer, so the whole result of an MSM is one
-//! `copy_buffer_to_buffer` and one `mapAsync`. Design §3 puts the per-proof readback ceiling
-//! at 64 KiB across all five MSMs and this is 20 + 8 points here, 7 KiB.
+//! `msm_reduce_*` writes `n_windows` points and `msm_ones_*` writes `ones_groups` points, and
+//! both go into **one** buffer, so the whole result of an MSM is one `copy_buffer_to_buffer`
+//! and one `mapAsync`. Design §3 puts the per-proof readback ceiling at 64 KiB across all
+//! five MSMs and this is 20 + 8 points here, 7 KiB over G2 and 3.5 KiB over G1.
 //!
 //! The two bindings are windows into that one buffer at different offsets, and a storage
 //! binding offset must be a multiple of `minStorageBufferOffsetAlignment`, which is **256** in
@@ -32,11 +41,14 @@
 //! WebGPU returns zero for an out-of-range storage read and drops an out-of-range storage
 //! write, both silently, so a short bucket array is a wrong point and not an error. Every
 //! bind function checks every buffer against the plan it was built from, and
-//! `tests/msm_g2.rs` pre-fills every output with a sentinel and asserts the slack survives.
+//! `tests/msm_g1.rs` and `tests/msm_g2.rs` pre-fill every output with a sentinel and assert
+//! the slack survives.
 
-use ark_ff::AdditiveGroup as _;
+use std::marker::PhantomData;
+
+use ark_ff::AdditiveGroup;
 use g16_core::ProveError;
-use g16_field::{Fq2, G2Projective, Zero};
+use g16_field::{Fq, Fq2, G1Projective, G2Projective, Zero};
 use g16_gpu_layout::{PackedFq, PackedFq2, LIMBS};
 
 use crate::device::{bad, WgpuBackend};
@@ -48,7 +60,9 @@ use crate::msm::{storage_buffer, DigitPlan, MsmParams};
 use crate::params::ParamRing;
 use crate::pipelines::Kernels;
 
-/// `u32` words in one `Xyzz<Fq2>`: four `Fq2` of two `Fq` of eight limbs.
+/// `u32` words in one `Xyzz<Fq>`: four `Fq` of eight limbs, 128 bytes.
+const XYZZ_G1_WORDS: usize = 4 * LIMBS;
+/// `u32` words in one `Xyzz<Fq2>`: four `Fq2` of two `Fq` of eight limbs, 256 bytes.
 const XYZZ_G2_WORDS: usize = 4 * 2 * LIMBS;
 
 /// A storage binding offset must be a multiple of this, in every browser, at every tier,
@@ -59,31 +73,11 @@ const BINDING_ALIGN: u64 = 256;
 // Slice length and ones groups
 // ---------------------------------------------------------------------------
 
-/// Entries one thread of `msm_segmented_g2` owns.
-///
-/// Accumulation costs `SLICE_LEN` mixed additions per thread and the merge costs
-/// `max_bucket_count / SLICE_LEN` full additions for the fattest bucket, so the balance point
-/// is near the square root of the worst occupancy, a few hundred on these artifacts. 64 sits
-/// under that on purpose: it also keeps the thread count high enough to fill the machine at
-/// the smaller domains, where there are only a few thousand slices to begin with.
-/// `g16-metal` chose 64 and heliax reached the same constant independently.
-///
-/// **Swept here rather than inherited, and 64 survives, which makes it the second inherited
-/// constant in this crate to do so.** `tests/msm_g2.rs::the_slice_length_is_measured`, 32,768
-/// general scalars at `c = 12`, medians of five release runs, microseconds for the whole
-/// five-kernel point stage:
-///
-/// ```text
-/// slice_len    16      32      64     128     256
-/// us       7530.6  6001.0  5449.1  5556.2  6270.1
-/// ```
-///
-/// The curve is flat between 64 and 128 (2.0%) and steep below 32 (+38% at 16, where the
-/// spill count doubles every halving and the merge walks four times as many slots). Nothing
-/// here is worth moving.
-pub const SLICE_LEN: u32 = 128;
+// The slice length lives on `gen::points::Curve`, because it is measured per curve and a
+// plan that took one curve's constant against another curve's module would be a silently
+// wrong point rather than an error. `Curve::slice_len` carries both sweeps.
 
-/// Workgroups in `msm_ones_g2`: enough that a 2^18-long witness gives each thread about sixty
+/// Workgroups in `msm_ones_*`: enough that a 2^18-long witness gives each thread about sixty
 /// scalars to scan, few enough that the host adds a few dozen points.
 ///
 /// Capped at 64 because every group is a point in the readback and a point the host adds
@@ -113,16 +107,22 @@ pub struct PointPlan {
 }
 
 impl PointPlan {
-    /// Plans the point stages for `digits`, reading bases from `base_off`.
+    /// Plans the point stages for `digits`, reading bases from `base_off`, at `curve`'s
+    /// measured slice length.
     ///
     /// `tg` is the reduction workgroup size, which sets `ones_groups`. It must be the `tg` the
-    /// module was generated at; [`MsmPointsG2::plan`] passes its own so a caller cannot get
-    /// that pair wrong.
-    pub fn new(digits: &DigitPlan, base_off: u32, tg: u32) -> Result<Self, ProveError> {
-        Self::with_slice_len(digits, base_off, tg, SLICE_LEN)
+    /// module was generated at; [`MsmPoints::plan_points`] passes its own and its own curve,
+    /// so a caller who goes through the module cannot get either pair wrong.
+    pub fn new(
+        digits: &DigitPlan,
+        base_off: u32,
+        tg: u32,
+        curve: wgsl::Curve,
+    ) -> Result<Self, ProveError> {
+        Self::with_slice_len(digits, base_off, tg, curve.slice_len)
     }
 
-    /// Same, at a forced slice length. For the sweep in `tests/msm_g2.rs`.
+    /// Same, at a forced slice length. For the sweeps in `tests/msm_g1.rs`.
     pub fn with_slice_len(
         digits: &DigitPlan,
         base_off: u32,
@@ -191,7 +191,7 @@ impl PointPlan {
     /// The full parameter block, digit fields and point fields together.
     ///
     /// `n` is the element count the *dispatching* kernel's guard uses, and `lo` is where this
-    /// dispatch starts. Only `msm_ones_g2` reads `n`; the other four compute their own domain
+    /// dispatch starts. Only `msm_ones_*` reads `n`; the other four compute their own domain
     /// from `n_windows`, `n_buckets` and `slices`, exactly as the Metal originals do.
     pub fn params(&self, digits: &DigitPlan, lo: u32) -> MsmParams {
         MsmParams {
@@ -208,7 +208,13 @@ impl PointPlan {
 // Buffers
 // ---------------------------------------------------------------------------
 
-/// The four device allocations one G2 MSM's point stages need.
+/// A debug label carrying the curve, so a validation error or a capture names the right one
+/// of the two MSM families.
+fn label(curve: wgsl::Curve, what: &str) -> String {
+    format!("g16 msm {what} {}", curve.suffix)
+}
+
+/// The four device allocations one MSM's point stages need.
 ///
 /// `results` is one buffer holding both outputs, because that makes the whole readback one
 /// copy. See the module docs for why the offset is aligned rather than assumed aligned.
@@ -227,8 +233,8 @@ impl PointBuffers {
     ///
     /// `slack` exists for one reason and it is a test: every output here is exactly the size
     /// the kernel should write, and WebGPU drops an out-of-range storage write in silence, so
-    /// without slack an over-run is *unobservable*. `tests/msm_g2.rs` allocates it and checks
-    /// it survives; the prover passes 0.
+    /// without slack an over-run is *unobservable*. `tests/msm_g1.rs` and `tests/msm_g2.rs`
+    /// allocate it and check it survives; the prover passes 0.
     pub fn new(
         backend: &WgpuBackend,
         digits: &DigitPlan,
@@ -241,20 +247,22 @@ impl PointBuffers {
         let slots = u64::from(points.spill_slots(digits) + slack);
         let ones_groups = points.ones_groups;
 
-        // The one error a caller can hit that is about G2 specifically rather than about
-        // being greedy: 256-byte accumulators halve the window width the floor's storage
-        // binding allows. c = 16 is 16 x 32768 x 256 = 134.2 MB against a 128 MiB binding.
+        // The one error a caller can hit that is about the curve rather than about being
+        // greedy: G2's 256-byte accumulators halve the window width the floor's storage
+        // binding allows. c = 16 is 16 x 32768 x 256 = 134.2 MB against a 128 MiB binding,
+        // where the same c over G1 is 67.1 MB and fits with room to spare.
         let bucket_bytes = rows * pt;
         let limit = backend.granted_limits().max_storage_buffer_binding_size;
         if bucket_bytes > limit {
             return Err(bad(format!(
                 "a {} window x {} bucket array of {pt}-byte {} accumulators is {bucket_bytes} \
                  bytes, over the {limit} byte storage binding limit. c = {} is too wide for \
-                 this curve; G1 has twice the headroom at the same c.",
+                 this curve; {}.",
                 digits.n_windows(),
                 digits.n_buckets(),
                 curve.pt,
-                digits.c()
+                digits.c(),
+                curve.headroom
             )));
         }
 
@@ -263,10 +271,10 @@ impl PointBuffers {
         let results_bytes = ones_off + u64::from(ones_groups + slack) * pt;
 
         Ok(Self {
-            buckets: storage_buffer(backend, "g16 msm buckets g2", bucket_bytes)?,
-            spill_pts: storage_buffer(backend, "g16 msm spill points g2", slots * pt)?,
-            spill_rows: storage_buffer(backend, "g16 msm spill rows g2", slots * 4)?,
-            results: storage_buffer(backend, "g16 msm results g2", results_bytes)?,
+            buckets: storage_buffer(backend, &label(curve, "buckets"), bucket_bytes)?,
+            spill_pts: storage_buffer(backend, &label(curve, "spill points"), slots * pt)?,
+            spill_rows: storage_buffer(backend, &label(curve, "spill rows"), slots * 4)?,
+            results: storage_buffer(backend, &label(curve, "results"), results_bytes)?,
             ones_off,
             ones_groups,
         })
@@ -292,16 +300,60 @@ impl PointBuffers {
 // The pipelines
 // ---------------------------------------------------------------------------
 
-/// The five G2 point entry points, their bind group layouts and their pipelines.
+/// Which BN254 group an [`MsmPoints`] is over: the WGSL shape, and the arkworks type the
+/// readback decodes into.
+///
+/// A trait rather than a runtime enum because [`MsmPoints::combine`] has to *return* the
+/// right projective type. A runtime curve field would make that `Result<Either<..>>` at every
+/// call site in the prover, and the whole point of one implementation is that the prover's
+/// four G1 MSMs and its one G2 MSM read identically.
+pub trait PointCurve {
+    /// The generated WGSL's shape and this curve's measured constants.
+    const WGSL: wgsl::Curve;
+    /// The arkworks projective type one window sum decodes into.
+    type Projective: AdditiveGroup;
+    /// One `Xyzz<F>` as the kernel wrote it to a projective point, with no field inversion.
+    fn from_xyzz_bytes(raw: &[u8]) -> Result<Self::Projective, ProveError>;
+}
+
+/// BN254's G1: the A, B-G1, L and H MSMs, four of a proof's five.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum G1Curve {}
+
+/// BN254's G2: the B-G2 MSM, one of a proof's five and the expensive one per point.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum G2Curve {}
+
+impl PointCurve for G1Curve {
+    const WGSL: wgsl::Curve = wgsl::G1;
+    type Projective = G1Projective;
+    fn from_xyzz_bytes(raw: &[u8]) -> Result<G1Projective, ProveError> {
+        xyzz_g1_from_bytes(raw)
+    }
+}
+
+impl PointCurve for G2Curve {
+    const WGSL: wgsl::Curve = wgsl::G2;
+    type Projective = G2Projective;
+    fn from_xyzz_bytes(raw: &[u8]) -> Result<G2Projective, ProveError> {
+        xyzz_g2_from_bytes(raw)
+    }
+}
+
+/// One curve's five point entry points, their bind group layouts and their pipelines.
 ///
 /// One shader module, five pipeline layouts, one bind group layout per entry point. One
 /// module because U8 measured the split and it costs 17% cold for five entry points of the
 /// same shape; one layout per entry point because giving all five the union of their bindings
 /// would put every kernel at the widest one's set of six and make the count meaningless as a
 /// check against the browser floor's eight.
-pub struct MsmPointsG2 {
+pub struct MsmPoints<C: PointCurve> {
     kernels: Kernels,
     curve: wgsl::Curve,
+    /// The five entry point names, `msm_clear_g1` and so on, built once from the suffix.
+    /// Owned rather than `&'static str` because they are derived from the curve and not
+    /// written out, which is what stopped the generator being G2-only.
+    names: [String; 5],
     wg: wgsl::Workgroups,
     workgroups_per_dispatch: u32,
     bgl_clear: wgpu::BindGroupLayout,
@@ -311,15 +363,29 @@ pub struct MsmPointsG2 {
     bgl_ones: wgpu::BindGroupLayout,
     _layouts: Vec<wgpu::PipelineLayout>,
     source_len: usize,
+    _curve: PhantomData<C>,
 }
 
-impl MsmPointsG2 {
-    /// Compiles at the measured shape and this device's workgroup-per-dimension limit.
+/// The G1 point stages: the A, B-G1, L and H MSMs.
+pub type MsmPointsG1 = MsmPoints<G1Curve>;
+/// The G2 point stages: the B-G2 MSM.
+pub type MsmPointsG2 = MsmPoints<G2Curve>;
+
+/// Indices into [`MsmPoints::names`], in dispatch order.
+const CLEAR: usize = 0;
+const SEGMENTED: usize = 1;
+const MERGE: usize = 2;
+const REDUCE: usize = 3;
+const ONES: usize = 4;
+
+impl<C: PointCurve> MsmPoints<C> {
+    /// Compiles at this curve's measured shape and this device's workgroup-per-dimension
+    /// limit.
     pub fn new(backend: &WgpuBackend) -> Result<Self, ProveError> {
         let max_wg = backend
             .granted_limits()
             .max_compute_workgroups_per_dimension;
-        Self::with_shape(backend, wgsl::Workgroups::default(), max_wg)
+        Self::with_shape(backend, C::WGSL.wg, max_wg)
     }
 
     /// Same, with the workgroup sizes and the per-dispatch workgroup cap forced.
@@ -333,7 +399,7 @@ impl MsmPointsG2 {
         wg: wgsl::Workgroups,
         workgroups_per_dispatch: u32,
     ) -> Result<Self, ProveError> {
-        let curve = wgsl::G2;
+        let curve = C::WGSL;
         let limits = backend.granted_limits();
         let max_inv = limits.max_compute_invocations_per_workgroup;
         for (name, n) in [
@@ -354,18 +420,21 @@ impl MsmPointsG2 {
                 "workgroups_per_dispatch {workgroups_per_dispatch} is outside 1..={max_wg}"
             )));
         }
-        // The check that G2 makes interesting: `array<PtG2, tg>` at 256 bytes a point.
-        // Reported here against the *granted* limit and by the generator against the floor,
-        // which are 32768 and 16384 on this adapter, so a `Raised` device would otherwise
-        // pass this and then panic inside the generator.
+        // The check the accumulator width makes interesting: `array<Pt, tg>` at 256 bytes a
+        // point over G2 and 128 over G1, so the same tg costs the two curves different
+        // budgets and G1 can afford twice the reduction width. Reported here against the
+        // *granted* limit and by the generator against the floor, which are 32768 and 16384
+        // on this adapter, so a `Raised` device would otherwise pass this and then panic
+        // inside the generator.
         let shared = curve.workgroup_bytes(wg.tg);
         let ceiling =
             u64::from(limits.max_compute_workgroup_storage_size).min(wgsl::FLOOR_WORKGROUP_BYTES);
         if shared > ceiling {
             return Err(bad(format!(
-                "msm_reduce_g2 at {} threads holds {shared} bytes of workgroup storage, over \
-                 the {ceiling} byte ceiling (the smaller of this device's {} and the browser \
+                "{} at {} threads holds {shared} bytes of workgroup storage, over the \
+                 {ceiling} byte ceiling (the smaller of this device's {} and the browser \
                  floor's {})",
+                curve.entry_reduce(),
                 wg.tg,
                 limits.max_compute_workgroup_storage_size,
                 wgsl::FLOOR_WORKGROUP_BYTES
@@ -379,11 +448,12 @@ impl MsmPointsG2 {
                 entries,
             })
         };
-        let bgl_clear = mk_bgl(wgsl::ENTRY_CLEAR, &Self::clear_entries());
-        let bgl_segmented = mk_bgl(wgsl::ENTRY_SEGMENTED, &Self::segmented_entries());
-        let bgl_merge = mk_bgl(wgsl::ENTRY_MERGE, &Self::merge_entries());
-        let bgl_reduce = mk_bgl(wgsl::ENTRY_REDUCE, &Self::reduce_entries());
-        let bgl_ones = mk_bgl(wgsl::ENTRY_ONES, &Self::ones_entries());
+        let names = curve.entries();
+        let bgl_clear = mk_bgl(&names[CLEAR], &Self::clear_entries());
+        let bgl_segmented = mk_bgl(&names[SEGMENTED], &Self::segmented_entries());
+        let bgl_merge = mk_bgl(&names[MERGE], &Self::merge_entries());
+        let bgl_reduce = mk_bgl(&names[REDUCE], &Self::reduce_entries());
+        let bgl_ones = mk_bgl(&names[ONES], &Self::ones_entries());
 
         let mk_layout = |label: &str, bgl: &wgpu::BindGroupLayout| {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -392,30 +462,31 @@ impl MsmPointsG2 {
                 immediate_size: 0,
             })
         };
-        let l_clear = mk_layout(wgsl::ENTRY_CLEAR, &bgl_clear);
-        let l_segmented = mk_layout(wgsl::ENTRY_SEGMENTED, &bgl_segmented);
-        let l_merge = mk_layout(wgsl::ENTRY_MERGE, &bgl_merge);
-        let l_reduce = mk_layout(wgsl::ENTRY_REDUCE, &bgl_reduce);
-        let l_ones = mk_layout(wgsl::ENTRY_ONES, &bgl_ones);
+        let l_clear = mk_layout(&names[CLEAR], &bgl_clear);
+        let l_segmented = mk_layout(&names[SEGMENTED], &bgl_segmented);
+        let l_merge = mk_layout(&names[MERGE], &bgl_merge);
+        let l_reduce = mk_layout(&names[REDUCE], &bgl_reduce);
+        let l_ones = mk_layout(&names[ONES], &bgl_ones);
 
         let src = wgsl::points_module_at(Variant::default(), curve, wg);
         let source_len = src.len();
         let kernels = Kernels::build_with_layouts(
             backend,
-            "msm_points_g2",
+            &format!("msm_points_{}", curve.suffix),
             &src,
             &[
-                (wgsl::ENTRY_CLEAR, &l_clear),
-                (wgsl::ENTRY_SEGMENTED, &l_segmented),
-                (wgsl::ENTRY_MERGE, &l_merge),
-                (wgsl::ENTRY_REDUCE, &l_reduce),
-                (wgsl::ENTRY_ONES, &l_ones),
+                (names[CLEAR].as_str(), &l_clear),
+                (names[SEGMENTED].as_str(), &l_segmented),
+                (names[MERGE].as_str(), &l_merge),
+                (names[REDUCE].as_str(), &l_reduce),
+                (names[ONES].as_str(), &l_ones),
             ],
         )?;
 
         Ok(Self {
             kernels,
             curve,
+            names,
             wg,
             workgroups_per_dispatch,
             bgl_clear,
@@ -425,6 +496,7 @@ impl MsmPointsG2 {
             bgl_ones,
             _layouts: vec![l_clear, l_segmented, l_merge, l_reduce, l_ones],
             source_len,
+            _curve: PhantomData,
         })
     }
 
@@ -478,7 +550,11 @@ impl MsmPointsG2 {
 
     /// Storage buffers each entry point's pipeline layout declares, counted from the lists
     /// above rather than from a duplicate. All five must be at most 8, the browser floor.
-    pub fn storage_buffer_counts() -> [(&'static str, u32); 5] {
+    ///
+    /// Curve-independent by construction: the bindings are the same eleven resources over
+    /// either group, only their element type changes. It is still reported per instantiation
+    /// so a test names the entry point it is talking about.
+    pub fn storage_buffer_counts() -> [(String, u32); 5] {
         fn count(entries: &[wgpu::BindGroupLayoutEntry]) -> u32 {
             entries
                 .iter()
@@ -494,11 +570,11 @@ impl MsmPointsG2 {
                 .count() as u32
         }
         [
-            (wgsl::ENTRY_CLEAR, count(&Self::clear_entries())),
-            (wgsl::ENTRY_SEGMENTED, count(&Self::segmented_entries())),
-            (wgsl::ENTRY_MERGE, count(&Self::merge_entries())),
-            (wgsl::ENTRY_REDUCE, count(&Self::reduce_entries())),
-            (wgsl::ENTRY_ONES, count(&Self::ones_entries())),
+            (C::WGSL.entry_clear(), count(&Self::clear_entries())),
+            (C::WGSL.entry_segmented(), count(&Self::segmented_entries())),
+            (C::WGSL.entry_merge(), count(&Self::merge_entries())),
+            (C::WGSL.entry_reduce(), count(&Self::reduce_entries())),
+            (C::WGSL.entry_ones(), count(&Self::ones_entries())),
         ]
     }
 
@@ -529,7 +605,7 @@ impl MsmPointsG2 {
             })
     }
 
-    /// The five bind groups one G2 MSM dispatches through, every buffer length checked.
+    /// The five bind groups one MSM dispatches through, every buffer length checked.
     ///
     /// One function rather than five, because the checks are the interesting part and a
     /// caller that can build four of five bind groups is a caller that can forget the fifth.
@@ -606,14 +682,14 @@ impl MsmPointsG2 {
         Ok(PointBinds {
             clear: self.bind(
                 backend,
-                wgsl::ENTRY_CLEAR,
+                &self.names[CLEAR],
                 &self.bgl_clear,
                 ring,
                 vec![(wgsl::BIND_BUCKETS, whole(&bufs.buckets))],
             ),
             segmented: self.bind(
                 backend,
-                wgsl::ENTRY_SEGMENTED,
+                &self.names[SEGMENTED],
                 &self.bgl_segmented,
                 ring,
                 vec![
@@ -627,7 +703,7 @@ impl MsmPointsG2 {
             ),
             merge: self.bind(
                 backend,
-                wgsl::ENTRY_MERGE,
+                &self.names[MERGE],
                 &self.bgl_merge,
                 ring,
                 vec![
@@ -643,7 +719,7 @@ impl MsmPointsG2 {
             // construction. See the module docs.
             reduce: self.bind(
                 backend,
-                wgsl::ENTRY_REDUCE,
+                &self.names[REDUCE],
                 &self.bgl_reduce,
                 ring,
                 vec![
@@ -656,7 +732,7 @@ impl MsmPointsG2 {
             ),
             ones: self.bind(
                 backend,
-                wgsl::ENTRY_ONES,
+                &self.names[ONES],
                 &self.bgl_ones,
                 ring,
                 vec![
@@ -676,6 +752,13 @@ impl MsmPointsG2 {
     }
 
     // ---- parameter blocks ----
+
+    /// The point plan for this module: this curve's measured slice length and this module's
+    /// reduction width, so the two things [`PointPlan`] cannot check for itself come from the
+    /// module that will run it.
+    pub fn plan_points(&self, digits: &DigitPlan, base_off: u32) -> Result<PointPlan, ProveError> {
+        PointPlan::new(digits, base_off, self.wg.tg, self.curve)
+    }
 
     fn dispatches(&self, n: u32, wg: u32) -> u32 {
         n.div_ceil(wg * self.workgroups_per_dispatch).max(1)
@@ -779,7 +862,7 @@ impl MsmPointsG2 {
     ) -> Result<(), ProveError> {
         self.encode_range(
             pass,
-            wgsl::ENTRY_CLEAR,
+            &self.names[CLEAR],
             &binds.clear,
             digits.rows(),
             self.wg.clear,
@@ -797,7 +880,7 @@ impl MsmPointsG2 {
     ) -> Result<(), ProveError> {
         self.encode_range(
             pass,
-            wgsl::ENTRY_SEGMENTED,
+            &self.names[SEGMENTED],
             &binds.segmented,
             points.seg_threads(digits),
             self.wg.segmented,
@@ -814,7 +897,7 @@ impl MsmPointsG2 {
     ) -> Result<(), ProveError> {
         self.encode_range(
             pass,
-            wgsl::ENTRY_MERGE,
+            &self.names[MERGE],
             &binds.merge,
             digits.rows(),
             self.wg.merge,
@@ -830,7 +913,7 @@ impl MsmPointsG2 {
         binds: &PointBinds,
         offsets: &PointOffsets,
     ) -> Result<(), ProveError> {
-        pass.set_pipeline(self.kernels.get(wgsl::ENTRY_REDUCE)?);
+        pass.set_pipeline(self.kernels.get(&self.names[REDUCE])?);
         pass.set_bind_group(0, &binds.reduce, &[offsets.reduce]);
         pass.dispatch_workgroups(digits.n_windows(), 1, 1);
         Ok(())
@@ -844,7 +927,7 @@ impl MsmPointsG2 {
         binds: &PointBinds,
         offsets: &PointOffsets,
     ) -> Result<(), ProveError> {
-        pass.set_pipeline(self.kernels.get(wgsl::ENTRY_ONES)?);
+        pass.set_pipeline(self.kernels.get(&self.names[ONES])?);
         pass.set_bind_group(0, &binds.ones, &[offsets.ones]);
         pass.dispatch_workgroups(points.ones_groups, 1, 1);
         Ok(())
@@ -892,7 +975,7 @@ impl MsmPointsG2 {
         digits: &DigitPlan,
         points: &PointPlan,
         bufs: &PointBuffers,
-    ) -> Result<G2Projective, ProveError> {
+    ) -> Result<C::Projective, ProveError> {
         let pt = self.curve.point_bytes as usize;
         let want = bufs.results_bytes(self.curve) as usize;
         if raw.len() < want {
@@ -904,7 +987,7 @@ impl MsmPointsG2 {
             )));
         }
         let at =
-            |i: usize| -> Result<G2Projective, ProveError> { xyzz_g2_from_bytes(&raw[i..i + pt]) };
+            |i: usize| -> Result<C::Projective, ProveError> { C::from_xyzz_bytes(&raw[i..i + pt]) };
         let last = digits.n_windows() as usize - 1;
         let mut acc = at(last * pt)?;
         for k in (0..last).rev() {
@@ -944,7 +1027,7 @@ impl MsmPointsG2 {
     }
 }
 
-/// The five bind groups one G2 MSM's point stages dispatch through.
+/// The five bind groups one MSM's point stages dispatch through.
 pub struct PointBinds {
     pub clear: wgpu::BindGroup,
     pub segmented: wgpu::BindGroup,
@@ -973,7 +1056,22 @@ impl PointOffsets {
 // XYZZ to arkworks, with no field inversion
 // ---------------------------------------------------------------------------
 
-/// One `Xyzz<Fq2>` as the kernel wrote it, 256 bytes, to a projective point.
+/// Limb group `j` of a flattened point: eight little-endian `u32` starting at word `8 * j`.
+///
+/// Exactly `g16_gpu_layout::PackedFq`, which is what makes these decoders the inverse of the
+/// packing the bases went out in rather than a second opinion about the wire format.
+fn limb_at(raw: &[u8], j: usize) -> PackedFq {
+    let mut v = [0u32; LIMBS];
+    for (k, word) in v.iter_mut().enumerate() {
+        let at = (j * LIMBS + k) * 4;
+        *word = u32::from_le_bytes([raw[at], raw[at + 1], raw[at + 2], raw[at + 3]]);
+    }
+    PackedFq { v }
+}
+
+/// One `Xyzz<Fq>` as the kernel wrote it, 128 bytes, to a projective point.
+///
+/// # Why there is no inversion
 ///
 /// XYZZ carries the invariant `ZZ^3 = ZZZ^2`, so setting the Jacobian `Z = ZZZ` gives
 /// `Z^2 = ZZ^3` and the point `(X * ZZ^2, Y * ZZ^3, ZZZ)` has `x = X*ZZ^2 / ZZ^3 = X/ZZ` and
@@ -984,6 +1082,28 @@ impl PointOffsets {
 /// inputs, and re-checking the curve equation on every window sum would cost a subgroup check
 /// per point for no information: a bug in the kernel shows up as a wrong MSM, which every
 /// test here compares against the CPU Pippenger.
+pub fn xyzz_g1_from_bytes(raw: &[u8]) -> Result<G1Projective, ProveError> {
+    if raw.len() < XYZZ_G1_WORDS * 4 {
+        return Err(bad(format!(
+            "an Xyzz<Fq> is {} bytes and this slice is {}",
+            XYZZ_G1_WORDS * 4,
+            raw.len()
+        )));
+    }
+    // x, y, zz, zzz, each eight little-endian u32 of Montgomery Fq.
+    let coord = |i: usize| -> Fq { limb_at(raw, i).to_fq() };
+    let (x, y, zz, zzz) = (coord(0), coord(1), coord(2), coord(3));
+    if zz.is_zero() {
+        return Ok(G1Projective::zero());
+    }
+    let zz2 = zz * zz;
+    Ok(G1Projective::new_unchecked(x * zz2, y * zz2 * zz, zzz))
+}
+
+/// One `Xyzz<Fq2>` as the kernel wrote it, 256 bytes, to a projective point.
+///
+/// See [`xyzz_g1_from_bytes`] for why there is no inversion here and no curve check; the only
+/// difference is that each coordinate is two `Fq` rather than one.
 pub fn xyzz_g2_from_bytes(raw: &[u8]) -> Result<G2Projective, ProveError> {
     if raw.len() < XYZZ_G2_WORDS * 4 {
         return Err(bad(format!(
@@ -992,21 +1112,11 @@ pub fn xyzz_g2_from_bytes(raw: &[u8]) -> Result<G2Projective, ProveError> {
             raw.len()
         )));
     }
-    // Limb `j` of the flattened 32-word point: x.c0, x.c1, y.c0, y.c1, zz.c0, zz.c1, zzz.c0,
-    // zzz.c1, each eight little-endian u32. Exactly `g16_gpu_layout::PackedFq2` twice per
-    // coordinate, which is what makes this the inverse of the packing the bases went out in.
-    let limb = |j: usize| -> PackedFq {
-        let mut v = [0u32; LIMBS];
-        for (k, word) in v.iter_mut().enumerate() {
-            let at = (j * LIMBS + k) * 4;
-            *word = u32::from_le_bytes([raw[at], raw[at + 1], raw[at + 2], raw[at + 3]]);
-        }
-        PackedFq { v }
-    };
+    // The flattened 32-word point is x.c0, x.c1, y.c0, y.c1, zz.c0, zz.c1, zzz.c0, zzz.c1.
     let coord = |i: usize| -> Fq2 {
         PackedFq2 {
-            c0: limb(i * 2),
-            c1: limb(i * 2 + 1),
+            c0: limb_at(raw, i * 2),
+            c1: limb_at(raw, i * 2 + 1),
         }
         .to_fq2()
     };

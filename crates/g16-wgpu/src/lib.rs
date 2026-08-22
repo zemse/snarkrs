@@ -19,8 +19,13 @@
 //! classification and the counting sort that makes one thread own one bucket by construction,
 //! so no 64-bit atomic is ever needed. It touches no curve arithmetic.
 //!
-//! There is still no `Backend` implementation and no proof. The point stages are U9 and U10,
-//! and U11 is where they become a backend.
+//! [`points`] and [`gen::points`] are the back half, U10 and U9: the XYZZ curve arithmetic
+//! and the five point kernels, emitted once per curve and instantiated for both BN254 groups.
+//! [`MsmPointsG1`] is four of a proof's five MSMs (A, B-G1, L, H) and [`MsmPointsG2`] is the
+//! fifth.
+//!
+//! There is still no `Backend` implementation and no proof. U11 is where the two halves of
+//! an MSM become one.
 //!
 //! # Why a fourth backend exists at all
 //!
@@ -80,7 +85,10 @@ pub use ntt::{
 };
 pub use params::ParamRing;
 pub use pipelines::{Kernels, PrepareCost};
-pub use points::{MsmPointsG2, PointBinds, PointBuffers, PointOffsets, PointPlan};
+pub use points::{
+    xyzz_g1_from_bytes, xyzz_g2_from_bytes, G1Curve, G2Curve, MsmPoints, MsmPointsG1, MsmPointsG2,
+    PointBinds, PointBuffers, PointCurve, PointOffsets, PointPlan,
+};
 pub use pointwise::{HJoin, HJoinParams};
 pub use readback::Readback;
 pub use stages::{HStages, Stage4, WgpuHandle};

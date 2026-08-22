@@ -1,10 +1,27 @@
 //! The back half of stages 5 to 9 in WGSL: BN254 curve arithmetic and the five point
-//! kernels that turn a sorted entry array into one point per window.
+//! kernels that turn a sorted entry array into one point per window, emitted once per curve.
 //!
 //! A port of `g16-metal/src/shaders/msm.metal:316-1158`, the half of that file the digit
-//! pipeline in [`crate::gen::msm`] leaves untouched. Everything here is `Fq2` arithmetic on
-//! top of the `fq_*` and `fq2_*` routines [`crate::gen::field`] already emits, so there is no
-//! second copy of the base field anywhere in this crate.
+//! pipeline in [`crate::gen::msm`] leaves untouched. Everything here is written in terms of
+//! [`Curve::f`], the coordinate field's function prefix, on top of the `fq_*` and `fq2_*`
+//! routines [`crate::gen::field`] already emits, so there is no second copy of the base field
+//! anywhere in this crate and no second copy of the curve arithmetic either.
+//!
+//! # One generator, two groups
+//!
+//! [`G1`] and [`G2`] are the same 836 lines at two sets of constants. That was U10's claim
+//! when it wrote this file for G2 alone and U9 checked it by instantiating G1: **four things
+//! turned out to be G2-specific and are now parameters**, and none of them was the
+//! arithmetic. The entry point names were `const &'static str` with `_g2` baked in rather
+//! than derived from the suffix; the affine struct's doc comment named `PackedG2Affine` and
+//! the G2 curve equation; the `Fq2` prelude was emitted unconditionally, which costs a G1
+//! module 6.6 KiB it never calls; and the workgroup sizes were one `Default` rather than one
+//! per curve, which matters because an `Xyzz<Fq>` is 128 bytes against an `Xyzz<Fq2>`'s 256
+//! and the occupancy arithmetic is therefore different. The `a = 0` short Weierstrass
+//! assumption is the one thing genuinely shared, and it holds on both BN254 groups.
+//!
+//! Four of the five MSMs in a Groth16 proof are G1 (A, B-G1, L, H) and one is G2, so [`G1`]
+//! is the hot path here and [`G2`] is the one that is tight against the limits.
 //!
 //! # Why XYZZ, and why the bases stay affine
 //!
@@ -17,10 +34,10 @@
 //! 35% waste before anything else it does.
 //!
 //! `ZZ == 0` is the identity, and `(0, 0)` is the affine point at infinity. The second is
-//! unambiguous rather than a convention: BN254's G2 is `y^2 = x^3 + 3/(9 + u)`, whose
-//! constant term is nonzero, so `(0, 0)` is off curve and can never be a real point. snarkjs
-//! zkeys really do contain points at infinity in the query vectors, so this is a case that
-//! occurs and not a defensive one.
+//! unambiguous rather than a convention on either group: BN254's G1 is `y^2 = x^3 + 3` and
+//! its G2 is `y^2 = x^3 + 3/(9 + u)`, and neither constant term is zero, so `(0, 0)` is off
+//! curve and can never be a real point. snarkjs zkeys really do contain points at infinity in
+//! the A, B and C query vectors, so this is a case that occurs and not a defensive one.
 //!
 //! # What `Fq2` costs, and what that does to the shapes below
 //!
@@ -63,13 +80,15 @@ use crate::gen::msm::params_struct;
 // Which curve
 // ---------------------------------------------------------------------------
 
-/// One curve's names and strides, so the arithmetic below is written once.
+/// One curve's names, strides and measured shape, so the arithmetic below is written once.
 ///
-/// Only [`G2`] exists today. G1 is design §8's U9 and is one more `const` of this shape plus
-/// the host wiring: every routine emitted here is written in terms of `c.f` and `c.fty`, so
-/// swapping `fq2` for `fq` and 256 bytes for 128 is the whole of the difference. Nothing in
-/// this file is G2-specific except those two constants and the `a = 0` short Weierstrass
-/// assumption, which holds on both BN254 groups.
+/// Every routine this module emits is written in terms of [`Self::f`] and [`Self::fty`], so
+/// swapping `fq2` for `fq` and 256 bytes for 128 really is most of the difference between the
+/// two groups. The rest of the fields are the things that turned out **not** to follow from
+/// those two: the packed layout the base vector arrives in, the curve equation the infinity
+/// sentinel argument rests on, whether the `Fq2` prelude is needed at all, and the workgroup
+/// sizes, which are measured per curve because a 128-byte accumulator and a 256-byte one do
+/// not have the same occupancy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Curve {
     /// Entry-point and function suffix: `msm_reduce_g2`, `pt_madd_g2`.
@@ -82,11 +101,51 @@ pub struct Curve {
     pub aff: &'static str,
     /// WGSL type of an XYZZ accumulator.
     pub pt: &'static str,
-    /// Device bytes per affine base. Must equal `g16_gpu_layout::PackedG2Affine`.
+    /// The `g16_gpu_layout` type the base vector is packed as, by name. Emitted into the
+    /// generated source so the wire format has one name on both sides of the boundary.
+    pub packed: &'static str,
+    /// This group's curve equation, for the comment that justifies the `(0, 0)` sentinel.
+    pub curve_eq: &'static str,
+    /// Whether the coordinate field needs [`crate::gen::field::FQ2_OPS`] in front of it.
+    /// False for G1, which saves 6.6 KiB of WGSL naga would otherwise parse and dead-strip.
+    pub needs_fq2: bool,
+    /// Device bytes per affine base. Must equal the `packed` type's `size_of`.
     pub base_bytes: u64,
-    /// Device bytes per XYZZ accumulator.
+    /// Device bytes per XYZZ accumulator, four coordinates.
     pub point_bytes: u64,
+    /// Entries one thread of `msm_segmented_*` owns. Not baked into the WGSL (it is a uniform
+    /// field), but measured per curve, so it lives with the other measured shape constants.
+    /// See [`crate::points::PointPlan`] and the sweeps in `tests/msm_g1.rs`.
+    pub slice_len: u32,
+    /// The measured workgroup sizes for this curve's five entry points.
+    pub wg: Workgroups,
+    /// What a caller whose bucket array is over the storage binding limit should be told
+    /// beyond the byte counts. G2 has a real alternative and G1 does not.
+    pub headroom: &'static str,
 }
+
+/// BN254's G1, over `Fq`. Four of a proof's five MSMs.
+pub const G1: Curve = Curve {
+    suffix: "g1",
+    f: "fq",
+    fty: "Fq",
+    aff: "AffG1",
+    pt: "PtG1",
+    packed: "PackedG1Affine",
+    curve_eq: "y^2 = x^3 + 3",
+    needs_fq2: false,
+    base_bytes: 64,
+    point_bytes: 128,
+    slice_len: 128,
+    wg: Workgroups {
+        clear: 256,
+        segmented: 64,
+        merge: 256,
+        tg: 128,
+    },
+    headroom: "no BN254 group has a narrower accumulator than this one, so the only way \
+               down is a narrower window",
+};
 
 /// BN254's G2, over `Fq2 = Fq[u]/(u^2 + 1)`.
 pub const G2: Curve = Curve {
@@ -95,40 +154,90 @@ pub const G2: Curve = Curve {
     fty: "Fq2",
     aff: "AffG2",
     pt: "PtG2",
+    packed: "PackedG2Affine",
+    curve_eq: "y^2 = x^3 + 3/(9 + u)",
+    needs_fq2: true,
     base_bytes: 128,
     point_bytes: 256,
+    slice_len: 128,
+    wg: Workgroups {
+        clear: 256,
+        segmented: 128,
+        merge: 256,
+        tg: 64,
+    },
+    headroom: "G1 has twice the headroom at the same c",
 };
+
+/// The two, in the order a proof spends its time on them.
+pub const CURVES: [Curve; 2] = [G1, G2];
 
 impl Curve {
     /// Bytes one reduction's workgroup array occupies at `tg` threads.
     pub const fn workgroup_bytes(&self, tg: u32) -> u64 {
         self.point_bytes * tg as u64
     }
+
+    /// The largest `tg` whose `array<Pt, tg>` still fits [`FLOOR_WORKGROUP_BYTES`]. 64 for G2,
+    /// 128 for G1, and the difference is the whole reason the reduction is swept per curve.
+    pub const fn max_tg(&self) -> u32 {
+        (FLOOR_WORKGROUP_BYTES / self.point_bytes) as u32
+    }
+
+    /// This curve's shipped workgroup sizes with `tg` forced, for the reduction sweep.
+    pub const fn with_tg(&self, tg: u32) -> Workgroups {
+        Workgroups { tg, ..self.wg }
+    }
+
+    /// This curve's shipped `tg` with the three 1D kernels forced to one size, for the
+    /// workgroup sweep.
+    pub const fn uniform(&self, n: u32) -> Workgroups {
+        Workgroups {
+            clear: n,
+            segmented: n,
+            merge: n,
+            tg: self.wg.tg,
+        }
+    }
+
+    // ---- entry point names ----
+    //
+    // Derived from the suffix rather than written out, because U10 wrote them out as five
+    // `const &'static str` with `_g2` in the text and that was one of the four things that
+    // stopped this file being generic.
+
+    /// Reset a pooled bucket array to the identity.
+    pub fn entry_clear(&self) -> String {
+        format!("msm_clear_{}", self.suffix)
+    }
+    /// Fixed-length-slice bucket accumulation, the kernel that does the work.
+    pub fn entry_segmented(&self) -> String {
+        format!("msm_segmented_{}", self.suffix)
+    }
+    /// Fold each bucket's spilled partials into it.
+    pub fn entry_merge(&self) -> String {
+        format!("msm_merge_{}", self.suffix)
+    }
+    /// One window's `2^(c-1)` buckets to one point.
+    pub fn entry_reduce(&self) -> String {
+        format!("msm_reduce_{}", self.suffix)
+    }
+    /// Sum the bases whose scalar is exactly 1.
+    pub fn entry_ones(&self) -> String {
+        format!("msm_ones_{}", self.suffix)
+    }
+
+    /// The five, in the order a proof dispatches them.
+    pub fn entries(&self) -> [String; 5] {
+        [
+            self.entry_clear(),
+            self.entry_segmented(),
+            self.entry_merge(),
+            self.entry_reduce(),
+            self.entry_ones(),
+        ]
+    }
 }
-
-// ---------------------------------------------------------------------------
-// Entry point names
-// ---------------------------------------------------------------------------
-
-/// Reset a pooled bucket array to the identity.
-pub const ENTRY_CLEAR: &str = "msm_clear_g2";
-/// Fixed-length-slice bucket accumulation, the kernel that does the work.
-pub const ENTRY_SEGMENTED: &str = "msm_segmented_g2";
-/// Fold each bucket's spilled partials into it.
-pub const ENTRY_MERGE: &str = "msm_merge_g2";
-/// One window's `2^(c-1)` buckets to one point.
-pub const ENTRY_REDUCE: &str = "msm_reduce_g2";
-/// Sum the bases whose scalar is exactly 1.
-pub const ENTRY_ONES: &str = "msm_ones_g2";
-
-/// The five, in the order a proof dispatches them.
-pub const ENTRIES: [&str; 5] = [
-    ENTRY_CLEAR,
-    ENTRY_SEGMENTED,
-    ENTRY_MERGE,
-    ENTRY_REDUCE,
-    ENTRY_ONES,
-];
 
 // ---------------------------------------------------------------------------
 // Bindings, group 0
@@ -256,38 +365,6 @@ pub struct Workgroups {
     pub tg: u32,
 }
 
-impl Default for Workgroups {
-    fn default() -> Self {
-        Self {
-            clear: 256,
-            segmented: 128,
-            merge: 256,
-            tg: 64,
-        }
-    }
-}
-
-impl Workgroups {
-    /// Every 1D kernel at the same size, the reduction left at its shipped `tg`. For the
-    /// sweep in `tests/msm_g2.rs`.
-    pub fn uniform(n: u32) -> Self {
-        Self {
-            clear: n,
-            segmented: n,
-            merge: n,
-            tg: Self::default().tg,
-        }
-    }
-
-    /// The shipped sizes with `tg` forced, for the reduction sweep.
-    pub fn with_tg(tg: u32) -> Self {
-        Self {
-            tg,
-            ..Self::default()
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Limits the generator refuses to cross
 // ---------------------------------------------------------------------------
@@ -302,10 +379,10 @@ pub const FLOOR_WORKGROUP_BYTES: u64 = 16384;
 // Emission
 // ---------------------------------------------------------------------------
 
-/// The five G2 point kernels behind one copy of the `Fq` and `Fq2` prelude, at the measured
-/// shape.
-pub fn points_module(v: Variant) -> String {
-    points_module_at(v, G2, Workgroups::default())
+/// One curve's five point kernels behind one copy of the coordinate field's prelude, at that
+/// curve's measured shape.
+pub fn points_module(v: Variant, c: Curve) -> String {
+    points_module_at(v, c, c.wg)
 }
 
 /// Same, at chosen workgroup sizes.
@@ -321,13 +398,14 @@ pub fn points_module(v: Variant) -> String {
 ///
 /// On a workgroup size outside `1..=`[`FLOOR_INVOCATIONS`], on a `tg` whose workgroup array
 /// would exceed [`FLOOR_WORKGROUP_BYTES`], and on [`Variant::NoCarry13x20`], whose `R = 2^260`
-/// wire format is not `g16_gpu_layout::PackedG2Affine` and which no host packer produces.
+/// wire format is not what the host packers produce.
 pub fn points_module_at(v: Variant, c: Curve, wg: Workgroups) -> String {
     assert_eq!(
         v,
         Variant::Cios32Unrolled,
-        "the point kernels read g16_gpu_layout::PackedG2Affine, which is 8 limbs of 32 bits; \
-         variant {v:?} has a different wire format and no host packer"
+        "the point kernels read g16_gpu_layout::{}, which is 8 limbs of 32 bits; variant \
+         {v:?} has a different wire format and no host packer",
+        c.packed
     );
     for (name, n) in [
         ("clear", wg.clear),
@@ -358,7 +436,12 @@ pub fn points_module_at(v: Variant, c: Curve, wg: Workgroups) -> String {
     );
     s.push_str(MUL64);
     s.push_str(&FQ.ops(v));
-    s.push_str(FQ2_OPS);
+    // Only when the coordinate field is Fq2. Carrying a prelude a kernel never calls costs
+    // naga time and no pipeline time (U8 measured about 2 ms per module), so this is 6.6 KiB
+    // and a couple of milliseconds off every G1 module rather than anything structural.
+    if c.needs_fq2 {
+        s.push_str(FQ2_OPS);
+    }
     s.push_str(&point_types(c));
     s.push_str(&point_ops(c));
     s.push_str(&params_struct());
@@ -371,15 +454,16 @@ pub fn points_module_at(v: Variant, c: Curve, wg: Workgroups) -> String {
     s
 }
 
-/// `AffG2` and `PtG2`, and nothing else: the coordinate type comes from the field prelude.
+/// The affine and accumulator structs, and nothing else: the coordinate type comes from the
+/// field prelude.
 fn point_types(c: Curve) -> String {
-    let (aff, pt, fty) = (c.aff, c.pt, c.fty);
+    let (aff, pt, fty, packed, eq) = (c.aff, c.pt, c.fty, c.packed, c.curve_eq);
     format!(
         "
 // ---------------------------------------------------------------------------
-// Points. {aff} is {base} bytes and matches g16_gpu_layout::PackedG2Affine exactly; {pt} is
+// Points. {aff} is {base} bytes and matches g16_gpu_layout::{packed} exactly; {pt} is
 // {point} bytes. (0, 0) is the affine point at infinity, which is unambiguous rather than a
-// convention: BN254's G2 is y^2 = x^3 + 3/(9 + u), so (0, 0) is off curve.
+// convention: this group is {eq}, whose constant term is nonzero, so (0, 0) is off curve.
 //
 // {pt} is the accumulator: x = X/ZZ, y = Y/ZZZ, with the invariant ZZ^3 = ZZZ^2, and ZZ == 0
 // is the identity. That last one is why the clear kernel writes only zz.
@@ -558,6 +642,7 @@ const NO_ROW: u32 = {NO_ROW}u;
 
 fn entry_clear(c: Curve, wg: u32) -> String {
     let f = c.f;
+    let entry = c.entry_clear();
     let mut s = String::new();
     let _ = write!(
         s,
@@ -569,7 +654,7 @@ fn entry_clear(c: Curve, wg: u32) -> String {
 // the segmented pass direct-writes is overwritten in full anyway, so clearing the other three
 // coordinates would be {bytes} bytes of pure memory traffic per bucket instead of {quarter}.
 @compute @workgroup_size({wg})
-fn {ENTRY_CLEAR}(@builtin(global_invocation_id) gid: vec3<u32>) {{
+fn {entry}(@builtin(global_invocation_id) gid: vec3<u32>) {{
     let i = P.lo + gid.x;
     if (i >= P.n_windows * P.n_buckets) {{ return; }}
     BUCKETS[i].zz = {f}_zero();
@@ -583,6 +668,7 @@ fn {ENTRY_CLEAR}(@builtin(global_invocation_id) gid: vec3<u32>) {{
 
 fn entry_segmented(c: Curve, wg: u32) -> String {
     let (f, sfx) = (c.f, c.suffix);
+    let entry = c.entry_segmented();
     let mut s = String::new();
     let _ = write!(
         s,
@@ -612,7 +698,7 @@ fn entry_segmented(c: Curve, wg: u32) -> String {
 // continues. Spilling one run that did not need to costs the merge one addition; failing to
 // spill one that did would lose it silently.
 @compute @workgroup_size({wg})
-fn {ENTRY_SEGMENTED}(@builtin(global_invocation_id) gid: vec3<u32>) {{
+fn {entry}(@builtin(global_invocation_id) gid: vec3<u32>) {{
     let t = P.lo + gid.x;
     if (t >= P.n_windows * P.slices) {{ return; }}
     let w = t / P.slices;
@@ -672,6 +758,7 @@ fn {ENTRY_SEGMENTED}(@builtin(global_invocation_id) gid: vec3<u32>) {{
 
 fn entry_merge(c: Curve, wg: u32) -> String {
     let sfx = c.suffix;
+    let entry = c.entry_merge();
     let mut s = String::new();
     let _ = write!(
         s,
@@ -681,7 +768,7 @@ fn entry_merge(c: Curve, wg: u32) -> String {
 // search and no atomic. The worst case is count / slice_len additions for the fattest bucket,
 // which turns g16-metal's 11,758-step serial loop into about 180.
 @compute @workgroup_size({wg})
-fn {ENTRY_MERGE}(@builtin(global_invocation_id) gid: vec3<u32>) {{
+fn {entry}(@builtin(global_invocation_id) gid: vec3<u32>) {{
     let row = P.lo + gid.x;
     if (row >= P.n_windows * P.n_buckets) {{ return; }}
     let cnt = COUNTS[row];
@@ -736,6 +823,7 @@ fn {ENTRY_MERGE}(@builtin(global_invocation_id) gid: vec3<u32>) {{
 
 fn entry_reduce(c: Curve, tg: u32) -> String {
     let (pt, sfx) = (c.pt, c.suffix);
+    let entry = c.entry_reduce();
     let mut s = String::new();
     let _ = write!(
         s,
@@ -753,7 +841,7 @@ fn entry_reduce(c: Curve, tg: u32) -> String {
 var<workgroup> SHARED: array<{pt}, {tg}>;
 
 @compute @workgroup_size({tg})
-fn {ENTRY_REDUCE}(@builtin(workgroup_id) wid: vec3<u32>,
+fn {entry}(@builtin(workgroup_id) wid: vec3<u32>,
                   @builtin(local_invocation_index) tid: u32) {{
     let w = wid.x;
     let seg_len = (P.n_buckets + {tg}u - 1u) / {tg}u;
@@ -792,6 +880,7 @@ fn {ENTRY_REDUCE}(@builtin(workgroup_id) wid: vec3<u32>,
 
 fn entry_ones(c: Curve, tg: u32) -> String {
     let sfx = c.suffix;
+    let entry = c.entry_ones();
     let mut s = String::new();
     let _ = write!(
         s,
@@ -805,7 +894,7 @@ fn entry_ones(c: Curve, tg: u32) -> String {
 // run at the same time and a second array would double this module's workgroup allocation for
 // nothing.
 @compute @workgroup_size({tg})
-fn {ENTRY_ONES}(@builtin(workgroup_id) wid: vec3<u32>,
+fn {entry}(@builtin(workgroup_id) wid: vec3<u32>,
                 @builtin(local_invocation_index) tid: u32) {{
     let g = wid.x;
     let stride = P.ones_groups * {tg}u;

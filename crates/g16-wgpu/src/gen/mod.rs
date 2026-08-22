@@ -10,9 +10,10 @@
 //! [`gather`] is stage 0's generator, [`ntt`] is stages 1 to 3's, [`pointwise`] is
 //! stage 4's standalone reference kernel, the one the fused NTT epilogue is checked
 //! against, and [`msm`] is the front half of stages 5 to 9, the counting sort that decides
-//! which bucket every point lands in, and [`points`] is the back half, U10's: the `Xyzz<Fq2>`
-//! arithmetic and the five G2 point kernels that turn a sorted entry array into one point per
-//! window. U9's G1 twin has not landed; [`points::Curve`] is the one constant it needs.
+//! which bucket every point lands in, and [`points`] is the back half: the XYZZ curve
+//! arithmetic and the five point kernels that turn a sorted entry array into one point per
+//! window, emitted once per curve from [`points::Curve`]. U10 wrote it for G2 and U9
+//! instantiated [`points::G1`] from the same lines.
 //! They all put a field prelude in front
 //! of their own entry points: [`field::field_module`] when they need `Fq` and `Fq2`, or just `FR.ops` when,
 //! like the NTT, they only ever touch the scalar field.
@@ -28,5 +29,5 @@ pub use field::{field_module, Field, Variant, FQ, FQ2_OPS, FR, MUL64};
 pub use gather::gather_module;
 pub use msm::{digits_module, fused_module_at, mont_module, LimbPick, Workgroups};
 pub use ntt::{ntt_module, Mode};
-pub use points::{points_module, Curve};
+pub use points::{points_module, Curve, G1, G2};
 pub use pointwise::h_join_module;
