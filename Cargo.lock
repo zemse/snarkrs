@@ -859,6 +859,7 @@ dependencies = [
  "g16-core",
  "g16-field",
  "g16-gpu-layout",
+ "g16-ntt",
  "g16-zkey",
  "num-bigint",
  "num-traits",

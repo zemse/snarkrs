@@ -54,6 +54,11 @@ wgpu = { version = "30.0.1", default-features = false, features = [
 # compile time.
 
 [dev-dependencies]
+# The NTT oracle. U6 checks the device transform against `g16_ntt::CpuNtt` elementwise, and
+# that crate is deliberately not a runtime dependency: the production GPU path implements
+# `compute_h` directly and never goes through `NttBackend`, because round-tripping every one
+# of the six transforms across the host boundary is the thing this backend exists to avoid.
+g16-ntt.workspace = true
 num-bigint.workspace = true
 num-traits = "0.2"
 ark-ff.workspace = true

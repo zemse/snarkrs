@@ -77,7 +77,7 @@ pub struct Kernels {
     label: String,
     source_len: usize,
     module: wgpu::ShaderModule,
-    pipelines: HashMap<&'static str, wgpu::ComputePipeline>,
+    pipelines: HashMap<String, wgpu::ComputePipeline>,
     cost: PrepareCost,
 }
 
@@ -99,7 +99,25 @@ impl Kernels {
         label: &str,
         source: &str,
         layout: &wgpu::PipelineLayout,
-        entries: &[&'static str],
+        entries: &[&str],
+    ) -> Result<Self, ProveError> {
+        let paired: Vec<(&str, &wgpu::PipelineLayout)> =
+            entries.iter().map(|&e| (e, layout)).collect();
+        Self::build_with_layouts(backend, label, source, &paired)
+    }
+
+    /// Same, with a separate pipeline layout per entry point.
+    ///
+    /// One module, several layouts, which is what design §4's "one entry point per mode"
+    /// needs: `ntt_head_plain` declares 4 storage buffers and `ntt_head_join` declares 7, and
+    /// giving both the union of 8 would put the pair exactly at the browser floor with no
+    /// margin, which is the situation the split exists to escape. The module is still
+    /// compiled once, which matters because the shared `Fr` prelude is most of its bytes.
+    pub fn build_with_layouts(
+        backend: &WgpuBackend,
+        label: &str,
+        source: &str,
+        entries: &[(&str, &wgpu::PipelineLayout)],
     ) -> Result<Self, ProveError> {
         let device = backend.device();
 
@@ -112,7 +130,7 @@ impl Kernels {
 
         let t1 = Instant::now();
         let mut pipelines = HashMap::with_capacity(entries.len());
-        for &entry in entries {
+        for &(entry, layout) in entries {
             let p = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(entry),
                 layout: Some(layout),
@@ -125,7 +143,7 @@ impl Kernels {
                 // already fast enough not to matter.
                 cache: None,
             });
-            if pipelines.insert(entry, p).is_some() {
+            if pipelines.insert(entry.to_string(), p).is_some() {
                 return Err(bad(format!(
                     "module {label:?} lists entry point {entry:?} twice"
                 )));

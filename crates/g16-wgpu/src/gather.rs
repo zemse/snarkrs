@@ -336,7 +336,7 @@ impl CsrTables {
 /// A zero-length allocation is illegal in WebGPU and does happen here: a key whose B matrix
 /// has no nonzeros at all gives an empty `signal` array. One padding word costs nothing and
 /// the kernel never reads it, because `lo == hi` for every row of such a matrix.
-fn storage_u32(
+pub(crate) fn storage_u32(
     backend: &WgpuBackend,
     label: &str,
     data: &[u32],
