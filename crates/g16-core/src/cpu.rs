@@ -51,7 +51,11 @@ pub struct CpuCircuit {
 }
 
 impl CpuCircuit {
-    fn new(pk: ProvingKey) -> Result<Self, ProveError> {
+    /// Public alongside [`CpuCircuit::gather`], and for the same reason: a GPU backend
+    /// testing one stage in isolation needs the CPU circuit as a concrete type, and
+    /// `Backend::prepare` hands back a `Box<dyn PreparedCircuit>` that has no stage 0 on it.
+    /// A prover still goes through `prepare`.
+    pub fn new(pk: ProvingKey) -> Result<Self, ProveError> {
         let bad = |reason: String| ProveError::Backend {
             backend: "cpu",
             reason,
@@ -117,7 +121,20 @@ impl CpuCircuit {
     ///
     /// A gather rather than snarkjs' scatter. The CSR sort in `g16-zkey` is what buys
     /// this: rows are disjoint, so the loop is embarrassingly parallel with no atomics.
-    fn gather(&self, m: usize, witness: &[Fr]) -> Vec<Fr> {
+    ///
+    /// Public because it is the oracle every GPU backend's stage 0 is checked against, and
+    /// `compute_h` folds stages 0 to 4 together so it cannot serve as one. A backend that
+    /// only compares the final `H` can pass with a gather that is wrong and a transform
+    /// that is wrong in the opposite direction, which is not a hypothetical: the two are
+    /// developed in separate units here.
+    ///
+    /// # Panics
+    ///
+    /// If `m` is not 0 (A) or 1 (B). There are only two matrices in a zkey: snarkjs filters
+    /// the C matrix out of section 4 before writing it, which is why stage 0 computes C
+    /// rather than gathering it.
+    pub fn gather(&self, m: usize, witness: &[Fr]) -> Vec<Fr> {
+        assert!(m < 2, "matrix index {m}: a zkey holds only A and B");
         let row_ptr = &self.pk.coeffs.row_ptr[m];
         let signal = &self.pk.coeffs.signal[m];
         let value = &self.pk.coeffs.value[m];

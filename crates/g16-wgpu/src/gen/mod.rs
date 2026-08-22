@@ -7,9 +7,12 @@
 //! straight-line code with literal indices, and nobody is hand-writing 8 rounds x 8 limbs
 //! of that twice (once for `Fr`, once for `Fq`) and keeping it right.
 //!
-//! Later units add `gen::ntt`, `gen::msm` and `gen::gather` next to [`field`]; they all
-//! concatenate [`field::field_module`] in front of their own entry points.
+//! [`gather`] is the first kernel generator built on top of it. Later units add `gen::ntt`
+//! and `gen::msm` next to them; they all concatenate [`field::field_module`] in front of
+//! their own entry points.
 
 pub mod field;
+pub mod gather;
 
 pub use field::{field_module, Field, Variant, FQ, FQ2_OPS, FR, MUL64};
+pub use gather::gather_module;
