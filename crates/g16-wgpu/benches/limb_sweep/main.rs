@@ -34,6 +34,16 @@ use num_traits::One;
 
 const ELEMS: u32 = 1 << 16;
 const ITERS: u32 = 256;
+/// Elements validated against `num-bigint` before a variant's time is printed.
+///
+/// 256 and not 8, which is what this harness checked until the browser gate caught 8 letting
+/// a real bug through. A kernel that drops the final conditional subtraction of `m` returns
+/// the right residue class in the wrong representative; CIOS leaves `T < m^2/R + m` and
+/// `m/R = 0.1888` for BN254, so the subtraction is needed on only 15.9% of outputs and
+/// `0.841^8 = 24%` of such kernels pass an 8-element check. Patching `take = false` into the
+/// generated `fr_mul` was measured doing exactly that in Chrome, 1.6% faster and undetected.
+/// At 256 the miss probability is 4e-20.
+const CHECK: usize = 256;
 
 fn modulus() -> BigUint {
     BigUint::from_slice(&FR_MODULUS)
@@ -240,12 +250,14 @@ async fn run() {
         };
 
         // With ITERS chained multiplies by b the closed form is a*b^ITERS in Montgomery form.
-        // Check the first few elements against bigint arithmetic.
+        // Check CHECK elements of it against bigint arithmetic. rinv is hoisted out of that
+        // loop: at CHECK = 256 a modpow inside it would be 256 full 256-bit exponentiations
+        // per variant, which would cost more than the sweep it is guarding.
+        let rinv = big_r.modpow(&(&r - BigUint::from(2u32)), &r);
         let mut correct = true;
-        for i in 0..8usize {
+        for i in 0..CHECK {
             let mut want = mont(&a_std[i]);
             let bm = mont(&b_std[i]);
-            let rinv = big_r.modpow(&(&r - BigUint::from(2u32)), &r);
             for _ in 0..ITERS {
                 want = (&want * &bm % &r) * &rinv % &r;
             }
