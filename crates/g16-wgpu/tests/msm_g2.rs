@@ -354,7 +354,7 @@ fn assert_matches_cpu(run: &Run, bases: &[G2Affine], scalars: &[Fr], what: &str)
 fn the_g2_msm_matches_cpu_pippenger_at_every_length() {
     let mut rng = test_rng();
     let mut checked = 0;
-    for n in [1usize, 2, 3, 63, 64, 65, 127, 128, 1000] {
+    for n in [1usize, 2, 3, 63, 64, 65, 127, 128, 129, 130, 200, 256, 257, 1000] {
         let bases = rand_bases(n, &mut rng);
         let scalars = general_scalars(n, &mut rng);
         let run = run_msm(&bases, &scalars, 0, 0, n as u32, None, 3);
@@ -1069,10 +1069,10 @@ fn the_point_plan_derives_its_shape_once() {
     let d = DigitPlan::with_c(1000, 0, Some(1000), 12).expect("plan");
     let p = PointPlan::new(&d, 0, 32).expect("point plan");
     assert_eq!(p.slice_len(), g16_wgpu::points::SLICE_LEN);
-    assert_eq!(p.slices(), 1000u32.div_ceil(64));
+    assert_eq!(p.slices(), 1000u32.div_ceil(g16_wgpu::points::SLICE_LEN));
     assert_eq!(p.seg_threads(&d), d.n_windows() * p.slices());
     assert_eq!(p.spill_slots(&d), 2 * p.seg_threads(&d));
-    // ceil(1000 / (32 * 64)) = 1, and it is never zero: a dispatch of zero workgroups writes
+    // ceil(1000 / (32 * SLICE_LEN)) = 1, and it is never zero: a dispatch of zero workgroups writes
     // nothing and the host would then add a stale slot.
     assert_eq!(p.ones_groups(), 1);
     assert_eq!(PointPlan::new(&d, 0, 32).unwrap().ones_groups(), 1);
