@@ -43,10 +43,17 @@ use g16_msm::{CpuMsm, MsmBackend};
 use g16_wgpu::gen::points as wgsl;
 use g16_wgpu::msm::{pack_scalars, DigitBuffers, DigitPlan, MsmDigits};
 use g16_wgpu::points::{MsmPointsG2, PointBuffers, PointPlan};
-use g16_wgpu::{LimitsProfile, ParamRing, Readback, WgpuBackend};
+use g16_wgpu::{LimitsProfile, ParamRing, WgpuBackend};
 
+#[path = "msmcommon/mod.rs"]
+mod common;
 #[path = "gpulock/mod.rs"]
 mod gpulock;
+
+use common::{
+    argmin, exclusive, fill, general_count, general_scalars, median, read_bytes, read_words,
+    storage_words, witness_shaped, SENTINEL,
+};
 
 // ---------------------------------------------------------------------------
 // Device and pipelines, built once for the whole binary
@@ -68,17 +75,6 @@ fn digits() -> &'static MsmDigits {
 fn points() -> &'static MsmPointsG2 {
     static P: OnceLock<MsmPointsG2> = OnceLock::new();
     P.get_or_init(|| MsmPointsG2::new(floor()).expect("G2 point pipelines"))
-}
-
-/// Serialises the timing tests against each other and against the heavy correctness ones.
-///
-/// Tests in one binary run in parallel by default and every one of them dispatches on the
-/// same device, so an unguarded sweep measures whatever else happened to be resident. This
-/// does not defend against the other test binaries, which run in their own processes; the
-/// sweeps take medians of five for that.
-fn exclusive() -> std::sync::MutexGuard<'static, ()> {
-    static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    GPU.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 // ---------------------------------------------------------------------------
@@ -105,87 +101,9 @@ fn walk_bases(n: usize, rng: &mut impl Rng) -> Vec<G2Affine> {
     G2Projective::normalize_batch(&proj)
 }
 
-/// `n` scalars, none of them 0 or 1, so every one reaches a bucket.
-fn general_scalars(n: usize, rng: &mut impl Rng) -> Vec<Fr> {
-    let mut out = Vec::with_capacity(n);
-    while out.len() < n {
-        let x = Fr::rand(rng);
-        if !(x.is_zero() || x.is_one()) {
-            out.push(x);
-        }
-    }
-    out
-}
-
-/// A witness-shaped vector: `general_ppm` parts per million are general, the rest split
-/// between 0 and 1. That is the shape design §5 sizes the window for, and it is the only
-/// shape that exercises `msm_ones_g2` and the bucket path at the same time.
-fn witness_shaped(n: usize, general_ppm: u32, rng: &mut impl Rng) -> Vec<Fr> {
-    (0..n)
-        .map(|_| {
-            let r: u32 = rng.gen_range(0..1_000_000);
-            if r < general_ppm {
-                let mut x = Fr::rand(rng);
-                while x.is_zero() || x.is_one() {
-                    x = Fr::rand(rng);
-                }
-                x
-            } else if r & 1 == 0 {
-                Fr::zero()
-            } else {
-                Fr::one()
-            }
-        })
-        .collect()
-}
-
 // ---------------------------------------------------------------------------
 // Device plumbing
 // ---------------------------------------------------------------------------
-
-/// The sentinel every output buffer is pre-filled with. Not zero, so a kernel that writes
-/// nothing is caught rather than silently agreeing with an identity oracle, and not a
-/// plausible bucket row either.
-const SENTINEL: u32 = 0xDEAD_BEEF;
-
-fn storage_words(label: &str, data: &[u32]) -> wgpu::Buffer {
-    let b = floor();
-    let bytes = (data.len().max(1) * 4) as u64;
-    let buf = b.device().create_buffer(&wgpu::BufferDescriptor {
-        label: Some(label),
-        size: bytes,
-        usage: wgpu::BufferUsages::STORAGE
-            | wgpu::BufferUsages::COPY_DST
-            | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
-    if !data.is_empty() {
-        b.queue().write_buffer(&buf, 0, bytemuck::cast_slice(data));
-    }
-    buf
-}
-
-fn fill(buf: &wgpu::Buffer, word: u32) {
-    let words = (buf.size() / 4) as usize;
-    floor()
-        .queue()
-        .write_buffer(buf, 0, bytemuck::cast_slice(&vec![word; words]));
-}
-
-fn read_words(buf: &wgpu::Buffer) -> Vec<u32> {
-    read_bytes(buf, buf.size())
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
-}
-
-fn read_bytes(buf: &wgpu::Buffer, bytes: u64) -> Vec<u8> {
-    let b = floor();
-    let rb = Readback::new(b, "u10 readback", bytes).expect("readback");
-    let mut enc = b.device().create_command_encoder(&Default::default());
-    rb.copy_from(&mut enc, buf, 0, bytes).expect("copy");
-    pollster::block_on(rb.submit_and_read(b, enc, bytes)).expect("read")
-}
 
 /// The base vector as the device sees it: `PackedG2Affine`, 128 bytes, infinity mapped onto
 /// the all-zero encoding by reading arkworks' flag rather than by hoping `x` and `y` are zero.
@@ -234,10 +152,7 @@ fn run_msm(
     let p = points();
 
     let (words, _) = pack_scalars(all_scalars);
-    let general = all_scalars[scalar_off as usize..(scalar_off + n) as usize]
-        .iter()
-        .filter(|x| !(x.is_zero() || x.is_one()))
-        .count() as u32;
+    let general = general_count(&all_scalars[scalar_off as usize..(scalar_off + n) as usize]);
 
     let dplan = match c {
         Some(c) => DigitPlan::with_c(n, scalar_off, Some(general), c),
@@ -246,15 +161,15 @@ fn run_msm(
     .expect("digit plan");
     let pplan = PointPlan::new(&dplan, base_off, p.workgroups().tg, p.curve()).expect("point plan");
 
-    let scalars = storage_words("u10 scalars", &words);
-    let bases_buf = storage_words("u10 bases", &base_words(bases));
+    let scalars = storage_words(b, "u10 scalars", &words);
+    let bases_buf = storage_words(b, "u10 bases", &base_words(bases));
     let sort = DigitBuffers::new(b, &dplan, slack).expect("digit buffers");
     let pts = PointBuffers::new(b, &dplan, &pplan, slack, p.curve()).expect("point buffers");
     for buf in [&sort.counts, &sort.cursor, &sort.entries] {
-        fill(buf, SENTINEL);
+        fill(b, buf, SENTINEL);
     }
     for buf in [&pts.buckets, &pts.spill_pts, &pts.spill_rows, &pts.results] {
-        fill(buf, SENTINEL);
+        fill(b, buf, SENTINEL);
     }
 
     let slots = d.sort_slots(&dplan) + p.slots(&dplan, &pplan) + 4;
@@ -284,15 +199,15 @@ fn run_msm(
         .expect("poll");
     assert!(b.take_error().is_none(), "device error during the G2 MSM");
 
-    let raw = read_bytes(&pts.results, pts.results.size());
+    let raw = read_bytes(b, &pts.results, pts.results.size());
     let result = p
         .combine(&raw, &dplan, &pplan, &pts)
         .expect("combine the window sums");
 
     Run {
         result,
-        buckets: read_words(&pts.buckets),
-        spill_rows: read_words(&pts.spill_rows),
+        buckets: read_words(b, &pts.buckets),
+        spill_rows: read_words(b, &pts.spill_rows),
         results: raw
             .chunks_exact(4)
             .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
@@ -724,7 +639,7 @@ impl Bench {
         let scalars = general_scalars(n as usize, &mut rng);
         let (words, general) = pack_scalars(&scalars);
         let dplan = DigitPlan::with_c(n, 0, Some(general), c).expect("plan");
-        let sbuf = storage_words("u10 bench scalars", &words);
+        let sbuf = storage_words(b, "u10 bench scalars", &words);
         let sort = DigitBuffers::new(b, &dplan, 0).expect("digit buffers");
 
         // The counting sort runs once and its output is reused by every timed repetition,
@@ -749,7 +664,7 @@ impl Bench {
 
         Self {
             scalars: sbuf,
-            bases: storage_words("u10 bench bases", &base_words(&bases)),
+            bases: storage_words(b, "u10 bench bases", &base_words(&bases)),
             sort,
             dplan,
         }
@@ -872,11 +787,6 @@ enum Stage {
     Merge,
 }
 
-fn median(mut xs: Vec<f64>) -> f64 {
-    xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    xs[xs.len() / 2]
-}
-
 #[test]
 fn the_g2_workgroup_sizes_are_measured() {
     let _gpu = exclusive();
@@ -970,14 +880,6 @@ fn shipped_size(wg: &wgsl::Workgroups, entry: &str) -> u32 {
     } else {
         wg.merge
     }
-}
-
-fn argmin(xs: &[f64]) -> usize {
-    xs.iter()
-        .enumerate()
-        .min_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-        .unwrap()
-        .0
 }
 
 #[test]
@@ -1144,8 +1046,8 @@ fn a_plan_built_for_the_wrong_reduction_width_is_refused() {
     let sort = DigitBuffers::new(b, &d, 0).expect("digit buffers");
     let pts = PointBuffers::new(b, &d, &pplan, 0, p.curve()).expect("point buffers");
     let ring = ParamRing::new(b, "u10 ring", 8).expect("ring");
-    let scalars = storage_words("u10 scalars", &vec![0u32; 64 * LIMBS]);
-    let bases = storage_words("u10 bases", &vec![0u32; 64 * 32]);
+    let scalars = storage_words(b, "u10 scalars", &vec![0u32; 64 * LIMBS]);
+    let bases = storage_words(b, "u10 bases", &vec![0u32; 64 * 32]);
     let err = match p.bind_all(b, &ring, &d, &pplan, &scalars, &bases, &sort, &pts) {
         Err(e) => e,
         Ok(_) => panic!(
@@ -1199,10 +1101,7 @@ fn what_one_g2_msm_costs_against_the_cpu() {
         } else {
             witness_shaped(n, ppm, &mut rng)
         };
-        let general = scalars
-            .iter()
-            .filter(|x| !(x.is_zero() || x.is_one()))
-            .count();
+        let general = general_count(&scalars);
 
         let t = std::time::Instant::now();
         let run = run_msm(&bases, &scalars, 0, 0, n as u32, None, 0);
@@ -1223,9 +1122,11 @@ fn what_one_g2_msm_costs_against_the_cpu() {
         );
     }
     println!(
-        "The device figure includes the counting sort, one submit, one readback and the \
-         host Horner tail; it excludes uploading the bases, which is prepare work. The CPU \
-         figure is g16-msm's rayon Pippenger on {} threads.",
+        "The device figure includes the counting sort, one submit, one readback, the host \
+         Horner tail AND packing and uploading the bases, which is prepare work a proof pays \
+         once and this column should not be charging for. `tests/msm_g1.rs` splits the two; \
+         the upload is small (2.4 ms at 65,536 G1 bases) but it is not zero. The CPU figure \
+         is g16-msm's rayon Pippenger on {} threads.",
         rayon_threads()
     );
 }
