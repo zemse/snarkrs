@@ -39,6 +39,13 @@ web-time = "1.1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 wgpu = { version = "30.0.1", features = ["wgsl"] }
+# `src/backend.rs` only. `g16_core::PreparedCircuit` is a synchronous trait and every wgpu
+# readback is asynchronous, so something has to block; on native `pollster::block_on` blocks
+# a thread while `device.poll` drives the queue, which is what the readback needs. It is in
+# this target table and `mod backend` is `cfg`-gated the same way, because on wasm32 pollster
+# compiles and then hangs the tab: its executor is `thread::park` in a loop and the browser
+# event loop never runs.
+pollster = "1.0.1"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # No default features: on wasm the only backend is `webgpu`, and the defaults would drag in

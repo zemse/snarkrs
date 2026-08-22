@@ -98,13 +98,45 @@ impl Readback {
         src_offset: u64,
         bytes: u64,
     ) -> Result<(), ProveError> {
-        if bytes > self.bytes {
+        self.copy_from_at(enc, src, src_offset, 0, bytes)
+    }
+
+    /// Same, into a chosen offset of the staging buffer.
+    ///
+    /// [`crate::batch::MsmBatch`] is the reason this exists: a proof's five MSMs write five
+    /// separate `results` buffers and the design budgets **one** readback for all of them, so
+    /// each one is copied into its own window of a single staging allocation inside the same
+    /// encoder as the dispatches. Concatenating them on the device costs five
+    /// `copy_buffer_to_buffer` calls and saves four `mapAsync` round trips at about 0.3 ms
+    /// each.
+    ///
+    /// WebGPU requires both offsets and the size to be multiples of 4. That is checked here
+    /// rather than left to the validation layer, whose message names a byte count and not the
+    /// job whose window was misaligned.
+    pub fn copy_from_at(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        src: &wgpu::Buffer,
+        src_offset: u64,
+        dst_offset: u64,
+        bytes: u64,
+    ) -> Result<(), ProveError> {
+        if dst_offset.saturating_add(bytes) > self.bytes {
             return Err(bad(format!(
-                "readback buffer holds {} bytes, asked to copy {bytes}",
+                "readback buffer holds {} bytes, asked to copy {bytes} to offset {dst_offset}",
                 self.bytes
             )));
         }
-        enc.copy_buffer_to_buffer(src, src_offset, &self.staging, 0, bytes);
+        if !bytes.is_multiple_of(4)
+            || !dst_offset.is_multiple_of(4)
+            || !src_offset.is_multiple_of(4)
+        {
+            return Err(bad(format!(
+                "a buffer to buffer copy needs every one of src {src_offset}, dst \
+                 {dst_offset} and size {bytes} to be a multiple of 4"
+            )));
+        }
+        enc.copy_buffer_to_buffer(src, src_offset, &self.staging, dst_offset, bytes);
         Ok(())
     }
 

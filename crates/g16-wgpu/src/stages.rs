@@ -168,6 +168,16 @@ pub enum Stage4 {
 /// it definitely buys is the concurrency property above.
 struct Scratch {
     witness: wgpu::Buffer,
+    /// The same witness in **standard form**, `PackedScalar`, written by one
+    /// `fr_mont_to_std` dispatch at the head of stages 5 to 9 and read by three of the five
+    /// MSMs.
+    ///
+    /// It lives here rather than in the MSM's own pool for the reason the rest of this
+    /// struct exists: it is one in-flight proof's device memory, it must not be shared
+    /// between two concurrent proofs, and it has to stay alive exactly as long as the
+    /// buffers stage 9 reads. Stages 0 to 4 never touch it, and it is 4.5 MB at 140,824
+    /// variables, which is 8% of what this struct already holds.
+    witness_std: wgpu::Buffer,
     a: wgpu::Buffer,
     b: wgpu::Buffer,
     c: wgpu::Buffer,
@@ -303,6 +313,7 @@ impl HStages {
         let n = self.domain.size as u32;
         Ok(Scratch {
             witness: fr_buffer(backend, "g16 witness", self.n_vars as u32)?,
+            witness_std: fr_buffer(backend, "g16 witness std", self.n_vars as u32)?,
             a: fr_buffer(backend, "g16 a", n)?,
             b: fr_buffer(backend, "g16 b", n)?,
             c: fr_buffer(backend, "g16 c", n)?,
@@ -314,10 +325,10 @@ impl HStages {
         })
     }
 
-    /// Device bytes one pooled scratch set holds: six domain vectors plus the witness, at 32
-    /// bytes an element. 52.3 MiB at `js_16x16_d32`.
+    /// Device bytes one pooled scratch set holds: six domain vectors plus the witness in
+    /// both encodings, at 32 bytes an element. 56.6 MiB at `js_16x16_d32`.
     pub fn scratch_bytes(&self) -> u64 {
-        (6 * self.domain.size as u64 + self.n_vars as u64) * FR_BYTES
+        (6 * self.domain.size as u64 + 2 * self.n_vars as u64) * FR_BYTES
     }
 
     /// Stages 0 to 4 in one submit, at [`Stage4::default`]. `H` stays on the device.
@@ -595,6 +606,27 @@ impl WgpuHandle {
     /// internal representation. For further field arithmetic and for host comparisons.
     pub fn h_mont(&self) -> &wgpu::Buffer {
         &self.sc().h_mont
+    }
+
+    /// The witness stage 0 uploaded, in **Montgomery form**, `n_vars` elements.
+    ///
+    /// Stages 5 to 9 read the witness three times (A, B-G2, B-G1) and a fourth over a
+    /// sub-range (L), and this is the copy that is already on the device. Handing it out
+    /// rather than re-uploading from the host is worth 4.5 MB of `write_buffer` and 140,824
+    /// limb splits per proof at `js_16x16_d32`.
+    pub fn witness_mont(&self) -> &wgpu::Buffer {
+        &self.sc().witness
+    }
+
+    /// The same witness in **standard form**, which is what a window digit has to be taken
+    /// from. Uninitialised until [`crate::batch::MsmBatch::run`] heads its encoder with one
+    /// `fr_mont_to_std` dispatch over it.
+    ///
+    /// A digit of a Montgomery representative is a digit of `a*R mod r`, a different number,
+    /// so a proof built from [`Self::witness_mont`] would be wrong by a factor of R and fail
+    /// verification with nothing else to go on.
+    pub fn witness_std(&self) -> &wgpu::Buffer {
+        &self.sc().witness_std
     }
 
     /// The three coset vectors A, B and C, for a debugging dump.

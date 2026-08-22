@@ -154,6 +154,8 @@ pub struct WgpuBackend {
     requested: wgpu::Limits,
     /// First uncaptured device error, if any. See [`Self::take_error`].
     error: Arc<Mutex<Option<String>>>,
+    /// Held for the whole of one proof's GPU section. See [`Self::exclusive`].
+    gpu: Mutex<()>,
     cost: Mutex<PrepareCost>,
     /// Command buffers handed to [`WgpuBackend::submit`] since this backend was created.
     /// See that method for why the count exists and what it cannot see.
@@ -239,6 +241,22 @@ impl WgpuBackend {
             }
         }));
 
+        // Device loss is a *different* channel from `on_uncaptured_error`, and it is the one
+        // that matters for a wrong answer rather than a rejected call. An uncaptured error is
+        // raised when the API refuses something; a lost device is what happens when work that
+        // was accepted does not complete, and the buffers it was going to write keep whatever
+        // they held. `wait_for_submitted_work` returns normally in that case and the proof
+        // comes out wrong with nothing else to go on, which is exactly the failure `TASKS.md`
+        // records against `g16-metal` for never checking command buffer status.
+        let sink = error.clone();
+        device.set_device_lost_callback(move |reason, msg| {
+            eprintln!("wgpu device lost: {reason:?}: {msg}");
+            let mut slot = sink.lock().unwrap();
+            if slot.is_none() {
+                *slot = Some(format!("the device was lost ({reason:?}): {msg}"));
+            }
+        });
+
         Ok(Self {
             _instance: instance,
             adapter,
@@ -248,6 +266,7 @@ impl WgpuBackend {
             profile,
             requested,
             error,
+            gpu: Mutex::new(()),
             cost: Mutex::new(PrepareCost::default()),
             submits: AtomicU64::new(0),
         })
@@ -318,8 +337,57 @@ impl WgpuBackend {
     ///
     /// Errors arrive asynchronously on both targets, so this is a poll and not a barrier:
     /// call it after a submit has been waited on, not immediately after encoding.
+    ///
+    /// **It is a single slot on the whole device, so it is only attributable while one proof
+    /// at a time is submitting.** [`Self::exclusive`] is what arranges that.
     pub fn take_error(&self) -> Option<String> {
         self.error.lock().unwrap().take()
+    }
+
+    /// Exclusive use of this device for one proof's GPU section: hold it from before the
+    /// first `write_buffer` until after [`Self::take_error`].
+    ///
+    /// # Why a proof has to hold a lock, when nothing here is otherwise shared
+    ///
+    /// `g16_core::PreparedCircuit` takes `&self` and is documented as safe to prove with from
+    /// several threads at once. Every piece of per-proof *state* is already per proof: the
+    /// scratch buffers and the parameter ring are pooled and checked out
+    /// (`crate::stages::Scratch`, `crate::batch`), so two concurrent proofs share no buffer.
+    /// Two things are still device-global and cannot be made per proof:
+    ///
+    /// 1. **The uncaptured-error slot.** `Device::on_uncaptured_error` takes one callback for
+    ///    the whole device and this backend funnels it into one `Mutex<Option<String>>`.
+    ///    With two proofs in flight, whichever calls [`Self::take_error`] first takes
+    ///    whichever error arrived, so proof A's dropped dispatch is reported against proof B
+    ///    and A returns `Ok` over buffers some of whose dispatches never ran. That is a proof
+    ///    that fails verification with nothing else to go on, which is the worst failure mode
+    ///    this crate has. WebGPU's `pushErrorScope`/`popErrorScope` does not fix it either:
+    ///    the scope stack is itself device-wide, so two interleaved proofs nest each other's
+    ///    scopes.
+    /// 2. **`onSubmittedWorkDone`.** [`Self::wait_for_submitted_work`] waits for *every*
+    ///    submission on the device, so under concurrency `StageTimings::ntt_us` would include
+    ///    another proof's GPU time and the benchmark would report a number nobody can
+    ///    attribute.
+    ///
+    /// Both were filed against U11 in `TASKS.md`. The honest options were a lock from submit
+    /// to poll or one device per in-flight proof, and a second device means a second copy of
+    /// every base vector, 62 MB at `js_16x16_d32`, plus a second set of pipeline compiles.
+    /// So: a lock, held across the whole of `compute_h` and the whole of `msms`.
+    ///
+    /// **What that costs, said plainly.** Concurrent proofs against one circuit are correct
+    /// and serialised, not parallel. Nothing is lost that a single queue was ever going to
+    /// give: this is one GPU with one queue, and two proofs interleaved on it finish in the
+    /// same total time as two run back to back. What is lost is the host half, the witness
+    /// limb split and the Horner tail, roughly 1 ms of the 100 at 2^18, which could in
+    /// principle overlap another proof's GPU work and now does not.
+    ///
+    /// The guard is deliberately taken at the synchronous `PreparedCircuit` boundary in
+    /// [`crate::backend`] rather than inside the `async fn`s here, so it is never held across
+    /// an `.await` and the futures stay `Send`. A caller driving [`crate::stages::HStages`]
+    /// or [`crate::batch::MsmBatch`] directly from two tasks has to take it itself; the
+    /// browser entry point at U13 runs one proof per worker and does not.
+    pub fn exclusive(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.gpu.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// `queue.submit`, counted.

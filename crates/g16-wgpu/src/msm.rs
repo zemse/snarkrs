@@ -1074,6 +1074,16 @@ impl MsmDigits {
     /// Parameter ring slots the whole counting sort consumes for `plan`, which is also its
     /// dispatch count because every dispatch takes its own block. Four at every shape any
     /// artifact reaches.
+    /// Ring slots `fr_mont_to_std` over `n` elements consumes, which is also its dispatch
+    /// count. One at every domain any artifact reaches, because a single dispatch covers
+    /// `128 * 65535` elements.
+    ///
+    /// Separate from [`Self::plan_mont`] because a ring has to be *sized* before anything is
+    /// pushed into it, and [`crate::batch::MsmBatch`] sizes one ring for a whole proof.
+    pub fn mont_slots(&self, n: u32) -> u32 {
+        self.dispatches(n, self.wg.mont)
+    }
+
     pub fn sort_slots(&self, plan: &DigitPlan) -> u32 {
         self.dispatches(plan.rows(), self.wg.zero)
             + self.dispatches(plan.n, self.wg.count)
