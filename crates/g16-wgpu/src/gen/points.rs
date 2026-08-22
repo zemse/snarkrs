@@ -9,13 +9,13 @@
 //!
 //! # One generator, two groups
 //!
-//! [`G1`] and [`G2`] are the same 836 lines at two sets of constants. That was U10's claim
+//! [`G1`] and [`G2`] are the same source at two sets of constants. That was U10's claim
 //! when it wrote this file for G2 alone and U9 checked it by instantiating G1: **four things
 //! turned out to be G2-specific and are now parameters**, and none of them was the
 //! arithmetic. The entry point names were `const &'static str` with `_g2` baked in rather
 //! than derived from the suffix; the affine struct's doc comment named `PackedG2Affine` and
-//! the G2 curve equation; the `Fq2` prelude was emitted unconditionally, which costs a G1
-//! module 6.6 KiB it never calls; and the workgroup sizes were one `Default` rather than one
+//! the G2 curve equation; the `Fq2` prelude was emitted unconditionally, which is 1.3 KiB a
+//! G1 module never calls; and the workgroup sizes were one `Default` rather than one
 //! per curve, which matters because an `Xyzz<Fq>` is 128 bytes against an `Xyzz<Fq2>`'s 256
 //! and the occupancy arithmetic is therefore different. The `a = 0` short Weierstrass
 //! assumption is the one thing genuinely shared, and it holds on both BN254 groups.
@@ -107,15 +107,43 @@ pub struct Curve {
     /// This group's curve equation, for the comment that justifies the `(0, 0)` sentinel.
     pub curve_eq: &'static str,
     /// Whether the coordinate field needs [`crate::gen::field::FQ2_OPS`] in front of it.
-    /// False for G1, which saves 6.6 KiB of WGSL naga would otherwise parse and dead-strip.
+    /// False for G1, which is 1,286 bytes of WGSL naga would otherwise parse and dead-strip
+    /// (a 47,067 byte module against G2's 48,353). Small, and free.
     pub needs_fq2: bool,
     /// Device bytes per affine base. Must equal the `packed` type's `size_of`.
     pub base_bytes: u64,
     /// Device bytes per XYZZ accumulator, four coordinates.
     pub point_bytes: u64,
-    /// Entries one thread of `msm_segmented_*` owns. Not baked into the WGSL (it is a uniform
-    /// field), but measured per curve, so it lives with the other measured shape constants.
-    /// See [`crate::points::PointPlan`] and the sweeps in `tests/msm_g1.rs`.
+    /// Entries one thread of `msm_segmented_*` owns. Not baked into the WGSL (it is a
+    /// uniform field), but measured per curve, so it lives with the other shape constants
+    /// rather than as a bare `const` a plan could take from the wrong curve.
+    ///
+    /// Accumulation costs `slice_len` mixed additions per thread and the merge costs
+    /// `max_bucket_count / slice_len` full additions for the fattest bucket, so the balance
+    /// point is near the square root of the worst occupancy. `g16-metal` chose 64 and heliax
+    /// reached the same constant independently.
+    ///
+    /// **Swept per curve rather than inherited, and both land on 128, not Metal's 64.**
+    /// `the_g1_slice_length_is_measured` and `the_slice_length_is_measured`, 32,768 general
+    /// scalars at `c = 12`, `clear + segmented + merge`, medians of three release runs,
+    /// microseconds:
+    ///
+    /// ```text
+    /// slice_len        16        32        64       128       256       512      1024
+    /// G1 us      195290.6  106322.1   62398.2   51856.2   69339.5  118077.7  226310.7
+    /// G2 us      664100.3  371389.7  240642.5  164629.4  214537.1  361292.0  693739.6
+    /// ```
+    ///
+    /// A clean V with the minimum at 128 on both curves, 16% better than 64 over G1 and 32%
+    /// better over G2, and 3.7x worse at either end of the swept range. This is the sharpest
+    /// of the three shape constants and the only one where the design's inherited value is
+    /// badly wrong rather than marginally so. The two arms are the two costs: below 128 the
+    /// spill count doubles with every halving and the merge walks proportionally more slots,
+    /// above it each thread's serial run grows and the load balance the segmentation exists
+    /// to provide goes away.
+    ///
+    /// The curves agree, and the G1 column is 3.1x faster, which is the `Fq2` multiply ratio
+    /// again.
     pub slice_len: u32,
     /// The measured workgroup sizes for this curve's five entry points.
     pub wg: Workgroups,
@@ -139,7 +167,7 @@ pub const G1: Curve = Curve {
     slice_len: 128,
     wg: Workgroups {
         clear: 256,
-        segmented: 64,
+        segmented: 128,
         merge: 256,
         tg: 128,
     },
@@ -286,37 +314,55 @@ pub const NO_ROW: u32 = 0xffff_ffff;
 // Workgroup sizes
 // ---------------------------------------------------------------------------
 
-/// Threads per workgroup for the five entry points, emitted as literals.
+/// Threads per workgroup for the five entry points, emitted as literals, per curve.
 ///
-/// **Design §4 assigns 256 to `msm_clear_g2` and 64 to the other four, and three of those
-/// four are wrong.** §4 carried `g16-metal`'s threadgroup sizes over on the assumption that
-/// MSL's occupancy reasoning transfers. It has now failed for `gather_abc` (24%), the NTT
-/// (7.8x), four of the five digit kernels (2 to 7%) and survived once, for `h_join`.
+/// **Design §4 assigns 256 to the clear and 64 to the other four, and it is wrong about at
+/// least two of them on both curves.** §4 carried `g16-metal`'s threadgroup sizes over on the
+/// assumption that MSL's occupancy reasoning transfers. It has now failed for `gather_abc`
+/// (24%), the NTT (7.8x), four of the five digit kernels (2 to 7%) and survived once, for
+/// `h_join`.
 ///
-/// Measured by `tests/msm_g2.rs::the_g2_workgroup_sizes_are_measured`, 32,768 general scalars
-/// at `c = 12`, one kernel's size varied at a time with the others at the shipped value, each
-/// cell the median of five **release** runs of the whole five-kernel point stage, GPU wall
-/// microseconds:
+/// Measured by `the_g1_workgroup_sizes_are_measured` and `the_g2_workgroup_sizes_are_measured`
+/// in `tests/msm_g1.rs` and `tests/msm_g2.rs`: 32,768 general scalars at `c = 12`, one
+/// kernel's size varied at a time with the others at the shipped value, **each kernel timed
+/// alone**, each cell the median of five **release** runs, GPU wall microseconds per
+/// repetition. M2 Max, wgpu 30 through naga to MSL.
 ///
 /// ```text
-/// kernel                 16      32      64     128     256    §4  ships
-/// msm_clear_g2        176.6   132.3   115.8   112.4   115.1   256    128
-/// msm_segmented_g2   6216.5  5449.1  5507.4  5691.4  5806.9    64     32
-/// msm_merge_g2        438.5   322.4   288.3   281.5   287.6    64    128
+/// kernel                  16       32       64      128      256    §4  ships
+/// msm_clear_g1           5.6      4.1      4.7      4.8      4.9   256    256
+/// msm_segmented_g1   29120.6  28939.4  29340.1  28698.5  28706.9    64    128
+/// msm_merge_g1       25721.5  24316.3  24346.0  24214.7  24191.6    64    256
+///
+/// msm_clear_g2          19.6     17.4     17.6     19.2     20.2   256    256
+/// msm_segmented_g2   89110.2  88808.3  89218.7  87704.8  87891.6    64    128
+/// msm_merge_g2       85287.5  81665.4  81135.8  81687.8  80457.4    64    256
 /// ```
 ///
-/// `msm_segmented_g2` is 94% of the point stage and it wants **32**, which is 1.1% better
-/// than Metal's 64 and 14% better than 16. It is also the one kernel here whose register
-/// pressure is extreme: one thread holds an `Xyzz<Fq2>` accumulator, an `Aff<Fq2>` base and
-/// the CIOS accumulator of an `Fq` multiply, so a wide workgroup runs out of registers and
-/// the occupancy that a wide workgroup is supposed to buy never arrives. The same kernel over
-/// G1 would hold half as much and may well want a different size, which is exactly why this
-/// is a parameter.
+/// Three things in that table are worth carrying forward, and one of them is a warning.
 ///
-/// `msm_merge_g2` inverts: it wants 128, 2.4% over Metal's 64. It walks a bucket's slice range
-/// in one lane and does almost nothing per lane on a bucket with no spills, so it is a
-/// scheduling problem rather than a register one and the two kernels disagree for the same
-/// reason `msm_count` and `msm_scatter` disagree.
+/// **The two curves agree on every 1D size, and the G1 column is 3.05x faster than the G2
+/// column.** That ratio is what says the measurement is not an artifact of the harness: an
+/// `Fq2` multiply is 3 `Fq` multiplies through Karatsuba, so 3.05x is the arithmetic and
+/// nothing else. It also means the G1 sweep was not a formality; it simply agreed, which is
+/// the first time in this crate that an inherited shape survived a re-measurement on a second
+/// input rather than moving.
+///
+/// **`msm_segmented_*` wants 128 and `msm_merge_*` wants 256, and Metal's 64 is wrong for
+/// both**, though only by 2.1% and 1.6% over G1. The spread across the whole row is under 3%
+/// on both curves, which is a real result and a small one: this kernel is memory-bound on the
+/// base vector and the entry array, not occupancy-bound, so the workgroup size barely moves
+/// it. The design's reasoning (register pressure decides the accumulation) predicts a large
+/// effect and there is not one.
+///
+/// **The clear row is noise and is not a decision.** Its whole spread is 1.5 microseconds
+/// over G1 and 2.8 over G2, on a kernel that writes one `Fq`-worth of zeros per bucket and is
+/// bandwidth-bound: 45,056 rows at `c = 12` is 1.4 MB over G1, which is about 5 microseconds
+/// at this machine's bandwidth, and that is what it costs at every size. Two consecutive runs
+/// of the G1 sweep named 64 and then 32 as the winner, which settles it. 256 ships on both
+/// curves because it is the fewest dispatched workgroups, not because it won. The tests
+/// assert an absolute 25-microsecond slack on this row for exactly that reason; a 3% relative
+/// bound on a 5-microsecond row would be a coin flip in CI.
 ///
 /// Release only, and re-run under Tint at U14. The debug harness inverted `h_join`'s answer
 /// once already, because differencing cancels the fixed cost of a submit and not the
@@ -326,42 +372,44 @@ pub struct Workgroups {
     pub clear: u32,
     pub segmented: u32,
     pub merge: u32,
-    /// Threads in `msm_reduce_g2` and `msm_ones_g2`, which is also the length of the
-    /// `array<PtG2, tg>` both hold in workgroup storage.
+    /// Threads in `msm_reduce_*` and `msm_ones_*`, which is also the length of the
+    /// `array<Pt, tg>` both hold in workgroup storage. **This is the one size the two curves
+    /// do not agree on, and the byte budget is why.**
     ///
-    /// **Design §4 says 32 and the measurement says 32, for a reason the design does not
-    /// give.** §4's argument is occupancy: an `Xyzz<Fq2>` is 256 bytes, so `tg = 64` is 16384
-    /// bytes, exactly the floor's whole workgroup allocation, and one workgroup is resident
-    /// per core where `tg = 32` keeps two. That is the same "fill the budget" reasoning U6
-    /// measured to be 5.1x **wrong** on the NTT, so it was swept rather than inherited.
+    /// An `Xyzz<Fq>` is 128 bytes and an `Xyzz<Fq2>` is 256, so the widest reduction
+    /// `maxComputeWorkgroupStorageSize`'s 16384-byte floor allows is 128 threads over G1 and
+    /// 64 over G2. Both curves want the widest one they can have.
     ///
-    /// `tests/msm_g2.rs::the_reduction_threadgroup_is_measured`, 32,768 general scalars at
-    /// `c = 12`, medians of five release runs, microseconds for `msm_reduce_g2` and
-    /// `msm_ones_g2` alone:
+    /// `the_g1_reduction_threadgroup_is_measured` and `the_reduction_threadgroup_is_measured`,
+    /// 32,768 general scalars at `c = 12`, medians of five release runs, microseconds for
+    /// `msm_reduce_*` plus `msm_ones_*`:
     ///
     /// ```text
-    /// tg    shared B   reduce us   ones us   sum us
-    ///  8        2048       990.7     153.8   1144.5
-    /// 16        4096       566.6     149.3    715.9
-    /// 32        8192       412.4     147.8    560.2
-    /// 64       16384       398.7     148.5    547.2
+    /// tg     G1 shared B    G1 us      G2 shared B     G2 us
+    ///  8            1024  139054.7            2048  466285.4
+    /// 16            2048   71507.1            4096  239764.4
+    /// 32            4096   45057.1            8192  140261.5
+    /// 64            8192   25286.5           16384   81319.6
+    /// 128          16384   17891.5               -         -
     /// ```
     ///
-    /// **64 wins, by 2.3% on the pair.** The design's occupancy story is real but it is worth
-    /// less than the halved tree depth and the halved per-thread segment: at `tg = 32` each
-    /// thread reduces twice as many buckets serially, and that term dominates. So this is the
-    /// second time the design's workgroup-storage reasoning has been measured and the second
-    /// time it did not hold, in the opposite direction from the NTT.
+    /// **Every doubling of `tg` is worth 40% to 50%, all the way to the limit.** Design §4
+    /// argues the other way, that `tg = 32` keeps two workgroups resident per core where the
+    /// widest keeps one, and that occupancy is worth more than the tree; the measurement says
+    /// it is worth 2.5x less. The reason is that `tg` is not only the tree width, it is also
+    /// the divisor on each thread's serial segment: at half the threads every thread reduces
+    /// twice as many buckets one after another, and that term dominates everything else in
+    /// the kernel. This is the third time the design's workgroup-storage reasoning has been
+    /// measured in this crate and the third time it did not survive.
     ///
-    /// **32 ships anyway, and the reason is not the 2.3%.** At `tg = 64` the workgroup array
-    /// is 16384 bytes, which is exactly `maxComputeWorkgroupStorageSize` at the floor with
-    /// **zero** headroom: one more byte in either reduction, on any future platform that
-    /// charges for anything else, and the pipeline fails to create in a browser rather than
-    /// running slowly. 2.3% of 0.55 ms is 13 microseconds against a proof this backend is
-    /// trying to bring under 200 ms, which is 0.007%, and it is not worth standing on a limit
-    /// with nothing to spare. `tg = 64` is selectable, tested, and what a `Raised` profile
-    /// should take; U14 should re-measure both in Chrome, where the array is charged by Tint
-    /// and not by naga.
+    /// Both curves therefore ship a reduction that sits at **exactly** the floor's whole
+    /// workgroup allocation with zero headroom, which is uncomfortable and is the trade the
+    /// numbers force: one more byte of workgroup storage in either reduction, on any platform
+    /// that charges for anything the generator does not count, and the pipeline fails to
+    /// create in a browser rather than running slowly. The alternative costs 41% over G1 and
+    /// 63% over G2 of a kernel that is a quarter of the point stage. `tests/wgsl_static.rs`
+    /// audits both modules at this width on every run, and U14 has to re-measure in Chrome,
+    /// where the array is charged by Tint and not by naga.
     pub tg: u32,
 }
 
@@ -437,8 +485,10 @@ pub fn points_module_at(v: Variant, c: Curve, wg: Workgroups) -> String {
     s.push_str(MUL64);
     s.push_str(&FQ.ops(v));
     // Only when the coordinate field is Fq2. Carrying a prelude a kernel never calls costs
-    // naga time and no pipeline time (U8 measured about 2 ms per module), so this is 6.6 KiB
-    // and a couple of milliseconds off every G1 module rather than anything structural.
+    // naga time and no pipeline time (U8 measured about 2 ms per module), so this is 1,286
+    // bytes off a G1 module rather than anything structural. It is here because a G1 module
+    // declaring Fq2 would be a claim about the curve that is not true, not because of the
+    // bytes.
     if c.needs_fq2 {
         s.push_str(FQ2_OPS);
     }
