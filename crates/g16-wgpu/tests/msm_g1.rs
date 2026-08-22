@@ -562,7 +562,35 @@ fn a_nonzero_scalar_offset_and_base_offset_read_the_right_windows() {
         want, other,
         "the two offsets happened to select the same thing"
     );
-    println!("scalar_off {scalar_off} and base_off {base_off} over {n} of {total}");
+
+    // And again with scalars that are sometimes exactly 1, which is the case the general
+    // vector above cannot reach: `msm_ones_*` is the only kernel that reads the scalar
+    // buffer and the base vector in the same statement, so it is the only place the two
+    // offsets can be confused, and with no 1-scalars it contributes nothing and the
+    // confusion is invisible. A mutation that made the ones pass read `BASES[scalar_off + i]`
+    // passed every test in this file except the artifact one until this block existed.
+    let mixed = witness_shaped(total, 200_000, &mut rng);
+    let ones_here = mixed[scalar_off as usize..(scalar_off + n) as usize]
+        .iter()
+        .filter(|x| x.is_one())
+        .count();
+    assert!(
+        ones_here > 10,
+        "only {ones_here} of {n} scalars are exactly 1, so the ones path is barely running"
+    );
+    let run = run_msm(&bases, &mixed, scalar_off, base_off, n, None, 2);
+    assert_eq!(
+        run.result,
+        CpuMsm::new().msm_g1(
+            &bases[base_off as usize..(base_off + n) as usize],
+            &mixed[scalar_off as usize..(scalar_off + n) as usize],
+        ),
+        "the offsets select the wrong sub-vectors once the ones path carries part of the sum"
+    );
+    println!(
+        "scalar_off {scalar_off} and base_off {base_off} over {n} of {total}, \
+         {ones_here} of them through msm_ones_g1"
+    );
 }
 
 // ---------------------------------------------------------------------------
