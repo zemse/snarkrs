@@ -1,0 +1,35 @@
+[package]
+name = "g16-wgpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+# cdylib is for `wasm-pack build --target web` at U13; rlib is what `cargo test`, the bench
+# and the CLI link. Both are cheap here because the crate has no native link dependencies.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The only dependency the generator has, and the point of the design: the modulus and n0 for
+# both fields come from here at run time, so there is no second copy in shader source to
+# drift. See src/gen/field.rs.
+g16-gpu-layout.workspace = true
+
+[dev-dependencies]
+# The device-side test and the limb sweep. wgpu is not a normal dependency yet because
+# nothing in `src/` creates a device; a later unit moves it up and adds the wasm32 table.
+wgpu = { version = "30.0.1", features = ["wgsl"] }
+pollster = "1.0.1"
+bytemuck = "1"
+num-bigint.workspace = true
+num-traits = "0.2"
+ark-ff.workspace = true
+g16-field.workspace = true
+
+# The limb-width sweep behind the field representation. Not a criterion bench:
+# it prints a table and validates every variant against num-bigint, so it owns its own main.
+# Run with `cargo bench -p g16-wgpu --bench limb_sweep`.
+[[bench]]
+name = "limb_sweep"
+path = "benches/limb_sweep/main.rs"
+harness = false
