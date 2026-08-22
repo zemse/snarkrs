@@ -13,9 +13,20 @@ use rayon::prelude::*;
 pub struct Witness(pub Vec<Fr>);
 
 impl Witness {
+    /// Native only; the browser has no filesystem, so it uses [`Witness::from_bytes`].
+    #[cfg(not(target_family = "wasm"))]
     pub fn load(path: &std::path::Path) -> Result<Self, super::ZkeyError> {
-        let file = BinFile::open(path, b"wtns", 2)?;
+        Self::parse(BinFile::open(path, b"wtns", 2)?)
+    }
 
+    /// A `.wtns` already in memory. The witness is small next to the zkey (4.5 MB at
+    /// 140,261 constraints against 94.4 MB), but it is regenerated per proof in the
+    /// browser, so it needs the same byte path.
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, super::ZkeyError> {
+        Self::parse(BinFile::from_bytes(bytes, b"wtns", 2)?)
+    }
+
+    fn parse(file: BinFile) -> Result<Self, super::ZkeyError> {
         let mut header = Cursor::new(file.unique_section(1)?, 1);
         let n8 = header.u32()? as usize;
         if n8 != FR_BYTES {

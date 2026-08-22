@@ -25,7 +25,6 @@
 
 use ark_ff::BigInt;
 use g16_field::*;
-use memmap2::Mmap;
 
 use crate::ZkeyError;
 
@@ -34,15 +33,52 @@ pub const G1_BYTES: usize = FQ_BYTES * 2;
 pub const G2_BYTES: usize = FQ_BYTES * 4;
 pub const FR_BYTES: usize = 32;
 
-/// A memory-mapped binfile with its section chain indexed.
+/// Where a binfile's bytes live. Both variants deref to `&[u8]`, so nothing below this
+/// type, and no decoder in `lib.rs` or `wtns.rs`, knows which one it got.
+///
+/// The split exists because the browser has no filesystem to map. `wasm32-unknown-unknown`
+/// has no `open(2)`: a zkey arrives over `fetch` and is written into linear memory, so an
+/// owned `Vec<u8>` is the only backing that can exist there.
+///
+/// This is not a build fix, and it would be dishonest to sell it as one. Checked before
+/// the change: memmap2 0.9.11 compiles for wasm32 and `cargo build --target
+/// wasm32-unknown-unknown -p g16-zkey` already succeeded. What it fixes is an API that
+/// links and then cannot work, because `File::open` on that target fails at runtime for
+/// every path there is.
+///
+/// `Mapped` stays the native default and is not a micro-optimisation: `js_16x16_d32`'s
+/// zkey is 94.4 MB (`bench/artifacts/manifest.csv`) and mmap keeps it out of the process
+/// entirely, paged in on demand by the sections we actually read.
+pub enum Backing {
+    #[cfg(not(target_family = "wasm"))]
+    Mapped(memmap2::Mmap),
+    Owned(Vec<u8>),
+}
+
+impl core::ops::Deref for Backing {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            #[cfg(not(target_family = "wasm"))]
+            Backing::Mapped(m) => m,
+            Backing::Owned(v) => v,
+        }
+    }
+}
+
+/// A binfile with its section chain indexed.
 pub struct BinFile {
-    map: Mmap,
+    data: Backing,
     /// `(id, start, len)` in file order. A handful of entries, so a linear scan beats a
     /// map and keeps duplicate ids addressable.
     sections: Vec<(u32, usize, usize)>,
 }
 
 impl BinFile {
+    /// Map the file and index it. Native only, because there is no filesystem to map on
+    /// wasm; the browser path is [`BinFile::from_bytes`].
+    #[cfg(not(target_family = "wasm"))]
     pub fn open(
         path: &std::path::Path,
         magic: &[u8; 4],
@@ -52,41 +88,61 @@ impl BinFile {
         // Safety: we only ever hand out shared slices of the mapping, and the mapping
         // outlives them. A concurrent truncation of the file would be UB, which is the
         // standard and unavoidable caveat of mmap on any key file.
-        let map = unsafe { Mmap::map(&file)? };
+        let map = unsafe { memmap2::Mmap::map(&file)? };
+        Self::index(Backing::Mapped(map), magic, max_version)
+    }
 
-        if map.len() < 12 {
+    /// Index a binfile already in memory. Takes the `Vec` by value rather than a slice
+    /// because the wasm caller has just written a 94 MB zkey into linear memory and a
+    /// borrow would force it to keep a second owner alive for the life of the key; the
+    /// whole point of the byte path is that the file exists exactly once.
+    pub fn from_bytes(
+        bytes: Vec<u8>,
+        magic: &[u8; 4],
+        max_version: u32,
+    ) -> Result<Self, ZkeyError> {
+        Self::index(Backing::Owned(bytes), magic, max_version)
+    }
+
+    /// Header check plus the one scan of the section chain, shared by both constructors so
+    /// the mmap path and the byte path cannot drift apart on a bounds check. Every one of
+    /// them is load-bearing: the header is attacker-controlled, and the offsets recorded
+    /// here are the only thing standing between a lying section length and a panic inside
+    /// `unique_section`.
+    fn index(data: Backing, magic: &[u8; 4], max_version: u32) -> Result<Self, ZkeyError> {
+        if data.len() < 12 {
             return Err(ZkeyError::BadMagic([0; 4]));
         }
-        let got: [u8; 4] = map[0..4].try_into().expect("slice is 4 bytes");
+        let got: [u8; 4] = data[0..4].try_into().expect("slice is 4 bytes");
         if &got != magic {
             return Err(ZkeyError::BadMagic(got));
         }
-        let version = u32_at(&map, 4);
+        let version = u32_at(&data, 4);
         if version > max_version {
             return Err(ZkeyError::Malformed {
                 section: 0,
                 reason: format!("version {version} exceeds supported {max_version}"),
             });
         }
-        let n_sections = u32_at(&map, 8) as usize;
+        let n_sections = u32_at(&data, 8) as usize;
 
         let mut sections = Vec::with_capacity(n_sections);
         let mut pos = 12usize;
         for i in 0..n_sections {
-            if pos + 12 > map.len() {
+            if pos + 12 > data.len() {
                 return Err(ZkeyError::Malformed {
                     section: 0,
                     reason: format!("section header {i} runs past end of file"),
                 });
             }
-            let id = u32_at(&map, pos);
-            let len = u64_at(&map, pos + 4) as usize;
+            let id = u32_at(&data, pos);
+            let len = u64_at(&data, pos + 4) as usize;
             pos += 12;
             let end = pos.checked_add(len).ok_or_else(|| ZkeyError::Malformed {
                 section: id,
                 reason: "section length overflows".into(),
             })?;
-            if end > map.len() {
+            if end > data.len() {
                 return Err(ZkeyError::Malformed {
                     section: id,
                     reason: format!("length {len} runs past end of file"),
@@ -96,7 +152,7 @@ impl BinFile {
             pos = end;
         }
 
-        Ok(Self { map, sections })
+        Ok(Self { data, sections })
     }
 
     /// The one section with this id. Duplicates are a format error for every section we
@@ -111,7 +167,7 @@ impl BinFile {
                         reason: "duplicated section".into(),
                     });
                 }
-                found = Some(&self.map[start..start + len]);
+                found = Some(&self.data[start..start + len]);
             }
         }
         found.ok_or(ZkeyError::MissingSection(id))

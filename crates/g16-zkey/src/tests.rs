@@ -608,3 +608,98 @@ fn a_vkey_claiming_an_impossible_npublic_is_refused() {
         }
     });
 }
+
+/// The mmap path and the byte path must produce the same key.
+///
+/// This is not a formality. The two constructors used to be one function that read
+/// `self.map`; they are now two entry points into a shared `index`/`parse` pair over an
+/// `enum Backing`, and the failure mode of getting that wrong is a browser build that
+/// parses a zkey slightly differently from the native build and produces a proof nobody
+/// can verify. Comparing field for field, rather than proving with both, is what makes a
+/// single wrong section offset visible as itself.
+///
+/// `l_query` is compared too even though it is derived from `n_vars - n_public - 1`,
+/// because that arithmetic is exactly the kind that a divergent header parse breaks.
+#[test]
+fn the_byte_path_and_the_mmap_path_parse_identically() {
+    for_each_artifact("byte_path_vs_mmap_path", |a| {
+        let path = a.dir.join("circuit.zkey");
+        let mapped = ProvingKey::load(&path).unwrap();
+        let owned = ProvingKey::from_bytes(std::fs::read(&path).unwrap()).unwrap();
+
+        let n = &a.name;
+        assert_eq!(mapped.n_vars, owned.n_vars, "{n}: n_vars");
+        assert_eq!(mapped.n_public, owned.n_public, "{n}: n_public");
+        assert_eq!(mapped.domain_size, owned.domain_size, "{n}: domain_size");
+        assert_eq!(mapped.alpha_g1, owned.alpha_g1, "{n}: alpha_g1");
+        assert_eq!(mapped.beta_g1, owned.beta_g1, "{n}: beta_g1");
+        assert_eq!(mapped.beta_g2, owned.beta_g2, "{n}: beta_g2");
+        assert_eq!(mapped.delta_g1, owned.delta_g1, "{n}: delta_g1");
+        assert_eq!(mapped.delta_g2, owned.delta_g2, "{n}: delta_g2");
+        assert_eq!(mapped.a_query, owned.a_query, "{n}: a_query");
+        assert_eq!(mapped.b_g1_query, owned.b_g1_query, "{n}: b_g1_query");
+        assert_eq!(mapped.b_g2_query, owned.b_g2_query, "{n}: b_g2_query");
+        assert_eq!(mapped.l_query, owned.l_query, "{n}: l_query");
+        assert_eq!(mapped.h_query, owned.h_query, "{n}: h_query");
+        for m in 0..2 {
+            assert_eq!(
+                mapped.coeffs.row_ptr[m], owned.coeffs.row_ptr[m],
+                "{n}: coeffs.row_ptr[{m}]"
+            );
+            assert_eq!(
+                mapped.coeffs.signal[m], owned.coeffs.signal[m],
+                "{n}: coeffs.signal[{m}]"
+            );
+            assert_eq!(
+                mapped.coeffs.value[m], owned.coeffs.value[m],
+                "{n}: coeffs.value[{m}]"
+            );
+        }
+        assert_eq!(mapped.vk.alpha_g1, owned.vk.alpha_g1, "{n}: vk.alpha_g1");
+        assert_eq!(mapped.vk.beta_g2, owned.vk.beta_g2, "{n}: vk.beta_g2");
+        assert_eq!(mapped.vk.gamma_g2, owned.vk.gamma_g2, "{n}: vk.gamma_g2");
+        assert_eq!(mapped.vk.delta_g2, owned.vk.delta_g2, "{n}: vk.delta_g2");
+        assert_eq!(mapped.vk.ic, owned.vk.ic, "{n}: vk.ic");
+
+        // The witness reader shares the same container, so it shares the same risk.
+        let wtns = a.dir.join("circuit.wtns");
+        let w_mapped = wtns::Witness::load(&wtns).unwrap();
+        let w_owned = wtns::Witness::from_bytes(std::fs::read(&wtns).unwrap()).unwrap();
+        assert_eq!(w_mapped.0, w_owned.0, "{n}: witness");
+    });
+}
+
+/// Both constructors must reject the same malformed containers. They share one `index`
+/// today; this is what notices if someone later inlines the checks back into `open` and
+/// leaves the byte path, which is the one the browser uses, without them.
+#[test]
+fn the_byte_path_rejects_what_the_mmap_path_rejects() {
+    // Shorter than the 12-byte magic + version + nSections header.
+    assert!(matches!(
+        ProvingKey::from_bytes(b"zkey".to_vec()),
+        Err(ZkeyError::BadMagic(_))
+    ));
+    // Right length, wrong magic.
+    assert!(matches!(
+        ProvingKey::from_bytes(b"wtns\x02\0\0\0\0\0\0\0".to_vec()),
+        Err(ZkeyError::BadMagic(m)) if &m == b"wtns"
+    ));
+    // Version 3 is past what this reader claims to understand.
+    assert!(matches!(
+        ProvingKey::from_bytes(b"zkey\x03\0\0\0\0\0\0\0".to_vec()),
+        Err(ZkeyError::Malformed { section: 0, .. })
+    ));
+    // One section header promised, zero bytes of it present.
+    assert!(matches!(
+        ProvingKey::from_bytes(b"zkey\x02\0\0\0\x01\0\0\0".to_vec()),
+        Err(ZkeyError::Malformed { section: 0, .. })
+    ));
+    // A section claiming 2^40 bytes inside a 24-byte file, which is the check that keeps
+    // `unique_section`'s unchecked slicing sound.
+    let mut lying = b"zkey\x02\0\0\0\x01\0\0\0\x01\0\0\0".to_vec();
+    lying.extend_from_slice(&(1u64 << 40).to_le_bytes());
+    assert!(matches!(
+        ProvingKey::from_bytes(lying),
+        Err(ZkeyError::Malformed { section: 1, .. })
+    ));
+}

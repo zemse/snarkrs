@@ -97,9 +97,28 @@ const COEF_RECORD: usize = 12 + FR_BYTES;
 
 impl ProvingKey {
     /// Parse a `.zkey` by mmap. Must not copy the point sections more than once.
+    ///
+    /// Native only. There is no filesystem on `wasm32-unknown-unknown`, so the browser
+    /// uses [`ProvingKey::from_bytes`] instead.
+    #[cfg(not(target_family = "wasm"))]
     pub fn load(path: &std::path::Path) -> Result<Self, ZkeyError> {
-        let file = BinFile::open(path, b"zkey", 2)?;
+        Self::parse(BinFile::open(path, b"zkey", 2)?)
+    }
 
+    /// Parse a `.zkey` that is already in memory, for the browser, where the key arrives
+    /// over `fetch` rather than from a path.
+    ///
+    /// By value, not `&[u8]`: at `js_16x16_d32` the key is 94.4 MB, and a borrow would
+    /// force the caller to hold a second live owner for as long as the `ProvingKey`
+    /// exists. In a 4 GiB wasm32 address space that doubling is worth avoiding on its own,
+    /// and the caller has no use for the bytes afterwards anyway.
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, ZkeyError> {
+        Self::parse(BinFile::from_bytes(bytes, b"zkey", 2)?)
+    }
+
+    /// Everything after the container is opened, shared by both constructors so the two
+    /// paths cannot diverge on a single validation.
+    fn parse(file: BinFile) -> Result<Self, ZkeyError> {
         let mut s1 = Cursor::new(file.unique_section(1)?, 1);
         let protocol = s1.u32()?;
         if protocol != PROTOCOL_GROTH16 {
@@ -455,9 +474,9 @@ impl VerifyingKey {
         // checks are off, `usize::MAX + 1` wraps to 0 and an empty IC then satisfies this
         // guard. That produced a key with no points at all, which `aggregate_public` indexed
         // and died on.
-        let want_ic = n_public.checked_add(1).ok_or_else(|| {
-            ZkeyError::BadJson(format!("nPublic {n_public} is impossibly large"))
-        })?;
+        let want_ic = n_public
+            .checked_add(1)
+            .ok_or_else(|| ZkeyError::BadJson(format!("nPublic {n_public} is impossibly large")))?;
         if ic_json.len() != want_ic {
             return Err(ZkeyError::BadJson(format!(
                 "IC has {} entries, nPublic {n_public} implies {want_ic}",
