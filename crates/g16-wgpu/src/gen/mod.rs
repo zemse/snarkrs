@@ -18,6 +18,22 @@
 //! of their own entry points: [`field::field_module`] when they need `Fq` and `Fq2`, or just `FR.ops` when,
 //! like the NTT, they only ever touch the scalar field.
 
+/// `maxComputeInvocationsPerWorkgroup` at the browser floor.
+///
+/// Every generator in this module asserts against this rather than against what the adapter
+/// grants, because the source it emits has to compile in a stock browser and this M2 Max
+/// grants 1024. It lives here, once, so that the host validators in `crate::gather`,
+/// `crate::ntt`, `crate::pointwise`, `crate::msm` and `crate::points` can read the same
+/// number through [`crate::device::WgpuBackend::ceiling_invocations`]. They used to compare
+/// against the granted limit instead, which meant a `with_shape` call under
+/// `G16_WGPU_LIMITS=raised` could pass its own check and then panic inside the generator
+/// rather than returning a `ProveError`.
+pub const FLOOR_INVOCATIONS: u32 = 256;
+
+/// `maxComputeWorkgroupStorageSize` at the browser floor, in bytes. Same reasoning as
+/// [`FLOOR_INVOCATIONS`]: this adapter grants 32768 and no browser does.
+pub const FLOOR_WORKGROUP_BYTES: u64 = 16384;
+
 pub mod field;
 pub mod gather;
 pub mod msm;

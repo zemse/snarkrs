@@ -92,11 +92,12 @@ impl HJoin {
         elems_per_dispatch: u32,
         workgroup: u32,
     ) -> Result<Self, ProveError> {
+        // The browser floor, not the granted limit; see `WgpuBackend::ceiling_invocations`.
         let limits = backend.granted_limits();
-        if workgroup == 0 || workgroup > limits.max_compute_invocations_per_workgroup {
+        let ceiling = backend.ceiling_invocations();
+        if workgroup == 0 || workgroup > ceiling {
             return Err(bad(format!(
-                "workgroup size {workgroup} is outside 1..={}",
-                limits.max_compute_invocations_per_workgroup
+                "workgroup size {workgroup} is outside 1..={ceiling}"
             )));
         }
         let elems = elems_per_dispatch - elems_per_dispatch % workgroup;

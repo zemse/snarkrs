@@ -471,11 +471,15 @@ impl GatherAbc {
         rows_per_dispatch: u32,
         workgroup: u32,
     ) -> Result<Self, ProveError> {
+        // The browser floor, not the granted limit. `gen::gather::gather_module_at` asserts
+        // the same ceiling, and the two disagreed until U11: under `G16_WGPU_LIMITS=raised`
+        // this adapter grants 1024, so a 512-thread request passed here and panicked in the
+        // generator. See `WgpuBackend::ceiling_invocations`.
         let limits = backend.granted_limits();
-        if workgroup == 0 || workgroup > limits.max_compute_invocations_per_workgroup {
+        let ceiling = backend.ceiling_invocations();
+        if workgroup == 0 || workgroup > ceiling {
             return Err(bad(format!(
-                "workgroup size {workgroup} is outside 1..={}",
-                limits.max_compute_invocations_per_workgroup
+                "workgroup size {workgroup} is outside 1..={ceiling}"
             )));
         }
         let rows = rows_per_dispatch - rows_per_dispatch % workgroup;

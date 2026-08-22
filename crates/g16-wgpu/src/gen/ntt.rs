@@ -168,9 +168,15 @@ pub const PREFERRED_FUSED: u32 = 8;
 ///
 /// 2^10 elements at 32 bytes is 32768 bytes, which is the largest workgroup allocation this
 /// M2 Max permits and twice the floor's, so this is a statement about the field rather than
-/// about the hardware. The memory ceiling is recomputed from the granted limits in
-/// [`crate::ntt::Ntt::max_fused`] and is 9 at the floor; what actually ships is
-/// [`PREFERRED_FUSED`], which is 8 and is a measurement rather than a limit.
+/// about the hardware.
+///
+/// **It is unreachable, and that is now true by construction rather than by accident.**
+/// [`ntt_module_at`] asserts a tile fits [`crate::gen::FLOOR_WORKGROUP_BYTES`], so `k = 10`
+/// at 32768 bytes always panics; U11 made [`crate::ntt::Ntt::max_fused`] read the same floor
+/// instead of the granted limit, so it returns 9 at both profiles and nothing can ask for
+/// the tenth pass any more. Before that, `G16_WGPU_LIMITS=raised` returned 10 here and
+/// turned a documented `ProveError` into a panic inside the generator. What actually ships
+/// is [`PREFERRED_FUSED`], which is 8 and is a measurement rather than a limit.
 pub const MAX_FUSED_PASSES: u32 = 10;
 
 /// `scale_mode`: the head multiplies nothing into the loaded element.

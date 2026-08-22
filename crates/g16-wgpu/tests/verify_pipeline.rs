@@ -646,19 +646,27 @@ fn every_uniform_dynamic_offset_is_a_multiple_of_256_at_the_floor() {
 // 7. The shipped tile is one the generator will actually emit, at both profiles
 // ---------------------------------------------------------------------------
 
-/// Two ceilings on the NTT tile disagree, and only one of them is enforced where it matters.
+/// The generator's ceiling and the host validator's ceiling are the same number, at both
+/// profiles.
+///
+/// # What this used to allow
 ///
 /// `gen::ntt::ntt_module_at` asserts the tile fits **16384** bytes, the browser floor's
 /// `maxComputeWorkgroupStorageSize`, so `k = 10` (32768 bytes) always panics.
-/// `Ntt::max_fused` divides the **granted** limit instead, and this adapter grants 32768, so
-/// under `Raised` it returns 10 and `Ntt::with_shape(b, log_n, 10, None)` passes its own
-/// `max_fused <= ceiling` check and then panics inside the generator rather than returning a
-/// `ProveError`. Nothing shipping reaches that, because `preferred_fused` is
-/// `min(max_fused, 8)`, and this is what pins that: **the tile the prover asks for has to be
-/// one the generator will emit, at every profile.**
+/// `Ntt::max_fused` used to divide the **granted** limit instead, and this adapter grants
+/// 32768, so under `Raised` it returned 10 and `Ntt::with_shape(b, log_n, 10, None)` passed
+/// its own `max_fused <= ceiling` check and then panicked inside the generator where a
+/// `ProveError` was the documented behaviour. Nothing shipping reached it, because
+/// `preferred_fused` is `min(max_fused, 8)`, which is why it was a wart and not a bug.
 ///
-/// The disagreement itself is printed rather than asserted, because asserting it would be a
-/// test that passes only while a wart is present. It is written up in `TASKS.md`.
+/// U11 closed it: both sides now read `WgpuBackend::ceiling_workgroup_bytes`, which is the
+/// smaller of the granted limit and the floor. So this asserts three things rather than
+/// printing one of them:
+///
+/// 1. the tile the prover asks for is one the generator will emit, at every profile;
+/// 2. the tile `max_fused` reports as the ceiling is *also* one the generator will emit,
+///    which is the half that used to be false; and
+/// 3. asking for one pass more than the ceiling is a `ProveError` and not a panic.
 #[test]
 fn the_shipped_ntt_tile_is_one_the_generator_will_emit_at_both_profiles() {
     /// Bytes the generator refuses above. Deliberately a literal here and read from
@@ -678,20 +686,52 @@ fn the_shipped_ntt_tile_is_one_the_generator_will_emit_at_both_profiles() {
         // And the shape it produces really does build, which is the end-to-end version of
         // the same statement.
         Ntt::with_shape(&b, 12, shipped, None).expect("the shipped tile did not build");
+
+        // The half that used to be printed as a NOTE. `max_fused` is documented as the
+        // largest `k` a caller may pass, so a caller who believes it must not hit a panic.
         let ceiling_bytes =
             g16_wgpu::gen::ntt::workgroup_bytes(ceiling, g16_wgpu::gen::Variant::default());
-        if ceiling_bytes > GENERATOR_CEILING_BYTES {
-            println!(
-                "NOTE {profile:?}: Ntt::max_fused reports {ceiling}, which is {ceiling_bytes} \
-                 bytes and over the generator's {GENERATOR_CEILING_BYTES}. with_shape would \
-                 accept it and the generator would panic. See TASKS.md; nothing shipping \
-                 asks for it."
-            );
-        }
+        assert!(
+            ceiling_bytes <= GENERATOR_CEILING_BYTES,
+            "{profile:?}: Ntt::max_fused reports {ceiling}, which is {ceiling_bytes} bytes and \
+             over the generator's {GENERATOR_CEILING_BYTES}. with_shape would accept it and \
+             the generator would panic instead of returning ProveError."
+        );
+        Ntt::with_shape(&b, 12, ceiling, None).unwrap_or_else(|e| {
+            panic!(
+                "{profile:?}: the reported ceiling k = {ceiling} did \
+                 not build: {e}"
+            )
+        });
+
+        // One past the ceiling is an error, not a panic. This is the statement that a
+        // `ProveError` is still the documented failure mode after the two were unified.
+        let over = Ntt::with_shape(&b, 12, ceiling + 1, None);
+        assert!(
+            over.is_err(),
+            "{profile:?}: with_shape accepted k = {} , one past its own ceiling",
+            ceiling + 1
+        );
+
+        // Same statement for the invocation ceiling, which had the identical shape in five
+        // places: 1024 granted here, 256 asserted by every generator.
+        assert_eq!(
+            b.ceiling_invocations(),
+            256,
+            "{profile:?}: the invocation ceiling has to be the floor's 256, whatever the \
+             adapter grants"
+        );
+        assert!(
+            Ntt::with_shape(&b, 12, shipped, Some(512)).is_err(),
+            "{profile:?}: a 512-thread NTT workgroup is over the floor and must be refused \
+             here rather than panic in the generator"
+        );
+
         println!(
-            "{profile:?}: granted workgroup storage {} B, max_fused {ceiling}, shipped tile \
-             k = {shipped} ({bytes} B)",
-            b.granted_limits().max_compute_workgroup_storage_size
+            "{profile:?}: granted workgroup storage {} B, ceiling {} B, max_fused {ceiling}, \
+             shipped tile k = {shipped} ({bytes} B)",
+            b.granted_limits().max_compute_workgroup_storage_size,
+            b.ceiling_workgroup_bytes(),
         );
     }
 }

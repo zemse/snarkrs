@@ -488,7 +488,8 @@ impl MsmDigits {
         shape: ModuleShape,
     ) -> Result<Self, ProveError> {
         let limits = backend.granted_limits();
-        let max_inv = limits.max_compute_invocations_per_workgroup;
+        // The browser floor, not the granted limit; see `WgpuBackend::ceiling_invocations`.
+        let max_inv = backend.ceiling_invocations();
         for (name, n) in [
             ("zero", wg.zero),
             ("mont", wg.mont),
@@ -511,12 +512,15 @@ impl MsmDigits {
         // msm_scan's workgroup array is `array<u32, scan>`; the floor allows 16384 bytes and
         // 256 threads, so this cannot bind. The check is here rather than left to a pipeline
         // creation error that names bytes instead of the constant that set them.
-        let scan_bytes = wg.scan * 4;
-        if scan_bytes > limits.max_compute_workgroup_storage_size {
+        let scan_bytes = u64::from(wg.scan) * 4;
+        if scan_bytes > backend.ceiling_workgroup_bytes() {
             return Err(bad(format!(
                 "msm_scan's workgroup array is {scan_bytes} bytes at {} threads, over the {} \
-                 byte limit",
-                wg.scan, limits.max_compute_workgroup_storage_size
+                 byte ceiling (the smaller of this device's {} and the browser floor's {})",
+                wg.scan,
+                backend.ceiling_workgroup_bytes(),
+                limits.max_compute_workgroup_storage_size,
+                crate::gen::FLOOR_WORKGROUP_BYTES,
             )));
         }
 

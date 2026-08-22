@@ -401,7 +401,8 @@ impl<C: PointCurve> MsmPoints<C> {
     ) -> Result<Self, ProveError> {
         let curve = C::WGSL;
         let limits = backend.granted_limits();
-        let max_inv = limits.max_compute_invocations_per_workgroup;
+        // The browser floor, not the granted limit; see `WgpuBackend::ceiling_invocations`.
+        let max_inv = backend.ceiling_invocations();
         for (name, n) in [
             ("clear", wg.clear),
             ("segmented", wg.segmented),
@@ -427,8 +428,7 @@ impl<C: PointCurve> MsmPoints<C> {
         // on this adapter, so a `Raised` device would otherwise pass this and then panic
         // inside the generator.
         let shared = curve.workgroup_bytes(wg.tg);
-        let ceiling =
-            u64::from(limits.max_compute_workgroup_storage_size).min(wgsl::FLOOR_WORKGROUP_BYTES);
+        let ceiling = backend.ceiling_workgroup_bytes();
         if shared > ceiling {
             return Err(bad(format!(
                 "{} at {} threads holds {shared} bytes of workgroup storage, over the \

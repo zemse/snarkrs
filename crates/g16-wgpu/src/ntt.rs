@@ -351,9 +351,9 @@ impl Ntt {
     /// Passes per dispatch this backend actually uses: the smaller of the memory ceiling and
     /// the measured [`wgsl::PREFERRED_FUSED`].
     ///
-    /// 8 at the floor, where the ceiling is 9. Filling the workgroup budget is 4.7x slower at
-    /// 2^18 than leaving a quarter of it unused, which is the opposite of what "as few
-    /// dispatches as the budget allows" predicts.
+    /// 8 at both profiles, where the ceiling is 9. Filling the workgroup budget is 4.7x
+    /// slower at 2^18 than leaving a quarter of it unused, which is the opposite of what "as
+    /// few dispatches as the budget allows" predicts.
     pub fn preferred_fused(backend: &WgpuBackend) -> u32 {
         Self::max_fused(backend).min(wgsl::PREFERRED_FUSED)
     }
@@ -361,13 +361,18 @@ impl Ntt {
     /// Largest `k` this device's workgroup storage allows, capped at
     /// [`wgsl::MAX_FUSED_PASSES`].
     ///
-    /// 9 at the floor (16384 / 32 = 512 elements), 10 on this M2 Max at `Raised`. Derived
-    /// from the granted limit and never from `Limits::default()`, so `Raised` gets the extra
-    /// pass and a stricter future device gets one fewer instead of a shader that will not
-    /// build.
+    /// **9, at both profiles**, and that is the U11 correction. It used to divide the
+    /// *granted* limit, which is 32768 on this M2 Max, so `G16_WGPU_LIMITS=raised` returned
+    /// 10 and `with_shape(b, log_n, 10, None)` passed the check below and then panicked
+    /// inside `gen::ntt::ntt_module_at`, which asserts the floor's 16384. The generated WGSL
+    /// is what has to compile in Chrome, so the floor is the side that wins; a device
+    /// stricter than the floor still gets fewer passes rather than a shader that will not
+    /// build. One consequence worth stating: `wgsl::MAX_FUSED_PASSES = 10` is now
+    /// unreachable by construction, and its own doc comment says so.
     pub fn max_fused(backend: &WgpuBackend) -> u32 {
-        let elems = backend.granted_limits().max_compute_workgroup_storage_size
-            / crate::gen::field::Variant::default().bytes_per_elem() as u32;
+        let elems = (backend.ceiling_workgroup_bytes()
+            / crate::gen::field::Variant::default().bytes_per_elem() as u64)
+            as u32;
         if elems == 0 {
             return 0;
         }
@@ -386,12 +391,13 @@ impl Ntt {
         max_fused: u32,
         workgroup: Option<u32>,
     ) -> Result<Self, ProveError> {
+        // The browser floor, not the granted limit; see `WgpuBackend::ceiling_invocations`.
         let limits = backend.granted_limits();
+        let inv_ceiling = backend.ceiling_invocations();
         if let Some(w) = workgroup {
-            if w == 0 || w > limits.max_compute_invocations_per_workgroup {
+            if w == 0 || w > inv_ceiling {
                 return Err(bad(format!(
-                    "workgroup size {w} is outside 1..={}",
-                    limits.max_compute_invocations_per_workgroup
+                    "workgroup size {w} is outside 1..={inv_ceiling}"
                 )));
             }
         }
@@ -403,9 +409,12 @@ impl Ntt {
         let ceiling = Self::max_fused(backend);
         if max_fused == 0 || max_fused > ceiling {
             return Err(bad(format!(
-                "max_fused {max_fused} is outside 1..={ceiling}; this device grants {} bytes \
-                 of workgroup storage and an Fr is {FR_BYTES}",
-                limits.max_compute_workgroup_storage_size
+                "max_fused {max_fused} is outside 1..={ceiling}; a tile may hold {} bytes of \
+                 workgroup storage (the smaller of this device's {} and the browser floor's \
+                 {}) and an Fr is {FR_BYTES}",
+                backend.ceiling_workgroup_bytes(),
+                backend.granted_limits().max_compute_workgroup_storage_size,
+                crate::gen::FLOOR_WORKGROUP_BYTES,
             )));
         }
 

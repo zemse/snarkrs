@@ -287,6 +287,33 @@ impl WgpuBackend {
         self.adapter.limits()
     }
 
+    /// Invocations per workgroup a kernel is allowed to declare: the smaller of what this
+    /// device grants and [`crate::gen::FLOOR_INVOCATIONS`].
+    ///
+    /// # Why this is not just the granted limit
+    ///
+    /// The generators hard-assert the floor, because the WGSL they emit has to compile in a
+    /// stock browser. The host constructors used to check the *granted* limit instead, which
+    /// is 1024 on this M2 Max under `G16_WGPU_LIMITS=raised`. A `with_shape(.., 512)` call
+    /// therefore passed its own validation and then panicked inside the generator, where a
+    /// `ProveError` was the documented behaviour. One ceiling, read by both sides, is the
+    /// fix; the floor is the side to keep, because the generated source is what has to run
+    /// in Chrome. Filed against U11 in `TASKS.md` by U9's verification pass.
+    pub fn ceiling_invocations(&self) -> u32 {
+        self.granted_limits()
+            .max_compute_invocations_per_workgroup
+            .min(crate::gen::FLOOR_INVOCATIONS)
+    }
+
+    /// Workgroup storage a kernel is allowed to declare, in bytes: the smaller of what this
+    /// device grants and [`crate::gen::FLOOR_WORKGROUP_BYTES`]. Same reasoning as
+    /// [`Self::ceiling_invocations`]; this adapter grants 32768 against the floor's 16384,
+    /// which is exactly one extra NTT tile.
+    pub fn ceiling_workgroup_bytes(&self) -> u64 {
+        u64::from(self.granted_limits().max_compute_workgroup_storage_size)
+            .min(crate::gen::FLOOR_WORKGROUP_BYTES)
+    }
+
     /// Takes the first uncaptured device error since the last call, if there was one.
     ///
     /// Errors arrive asynchronously on both targets, so this is a poll and not a barrier:

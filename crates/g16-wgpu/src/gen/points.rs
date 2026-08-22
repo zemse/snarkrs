@@ -409,11 +409,11 @@ pub struct Workgroups {
 // Limits the generator refuses to cross
 // ---------------------------------------------------------------------------
 
-/// `maxComputeInvocationsPerWorkgroup` at the browser floor. This adapter allows 1024 and no
-/// browser does, so the check is against the floor.
-pub const FLOOR_INVOCATIONS: u32 = 256;
-/// `maxComputeWorkgroupStorageSize` at the browser floor, in bytes.
-pub const FLOOR_WORKGROUP_BYTES: u64 = 16384;
+// Both floors moved to `crate::gen` at U11, so the five host validators and the five
+// generators read one constant instead of six copies. Re-exported here because
+// `tests/msm_g1.rs`, `tests/msm_g2.rs` and `tests/wgsl_static.rs` name them through this
+// module.
+pub use crate::gen::{FLOOR_INVOCATIONS, FLOOR_WORKGROUP_BYTES};
 
 // ---------------------------------------------------------------------------
 // Emission
