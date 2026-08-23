@@ -5,9 +5,22 @@ edition.workspace = true
 license.workspace = true
 
 [lib]
-# cdylib is for `wasm-pack build --target web` at U13; rlib is what `cargo test`, the bench
-# and the CLI link. Both are cheap here because the crate has no native link dependencies.
-crate-type = ["cdylib", "rlib"]
+# rlib only, and the `cdylib` that was here until U11 is not coming back to this crate.
+#
+# Cargo drops `-C extra-filename` for any lib target whose crate-type list contains cdylib, so
+# that the shared object has a predictable name. That makes the *rlib* unhashed too, because
+# both crate types come out of one rustc invocation. The workspace release profile sets
+# `panic = "abort"` and a test harness needs `unwind`, so every library in a
+# `cargo test --workspace --release` is built twice, and those two units then wrote the same
+# `target/release/deps/libg16_wgpu.rlib`. Cargo says so ("output filename collision", cargo
+# issue 6313, "this may become a hard error") and the effect was not a warning: with
+# `g16-wgpu` in `g16-cli`'s default features, `cargo build --workspace --release --tests`
+# failed 5 times out of 5 with `can't find crate for g16_cli`.
+#
+# U13's browser entry point needs `cdylib` plus wasm-bindgen, js-sys and web-sys, none of
+# which belong in the native dependency tree. It gets its own thin wrapper crate, which is
+# where wasm-pack should have been pointed anyway. See TASKS.md.
+crate-type = ["rlib"]
 
 [dependencies]
 # The modulus and n0 for both fields come from here at run time, so there is no second copy
