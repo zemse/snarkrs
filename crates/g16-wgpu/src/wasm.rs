@@ -121,6 +121,20 @@ pub fn wasm_memory_bytes() -> f64 {
     (core::arch::wasm32::memory_size(0) as f64) * 65536.0
 }
 
+/// This module's `WebAssembly.Memory`, so the page can build a view over linear memory.
+///
+/// `wasm-pack --target web` keeps the exports object private to its glue, and the returned
+/// value of the default `init()` is the only other way to it. Exporting it explicitly means
+/// `worker.js` does not depend on that being true of a future wasm-bindgen.
+///
+/// **Every view built from `.buffer` is invalidated by any wasm allocation**, because growing
+/// the memory detaches the old `ArrayBuffer`, and a write through a detached view is silently
+/// discarded rather than an error. Re-derive after every chunk. See the module docs.
+#[wasm_bindgen]
+pub fn wasm_memory() -> JsValue {
+    wasm_bindgen::memory()
+}
+
 // ---------------------------------------------------------------------------------------
 // The streaming byte path.
 // ---------------------------------------------------------------------------------------
@@ -460,9 +474,16 @@ pub fn verify(vkey_json: &str, public_json: &str, proof_json: &str) -> Result<bo
     let vk = VerifyingKey::from_json_str(vkey_json).map_err(js)?;
     let public = json::public_from_str(public_json).map_err(js)?;
     let proof = json::proof_from_str(proof_json).map_err(js)?;
-    // A rejected proof is `false` and not an error: the page distinguishes "did not verify"
-    // from "could not be read", and only the first one is a result.
-    Ok(verify_proof(&vk, &public, &proof).is_ok())
+    // Only a failed pairing is `false`. The wrong number of public signals, or a key with no
+    // IC, is the caller handing over mismatched arguments and it throws, because `false`
+    // there reads as "the proof is bad" and sends the reader after the prover. Written this
+    // way after the page reported a rejected proof that was in fact a mismatched envelope
+    // field in `worker.js`, and a `bool` return gave nothing to go on.
+    match verify_proof(&vk, &public, &proof) {
+        Ok(()) => Ok(true),
+        Err(g16_core::verify::VerifyError::PairingFailed) => Ok(false),
+        Err(e) => Err(js(e)),
+    }
 }
 
 // ---------------------------------------------------------------------------------------

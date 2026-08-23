@@ -23,3 +23,10 @@ crate-type = ["cdylib"]
 # nothing in CI ever notices when a change to `g16-wgpu` stops compiling for the browser.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 g16-wgpu = { workspace = true, features = ["wasm"] }
+
+# wasm-pack runs its own `wasm-opt` and overwrites the bindgen output in place, which destroys
+# the one number design section 6 asks to be recorded: the size before optimisation. The
+# webgpu-trial build script runs `wasm-opt -O` itself and prints all three sizes, so this
+# turns wasm-pack's copy off rather than measuring a file that has already been rewritten.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
