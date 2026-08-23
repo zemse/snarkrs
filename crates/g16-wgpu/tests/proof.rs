@@ -12,10 +12,14 @@ use g16_core::cpu::CpuBackend;
 use g16_core::prove::{prove, prove_with_blinders};
 use g16_core::verify::verify;
 use g16_core::{Backend, HPoly, ProveError, StageTimings};
-use g16_field::Fr;
+use g16_field::{Fr, One, Zero};
 use g16_wgpu::backend::WgpuProver;
+use g16_wgpu::{G1Bases, G2Bases, Group, Job, MontConvert, Source};
 use g16_wgpu::{LimitsProfile, WgpuBackend};
 use g16_zkey::{wtns::Witness, ProvingKey, VerifyingKey};
+
+#[path = "gpulock/mod.rs"]
+mod gpulock;
 
 /// Serialises the tests in this binary against each other.
 ///
@@ -224,9 +228,9 @@ fn cpu_and_wgpu_proofs_are_bit_identical_at_pinned_blinders() {
             assert_eq!(got.c, want.c, "{}: pi_c differs", a.name);
 
             // And it is not vacuously true because both are the identity.
-            assert!(!bool::from(got.a.infinity), "{}: pi_a is infinity", a.name);
-            assert!(!bool::from(got.b.infinity), "{}: pi_b is infinity", a.name);
-            assert!(!bool::from(got.c.infinity), "{}: pi_c is infinity", a.name);
+            assert!(!got.a.infinity, "{}: pi_a is infinity", a.name);
+            assert!(!got.b.infinity, "{}: pi_b is infinity", a.name);
+            assert!(!got.c.infinity, "{}: pi_c is infinity", a.name);
 
             verify(&a.vkey(), &public_of(&witness, cpu.n_public()), &got).expect("verify");
         },
@@ -475,4 +479,198 @@ fn a_whole_proof_is_two_submits_and_the_readback_is_bounded() {
         );
     }
     println!("ceiling from the constants: {ceiling} bytes");
+}
+
+// ---------------------------------------------------------------------------
+// 5. The denominator: where a proof's time actually goes, and against what
+// ---------------------------------------------------------------------------
+
+/// Which of the five MSMs owns the 907 ms.
+///
+/// `msms` is 98% of a warm proof at 2^18, so "the MSM is slow" is not a useful statement and
+/// the split is. This runs the three digit groups one at a time as their own batches, which
+/// costs three fences instead of one (about 70 microseconds against 900 ms, so it changes
+/// nothing), and then all three together to confirm the parts add up.
+///
+/// It builds the base vectors itself rather than reaching into `WgpuCircuit`, so nothing had
+/// to become public for a report to exist.
+///
+/// # What it says, measured on an M2 Max at the Floor profile, best of three
+///
+/// ```text
+/// artifact       n_vars   general   domain   A+B2+B1     L        H      sum   batched
+/// tiny_mul            6         5        8     12.71   3.31     5.79    21.82    21.14
+/// js_1x1_d8        3373      3234     4096    189.78  38.62    36.75   265.15   264.12
+/// js_2x2_d16      10194      9906    16384    192.52  40.47    38.86   271.85   269.43
+/// js_2x2_d32      18002     17682    32768    194.20  39.68    45.53   279.41   278.69
+/// js_8x8_d32      70640     69372   131072    485.99  69.42    97.41   652.82   645.77
+/// js_16x16_d32   140824    138292   262144    666.34 100.09   156.90   923.32   957.56
+/// ```
+///
+/// Two things, and the second is the one that matters.
+///
+/// **The batch costs what the parts cost.** Three submissions and one submission agree to
+/// within 1% at every artifact except the largest, where the single batch is 3.7% *slower*
+/// and the run-to-run spread on a 900 ms number is wider than that. So `msm_batch` adds no
+/// arithmetic and hides none: what it saves is two fences and two map round trips, which is
+/// about 0.7 ms and invisible next to this.
+///
+/// **The cost barely moves with `n`.** From 3,373 variables to 18,002, a 5.3x increase, the
+/// three witness MSMs go from 189.8 ms to 194.2, 2.3%. That is U9's finding reproduced at
+/// whole-proof scale and it is worth doing the division: 189.8 ms for A, B-G2 and B-G1 is
+/// 38 ms per G1-equivalent MSM (B-G2 costs 3.05x a G1 one, so the three are five units),
+/// against the 38.3 ms `tests/msm_g1.rs::what_one_g1_msm_costs_against_the_cpu` measured for
+/// **one** G1 MSM at n = 4096 standing alone. The two agree to the last figure. Whatever is
+/// wrong is not in this file: batching five MSMs is free, and each of the five costs exactly
+/// what U9 measured it costing on its own. The fix is the occupancy item in `TASKS.md`.
+#[test]
+fn where_the_msm_time_goes() {
+    let _one_at_a_time = exclusive();
+    let _lock = gpulock::exclusive_gpu();
+    for_each_artifact("where_the_msm_time_goes", |a| {
+        let pk = a.key();
+        let witness = a.witness();
+        let n_vars = pk.n_vars as u32;
+        let n_public = pk.n_public;
+        let domain = pk.domain_size as u32;
+        let l_len = pk.l_query.len() as u32;
+        let private_from = (n_public + 1) as u32;
+
+        let b = device();
+        let batch = prover().msm();
+        let a_bases = G1Bases::upload(b, &pk.a_query).expect("a");
+        let b_g1_bases = G1Bases::upload(b, &pk.b_g1_query).expect("b_g1");
+        let b_g2_bases = G2Bases::upload(b, &pk.b_g2_query).expect("b_g2");
+        let l_bases = G1Bases::upload(b, &pk.l_query).expect("l");
+        let h_bases = G1Bases::upload(b, &pk.h_query).expect("h");
+
+        // Stage 4's own output, so the H group reads the buffer the prover would.
+        let circuit = prover().prepare(a.key()).expect("prepare");
+        let mut t = StageTimings::default();
+        let h = circuit.compute_h(&witness, &mut t).expect("compute_h");
+        let handle = h
+            .device_handle::<g16_wgpu::stages::WgpuHandle>(g16_wgpu::stages::TAG)
+            .expect("a wgpu handle");
+
+        let (g_all, g_priv) = {
+            let mut all = 0u32;
+            let mut private = 0u32;
+            for (i, x) in witness.iter().enumerate() {
+                if !(x.is_zero() || x.is_one()) {
+                    all += 1;
+                    if i >= private_from as usize {
+                        private += 1;
+                    }
+                }
+            }
+            (all, private)
+        };
+
+        let w_jobs = [
+            Job::G1 {
+                bases: &a_bases,
+                base_off: 0,
+            },
+            Job::G2 {
+                bases: &b_g2_bases,
+                base_off: 0,
+            },
+            Job::G1 {
+                bases: &b_g1_bases,
+                base_off: 0,
+            },
+        ];
+        let l_jobs = [Job::G1 {
+            bases: &l_bases,
+            base_off: 0,
+        }];
+        let h_jobs = [Job::G1 {
+            bases: &h_bases,
+            base_off: 0,
+        }];
+        let ws = handle.witness_std();
+        let mont = || MontConvert {
+            src: handle.witness_mont(),
+            dst: ws,
+            n: n_vars,
+        };
+        let w_group = || Group {
+            scalars: Source::Device {
+                buf: ws,
+                general: Some(g_all),
+            },
+            scalar_off: 0,
+            n: n_vars,
+            jobs: &w_jobs,
+        };
+        let l_group = || Group {
+            scalars: Source::Device {
+                buf: ws,
+                general: Some(g_priv),
+            },
+            scalar_off: private_from,
+            n: l_len,
+            jobs: &l_jobs,
+        };
+        let h_group = || Group {
+            scalars: Source::Device {
+                buf: handle.h_std(),
+                general: None,
+            },
+            scalar_off: 0,
+            n: domain,
+            jobs: &h_jobs,
+        };
+
+        // Warm the pools and the pipelines before anything is timed.
+        let all = vec![w_group(), l_group(), h_group()];
+        pollster::block_on(batch.run(b, Some(mont()), &all)).expect("warm");
+
+        let time = |groups: Vec<Group<'_>>, mont: Option<MontConvert<'_>>| -> f64 {
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let start = std::time::Instant::now();
+                pollster::block_on(batch.run(
+                    b,
+                    mont.as_ref().map(|m| MontConvert {
+                        src: m.src,
+                        dst: m.dst,
+                        n: m.n,
+                    }),
+                    &groups,
+                ))
+                .expect("run");
+                best = best.min(start.elapsed().as_secs_f64() * 1000.0);
+            }
+            best
+        };
+
+        let t_w = time(vec![w_group()], Some(mont()));
+        let t_l = time(vec![l_group()], None);
+        let t_h = time(vec![h_group()], None);
+        let t_all = time(vec![w_group(), l_group(), h_group()], Some(mont()));
+
+        println!(
+            "{:14} n_vars {:>7} general {:>7} domain {:>7} | A+B2+B1 {:8.2} ms  L {:8.2}  \
+             H {:8.2}  sum {:8.2}  batched {:8.2}",
+            a.name,
+            n_vars,
+            g_all,
+            domain,
+            t_w,
+            t_l,
+            t_h,
+            t_w + t_l + t_h,
+            t_all
+        );
+        // The batch cannot be slower than running the same work in three submissions, which
+        // is the claim `msm_batch` is built on. Allowed 10% of slack for the medians being
+        // three-sample minima on a machine that is not idle.
+        assert!(
+            t_all <= 1.10 * (t_w + t_l + t_h),
+            "{}: one batch took {t_all:.2} ms where three took {:.2}",
+            a.name,
+            t_w + t_l + t_h
+        );
+    });
 }
