@@ -688,6 +688,10 @@ fn real_witnesses_from_the_artifacts_match_the_cpu_pippenger() {
          and this test would otherwise pass by doing nothing"
     );
     let cpu = CpuMsm::new();
+    // Which witness shapes the corpus actually covers. Asserted across the corpus at the end
+    // rather than per artifact, because both shapes are real and neither is the normal one.
+    let mut saw_mostly_general = None::<String>;
+    let mut saw_mostly_bits = None::<String>;
     for (name, dir) in found {
         let pk = ProvingKey::load(&dir.join("circuit.zkey")).expect("zkey");
         let w = Witness::load(&dir.join("circuit.wtns")).expect("wtns").0;
@@ -738,14 +742,38 @@ fn real_witnesses_from_the_artifacts_match_the_cpu_pippenger() {
                 inf > 0,
                 "{name}: no base at infinity in the A query, so the skip path is untested here"
             );
-            assert!(
-                general * 10 > n * 9,
-                "{name}: only {general} of {n} scalars are general; the comment in \
-                 gen::points about a witness being mostly zeros and ones has become true and \
-                 this test's description is now the stale one"
-            );
+            // Both shapes exist in the wild and the two take different paths through the MSM:
+            // a mostly-general witness drives the bucket machinery and hands `window_size`
+            // nearly the whole witness, while a mostly-0/1 one drives `msm_ones` and leaves
+            // the buckets nearly empty. The joinsplit artifacts are 96% to 98% general; the
+            // anon-aadhaar key is 7.9%, which is 92% zeros and ones over 1.1M variables. An
+            // earlier version of this test asserted every artifact was mostly general, which
+            // was true of the six circuits that existed when it was written and stopped being
+            // true the moment a real-world key landed in the tree. The property worth holding
+            // is that the corpus covers both, not that every member looks the same.
+            if general * 10 > n * 9 {
+                saw_mostly_general.get_or_insert_with(|| name.clone());
+            }
+            if general * 10 < n {
+                saw_mostly_bits.get_or_insert_with(|| name.clone());
+            }
         }
     }
+    assert!(
+        saw_mostly_general.is_some(),
+        "no artifact has a mostly-general witness, so the bucket path is only covered by the \
+         random tests and this one has become a duplicate of them"
+    );
+    assert!(
+        saw_mostly_bits.is_some(),
+        "no artifact has a mostly-zeros-and-ones witness, so the msm_ones path is only \
+         covered by synthetic scalars here"
+    );
+    println!(
+        "corpus covers both witness shapes: mostly general via {}, mostly 0/1 via {}",
+        saw_mostly_general.unwrap(),
+        saw_mostly_bits.unwrap()
+    );
 }
 
 // ---------------------------------------------------------------------------
