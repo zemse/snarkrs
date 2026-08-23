@@ -258,6 +258,20 @@ macro_rules! run_msm_words {
         for buf in [&pts.buckets, &pts.spill_pts, &pts.spill_rows, &pts.results] {
             fill(b, buf, SENTINEL);
         }
+        // The sentinel is neither a row number nor NO_ROW, so a merge that read an untagged
+        // slot would ignore it, which is exactly why a sentinel fill cannot see a missing
+        // tag. `$poison` writes real row numbers over the live part of the array instead,
+        // leaving the slack at the sentinel so the over-run assertion still works.
+        if let Some(rows) = $poison {
+            let rows: &[u32] = rows;
+            assert_eq!(
+                rows.len(),
+                pplan.spill_slots(&dplan) as usize,
+                "the poison is not the length of the spill array"
+            );
+            b.queue()
+                .write_buffer(&pts.spill_rows, 0, bytemuck::cast_slice(rows));
+        }
 
         let slots = d.sort_slots(&dplan) + p.slots(&dplan, &pplan) + 4;
         let mut ring = ParamRing::new(b, "verify ring", slots).expect("ring");
