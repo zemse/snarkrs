@@ -439,10 +439,21 @@ fn coef_indices(data: &[u8], i: usize) -> Result<(usize, usize, usize, usize), Z
 impl VerifyingKey {
     /// Parse snarkjs' `verification_key.json`, so we can verify against the same key
     /// snarkjs uses without trusting our own zkey reader.
+    ///
+    /// Native only, because there is no filesystem in a browser. The browser path is
+    /// [`VerifyingKey::from_json_str`], which this is a thin wrapper over.
+    #[cfg(not(target_family = "wasm"))]
     pub fn from_json(path: &std::path::Path) -> Result<Self, ZkeyError> {
-        let text = std::fs::read_to_string(path)?;
+        Self::from_json_str(&std::fs::read_to_string(path)?)
+    }
+
+    /// Same, on text the caller already has.
+    ///
+    /// The page in `../webgpu-trial` cross-checks snarkjs' proofs against our own verifier,
+    /// and it has `vkey.json` as a string from `fetch`, not as a path.
+    pub fn from_json_str(text: &str) -> Result<Self, ZkeyError> {
         let v: serde_json::Value =
-            serde_json::from_str(&text).map_err(|e| ZkeyError::BadJson(e.to_string()))?;
+            serde_json::from_str(text).map_err(|e| ZkeyError::BadJson(e.to_string()))?;
 
         match v.get("protocol").and_then(|p| p.as_str()) {
             Some("groth16") => {}

@@ -6,7 +6,7 @@
 //! work, which must all be hoisted into [`WgpuProver::prepare`], and per-proof work, which
 //! must touch nothing shared and mutable.
 //!
-//! # Native only, and why that is not a hedge
+//! # One circuit, two ways of waiting for it
 //!
 //! `g16_core::PreparedCircuit` is a synchronous trait and every wgpu readback is
 //! fundamentally asynchronous, so something has to block. On native, `pollster::block_on`
@@ -15,10 +15,13 @@
 //! only thing that fires a `mapAsync` callback is a yield to the event loop, and
 //! `pollster::block_on` compiles for wasm32 and then hangs the tab.
 //!
-//! So this module is `cfg`-gated off wasm32 rather than made to compile and deadlock. The
-//! browser gets an `async fn prove` of its own at U13, over the same [`crate::stages`] and
-//! [`crate::batch`] that this file calls; nothing below is on the browser's path and nothing
-//! below has to be rewritten for it.
+//! So the *async* half of this file compiles on both targets and the blocking half does not.
+//! [`WgpuCircuit::compute_h_async`] and [`WgpuCircuit::msms_async`] are the real
+//! implementations; the `PreparedCircuit` impl is four `pollster::block_on` calls over them
+//! and is `cfg`-gated off wasm32, and [`crate::wasm`] awaits the same two functions from the
+//! browser's dedicated Web Worker. U13 did it this way after starting to copy the file: the
+//! only thing that differs between a native proof and a browser proof is who waits, and
+//! duplicating 200 lines of job wiring to express that is how the two backends drift.
 //!
 //! # What `prepare` hoists, and what it cannot
 //!
@@ -44,16 +47,31 @@
 //! a measurement to publish, and `tests/proof.rs` publishes it.
 
 use std::sync::Arc;
-use std::time::Instant;
+// Not `std::time`: `Instant::now()` panics at run time on wasm32-unknown-unknown, and every
+// timing below is taken on the browser's path too. web-time is a plain re-export of
+// `std::time` on native, so no number on this machine changes.
+use web_time::Instant;
 
-use g16_core::{Backend, HPoly, MsmOutputs, PreparedCircuit, ProveError, StageTimings};
+use g16_core::{HPoly, MsmOutputs, ProveError, StageTimings};
 use g16_field::{Fr, One, Zero};
 use g16_zkey::ProvingKey;
 
 use crate::batch::{G1Bases, G2Bases, Group, Job, MontConvert, MsmBatch, Source};
-use crate::device::{bad, LimitsProfile, WgpuBackend};
+use crate::device::{bad, WgpuBackend};
 use crate::pipelines::PrepareCost;
-use crate::stages::{HStages, Stage4, WgpuHandle};
+use crate::stages::{HStages, WgpuHandle};
+
+// `Backend` and `PreparedCircuit` are the synchronous traits, `Stage4` is only reachable
+// through the synchronous `compute_h_with`, and `LimitsProfile::from_env` reads an
+// environment a browser does not have. All four are native only, and importing them
+// unconditionally is an unused-import warning on wasm32 rather than an error, which is
+// exactly the kind of warning that gets ignored until it hides a real one.
+#[cfg(not(target_arch = "wasm32"))]
+use crate::device::LimitsProfile;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::stages::Stage4;
+#[cfg(not(target_arch = "wasm32"))]
+use g16_core::{Backend, PreparedCircuit};
 
 /// Where the time in [`WgpuProver::prepare`] went, in microseconds.
 ///
@@ -92,10 +110,14 @@ impl WgpuProver {
     ///
     /// Fails rather than falling back to anything. A benchmark that quietly measures a
     /// different backend is worse than no number at all.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new() -> Result<Self, ProveError> {
         Self::with_profile(LimitsProfile::from_env()?)
     }
 
+    /// Native only: opening a device is async and blocking a browser's only thread on it
+    /// hangs the tab. The browser opens the device with `.await` in [`crate::wasm`].
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn with_profile(profile: LimitsProfile) -> Result<Self, ProveError> {
         let device = pollster::block_on(WgpuBackend::with_profile(profile))?;
         Self::with_device(Arc::new(device))
@@ -142,6 +164,9 @@ impl WgpuProver {
     }
 }
 
+/// Native only, because `prepare` hands back a `Box<dyn PreparedCircuit>` and that trait is
+/// synchronous. The browser builds a [`WgpuCircuit`] directly; see [`crate::wasm`].
+#[cfg(not(target_arch = "wasm32"))]
 impl Backend for WgpuProver {
     fn name(&self) -> &'static str {
         "wgpu"
@@ -182,7 +207,10 @@ pub struct WgpuCircuit {
 }
 
 impl WgpuCircuit {
-    fn new(
+    /// Uploads everything witness independent. `pub` because [`crate::wasm`] builds a circuit
+    /// without going through [`Backend::prepare`], whose return type is a boxed
+    /// `PreparedCircuit` and therefore native only.
+    pub fn new(
         device: Arc<WgpuBackend>,
         msm: Arc<MsmBatch>,
         pk: ProvingKey,
@@ -293,6 +321,7 @@ impl WgpuCircuit {
     }
 
     /// Stages 0 to 4 with stage 4's implementation chosen, for the test that runs both.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn compute_h_with(
         &self,
         witness: &[Fr],
@@ -301,6 +330,22 @@ impl WgpuCircuit {
     ) -> Result<HPoly, ProveError> {
         let _gpu = self.device.exclusive();
         pollster::block_on(self.stages.compute_h_with(&self.device, witness, mode, t))
+    }
+
+    /// Stages 0 to 4, awaited. The real implementation behind `PreparedCircuit::compute_h`.
+    ///
+    /// **Takes no lock, and the caller must.** [`crate::device::WgpuBackend::exclusive`] is
+    /// what makes two concurrent proofs on one device produce right answers, and its own doc
+    /// comment requires it to be held at the synchronous boundary rather than inside an
+    /// `async fn`, so that no `MutexGuard` is live across an `.await` and these futures stay
+    /// `Send`. The `PreparedCircuit` impl below takes it; the browser worker in
+    /// [`crate::wasm`] runs one proof at a time by protocol and refuses a second instead.
+    pub async fn compute_h_async(
+        &self,
+        witness: &[Fr],
+        t: &mut StageTimings,
+    ) -> Result<HPoly, ProveError> {
+        self.stages.compute_h(&self.device, witness, t).await
     }
 
     fn check_witness(&self, witness: &[Fr]) -> Result<(), ProveError> {
@@ -336,6 +381,7 @@ fn general_counts(witness: &[Fr], private_from: usize) -> (u32, u32) {
     (all, private)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl PreparedCircuit for WgpuCircuit {
     /// Always "wgpu", and that is a claim about what ran: no stage in this backend has a CPU
     /// fallback, so the name cannot be describing a proof the CPU did.
@@ -357,10 +403,30 @@ impl PreparedCircuit for WgpuCircuit {
 
     fn compute_h(&self, witness: &[Fr], t: &mut StageTimings) -> Result<HPoly, ProveError> {
         let _gpu = self.device.exclusive();
-        pollster::block_on(self.stages.compute_h(&self.device, witness, t))
+        pollster::block_on(self.compute_h_async(witness, t))
     }
 
     fn msms(
+        &self,
+        witness: &[Fr],
+        h: &HPoly,
+        t: &mut StageTimings,
+    ) -> Result<MsmOutputs, ProveError> {
+        // The guard first, then the clock, and the order is the whole point. The reason is
+        // the long comment in `msms_async`, which is where the clock starts.
+        let _gpu = self.device.exclusive();
+        pollster::block_on(self.msms_async(witness, h, t))
+    }
+}
+
+impl WgpuCircuit {
+    /// Stages 5 to 9, awaited. The real implementation; the `PreparedCircuit::msms` above
+    /// is `pollster::block_on` over this and the browser worker awaits it directly.
+    ///
+    /// Takes no lock, for the reason in [`Self::compute_h_async`]. The clock below still
+    /// starts after the caller's guard is acquired, which is the ordering the long comment
+    /// inside argues for.
+    pub async fn msms_async(
         &self,
         witness: &[Fr],
         h: &HPoly,
@@ -391,7 +457,9 @@ impl PreparedCircuit for WgpuCircuit {
         // not to grow by it. Single-threaded proving, which is every benchmark in this repo,
         // is unaffected: the guard is uncontended and the two orderings differ by the lock
         // acquisition.
-        let _gpu = self.device.exclusive();
+        //
+        // The guard itself is the caller's, one stack frame up, so that it is not held across
+        // an `.await`. Acquiring it there and starting the clock here keeps the ordering.
         let start = Instant::now();
 
         let private_from = self.pk.n_public + 1;
@@ -519,7 +587,7 @@ impl PreparedCircuit for WgpuCircuit {
             }
         };
 
-        let out = pollster::block_on(self.msm.run(&self.device, mont, &groups))?;
+        let out = self.msm.run(&self.device, mont, &groups).await?;
         if out.len() != 5 {
             return Err(bad(format!(
                 "the MSM batch returned {} results for 5 jobs",

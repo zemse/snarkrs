@@ -26,6 +26,11 @@ serde.workspace = true
 serde_json.workspace = true
 num-bigint.workspace = true
 hotpath = { workspace = true, optional = true }
+# `std::time::Instant::now()` panics at run time on wasm32-unknown-unknown, and stage 11 is
+# the one place in this crate a browser proof goes through. web-time is `performance.now()`
+# there and a plain re-export of `std::time` everywhere else, so no target cfg is needed and
+# no native number changes. Same dependency, same reason, as `g16-wgpu`.
+web-time = "1.1"
 
 # Needs the feature that supplies the `hotpath` dependency, so it is not a build target
 # without it and a default `cargo check --all-targets` never sees it.

@@ -65,9 +65,8 @@
 //! offers. A kernel that only fits native Metal's headroom is a kernel that fails in a stock
 //! browser, and native `cargo test` will not tell you.
 
-/// The `g16_core::Backend` implementation. Native only; see the module docs for why a
-/// synchronous trait and a browser cannot both be served by one entry point.
-#[cfg(not(target_arch = "wasm32"))]
+/// The circuit, the five MSM jobs and the `g16_core::Backend` implementation. The async
+/// halves compile everywhere; the blocking `PreparedCircuit` impl over them is native only.
 pub mod backend;
 pub mod batch;
 pub mod device;
@@ -82,7 +81,6 @@ pub mod pointwise;
 pub mod readback;
 pub mod stages;
 
-#[cfg(not(target_arch = "wasm32"))]
 pub use backend::{CircuitCost, WgpuCircuit, WgpuProver};
 pub use batch::{G1Bases, G2Bases, Group, Job, MontConvert, MsmBatch, MsmResult, Source};
 pub use device::{LimitsProfile, WgpuBackend};

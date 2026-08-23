@@ -56,6 +56,10 @@ macro_rules! stage {
 }
 
 pub mod cpu;
+/// snarkjs' `proof.json` and `public.json` encoding, which is the interop contract the whole
+/// benchmark rests on. Here rather than in `g16-cli` because the browser prover has no
+/// filesystem and still has to hand `snarkjs.groth16.verify` exactly these bytes.
+pub mod json;
 pub mod prove;
 pub mod verify;
 

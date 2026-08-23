@@ -1,9 +1,13 @@
 //! Stages 10-11: blinding and assembly, plus the top-level `prove` that drives a backend.
 
-use std::time::Instant;
+// Not `std::time`: `Instant::now()` panics at run time on wasm32-unknown-unknown, and
+// `assemble` below is on the browser prover's path. web-time is a re-export of `std::time`
+// on every other target, so nothing native changes.
+use web_time::Instant;
 
-use crate::{PreparedCircuit, Proof, ProveError, StageTimings};
+use crate::{MsmOutputs, PreparedCircuit, Proof, ProveError, StageTimings};
 use g16_field::*;
+use g16_zkey::ProvingKey;
 
 /// Full proof: stages 0-11. `rng` supplies the zero-knowledge blinders `r` and `s`.
 pub fn prove<R: ark_std::rand::RngCore + ark_std::rand::CryptoRng>(
@@ -32,9 +36,25 @@ pub fn prove_with_blinders(
 ) -> Result<Proof, ProveError> {
     let h = stage!("stages 0-4 compute_h", circuit.compute_h(witness, timings))?;
     let m = stage!("stages 5-9 msms", circuit.msms(witness, &h, timings))?;
+    Ok(assemble(circuit.key(), &m, r, s, timings))
+}
 
+/// Stage 11 alone: blind the five MSM outputs into `(A, B, C)`.
+///
+/// Split out of [`prove_with_blinders`] because the browser prover cannot go through
+/// [`PreparedCircuit`] at all. That trait is synchronous and every WebGPU readback is
+/// asynchronous, so `g16-wgpu`'s wasm entry point awaits stages 0 to 4 and 5 to 9 itself and
+/// then needs exactly this. Copying these six lines into that crate instead is how a
+/// transcription error gets into one backend and not the other, and the one term that invites
+/// it is `s * pi_a`: that is the *blinded* A, not the raw MSM.
+pub fn assemble(
+    pk: &ProvingKey,
+    m: &MsmOutputs,
+    r: Fr,
+    s: Fr,
+    timings: &mut StageTimings,
+) -> Proof {
     let start = Instant::now();
-    let pk = circuit.key();
 
     // Stage 11, in snarkjs' order (groth16_prove.js). Deriving it from the article's
     // equation gives the same thing: A = alpha + sum(a_i w_i) + r*delta lives in G1,
@@ -59,11 +79,11 @@ pub fn prove_with_blinders(
     });
     timings.assemble_us += start.elapsed().as_micros() as u64;
 
-    Ok(Proof {
+    Proof {
         a: g1[0],
         b: g2[0],
         c: g1[1],
-    })
+    }
 }
 
 #[cfg(test)]
