@@ -10,23 +10,35 @@
 //! `mul_bigint` at a time, which shares no code with either MSM, no window width, no bucket
 //! and no digit.
 //!
-//! # The second gap, which is a shape and not an oracle
+//! # The second thing, which is a shape and not an oracle
 //!
-//! `msm_merge_*` folds a bucket's spills over the slices `[k_lo, k_hi]` its run reaches. The
-//! historical bug (`k_hi = k_lo`, shipped in the G2 merge) drops every slice past the first,
-//! and the G1 suite catches it at n = 129 because 1,000 random entries spread over 128-entry
-//! slices leave a few buckets straddling **one** boundary. Nothing in either suite makes a
-//! single bucket's run cross **two**, because a random draw at those sizes never puts 129
-//! entries in one bucket. So `k_hi = k_lo + 1u`, a plausible off-by-one in exactly the line
-//! that was already wrong once, passes the whole existing suite.
+//! `msm_merge_*` folds a bucket's spills over the slices `[k_lo, k_hi]` its run reaches, and
+//! `k_hi` is the line that shipped wrong once already. The bug that shipped, `k_hi = k_lo`,
+//! drops every slice past the first; the neighbouring mistake, `k_hi = k_lo + 1u`, drops
+//! every slice past the second and needs a bucket whose run crosses **two** boundaries to
+//! show at all.
 //!
-//! The witness distribution the segmented pass was built for is the one that produces those
-//! runs: `gen::points` quotes a busiest bucket of 11,758 entries against a mean of 17 on
-//! `js_2x2_d32`, from repeated witness values. Repeating one scalar reproduces it exactly,
-//! because equal scalars have equal digits and therefore share a bucket in **every** window.
-//! [`one_bucket_holding_a_run_longer_than_several_slices_is_merged_whole`] does that at
-//! `slice_len - 1` through `5 * slice_len + 7`, and it is the only test in this crate where
-//! `k_hi - k_lo` exceeds 1.
+//! **The existing suites do catch both, and the claim that they do not was checked before it
+//! was believed.** Applying `k_hi = k_lo + 1u` and running only `tests/msm_g1.rs`,
+//! `tests/msm_g2.rs` and `tests/proof.rs` fails `the_g1_msm_matches_cpu_pippenger_at_every_
+//! window_width` and `real_witnesses_from_the_artifacts_match_the_cpu_pippenger`. The reason
+//! is not the length sweep, which never puts 129 entries in one bucket: it is `c = 2`, where
+//! 700 entries fall into two buckets and every run is 350 long, and it is the real witnesses,
+//! whose repeated values are the imbalance the segmented pass exists for (`gen::points`
+//! quotes a busiest bucket of 11,758 against a mean of 17 on `js_2x2_d32`).
+//!
+//! What is missing is not the coverage but any statement of it. Both sources are incidental:
+//! one is the far end of a window-width sweep and the other is a property of six artifacts on
+//! a gitignored symlink, and nothing anywhere asserts that a bucket run ever crosses a slice
+//! boundary. Change `slice_len`, drop `c = 2` from the sweep, or run without artifacts, and
+//! the multi-slice merge stops being exercised with no test going red.
+//!
+//! So the tests here build the case on purpose and assert the shape they built. Repeating one
+//! scalar reproduces the distribution exactly, because equal scalars have equal digits and
+//! therefore share a bucket in **every** window;
+//! [`one_bucket_holding_a_run_longer_than_several_slices_is_merged_whole`] does that from
+//! `slice_len - 1` to `5 * slice_len + 7` and asserts the observed span, recomputed from the
+//! counts and cursors the kernels themselves wrote.
 //!
 //! Native only, for the reason in `tests/device.rs`. Fixed seeds throughout.
 
@@ -45,9 +57,7 @@ use g16_wgpu::{LimitsProfile, ParamRing, WgpuBackend};
 #[path = "msmcommon/mod.rs"]
 mod common;
 
-use common::{
-    fill, general_count, general_scalars, read_bytes, read_words, storage_words, SENTINEL,
-};
+use common::{fill, general_scalars, read_bytes, read_words, storage_words, SENTINEL};
 
 // ---------------------------------------------------------------------------
 // Device, built once for the binary
@@ -193,13 +203,40 @@ impl<P> Run<P> {
 /// trait object would add a layer to read past for two call sites.
 macro_rules! run_msm {
     ($points:expr, $curve:expr, $bases_words:expr, $scalars:expr, $n:expr, $c:expr, $slack:expr) => {{
+        let (sw, general) = pack_scalars($scalars);
+        run_msm_words!(
+            digits(),
+            $points,
+            $curve,
+            $bases_words,
+            &sw,
+            general,
+            $n,
+            $c,
+            $slack,
+            None
+        )
+    }};
+}
+
+/// The same, on chosen pipelines, a scalar buffer that is already `u32` words, and an
+/// optional poison written over the live part of `spill_rows` before the dispatch.
+///
+/// Each extra exists for one test and none of the three can be written without it:
+/// `pack_scalars` only produces canonical field elements, the multi-dispatch path is a
+/// property of the `MsmDigits`/`MsmPoints` instance rather than of the plan, and the
+/// spill-tag poison is the only way to reproduce a pooled buffer that still holds the
+/// previous proof's tags.
+macro_rules! run_msm_words {
+    ($digits:expr, $points:expr, $curve:expr, $bases_words:expr, $words:expr, $general:expr,
+     $n:expr, $c:expr, $slack:expr, $poison:expr) => {{
         let b = floor();
-        let d = digits();
+        let d = $digits;
         let p = $points;
         let n: u32 = $n;
         let slack: u32 = $slack;
 
-        let general = general_count(&$scalars[..n as usize]);
+        let general: u32 = $general;
         let dplan = match $c {
             Some(c) => DigitPlan::with_c(n, 0, Some(general), c),
             None => DigitPlan::new(n, 0, Some(general)),
@@ -207,8 +244,7 @@ macro_rules! run_msm {
         .expect("digit plan");
         let pplan = p.plan_points(&dplan, 0).expect("point plan");
 
-        let (sw, _) = pack_scalars($scalars);
-        let scalars_buf = storage_words(b, "verify scalars", &sw);
+        let scalars_buf = storage_words(b, "verify scalars", $words);
         let bases_buf = storage_words(b, "verify bases", $bases_words);
 
         let sort = DigitBuffers::new(b, &dplan, slack).expect("digit buffers");
@@ -338,22 +374,23 @@ fn the_g1_msm_equals_a_naive_sum_of_scalar_multiples() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. The gap: one bucket whose run crosses more than one slice boundary
+// 2. One bucket whose run crosses more than one slice boundary, on purpose
 // ---------------------------------------------------------------------------
 
 /// `m` copies of one scalar over `m` distinct bases, so every window has exactly one occupied
 /// bucket holding all `m` entries.
 ///
-/// This is the only shape in this crate where `msm_merge_*` iterates its slice loop more than
-/// twice. Each slice of the run sees no bucket change, so every one of them spills its whole
-/// partial to its head slot and `BUCKETS[row]` is left at the identity by `msm_clear_*`; the
-/// answer is therefore **entirely** the merge's fold, and a merge that stops early returns a
-/// proper prefix of it. At `m = 5 * slice_len + 7` that is 6 slices, so `k_hi = k_lo` returns
-/// about a sixth of the right point and `k_hi = k_lo + 1u` about a third.
+/// Each slice of the run sees no bucket change, so every one of them spills its whole
+/// partial to its head slot and `BUCKETS[row]` is left at the identity by `msm_clear_*`; the answer is
+/// therefore **entirely** the merge's fold, and a merge that stops early returns a proper
+/// prefix of it. At `m = 5 * slice_len + 7` that is 6 slices, so `k_hi = k_lo` returns about a
+/// sixth of the right point and `k_hi = k_lo + 1u` about a third.
 ///
-/// It is also the distribution the segmented pass exists for: `gen::points` cites 11,758
-/// entries in one bucket against a mean of 17 on `js_2x2_d32`, which comes from repeated
-/// witness values, and repeated values have identical digits in every window.
+/// The span is asserted, not assumed. `c = 2` in the sweep above and the real witnesses in
+/// `tests/msm_g1.rs` both happen to produce runs this long, and neither says so, so both can
+/// stop doing it without a test going red. This one cannot: it recomputes the fattest
+/// bucket's span from the counts and cursors the kernels wrote and fails if it is not
+/// `ceil(m / slice_len)`.
 #[test]
 fn one_bucket_holding_a_run_longer_than_several_slices_is_merged_whole() {
     let _one = exclusive();
@@ -640,4 +677,302 @@ fn infinity_bases_inside_a_fat_bucket_are_skipped() {
         "a slice whose every base is at infinity changed the answer"
     );
     println!("infinity bases inside and filling a slice of a fat run are both skipped exactly");
+}
+
+// ---------------------------------------------------------------------------
+// 4. Scalars a `Fr` cannot hold
+// ---------------------------------------------------------------------------
+
+/// A scalar buffer whose words are not canonical field elements.
+///
+/// `security/README.md` reads the zkey as trusted, but the scalars are the *witness*, and
+/// nothing between `Witness::load` and `PackedScalar::from_fr` re-checks that a limb group is
+/// below `r`. On the CPU that is moot: `Fr` is canonical by construction. On the device the
+/// eight limbs are read raw by `sc_bits`, and a digit that came out too large would index
+/// `COUNTS[w * n_buckets + d - 1]` past its window, which WebGPU turns into a dropped write
+/// that this crate would never hear about.
+///
+/// Two claims, and they are different claims.
+///
+/// **Below 2^254 the answer is still right.** The recoding is exact for any integer whose
+/// **bit 254 is clear**, and 2^254 rather than 2^255 is the bound, which is worth spelling
+/// out because the obvious reading of `RECODE_BITS = 255` gives the wrong one and this test
+/// was written with the wrong one first. `sc_digit` borrows `2^c` whenever a window's top bit
+/// is set and the next window pays it back through its carry; the highest window has no next
+/// window, so its top bit, which is bit `W*c - 1 = 254`, must be clear or the borrow is never
+/// repaid and the sum comes out `2^255` short. `gen::msm` says exactly that and rests it on
+/// every BN254 scalar being below `r < 2^254`. So `u + r` for `u < 2^254 - r` is a
+/// non-canonical representative the recoding still handles exactly, and it must give the same
+/// point as `u`: not because the device reduces anything, but because `u + r` and `u` are the
+/// same multiple of a point of order `r`.
+///
+/// **Above that the answer is wrong by construction and the writes still have to stay inside
+/// their buffers.** All ones is the worst case: every window is at its maximum and bit 254 is
+/// set, so the top borrow is exactly the one the proof excludes. The magnitude is bounded by
+/// `2^(c-1)` whatever the input, so the row index is in range however wrong the value is, and
+/// this asserts that construction rather than trusting it.
+#[test]
+fn scalars_that_are_not_canonical_field_elements_stay_inside_their_buffers() {
+    let _one = exclusive();
+    let mut rng = test_rng();
+    let n = 300usize;
+    let bases = rand_g1(n, &mut rng);
+    let words = g1_words(&bases);
+
+    // `u + r` with `u` below 2^251, which is comfortably below `2^254 - r` (about 2^252.0),
+    // so every sum has bit 254 clear and is a value the recoding covers exactly. Built by
+    // masking a random field element's top limb rather than by rejection sampling, so the
+    // yield is 300 of 300 and the test never quietly shrinks.
+    let r_limbs: [u64; 4] = Fr::MODULUS.0;
+    let mut raw: Vec<u32> = Vec::with_capacity(n * 8);
+    let mut canonical: Vec<Fr> = Vec::with_capacity(n);
+    for _ in 0..n {
+        let mut u = Fr::rand(&mut rng).into_bigint();
+        u.0[3] &= (1u64 << 59) - 1;
+        let small = Fr::from_bigint(u).expect("below 2^251 is below r");
+        if small.is_zero() || small == Fr::from(1u64) {
+            continue;
+        }
+        let mut sum = [0u64; 4];
+        let mut carry = 0u128;
+        for i in 0..4 {
+            let t = u128::from(u.0[i]) + u128::from(r_limbs[i]) + carry;
+            sum[i] = t as u64;
+            carry = t >> 64;
+        }
+        assert_eq!(carry, 0);
+        assert_eq!(sum[3] >> 62, 0, "u + r reached bit 254");
+        canonical.push(small);
+        for l in sum {
+            raw.push(l as u32);
+            raw.push((l >> 32) as u32);
+        }
+    }
+    let m = canonical.len();
+    assert!(m >= n - 2, "{} of {n} draws were 0 or 1", n - m);
+    let kept_bases = &bases[..m];
+    let want = naive_g1(kept_bases, &canonical);
+    assert!(!want.is_zero(), "degenerate oracle");
+    let kept_words = g1_words(kept_bases);
+
+    let run = run_msm_words!(
+        digits(),
+        g1(),
+        wgsl::G1,
+        &kept_words,
+        &raw,
+        m as u32,
+        m as u32,
+        None,
+        2,
+        None
+    );
+    assert_eq!(
+        run.result, want,
+        "u + r and u are the same multiple of a point of order r, and the device disagreed \
+         over {m} of them"
+    );
+    run.assert_no_overrun(wgsl::G1.point_bytes, 2, "u + r");
+
+    // All ones: 256 bits set, so bit 255 is set and the recoding's top-carry proof does not
+    // cover this input. The answer is meaningless and is deliberately not asserted. What is
+    // asserted is that nothing wrote outside a buffer.
+    let ones = vec![0xffff_ffffu32; n * 8];
+    let run = run_msm_words!(
+        digits(),
+        g1(),
+        wgsl::G1,
+        &words,
+        &ones,
+        n as u32,
+        n as u32,
+        None,
+        4,
+        None
+    );
+    run.assert_no_overrun(wgsl::G1.point_bytes, 4, "all-ones scalars");
+    println!(
+        "{m} non-canonical scalars below 2^254 gave the canonical answer, and {n} all-ones \
+         scalars wrote nothing outside their buffers"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 5. The dispatch chunking, which no artifact reaches
+// ---------------------------------------------------------------------------
+
+/// The whole MSM with `workgroups_per_dispatch` forced to 2, so `clear`, `segmented` and
+/// `merge` are each encoded as many dispatches over `P.lo`.
+///
+/// `MsmDigits::with_shape` and `MsmPoints::with_shape` are both public and both say, in the
+/// same words, that one reason is "the multi-dispatch path, which no artifact reaches ... a
+/// code path no test can reach is a code path that ships untested". **Every existing caller
+/// of either passes 65535**, so the path was reachable and still untested. `tests/gather.rs`
+/// does force the chunking on stage 0 (three workgroups per dispatch, with a short last
+/// chunk); nothing did it for stages 5 to 9.
+///
+/// The chunking is where a `lo` that is not carried, a last chunk that is rounded up rather
+/// than clamped, or a parameter ring slot count that disagrees with the dispatch count all
+/// live, and none of the three is visible in a single-dispatch encode. `n = 2000` at the
+/// default window width makes all three kernels take several chunks; the answer must not
+/// move.
+#[test]
+fn the_msm_is_the_same_point_when_every_kernel_is_split_across_dispatches() {
+    let _one = exclusive();
+    let mut rng = test_rng();
+    let n = 2000usize;
+    let bases = rand_g1(n, &mut rng);
+    let words = g1_words(&bases);
+    let scalars = general_scalars(n, &mut rng);
+    let want = naive_g1(&bases, &scalars);
+    assert!(!want.is_zero(), "degenerate oracle");
+    let (sw, general) = pack_scalars(&scalars);
+
+    let whole = run_msm_words!(
+        digits(),
+        g1(),
+        wgsl::G1,
+        &words,
+        &sw,
+        general,
+        n as u32,
+        None,
+        2,
+        None
+    );
+    assert_eq!(
+        whole.result, want,
+        "the single-dispatch encode is already wrong"
+    );
+
+    // Two workgroups per dispatch: at the shipped sizes that is 512 rows a chunk for clear
+    // and merge and 256 threads a chunk for the segmented pass.
+    let d = MsmDigits::with_shape(
+        floor(),
+        g16_wgpu::gen::msm::Workgroups::default(),
+        g16_wgpu::gen::msm::LimbPick::default(),
+        2,
+    )
+    .expect("chunked digit pipelines");
+    let p = MsmPointsG1::with_shape(floor(), wgsl::G1.wg, 2).expect("chunked point pipelines");
+    let split = run_msm_words!(
+        &d,
+        &p,
+        wgsl::G1,
+        &words,
+        &sw,
+        general,
+        n as u32,
+        None,
+        2,
+        None
+    );
+
+    assert_eq!(
+        split.result, want,
+        "splitting clear, segmented and merge across dispatches changed the answer"
+    );
+    split.assert_no_overrun(wgsl::G1.point_bytes, 2, "chunked");
+    // And it really was split, which is the premise: without this the test passes if
+    // `with_shape` quietly ignored the cap.
+    let dplan = DigitPlan::new(n as u32, 0, Some(general)).expect("plan");
+    let pplan = p.plan_points(&dplan, 0).expect("point plan");
+    let dispatches = p.slots(&dplan, &pplan);
+    assert!(
+        dispatches > 5,
+        "the chunked run encoded {dispatches} point dispatches, so nothing was chunked and \
+         this test compares two identical encodes"
+    );
+    println!("{dispatches} point dispatches at 2 workgroups each, same point as one dispatch");
+}
+
+// ---------------------------------------------------------------------------
+// 6. A pooled spill array that still holds the last proof's tags
+// ---------------------------------------------------------------------------
+
+/// `msm_segmented_*` tags both of its spill slots `NO_ROW` **before** the early return that
+/// skips an empty slice, and its comment says why: "the merge reads every slot in a bucket's
+/// slice range and a pooled spill_rows buffer holds the last proof's tags". Nothing tested
+/// it. Deleting both lines leaves the whole existing suite green, `tests/msm_g1.rs`,
+/// `tests/msm_g2.rs`, `tests/proof.rs` and the five tests above included, because every one
+/// of them pre-fills the array with a sentinel that is neither a row number nor `NO_ROW`, so
+/// a stale slot is ignored by the merge whether it was re-tagged or not.
+///
+/// The slot that matters is the **tail**. A slice whose entries are all one run writes its
+/// head slot and leaves the tail untouched after the pre-tagging, and that is the common case
+/// inside a fat bucket, which is the case the segmented pass was built for. If the tail still
+/// held a row from the previous proof, the merge would fold that slice's leftover point into
+/// whichever bucket the tag named.
+///
+/// So this reproduces the pool: run once, take the tags the run produced, and run the same
+/// MSM again with **the head tag copied into the tail slot** of every slice. That is not an
+/// arbitrary poison. It is the one value guaranteed to name a bucket whose own slice range
+/// contains this slice, so a merge that trusts it will read it. `SPILL_PTS` is left at the
+/// sentinel, whose `zz` is nonzero and therefore a live point to `pt_add_g1`.
+///
+/// The answer must not move.
+#[test]
+fn a_pooled_spill_array_holding_the_previous_tags_changes_nothing() {
+    let _one = exclusive();
+    let mut rng = test_rng();
+    let sl = wgsl::G1.slice_len as usize;
+    // A fat bucket, so most slices are a single run and most tail slots go untouched.
+    let n = 4 * sl + 17;
+    let bases = rand_g1(n, &mut rng);
+    let k = general_scalars(1, &mut rng)[0];
+    let scalars = vec![k; n];
+    let want = naive_g1(&bases, &scalars);
+    assert!(!want.is_zero(), "degenerate oracle");
+    let words = g1_words(&bases);
+    let (sw, general) = pack_scalars(&scalars);
+
+    let first = run_msm_words!(
+        digits(),
+        g1(),
+        wgsl::G1,
+        &words,
+        &sw,
+        general,
+        n as u32,
+        None,
+        2,
+        None
+    );
+    assert_eq!(first.result, want, "the unpoisoned run is already wrong");
+
+    // Head tag into the tail slot, everywhere. Slices whose head is NO_ROW were empty and
+    // stay empty, which is the other half of what the pre-tagging defends.
+    let slots = first.spill_slots as usize;
+    let mut poison: Vec<u32> = first.spill_rows[..slots].to_vec();
+    let mut carried = 0usize;
+    for slice in 0..slots / 2 {
+        if poison[2 * slice] != wgsl::NO_ROW {
+            poison[2 * slice + 1] = poison[2 * slice];
+            carried += 1;
+        }
+    }
+    assert!(
+        carried > 4,
+        "only {carried} slices had a head tag to carry, so this poison names no bucket"
+    );
+
+    let second = run_msm_words!(
+        digits(),
+        g1(),
+        wgsl::G1,
+        &words,
+        &sw,
+        general,
+        n as u32,
+        None,
+        2,
+        Some(&poison[..])
+    );
+    assert_eq!(
+        second.result, want,
+        "a spill array pre-loaded with {carried} stale tail tags changed the answer, so \
+         msm_segmented_g1 is not re-tagging the slots it does not write"
+    );
+    second.assert_no_overrun(wgsl::G1.point_bytes, 2, "poisoned spill tags");
+    println!("{carried} stale tail tags folded into nothing");
 }
