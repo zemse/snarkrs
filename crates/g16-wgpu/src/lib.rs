@@ -81,6 +81,12 @@ pub mod pointwise;
 pub mod readback;
 pub mod stages;
 
+/// The browser entry point: `wasm-bindgen` exports for a page and a Web Worker. Behind the
+/// `wasm` feature and `target_arch = "wasm32"`, so a native build never sees it and neither
+/// does a plain wasm `cargo check`.
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+pub mod wasm;
+
 pub use backend::{CircuitCost, WgpuCircuit, WgpuProver};
 pub use batch::{G1Bases, G2Bases, Group, Job, MontConvert, MsmBatch, MsmResult, Source};
 pub use device::{LimitsProfile, WgpuBackend};

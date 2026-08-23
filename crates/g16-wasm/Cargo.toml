@@ -1,0 +1,25 @@
+[package]
+name = "g16-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+# `cdylib` and nothing else, which is what `wasm-pack` links and what `g16-wgpu` cannot be.
+#
+# Cargo drops `-C extra-filename` for any lib target whose crate-type list contains `cdylib`,
+# so the shared object has a predictable name, and the `rlib` from the same rustc invocation
+# loses its hash with it. The workspace release profile is `panic = "abort"` and a test
+# harness needs `unwind`, so `cargo test --workspace --release` builds every library twice and
+# two units then write one path. That took `g16-cli` down 5 times out of 5 at U11 with an
+# error naming neither crate. This crate has no `rlib` and nothing depends on it, so the
+# collision has nothing to collide with. `g16-wgpu/tests/manifest.rs` holds the other half.
+crate-type = ["cdylib"]
+
+# Everything is target gated, so on aarch64 this is an empty cdylib with no dependencies and
+# `cargo build --workspace` pays about nothing for it. That is deliberate: a wasm crate
+# excluded from the workspace gets its own Cargo.lock and its own target directory, and then
+# nothing in CI ever notices when a change to `g16-wgpu` stops compiling for the browser.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+g16-wgpu = { workspace = true, features = ["wasm"] }

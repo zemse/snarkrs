@@ -316,6 +316,24 @@ impl WgpuCircuit {
         &self.stages
     }
 
+    /// The key this circuit was prepared from. Inherent as well as on `PreparedCircuit`,
+    /// because that trait is native only and stage 11 in the browser needs it.
+    pub fn key(&self) -> &ProvingKey {
+        &self.pk
+    }
+
+    pub fn n_vars(&self) -> usize {
+        self.pk.n_vars
+    }
+
+    pub fn n_public(&self) -> usize {
+        self.pk.n_public
+    }
+
+    pub fn domain_size(&self) -> usize {
+        self.pk.domain_size
+    }
+
     pub fn msm(&self) -> &MsmBatch {
         &self.msm
     }

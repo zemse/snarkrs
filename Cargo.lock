@@ -434,6 +434,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
+name = "console_error_panic_hook"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a06aeb73f470f66dcdbf7223caeebb85984942f22f1adb2a088cf9668146bbbc"
+dependencies = [
+ "cfg-if",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -852,12 +862,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "g16-wasm"
+version = "0.1.0"
+dependencies = [
+ "g16-wgpu",
+]
+
+[[package]]
 name = "g16-wgpu"
 version = "0.1.0"
 dependencies = [
  "ark-ff",
  "ark-std",
  "bytemuck",
+ "console_error_panic_hook",
  "flume",
  "g16-core",
  "g16-field",
@@ -865,10 +883,14 @@ dependencies = [
  "g16-msm",
  "g16-ntt",
  "g16-zkey",
+ "js-sys",
  "libc",
  "num-bigint",
  "num-traits",
  "pollster",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
  "web-time",
  "wgpu",
 ]
