@@ -1,6 +1,11 @@
 //! The CPU backend: composes `g16-ntt` and `g16-msm` into stages 0-9.
 
-use std::time::Instant;
+// Not `std::time`: `Instant::now()` compiles for wasm32-unknown-unknown and then panics at
+// run time, and this backend is on the browser's path too. It is the single-threaded wasm CPU
+// row in ../../../webgpu-trial, which exists to separate what the GPU contributes from what
+// snarkjs' 12 workers do. web-time is a re-export of `std::time` on every other target, so no
+// native number changes.
+use web_time::Instant;
 
 use crate::{Backend, HPoly, MsmOutputs, PreparedCircuit, ProveError, StageTimings};
 use g16_field::*;

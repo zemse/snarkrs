@@ -888,6 +888,7 @@ dependencies = [
  "num-bigint",
  "num-traits",
  "pollster",
+ "rayon",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",

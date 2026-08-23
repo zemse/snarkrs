@@ -50,7 +50,9 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use g16_core::{json, verify::verify as verify_proof, ProveError, StageTimings};
+use g16_core::cpu::CpuCircuit;
+use g16_core::{json, prove::prove as cpu_prove_all, verify::verify as verify_proof};
+use g16_core::{PreparedCircuit, Proof, ProveError, StageTimings};
 use g16_field::Fr;
 use g16_zkey::{wtns::Witness, ProvingKey, VerifyingKey};
 use wasm_bindgen::prelude::*;
@@ -67,11 +69,24 @@ struct State {
     msm: Arc<MsmBatch>,
     /// Resolved once at start-up. See the module docs on why there is no fallback.
     crypto: web_sys::Crypto,
-    /// Parsed but not yet uploaded. Taken by [`prepare`], which consumes it.
+    /// Parsed but not yet uploaded. Taken by [`prepare`] or [`cpu_prepare`], which consume it.
     pk: Option<ProvingKey>,
+    /// The zkey bytes, kept whole, for the cold loop only. A cold rep re-parses them, so it
+    /// has to have them; the warm path never sets this and never pays for it. See
+    /// [`zkey_retain`] on why a cold rep costs one extra copy of the key and what that costs.
+    zkey_raw: Option<Vec<u8>>,
+    /// The witness bytes, same reason. snarkjs re-parses its `.wtns` inside every `prove()`
+    /// because the argument is a byte array, so a cold rep of ours that did not would be
+    /// comparing against a snarkjs that does.
+    wtns_raw: Option<Vec<u8>>,
     /// `Rc` so [`prove`] can clone a handle out of the `RefCell` and drop the borrow before
     /// it awaits. Holding a `Ref` across an `.await` is how a re-entrant call panics.
     circuit: Option<Rc<WgpuCircuit>>,
+    /// The same prover's `cpu` backend, compiled to wasm and single-threaded. Not a
+    /// competitor, a control: it is the only row in the page that isolates what the GPU
+    /// contributes, because it shares every line of stage 0 to 11 with the wgpu row and
+    /// differs only in where the arithmetic runs.
+    cpu: Option<Rc<CpuCircuit>>,
     witness: Option<Rc<Vec<Fr>>>,
     /// Set for the duration of a proof. See the module docs: the alternative is a deadlock.
     busy: bool,
@@ -211,6 +226,60 @@ pub fn zkey_take(ptr: *mut u8, len: usize) -> Result<(), JsError> {
         // A new key invalidates the uploaded one. Silently keeping the old circuit is how a
         // benchmark reports the wrong artifact's time.
         s.circuit = None;
+        s.cpu = None;
+        Ok(())
+    })
+}
+
+/// Keeps the zkey bytes whole, unparsed, for the cold loop.
+///
+/// [`zkey_take`] parses once and the raw bytes are gone; a cold rep has to parse inside its
+/// own timed region, every rep, so it needs the bytes to still be there. Only the cold path
+/// calls this and only the cold path pays for it.
+///
+/// **A cold rep therefore costs one extra copy of the key**, because
+/// [`ProvingKey::from_bytes`] takes the `Vec` by value and keeps it (the point sections are
+/// views into it), so the rep clones this buffer rather than consuming it. That copy is
+/// measured and reported on its own as `zkey_copy_us`, because it is an artifact of this
+/// API and not of proving: snarkjs reads its sections straight out of the `Uint8Array` the
+/// caller already owns and never copies the whole thing. Subtract it before quoting a
+/// cold-against-cold ratio if you want to be generous to us; the published ratio does not.
+#[wasm_bindgen]
+pub fn zkey_retain(ptr: *mut u8, len: usize) -> Result<(), JsError> {
+    let bytes = take(ptr, len)?;
+    with_state(|s| {
+        s.zkey_raw = Some(bytes);
+        s.circuit = None;
+        s.cpu = None;
+        s.pk = None;
+        Ok(())
+    })
+}
+
+/// Keeps the witness bytes whole, unparsed, for the cold loop. See [`zkey_retain`].
+#[wasm_bindgen]
+pub fn wtns_retain(ptr: *mut u8, len: usize) -> Result<(), JsError> {
+    let bytes = take(ptr, len)?;
+    with_state(|s| {
+        s.wtns_raw = Some(bytes);
+        Ok(())
+    })
+}
+
+/// Drops everything an artifact left behind, so the next one starts from nothing.
+///
+/// The page calls this between artifacts. Without it a 94 MB zkey, its parsed copy and its
+/// uploaded bases stay live while the next artifact's are allocated, and the peak is the sum
+/// of two artifacts rather than the largest one.
+#[wasm_bindgen]
+pub fn unload() -> Result<(), JsError> {
+    with_state(|s| {
+        s.pk = None;
+        s.zkey_raw = None;
+        s.wtns_raw = None;
+        s.circuit = None;
+        s.cpu = None;
+        s.witness = None;
         Ok(())
     })
 }
@@ -261,7 +330,10 @@ pub async fn create_prover(profile: Option<String>) -> Result<(), JsError> {
             msm,
             crypto,
             pk: None,
+            zkey_raw: None,
+            wtns_raw: None,
             circuit: None,
+            cpu: None,
             witness: None,
             busy: false,
         });
@@ -427,8 +499,17 @@ async fn prove_inner(circuit: &WgpuCircuit, witness: &[Fr]) -> Result<String, Js
     let h = circuit.compute_h_async(witness, &mut t).await.map_err(js)?;
     let m = circuit.msms_async(witness, &h, &mut t).await.map_err(js)?;
 
-    // Stage 10, the trust boundary. `Fr::rand` over the browser's CSPRNG; see the module docs.
-    let (r, s) = with_state(|st| {
+    let (r, s) = blinders()?;
+    // Stage 11, from `g16-core`, so the browser and the CLI blind identically.
+    let proof = g16_core::prove::assemble(circuit.key(), &m, r, s, &mut t);
+    let total_us = t0.elapsed().as_micros() as u64;
+
+    result_json(circuit.key(), witness, &proof, &t, total_us, "")
+}
+
+/// Stage 10, the trust boundary. `Fr::rand` over the browser's CSPRNG; see the module docs.
+fn blinders() -> Result<(Fr, Fr), JsError> {
+    with_state(|st| {
         let mut rng = BrowserRng {
             crypto: st.crypto.clone(),
         };
@@ -436,13 +517,21 @@ async fn prove_inner(circuit: &WgpuCircuit, witness: &[Fr]) -> Result<String, Js
             <Fr as ark_std::UniformRand>::rand(&mut rng),
             <Fr as ark_std::UniformRand>::rand(&mut rng),
         ))
-    })?;
+    })
+}
 
-    // Stage 11, from `g16-core`, so the browser and the CLI blind identically.
-    let proof = g16_core::prove::assemble(circuit.key(), &m, r, s, &mut t);
-    let total_us = t0.elapsed().as_micros() as u64;
-
-    let n_public = circuit.key().n_public;
+/// The one shape every prove entry point in this module returns, so a warm row, a cold row and
+/// a CPU row cannot disagree about what a column means. `extra` is spliced in as raw JSON
+/// members and is `""` for a warm rep, which has nothing extra to say.
+fn result_json(
+    pk: &ProvingKey,
+    witness: &[Fr],
+    proof: &Proof,
+    t: &StageTimings,
+    total_us: u64,
+    extra: &str,
+) -> Result<String, JsError> {
+    let n_public = pk.n_public;
     if witness.len() < n_public + 1 {
         return Err(js(ProveError::WitnessLength {
             got: witness.len(),
@@ -452,8 +541,8 @@ async fn prove_inner(circuit: &WgpuCircuit, witness: &[Fr]) -> Result<String, Js
     let public = &witness[1..=n_public];
 
     Ok(format!(
-        r#"{{"proof":{},"publicSignals":{},"timings":{{"gather_us":{},"ntt_us":{},"pointwise_us":{},"msm_us":{},"assemble_us":{},"total_us":{}}}}}"#,
-        json::proof_to_string(&proof).trim_end(),
+        r#"{{"proof":{},"publicSignals":{},"timings":{{"gather_us":{},"ntt_us":{},"pointwise_us":{},"msm_us":{},"assemble_us":{},"total_us":{}{}}}}}"#,
+        json::proof_to_string(proof).trim_end(),
         json::public_to_string(public).trim_end(),
         t.gather_us,
         t.ntt_us,
@@ -461,7 +550,206 @@ async fn prove_inner(circuit: &WgpuCircuit, witness: &[Fr]) -> Result<String, Js
         t.msm_us,
         t.assemble_us,
         total_us,
+        extra,
     ))
+}
+
+/// Re-parses the retained bytes, exactly as a cold rep must.
+///
+/// Both `from_bytes` calls take their `Vec` by value and keep it, so this clones rather than
+/// consuming: the retained copy has to survive for the next rep. The clone is timed on its own
+/// and reported as `zkey_copy_us` / `wtns_copy_us`, because it is a cost of this API rather
+/// than a cost of proving. See [`zkey_retain`].
+fn reparse() -> Result<(ProvingKey, Vec<Fr>, String), JsError> {
+    let (zbytes, wbytes, copy_us) = with_state(|s| {
+        let t0 = Instant::now();
+        let z = s
+            .zkey_raw
+            .as_ref()
+            .ok_or_else(|| JsError::new("no retained zkey; call zkey_alloc and zkey_retain"))?
+            .clone();
+        let zc = t0.elapsed().as_micros() as u64;
+        let t1 = Instant::now();
+        let w = s
+            .wtns_raw
+            .as_ref()
+            .ok_or_else(|| JsError::new("no retained witness; call wtns_alloc and wtns_retain"))?
+            .clone();
+        Ok((z, w, (zc, t1.elapsed().as_micros() as u64)))
+    })?;
+
+    let t0 = Instant::now();
+    let pk = ProvingKey::from_bytes(zbytes).map_err(js)?;
+    let zkey_parse_us = t0.elapsed().as_micros() as u64;
+    let t0 = Instant::now();
+    let witness = Witness::from_bytes(wbytes).map_err(js)?.0;
+    let wtns_parse_us = t0.elapsed().as_micros() as u64;
+
+    Ok((
+        pk,
+        witness,
+        format!(
+            r#","zkey_copy_us":{},"zkey_parse_us":{},"wtns_copy_us":{},"wtns_parse_us":{}"#,
+            copy_us.0, zkey_parse_us, copy_us.1, wtns_parse_us
+        ),
+    ))
+}
+
+/// One **cold** proof: everything a rep can pay for, it pays for, and nothing survives it.
+///
+/// This is `crates/g16-cli/src/bench.rs`'s cold mode, minus the one thing a browser cannot
+/// repeat: opening the adapter and compiling the shader modules. Those are page-lifetime costs
+/// and they are excluded on purpose, because snarkjs' equivalent (building its BN254 wasm
+/// module and spawning `hardwareConcurrency` workers) is amortised by the three warm-ups and
+/// is not in snarkjs' number either. They are reported separately as `module_ms` and
+/// `device_ms` and belong to neither prover's per-rep figure.
+///
+/// What is inside the timed region: re-parsing the zkey, re-parsing the witness, building the
+/// circuit (which on this backend means uploading every base vector and both twiddle tables),
+/// stages 0 to 11, and dropping all of it. That is the row to compare against snarkjs, because
+/// snarkjs re-reads zkey sections 4 through 9 inside every `prove()` and has no `prepare()`.
+#[wasm_bindgen]
+pub async fn prove_cold() -> Result<String, JsError> {
+    let (device, msm) = with_state(|s| {
+        if s.busy {
+            return Err(JsError::new(
+                "a proof is already running in this worker; prove_cold() is not re-entrant",
+            ));
+        }
+        s.busy = true;
+        Ok((Arc::clone(&s.device), Arc::clone(&s.msm)))
+    })?;
+
+    let out = prove_cold_inner(device, msm).await;
+    with_state(|s| {
+        s.busy = false;
+        Ok(())
+    })?;
+    out
+}
+
+async fn prove_cold_inner(device: Arc<WgpuBackend>, msm: Arc<MsmBatch>) -> Result<String, JsError> {
+    let mut t = StageTimings::default();
+    let t_all = Instant::now();
+
+    let (pk, witness, mut extra) = reparse()?;
+
+    let t0 = Instant::now();
+    let circuit = WgpuCircuit::new(device, msm, pk).map_err(js)?;
+    extra.push_str(&format!(
+        r#","prepare_us":{}"#,
+        t0.elapsed().as_micros() as u64
+    ));
+
+    let h = circuit
+        .compute_h_async(&witness, &mut t)
+        .await
+        .map_err(js)?;
+    let m = circuit.msms_async(&witness, &h, &mut t).await.map_err(js)?;
+    let (r, s) = blinders()?;
+    let proof = g16_core::prove::assemble(circuit.key(), &m, r, s, &mut t);
+    let total_us = t_all.elapsed().as_micros() as u64;
+
+    let out = result_json(circuit.key(), &witness, &proof, &t, total_us, &extra);
+    // Explicit, because the whole meaning of "cold" is that nothing survives a rep. Dropping
+    // the circuit releases every device buffer it uploaded.
+    drop(circuit);
+    out
+}
+
+// ---------------------------------------------------------------------------------------
+// The CPU control.
+// ---------------------------------------------------------------------------------------
+
+/// How many threads the `cpu` backend actually has here. Expect 1.
+///
+/// rayon-core's `default_global_registry` cannot spawn a thread on
+/// `wasm32-unknown-unknown` and falls back to a one-thread pool that runs on the calling
+/// thread, so `rayon::join` becomes "do the first, then the second" and every `par_iter`
+/// becomes a serial iterator. Nothing panics and nothing warns, which is exactly why this is
+/// exported and printed on the row: a CPU row that silently ran on 1 thread when the reader
+/// assumed 12 is worse than no CPU row.
+#[wasm_bindgen]
+pub fn cpu_threads() -> usize {
+    rayon::current_num_threads()
+}
+
+/// Builds the `cpu` backend's circuit from the parsed key: the CSR sort and the twiddles, and
+/// no upload, because there is nowhere to upload to. Consumes the key, like [`prepare`].
+#[wasm_bindgen]
+pub fn cpu_prepare() -> Result<String, JsError> {
+    let pk = with_state(|s| {
+        s.pk.take()
+            .ok_or_else(|| JsError::new("no zkey; call zkey_alloc and zkey_take first"))
+    })?;
+    let t0 = Instant::now();
+    let (n_vars, n_public, domain) = (pk.n_vars, pk.n_public, pk.domain_size);
+    let circuit = CpuCircuit::new(pk).map_err(js)?;
+    let total_us = t0.elapsed().as_micros() as u64;
+    with_state(|s| {
+        s.cpu = Some(Rc::new(circuit));
+        Ok(())
+    })?;
+    Ok(format!(
+        r#"{{"stages_us":{},"bases_us":0,"total_us":{},"base_bytes":0,"n_vars":{},"n_public":{},"domain_size":{},"threads":{},"wasm_memory_bytes":{}}}"#,
+        total_us,
+        total_us,
+        n_vars,
+        n_public,
+        domain,
+        rayon::current_num_threads(),
+        wasm_memory_bytes(),
+    ))
+}
+
+/// One **warm** CPU proof. Synchronous from start to finish, which is the point: this is the
+/// same `g16_core::prove` the CLI runs, with nothing awaited and no device involved.
+#[wasm_bindgen]
+pub fn cpu_prove() -> Result<String, JsError> {
+    let (circuit, witness) = with_state(|s| {
+        let c = s
+            .cpu
+            .clone()
+            .ok_or_else(|| JsError::new("not prepared; call cpu_prepare() first"))?;
+        let w = s
+            .witness
+            .clone()
+            .ok_or_else(|| JsError::new("no witness; call wtns_alloc and wtns_take first"))?;
+        Ok((c, w))
+    })?;
+    cpu_run(circuit.as_ref(), &witness, Instant::now(), String::new())
+}
+
+/// One **cold** CPU proof, under the same rules as [`prove_cold`].
+#[wasm_bindgen]
+pub fn cpu_prove_cold() -> Result<String, JsError> {
+    let t_all = Instant::now();
+    let (pk, witness, mut extra) = reparse()?;
+    let t0 = Instant::now();
+    let circuit = CpuCircuit::new(pk).map_err(js)?;
+    extra.push_str(&format!(
+        r#","prepare_us":{}"#,
+        t0.elapsed().as_micros() as u64
+    ));
+    let out = cpu_run(&circuit, &witness, t_all, extra);
+    drop(circuit);
+    out
+}
+
+fn cpu_run(
+    circuit: &CpuCircuit,
+    witness: &[Fr],
+    started: Instant,
+    extra: String,
+) -> Result<String, JsError> {
+    let mut t = StageTimings::default();
+    let mut rng = BrowserRng {
+        crypto: with_state(|s| Ok(s.crypto.clone()))?,
+    };
+    let proof =
+        cpu_prove_all(circuit as &dyn PreparedCircuit, witness, &mut rng, &mut t).map_err(js)?;
+    let total_us = started.elapsed().as_micros() as u64;
+    result_json(circuit.key(), witness, &proof, &t, total_us, &extra)
 }
 
 /// Our own verifier, over snarkjs' own JSON. Returns `true` only if the pairing check holds.
