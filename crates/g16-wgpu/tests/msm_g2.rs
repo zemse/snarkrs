@@ -1134,27 +1134,3 @@ fn what_one_g2_msm_costs_against_the_cpu() {
 fn rayon_threads() -> usize {
     CpuMsm::new().threads
 }
-
-#[test]
-#[ignore]
-fn scratch_probe() {
-    let _gpu = exclusive();
-    let p = points();
-    let bench = Bench::new(32_768, 12);
-    for sl in [32u32, 64, 128, 256, 512, 1024, 2048] {
-        let m = median(
-            (0..3)
-                .map(|_| bench.time(p, sl, 10, Stage::Merge))
-                .collect(),
-        );
-        let g = median(
-            (0..3)
-                .map(|_| bench.time(p, sl, 4, Stage::Segmented))
-                .collect(),
-        );
-        println!(
-            "slice_len {sl:5}  slices {:5}  merge {m:9.1} us  seg {g:9.1} us",
-            32768u32.div_ceil(sl)
-        );
-    }
-}
