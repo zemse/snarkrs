@@ -895,3 +895,83 @@ fn where_the_msm_time_goes() {
         );
     });
 }
+
+// ---------------------------------------------------------------------------
+// 5. StageTimings honesty
+// ---------------------------------------------------------------------------
+
+/// `StageTimings::msm_us` must not be charged for the time this proof spent waiting for
+/// another proof's GPU section.
+///
+/// `compute_h` starts its clock inside `HStages::compute_h_with`, after the guard, so it is
+/// already honest. `msms` started its clock in `crate::backend` **before**
+/// `WgpuBackend::exclusive`, so a proof that queued behind another one billed itself for the
+/// other one's whole GPU section: at `js_16x16_d32` that is 900 ms of somebody else's MSM in
+/// a number this repo publishes as `msm_us`. The two halves of one proof disagreed about what
+/// they were measuring, and `WgpuBackend::exclusive`'s own doc gives "another proof's GPU
+/// time would land in a stage timing" as one of the two reasons the guard exists.
+///
+/// Deterministic in both directions, like `the_gpu_section_of_a_proof_is_behind_the_device_
+/// guard`: hold the guard for a known interval, have another thread call `msms` inside it,
+/// and require the reported `msm_us` to be near the uncontended one rather than near the
+/// uncontended one plus the interval. The smallest artifact, so the interval dominates.
+#[test]
+fn the_msm_stage_timing_is_not_charged_for_another_proofs_gpu_section() {
+    let _one_at_a_time = exclusive();
+    /// Long enough to dwarf the smallest artifact's own `msms` (about 21 ms warm), short
+    /// enough to pay once.
+    const BLOCKED_FOR: std::time::Duration = std::time::Duration::from_millis(500);
+
+    let found = artifacts();
+    let Some(a) = found.iter().min_by_key(|a| a.witness().len()) else {
+        eprintln!("SKIPPED the_msm_stage_timing_is_not_charged_for_another_proofs_gpu_section");
+        return;
+    };
+    eprintln!(
+        "the_msm_stage_timing_is_not_charged_for_another_proofs_gpu_section: {}",
+        a.name
+    );
+
+    let circuit = prover().prepare(a.key()).expect("prepare");
+    let witness = a.witness();
+
+    // Warm every pool, then take the uncontended cost of one `msms` on its own.
+    let mut warm = StageTimings::default();
+    let h = circuit.compute_h(&witness, &mut warm).expect("compute_h");
+    circuit.msms(&witness, &h, &mut warm).expect("msms");
+    let mut alone = StageTimings::default();
+    circuit.msms(&witness, &h, &mut alone).expect("msms");
+
+    let circuit = circuit.as_ref();
+    let (witness, h) = (&witness, &h);
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let blocked = std::thread::scope(|scope| {
+        let guard = device().exclusive();
+        let worker = scope.spawn(move || {
+            let mut t = StageTimings::default();
+            // Announced immediately before the call, so the sleep below starts from a point
+            // where this thread is about to reach the guard rather than from thread spawn.
+            tx.send(()).expect("the main thread went away");
+            circuit.msms(witness, h, &mut t).expect("msms");
+            t.msm_us
+        });
+        rx.recv().expect("the worker never started");
+        std::thread::sleep(BLOCKED_FOR);
+        drop(guard);
+        worker.join().expect("the blocked call panicked")
+    });
+
+    let wait_us = BLOCKED_FOR.as_micros() as u64;
+    println!(
+        "msms alone {} us, msms behind a {} ms guard {} us",
+        alone.msm_us,
+        BLOCKED_FOR.as_millis(),
+        blocked
+    );
+    assert!(
+        blocked < alone.msm_us + wait_us / 2,
+        "msms reported {blocked} us while it was blocked for {wait_us} us behind another \
+         proof's guard and its own work costs {} us: the wait is inside the stage timing",
+        alone.msm_us
+    );
+}

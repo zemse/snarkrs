@@ -374,8 +374,25 @@ impl PreparedCircuit for WgpuCircuit {
                 self.pk.domain_size
             )));
         }
-        let start = Instant::now();
+        // The guard first, then the clock, and the order is the whole point.
+        //
+        // `compute_h` starts its clock inside `HStages::compute_h_with`, which is after the
+        // guard, so it reports this proof's own work. With the clock started first here,
+        // `msms` reported this proof's work **plus** however long it waited behind another
+        // proof: at `js_16x16_d32` that is 900 ms of somebody else's MSM landing in a number
+        // this repo publishes as `msm_us`, and the two halves of one proof were measuring
+        // different things. `WgpuBackend::exclusive` exists partly so that a stage timing
+        // never contains another proof's GPU time, and taking the timestamp outside it gave
+        // exactly that back. The wait is real and it is a cost of the guard, but it is not
+        // MSM time and this field is what `bench/results/history.csv` records.
+        //
+        // Pinned by `tests/proof.rs::the_msm_stage_timing_is_not_charged_for_another_proofs
+        // _gpu_section`, which holds the guard for 500 ms and requires the reported number
+        // not to grow by it. Single-threaded proving, which is every benchmark in this repo,
+        // is unaffected: the guard is uncontended and the two orderings differ by the lock
+        // acquisition.
         let _gpu = self.device.exclusive();
+        let start = Instant::now();
 
         let private_from = self.pk.n_public + 1;
         let (g_all, g_private) = general_counts(witness, private_from);
