@@ -46,7 +46,8 @@ use std::sync::OnceLock;
 
 use ark_std::{rand::Rng, test_rng, UniformRand};
 use g16_field::{
-    CurveGroup, Fr, G1Affine, G1Projective, G2Affine, G2Projective, PrimeField, PrimeGroup, Zero,
+    CurveGroup, Fr, G1Affine, G1Projective, G2Affine, G2Projective, One, PrimeField, PrimeGroup,
+    Zero,
 };
 use g16_gpu_layout::{PackedG1Affine, PackedG2Affine};
 use g16_wgpu::gen::points as wgsl;
@@ -1110,4 +1111,112 @@ fn the_window_width_the_cost_model_picks_is_within_ten_percent_of_the_measured_b
             best.0
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// 8. A witness with no general scalars at all
+// ---------------------------------------------------------------------------
+
+/// Every scalar is 0 or 1, so `general` is zero, `cap` is its floor of 1, `window_size(0)`
+/// returns the narrowest width the model will pick, and the whole answer comes out of
+/// `msm_ones_g1` with the bucket path contributing nothing.
+///
+/// # This stopped being hypothetical during this pass
+///
+/// `gen::msm` justifies the one-scalar fast path with "a bit-heavy circuit is over 99% zeros
+/// and ones". U9 measured the six artifacts of the time at 96% to 98% **general**, the
+/// opposite, and filed that as a correction. A `keccak256` artifact appeared under
+/// `bench/artifacts` while this pass was running, from another worktree, and it is **0.0%
+/// general over 240,257 variables**, with 95,104 of its 240,257 A-query bases at infinity.
+/// So the comment was right about some circuits and U9 was right about the ones we had.
+///
+/// `tests/msm_g1.rs::real_witnesses_from_the_artifacts_match_the_cpu_pippenger` asserts
+/// `general > 0` on every artifact and now fails on that one, with a message its author
+/// wrote for exactly this day. It fails **before** it compares anything, so it says nothing
+/// about whether the device is right on that shape. This does, without depending on an
+/// artifact that is not in the repository:
+///
+/// * every scalar 1, which is the maximum work for `msm_ones_g1` and zero for the buckets;
+/// * a half-and-half mixture, which is the real shape;
+/// * every scalar 0, where the honest answer is the identity and a kernel that wrote nothing
+///   would agree with it, so the sentinel and a nonzero companion case are what make it mean
+///   anything;
+/// * and the same mixture with a third of the bases at infinity, because that is what the
+///   artifact has.
+#[test]
+fn a_witness_of_nothing_but_zeros_and_ones_goes_entirely_through_msm_ones() {
+    let _one = exclusive();
+    let mut rng = test_rng();
+    let n = 1000usize;
+    let bases = rand_g1(n, &mut rng);
+    let words = g1_words(&bases);
+
+    let all_ones = vec![Fr::from(1u64); n];
+    let want = naive_g1(&bases, &all_ones);
+    assert!(!want.is_zero());
+    let run = run_msm!(g1(), wgsl::G1, &words, &all_ones, n as u32, None, 2);
+    assert_eq!(
+        run.result, want,
+        "every scalar 1: the device did not sum the bases"
+    );
+    assert_eq!(
+        run.widest_run_slices, 0,
+        "a witness with no general scalar put something in a bucket"
+    );
+    run.assert_no_overrun(wgsl::G1.point_bytes, 2, "all ones");
+
+    let mixed: Vec<Fr> = (0..n)
+        .map(|_| {
+            if rng.gen_range(0..2u32) == 0 {
+                Fr::zero()
+            } else {
+                Fr::from(1u64)
+            }
+        })
+        .collect();
+    let ones = mixed.iter().filter(|x| x.is_one()).count();
+    assert!(
+        (300..700).contains(&ones),
+        "{ones} ones of {n} is not a mixture"
+    );
+    let want = naive_g1(&bases, &mixed);
+    assert!(!want.is_zero());
+    let run = run_msm!(g1(), wgsl::G1, &words, &mixed, n as u32, None, 2);
+    assert_eq!(
+        run.result,
+        want,
+        "{ones} ones and {} zeros: the device disagrees with the naive sum",
+        n - ones
+    );
+    run.assert_no_overrun(wgsl::G1.point_bytes, 2, "zeros and ones");
+
+    // Every scalar 0. The identity is the right answer and it is also what a kernel that ran
+    // nothing produces, so this case only means something beside the two above.
+    let all_zero = vec![Fr::zero(); n];
+    let run = run_msm!(g1(), wgsl::G1, &words, &all_zero, n as u32, None, 2);
+    assert!(
+        run.result.is_zero(),
+        "every scalar 0 did not give the identity"
+    );
+
+    // A third of the bases at infinity, which is the proportion `keccak256`'s A query has.
+    let mut holed = bases.clone();
+    for i in (0..n).step_by(3) {
+        holed[i] = G1Affine::identity();
+    }
+    let want = naive_g1(&holed, &mixed);
+    assert!(!want.is_zero());
+    let run = run_msm!(g1(), wgsl::G1, &g1_words(&holed), &mixed, n as u32, None, 2);
+    assert_eq!(
+        run.result,
+        want,
+        "{} infinity bases under a zero-and-one witness changed the answer",
+        n.div_ceil(3)
+    );
+    println!(
+        "a 0.0% general witness at c = {}: all ones, {ones}/{n} ones, all zeros and \
+         {} infinity bases all agree with the naive sum",
+        g16_wgpu::window_size(0),
+        n.div_ceil(3)
+    );
 }
