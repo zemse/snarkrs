@@ -316,21 +316,31 @@ macro_rules! run_msm_words {
             .combine(&raw, &dplan, &pplan, &pts)
             .expect("combine the window sums");
 
-        // How many slices the fattest bucket of window 0 spans, which is `k_hi - k_lo + 1`
-        // in `msm_merge_*`. Recomputed here from the counts and cursors the kernels wrote,
-        // not from the plan, so it reports what the device actually built.
+        // How many slices the fattest bucket spans, which is `k_hi - k_lo + 1` in
+        // `msm_merge_*`. Recomputed from the counts and cursors the kernels wrote, not from
+        // the plan, so it reports what the device actually built.
+        //
+        // Over **every** window, not window 0. A repeated scalar occupies one bucket per
+        // window, but the window whose digit is zero has no bucket at all, and for a random
+        // scalar at c = 5 that is one window in sixteen. Scanning window 0 alone therefore
+        // made the premise a property of the draw; scanning all of them makes it a property
+        // of the scalar, and a nonzero scalar has a nonzero digit somewhere by definition.
         let counts = read_words(b, &sort.counts);
         let cursor = read_words(b, &sort.cursor);
         let mut widest = 0u32;
-        for row in 0..dplan.n_buckets() as usize {
-            let cnt = counts[row];
-            if cnt == 0 || cnt == SENTINEL {
-                continue;
+        for w in 0..dplan.n_windows() {
+            let base = w * dplan.cap();
+            for j in 0..dplan.n_buckets() {
+                let row = (w * dplan.n_buckets() + j) as usize;
+                let cnt = counts[row];
+                if cnt == 0 || cnt == SENTINEL {
+                    continue;
+                }
+                let end = cursor[row] - base;
+                let start = end - cnt;
+                let span = (end - 1) / pplan.slice_len() - start / pplan.slice_len() + 1;
+                widest = widest.max(span);
             }
-            let end = cursor[row];
-            let start = end - cnt;
-            let span = (end - 1) / pplan.slice_len() - start / pplan.slice_len() + 1;
-            widest = widest.max(span);
         }
 
         Run {
@@ -435,16 +445,19 @@ fn one_bucket_holding_a_run_longer_than_several_slices_is_merged_whole() {
         // run really does reach this many slices. Without it a change to `slice_len` or to
         // the digit plan could quietly make every case here a one-slice run again.
         let want_slices = m.div_ceil(sl);
+        // The answer first and the premise second, deliberately. A run whose dispatches did
+        // not all take effect shows up in both, and the useful message is the one that says
+        // the MSM is wrong rather than the one that says a count came back small.
+        assert_eq!(
+            run.result, want,
+            "m = {m} copies of one scalar: the device MSM disagrees with the naive sum, over \
+             a bucket run that should span {want_slices} slices"
+        );
         assert_eq!(
             run.widest_run_slices, want_slices,
             "m = {m}: the fattest bucket spans {} slices, not the {want_slices} this test \
              needs to exercise the merge's slice loop",
             run.widest_run_slices
-        );
-        assert_eq!(
-            run.result, want,
-            "m = {m} copies of one scalar: the device MSM disagrees with the naive sum, and \
-             this bucket's run spans {want_slices} slices"
         );
         run.assert_no_overrun(wgsl::G1.point_bytes, 2, &format!("m = {m}"));
         cases += 1;
@@ -501,15 +514,15 @@ fn a_fat_bucket_beside_sparse_ones_merges_both_kinds() {
             least >= 3,
             "this case was chosen to force at least three slices and its floor is {least}"
         );
+        assert_eq!(
+            run.result, want,
+            "fat = {fat} repeated scalars beside {sparse} random ones: device MSM disagrees"
+        );
         assert!(
             run.widest_run_slices as usize >= least,
             "fat = {fat}, sparse = {sparse}: the fattest bucket spans {} slices, fewer than \
              the {least} a run of {fat} must touch",
             run.widest_run_slices
-        );
-        assert_eq!(
-            run.result, want,
-            "fat = {fat} repeated scalars beside {sparse} random ones: device MSM disagrees"
         );
         run.assert_no_overrun(wgsl::G1.point_bytes, 2, &format!("fat = {fat}"));
     }
@@ -533,11 +546,11 @@ fn a_multi_slice_bucket_run_over_g2_is_merged_whole() {
     assert!(!want.is_zero(), "degenerate oracle");
 
     let run = run_msm!(g2(), wgsl::G2, &g2_words(&bases), &scalars, m, None, 2);
-    assert_eq!(run.widest_run_slices, m.div_ceil(sl));
     assert_eq!(
         run.result, want,
         "m = {m} copies of one scalar over G2: the device MSM disagrees with the naive sum"
     );
+    assert_eq!(run.widest_run_slices, m.div_ceil(sl));
     run.assert_no_overrun(wgsl::G2.point_bytes, 2, "g2 fat bucket");
     println!("a {}-slice G2 bucket run merged whole", m.div_ceil(sl));
 }
