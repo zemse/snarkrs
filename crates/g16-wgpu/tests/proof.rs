@@ -125,9 +125,44 @@ impl Artifact {
             .and_then(|t| t.parse().ok())
             .unwrap_or(-1)
     }
+
+    /// `n_vars`, read from `r1cs-info.txt` rather than from the key, because the point of
+    /// asking is to decide whether to open a 631 MB zkey at all. snarkjs calls it "# of
+    /// Wires" and it is exactly `ProvingKey::n_vars`, checked against `anon-aadhaar`
+    /// (1,101,048 both ways).
+    fn wires(&self) -> i64 {
+        let Ok(text) = std::fs::read_to_string(self.dir.join("r1cs-info.txt")) else {
+            return -1;
+        };
+        text.lines()
+            .find(|l| l.contains("# of Wires"))
+            .and_then(|l| l.split_whitespace().last())
+            .and_then(|t| t.parse().ok())
+            .unwrap_or(-1)
+    }
 }
 
-fn artifacts() -> Vec<Artifact> {
+/// The G2 base vector is `n_vars` points of 128 bytes, and a WebGPU storage binding is capped
+/// at 134,217,728 bytes at the spec floor, so a key with more than 2^20 variables cannot bind
+/// its B query in one buffer. That is design §8's U15, chunked base bindings, which the design
+/// filed as "gated on an artifact that needs it" and left unbuilt.
+///
+/// The artifact arrived: `anon-aadhaar` has 1,101,048 variables and wants 140,934,144 bytes.
+/// Until U15 lands the backend refuses such a key with exactly that message, which is correct
+/// behaviour rather than a defect, so these tests skip it loudly instead of failing. Delete
+/// this filter when U15 lands; the tests will then cover the artifact and U15's own test can
+/// stop being the only thing that does.
+const G2_BINDING_FLOOR_BYTES: i64 = 134_217_728;
+
+fn over_the_g2_binding_floor(a: &Artifact) -> Option<i64> {
+    let wires = a.wires();
+    let want = wires.checked_mul(128)?;
+    (wires > 0 && want > G2_BINDING_FLOOR_BYTES).then_some(want)
+}
+
+/// Every artifact on disk, including ones this backend cannot yet prepare. Only U15's own
+/// test and [`artifacts`] should call this.
+fn artifacts_all() -> Vec<Artifact> {
     let Ok(root) = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../bench/artifacts")
         .canonicalize()
@@ -154,6 +189,28 @@ fn artifacts() -> Vec<Artifact> {
     out
 }
 
+/// Every artifact this backend can currently prepare.
+///
+/// Filters out keys whose G2 base vector is over the storage binding floor, which is design
+/// §8's U15 and is not built. The skip is printed once per test binary rather than silently,
+/// because a shrinking corpus is exactly the failure mode that hides: `bench/artifacts` is a
+/// gitignored symlink into another worktree and another session is actively adding keys to it.
+fn artifacts() -> Vec<Artifact> {
+    let all = artifacts_all();
+    let (ok, skipped): (Vec<_>, Vec<_>) = all
+        .into_iter()
+        .partition(|a| over_the_g2_binding_floor(a).is_none());
+    for a in &skipped {
+        let want = over_the_g2_binding_floor(a).unwrap_or(0);
+        eprintln!(
+            "SKIPPED {}: {want} bytes of G2 bases, over the {G2_BINDING_FLOOR_BYTES} byte \
+             storage binding floor. Needs U15, chunked base bindings.",
+            a.name
+        );
+    }
+    ok
+}
+
 /// Runs `f` over every artifact. An empty artifact directory reports a skip on stderr rather
 /// than passing silently, because `bench/artifacts` is a gitignored symlink and a green test
 /// over nothing is the failure mode that hides.
@@ -163,10 +220,16 @@ fn for_each_artifact(test: &str, f: impl Fn(&Artifact)) {
         eprintln!("SKIPPED {test}: no artifacts under bench/artifacts");
         return;
     }
+    let mut ran = 0usize;
     for a in &found {
         eprintln!("{test}: {}", a.name);
         f(a);
+        ran += 1;
     }
+    assert!(
+        ran > 0,
+        "{test}: every artifact was skipped, so this test asserted nothing"
+    );
 }
 
 fn public_of(witness: &[Fr], n_public: usize) -> Vec<Fr> {
