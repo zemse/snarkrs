@@ -897,7 +897,68 @@ fn where_the_msm_time_goes() {
 }
 
 // ---------------------------------------------------------------------------
-// 5. StageTimings honesty
+// 6. The verifier round: eight threads, not four
+// ---------------------------------------------------------------------------
+
+/// Eight, not four.
+///
+/// `two_proofs_in_parallel_on_one_prepared_circuit_both_verify` runs four threads, and four
+/// is the number the pool happened to be sized around while `crate::batch::Scratch` was being
+/// written. Nothing in that file says why four is enough. It is, and for a reason worth
+/// stating rather than discovering: `WgpuBackend::exclusive` covers the whole of `msms`, so
+/// at most **one** thread is ever inside `MsmBatch::run` and the pool never holds more than
+/// one scratch set however many threads are proving. Eight threads therefore cost eight times
+/// the wall clock and no extra device memory at all, which is the property this asserts.
+///
+/// It also doubles the number of times the guard is contended, which is where the
+/// one-in-three `PairingFailed` of the unguarded build showed up.
+#[test]
+fn eight_proofs_in_parallel_on_one_prepared_circuit_all_verify() {
+    let _one_at_a_time = exclusive();
+    for_each_artifact("eight_proofs_in_parallel_on_one_prepared_circuit", |a| {
+        let pk = a.key();
+        let n_public = pk.n_public;
+        let circuit = prover().prepare(pk).expect("prepare");
+        let witness = a.witness();
+        let public = public_of(&witness, n_public);
+        let vk = a.vkey();
+        let batch = prover().msm();
+        let circuit = circuit.as_ref();
+        let (witness, vk, public) = (&witness, &vk, &public);
+
+        std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..8u8)
+                .map(|seed| {
+                    scope.spawn(move || {
+                        let mut t = StageTimings::default();
+                        // A different seed per thread, so the eight proofs are eight
+                        // different points and a pooled buffer leaking between them shows as
+                        // a failed pairing rather than as two identical answers.
+                        let mut rng = StdRng::from_seed([seed; 32]);
+                        let proof = prove(circuit, witness, &mut rng, &mut t).expect("prove");
+                        verify(vk, public, &proof).expect("verify");
+                    })
+                })
+                .collect();
+            for t in threads {
+                t.join().expect("a proving thread panicked");
+            }
+        });
+        // One scratch set for eight threads, because the guard admits one at a time. If this
+        // ever reads more than one, the guard has been narrowed and the memory cost of a
+        // concurrent prover has changed by a factor of eight without anyone saying so.
+        assert_eq!(
+            batch.pooled(),
+            1,
+            "{}: eight concurrent proofs left {} scratch sets in the pool",
+            a.name,
+            batch.pooled()
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// 7. StageTimings honesty
 // ---------------------------------------------------------------------------
 
 /// `StageTimings::msm_us` must not be charged for the time this proof spent waiting for
@@ -974,4 +1035,148 @@ fn the_msm_stage_timing_is_not_charged_for_another_proofs_gpu_section() {
          proof's guard and its own work costs {} us: the wait is inside the stage timing",
         alone.msm_us
     );
+}
+
+// ---------------------------------------------------------------------------
+// 8. A key nobody validated
+// ---------------------------------------------------------------------------
+
+/// `security/README.md` accepts a malicious zkey as out of scope and validates only the O(1)
+/// header points, so the query sections reach this backend unchecked. That is a decision
+/// about *soundness*. It is not a licence to fault the device, and a GPU backend has two
+/// failure modes the CPU one does not: an out-of-range storage read, which WebGPU turns into
+/// a zero rather than a signal, and an out-of-range storage write, which it drops in silence.
+///
+/// So: every section length that disagrees with the header must be refused **before** a
+/// buffer is sized from it, by name, at `prepare` rather than as an offset arithmetic error
+/// mid-proof.
+#[test]
+fn a_key_whose_sections_disagree_with_its_header_is_refused_at_prepare() {
+    let _one_at_a_time = exclusive();
+    let found = artifacts();
+    let Some(a) = found.iter().min_by_key(|a| a.witness().len()) else {
+        eprintln!("SKIPPED a_key_whose_sections_disagree_with_its_header_is_refused_at_prepare");
+        return;
+    };
+    eprintln!(
+        "a_key_whose_sections_disagree_with_its_header_is_refused_at_prepare: {}",
+        a.name
+    );
+
+    // The honest key first, so a rejection below is the mutation talking and not the artifact.
+    prover().prepare(a.key()).expect("the unmodified key");
+
+    /// One way to break a key, and its name for the failure message.
+    type Break = (&'static str, fn(&mut ProvingKey));
+    let cases: [Break; 8] = [
+        ("a_query one short", |pk| {
+            pk.a_query.pop();
+        }),
+        ("a_query one long", |pk| {
+            let p = pk.a_query[0];
+            pk.a_query.push(p);
+        }),
+        ("b_g1_query one short", |pk| {
+            pk.b_g1_query.pop();
+        }),
+        ("b_g2_query one short", |pk| {
+            pk.b_g2_query.pop();
+        }),
+        ("l_query one short", |pk| {
+            pk.l_query.pop();
+        }),
+        ("h_query one short", |pk| {
+            pk.h_query.pop();
+        }),
+        ("h_query one long", |pk| {
+            let p = pk.h_query[0];
+            pk.h_query.push(p);
+        }),
+        // n_public past n_vars makes the private witness length underflow, which is the one
+        // shape here that is a subtraction and not a comparison.
+        ("n_public past n_vars", |pk| {
+            pk.n_public = pk.n_vars + 1;
+        }),
+    ];
+
+    for (what, break_it) in cases {
+        let mut pk = a.key();
+        break_it(&mut pk);
+        let got = prover().prepare(pk);
+        assert!(
+            got.is_err(),
+            "{what}: a key with a section the header does not describe was accepted"
+        );
+    }
+    println!("8 malformed key shapes refused at prepare, none of them by a panic");
+}
+
+/// A base that is not on the curve, which no zkey section is checked for.
+///
+/// The claim being pinned is narrow and it is the only honest one: the device must be **no
+/// worse than the CPU backend**. Neither can detect this (a subgroup check per base is the
+/// cost `security/README.md` declines to pay), so both produce a proof, both proofs fail
+/// verification, and the interesting part is that the device raises no uncaptured error and
+/// does not panic on the way. An off-curve point is still a well-defined input to the
+/// addition formulas; what it is not is a group element, so the two backends' answers are
+/// allowed to differ, and this deliberately does not assert they agree: the bucket order the
+/// scatter produces is arbitrary and associativity is exactly the property that fails here.
+#[test]
+fn an_off_curve_base_is_no_worse_on_the_device_than_on_the_cpu() {
+    let _one_at_a_time = exclusive();
+    let found = artifacts();
+    let Some(a) = found.iter().min_by_key(|a| a.witness().len()) else {
+        eprintln!("SKIPPED an_off_curve_base_is_no_worse_on_the_device_than_on_the_cpu");
+        return;
+    };
+    eprintln!(
+        "an_off_curve_base_is_no_worse_on_the_device_than_on_the_cpu: {}",
+        a.name
+    );
+
+    let witness = a.witness();
+    let (r, s) = (Fr::from(7u64), Fr::from(11u64));
+
+    // (1, 1) is off curve on BN254 G1: y^2 = x^3 + 3 gives 1 against 4. Placed in the A
+    // query, which every proof reads, at an index whose witness value is general so it
+    // reaches a bucket rather than the ones path.
+    let at = witness
+        .iter()
+        .position(|x| !(x.is_zero() || x.is_one()))
+        .expect("the witness has a general scalar");
+    let off_curve =
+        g16_field::G1Affine::new_unchecked(g16_field::Fq::from(1u64), g16_field::Fq::from(1u64));
+    assert!(!off_curve.is_on_curve(), "(1, 1) is on BN254 G1 after all");
+    // `prepare` takes the key by value, so each backend gets its own copy of the same
+    // corruption rather than a clone of a struct that is deliberately not `Clone`.
+    let poisoned = || {
+        let mut pk = a.key();
+        pk.a_query[at] = off_curve;
+        pk
+    };
+    let n_public = a.key().n_public;
+
+    let mut t = StageTimings::default();
+    let cpu = CpuBackend::new().prepare(poisoned()).expect("cpu prepare");
+    let cpu_proof = prove_with_blinders(cpu.as_ref(), &witness, r, s, &mut t).expect("cpu prove");
+    let gpu = prover().prepare(poisoned()).expect("wgpu prepare");
+    let gpu_proof = prove_with_blinders(gpu.as_ref(), &witness, r, s, &mut t).expect("wgpu prove");
+
+    // No uncaptured device error anywhere in that proof.
+    assert!(
+        device().take_error().is_none(),
+        "an off-curve base raised an uncaptured device error"
+    );
+    let vk = a.vkey();
+    let public = public_of(&witness, n_public);
+    assert!(
+        verify(&vk, &public, &cpu_proof).is_err(),
+        "an off-curve base in the A query still verified on the CPU backend, so this test \
+         proves nothing about the device"
+    );
+    assert!(
+        verify(&vk, &public, &gpu_proof).is_err(),
+        "an off-curve base in the A query produced a proof the verifier accepted"
+    );
+    println!("an off-curve A-query base: both backends prove, both proofs are rejected");
 }
