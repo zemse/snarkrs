@@ -752,6 +752,7 @@ dependencies = [
  "g16-cuda",
  "g16-field",
  "g16-metal",
+ "g16-wgpu",
  "g16-zkey",
  "hex",
  "num-bigint",

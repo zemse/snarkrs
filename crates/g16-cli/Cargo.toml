@@ -26,6 +26,7 @@ g16-zkey.workspace = true
 g16-core.workspace = true
 g16-metal = { workspace = true, optional = true }
 g16-cuda  = { workspace = true, optional = true }
+g16-wgpu  = { workspace = true, optional = true }
 ark-bn254.workspace = true
 ark-ff.workspace = true
 ark-ec.workspace = true
@@ -42,8 +43,14 @@ num-bigint.workspace = true
 hex.workspace = true
 
 [features]
-default = ["cpu"]
+# `wgpu` is on by default where `metal` and `cuda` are not, and the asymmetry is deliberate.
+# Metal is macOS only and CUDA needs a driver, so both are opt in; the WebGPU backend is pure
+# Rust, builds on macOS, Linux and Windows, and needs nothing installed. A machine with no
+# GPU still builds the binary and gets an error from `--backend wgpu` at run time rather than
+# a binary that cannot ask.
+default = ["cpu", "wgpu"]
 cpu = []
+wgpu = ["dep:g16-wgpu"]
 metal = ["dep:g16-metal"]
 # `dep:g16-cuda` alone is not enough: g16-cuda gates its whole backend behind its own
 # `cuda` feature so that a default macOS workspace build never pulls cudarc. Without

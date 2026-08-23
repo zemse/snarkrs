@@ -1,9 +1,9 @@
 //! `g16` - prove, verify and benchmark.
 //!
 //!   g16 prove  --zkey c.zkey --witness c.wtns --proof p.json --public pub.json
-//!              [--backend cpu|metal] [--stage-timings]
+//!              [--backend cpu|wgpu|metal|cuda] [--stage-timings]
 //!   g16 verify --vkey vkey.json --proof p.json --public pub.json
-//!   g16 bench  --artifacts DIR [--variant NAME]... [--reps 15] [--backend cpu]
+//!   g16 bench  --artifacts DIR [--variant NAME]... [--reps 15] [--backend cpu|wgpu|...]
 //!              [--mode cold|warm|both] [--csv out.csv]
 //!
 //! `prove` writes snarkjs' `proof.json` and `public.json` verbatim, so the output is

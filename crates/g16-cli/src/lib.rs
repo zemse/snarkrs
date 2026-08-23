@@ -13,6 +13,7 @@ use g16_core::{cpu::CpuBackend, Backend};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum BackendKind {
     Cpu,
+    Wgpu,
     Metal,
     Cuda,
 }
@@ -21,6 +22,7 @@ impl BackendKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             BackendKind::Cpu => "cpu",
+            BackendKind::Wgpu => "wgpu",
             BackendKind::Metal => "metal",
             BackendKind::Cuda => "cuda",
         }
@@ -38,9 +40,37 @@ impl BackendKind {
 pub fn make_backend(kind: BackendKind) -> Result<Box<dyn Backend>> {
     match kind {
         BackendKind::Cpu => Ok(Box::new(CpuBackend::new())),
+        BackendKind::Wgpu => wgpu_backend(),
         BackendKind::Metal => metal_backend(),
         BackendKind::Cuda => cuda_backend(),
     }
+}
+
+/// WebGPU has the same two failure modes as CUDA and for a similar reason: `wgpu` compiles on
+/// every target this workspace supports and picks a native backend (Metal, Vulkan, DX12) at
+/// run time, so there is no "wrong operating system" arm. Either the feature is off, or the
+/// feature is on and the machine either has an adapter or does not.
+///
+/// A missing adapter is an error rather than a quiet fall back to the CPU backend, for the
+/// reason the other two give: a benchmark that silently measures a different backend is worse
+/// than no number at all.
+///
+/// The expensive constructor is here, once, and never on a proving path: it opens the device
+/// and compiles the three MSM shader modules. The per-key work, which is the NTT pipelines and
+/// every base vector, is in `prepare`.
+#[cfg(feature = "wgpu")]
+fn wgpu_backend() -> Result<Box<dyn Backend>> {
+    Ok(Box::new(g16_wgpu::WgpuProver::new().map_err(|e| {
+        anyhow::anyhow!("backend `wgpu` is unavailable: {e}")
+    })?))
+}
+
+#[cfg(not(feature = "wgpu"))]
+fn wgpu_backend() -> Result<Box<dyn Backend>> {
+    anyhow::bail!(
+        "backend `wgpu` is unavailable: this binary was built WITHOUT the `wgpu` \
+         feature. Rebuild with `cargo build --release --features wgpu`."
+    )
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -140,6 +170,39 @@ mod tests {
     #[test]
     fn cpu_backend_is_always_available() {
         assert_eq!(make_backend(BackendKind::Cpu).unwrap().name(), "cpu");
+    }
+
+    /// Every backend has a spelling in the CSV and on the command line, and they have to be
+    /// the same string: `bench/results/history.csv` is keyed on it and a row written as
+    /// "webgpu" would never join a row written as "wgpu".
+    #[test]
+    fn every_backend_kind_has_a_stable_name() {
+        for (kind, want) in [
+            (BackendKind::Cpu, "cpu"),
+            (BackendKind::Wgpu, "wgpu"),
+            (BackendKind::Metal, "metal"),
+            (BackendKind::Cuda, "cuda"),
+        ] {
+            assert_eq!(kind.as_str(), want);
+        }
+    }
+
+    /// Without the feature the error must name the feature, so the fix is obvious from the
+    /// message alone. With it, the backend either builds or explains that the machine has no
+    /// adapter; both are acceptable on a headless box and neither may be a silent CPU proof.
+    #[test]
+    fn wgpu_either_builds_or_says_why_not() {
+        match make_backend(BackendKind::Wgpu) {
+            Ok(b) => assert_eq!(b.name(), "wgpu"),
+            Err(e) => {
+                let e = e.to_string();
+                assert!(e.contains("wgpu"), "{e}");
+                assert!(
+                    !e.contains("cpu"),
+                    "a wgpu failure must not mention a fallback: {e}"
+                );
+            }
+        }
     }
 
     /// Without the feature the error must name the feature, so the fix is obvious from
