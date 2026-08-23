@@ -94,8 +94,27 @@ pub fn window_size(m: usize) -> u32 {
     /// One iteration of the merge loop on the busiest bucket, microseconds. Serial, and
     /// Metal's, unscaled.
     const MERGE_US: f64 = 27.0;
-    /// Entries one thread of U9's segmented accumulation will own. Duplicated from Metal's
-    /// `SLICE_LEN` because the kernel that uses it does not exist yet; U9 owns the real one.
+    /// Entries one thread of the segmented accumulation owns, **as this cost model assumes
+    /// them**, which is deliberately not the number the kernel uses.
+    ///
+    /// The kernel ships 128 (`gen::points::Curve::slice_len`, swept on both curves at U9 and
+    /// U10, a clean V with 128 the minimum). This says 64, which is Metal's, and it stays at
+    /// 64 because the model is better with it. `SLICE_LEN` appears only in the merge term, so
+    /// doubling it halves that term, and the width this function returns then changes at two
+    /// of the sizes this repo proves. Measured, whole G1 MSM, medians of three, M2 Max,
+    /// release, milliseconds:
+    ///
+    /// ```text
+    /// m         c=8    c=9   c=10   c=11   c=12   c=13   c=14   at 64  at 128
+    /// 18002    41.5   53.4   45.6   69.9   64.1   64.6  100.6       8      10
+    /// 65536    76.0  117.1   82.7  143.0  104.7   75.1  140.5      13      10
+    /// ```
+    ///
+    /// 64 picks the measured winner at both; 128 picks a width 10.0% and 10.1% worse. The
+    /// model is a fit and not a derivation, and its other three constants are Metal's too, so
+    /// making one of them agree with the kernel while the rest do not is not an improvement.
+    /// `tests/msm_verify.rs::the_window_width_the_cost_model_picks_is_within_ten_percent_of_
+    /// the_measured_best` fails on either substitution.
     const SLICE_LEN: f64 = 64.0;
 
     let mut best = 3;

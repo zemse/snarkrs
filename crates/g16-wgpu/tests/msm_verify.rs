@@ -56,6 +56,8 @@ use g16_wgpu::{LimitsProfile, ParamRing, WgpuBackend};
 
 #[path = "msmcommon/mod.rs"]
 mod common;
+#[path = "gpulock/mod.rs"]
+mod gpulock;
 
 use common::{fill, general_scalars, read_bytes, read_words, storage_words, SENTINEL};
 
@@ -989,4 +991,110 @@ fn a_pooled_spill_array_holding_the_previous_tags_changes_nothing() {
     );
     second.assert_no_overrun(wgsl::G1.point_bytes, 2, "poisoned spill tags");
     println!("{carried} stale tail tags folded into nothing");
+}
+
+/// Bases at 2^16 without paying for 65,536 scalar multiplications: an arithmetic progression.
+/// Structure in the bases cannot help or hurt an MSM, which only ever adds them.
+fn walk_g1(n: usize, rng: &mut impl Rng) -> Vec<G1Affine> {
+    let step = G1Projective::rand(rng);
+    let mut cur = G1Projective::rand(rng);
+    let mut proj = Vec::with_capacity(n);
+    for _ in 0..n {
+        proj.push(cur);
+        cur += &step;
+    }
+    G1Projective::normalize_batch(&proj)
+}
+
+// ---------------------------------------------------------------------------
+// 7. The window width the cost model picks
+// ---------------------------------------------------------------------------
+
+/// `crate::msm::window_size` against a measured sweep, at the two `m` where its most
+/// suspicious constant changes the answer.
+///
+/// # Why these two sizes and not a grid
+///
+/// The model's `SLICE_LEN` is 64 and its comment says "Duplicated from Metal's `SLICE_LEN`
+/// because the kernel that uses it does not exist yet; U9 owns the real one". U9 landed, swept
+/// it on both curves, and shipped **128** (`gen::points::Curve::slice_len`). The model was not
+/// updated, so it now disagrees with the kernel it is modelling, and the comment reads as an
+/// invitation to go and tidy that up.
+///
+/// Doing so would make the prover slower. `SLICE_LEN` appears only in the merge term, so
+/// doubling it halves that term, and the pick changes at exactly two of the sizes this repo
+/// proves: `m = 18002` goes 8 to 10 and `m = 65536` goes 13 to 10. Measured, medians of
+/// three, whole G1 MSM including the upload, M2 Max, release, milliseconds:
+///
+/// ```text
+/// m         c=8    c=9   c=10   c=11   c=12   c=13   c=14   model  best
+/// 18002    41.5   53.4   45.6   69.9   64.1   64.6  100.6       8     8
+/// 65536    76.0  117.1   82.7  143.0  104.7   75.1  140.5      13    13
+/// ```
+///
+/// The stale constant picks the measured winner at both, and the value it would be "corrected"
+/// to picks a width that is 10.0% worse at `m = 18002` and 10.1% worse at `m = 65536`. So the
+/// 64 stays, the comment in `crate::msm::window_size` now says why, and this test is the thing
+/// that will argue back the next time someone changes it.
+///
+/// The assertion is 10% and not "is the best", because at `m = 65536` the second-placed width
+/// is 1.2% away and that is inside the noise of a three-sample median. 10% still fails on
+/// either of the two substitutions above and on anything larger.
+#[test]
+fn the_window_width_the_cost_model_picks_is_within_ten_percent_of_the_measured_best() {
+    use std::time::Instant;
+    let _one = exclusive();
+    let _gpu = gpulock::exclusive_gpu();
+    let mut rng = test_rng();
+    for m in [18002usize, 65536usize] {
+        let bases = walk_g1(m, &mut rng);
+        let words = g1_words(&bases);
+        let scalars = general_scalars(m, &mut rng);
+        let (sw, general) = pack_scalars(&scalars);
+        let picked = g16_wgpu::window_size(m);
+        let mut line = String::new();
+        let mut best = (f64::MAX, 0u32);
+        let mut at_pick = f64::MAX;
+        for c in 8u32..=14 {
+            let mut ts = Vec::new();
+            for _ in 0..3 {
+                let t = Instant::now();
+                let run = run_msm_words!(
+                    digits(),
+                    g1(),
+                    wgsl::G1,
+                    &words,
+                    &sw,
+                    general,
+                    m as u32,
+                    Some(c),
+                    0,
+                    None
+                );
+                let _ = std::hint::black_box(run.result);
+                ts.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+            ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let med = ts[1];
+            line.push_str(&format!("  c={c} {med:.1}"));
+            if med < best.0 {
+                best = (med, c);
+            }
+            if c == picked {
+                at_pick = med;
+            }
+        }
+        println!(
+            "m={m} model picks c={picked} ({at_pick:.1} ms), best c={} ({:.1} ms) |{line}",
+            best.1, best.0
+        );
+        assert!(
+            at_pick <= 1.10 * best.0,
+            "m = {m}: window_size picked c = {picked} at {at_pick:.1} ms, {:.1}% over the \
+             measured best c = {} at {:.1} ms",
+            100.0 * (at_pick / best.0 - 1.0),
+            best.1,
+            best.0
+        );
+    }
 }
