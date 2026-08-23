@@ -227,6 +227,10 @@ pub fn zkey_take(ptr: *mut u8, len: usize) -> Result<(), JsError> {
         // benchmark reports the wrong artifact's time.
         s.circuit = None;
         s.cpu = None;
+        // And it invalidates the cold loop's copy, which would otherwise sit there whole for
+        // the length of a warm run: 94 MB of the largest key, held for nothing, because the
+        // page ran cold before warm on the same artifact.
+        s.zkey_raw = None;
         Ok(())
     })
 }
@@ -262,6 +266,7 @@ pub fn wtns_retain(ptr: *mut u8, len: usize) -> Result<(), JsError> {
     let bytes = take(ptr, len)?;
     with_state(|s| {
         s.wtns_raw = Some(bytes);
+        s.witness = None;
         Ok(())
     })
 }
@@ -291,6 +296,7 @@ pub fn wtns_take(ptr: *mut u8, len: usize) -> Result<(), JsError> {
     let w = Witness::from_bytes(bytes).map_err(js)?;
     with_state(|s| {
         s.witness = Some(Rc::new(w.0));
+        s.wtns_raw = None;
         Ok(())
     })
 }
