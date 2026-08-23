@@ -14,7 +14,7 @@ use g16_core::verify::verify;
 use g16_core::{Backend, HPoly, ProveError, StageTimings};
 use g16_field::{Fr, One, Zero};
 use g16_wgpu::backend::WgpuProver;
-use g16_wgpu::{G1Bases, G2Bases, Group, Job, MontConvert, Source};
+use g16_wgpu::{G1Bases, G2Bases, Group, Job, MontConvert, MsmResult, Source};
 use g16_wgpu::{LimitsProfile, WgpuBackend};
 use g16_zkey::{wtns::Witness, ProvingKey, VerifyingKey};
 
@@ -37,7 +37,7 @@ mod gpulock;
 /// `PairingFailed` about one run in two. Bisected:
 ///
 /// ```text
-/// one device, 4 threads proving          12 runs, 0 wrong
+/// one device, 4 threads proving          12 runs, 0 wrong   <- see below
 /// two processes, one device each         2 runs,  0 wrong
 /// two devices in one process, tiny load  3 runs,  0 wrong
 /// two devices in one process, serialised 24 reps, 0 wrong
@@ -45,17 +45,27 @@ mod gpulock;
 /// ```
 ///
 /// **Two `wgpu::Device`s in one process, both under load, silently produce wrong results on
-/// this machine.** The same two workloads in two *processes* are fine, and one device driven
-/// from four threads is fine, so it is neither GPU contention nor total memory. No uncaptured
-/// error is raised and the device-lost callback (added in `crate::device` while chasing this)
-/// never fires. The wrong values are always whole stage outputs: H identical to the previous
-/// proof's, or four of the five MSMs wrong with the first one right. M2 Max, wgpu 30.0.1,
-/// Metal, `STRICT_WEBGPU_COMPLIANCE` on, `LimitsProfile::Floor`.
+/// this machine.** The same two workloads in two *processes* are fine, so it is neither GPU
+/// contention nor total memory. No uncaptured error is raised and the device-lost callback
+/// (added in `crate::device` while chasing this) never fires. The wrong values are always
+/// whole stage outputs: H identical to the previous proof's, or four of the five MSMs wrong
+/// with the first one right. M2 Max, wgpu 30.0.1, Metal, `STRICT_WEBGPU_COMPLIANCE` on,
+/// `LimitsProfile::Floor`.
+///
+/// **The first row of that table does not mean what it was written to mean, and U11's
+/// mutation round is what said so.** Deleting `WgpuBackend::exclusive` from `compute_h` and
+/// `msms` and running `two_proofs_in_parallel_on_one_prepared_circuit_both_verify` alone,
+/// which is four threads on *one* device, gave `verify: PairingFailed` on **run 2 of 3**.
+/// So one device driven from four unguarded threads is not fine either; 12 runs was a small
+/// sample of a roughly one-in-three event and it came up empty. Whatever else is going on
+/// with two devices, the guard `crate::backend` takes is load bearing for correctness on one,
+/// and not only for attributing an uncaptured error or a timing.
 ///
 /// Nothing this crate ships opens two devices, so the product is not affected: a
-/// `WgpuProver` owns one. It is written up in `TASKS.md` because it is worth reporting
-/// upstream and because the next person to reach for a private device in a test needs to
-/// know. Here, the answer is one device and this lock.
+/// `WgpuProver` owns one, and every proof through it holds the guard. It is written up in
+/// `TASKS.md` because it is worth reporting upstream and because the next person to reach
+/// for a private device in a test needs to know. Here, the answer is one device and this
+/// lock.
 fn exclusive() -> std::sync::MutexGuard<'static, ()> {
     static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
     GPU.lock().unwrap_or_else(|e| e.into_inner())
@@ -266,8 +276,14 @@ fn proving_the_same_witness_twice_is_stable() {
 /// dispatch was reported against the other and the proof that caused it returned `Ok` over
 /// buffers whose contents nobody could describe. `WgpuBackend::exclusive` now serialises the
 /// GPU section of a proof, so concurrent proofs are correct and serialised rather than
-/// parallel. This asserts the correctness half; `the_serialisation_cost_of_two_concurrent_proofs`
-/// measures what the other half costs.
+/// parallel.
+///
+/// This asserts the outcome: four threads, one circuit, four proofs that verify. It is also
+/// the test that showed the guard is not merely tidiness. Run with both
+/// `let _gpu = self.device.exclusive();` lines deleted from `crate::backend` it fails with
+/// `verify: PairingFailed` about one run in three, which is written up on [`exclusive`].
+/// `the_gpu_section_of_a_proof_is_behind_the_device_guard` asserts the mechanism instead,
+/// deterministically, because one run in three is not a gate anyone should rely on.
 #[test]
 fn two_proofs_in_parallel_on_one_prepared_circuit_both_verify() {
     let _one_at_a_time = exclusive();
@@ -297,6 +313,86 @@ fn two_proofs_in_parallel_on_one_prepared_circuit_both_verify() {
             }
         });
     });
+}
+
+/// The other half of the same contract: the GPU section of a proof really is behind
+/// [`g16_wgpu::WgpuBackend::exclusive`], and not merely documented as being.
+///
+/// `two_proofs_in_parallel_on_one_prepared_circuit_both_verify` cannot see this. Four threads
+/// on **one** device were measured correct with the lock and correct without it (12 runs, 0
+/// wrong; the bisect is on [`exclusive`]), because the thing the lock defends against is the
+/// device's single uncaptured-error slot being emptied by the wrong proof, and that needs a
+/// device error to happen at all. A test that waits for one is a test that never fails on a
+/// working machine.
+///
+/// So this asserts the mechanism instead of the symptom. Hold the backend guard on this
+/// thread, call `compute_h` on another, and it must **not** finish; release, and it must.
+/// That is deterministic in both directions: a guard that is taken blocks whatever the GPU is
+/// doing, and a guard that is not taken lets the smallest artifact through in about 20 ms.
+///
+/// Both entry points are checked. Deleting the guard from `compute_h` and leaving it in
+/// `msms` is exactly the shape a careless edit takes, and one assertion would pass it.
+///
+/// The smallest artifact, on purpose: this waits 300 ms for a call that must not complete,
+/// and `js_16x16_d32`'s `msms` takes 900 ms all by itself, so the largest artifact would
+/// "pass" with no guard at all.
+#[test]
+fn the_gpu_section_of_a_proof_is_behind_the_device_guard() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let _one_at_a_time = exclusive();
+    /// Long enough that the smallest artifact's `compute_h` and `msms` both finish inside it
+    /// with no guard (20 ms and 21 ms warm), short enough to pay twice.
+    const BLOCKED_FOR: std::time::Duration = std::time::Duration::from_millis(300);
+
+    let found = artifacts();
+    let Some(a) = found.iter().min_by_key(|a| a.witness().len()) else {
+        eprintln!("SKIPPED the_gpu_section_of_a_proof_is_behind_the_device_guard: no artifacts");
+        return;
+    };
+    eprintln!(
+        "the_gpu_section_of_a_proof_is_behind_the_device_guard: {}",
+        a.name
+    );
+
+    let circuit = prover().prepare(a.key()).expect("prepare");
+    let witness = a.witness();
+    let mut t = StageTimings::default();
+    // Warm the pools and take an H to hand `msms`, both while nothing holds the guard.
+    let h = circuit.compute_h(&witness, &mut t).expect("compute_h");
+    circuit.msms(&witness, &h, &mut t).expect("msms");
+
+    let circuit = circuit.as_ref();
+    let (witness, h) = (&witness, &h);
+    for (what, call) in [("compute_h", 0u8), ("msms", 1u8)] {
+        let done = AtomicBool::new(false);
+        let done = &done;
+        let guard = device().exclusive();
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(move || {
+                let mut t = StageTimings::default();
+                match call {
+                    0 => {
+                        circuit.compute_h(witness, &mut t).expect("compute_h");
+                    }
+                    _ => {
+                        circuit.msms(witness, h, &mut t).expect("msms");
+                    }
+                }
+                done.store(true, Ordering::SeqCst);
+            });
+            std::thread::sleep(BLOCKED_FOR);
+            assert!(
+                !done.load(Ordering::SeqCst),
+                "{what} finished while another thread held WgpuBackend::exclusive, so the \
+                 GPU section of a proof is not serialised and one proof can take another's \
+                 uncaptured error"
+            );
+            drop(guard);
+            worker.join().expect("the blocked call panicked");
+        });
+        assert!(done.load(Ordering::SeqCst), "{what} never finished");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -368,6 +464,131 @@ fn the_device_msms_finish_a_cpu_computed_h() {
         assert_eq!(got.l_g1, want.l_g1, "{}: L", a.name);
         assert_eq!(got.h_g1, want.h_g1, "{}: H", a.name);
     });
+}
+
+/// A [`Group`] with `n == 0` dispatches nothing and still owns its own result slots.
+///
+/// `MsmBatch::run` returns one result per job, flat, in group then job order, but it only
+/// *computes* the jobs of non-empty groups. So the two loops that fill the output disagree
+/// about indexing on purpose: the computed jobs are placed at `first_job[group] + job`, a
+/// prefix sum, and a second pass fills the identity into whatever is left. Indexing the first
+/// pass by the running count of computed jobs instead would be correct on every artifact we
+/// have and wrong the first time a group is empty, and the symptom would be a proof that does
+/// not verify with nothing else to go on.
+///
+/// The case is real and is the reason the code is written that way: an empty L query is a
+/// circuit whose wires are all public. No artifact under `bench/artifacts` has one, and no
+/// test had one either until this, which is how the mutation that collapses the two indexings
+/// survived U11's first mutation round.
+///
+/// The oracle is the same batch without the empty group, so this asserts the placement and
+/// nothing about the curve arithmetic that four other tests already cover. Both arms of the
+/// identity fill are exercised, G1 and G2, because they are two separate match arms.
+#[test]
+fn an_empty_group_dispatches_nothing_and_keeps_its_result_slots() {
+    let _one_at_a_time = exclusive();
+    for_each_artifact(
+        "an_empty_group_dispatches_nothing_and_keeps_its_slots",
+        |a| {
+            let pk = a.key();
+            let witness = a.witness();
+            let n_vars = pk.n_vars as u32;
+            let b = device();
+            let batch = prover().msm();
+            let a_bases = G1Bases::upload(b, &pk.a_query).expect("a bases");
+            let l_bases = G1Bases::upload(b, &pk.l_query).expect("l bases");
+            let g2_bases = G2Bases::upload(b, &pk.b_g2_query).expect("b_g2 bases");
+
+            let first = [Job::G1 {
+                bases: &a_bases,
+                base_off: 0,
+            }];
+            // Two jobs and two curves, so both arms of the identity fill are covered.
+            let empty = [
+                Job::G1 {
+                    bases: &l_bases,
+                    base_off: 0,
+                },
+                Job::G2 {
+                    bases: &g2_bases,
+                    base_off: 0,
+                },
+            ];
+            let last = [Job::G2 {
+                bases: &g2_bases,
+                base_off: 0,
+            }];
+
+            let g_first = || Group {
+                scalars: Source::Host(&witness),
+                scalar_off: 0,
+                n: n_vars,
+                jobs: &first,
+            };
+            let g_last = || Group {
+                scalars: Source::Host(&witness),
+                scalar_off: 0,
+                n: n_vars,
+                jobs: &last,
+            };
+
+            let want = pollster::block_on(batch.run(b, None, &[g_first(), g_last()])).expect("two");
+            assert_eq!(want.len(), 2, "{}", a.name);
+
+            let got = pollster::block_on(batch.run(
+                b,
+                None,
+                &[
+                    g_first(),
+                    Group {
+                        scalars: Source::Host(&witness),
+                        scalar_off: 0,
+                        n: 0,
+                        jobs: &empty,
+                    },
+                    g_last(),
+                ],
+            ))
+            .expect("three");
+
+            assert_eq!(
+                got.len(),
+                4,
+                "{}: one result per job, empty group included",
+                a.name
+            );
+            let g1 = |r: &MsmResult| r.g1().expect("a G1 result");
+            let g2 = |r: &MsmResult| r.g2().expect("a G2 result");
+            assert_eq!(
+                g1(&got[0]),
+                g1(&want[0]),
+                "{}: the job before the empty group",
+                a.name
+            );
+            assert!(
+                g1(&got[1]).is_zero(),
+                "{}: the empty group's G1 job is not the identity",
+                a.name
+            );
+            assert!(
+                g2(&got[2]).is_zero(),
+                "{}: the empty group's G2 job is not the identity",
+                a.name
+            );
+            assert_eq!(
+                g2(&got[3]),
+                g2(&want[1]),
+                "{}: the job after the empty group",
+                a.name
+            );
+            // And the oracle is not vacuous.
+            assert!(
+                !g1(&want[0]).is_zero() && !g2(&want[1]).is_zero(),
+                "{}",
+                a.name
+            );
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------

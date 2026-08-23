@@ -386,6 +386,16 @@ impl WgpuBackend {
     /// an `.await` and the futures stay `Send`. A caller driving [`crate::stages::HStages`]
     /// or [`crate::batch::MsmBatch`] directly from two tasks has to take it itself; the
     /// browser entry point at U13 runs one proof per worker and does not.
+    ///
+    /// **Measured, after the fact: this is load bearing for correctness and not only for
+    /// error attribution and timing.** U11's mutation round deleted the two calls to it and
+    /// ran `tests/proof.rs::two_proofs_in_parallel_on_one_prepared_circuit_both_verify` on
+    /// its own, which is four threads proving `js_16x16_d32` against one circuit on one
+    /// device: `verify: PairingFailed` on run 2 of 3. The reasoning above argued for the
+    /// guard from the error slot and the fence; four concurrent unguarded proofs on one
+    /// device also simply produce a wrong proof, about one run in three, with no error
+    /// raised anywhere. Reproduce by removing both `let _gpu = self.device.exclusive();`
+    /// lines in [`crate::backend`].
     pub fn exclusive(&self) -> std::sync::MutexGuard<'_, ()> {
         self.gpu.lock().unwrap_or_else(|e| e.into_inner())
     }
