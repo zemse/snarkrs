@@ -26,6 +26,15 @@ export type Row = {
   prepareMs?: number;
   webgpuMs?: number;
   snarkjsMs?: number;
+  /// Every timed rep, not just the median. Kept so the page can show how tight the
+  /// measurement was, and so a reader can tell a stable number from a lucky one.
+  webgpuReps?: number[];
+  snarkjsReps?: number[];
+  /// The prover's own per-stage breakdown from the last rep, in microseconds. The same
+  /// columns the native harness records, so a browser row and a native row are comparable,
+  /// and the first place to look when a proof comes back wrong: a stage reporting zero did
+  /// not run.
+  stages?: Record<string, number>;
   snarkjsWorkers?: number | null;
   /// Each prover's proof, checked by the other one's verifier.
   crossVerified?: boolean;
@@ -108,6 +117,10 @@ export class Run {
     this.fatal = null;
     this.phase = 'starting';
     this.runId++;
+    // A handle for reading the raw per-rep timings out of the console. The page shows a
+    // median and a spread; this is how the rep counts in `reps`/`warmup` were chosen, and
+    // how they should be re-chosen on a machine that behaves differently.
+    (globalThis as Record<string, unknown>).__g16run = this;
     this.startedAt = performance.now();
     // Reset rather than rebuild, so a second run reuses the same objects and the table does
     // not flash empty between runs.
@@ -116,6 +129,8 @@ export class Run {
       r.downloaded = 0;
       r.downloadMs = r.prepareMs = r.webgpuMs = r.snarkjsMs = undefined;
       r.crossVerified = undefined;
+      r.webgpuReps = r.snarkjsReps = undefined;
+      r.stages = undefined;
       r.error = undefined;
       r.note = r.circuit.refuses;
     }
@@ -145,6 +160,7 @@ export class Run {
         this.recomputeEta();
       }
       this.phase = this.cancelled ? 'idle' : 'done';
+      await this.report();
       this.activity = '';
       this.subProgress = null;
       this.etaMs = null;
@@ -154,6 +170,35 @@ export class Run {
     } finally {
       this.prover?.terminate();
       this.prover = null;
+    }
+  }
+
+  /// Posts the finished rows to the dev server when `?report=1`. See the `g16-report-sink`
+  /// plugin in vite.config.ts for why: it is the only way to read a result out of a browser
+  /// this machine cannot drive.
+  private async report() {
+    if (new URLSearchParams(q()).get('report') !== '1') return;
+    const body = {
+      userAgent: navigator.userAgent,
+      env: this.env,
+      rows: this.rows.map((r) => ({
+        circuit: r.circuit.name,
+        status: r.status,
+        snarkjsMs: r.snarkjsMs,
+        webgpuMs: r.webgpuMs,
+        prepareMs: r.prepareMs,
+        crossVerified: r.crossVerified,
+        webgpuReps: r.webgpuReps,
+        snarkjsReps: r.snarkjsReps,
+        stages: r.stages,
+        error: r.error,
+        note: r.note
+      }))
+    };
+    try {
+      await fetch('/__report', { method: 'POST', body: JSON.stringify(body, null, 2) });
+    } catch {
+      /* reporting is a debugging aid; never let it take a completed run down */
     }
   }
 
@@ -201,6 +246,8 @@ export class Run {
         ourProof = r;
         if (i >= this.warmup) ours.push(r.wallMs);
       }
+      row.webgpuReps = ours;
+      row.stages = ourProof?.timings;
       row.webgpuMs = median(ours);
       this.est.observeProof('webgpu', c, row.webgpuMs);
       this.recomputeEta();
@@ -221,23 +268,48 @@ export class Run {
         }
       );
       if (!sj.ms.length) throw new Error('every snarkjs rep was discarded (tab hidden?)');
+      row.snarkjsReps = sj.ms;
       row.snarkjsMs = median(sj.ms);
       row.snarkjsWorkers = sj.workers;
       if (sj.warning) row.note = sj.warning;
       this.est.observeProof('snarkjs', c, row.snarkjsMs);
 
       // ---- neither prover is allowed to be its own judge. ------------------------------
+      //
+      // Three checks, not one, because "cross-verification failed" on its own sends the
+      // reader looking in the wrong place. Each of the three fails for a different reason:
+      //
+      //  * public signals differ  -> the two provers did not prove the same statement, so
+      //    one of them read the witness or the key differently. Nothing downstream of this
+      //    means anything, so it is checked first.
+      //  * snarkjs rejects ours   -> our prover is wrong on this browser.
+      //  * we reject snarkjs'     -> our verifier is wrong on this browser. snarkjs already
+      //    verified this proof itself during the warm-up, so the proof is good.
+      //
+      // The distinction is not hypothetical: a report of this failing on Safari is exactly
+      // the case where knowing which of the three broke is the whole diagnosis.
+      const samePublic =
+        JSON.stringify(ourProof.publicSignals) === JSON.stringify(sj.publicSignals);
       const theirsChecksOurs = await snarkjsVerify(
         loaded.vkey,
         ourProof.publicSignals,
         ourProof.proof
       );
       const oursChecksTheirs = await p.verify(loaded.vkey, sj.publicSignals, sj.proof);
-      row.crossVerified = theirsChecksOurs && oursChecksTheirs.verified;
+      row.crossVerified = samePublic && theirsChecksOurs && oursChecksTheirs.verified;
       if (!row.crossVerified) {
-        throw new Error(
-          `cross-verification failed (snarkjs on ours: ${theirsChecksOurs}, ours on snarkjs: ${oursChecksTheirs.verified})`
-        );
+        const why = !samePublic
+          ? 'the two provers produced different public signals, so they did not prove the ' +
+            'same statement; the key or the witness is being read differently'
+          : !theirsChecksOurs && !oursChecksTheirs.verified
+            ? 'snarkjs rejects our proof and we reject snarkjs\u2019, so both our prover and ' +
+              'our verifier disagree with snarkjs on this browser'
+            : !theirsChecksOurs
+              ? 'snarkjs rejects our proof, so our prover is producing a bad proof on this ' +
+                'browser (our verifier accepts snarkjs\u2019 proof, so the verifier is fine)'
+              : 'we reject snarkjs\u2019 proof, which snarkjs itself verified, so our ' +
+                'verifier is wrong on this browser and the prover may be fine';
+        throw new Error(`cross-verification failed: ${why}`);
       }
 
       row.status = 'done';

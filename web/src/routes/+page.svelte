@@ -2,17 +2,23 @@
   import { onMount } from 'svelte';
   import { Run } from '$lib/runner.svelte';
   import { bytes, count, duration, ms, ratioLabel } from '$lib/format';
+  import { checkSupport, type Support } from '$lib/support';
 
   const run = new Run();
 
-  let supported = $state<boolean | null>(null);
+  // null while the check is in flight. See $lib/support for what it actually tests and why
+  // checking `navigator.gpu` alone is not enough.
+  let support = $state<Support | null>(null);
+  const supported = $derived(support === null ? null : support.ok);
   let peakEta = $state(0);
 
   onMount(async () => {
-    // Two checks, not one. `navigator.gpu` exists in browsers that then hand back a null
-    // adapter (a blocklisted driver, a headless container, Linux without the flag), and a
-    // page that only checks the first reports "supported" and then dies at the first proof.
-    supported = !!navigator.gpu && !!(await navigator.gpu.requestAdapter());
+    support = await checkSupport();
+    // `?auto=1` starts without a click. This exists so the page can be run on a browser
+    // that cannot be driven from here: Safari refuses WebDriver until "Allow remote
+    // automation" is switched on by hand, and a Safari-only failure is exactly the kind that
+    // has to be reproduced rather than reasoned about.
+    if (support.ok && new URLSearchParams(location.search).get('auto') === '1') run.start();
   });
 
   // The ring fills against the largest ETA seen, which is the one from before any work
@@ -100,7 +106,7 @@
         {#if supported === null}
           <span class="word">···</span>
         {:else if supported === false}
-          <span class="word small">no WebGPU</span>
+          <span class="word small">unsupported</span>
         {:else if run.phase === 'idle'}
           <span class="word">GO</span>
         {:else if run.phase === 'done' && verdict}
@@ -118,12 +124,9 @@
     <div class="activity">
       {#if run.fatal}
         <p class="bad">{run.fatal}</p>
-      {:else if supported === false}
-        <p class="fine">
-          This page needs WebGPU. Chrome 113+ or Edge on desktop, Chrome 121+ on Android, or
-          Safari 26+. A browser with <code>navigator.gpu</code> can still hand back no adapter
-          if the driver is blocklisted, which is what happened here.
-        </p>
+      {:else if support && !support.ok}
+        <p class="bad">{support.reason}</p>
+        <p class="fine">{support.detail}</p>
       {:else if run.activity}
         <p class="what">{run.activity}</p>
         <div class="bar" class:indeterminate={run.subProgress == null}>
