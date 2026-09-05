@@ -1,0 +1,18 @@
+# Netlify and Cloudflare Pages read this file. Vercel reads vercel.json instead; both are
+# committed so the same build directory deploys to either without edits.
+#
+# Note what is NOT here: Cross-Origin-Opener-Policy and Cross-Origin-Embedder-Policy. The
+# earlier prototype set both, for the clock rather than for threads: performance.now() steps
+# by 100 us without cross-origin isolation and by 5 us with it. This page does not need that
+# precision (the smallest thing it times is a ~250 ms proof) and COEP costs something real
+# here, because require-corp blocks every cross-origin subresource that does not send a CORP
+# header, and the S3 bucket holding the proving keys does not send one. Isolation would mean
+# proxying 262 MB of artifacts through the site's own origin.
+/*.wasm
+  Content-Type: application/wasm
+
+/pkg/*
+  Cache-Control: public, max-age=31536000, immutable
+
+/vendor/*
+  Cache-Control: public, max-age=31536000, immutable

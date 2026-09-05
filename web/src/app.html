@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- Declared in the head, not only in CSS. Chrome's Auto Dark Mode decides whether to
+         invert a page before the stylesheet has loaded, and a page that is already dark comes
+         out beige: measured here, with the site's own #18202f ring rendering as #DEDAD3.
+         This meta tag is what opts out early enough to matter. -->
+    <meta name="color-scheme" content="dark" />
+    <meta name="description" content="How fast can your GPU prove a Groth16 zkSNARK in the browser? WebGPU against snarkjs, on real circuits." />
+    <title>Groth16 Speed Test</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ctext y='26' font-size='26'%3E%E2%9A%A1%3C/text%3E%3C/svg%3E" />
+    <!-- The UMD bundle, vendored and pinned, loaded with a plain script tag.
+         Not `import snarkjs from "snarkjs"`: a bundler resolving snarkjs' `node` export
+         condition gives a silently single-threaded prover, which turns the whole comparison
+         into a fraudulent speedup. There is nothing to configure away, so the bundler is
+         kept out of it entirely. -->
+    <script src="%sveltekit.assets%/vendor/snarkjs.min.js"></script>
+    %sveltekit.head%
+  </head>
+  <body data-sveltekit-preload-data="hover">
+    <div style="display: contents">%sveltekit.body%</div>
+  </body>
+</html>
