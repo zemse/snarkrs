@@ -179,6 +179,11 @@ export class Run {
     } catch (e: any) {
       this.phase = 'error';
       this.fatal = String(e?.message ?? e);
+      // Reported too, and not only on the happy path. The failure worth reading is usually
+      // the one that stopped the run before it produced a row: a device that refused to
+      // open, or a GPU self-test that refused to let it prove. Without this, `?report=1`
+      // posts nothing at all and the log looks like the page never ran.
+      await this.report();
     } finally {
       this.prover?.terminate();
       this.prover = null;
@@ -193,6 +198,8 @@ export class Run {
     const body = {
       userAgent: navigator.userAgent,
       env: this.env,
+      phase: this.phase,
+      fatal: this.fatal,
       rows: this.rows.map((r) => ({
         circuit: r.circuit.name,
         status: r.status,

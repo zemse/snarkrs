@@ -209,7 +209,10 @@ impl Kernel<'_> {
             .collect();
         if !complaints.is_empty() {
             let _ = scope.pop().await;
-            return Err(format!("WGSL rejected: {}", complaints.join("; ")));
+            return Err(condense(&format!(
+                "WGSL rejected: {}",
+                complaints.join("; ")
+            )));
         }
 
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -272,13 +275,40 @@ impl Kernel<'_> {
         staging.unmap();
 
         if let Some(e) = scope.pop().await {
-            return Err(format!("validation: {e}"));
+            return Err(format!("validation: {}", condense(&e.to_string())));
         }
         if let Some(e) = backend.take_error() {
-            return Err(format!("uncaptured: {e}"));
+            return Err(format!("uncaptured: {}", condense(&e.to_string())));
         }
         Ok(got)
     }
+}
+
+/// Trims a device error down to something a page can show.
+///
+/// Safari answers a failed pipeline build with the *entire* generated Metal source, which for
+/// the field prelude is over 100 KB, followed by the compiler's diagnostics. The diagnostics
+/// are the whole content and they are at the end, so this keeps every line that carries one
+/// plus a short head, and says how much it dropped. The full text is still in the browser
+/// console, where wgpu logs it.
+fn condense(msg: &str) -> String {
+    const HEAD: usize = 200;
+    let diagnostics: Vec<&str> = msg
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.contains("error:") || l.contains("warning:"))
+        .collect();
+    if diagnostics.is_empty() || msg.len() <= HEAD {
+        return msg.chars().take(600).collect();
+    }
+    let head: String = msg.chars().take(HEAD).collect();
+    // Characters and not bytes, because `head` is taken in characters and a count in the
+    // other unit would not add up to the whole.
+    format!(
+        "{head} [{} more characters of generated source elided] {}",
+        msg.chars().count().saturating_sub(HEAD),
+        diagnostics.join(" | ")
+    )
 }
 
 /// Compares and formats the first mismatch, which is the only one worth printing.
@@ -474,7 +504,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         drop(view);
         staging.unmap();
         if let Some(e) = scope.pop().await {
-            return Err(format!("validation: {e}"));
+            return Err(format!("validation: {}", condense(&e.to_string())));
         }
 
         let want: Vec<u32> = (0..n as u32).map(xorshift_200k).collect();
@@ -851,7 +881,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         drop(view);
         staging.unmap();
         if let Some(e) = scope.pop().await {
-            return Err(format!("validation: {e}"));
+            return Err(format!("validation: {}", condense(&e.to_string())));
         }
 
         let mut want = vec![0u32; words];
