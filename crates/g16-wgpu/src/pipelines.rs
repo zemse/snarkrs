@@ -195,6 +195,11 @@ impl Kernels {
         &self.module
     }
 
+    /// The label this module was built under, which is what a diagnostic dump names it by.
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
     pub fn cost(&self) -> PrepareCost {
         self.cost
     }

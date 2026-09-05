@@ -31,6 +31,8 @@ type Wasm = {
   unload: () => void;
   prepare: () => Promise<string>;
   prove: () => Promise<string>;
+  selftest: () => Promise<string>;
+  shader_diagnostics: () => Promise<string>;
   verify: (vkey: string, pub: string, proof: string) => boolean;
   wasm_memory: () => WebAssembly.Memory;
   wasm_memory_bytes: () => number;
@@ -204,6 +206,16 @@ const handlers: Record<string, (a: Args, emit: (p: unknown) => void) => Promise<
     const t0 = performance.now();
     const r = JSON.parse(await w().prove());
     return { ...r, wallMs: performance.now() - t0 };
+  },
+
+  /// The GPU known-answer battery, plus whatever the browser's WGSL compiler said about the
+  /// modules the prover already built. Only run when the page asks for it; see
+  /// crates/g16-wgpu/src/selftest.rs for what each check is for.
+  async selftest() {
+    return {
+      checks: JSON.parse(await w().selftest()),
+      shaders: JSON.parse(await w().shader_diagnostics())
+    };
   },
 
   /// Our verifier over snarkjs' proof, so the cross-check runs both ways. `verified: false`

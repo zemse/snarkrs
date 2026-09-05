@@ -151,6 +151,18 @@ export class Run {
         // have to come from JS rather than from the prover.
         adapter: await adapterInfo()
       };
+      // `?selftest=1` runs the GPU known-answer battery before any proving and puts the
+      // result in `env`, which is what `?report=1` posts. It is off by default because it
+      // compiles seven throwaway shader modules; it is the first thing to turn on when a
+      // browser produces a proof nobody can explain.
+      if (new URLSearchParams(q()).get('selftest') === '1') {
+        this.activity = 'running the GPU self-test';
+        try {
+          this.env.selftest = await this.prover.selftest();
+        } catch (e: any) {
+          this.env.selftest = { error: String(e?.message ?? e) };
+        }
+      }
       this.phase = 'running';
 
       for (const row of this.rows) {

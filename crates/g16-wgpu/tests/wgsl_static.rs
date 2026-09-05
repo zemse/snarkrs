@@ -479,6 +479,98 @@ fn no_generated_module_uses_a_construct_the_browser_lacks() {
     );
 }
 
+/// Safari cannot compile a WGSL array value constructor, so the generators must not emit one.
+///
+/// # The bug this is the regression guard for
+///
+/// Safari 26.6 produced a Groth16 proof that snarkjs rejected, in 3 ms against Chrome's 290,
+/// with no error raised anywhere. WebKit translates WGSL to MSL and emits a WGSL
+/// `array<u32, 8>(a, b, ...)` as a Metal `array<unsigned, 8>(a, b, ...)`. `metal::array` is a
+/// plain aggregate with no such constructor, so Metal answers
+///
+/// ```text
+/// error: no matching constructor for initialization of 'array<unsigned int, 8>'
+/// ```
+///
+/// and every pipeline built from that module is invalid. An invalid pipeline makes its
+/// command buffer invalid, an invalid command buffer makes `submit` a no-op, and the proof is
+/// then assembled from buffers nothing ever wrote. `getCompilationInfo()` is silent, because
+/// the WGSL itself is valid; the failure is in the translation, and it is only visible if the
+/// pipeline build sits inside an error scope.
+///
+/// The construct is entirely avoidable: `var r: Fr; r[0] = ...; return r;` compiles to
+/// `array<unsigned, 8> local { };` plus indexed stores everywhere, costs nothing, and every
+/// index is a literal so it is not the loop-variable indexing that
+/// measured at 3.8x.
+///
+/// Struct constructors are fine and are not flagged: WebKit emits those as a Metal struct
+/// with a matching constructor, and `Fq2(...)`, `Pt(...)` and the parameter structs all
+/// compile there.
+#[test]
+fn no_generated_module_constructs_an_array_by_value() {
+    let mut checked = 0usize;
+    for m in all_modules() {
+        // Every name that denotes an array type in this module: the aliases it declares, plus
+        // the spelled-out form.
+        let mut array_types: Vec<String> = vec!["array".to_string()];
+        for line in m.src.lines() {
+            let line = line.trim();
+            let Some(rest) = line.strip_prefix("alias ") else {
+                continue;
+            };
+            let Some((name, ty)) = rest.split_once('=') else {
+                continue;
+            };
+            if ty.trim_start().starts_with("array<") {
+                array_types.push(name.trim().to_string());
+            }
+        }
+        let src = strip_comments(&m.src);
+        for ty in &array_types {
+            // `Fr(` for an alias, `array<u32, 8>(` for the spelled-out form. A declaration
+            // (`alias Fr = array<u32, 8>;`) has no `(` after the type name, so it does not
+            // match, and neither does a parameter or return type.
+            for (i, _) in src.match_indices(ty.as_str()) {
+                // Reject a match that is part of a longer identifier, so `Fr` does not fire
+                // on `FR_R` or on `array_len`.
+                let before = src[..i].chars().next_back();
+                if before.is_some_and(|c| c.is_alphanumeric() || c == '_') {
+                    continue;
+                }
+                let after = &src[i + ty.len()..];
+                let opens = if ty == "array" {
+                    // `array<u32, 8>(` and not `array<u32, 8>` as a type position.
+                    after
+                        .find('>')
+                        .is_some_and(|j| after[j + 1..].starts_with('('))
+                } else {
+                    after.starts_with('(')
+                };
+                // A module-scope `const` is exempt, and measured to be so rather than
+                // assumed: WebKit emits those with *braces*, `array<unsigned, 8>{..}`, which
+                // Metal accepts. It is only the runtime form that comes out with parentheses.
+                // The field constants (`FR_R`, `FR_R2`, `FR_STD_ONE`, `FR_ZERO` and their
+                // `Fq` twins) are all of this kind and all compiled in Safari 26.6.
+                let line_start = src[..i].rfind('\n').map(|j| j + 1).unwrap_or(0);
+                let is_const = src[line_start..i].trim_start().starts_with("const ");
+                if opens && !is_const {
+                    let line = src[..i].matches('\n').count() + 1;
+                    panic!(
+                        "{}: line {line} constructs {ty:?} by value. Safari's WGSL to MSL \
+                         translation emits a Metal `array<..>(..)` for this, which does not \
+                         compile, and every pipeline in the module is silently invalidated. \
+                         Build it with `var r: {ty}; r[0] = ..;` instead. Context: {:?}",
+                        m.label,
+                        &src[i..(i + 90).min(src.len())]
+                    );
+                }
+                checked += 1;
+            }
+        }
+    }
+    println!("{checked} array-typed name uses checked across every generated module");
+}
+
 // ---------------------------------------------------------------------------
 // 3. Barrier uniformity, which WGSL makes a hard error and MSL makes undefined
 // ---------------------------------------------------------------------------

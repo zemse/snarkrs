@@ -54,6 +54,9 @@ export class Prover {
   prove() {
     return this.call('prove');
   }
+  selftest() {
+    return this.call('selftest');
+  }
   verify(vkey: unknown, publicSignals: unknown, proof: unknown) {
     return this.call<{ verified: boolean }>('verify', { vkey, publicSignals, proof });
   }

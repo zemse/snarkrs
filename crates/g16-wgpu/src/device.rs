@@ -463,6 +463,49 @@ impl WgpuBackend {
             .map_err(|_| bad("the submitted-work callback was dropped before it fired"))
     }
 
+    /// Runs `f` inside a WebGPU validation error scope and reports what the scope caught.
+    ///
+    /// # Why this exists on top of `on_uncaptured_error`
+    ///
+    /// Because on Safari 26.6 the uncaptured-error channel reported nothing at all for a
+    /// device error that a scope catches in full. WebKit's WGSL to MSL translation emitted a
+    /// Metal construct that does not compile (`gen::field::Field::ret_limbs` has the detail),
+    /// every `createComputePipeline` in the prover failed, every submit became a no-op, and
+    /// [`Self::take_error`] returned `None` at all five places this crate calls it. The
+    /// proof came out in 3 ms and snarkjs rejected it.
+    ///
+    /// A scope is the channel that is *specified* to answer: `popErrorScope` resolves after
+    /// the operations inside it have finished their error checking, so it does not race the
+    /// way polling a slot filled by an event does.
+    ///
+    /// # The concurrency rule this owes [`Self::exclusive`]
+    ///
+    /// That method argues error scopes cannot attribute a *proof's* errors, because the scope
+    /// stack is device-wide and two proofs in flight would nest each other's. That argument
+    /// stands and this does not contradict it: **the caller must hold the device exclusively
+    /// for the whole of `f`**, which is why the only callers are the two build paths
+    /// (`create_prover` and `prepare`), each of which runs before any proof exists on this
+    /// device. Do not reach for this inside `compute_h` or `msms`.
+    ///
+    /// Not used natively for anything, and harmless there: wgpu implements scopes on every
+    /// backend, and a native validation error is reported through both channels.
+    pub async fn scoped<T>(
+        &self,
+        what: &str,
+        f: impl FnOnce() -> Result<T, ProveError>,
+    ) -> Result<T, ProveError> {
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let out = f();
+        // Popped on both paths. A scope left on the stack is one the next `scoped` call pops
+        // instead, which would report this section's error against the next one.
+        let caught = scope.pop().await;
+        let out = out?;
+        match caught {
+            Some(e) => Err(bad(format!("{what} was rejected by this device: {e}"))),
+            None => Ok(out),
+        }
+    }
+
     pub(crate) fn charge(&self, cost: PrepareCost) {
         self.cost.lock().unwrap().add(cost);
     }

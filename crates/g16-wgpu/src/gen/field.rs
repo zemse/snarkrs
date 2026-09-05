@@ -373,6 +373,41 @@ impl Field {
         s
     }
 
+    /// Returns a field element built limb by limb, never as an array value constructor.
+    ///
+    /// # Why this is not `return Fr(x0, x1, ..)`
+    ///
+    /// It was, and it made every proof this backend produced in Safari 26.6 garbage. WebKit
+    /// translates WGSL to MSL itself, and it emits a WGSL array value constructor as a Metal
+    /// `array<unsigned, 8>(a, b, ..)`. `metal::array` is an aggregate with no such
+    /// constructor, so the Metal compiler answers "no matching constructor for
+    /// initialization of 'array<unsigned int, 8>'" and every pipeline built from the module
+    /// is invalid. WebKit does not have the same problem with a *constant*: `const FR_R =
+    /// Fr(..)` comes out as `array<unsigned, 8>{..}`, with braces, which compiles. Only the
+    /// runtime form is affected, and only these six functions ever used it.
+    ///
+    /// Nothing downstream notices. An invalid pipeline invalidates the command buffer that
+    /// set it, an invalid command buffer makes `submit` a no-op, and the prover reads the
+    /// buffers back unwritten: a 3 ms proof, in Chrome's 290, that snarkjs rejects.
+    /// `getCompilationInfo()` is empty, because the WGSL is valid WGSL; the error is raised
+    /// against `createComputePipeline` and is only visible inside an error scope. See
+    /// `crate::device::WgpuBackend::scoped`, which is what now puts one there.
+    ///
+    /// The emitted form costs nothing: `var r: Fr;` is a Metal `array<unsigned, 8> r { };`
+    /// and every store below has a literal index, so this is not the loop-variable indexing
+    /// measured at 3.8x.
+    ///
+    /// `tests/wgsl_static.rs::no_generated_module_constructs_an_array_by_value` is the
+    /// regression guard, and it reads the generated text rather than trusting this comment.
+    fn ret_limbs(&self, s: &mut String, limbs: &[String]) {
+        let ty = self.ty;
+        writeln!(s, "    var r: {ty};").unwrap();
+        for (j, e) in limbs.iter().enumerate() {
+            writeln!(s, "    r[{j}] = {e};").unwrap();
+        }
+        writeln!(s, "    return r;").unwrap();
+    }
+
     /// `(a + b) mod m` for 32-bit limbs. Carry emulated with `select`, since WGSL has no
     /// `uaddCarry`: the carry out of `s = x + y` is `select(0u, 1u, s < x)`.
     fn add_32(&self, s: &mut String, n: usize) {
@@ -407,11 +442,10 @@ impl Field {
             .unwrap();
         }
         writeln!(s, "    let take = (c != 0u) || (borrow == 0u);").unwrap();
-        let sel = (0..n)
+        let limbs: Vec<String> = (0..n)
             .map(|j| format!("select(s{j}, d{j}, take)"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        writeln!(s, "    return {ty}({sel});").unwrap();
+            .collect();
+        self.ret_limbs(s, &limbs);
         writeln!(s, "}}").unwrap();
     }
 
@@ -449,11 +483,8 @@ impl Field {
             )
             .unwrap();
         }
-        let outs = (0..n)
-            .map(|j| format!("t{j}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        writeln!(s, "    return {ty}({outs});").unwrap();
+        let limbs: Vec<String> = (0..n).map(|j| format!("t{j}")).collect();
+        self.ret_limbs(s, &limbs);
         writeln!(s, "}}").unwrap();
     }
 
@@ -542,11 +573,10 @@ impl Field {
         // multiply can never produce t == m exactly, so the strict form is only wrong here at
         // t == m + 1 and above; `add` is where `>` really breaks, and it is tested there too.
         writeln!(s, "    let take = borrow == 0u;").unwrap();
-        let sel = (0..8)
+        let limbs: Vec<String> = (0..8)
             .map(|j| format!("select(t{j}, f{j}, take)"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        writeln!(s, "    return {ty}({sel});").unwrap();
+            .collect();
+        self.ret_limbs(s, &limbs);
         writeln!(s, "}}").unwrap();
     }
 
@@ -583,11 +613,10 @@ impl Field {
             .unwrap();
         }
         writeln!(s, "    let take = (c != 0u) || (borrow == 0u);").unwrap();
-        let sel = (0..n)
+        let limbs: Vec<String> = (0..n)
             .map(|j| format!("select(s{j}, d{j}, take)"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        writeln!(s, "    return {ty}({sel});").unwrap();
+            .collect();
+        self.ret_limbs(s, &limbs);
         writeln!(s, "}}").unwrap();
     }
 
@@ -623,11 +652,8 @@ impl Field {
             )
             .unwrap();
         }
-        let outs = (0..n)
-            .map(|j| format!("t{j}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        writeln!(s, "    return {ty}({outs});").unwrap();
+        let limbs: Vec<String> = (0..n).map(|j| format!("t{j}")).collect();
+        self.ret_limbs(s, &limbs);
         writeln!(s, "}}").unwrap();
     }
 
@@ -687,11 +713,10 @@ impl Field {
             .unwrap();
         }
         writeln!(s, "    let take = borrow == 0u;").unwrap();
-        let sel = (0..n)
+        let limbs: Vec<String> = (0..n)
             .map(|j| format!("select(s{j}, d{j} & {mask}u, take)"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        writeln!(s, "    return {ty}({sel});").unwrap();
+            .collect();
+        self.ret_limbs(s, &limbs);
         writeln!(s, "}}").unwrap();
     }
 }

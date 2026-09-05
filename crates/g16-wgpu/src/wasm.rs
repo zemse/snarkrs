@@ -328,7 +328,26 @@ pub async fn create_prover(profile: Option<String>) -> Result<(), JsError> {
         .map_err(|_| JsError::new("`crypto` is not a Crypto object"))?;
 
     let device = Arc::new(WgpuBackend::with_profile(profile).await.map_err(js)?);
-    let msm = Arc::new(MsmBatch::new(&device).map_err(js)?);
+
+    // Before a single kernel is compiled, and not optional. `crate::selftest::guard` runs two
+    // known-answer round trips: one trivial dispatch, and the whole field prelude that every
+    // kernel in this prover puts in front of its own entry points. It is here because the
+    // failure it catches is invisible through every other channel. Safari 26.6 could not
+    // translate the prelude to Metal, so every pipeline was invalid, every submit was a no-op
+    // and the prover read back the buffers it had never written: a 3 ms proof that snarkjs
+    // rejected, with `on_uncaptured_error` silent and `getCompilationInfo()` empty. About
+    // 350 ms on Safari and 40 ms on Chrome, once per page, and it is not inside any number
+    // this page publishes.
+    crate::selftest::guard(&device).await.map_err(js)?;
+
+    // The MSM modules under a validation error scope, which is the channel that reports a
+    // pipeline the browser could not build. See `WgpuBackend::scoped`.
+    let msm = Arc::new(
+        device
+            .scoped("building the MSM shader modules", || MsmBatch::new(&device))
+            .await
+            .map_err(js)?,
+    );
 
     STATE.with(|s| {
         *s.borrow_mut() = Some(State {
@@ -395,6 +414,40 @@ pub fn caps() -> Result<String, JsError> {
     })
 }
 
+/// Runs the GPU known-answer battery in [`crate::selftest`] and returns it as JSON.
+///
+/// Exported separately from [`create_prover`] rather than folded into it because the two
+/// answer different questions. `create_prover` has to refuse a device that cannot compute,
+/// and it does (see the call there). This one exists so the page can show *which* check
+/// failed and how long each took, on a browser whose console cannot be read from a terminal.
+///
+/// Compiles seven throwaway shader modules and submits seven times, so it costs tens of
+/// milliseconds. It is not on the proving path.
+#[wasm_bindgen]
+pub async fn selftest() -> Result<String, JsError> {
+    let device = with_state(|s| Ok(Arc::clone(&s.device)))?;
+    Ok(crate::selftest::run_json(&device, crate::selftest::Battery::Full).await)
+}
+
+/// Every complaint the browser's own WGSL compiler made about the modules already built.
+///
+/// On the web `createShaderModule` is not required to fail on a bad shader; the errors come
+/// out of `getCompilationInfo()`, which nothing else in this crate asks for. An empty array
+/// here means the browser accepted every module.
+#[wasm_bindgen]
+pub async fn shader_diagnostics() -> Result<String, JsError> {
+    let (msm, circuit) = with_state(|s| Ok((Arc::clone(&s.msm), s.circuit.clone())))?;
+    let mut mods: Vec<&crate::pipelines::Kernels> = msm.digits().modules().iter().collect();
+    mods.push(msm.g1().kernels());
+    mods.push(msm.g2().kernels());
+    if let Some(c) = circuit.as_deref() {
+        mods.push(c.stages().gather().kernels());
+        mods.push(c.stages().ntt().kernels());
+        mods.push(c.stages().h_join().kernels());
+    }
+    Ok(crate::selftest::module_diagnostics(&mods).await)
+}
+
 /// Minimal JSON string escaping, for adapter strings that come from a driver.
 fn json_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
@@ -432,7 +485,14 @@ pub async fn prepare() -> Result<String, JsError> {
     // Synchronous: every upload is `Queue::write_buffer`, which copies into a staging belt
     // and needs no readback. Nothing here awaits, and that is a property of `WgpuCircuit`
     // rather than an accident, so the browser and the native path prepare identically.
-    let circuit = WgpuCircuit::new(device, msm, pk).map_err(js)?;
+    // Same scope discipline as `create_prover`: this builds the gather, NTT and h_join
+    // modules, and a pipeline the browser rejects is only reported inside a scope.
+    let circuit = device
+        .scoped("building the stage 0 to 4 shader modules", || {
+            WgpuCircuit::new(Arc::clone(&device), Arc::clone(&msm), pk)
+        })
+        .await
+        .map_err(js)?;
     let total_us = t0.elapsed().as_micros() as u64;
     let cost = circuit.prepare_cost();
     let base_bytes = circuit.base_bytes();

@@ -79,6 +79,7 @@ pub mod pipelines;
 pub mod points;
 pub mod pointwise;
 pub mod readback;
+pub mod selftest;
 pub mod stages;
 
 /// The browser entry point: `wasm-bindgen` exports for a page and a Web Worker. Behind the
@@ -103,4 +104,5 @@ pub use points::{
 };
 pub use pointwise::{HJoin, HJoinParams};
 pub use readback::Readback;
+pub use selftest::Check;
 pub use stages::{HStages, Stage4, WgpuHandle};

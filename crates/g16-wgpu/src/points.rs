@@ -502,6 +502,12 @@ impl<C: PointCurve> MsmPoints<C> {
 
     // ---- bind group layouts, as data, so a test can count what the device enforces ----
 
+    /// This curve's one shader module. Public for the same reason as
+    /// [`crate::msm::MsmDigits::modules`].
+    pub fn kernels(&self) -> &Kernels {
+        &self.kernels
+    }
+
     pub fn clear_entries() -> [wgpu::BindGroupLayoutEntry; 2] {
         [
             ParamRing::layout_entry(BIND_PARAMS),

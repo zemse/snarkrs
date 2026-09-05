@@ -416,8 +416,15 @@ struct NttParams {{
 @group(0) @binding({BIND_H_MONT}) var<storage, read_write> H_MONT: array<Fr>;
 @group(0) @binding({BIND_H_STD}) var<storage, read_write> H_STD: array<Fr>;
 
+// Built limb by limb and not as `Fr(P.ks0, ..)`. Safari emits a WGSL array value
+// constructor as a Metal `array<unsigned, 8>(..)`, which does not compile, and every
+// pipeline in the module then silently produces nothing. See
+// gen::field::Field::ret_limbs for the whole story.
 fn ntt_kscale() -> Fr {{
-    return Fr(P.ks0, P.ks1, P.ks2, P.ks3, P.ks4, P.ks5, P.ks6, P.ks7);
+    var r: Fr;
+    r[0] = P.ks0; r[1] = P.ks1; r[2] = P.ks2; r[3] = P.ks3;
+    r[4] = P.ks4; r[5] = P.ks5; r[6] = P.ks6; r[7] = P.ks7;
+    return r;
 }}
 "
     )

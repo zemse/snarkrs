@@ -1114,6 +1114,13 @@ impl MsmDigits {
         self.wg
     }
 
+    /// Every shader module this kernel set compiled: one under [`ModuleShape::Fused`], two
+    /// under [`ModuleShape::Split`]. Public so `crate::selftest::module_diagnostics` can ask
+    /// the browser what it thought of them.
+    pub fn modules(&self) -> &[Kernels] {
+        &self.modules
+    }
+
     pub fn module_shape(&self) -> ModuleShape {
         self.shape
     }
