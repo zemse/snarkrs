@@ -13,26 +13,35 @@
 import type { Circuit } from './circuits';
 
 /// Median proof time in milliseconds for each circuit, on an M2 Max in Chrome 152, warm,
-/// three untimed warm-ups then five timed reps. Taken with this page, on these exact
-/// artifacts.
+/// three untimed warm-ups then five timed reps, every proof cross-verified. Taken with this
+/// page, on these exact artifacts.
 ///
-/// Keyed by circuit rather than fitted against constraint count, because constraint count
-/// does not predict proving time and this table is the evidence. Tornado has less than half
-/// Keccak's constraints and takes four times as long on snarkjs; it is slower than SHA-256,
-/// which is twice its size, on **both** provers. The reason is that the cost tracks non-zero
-/// entries in the A/B/C matrices, not rows of them: Tornado is Poseidon-dense, where every
-/// constraint has many terms, while the hash circuits are bit operations with two or three
-/// terms each. On our side there is a second effect on top, that the MSM skips zero digits,
-/// so a bit-valued witness leaves most high windows empty and Keccak comes out cheaper than
-/// a circuit two thirds its size.
+/// Keyed by circuit rather than fitted against constraint count, because the measurements
+/// say constraint count is not the ordering and this table is the evidence:
+///
+/// * Tornado has less than half of SHA-256's constraints and is slower on **both** provers.
+///   Cost tracks non-zero entries in the A/B/C matrices rather than rows of them, and
+///   Tornado is Poseidon-dense where the hash circuits are two- and three-term bit
+///   operations.
+/// * Keccak is 1.25x RSA's constraint count and proves in 53% of the time on our side,
+///   because the MSM skips zero digits and a bit-valued witness leaves most high windows
+///   empty.
+/// * Railgun 13x1 is smaller than RSA on both counts and slower than it on both provers.
 ///
 /// A fitted curve through these points would be a curve through noise. An unknown circuit
 /// falls back to `interpolate` below, which is honest about being a rough shape.
+///
+/// The `webgpu` column also shows where this backend stops winning: it does not go below
+/// about 330 ms however small the circuit is, because that floor is fixed per-proof cost
+/// rather than arithmetic. Railgun 1x1 is only 1.9x, and something a little smaller would
+/// lose outright.
 const REFERENCE: Record<string, { snarkjs: number; webgpu: number; prepare: number }> = {
-  tornado: { snarkjs: 1030, webgpu: 334, prepare: 15 },
-  sha256: { snarkjs: 890, webgpu: 149, prepare: 30 },
-  rsa2048: { snarkjs: 3550, webgpu: 491, prepare: 50 },
-  keccak256: { snarkjs: 3090, webgpu: 259, prepare: 46 }
+  'railgun-01x01': { snarkjs: 660, webgpu: 347, prepare: 13 },
+  tornado: { snarkjs: 1040, webgpu: 331, prepare: 14 },
+  sha256: { snarkjs: 900, webgpu: 148, prepare: 25 },
+  'railgun-13x01': { snarkjs: 4130, webgpu: 939, prepare: 41 },
+  rsa2048: { snarkjs: 3610, webgpu: 489, prepare: 47 },
+  keccak256: { snarkjs: 3110, webgpu: 260, prepare: 44 }
 };
 
 type Point = { c: number; ms: number };

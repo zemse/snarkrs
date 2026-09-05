@@ -138,7 +138,7 @@
         <button class="link" onclick={() => run.stop()}>stop after this circuit</button>
       {:else if run.phase === 'idle'}
         <p class="fine">
-          {run.circuits.length} real circuits, smallest first · {bytes(run.totalDownload)} to
+          {run.willRun} real circuits, smallest first · {bytes(run.totalDownload)} to
           download · keep this tab in front, a hidden tab gets a throttled clock and its
           timings are thrown away
         </p>

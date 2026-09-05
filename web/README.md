@@ -61,32 +61,40 @@ workers. It is a genuine multi-threaded wasm baseline, not a strawman.
 ## Circuits
 
 Measured on an M2 Max in Chrome 152, warm, three untimed warm-ups then five timed reps, every
-proof cross-verified. These are the numbers baked into the estimator as its reference.
+proof cross-verified in both directions. These are the numbers baked into the estimator as its
+reference.
 
 | circuit | constraints | key | snarkjs | WebGPU | GPU upload | |
 |---|---:|---:|---:|---:|---:|---:|
-| Tornado Cash | 28,275 | 15 MB | 1.03 s | 334 ms | 15 ms | 3.1x |
-| SHA-256 | 59,281 | 34 MB | 899 ms | 151 ms | 25 ms | 5.9x |
-| RSA-2048 | 190,945 | 104 MB | 3.59 s | 488 ms | 46 ms | 7.4x |
-| Keccak-256 | 239,176 | 108 MB | 3.17 s | 260 ms | 45 ms | 12x |
+| Railgun 1x1 | 20,135 | 10 MB | 660 ms | 347 ms | 13 ms | 1.9x |
+| Tornado Cash | 28,275 | 15 MB | 1.05 s | 329 ms | 11 ms | 3.2x |
+| SHA-256 | 59,281 | 34 MB | 910 ms | 145 ms | 24 ms | 6.3x |
+| Railgun 13x1 | 141,276 | 68 MB | 4.13 s | 939 ms | 41 ms | 4.4x |
+| RSA-2048 | 190,945 | 104 MB | 3.63 s | 488 ms | 44 ms | 7.4x |
+| Keccak-256 | 239,176 | 108 MB | 3.07 s | 261 ms | 42 ms | 12x |
 | Anon Aadhaar | 1,115,080 | 631 MB | — | — | — | listed, not run |
 
-Read the first two rows before trusting constraint count as a size: Tornado has less than
-half the constraints of SHA-256 and is slower on **both** provers. Cost tracks non-zero
-entries in the A/B/C matrices rather than rows of them, and Tornado is Poseidon-dense where
-the hash circuits are two- and three-term bit operations. On our side there is a second
-effect on top, that the MSM skips zero digits, so a bit-valued witness leaves most high
-windows empty and Keccak comes out cheaper than RSA at 1.25x its constraint count. This is
-why the estimator keys its reference by circuit and not by a fitted curve.
+Median ratio 5.3x. Read the table before trusting constraint count as a proxy for cost: it is
+not even monotonic. Tornado has less than half of SHA-256's constraints and is slower on both
+provers, Railgun 13x1 is smaller than RSA on both counts and slower than it on both provers,
+and Keccak is 1.25x RSA's constraint count and proves in 53% of the time on our side. Cost
+tracks non-zero entries in the A/B/C matrices rather than rows of them, and on our side the
+MSM additionally skips zero digits, so a bit-valued witness leaves most high windows empty.
+That is why the estimator keys its reference by circuit instead of fitting a curve.
 
-Anon Aadhaar is listed and skipped rather than omitted. Its 1,101,048 wires need 134.4 MB of
-G2 bases in a single storage binding, against the 128 MB WebGPU guarantees, so the backend
+The WebGPU column also shows where this backend stops winning. It does not go below about
+330 ms however small the circuit is, because that floor is fixed per-proof cost rather than
+arithmetic: Railgun 1x1 is only 1.9x, and something a little smaller would lose outright.
+
+Anon Aadhaar is shown as a skipped row rather than omitted. Its 1,101,048 wires need 134.4 MB
+of G2 bases in a single storage binding, against the 128 MB WebGPU guarantees, so the backend
 refuses it before it reaches the GPU. Chunked base bindings would fix it and are not written
-yet. A prover's ceiling is a result; hiding it is how a benchmark flatters itself.
+yet. A prover's ceiling is a result; dropping the row would leave a page whose largest circuit
+is the largest one that happens to work.
 
-`?circuits=tornado,sha256` picks a subset, `?reps=5` changes the rep count, `?all=1` includes
-the ones expected to refuse, `?profile=raised` asks for limits above the floor (which the
-browser may decline).
+`?circuits=tornado,sha256` picks a subset, `?reps=5` changes the rep count, `?warmup=N` the
+number of untimed reps before it, and `?profile=raised` asks the adapter for limits above the
+floor, which it is free to decline.
 
 ## Estimates
 

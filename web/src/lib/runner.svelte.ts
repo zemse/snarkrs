@@ -96,6 +96,11 @@ export class Run {
   get totalDownload() {
     return totalBytes(this.circuits);
   }
+  /// How many circuits will actually be proved. Not `circuits.length`, which counts the
+  /// listed-but-refused rows too, and would promise work the run is not going to do.
+  get willRun() {
+    return this.circuits.filter((c) => !c.refuses).length;
+  }
 
   async start() {
     if (this.phase === 'running' || this.phase === 'starting') return;

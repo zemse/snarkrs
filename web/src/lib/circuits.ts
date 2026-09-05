@@ -25,6 +25,15 @@ export type Circuit = {
 
 export const CIRCUITS: Circuit[] = [
   {
+    name: 'railgun-01x01',
+    label: 'Railgun 1x1',
+    blurb: 'A private transfer with one input note and one output. The small end.',
+    constraints: 20135,
+    wires: 20154,
+    zkeyBytes: 10010885,
+    wtnsBytes: 645004
+  },
+  {
     name: 'tornado',
     label: 'Tornado Cash',
     blurb: 'A Merkle membership proof, the shape most mixers and airdrops use.',
@@ -41,6 +50,15 @@ export const CIRCUITS: Circuit[] = [
     wires: 59170,
     zkeyBytes: 33867697,
     wtnsBytes: 1893516
+  },
+  {
+    name: 'railgun-13x01',
+    label: 'Railgun 13x1',
+    blurb: 'The same private transfer with thirteen input notes. Five times the work.',
+    constraints: 141276,
+    wires: 141499,
+    zkeyBytes: 68499861,
+    wtnsBytes: 4528044
   },
   {
     name: 'rsa2048',
@@ -67,7 +85,7 @@ export const CIRCUITS: Circuit[] = [
     // Chunked base bindings would fix it and are not written yet.
     name: 'anon-aadhaar',
     label: 'Anon Aadhaar',
-    blurb: 'India’s identity circuit. 1.1M constraints and a 631 MB proving key.',
+    blurb: 'India\u2019s identity circuit. 1.1M constraints and a 631 MB proving key.',
     constraints: 1115080,
     wires: 1101048,
     zkeyBytes: 631413453,
@@ -77,19 +95,21 @@ export const CIRCUITS: Circuit[] = [
   }
 ];
 
-/// What a run covers by default: everything the prover will actually accept, which today is
-/// the four that fit inside the floor limits. 262 MB of downloads and a couple of minutes.
-/// `?circuits=a,b` overrides it, and `?all=1` adds the ones expected to refuse.
+/// Every circuit, including the ones marked `refuses`. Those are shown as a skipped row
+/// rather than filtered out, which costs nothing (a skipped row downloads nothing) and keeps
+/// the prover's ceiling on the page. `?circuits=a,b` narrows it.
+///
+/// A refusal is a result. Dropping the row would leave a page whose largest circuit is the
+/// largest one that happens to work, which is how a benchmark ends up flattering itself
+/// without anybody deciding to.
 export function selectCircuits(search: string): Circuit[] {
-  const q = new URLSearchParams(search);
-  const only = q.get('circuits');
-  if (only) {
-    const want = only.split(',').map((s) => s.trim());
-    return CIRCUITS.filter((c) => want.includes(c.name));
-  }
-  if (q.get('all') === '1') return CIRCUITS;
-  return CIRCUITS.filter((c) => !c.refuses);
+  const only = new URLSearchParams(search).get('circuits');
+  if (!only) return CIRCUITS;
+  const want = only.split(',').map((s) => s.trim());
+  return CIRCUITS.filter((c) => want.includes(c.name));
 }
 
+/// What a run will actually fetch. The skipped rows are excluded, so the figure on the button
+/// is what the visitor is agreeing to download.
 export const totalBytes = (cs: Circuit[]) =>
-  cs.reduce((n, c) => n + c.zkeyBytes + c.wtnsBytes, 0);
+  cs.filter((c) => !c.refuses).reduce((n, c) => n + c.zkeyBytes + c.wtnsBytes, 0);

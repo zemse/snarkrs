@@ -66,7 +66,19 @@ async function streamInto(
   onProgress: (done: number, total: number) => void
 ) {
   const t0 = performance.now();
-  const r = await fetch(url);
+  const r = await fetch(url).catch((e) => {
+    // A CORS rejection reaches JavaScript as a bare TypeError reading "Failed to fetch",
+    // with the real reason left in the console where a visitor will not look. Since the one
+    // way this page fails on a fresh deployment is a bucket without a CORS rule, say so
+    // rather than making someone match a generic network error to a config file.
+    const cross = new URL(url, self.location.href).origin !== self.location.origin;
+    throw new Error(
+      cross
+        ? `could not fetch ${url}: ${e?.message ?? e}. The artifact host has to allow ` +
+          `cross-origin reads from ${self.location.origin}; see web/s3-cors.json.`
+        : `could not fetch ${url}: ${e?.message ?? e}`
+    );
+  });
   if (!r.ok) throw new Error(`${url}: ${r.status} ${r.statusText}`);
   const len = Number(r.headers.get('content-length') ?? 0);
   if (!len) {
@@ -157,12 +169,14 @@ const handlers: Record<string, (a: Args, emit: (p: unknown) => void) => Promise<
 
     // Small enough to keep as JSON. The vkey is what both provers get verified against.
     const [vkey, publicSignals] = await Promise.all(
-      ['vkey.json', 'public.json'].map((f) =>
-        fetch(`${base}/${name}/${f}`).then((r) => {
-          if (!r.ok) throw new Error(`${name}/${f}: ${r.status}`);
-          return r.json();
-        })
-      )
+      ['vkey.json', 'public.json'].map(async (f) => {
+        const url = `${base}/${name}/${f}`;
+        const r = await fetch(url).catch((e) => {
+          throw new Error(`could not fetch ${url}: ${e?.message ?? e}`);
+        });
+        if (!r.ok) throw new Error(`${name}/${f}: ${r.status} ${r.statusText}`);
+        return r.json();
+      })
     );
 
     return {
