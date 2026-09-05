@@ -20,6 +20,14 @@ name = "g16-dhat"
 path = "src/bin/dhat.rs"
 required-features = ["dhat-heap"]
 
+# Same reasoning, for the same reason it exists: the README snippet proves against a GPU
+# backend, so it cannot compile without one. Left ungated it is a compilation target under
+# the default features, where `g16_metal` is not linked, and `cargo test --workspace` goes
+# red on a tree with nothing wrong with it.
+[[example]]
+name = "readme_library_usage"
+required-features = ["metal"]
+
 [dependencies]
 g16-field.workspace = true
 g16-zkey.workspace = true
