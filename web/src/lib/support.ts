@@ -14,17 +14,35 @@
 ///    spec floor is exactly 128 MB so this should always pass, which is the reason to check
 ///    it: if it ever fails, saying so beats a shader that fails to create.
 ///
+/// The adapter's *actual* storage-binding size is returned on success, not just compared
+/// against the floor. The prover opens its device at the `auto` profile, which raises that
+/// one limit to whatever the adapter grants, so this number is what decides how far up the
+/// circuit ladder this machine can go. See `circuits.ts`.
+///
 /// A secure context is a fourth requirement and is not checked here, because a browser
 /// outside one does not expose `navigator.gpu` at all and so fails the first test. It is
 /// worth knowing when reading a bug report: WebGPU needs HTTPS in production, with
 /// `localhost` and `127.0.0.1` exempt.
 
 export type Support =
-  | { ok: true; vendor: string; architecture: string; device: string }
+  | {
+      ok: true;
+      vendor: string;
+      architecture: string;
+      device: string;
+      /// What this adapter says it can bind in one storage buffer, which is what decides
+      /// whether the largest circuits are in reach. Read here rather than after the device
+      /// opens, because the page has to size the ladder and quote a download total before
+      /// the worker exists. The device may still grant less; the runner reconciles.
+      maxStorageBinding: number;
+      maxBufferSize: number;
+    }
   | { ok: false; reason: string; detail: string };
 
+import { FLOOR_STORAGE_BINDING } from './circuits';
+
 /// The floor every WebGPU implementation guarantees, and what the backend is built against.
-const NEEDED_STORAGE_BINDING = 128 * 1024 * 1024;
+const NEEDED_STORAGE_BINDING = FLOOR_STORAGE_BINDING;
 
 export async function checkSupport(): Promise<Support> {
   if (!navigator.gpu) {
@@ -76,6 +94,8 @@ export async function checkSupport(): Promise<Support> {
     ok: true,
     vendor: i.vendor ?? '',
     architecture: i.architecture ?? '',
-    device: i.device ?? ''
+    device: i.device ?? '',
+    maxStorageBinding: have,
+    maxBufferSize: adapter.limits.maxBufferSize
   };
 }

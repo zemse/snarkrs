@@ -6,7 +6,14 @@
 /// through, because at real circuit sizes the last row can be two minutes after the first
 /// and a page that shows nothing until the end looks broken.
 
-import { CIRCUITS, selectCircuits, totalBytes, type Circuit } from './circuits';
+import {
+  CIRCUITS,
+  FLOOR_STORAGE_BINDING,
+  cannotRun,
+  selectCircuits,
+  totalBytes,
+  type Circuit
+} from './circuits';
 import { Estimator } from './estimate';
 import { Prover } from './prover';
 import { snarkjsProve, snarkjsVerify } from './snarkjs';
@@ -53,9 +60,11 @@ export class Run {
   rows = $state<Row[]>(
     selectCircuits(typeof location === 'undefined' ? '' : location.search).map((circuit) => ({
       circuit,
-      status: circuit.refuses ? ('skipped' as const) : ('pending' as const),
-      downloaded: 0,
-      note: circuit.refuses
+      // Every row starts runnable. What this device can actually hold is not known until an
+      // adapter has been asked, so `plan()` is what marks rows skipped, and it is called
+      // again once the device reports what it really granted.
+      status: 'pending' as const,
+      downloaded: 0
     }))
   );
   phase = $state<'idle' | 'starting' | 'running' | 'done' | 'error'>('idle');
@@ -86,7 +95,11 @@ export class Run {
   /// came out at 4.09 s, against 1.03 s for the same circuit once the page was warm. Three
   /// untimed reps is what the native harness settled on for the same reason.
   private readonly warmup = param('warmup', 3);
-  private readonly profile = new URLSearchParams(q()).get('profile') ?? 'floor';
+  /// `auto` by default: the floor for everything that shapes a kernel, and the adapter's own
+  /// number for the two limits that only decide how much fits. `?profile=floor` forces the
+  /// specification's guarantees, which is what to use when the question is what a stock
+  /// browser elsewhere would do rather than what this machine can do.
+  private readonly profile = new URLSearchParams(q()).get('profile') ?? 'auto';
   /// Where the artifacts come from. In dev this is the Vite proxy, which exists so a
   /// checkout with no AWS access still runs the whole benchmark; in a build it is the bucket
   /// directly, which is what makes the CORS rule in s3-cors.json load-bearing.
@@ -104,12 +117,46 @@ export class Run {
     return selectCircuits(q());
   }
   get totalDownload() {
-    return totalBytes(this.circuits);
+    return totalBytes(this.circuits, this.bindingLimit);
   }
   /// How many circuits will actually be proved. Not `circuits.length`, which counts the
   /// listed-but-refused rows too, and would promise work the run is not going to do.
+  /// What one storage binding may hold on this device, in bytes.
+  ///
+  /// Starts at the WebGPU floor, which is what the specification guarantees and therefore
+  /// the only safe assumption before an adapter has been asked. The page raises it from
+  /// `checkSupport()` as soon as that resolves, and the runner lowers it again if the device
+  /// turns out to have granted less than the adapter advertised.
+  bindingLimit = $state(FLOOR_STORAGE_BINDING);
+
+  /// Marks the rows this device cannot hold, and un-marks the ones it can.
+  ///
+  /// Idempotent and safe to call repeatedly: it only ever moves a row between `pending` and
+  /// `skipped`, never touching one that has already run. That matters because it is called
+  /// three times, on three progressively better answers to "how big a buffer is allowed":
+  /// the floor at construction, the adapter's claim once `checkSupport()` returns, and the
+  /// device's actual grant once the worker has opened one.
+  plan(limit: number) {
+    this.bindingLimit = limit;
+    for (const r of this.rows) {
+      if (r.status !== 'pending' && r.status !== 'skipped') continue;
+      const why = cannotRun(r.circuit, limit);
+      r.status = why ? 'skipped' : 'pending';
+      // A row that only runs because this GPU offers more than the specification promises
+      // says so. Without it, a result taken here and a result taken on a stock floor-only
+      // device look like the same measurement of the same ladder, and the first one quietly
+      // has an extra circuit in it.
+      r.note =
+        why ??
+        (cannotRun(r.circuit, FLOOR_STORAGE_BINDING)
+          ? 'needs more than the 128 MiB binding the WebGPU floor guarantees; this GPU ' +
+            'allows it, a stock floor-only device would skip this row'
+          : undefined);
+    }
+  }
+
   get willRun() {
-    return this.circuits.filter((c) => !c.refuses).length;
+    return this.rows.filter((r) => r.status !== 'skipped').length;
   }
 
   async start() {
@@ -126,15 +173,16 @@ export class Run {
     // Reset rather than rebuild, so a second run reuses the same objects and the table does
     // not flash empty between runs.
     for (const r of this.rows) {
-      r.status = r.circuit.refuses ? 'skipped' : 'pending';
+      r.status = 'pending';
       r.downloaded = 0;
       r.downloadMs = r.prepareMs = r.webgpuMs = r.snarkjsMs = undefined;
       r.crossVerified = undefined;
       r.webgpuReps = r.snarkjsReps = undefined;
       r.stages = undefined;
       r.error = undefined;
-      r.note = r.circuit.refuses;
+      r.note = undefined;
     }
+    this.plan(this.bindingLimit);
     this.recomputeEta();
 
     try {
@@ -152,6 +200,19 @@ export class Run {
         // have to come from JS rather than from the prover.
         adapter: await adapterInfo()
       };
+
+      // Re-plan against what the device actually granted, which is the first authoritative
+      // answer. Until now the ladder was sized from the adapter's *claim*, and the two can
+      // differ: `auto` asks for the adapter's number, but a driver may refuse it and the
+      // backend then falls back to the floor rather than failing outright. When that
+      // happens the fallback reason is carried in `caps()` so the row can say the circuit
+      // was dropped because this device would not grant the memory, not because the circuit
+      // is too big in principle.
+      const granted = this.env?.limits?.max_storage_buffer_binding_size?.[1];
+      if (typeof granted === 'number' && granted > 0) this.plan(granted);
+      if (this.env?.auto_fallback) {
+        this.activity = 'this device refused the larger limits; running what fits';
+      }
       // `?selftest=1` runs the GPU known-answer battery before any proving and puts the
       // result in `env`, which is what `?report=1` posts. It is off by default because it
       // compiles seven throwaway shader modules; it is the first thing to turn on when a
@@ -338,8 +399,20 @@ export class Run {
 
       row.status = 'done';
     } catch (e: any) {
-      row.status = 'error';
-      row.error = String(e?.message ?? e);
+      const msg = String(e?.message ?? e);
+      // The backend refuses an oversized binding before it allocates anything, with a
+      // message naming the limit. That is this device declining the circuit, which the
+      // pre-flight `plan()` normally catches first; reaching it here means the device
+      // granted less than it advertised, or some other buffer was the one that did not fit.
+      // Either way it is a capacity fact, not a failure, and a red error row would say the
+      // wrong thing about a prover that behaved correctly.
+      if (/over the \d+ byte (storage binding|buffer) limit/.test(msg)) {
+        row.status = 'skipped';
+        row.note = `could not run on this device: ${msg}`;
+      } else {
+        row.status = 'error';
+        row.error = msg;
+      }
     } finally {
       this.subProgress = null;
       // Always, including after a failure. Otherwise the key that just failed is still

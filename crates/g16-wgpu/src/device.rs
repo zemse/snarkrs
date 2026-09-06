@@ -87,6 +87,32 @@ pub enum LimitsProfile {
     /// against 8. That last one is the correction in the module docs, and it is why no
     /// kernel is allowed to need a ninth.
     Raised,
+    /// The floor, with **only the two capacity limits** raised to what the adapter grants:
+    /// `max_buffer_size` and `max_storage_buffer_binding_size`. This is the profile the
+    /// browser uses, and it is the one to reach for when the question is "can this device
+    /// hold a bigger circuit" rather than "how fast can this device go".
+    ///
+    /// # Why this is not just [`Self::Raised`]
+    ///
+    /// `Raised` hands the adapter's whole limit set to the device, which on this machine
+    /// also means 32 KiB of workgroup storage against the floor's 16 KiB and 1024
+    /// invocations against 256. Those two are inputs to kernel *geometry*: how many NTT
+    /// passes fuse into a tile, how wide a workgroup is. A kernel shaped by them is a kernel
+    /// shaped differently on every GPU, and it is shaped in a way no test covers, because
+    /// the tests run at the floor.
+    ///
+    /// In practice they cannot leak, because [`WgpuBackend::ceiling_workgroup_bytes`] and
+    /// [`WgpuBackend::ceiling_invocations`] already clamp to the floor whatever the device
+    /// granted. This profile makes that belt-and-braces: geometry is pinned by not asking
+    /// for the headroom in the first place, so the only thing that changes between Floor and
+    /// Auto is **how large a buffer may be**, which every kernel treats as a bound to check
+    /// rather than a shape to fit.
+    ///
+    /// That distinction is what makes this safe to turn on by default. A device that grants
+    /// more capacity runs the identical kernels over more data. See
+    /// [`Self::limits_table`] for the measured gap, and prior art for heliax shipping the
+    /// other choice twice.
+    Auto,
 }
 
 impl LimitsProfile {
@@ -112,8 +138,10 @@ impl LimitsProfile {
         match v.trim().to_ascii_lowercase().as_str() {
             "floor" | "" => Ok(Self::Floor),
             "raised" => Ok(Self::Raised),
+            "auto" => Ok(Self::Auto),
             other => Err(bad(format!(
-                "G16_WGPU_LIMITS={other:?} is not a profile, expected \"floor\" or \"raised\""
+                "G16_WGPU_LIMITS={other:?} is not a profile, expected \"floor\", \"raised\" \
+                 or \"auto\""
             ))),
         }
     }
@@ -122,6 +150,7 @@ impl LimitsProfile {
         match self {
             Self::Floor => "floor",
             Self::Raised => "raised",
+            Self::Auto => "auto",
         }
     }
 
@@ -130,6 +159,24 @@ impl LimitsProfile {
         match self {
             Self::Floor => wgpu::Limits::default(),
             Self::Raised => adapter.limits(),
+            Self::Auto => {
+                let floor = wgpu::Limits::default();
+                let a = adapter.limits();
+                wgpu::Limits {
+                    // `max` and not a bare assignment: an adapter is allowed to report less
+                    // than the floor for a limit it does not care about, and requesting less
+                    // than the floor would make this profile a downgrade on that device.
+                    max_buffer_size: a.max_buffer_size.max(floor.max_buffer_size),
+                    max_storage_buffer_binding_size: a
+                        .max_storage_buffer_binding_size
+                        .max(floor.max_storage_buffer_binding_size),
+                    // Everything else stays exactly at the floor. See the variant's docs for
+                    // why widening `max_compute_workgroup_storage_size` or
+                    // `max_compute_invocations_per_workgroup` here would be a different and
+                    // much less safe change.
+                    ..floor
+                }
+            }
         }
     }
 }
@@ -152,6 +199,10 @@ pub struct WgpuBackend {
     info: wgpu::AdapterInfo,
     profile: LimitsProfile,
     requested: wgpu::Limits,
+    /// Why [`LimitsProfile::Auto`] became [`LimitsProfile::Floor`], if it did. Kept rather
+    /// than logged because the only caller that needs it is the browser, where `eprintln!`
+    /// goes nowhere: see [`Self::auto_fallback`].
+    auto_fallback: Option<String>,
     /// First uncaptured device error, if any. See [`Self::take_error`].
     error: Arc<Mutex<Option<String>>>,
     /// Held for the whole of one proof's GPU section. See [`Self::exclusive`].
@@ -199,27 +250,59 @@ impl WgpuBackend {
             .await
             .map_err(|e| bad(format!("no wgpu adapter on this machine: {e}")))?;
         let info = adapter.get_info();
-        let requested = profile.required_limits(&adapter);
 
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("g16-wgpu"),
-                // Empty on purpose and at both profiles. Every feature beyond the WebGPU
-                // core set is one no browser has, and `SHADER_INT64` in particular is
-                // reported as present on native Metal here while not existing in the
-                // specification at all.
-                required_features: wgpu::Features::empty(),
-                required_limits: requested.clone(),
-                ..Default::default()
-            })
-            .await
-            .map_err(|e| {
-                bad(format!(
-                    "adapter {:?} refused a device at the {} profile: {e}",
-                    info.name,
-                    profile.as_str()
-                ))
-            })?;
+        // `Auto` asks for capacity the adapter has just claimed to have, so a refusal here
+        // should be impossible. It is still handled, because "impossible" across every
+        // driver and browser version this will ever run on is a guess, and the failure mode
+        // without a fallback is a page that cannot prove anything at all rather than one
+        // that cannot prove the largest circuit. Floor is what the tests run, so it is the
+        // safe thing to land on.
+        let mut profile = profile;
+        let mut requested = profile.required_limits(&adapter);
+        let mut refusal: Option<String> = None;
+
+        let (device, queue) = loop {
+            match adapter
+                .request_device(&wgpu::DeviceDescriptor {
+                    label: Some("g16-wgpu"),
+                    // Empty on purpose and at every profile. Every feature beyond the WebGPU
+                    // core set is one no browser has, and `SHADER_INT64` in particular is
+                    // reported as present on native Metal here while not existing in the
+                    // specification at all.
+                    required_features: wgpu::Features::empty(),
+                    required_limits: requested.clone(),
+                    ..Default::default()
+                })
+                .await
+            {
+                Ok(pair) => break pair,
+                Err(e) if profile == LimitsProfile::Auto => {
+                    refusal = Some(format!("{e}"));
+                    profile = LimitsProfile::Floor;
+                    requested = profile.required_limits(&adapter);
+                }
+                Err(e) => {
+                    return Err(bad(format!(
+                        "adapter {:?} refused a device at the {} profile: {e}",
+                        info.name,
+                        profile.as_str()
+                    )))
+                }
+            }
+        };
+
+        // Not silent. A run that quietly fell back would report a floor-sized ceiling on a
+        // device that should have had more, and the row it then skips would look like a
+        // property of the circuit rather than of this fallback. `eprintln!` covers native;
+        // the browser reads `auto_fallback` out of `caps()`, because stderr is not a place
+        // there.
+        if let Some(e) = &refusal {
+            eprintln!(
+                "wgpu: adapter {:?} refused a device at the auto profile ({e}); fell back to \
+                 floor",
+                info.name
+            );
+        }
 
         // wgpu's default uncaptured-error handler panics on native and logs to the console on
         // the web, and the web half is the problem: a shader that fails validation in Chrome
@@ -265,6 +348,7 @@ impl WgpuBackend {
             info,
             profile,
             requested,
+            auto_fallback: refusal,
             error,
             gpu: Mutex::new(()),
             cost: Mutex::new(PrepareCost::default()),
@@ -331,6 +415,12 @@ impl WgpuBackend {
     pub fn ceiling_workgroup_bytes(&self) -> u64 {
         u64::from(self.granted_limits().max_compute_workgroup_storage_size)
             .min(crate::gen::FLOOR_WORKGROUP_BYTES)
+    }
+
+    /// Why an [`LimitsProfile::Auto`] request ended up on the floor, if it did. `None` on
+    /// every other profile and on an `Auto` request the adapter honoured.
+    pub fn auto_fallback(&self) -> Option<&str> {
+        self.auto_fallback.as_deref()
     }
 
     /// Takes the first uncaptured device error since the last call, if there was one.

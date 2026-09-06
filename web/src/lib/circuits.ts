@@ -17,11 +17,40 @@ export type Circuit = {
   wires: number;
   zkeyBytes: number;
   wtnsBytes: number;
-  /// Set when the prover is known to refuse the circuit, with the reason. The row is still
-  /// listed: a prover's ceiling is a result, and hiding it is how a benchmark flatters
-  /// itself. Nothing here runs by default.
-  refuses?: string;
 };
+
+/// The storage-binding size every WebGPU implementation guarantees, and the only size that
+/// may be assumed before an adapter has answered. 128 MiB.
+export const FLOOR_STORAGE_BINDING = 128 * 1024 * 1024;
+
+/// Bytes of one G2 base point: `(x, y)` with both in Fq2, so four Fq, each a 254-bit number
+/// stored in 32 bytes.
+const G2_POINT_BYTES = 128;
+
+/// The largest single storage binding a circuit needs, which is stage 6's G2 base vector:
+/// one point per wire, contiguous, bound whole.
+///
+/// This is the ceiling that decides whether a device can prove a circuit at all, and it is
+/// computed rather than recorded per circuit so a new row cannot be added with a stale
+/// answer. The G1 bases are half the size per point and never the binding that overflows.
+export const g2BindingBytes = (c: Circuit) => c.wires * G2_POINT_BYTES;
+
+/// Why this device cannot prove this circuit, or `null` if it can.
+///
+/// `granted` is the adapter's own `maxStorageBufferBindingSize`, not the WebGPU floor. The
+/// prover opens its device at the `auto` profile, which asks for exactly that number, so a
+/// GPU with headroom gets to use it. A stock floor-only device gets the 128 MiB the
+/// specification guarantees and the largest circuits are simply out of reach there, which is
+/// a fact about the device and is reported as one.
+export function cannotRun(c: Circuit, granted: number): string | null {
+  const need = g2BindingBytes(c);
+  if (need <= granted) return null;
+  const mib = (n: number) => `${(n / 1024 ** 2).toFixed(1)} MiB`;
+  return (
+    `needs ${mib(need)} in one GPU buffer binding for its ${c.wires.toLocaleString()} G2 ` +
+    `base points, and this device grants ${mib(granted)}`
+  );
+}
 
 export const CIRCUITS: Circuit[] = [
   {
@@ -79,23 +108,25 @@ export const CIRCUITS: Circuit[] = [
     wtnsBytes: 7688300
   },
   {
-    // 1,101,048 wires. The G2 base vector alone is 128 bytes per wire, so 140,934,144 bytes
-    // against WebGPU's guaranteed 134,217,728 byte storage-binding limit: the backend
-    // refuses it before it touches the GPU, on every browser that only offers the floor.
-    // Chunked base bindings would fix it and are not written yet.
+    // 1,101,048 wires, so 140,934,144 bytes of G2 bases against WebGPU's guaranteed
+    // 134,217,728 byte storage binding: 5% too big for a device that only offers the floor,
+    // and comfortable on one that offers more. It proves in about 1.8 s on an M2 Max, whose
+    // adapter grants 4 GiB. `cannotRun` decides per device rather than per circuit, which is
+    // why there is no hardcoded refusal here any more.
+    //
+    // Chunked base bindings would put it in reach of floor-only devices too, and are not
+    // written yet.
     name: 'anon-aadhaar',
     label: 'Anon Aadhaar',
     blurb: 'India\u2019s identity circuit. 1.1M constraints and a 631 MB proving key.',
     constraints: 1115080,
     wires: 1101048,
     zkeyBytes: 631413453,
-    wtnsBytes: 35233612,
-    refuses:
-      'its G2 bases need 134.4 MB in one binding, over the 128 MB WebGPU guarantees; needs chunked bindings'
+    wtnsBytes: 35233612
   }
 ];
 
-/// Every circuit, including the ones marked `refuses`. Those are shown as a skipped row
+/// Every circuit, including any this device cannot hold. Those are shown as a skipped row
 /// rather than filtered out, which costs nothing (a skipped row downloads nothing) and keeps
 /// the prover's ceiling on the page. `?circuits=a,b` narrows it.
 ///
@@ -109,7 +140,10 @@ export function selectCircuits(search: string): Circuit[] {
   return CIRCUITS.filter((c) => want.includes(c.name));
 }
 
-/// What a run will actually fetch. The skipped rows are excluded, so the figure on the button
-/// is what the visitor is agreeing to download.
-export const totalBytes = (cs: Circuit[]) =>
-  cs.filter((c) => !c.refuses).reduce((n, c) => n + c.zkeyBytes + c.wtnsBytes, 0);
+/// What a run will actually fetch on a device with this binding limit. The rows that cannot
+/// run are excluded, so the figure on the button is what the visitor is agreeing to download
+/// and not a number that includes a 631 MB key nothing will ask for.
+export const totalBytes = (cs: Circuit[], granted: number) =>
+  cs
+    .filter((c) => !cannotRun(c, granted))
+    .reduce((n, c) => n + c.zkeyBytes + c.wtnsBytes, 0);

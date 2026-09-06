@@ -307,16 +307,31 @@ pub fn wtns_take(ptr: *mut u8, len: usize) -> Result<(), JsError> {
 
 /// Opens an adapter and a device and compiles the three MSM shader modules.
 ///
-/// `profile` is `"floor"` or `"raised"`, and it is a parameter rather than an environment
-/// variable because a browser has no environment. **Floor is the default and it is the honest
-/// one**: it requests the WebGPU specification's own defaults (128 MiB storage binding,
-/// 16 KiB workgroup storage, 256 invocations) rather than what this adapter happens to offer,
-/// so a number taken here is one a stock browser on other hardware could reproduce. Chrome on
-/// an M2 Max grants far more if asked. Whichever ran is reported by [`caps`] and belongs in
-/// the CSV.
+/// `profile` is `"auto"`, `"floor"` or `"raised"`, and it is a parameter rather than an
+/// environment variable because a browser has no environment. **`auto` is the default.**
+///
+/// # Why the default is `auto` and why that is still honest
+///
+/// `floor` requests the WebGPU specification's own defaults, so a number taken under it is
+/// one a stock browser on other hardware could reproduce. That is the right default for a
+/// benchmark and it was the default here. It is the wrong default for a page whose question
+/// is "what can *this* device do", because it makes a 1.1M-constraint circuit unprovable on
+/// a GPU with 4 GiB of binding headroom purely because the specification only promises
+/// 128 MiB.
+///
+/// `auto` keeps every limit at the floor except `max_buffer_size` and
+/// `max_storage_buffer_binding_size`. Those two are capacity, not geometry: no kernel is
+/// shaped by them, they are bounds each stage checks before allocating. The two limits that
+/// *do* shape kernels stay pinned, and were already clamped to the floor in code regardless
+/// of what the device granted. So `auto` runs the identical kernels over more data, and the
+/// only thing it can change about a result is whether it exists.
+///
+/// It is still reportable: [`caps`] names the profile that actually ran, gives requested
+/// against granted for all five limits, and gives `auto_fallback` when a device refused the
+/// request. A row that needed above-floor capacity is a row the caller can label as such.
 #[wasm_bindgen]
 pub async fn create_prover(profile: Option<String>) -> Result<(), JsError> {
-    let profile = LimitsProfile::parse(profile.as_deref().unwrap_or("floor")).map_err(js)?;
+    let profile = LimitsProfile::parse(profile.as_deref().unwrap_or("auto")).map_err(js)?;
 
     // Before the device, because a context with no CSPRNG must fail at start-up and not at
     // stage 10 of the first proof. `js_sys::global()` covers Window and WorkerGlobalScope
@@ -388,6 +403,7 @@ pub fn caps() -> Result<String, JsError> {
                 r#""max_compute_workgroup_storage_size":[{},{}],"#,
                 r#""max_compute_invocations_per_workgroup":[{},{}],"#,
                 r#""max_storage_buffers_per_shader_stage":[{},{}]}},"#,
+                r#""auto_fallback":{},"#,
                 r#""msm_modules":{},"msm_pipelines":{},"msm_compile_us":{}}}"#,
             ),
             d.profile().as_str(),
@@ -407,6 +423,7 @@ pub fn caps() -> Result<String, JsError> {
             g.max_compute_invocations_per_workgroup,
             r.max_storage_buffers_per_shader_stage,
             g.max_storage_buffers_per_shader_stage,
+            d.auto_fallback().map_or("null".to_string(), json_string),
             compile.modules,
             compile.pipelines,
             compile.module_us,

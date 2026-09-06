@@ -14,6 +14,10 @@
 
   onMount(async () => {
     support = await checkSupport();
+    // Size the ladder to this adapter before the button is enabled, so the download total on
+    // it is what this machine will actually fetch. The device may still grant less than the
+    // adapter claims, and `start()` re-plans when it finds out.
+    if (support.ok) run.plan(support.maxStorageBinding);
     // `?auto=1` starts without a click. This exists so the page can be run on a browser
     // that cannot be driven from here: Safari refuses WebDriver until "Allow remote
     // automation" is switched on by hand, and a Safari-only failure is exactly the kind that
