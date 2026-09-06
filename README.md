@@ -4,6 +4,7 @@
 - CPU (pure rust)
 - Apple Metal
 - NVIDIA CUDA
+- WebGPU ([demo](https://gpu-snark.vercel.app/))
 - BN254 support
 - Backends behind a rust feature flags
 - Library support
