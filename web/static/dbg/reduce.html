@@ -15,7 +15,8 @@
   storage, no atomics, one thread per workgroup: nothing here is allowed to race. Needs <code>g2.wgsl</code> beside it:
   <code>cargo run -p g16-wgpu --example dump_points_wgsl g2 &gt; web/static/dbg/g2.wgsl</code>.
 </p>
-<pre id="out">idle; call __run(windows = 8, buckets = 256)</pre>
+<p><button id="go" style="font:16px system-ui;padding:.6rem 1.2rem">run</button></p>
+<pre id="out">idle; or call __run(windows = 8, buckets = 256)</pre>
 <script type="module">
   const out = document.getElementById('out');
   const log = (s) => { out.textContent += '\n' + s; };
@@ -51,6 +52,18 @@ fn repro_folded(@builtin(workgroup_id) wid: vec3<u32>) {
     WSUMS[w] = pts[1];
 }
 `;
+
+  // `?report=1` posts the verdict to the dev server's sink, which is the only way to read a
+  // result off a phone with no inspector attached. Off by default, so the page stays
+  // standalone: see the g16-report-sink plugin in web/vite.config.ts.
+  const report = async (text) => {
+    if (new URLSearchParams(location.search).get('report') !== '1') return;
+    try {
+      await fetch('/__report', { method: 'POST', body: `${navigator.userAgent}\n${text}` });
+    } catch {
+      /* a debugging aid must never take the measurement down with it */
+    }
+  };
 
   globalThis.__run = async (windows = 8, buckets = 256) => {
     out.textContent = `running, ${windows} windows of ${buckets} buckets`;
@@ -106,6 +119,7 @@ fn repro_folded(@builtin(workgroup_id) wid: vec3<u32>) {
       await new Promise((r) => setTimeout(r, 800));
       log(`${b ? 'repro_direct' : 'repro_folded'} failed: ${e}`);
       log('device: ' + (lost ?? 'alive'));
+      await report(out.textContent);
       return 'LOST';
     }
     let firstBad = -1, zeroA = true, zeroB = true;
@@ -117,6 +131,14 @@ fn repro_folded(@builtin(workgroup_id) wid: vec3<u32>) {
     if (zeroA !== zeroB) log(`all-zero output: direct ${zeroA}, folded ${zeroB}`);
     log(firstBad < 0 ? 'outputs MATCH' : `outputs DIFFER from word ${firstBad} (window ${Math.floor(firstBad / (PT / 4))})`);
     log('device: ' + (lost ?? 'alive'));
+    await report(out.textContent);
     return firstBad < 0 ? 'MATCH' : 'DIFFER';
   };
+
+  // A phone has no console unless a Mac is attached, and that is exactly the case this
+  // page exists for. `?auto=1` needs not even the tap, for a phone opened by
+  // `xcrun devicectl device process launch --payload-url`.
+  const go = () => __run().then((v) => log('verdict: ' + v), (e) => log('threw: ' + e));
+  document.getElementById('go').onclick = go;
+  if (new URLSearchParams(location.search).get('auto') === '1') go();
 </script>
