@@ -9,3 +9,8 @@ node_modules
 .svelte-kit
 build
 .vercel
+
+# `vercel link` writes a VERCEL_OIDC_TOKEN in here. A credential has no business in an
+# upload, and anything the build genuinely needs belongs in the project's environment
+# variables rather than in a file that rides along with the source.
+.env*

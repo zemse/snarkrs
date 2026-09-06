@@ -1,5 +1,8 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "buildCommand": "vite build",
+  "outputDirectory": "build",
   "headers": [
     {
       "source": "/(.*).wasm",

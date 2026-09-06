@@ -4,3 +4,5 @@ build/
 # Produced by scripts/build-wasm.sh from crates/g16-wasm. Around 1 MB of binary that is
 # fully reproducible from the workspace, so it is built rather than committed.
 static/pkg/
+.vercel
+.env*
