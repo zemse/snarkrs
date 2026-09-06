@@ -72,29 +72,43 @@ reference.
 | Railgun 13x1 | 141,276 | 68 MB | 4.13 s | 939 ms | 41 ms | 4.4x |
 | RSA-2048 | 190,945 | 104 MB | 3.63 s | 488 ms | 44 ms | 7.4x |
 | Keccak-256 | 239,176 | 108 MB | 3.07 s | 261 ms | 42 ms | 12x |
-| Anon Aadhaar | 1,115,080 | 631 MB | — | — | — | listed, not run |
+| Anon Aadhaar | 1,115,080 | 631 MB | 22.5 s | 1712 ms | n/a | 13.1x |
 
-Median ratio 5.3x. Read the table before trusting constraint count as a proxy for cost: it is
-not even monotonic. Tornado has less than half of SHA-256's constraints and is slower on both
-provers, Railgun 13x1 is smaller than RSA on both counts and slower than it on both provers,
-and Keccak is 1.25x RSA's constraint count and proves in 53% of the time on our side. Cost
-tracks non-zero entries in the A/B/C matrices rather than rows of them, and on our side the
-MSM additionally skips zero digits, so a bit-valued witness leaves most high windows empty.
-That is why the estimator keys its reference by circuit instead of fitting a curve.
+Median ratio 5.3x over the first six. Anon Aadhaar's upload was not recorded on the run that
+produced its proving numbers, hence the gap in that column.
+
+Read the table before trusting constraint count as a proxy for cost: it is not even monotonic.
+Tornado has less than half of SHA-256's constraints and is slower on both provers, Railgun
+13x1 is smaller than RSA on both counts and slower than it on both provers, and Keccak is
+1.25x RSA's constraint count and proves in 53% of the time on our side. Cost tracks non-zero
+entries in the A/B/C matrices rather than rows of them, and on our side the MSM additionally
+skips zero digits, so a bit-valued witness leaves most high windows empty. That is why the
+estimator keys its reference by circuit instead of fitting a curve.
 
 The WebGPU column also shows where this backend stops winning. It does not go below about
 330 ms however small the circuit is, because that floor is fixed per-proof cost rather than
 arithmetic: Railgun 1x1 is only 1.9x, and something a little smaller would lose outright.
 
-Anon Aadhaar is shown as a skipped row rather than omitted. Its 1,101,048 wires need 134.4 MB
-of G2 bases in a single storage binding, against the 128 MB WebGPU guarantees, so the backend
-refuses it before it reaches the GPU. Chunked base bindings would fix it and are not written
-yet. A prover's ceiling is a result; dropping the row would leave a page whose largest circuit
-is the largest one that happens to work.
+Anon Aadhaar is the row that does not fit everywhere. Its 1,101,048 wires need 134.4 MB of G2
+bases in a single storage binding, against the 128 MB the WebGPU specification guarantees, so
+it is 5% over a floor-only device's ceiling. The page does not ask the reader to care about
+that. It reads the adapter's real `maxStorageBufferBindingSize` before enabling the button,
+runs the row if the number covers it, and marks it skipped with the two sizes spelled out if
+it does not. Chunked base bindings would put it in reach of floor-only devices too, and are
+not written yet. A prover's ceiling is a result; dropping the row would leave a page whose
+largest circuit is the largest one that happens to work.
+
+The limits it asks for are narrower than they look. `auto`, the default, takes the floor for
+everything that shapes a kernel and the adapter's own number only for the two limits that
+decide how much fits, so a device with 32 KiB of workgroup storage still runs the 16 KiB
+kernels the floor guarantees and the numbers stay comparable across machines. Measured back
+to back on an M2 Max, `auto` and `raised` are the same proof to within noise (1778 ms against
+1789 ms), which is the evidence that the extra geometry buys nothing and the two capacity
+limits are the whole of it.
 
 `?circuits=tornado,sha256` picks a subset, `?reps=5` changes the rep count, `?warmup=N` the
-number of untimed reps before it, and `?profile=raised` asks the adapter for limits above the
-floor, which it is free to decline.
+number of untimed reps before it, and `?profile=floor|raised|auto` overrides the limits
+profile described above.
 
 ## Estimates
 
@@ -111,7 +125,21 @@ starting point rather than a prediction: Keccak-256 has 1.7x the wires of a synt
 that takes three times as long, because the MSM skips zero digits and a bit-valued witness
 leaves most high windows empty.
 
-## Deployment notes
+## Deploying
+
+    npm run deploy        # build-wasm.sh, then vercel deploy --prod
+
+**Deploy from a machine, not from a git push.** `static/pkg` is gitignored and building it
+needs the Rust toolchain, wasm-pack and binaryen, none of which exist in Vercel's build
+image. A git-linked project would clone a checkout with no prover in it, run `vite build`
+successfully, and serve a page that 404s on `g16_wasm_bg.wasm` at `init()`. Nothing in the
+build would go red. `.vercelignore` is what keeps `static/pkg` in the CLI's upload, and it
+replaces `.gitignore` rather than adding to it, which is the only reason the wasm travels.
+
+If push-to-deploy is ever wanted, the fork is: commit `static/pkg` (2 MB of binary that then
+has to be kept in step by hand), or install rustup and wasm-pack in the Vercel build
+(several minutes per deploy, and the root directory has to be allowed to read the crates
+above it). Neither is worth it for a page that is deployed when a number changes.
 
 WebGPU needs a secure context: HTTPS in production, with `localhost` and `127.0.0.1` exempt.
 Chrome 113+ on desktop, 121+ on Android. Feature-detect `navigator.gpu` **and** null-check the

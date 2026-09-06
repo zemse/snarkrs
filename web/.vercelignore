@@ -1,0 +1,11 @@
+# Vercel's CLI falls back to .gitignore when this file is absent, and .gitignore excludes
+# static/pkg. That directory is the entire prover. Without this file the upload silently
+# omits the wasm, npm run build succeeds on Vercel, and the deployed page dies at
+# `init()` with a 404 for g16_wasm_bg.wasm.
+#
+# So this list exists to REPLACE .gitignore rather than to add to it. Anything that has to
+# reach the build image and is not committed to git belongs off this list.
+node_modules
+.svelte-kit
+build
+.vercel
