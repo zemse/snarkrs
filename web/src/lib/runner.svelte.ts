@@ -531,7 +531,14 @@ export class Run {
   private recomputeEta() {
     const { done, total } = this.work();
     this.etaMs = Math.max(0, total - done);
-    this.progress = total > 0 ? Math.min(1, done / total) : 0;
+    // Ratcheted, because pricing both halves with the same estimates keeps the ring steady
+    // through a recalibration but does not quite pin it. When the machine turns out slower
+    // than the reference, every unproved circuit's prediction grows, and the largest one
+    // still to come grows most, so the denominator can outrun the numerator: measured at
+    // 4% of the sweep on a loaded machine, once, between the first and second circuit. The
+    // ring may decline to advance. It may not go backwards.
+    const p = total > 0 ? Math.min(1, done / total) : 0;
+    this.progress = Math.max(this.progress, p);
     this.calibrated = this.est.calibrated;
   }
 
