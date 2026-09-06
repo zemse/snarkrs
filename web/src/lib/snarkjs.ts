@@ -35,18 +35,24 @@ export async function snarkjsProve(
   vkey: unknown,
   reps: number,
   warmup: number,
-  onRep: (i: number, ms: number) => void
+  /// Fires after every proof, warm-ups included, with how many of the `warmup + reps` are
+  /// behind us. Warm-ups used to report nothing, so the whole warm-up block looked to the
+  /// caller like one proof that had not finished yet, and an ETA driven off it sat still
+  /// for the duration.
+  onStep: (done: number, total: number) => void
 ): Promise<SnarkjsRun> {
   if (typeof snarkjs === 'undefined') {
     throw new Error('snarkjs did not load; static/vendor/snarkjs.min.js is missing');
   }
 
+  const total = warmup + reps;
   let last: any = null;
   for (let i = 0; i < warmup; i++) {
     last = await snarkjs.groth16.prove(zkey, wtns);
     if (i === 0 && !(await snarkjs.groth16.verify(vkey, last.publicSignals, last.proof))) {
       throw new Error('snarkjs did not verify its own proof');
     }
+    onStep(i + 1, total);
   }
 
   // Read the thread manager only after a prove, because that is when it exists.
@@ -76,8 +82,8 @@ export async function snarkjsProve(
     }
     last = r;
     ms.push(t1 - t0);
-    onRep(i, t1 - t0);
     i++;
+    onStep(warmup + i, total);
   }
 
   return {

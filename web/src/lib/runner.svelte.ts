@@ -48,6 +48,12 @@ export type Row = {
   crossVerified?: boolean;
   note?: string;
   error?: string;
+  /// Reps finished so far on each side, warm-ups included. Only the ETA reads these: a
+  /// circuit that is four proofs into a five-proof block has four proofs less left to do,
+  /// and without counting them the estimate sits still for the whole block and then drops
+  /// off a cliff when the median lands.
+  webgpuDone?: number;
+  snarkjsDone?: number;
 };
 
 const q = () => (typeof location === 'undefined' ? '' : location.search);
@@ -68,14 +74,11 @@ export class Run {
     }))
   );
   phase = $state<'idle' | 'starting' | 'running' | 'done' | 'error'>('idle');
-  /// Bumped on every start. The page watches it to reset the ring's scale, which is
-  /// anchored to the largest ETA seen and would otherwise carry over from the last run.
-  runId = $state(0);
   /// One line under the ring saying what is happening right now.
   activity = $state('');
-  /// 0..1 for the current sub-step, or null when there is nothing meaningful to show.
-  subProgress = $state<number | null>(null);
   etaMs = $state<number | null>(null);
+  /// 0..1 across the whole run. The one progress number the page draws; see `work()`.
+  progress = $state(0);
   calibrated = $state(false);
   mbits = $state(0);
   env = $state<any>(null);
@@ -85,6 +88,13 @@ export class Run {
   private prover: Prover | null = null;
   private cancelled = false;
   private startedAt = 0;
+  /// The operation currently being awaited, and what it was estimated to cost. Everything
+  /// on the proving path is one long await with no progress events inside it, so without
+  /// this the ETA would be a staircase: frozen for the eleven seconds of a snarkjs proof,
+  /// then eleven seconds lower. Subtracting the time already spent inside the current
+  /// operation is what lets the number move while nothing is reporting.
+  private inFlight: { estMs: number; startedAt: number } | null = null;
+  private ticker: ReturnType<typeof setInterval> | null = null;
 
   /// Downloads and proofs are timed for real; the ETA has to guess. Both curves live in
   /// Estimator and both get re-anchored to this machine as measurements come in.
@@ -142,17 +152,24 @@ export class Run {
       if (r.status !== 'pending' && r.status !== 'skipped') continue;
       const why = cannotRun(r.circuit, limit);
       r.status = why ? 'skipped' : 'pending';
-      // A row that only runs because this GPU offers more than the specification promises
-      // says so. Without it, a result taken here and a result taken on a stock floor-only
-      // device look like the same measurement of the same ladder, and the first one quietly
-      // has an extra circuit in it.
-      r.note =
-        why ??
-        (cannotRun(r.circuit, FLOOR_STORAGE_BINDING)
-          ? 'needs more than the 128 MiB binding the WebGPU floor guarantees; this GPU ' +
-            'allows it, a stock floor-only device would skip this row'
-          : undefined);
+      // Only a row that cannot run says why. A row that runs because this GPU offers more
+      // than the specification's floor used to carry a note saying so, and on the machines
+      // that can run everything it read as a warning attached to the one circuit that had
+      // nothing wrong with it. The comparability point it was making is real but belongs
+      // once in the footer, not per row: see `aboveFloor`.
+      r.note = why ?? undefined;
     }
+  }
+
+  /// Circuits this run will prove that a stock floor-only device could not hold.
+  ///
+  /// Worth stating once, because a seven-circuit result from here and a six-circuit result
+  /// from a floor-only device are not the same measurement of the same ladder, and nothing
+  /// else on the page would say so.
+  get aboveFloor() {
+    return this.rows.filter(
+      (r) => r.status !== 'skipped' && cannotRun(r.circuit, FLOOR_STORAGE_BINDING)
+    );
   }
 
   get willRun() {
@@ -164,7 +181,6 @@ export class Run {
     this.cancelled = false;
     this.fatal = null;
     this.phase = 'starting';
-    this.runId++;
     // A handle for reading the raw per-rep timings out of the console. The page shows a
     // median and a spread; this is how the rep counts in `reps`/`warmup` were chosen, and
     // how they should be re-chosen on a machine that behaves differently.
@@ -178,12 +194,19 @@ export class Run {
       r.downloadMs = r.prepareMs = r.webgpuMs = r.snarkjsMs = undefined;
       r.crossVerified = undefined;
       r.webgpuReps = r.snarkjsReps = undefined;
+      r.webgpuDone = r.snarkjsDone = undefined;
       r.stages = undefined;
       r.error = undefined;
       r.note = undefined;
     }
     this.plan(this.bindingLimit);
+    this.progress = 0;
     this.recomputeEta();
+    // The ETA is the only thing on the page that moves while a proof is running, and the
+    // ring is drawn from it, so it is driven by a clock rather than by work completing.
+    // 200 ms is under the ~250 ms at which a countdown starts to look broken and far above
+    // anything this costs to recompute.
+    this.ticker ??= setInterval(() => this.recomputeEta(), 200);
 
     try {
       this.activity = 'opening the GPU';
@@ -236,8 +259,8 @@ export class Run {
       this.phase = this.cancelled ? 'idle' : 'done';
       await this.report();
       this.activity = '';
-      this.subProgress = null;
       this.etaMs = null;
+      if (this.phase === 'done') this.progress = 1;
     } catch (e: any) {
       this.phase = 'error';
       this.fatal = String(e?.message ?? e);
@@ -247,6 +270,11 @@ export class Run {
       // posts nothing at all and the log looks like the page never ran.
       await this.report();
     } finally {
+      if (this.ticker != null) {
+        clearInterval(this.ticker);
+        this.ticker = null;
+      }
+      this.inFlight = null;
       this.prover?.terminate();
       this.prover = null;
     }
@@ -298,7 +326,6 @@ export class Run {
         // zkey then witness, so the bar covers both files rather than resetting between them.
         const done = pr.file === 'zkey' ? pr.done : c.zkeyBytes + pr.done;
         row.downloaded = done;
-        this.subProgress = done / (c.zkeyBytes + c.wtnsBytes);
         this.recomputeEta();
       });
       row.downloaded = loaded.downloadedBytes;
@@ -308,10 +335,10 @@ export class Run {
 
       // ---- our side first, as asked. -------------------------------------------------
       row.status = 'webgpu';
-      this.subProgress = null;
       this.activity = `${c.label}: uploading ${(c.zkeyBytes / 1024 ** 2).toFixed(0)} MB to the GPU`;
-      const prep = await p.prepare();
+      const prep = await this.timed(this.est.prepareMs(c), () => p.prepare());
       row.prepareMs = prep.wallMs;
+      this.est.observePrepare();
 
       const ours: number[] = [];
       let ourProof: any = null;
@@ -320,9 +347,11 @@ export class Run {
       // measured, so a hidden tab does not spoil it, and re-taking it would only be slower.
       for (let i = 0; i < this.warmup + this.reps; ) {
         await visible();
-        this.activity = `${c.label}: proving on the GPU (${Math.max(1, i - this.warmup + 1)}/${this.reps})`;
-        this.subProgress = i / (this.warmup + this.reps);
-        const r = await p.prove();
+        // Warm-ups counted, and counted the same way snarkjs counts them, because the two
+        // lines sit in the same place on screen one after the other and a reader comparing
+        // them should not have to know that one of them hides its warm-up.
+        this.activity = `${c.label}: proving on the GPU (${i + 1}/${this.warmup + this.reps})`;
+        const r = await this.timed(this.est.proveMs('webgpu', c), () => p.prove());
         if (i >= this.warmup && document.visibilityState !== 'visible') {
           gpuDiscards.count(`${c.label} on the GPU`);
           continue;
@@ -330,6 +359,7 @@ export class Run {
         ourProof = r;
         if (i >= this.warmup) ours.push(r.wallMs);
         i++;
+        row.webgpuDone = i;
       }
       row.webgpuReps = ours;
       row.stages = ourProof?.timings;
@@ -339,17 +369,21 @@ export class Run {
 
       // ---- then snarkjs, on the identical bytes. ---------------------------------------
       row.status = 'snarkjs';
-      this.subProgress = null;
       this.activity = `${c.label}: proving with snarkjs`;
+      // snarkjs runs its whole rep loop inside one call and reports back per rep, so the
+      // in-flight window is re-armed from the callback rather than wrapped around the call.
+      this.inFlight = { estMs: this.est.proveMs('snarkjs', c), startedAt: performance.now() };
       const sj = await snarkjsProve(
         loaded.zkeyBytes,
         loaded.wtnsBytes,
         loaded.vkey,
         this.reps,
         this.warmup,
-        (i) => {
-          this.subProgress = (i + 1) / this.reps;
-          this.activity = `${c.label}: proving with snarkjs (${i + 1}/${this.reps})`;
+        (done, total) => {
+          row.snarkjsDone = done;
+          this.inFlight = { estMs: this.est.proveMs('snarkjs', c), startedAt: performance.now() };
+          this.activity = `${c.label}: proving with snarkjs (${done}/${total})`;
+          this.recomputeEta();
         }
       );
       if (!sj.ms.length) throw new Error('every snarkjs rep was discarded (tab hidden?)');
@@ -414,7 +448,7 @@ export class Run {
         row.error = msg;
       }
     } finally {
-      this.subProgress = null;
+      this.inFlight = null;
       // Always, including after a failure. Otherwise the key that just failed is still
       // resident when the next circuit allocates its own and the whole run dies at a
       // circuit that would have been fine on its own.
@@ -426,24 +460,78 @@ export class Run {
     }
   }
 
-  /// Everything still to do, in milliseconds: the downloads not yet fetched plus the
-  /// proving not yet run, for every circuit that has not finished.
-  private recomputeEta() {
-    let total = 0;
-    for (const row of this.rows) {
-      if (row.status === 'done' || row.status === 'skipped' || row.status === 'error') continue;
-      const c = row.circuit;
-      const remaining = Math.max(0, c.zkeyBytes + c.wtnsBytes - row.downloaded);
-      total += this.est.downloadMs(remaining);
-      if (row.prepareMs == null) total += this.est.prepareMs(c);
-      if (row.webgpuMs == null) {
-        total += this.est.proveMs('webgpu', c) * (this.reps + this.warmup);
-      }
-      if (row.snarkjsMs == null) {
-        total += this.est.proveMs('snarkjs', c) * (this.reps + this.warmup);
-      }
+  /// Runs one awaited step with its estimated cost declared, so the ETA can keep counting
+  /// down while the step is in progress instead of freezing until it returns.
+  private async timed<T>(estMs: number, f: () => Promise<T>): Promise<T> {
+    this.inFlight = { estMs, startedAt: performance.now() };
+    try {
+      return await f();
+    } finally {
+      this.inFlight = null;
     }
-    this.etaMs = total;
+  }
+
+  /// Credit for the operation currently being awaited, in milliseconds.
+  ///
+  /// Asymptotic rather than clamped at the estimate. A hard clamp is the honest answer to
+  /// "how much of this step is done" once the step has outlasted its prediction, but it
+  /// means the countdown and the ring both stop dead, and a prediction being wrong is not
+  /// rare: snarkjs saturates every core, so a machine with anything else running takes
+  /// several times the reference and the very first circuit is estimated before anything
+  /// has been measured on it. This curve credits the step at real time to begin with and
+  /// then ever more slowly, approaching the estimate without reaching it, so an overrun
+  /// crawls instead of freezing and can never claim more than the step is worth.
+  private inFlightCredit() {
+    const f = this.inFlight;
+    if (!f || f.estMs <= 0) return 0;
+    return f.estMs * (1 - Math.exp(-(performance.now() - f.startedAt) / f.estMs));
+  }
+
+  /// The whole run priced in milliseconds, split into what is behind us and what is not.
+  ///
+  /// Both halves are priced with the estimates as they stand right now. That is the point:
+  /// when the estimator re-anchors to this machine partway through, the two move together
+  /// and the ring stays where it is, instead of lurching because the denominator changed
+  /// under it. It is also why the ring is drawn from this rather than from the ETA. An ETA
+  /// can go up, and a progress ring driven off one goes backwards when it does, which reads
+  /// as the run losing work it had already done.
+  private work() {
+    let done = 0;
+    let total = 0;
+    const all = this.reps + this.warmup;
+    for (const row of this.rows) {
+      if (row.status === 'skipped') continue;
+      const c = row.circuit;
+      const dl = this.est.downloadMs(c.zkeyBytes + c.wtnsBytes);
+      const prep = this.est.prepareMs(c);
+      const gpu = this.est.proveMs('webgpu', c) * all;
+      const sj = this.est.proveMs('snarkjs', c) * all;
+      total += dl + prep + gpu + sj;
+      if (row.status === 'done' || row.status === 'error') {
+        // Priced at the prediction, not at what it actually cost, so the two sides of the
+        // ratio stay in the same units.
+        done += dl + prep + gpu + sj;
+        continue;
+      }
+      done += this.est.downloadMs(Math.min(row.downloaded, c.zkeyBytes + c.wtnsBytes));
+      if (row.prepareMs != null) done += prep;
+      done += this.est.proveMs('webgpu', c) * Math.min(all, row.webgpuDone ?? 0);
+      done += this.est.proveMs('snarkjs', c) * Math.min(all, row.snarkjsDone ?? 0);
+    }
+    done = Math.min(total, done + this.inFlightCredit());
+    return { done, total };
+  }
+
+  /// Everything still to do, in milliseconds, and how much of the run is behind us.
+  ///
+  /// Called on a 200 ms clock as well as on every event, which is the only reason either
+  /// number moves during a proof. The clock is why everything counted here is counted from
+  /// state a timer can re-read: bytes downloaded, reps finished, and the elapsed part of
+  /// the one operation currently being awaited.
+  private recomputeEta() {
+    const { done, total } = this.work();
+    this.etaMs = Math.max(0, total - done);
+    this.progress = total > 0 ? Math.min(1, done / total) : 0;
     this.calibrated = this.est.calibrated;
   }
 

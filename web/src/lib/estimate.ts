@@ -96,6 +96,15 @@ const DEFAULT_BYTES_PER_MS = (12 * 1_000_000) / 8 / 1000;
 /// also the smallest term in the estimate by an order of magnitude.
 const PREPARE_MS_PER_MB = 0.8;
 
+/// The first `prepare()` on a page is not the reference number and is not close to it. It
+/// compiles every pipeline the backend owns and warms the driver, once, and the reference
+/// column is what an upload costs after that has happened. Measured twice on an M2 Max in
+/// Chrome 152, 2.63 s and 2.4 s, against a 13 ms warm upload of the same 10 MB key: a
+/// factor of about 200. Left out, the ETA freezes for the whole of the first upload,
+/// because the countdown will not credit a step for more than the step was predicted to
+/// cost. One machine's number, so it is a starting point like every other reference here.
+const FIRST_PREPARE_MS = 2400;
+
 export class Estimator {
   private bytesPerMs = DEFAULT_BYTES_PER_MS;
   private downloadObserved = false;
@@ -104,6 +113,7 @@ export class Estimator {
   /// factor would smear one into the other.
   private scale = { webgpu: 1, snarkjs: 1 };
   private scaled = { webgpu: 0, snarkjs: 0 };
+  private preparesObserved = 0;
 
   /// Called with each completed download. Only whole files, and only ones big enough for the
   /// number to mean something: a 241-byte public.json over a warm connection reports an
@@ -115,6 +125,12 @@ export class Estimator {
     // slow chunk on a shared connection does not swing the whole remaining estimate.
     this.bytesPerMs = this.downloadObserved ? this.bytesPerMs * 0.6 + rate * 0.4 : rate;
     this.downloadObserved = true;
+  }
+
+  /// Called with each completed upload. Only the count is used: what it decides is whether
+  /// the next `prepare()` still has the one-off pipeline compilation ahead of it.
+  observePrepare() {
+    this.preparesObserved++;
   }
 
   /// Called with each completed proof, to re-anchor the reference to this machine.
@@ -146,7 +162,10 @@ export class Estimator {
   prepareMs(c: Circuit) {
     const row = REFERENCE[c.name];
     const base = row ? row.prepare : (c.zkeyBytes / 1_000_000) * PREPARE_MS_PER_MB;
-    return base * this.scale.webgpu;
+    // The surcharge is not scaled: `scale.webgpu` is fitted to proving, and this is shader
+    // compilation, which is a different machine's worth of work and is not measured yet
+    // anyway the one time this term is used.
+    return base * this.scale.webgpu + (this.preparesObserved === 0 ? FIRST_PREPARE_MS : 0);
   }
 
   /// Whether the numbers above still rest on the reference machine rather than this one. The

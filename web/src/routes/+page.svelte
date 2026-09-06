@@ -10,7 +10,6 @@
   // checking `navigator.gpu` alone is not enough.
   let support = $state<Support | null>(null);
   const supported = $derived(support === null ? null : support.ok);
-  let peakEta = $state(0);
 
   onMount(async () => {
     support = await checkSupport();
@@ -25,21 +24,11 @@
     if (support.ok && new URLSearchParams(location.search).get('auto') === '1') run.start();
   });
 
-  // The ring fills against the largest ETA seen, which is the one from before any work
-  // started. Anchoring it to the live ETA instead would make the ring go backwards every
-  // time the estimate was revised upward, which reads as the run losing progress.
-  $effect(() => {
-    run.runId;
-    peakEta = 0;
-  });
-  $effect(() => {
-    if (run.etaMs != null && run.etaMs > peakEta) peakEta = run.etaMs;
-  });
-
   const busy = $derived(run.phase === 'running' || run.phase === 'starting');
-  const progress = $derived(
-    run.phase === 'done' ? 1 : peakEta > 0 && run.etaMs != null ? Math.min(1, Math.max(0, 1 - run.etaMs / peakEta)) : 0
-  );
+  // Capped just short of full until the run says it is done. The ring is priced from
+  // estimates, so a run that outlasts them would otherwise show a full ring with circuits
+  // still to prove, which is the one thing a progress indicator must never say.
+  const progress = $derived(run.phase === 'done' ? 1 : Math.min(0.99, run.progress));
   const headline = $derived(run.headline);
   const verdict = $derived(headline == null ? null : ratioLabel(headline));
   const workers = $derived(run.rows.find((r) => r.snarkjsWorkers)?.snarkjsWorkers ?? null);
@@ -67,7 +56,7 @@
     <div class="gauge">
       <svg viewBox="0 0 320 320" aria-hidden="true">
         <!-- tick marks, the dial's face -->
-        <g class="ticks" class:lit={busy || run.phase === 'done'}>
+        <g class="ticks">
           {#each TICKS as deg, i}
             <line
               x1="160"
@@ -76,7 +65,6 @@
               y2={i % 5 === 0 ? 26 : 21}
               transform="rotate({deg - 90} 160 160)"
               class:major={i % 5 === 0}
-              class:passed={i / (TICKS.length - 1) <= progress}
             />
           {/each}
         </g>
@@ -118,9 +106,11 @@
           <span class="cap" class:bad={!verdict.faster}>{verdict.faster ? 'faster' : 'slower'}</span>
         {:else if run.phase === 'done'}
           <span class="word small">no result</span>
+        {:else if run.etaMs != null}
+          <span class="num">{duration(run.etaMs)}</span>
+          <span class="cap">left</span>
         {:else}
-          <span class="num">{Math.round(progress * 100)}<em>%</em></span>
-          <span class="cap">{run.etaMs != null ? `${duration(run.etaMs)} left` : 'starting'}</span>
+          <span class="word small">starting</span>
         {/if}
       </button>
     </div>
@@ -133,9 +123,6 @@
         <p class="fine">{support.detail}</p>
       {:else if run.activity}
         <p class="what">{run.activity}</p>
-        <div class="bar" class:indeterminate={run.subProgress == null}>
-          <i style:width={run.subProgress != null ? `${run.subProgress * 100}%` : undefined}></i>
-        </div>
         <p class="fine">
           {#if run.mbits > 0}{run.mbits.toFixed(0)} Mbit/s ·{/if}
           {run.calibrated
@@ -239,6 +226,16 @@
       upload it warms up with is the separate <em>GPU upload</em> column rather than being
       hidden inside the proof.
     </p>
+    {#if run.aboveFloor.length}
+      <p class="fine">
+        {run.aboveFloor.map((r) => r.circuit.label).join(', ')}
+        {run.aboveFloor.length === 1 ? 'needs' : 'need'} a storage binding larger than the 128
+        MiB WebGPU guarantees, and this adapter grants
+        {(run.bindingLimit / 1024 ** 3).toFixed(2)} GiB. A device offering only the floor would
+        skip {run.aboveFloor.length === 1 ? 'that row' : 'those rows'}, so its ladder is shorter
+        than this one.
+      </p>
+    {/if}
     {#if run.env}
       <p class="fine">
         {[run.env.adapter?.vendor, run.env.adapter?.architecture, run.env.adapter?.device]
@@ -308,16 +305,14 @@
     height: 100%;
     display: block;
   }
+  /* The dial's face, and only that. These used to light up as the run advanced, which made
+     them a second progress readout of the same number the arc already draws. */
   .ticks line {
     stroke: #202a3c;
     stroke-width: 2;
-    transition: stroke 0.3s ease;
   }
   .ticks line.major {
     stroke-width: 3;
-  }
-  .ticks.lit line.passed {
-    stroke: var(--gpu);
   }
   .track {
     fill: none;
@@ -335,8 +330,10 @@
     stroke: var(--gpu);
     stroke-width: 10;
     stroke-linecap: round;
-    /* Tweened, because the ETA revises a few times a second and an untweened arc ratchets. */
-    transition: stroke-dasharray 0.5s linear;
+    /* Tweened, because the ETA is recomputed five times a second and an untweened arc
+       ratchets. Just under the tick, so each step has landed before the next arrives and
+       the sweep reads as continuous rather than as five jumps a second. */
+    transition: stroke-dasharray 0.18s linear;
   }
 
   /* The button is the inner disc, so the dial around it stays visible and unclickable. */
@@ -424,34 +421,6 @@
   }
   .what {
     font-variant-numeric: tabular-nums;
-  }
-  .bar {
-    width: min(420px, 78vw);
-    height: 3px;
-    background: var(--line);
-    border-radius: 99px;
-    margin: 0.6rem auto;
-    overflow: hidden;
-  }
-  .bar i {
-    display: block;
-    height: 100%;
-    background: var(--gpu);
-    transition: width 0.2s linear;
-  }
-  /* No measurable sub-step (a GPU upload, a single long proof): sweep instead of lying
-     about a percentage. */
-  .bar.indeterminate i {
-    width: 32%;
-    animation: slide 1.4s ease-in-out infinite;
-  }
-  @keyframes slide {
-    0% {
-      transform: translateX(-110%);
-    }
-    100% {
-      transform: translateX(330%);
-    }
   }
   .link {
     background: none;
