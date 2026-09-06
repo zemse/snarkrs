@@ -11,6 +11,7 @@ import { Estimator } from './estimate';
 import { Prover } from './prover';
 import { snarkjsProve, snarkjsVerify } from './snarkjs';
 import { median } from './format';
+import { visible, Discards } from './visibility';
 
 export type RowStatus = 'pending' | 'downloading' | 'webgpu' | 'snarkjs' | 'done' | 'error' | 'skipped';
 
@@ -253,17 +254,21 @@ export class Run {
 
       const ours: number[] = [];
       let ourProof: any = null;
-      for (let i = 0; i < this.warmup + this.reps; i++) {
-        if (document.visibilityState !== 'visible') {
-          // Same rule the snarkjs side follows: a rep spanning a hidden tab is measured
-          // against a clock Chrome has throttled to 1 Hz, so it is dropped, not recorded.
-          await visible();
-        }
+      const gpuDiscards = new Discards(this.reps + 5);
+      // `i` advances only on a rep that counted. A warm-up is never discarded: it is not
+      // measured, so a hidden tab does not spoil it, and re-taking it would only be slower.
+      for (let i = 0; i < this.warmup + this.reps; ) {
+        await visible();
         this.activity = `${c.label}: proving on the GPU (${Math.max(1, i - this.warmup + 1)}/${this.reps})`;
         this.subProgress = i / (this.warmup + this.reps);
         const r = await p.prove();
+        if (i >= this.warmup && document.visibilityState !== 'visible') {
+          gpuDiscards.count(`${c.label} on the GPU`);
+          continue;
+        }
         ourProof = r;
         if (i >= this.warmup) ours.push(r.wallMs);
+        i++;
       }
       row.webgpuReps = ours;
       row.stages = ourProof?.timings;
@@ -391,19 +396,6 @@ export class Run {
   get elapsedMs() {
     return this.startedAt ? performance.now() - this.startedAt : 0;
   }
-}
-
-function visible(): Promise<void> {
-  if (document.visibilityState === 'visible') return Promise.resolve();
-  return new Promise((res) => {
-    const on = () => {
-      if (document.visibilityState === 'visible') {
-        document.removeEventListener('visibilitychange', on);
-        res();
-      }
-    };
-    document.addEventListener('visibilitychange', on);
-  });
 }
 
 /// The adapter's own description of itself. `wgpu::AdapterInfo` comes back empty on WebGPU,

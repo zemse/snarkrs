@@ -13,6 +13,11 @@
 ///    bundle removes the cause; this catches it anyway.
 /// 4. Every proof is verified before its time is recorded. A timing from an unverified proof
 ///    is not a timing.
+///
+/// The hidden-tab rule is rule 5 and lives in `visibility.ts`, because the GPU side has to
+/// follow exactly the same one for the two columns to be comparable.
+
+import { visible, Discards } from './visibility';
 
 declare const snarkjs: any;
 
@@ -53,21 +58,26 @@ export async function snarkjsProve(
   }
 
   const ms: number[] = [];
-  for (let i = 0; i < reps; i++) {
-    // Chrome batches timers to once a second in a hidden tab and once a minute after five
-    // minutes. That does not slow the wasm, but it does move the clock the wasm is measured
-    // against, so a rep that spans a hidden tab is discarded rather than recorded.
-    if (document.visibilityState !== 'visible') continue;
+  const discards = new Discards(reps + 5);
+  // `i` advances only on a rep that counted, so a discarded one is re-taken rather than lost.
+  // See `visibility.ts` for why a hidden tab invalidates a measurement, and for what this
+  // loop used to do instead.
+  for (let i = 0; i < reps; ) {
+    await visible();
     const t0 = performance.now();
     const r = await snarkjs.groth16.prove(zkey, wtns);
     const t1 = performance.now();
-    if (document.visibilityState !== 'visible') continue;
+    if (document.visibilityState !== 'visible') {
+      discards.count('snarkjs');
+      continue;
+    }
     if (!(await snarkjs.groth16.verify(vkey, r.publicSignals, r.proof))) {
       throw new Error(`snarkjs rep ${i} produced a proof that does not verify`);
     }
     last = r;
     ms.push(t1 - t0);
     onRep(i, t1 - t0);
+    i++;
   }
 
   return {
