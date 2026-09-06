@@ -5,8 +5,8 @@ logical), macOS 15, rustc release profile (`opt-level=3`, `lto="fat"`,
 `codegen-units=1`). Every number below names the command that produced it. Nothing here
 was optimised; this lane only measured.
 
-Raw output for each instrument is in this directory. Read `msm-shape.txt`,
-`field-ops.txt` and `ntt-shape.txt` first if you only read one thing.
+The raw dumps those commands write are not committed, so this write-up is the record.
+Re-run the command named in a section to get its output back.
 
 ---
 
