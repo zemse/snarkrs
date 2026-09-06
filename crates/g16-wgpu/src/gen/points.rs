@@ -621,9 +621,30 @@ fn pt_add_{sfx}(a: {pt}, b: {pt}) -> {pt} {{
     return {pt}(rx, ry, {f}_mul({f}_mul(a.zz, b.zz), pp), {f}_mul({f}_mul(a.zzz, b.zzz), ppp));
 }}
 
-// k * P for a small k: here k is a bucket index inside one window, so it is below 2^15. Plain
-// MSB-first double-and-add. It runs once per reduce thread against a whole segment of bucket
-// additions, so a windowed ladder would not pay for itself.
+"
+    );
+    // k * P for a small k: here k is a bucket index inside one window, so it is below 2^15.
+    // Plain MSB-first double-and-add, once per reduce thread against a whole segment of
+    // bucket additions, so a windowed ladder would not pay for itself.
+    //
+    // # Why one `pt_add` call site and not `pt_dbl` plus `pt_add`
+    //
+    // The obvious spelling doubles and then conditionally adds, two inlined point operations
+    // in one loop, which is the exact shape 29b5940 removed from the merge kernel after it
+    // lost an iPhone 15 Pro's WebGPU device every time. Inlined here it does it again: the
+    // `REDUCE_BODY` ladder's rung 7 is nothing but the correct serial reduction plus one
+    // call of this function, and with the two-site spelling it loses that phone's device on
+    // both of two runs, while rung 3 without it is bit-exact. So the doubling is expressed
+    // through `pt_add` too, which is unified (a == b falls through to `pt_dbl` inside it,
+    // and either argument may be the identity): even steps of `i` double, odd steps fold in
+    // the bit's addend, and the compiler sees a single inlined copy. Twice the loop trips of
+    // the obvious spelling, on a path that is not the reduce kernel's cost. `MUL_SMALL_BODY`
+    // keeps the failing spelling reachable, because a workaround for a compiler nobody can
+    // inspect should not also be the only record of what was tried.
+    if MUL_SMALL_BODY.load(std::sync::atomic::Ordering::Relaxed) == 1 {
+        let _ = write!(
+            s,
+            "
 fn pt_mul_small_{sfx}(p: {pt}, k: u32) -> {pt} {{
     var acc = pt_zero_{sfx}();
     if (k == 0u || pt_is_zero_{sfx}(p)) {{ return acc; }}
@@ -637,9 +658,35 @@ fn pt_mul_small_{sfx}(p: {pt}, k: u32) -> {pt} {{
     return acc;
 }}
 "
-    );
+        );
+    } else {
+        let _ = write!(
+            s,
+            "
+fn pt_mul_small_{sfx}(p: {pt}, k: u32) -> {pt} {{
+    var acc = pt_zero_{sfx}();
+    if (k == 0u || pt_is_zero_{sfx}(p)) {{ return acc; }}
+    let top = 31u - countLeadingZeros(k);
+    for (var i: i32 = i32(2u * top + 1u); i >= 0; i = i - 1) {{
+        var q = acc;
+        if ((u32(i) & 1u) == 0u) {{
+            if (((k >> (u32(i) >> 1u)) & 1u) == 0u) {{ continue; }}
+            q = p;
+        }}
+        acc = pt_add_{sfx}(acc, q);
+    }}
+    return acc;
+}}
+"
+        );
+    }
     s
 }
+
+/// Restores `pt_mul_small_*`'s two-call-site spelling, the one that loses an iPhone 15
+/// Pro's device; 0 is the folded single-call-site form that ships. See the comment above
+/// the function body. A bisection gate, kept for `MERGE_BODY`'s reason.
+pub static MUL_SMALL_BODY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// The eleven module-scope resources. No entry point reaches more than six.
 ///
@@ -798,9 +845,99 @@ fn {entry}(@builtin(global_invocation_id) gid: vec3<u32>) {{
     s
 }
 
+/// Replaces the merge kernel's body at generation time, for bisecting a device loss.
+///
+/// 0 is the real kernel. 1 returns immediately, so the dispatch still happens, the bindings
+/// are still set and none of the code runs. If a device dies with 1, the fault is not in
+/// this kernel's body at all.
+///
+/// At generation time rather than behind a uniform, because the question is what Metal is
+/// asked to compile, and a branch the compiler can see is a different experiment from code
+/// that is not there.
+pub static MERGE_BODY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 fn entry_merge(c: Curve, wg: u32) -> String {
     let sfx = c.suffix;
     let entry = c.entry_merge();
+    let level = MERGE_BODY.load(std::sync::atomic::Ordering::Relaxed);
+    if level == 1 {
+        return format!(
+            "\n@compute @workgroup_size({wg})\nfn {entry}(@builtin(global_invocation_id) gid: vec3<u32>) {{\n    return;\n}}\n"
+        );
+    }
+    // The loop over this bucket's spill slices.
+    //
+    // # Why one `pt_add` call site and not two
+    //
+    // The obvious spelling checks both of a slice's two spill slots with a separate `if`
+    // and a separate add. That shape loses the GPU device on an iPhone 15 Pro (iOS 26.6,
+    // Safari 26.6), every time, on the smallest circuit in the ladder, with no error, no
+    // crash and nothing in the device's system log.
+    //
+    // Bisected on the device, one piece at a time:
+    //
+    // * the whole kernel emptied, dispatch and bindings unchanged: survives
+    // * the loop kept and every point operation removed: survives
+    // * the point operation kept and the loop removed: survives
+    // * both, with the two call sites folded into one: survives
+    // * both, with two call sites: **device lost**
+    //
+    // So it is neither the loop nor the arithmetic but the two together, and the threshold
+    // sits between one and two inlined `pt_add` over a 256-byte struct loaded from storage
+    // inside a dynamically bounded loop. G1 is the same code over 128-byte points and never
+    // failed, which is consistent with a size threshold rather than a logic fault. It is not
+    // the trip count (guarded and clamped just above), not the workgroup array (halving and
+    // quartering it changes nothing), not the window width (c = 4 fails the same), and not
+    // the storage read-modify-write on its own (262,144 of them run clean).
+    //
+    // The inner loop is two iterations and unrollable, so this costs nothing anywhere else;
+    // it just denies the compiler the second inlined copy. `MERGE_BODY` keeps every variant
+    // above reachable, because a workaround for a compiler nobody can inspect should not
+    // also be the only record of what was tried.
+    let level = MERGE_BODY.load(std::sync::atomic::Ordering::Relaxed);
+    let spill_loop = match level {
+        // Loop kept, every point operation dropped.
+        2 => "    for (var k = k_lo; k <= k_hi; k = k + 1u) {
+        let slot = 2u * (w * P.slices + k);
+        if (SPILL_ROWS[slot] == row) { any = true; }
+        if (SPILL_ROWS[slot + 1u] == row) { any = true; }
+    }"
+        .to_string(),
+        // Point operation kept, loop dropped.
+        3 => format!(
+            "    let slot = 2u * (w * P.slices + k_lo);
+    if (SPILL_ROWS[slot] == row) {{
+        acc = pt_add_{sfx}(acc, SPILL_PTS[slot]);
+        any = true;
+    }}"
+        ),
+        // The shape that loses the device. Kept reachable so the failure can be shown again.
+        5 => format!(
+            "    for (var k = k_lo; k <= k_hi; k = k + 1u) {{
+        let slot = 2u * (w * P.slices + k);
+        if (SPILL_ROWS[slot] == row) {{
+            acc = pt_add_{sfx}(acc, SPILL_PTS[slot]);
+            any = true;
+        }}
+        if (SPILL_ROWS[slot + 1u] == row) {{
+            acc = pt_add_{sfx}(acc, SPILL_PTS[slot + 1u]);
+            any = true;
+        }}
+    }}"
+        ),
+        // What ships.
+        _ => format!(
+            "    for (var k = k_lo; k <= k_hi; k = k + 1u) {{
+        let slot = 2u * (w * P.slices + k);
+        for (var j = 0u; j < 2u; j = j + 1u) {{
+            if (SPILL_ROWS[slot + j] == row) {{
+                acc = pt_add_{sfx}(acc, SPILL_PTS[slot + j]);
+                any = true;
+            }}
+        }}
+    }}"
+        ),
+    };
     let mut s = String::new();
     let _ = write!(
         s,
@@ -817,15 +954,31 @@ fn {entry}(@builtin(global_invocation_id) gid: vec3<u32>) {{
     if (cnt == 0u) {{ return; }}
     let w = row / P.n_buckets;
     let base = w * P.cap;
-    let start = CURSOR[row] - cnt - base;
-    let end = CURSOR[row] - base;
-    let k_lo = start / P.slice_len;
+    // Both subtractions are guarded, and the loop bound below is clamped, because the cost
+    // of being wrong here is not a wrong answer. `cur` is written by the scatter kernel's
+    // atomics and read back here; if it is ever below `cnt + base`, `end` wraps to near
+    // 2^32 and `k_hi` becomes tens of millions, so the loop underneath stops being a walk
+    // over a handful of slices and becomes an unbounded one. A GPU does not survive that:
+    // it is a hang, and it surfaces as a lost device with no error, no crash and nothing in
+    // the system log. That is exactly how an iPhone 15 Pro failed here, on the smallest
+    // circuit in the ladder, at every window width tried, while every G1 MSM completed.
+    //
+    // A kernel must not contain a loop whose trip count comes from a buffer without a
+    // bound. On the correct inputs neither guard changes anything.
+    let cur = CURSOR[row];
+    if (cur < cnt + base) {{ return; }}
+    let start = cur - cnt - base;
+    let end = cur - base;
+    // `P.slices` is `ceil(cap / slice_len)`, so the last slice a run can reach is
+    // `slices - 1`. Anything past that is an index this window does not own.
+    let last = max(P.slices, 1u) - 1u;
+    let k_lo = min(start / P.slice_len, last);
     // The last slice this bucket's run reaches. `cnt > 0` was checked above so `end >= 1`
     // and the subtraction cannot wrap; `end` is one past the run, so `end - 1` is its last
     // entry. Setting this to `k_lo` looks harmless when a run fits inside one slice and
     // silently drops every spill past the first boundary when it does not, which is correct
     // for every n up to slice_len and wrong for every n above it.
-    let k_hi = (end - 1u) / P.slice_len;
+    let k_hi = min((end - 1u) / P.slice_len, last);
 
     // Spills first, into a local identity, and the bucket is touched only if there were any.
     //
@@ -843,17 +996,7 @@ fn {entry}(@builtin(global_invocation_id) gid: vec3<u32>) {{
     // adding that to the bucket once is the same point.
     var acc = pt_zero_{sfx}();
     var any = false;
-    for (var k = k_lo; k <= k_hi; k = k + 1u) {{
-        let slot = 2u * (w * P.slices + k);
-        if (SPILL_ROWS[slot] == row) {{
-            acc = pt_add_{sfx}(acc, SPILL_PTS[slot]);
-            any = true;
-        }}
-        if (SPILL_ROWS[slot + 1u] == row) {{
-            acc = pt_add_{sfx}(acc, SPILL_PTS[slot + 1u]);
-            any = true;
-        }}
-    }}
+{spill_loop}
     if (any) {{
         BUCKETS[row] = pt_add_{sfx}(BUCKETS[row], acc);
     }}
@@ -863,9 +1006,88 @@ fn {entry}(@builtin(global_invocation_id) gid: vec3<u32>) {{
     s
 }
 
+/// Restores the reduce kernel's pre-fix per-thread body at generation time; 0 is what ships.
+///
+/// The pre-fix spelling is the loop, multiply and join the kernel actually computes, written
+/// directly: a two-site segment loop plus an inlined `pt_mul_small` and its join, six
+/// `pt_add` call sites once the barrier tree's is counted. On an iPhone 15 Pro it makes every
+/// G2 window sum wrong. Kept reachable for `MERGE_BODY`'s reason, and because it is the only
+/// way left to ask a future Safari whether the compiler bug is still there.
+///
+/// At generation time rather than behind a uniform, also for `MERGE_BODY`'s reason: the
+/// question is what Metal is asked to compile.
+pub static REDUCE_BODY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 fn entry_reduce(c: Curve, tg: u32) -> String {
     let (pt, sfx) = (c.pt, c.suffix);
     let entry = c.entry_reduce();
+    let level = REDUCE_BODY.load(std::sync::atomic::Ordering::Relaxed);
+    let mine = if level != 1 {
+        format!(
+            "    // One pt_add call site for everything this thread computes: even steps of
+    // phase A fold a bucket into run (pts[0]), odd steps fold run into tot (pts[1]);
+    // phase B is pt_mul_small's double-and-add on pts[2] with run as the addend; the
+    // last step joins pts[2] into tot. See REDUCE_BODY rung 12 for what this dodges.
+    var pts: array<{pt}, 3>;
+    pts[0] = pt_zero_{sfx}();
+    pts[1] = pt_zero_{sfx}();
+    pts[2] = pt_zero_{sfx}();
+    let a_steps = 2u * (hi - min(lo, hi));
+    let top = select(0u, 31u - countLeadingZeros(lo), lo != 0u);
+    let b_steps = select(0u, 2u * (top + 1u), lo != 0u);
+    for (var step = 0u; step < a_steps + b_steps + 1u; step = step + 1u) {{
+        var dst = 0u;
+        var src: {pt};
+        var skip = false;
+        if (step < a_steps) {{
+            if ((step & 1u) == 0u) {{
+                src = BUCKETS[w * P.n_buckets + (hi - 1u - (step >> 1u))];
+            }} else {{
+                dst = 1u;
+                src = pts[0];
+            }}
+        }} else if (step < a_steps + b_steps) {{
+            let t = step - a_steps;
+            dst = 2u;
+            if ((t & 1u) == 0u) {{
+                src = pts[2];
+            }} else {{
+                if (((lo >> (top - (t >> 1u))) & 1u) == 0u) {{ skip = true; }}
+                src = pts[0];
+            }}
+        }} else {{
+            dst = 1u;
+            src = pts[2];
+        }}
+        if (!skip) {{ pts[dst] = pt_add_{sfx}(pts[dst], src); }}
+    }}
+    SHARED[tid] = pts[1];"
+        )
+    } else {
+        format!(
+            "    var mine = pt_zero_{sfx}();
+    if (lo < hi) {{
+        var run = pt_zero_{sfx}();
+        var tot = pt_zero_{sfx}();
+        for (var j = hi; j > lo; j = j - 1u) {{
+            run = pt_add_{sfx}(run, BUCKETS[w * P.n_buckets + (j - 1u)]);
+            tot = pt_add_{sfx}(tot, run);
+        }}
+        mine = pt_add_{sfx}(tot, pt_mul_small_{sfx}(run, lo));
+    }}
+    SHARED[tid] = mine;"
+        )
+    };
+    let tail = format!(
+        "    for (var s = 1u; s < {tg}u; s = s << 1u) {{
+        workgroupBarrier();
+        if ((tid & ((s << 1u) - 1u)) == 0u && tid + s < {tg}u) {{
+            SHARED[tid] = pt_add_{sfx}(SHARED[tid], SHARED[tid + s]);
+        }}
+    }}
+    workgroupBarrier();
+    if (tid == 0u) {{ WSUMS[w] = SHARED[0]; }}"
+    );
     let mut s = String::new();
     let _ = write!(
         s,
@@ -877,6 +1099,16 @@ fn entry_reduce(c: Curve, tg: u32) -> String {
 // Q = sum_j B_j in two additions per bucket, and the segment contributes P + lo * Q. The
 // per-thread results are then tree-reduced in workgroup memory, so the host reads back one
 // point per window and does nothing but the Horner combination.
+//
+// The per-thread part is spelled as a state machine over a single pt_add call site rather
+// than as the loop, multiply and join it computes, because on an iPhone 15 Pro the direct
+// spelling makes every G2 window sum wrong. Bisected there by holding the phone to a laptop
+// one construct at a time: two inlined G2 point-operation call sites are bit-exact, three
+// return every window as the identity, four or more corrupt the windows, and one of the
+// four-site spellings loses the device outright. One site is bit-exact. G1, the same code
+// over points half the size, never failed at any of them, so it is a code-size cliff in
+// WebKit's WGSL-to-Metal path, the merge kernel's 29b5940 class with a lower edge.
+// `REDUCE_BODY` keeps the failing spelling reachable.
 //
 // {tg} threads is {shared} bytes of workgroup storage. See gen::points::Workgroups::tg for
 // what the alternatives measured and why this one ships.
@@ -890,29 +1122,12 @@ fn {entry}(@builtin(workgroup_id) wid: vec3<u32>,
     let lo = tid * seg_len;
     let hi = min(lo + seg_len, P.n_buckets);
 
-    var mine = pt_zero_{sfx}();
-    if (lo < hi) {{
-        var run = pt_zero_{sfx}();
-        var tot = pt_zero_{sfx}();
-        for (var j = hi; j > lo; j = j - 1u) {{
-            run = pt_add_{sfx}(run, BUCKETS[w * P.n_buckets + (j - 1u)]);
-            tot = pt_add_{sfx}(tot, run);
-        }}
-        mine = pt_add_{sfx}(tot, pt_mul_small_{sfx}(run, lo));
-    }}
-    SHARED[tid] = mine;
+{mine}
 
     // The barrier sits outside the conditional and the loop bound is the literal workgroup
     // size, so every invocation reaches every barrier the same number of times. WGSL makes
     // that a hard shader-creation error to get wrong; MSL merely makes it undefined.
-    for (var s = 1u; s < {tg}u; s = s << 1u) {{
-        workgroupBarrier();
-        if ((tid & ((s << 1u) - 1u)) == 0u && tid + s < {tg}u) {{
-            SHARED[tid] = pt_add_{sfx}(SHARED[tid], SHARED[tid + s]);
-        }}
-    }}
-    workgroupBarrier();
-    if (tid == 0u) {{ WSUMS[w] = SHARED[0]; }}
+{tail}
 }}
 ",
         shared = c.workgroup_bytes(tg),

@@ -148,3 +148,11 @@ only checks the first reports "supported" and then dies at the first proof.
 
 `.wasm` must be served as `application/wasm` or `WebAssembly.instantiateStreaming` refuses it.
 `static/_headers` covers Netlify and Cloudflare Pages, `vercel.json` covers Vercel.
+
+Both files in `static/pkg` have names that never change and both are served immutable for a
+year, so the URLs carry the wasm's content hash as `?v=`. Without it a returning visitor is
+pinned to whichever prover they downloaded first while the page around it moves on, and the
+symptom is new page code calling an export the cached glue has never heard of. Revalidating
+instead would fix the next visitor and not that one: `immutable` means a reload does not even
+ask. `scripts/build-wasm.sh` stamps the hash into `src/lib/pkg-version.ts`, which is generated
+and gitignored, so building the page without building the prover fails rather than ships.

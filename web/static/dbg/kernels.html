@@ -1,0 +1,125 @@
+<!doctype html>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>MSM kernel probe</title>
+<style>
+  body { font: 14px -apple-system, system-ui, sans-serif; margin: 1rem; background: #0a0e17; color: #eaeef6 }
+  pre { white-space: pre-wrap; word-break: break-word; background: #111725; padding: .6rem; border-radius: 8px }
+  button { font: inherit; padding: .6rem 1rem; margin-right: .5rem }
+</style>
+<h1>MSM kernel probe</h1>
+<!--
+  Runs each generated MSM entry point on its own, on zeroed buffers, with nothing of ours
+  in the way: no wasm, no wgpu, no proving key. An iPhone 15 Pro loses its WebGPU device
+  inside the G2 MSM alone, at every window width down to c=4, while every G1 MSM and stages
+  0 to 4 complete. That rules out the size of the work, so what is left is the code, and
+  this is the smallest thing that runs the code.
+
+  Params are small but non-zero, because an all-zero MsmParams makes every loop bound zero
+  and the kernels exit without executing the arithmetic under suspicion.
+-->
+<p><button id="g1">run G1</button><button id="g2">run G2</button></p>
+<pre id="out">idle</pre>
+<script type="module">
+  const out = document.getElementById('out');
+  const log = (s) => { out.textContent += '\n' + s; console.log(s); };
+
+  const ENTRIES = (c) => [`msm_clear_${c}`, `msm_segmented_${c}`, `msm_merge_${c}`, `msm_reduce_${c}`, `msm_ones_${c}`];
+
+  // MsmParams, in declaration order. Small enough to be instant, non-zero so the loops run.
+  const params = () => {
+    const p = new Uint32Array(12);
+    p[0] = 64;   // n
+    p[1] = 4;    // c
+    p[2] = 64;   // n_windows
+    p[3] = 8;    // n_buckets
+    p[4] = 64;   // cap
+    p[5] = 0;    // scalar_off
+    p[6] = 0;    // lo
+    p[7] = 0;    // base_off
+    p[8] = 1;    // ones_groups
+    p[9] = 4;    // slice_len
+    p[10] = 16;  // slices
+    p[11] = 0;   // pad0
+    return p;
+  };
+
+  async function run(curve, only) {
+    out.textContent = 'running ' + curve + (only ? ' [' + only + ']' : '');
+    const src = await (await fetch(`./${curve}.wgsl`)).text();
+    const adapter = await navigator.gpu.requestAdapter();
+    const dev = await adapter.requestDevice();
+    let lost = null;
+    dev.lost.then((e) => { lost = `${e.reason}: ${e.message}`; });
+
+    dev.pushErrorScope('validation');
+    const mod = dev.createShaderModule({ code: src });
+    const info = await mod.getCompilationInfo();
+    for (const m of info.messages) log(`compile ${m.type}: ${m.message} (line ${m.lineNum})`);
+    const verr = await dev.popErrorScope();
+    if (verr) { log('module validation: ' + verr.message); return; }
+
+    const MB = 1 << 20;
+    const uni = dev.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    dev.queue.writeBuffer(uni, 0, params());
+    // Non-zero, and that is the whole point. `(0, 0)` is this code's identity sentinel, so
+    // zeroed buffers send every point op down its is_zero fast path and the Fq2 arithmetic
+    // under suspicion never executes. Filled with a cheap deterministic pattern instead:
+    // the values are not valid curve points, but nothing here validates them and the
+    // question is only which instructions the GPU is asked to run.
+    const filled = (n) => {
+      const b = dev.createBuffer({ size: n, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+      const words = new Uint32Array(Math.min(n, 1 << 20) / 4);
+      let x = 0x9e3779b9;
+      for (let i = 0; i < words.length; i++) { x ^= x << 13; x ^= x >>> 17; x ^= x << 5; words[i] = x >>> 0; }
+      for (let off = 0; off < n; off += words.byteLength) {
+        dev.queue.writeBuffer(b, off, words, 0, Math.min(words.length, (n - off) / 4));
+      }
+      return b;
+    };
+    const bufs = [uni, filled(4 * MB), filled(MB), filled(2 * MB), filled(MB), filled(MB), filled(MB), filled(MB), filled(2 * MB), filled(MB), filled(2 * MB)];
+
+    for (const name of ENTRIES(curve).filter((n) => !only || n.includes(only))) {
+      if (lost) { log(`${name}: SKIPPED, device already lost (${lost})`); continue; }
+      try {
+        dev.pushErrorScope('validation');
+        dev.pushErrorScope('internal');
+        const pipe = dev.createComputePipeline({ layout: 'auto', compute: { module: mod, entryPoint: name } });
+        // `layout: auto` only creates layouts for bindings the entry point actually uses,
+        // so each kernel gets exactly the subset it declared.
+        const used = [];
+        for (let i = 0; i < bufs.length; i++) used.push({ binding: i, resource: { buffer: bufs[i] } });
+        let bg;
+        try {
+          bg = dev.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: used });
+        } catch {
+          // Drop bindings this entry point does not declare, one at a time, until it binds.
+          let subset = used;
+          for (let i = used.length - 1; i >= 0 && !bg; i--) {
+            subset = used.filter((_, j) => j !== i);
+            try { bg = dev.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: subset }); } catch {}
+          }
+          if (!bg) { log(`${name}: could not build a bind group`); continue; }
+        }
+        const enc = dev.createCommandEncoder();
+        const pass = enc.beginComputePass();
+        // 64 workgroups, not one: a single one can finish before a fault that only shows up
+        // across a real grid, and 64 is still instant on any GPU.
+        pass.setPipeline(pipe); pass.setBindGroup(0, bg); pass.dispatchWorkgroups(64); pass.end();
+        dev.queue.submit([enc.finish()]);
+        await dev.queue.onSubmittedWorkDone();
+        const ierr = await dev.popErrorScope();
+        const verr2 = await dev.popErrorScope();
+        log(`${name}: ok${ierr ? ' internal=' + ierr.message : ''}${verr2 ? ' validation=' + verr2.message : ''}${lost ? ' LOST=' + lost : ''}`);
+      } catch (e) {
+        log(`${name}: threw ${e}`);
+      }
+    }
+    await new Promise((r) => setTimeout(r, 1500));
+    log('final: ' + (lost ? 'DEVICE LOST ' + lost : 'device alive'));
+  }
+
+  document.getElementById('g1').onclick = () => run('g1');
+  document.getElementById('g2').onclick = () => run('g2');
+  globalThis.__run = run;
+</script>

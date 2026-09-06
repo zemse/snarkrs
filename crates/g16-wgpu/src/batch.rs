@@ -703,6 +703,23 @@ impl MsmBatch {
                 Job::G1 { .. } => MsmResult::G1(self.g1.combine(window, &dplan, pplan, pts)?),
                 Job::G2 { .. } => MsmResult::G2(self.g2.combine(window, &dplan, pplan, pts)?),
             });
+            // The trace sees only the five final points. Under the knob, record what
+            // `combine` just folded, so a wrong final point names a window instead of a run.
+            // See `WINDOW_DEBUG` for the iPhone this is for. `i` is the flat job index, in
+            // the deterministic order the caller listed the jobs, so the labels line up
+            // between two machines.
+            if crate::points::WINDOW_DEBUG.load(Ordering::Relaxed) != 0 {
+                crate::points::window_log(&match groups[*gi].jobs[*ji] {
+                    Job::G1 { .. } => {
+                        self.g1
+                            .debug_windows(&format!("j{i}_g1"), window, &dplan, pplan, pts)?
+                    }
+                    Job::G2 { .. } => {
+                        self.g2
+                            .debug_windows(&format!("j{i}_g2"), window, &dplan, pplan, pts)?
+                    }
+                });
+            }
         }
         // Every job in a group with `n == 0` was skipped above, and its answer is the empty
         // sum. An empty L query is the real case: a circuit whose wires are all public.

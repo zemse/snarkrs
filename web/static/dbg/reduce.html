@@ -1,0 +1,122 @@
+<!doctype html>
+<meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>reduce spelling probe</title>
+<style>body{font:14px system-ui;margin:1rem;background:#0a0e17;color:#eaeef6}pre{white-space:pre-wrap;background:#111725;padding:.6rem;border-radius:8px}</style>
+<h1>reduce spelling probe</h1>
+<p>
+  Two entry points compute the same function of the same buffer: the descending
+  run/tot recurrence over each window's buckets, plus one closing add. <code>repro_direct</code>
+  spells it the obvious way, three inlined <code>pt_add_g2</code> call sites;
+  <code>repro_folded</code> routes every operation through a single call site. A correct
+  compiler makes the outputs byte-identical, and desktop Chrome does. Safari on an
+  iPhone 15 Pro (iOS 18.7, Safari 26.6) returns all-identity points from the three-site
+  spelling, and at four or more sites returns garbage that differs on every run; running the
+  three-site kernel has also been seen to lose the device outright. No barrier, no workgroup
+  storage, no atomics, one thread per workgroup: nothing here is allowed to race. Needs <code>g2.wgsl</code> beside it:
+  <code>cargo run -p g16-wgpu --example dump_points_wgsl g2 &gt; web/static/dbg/g2.wgsl</code>.
+</p>
+<pre id="out">idle; call __run(windows = 8, buckets = 256)</pre>
+<script type="module">
+  const out = document.getElementById('out');
+  const log = (s) => { out.textContent += '\n' + s; };
+
+  const EXTRA = `
+@compute @workgroup_size(1)
+fn repro_direct(@builtin(workgroup_id) wid: vec3<u32>) {
+    let w = wid.x;
+    var run = pt_zero_g2();
+    var tot = pt_zero_g2();
+    for (var j = P.n_buckets; j > 0u; j = j - 1u) {
+        run = pt_add_g2(run, BUCKETS[w * P.n_buckets + (j - 1u)]);
+        tot = pt_add_g2(tot, run);
+    }
+    WSUMS[w] = pt_add_g2(tot, run);
+}
+
+@compute @workgroup_size(1)
+fn repro_folded(@builtin(workgroup_id) wid: vec3<u32>) {
+    let w = wid.x;
+    var pts: array<PtG2, 2>;
+    pts[0] = pt_zero_g2();
+    pts[1] = pt_zero_g2();
+    for (var step = 0u; step < 2u * P.n_buckets + 1u; step = step + 1u) {
+        var dst = 1u;
+        var src = pts[0];
+        if (step < 2u * P.n_buckets && (step & 1u) == 0u) {
+            dst = 0u;
+            src = BUCKETS[w * P.n_buckets + (P.n_buckets - 1u - (step >> 1u))];
+        }
+        pts[dst] = pt_add_g2(pts[dst], src);
+    }
+    WSUMS[w] = pts[1];
+}
+`;
+
+  globalThis.__run = async (windows = 8, buckets = 256) => {
+    out.textContent = `running, ${windows} windows of ${buckets} buckets`;
+    const prelude = await (await fetch('./g2.wgsl')).text();
+    const dev = await (await navigator.gpu.requestAdapter()).requestDevice();
+    let lost = null;
+    dev.lost.then((e) => { lost = `${e.reason}: ${e.message}`; });
+    const mod = dev.createShaderModule({ code: prelude + EXTRA });
+    for (const m of (await mod.getCompilationInfo()).messages) log(`compile ${m.type}: ${m.message} @${m.lineNum}`);
+
+    // pt_add_g2 is pure field arithmetic plus branches on its own intermediates, so the
+    // comparison holds for any inputs; the points need not be on the curve. Nonzero zz,
+    // or the identity short-circuit would skip the arithmetic under test.
+    const PT = 256, n = windows * buckets;
+    const words = new Uint32Array(n * PT / 4);
+    let x = 0x9e3779b9;
+    for (let i = 0; i < words.length; i++) { x ^= x << 13; x ^= x >>> 17; x ^= x << 5; words[i] = x >>> 0; }
+    const params = new Uint32Array(12);
+    params[3] = buckets; // MsmParams.n_buckets; nothing else is read by these kernels
+
+    const pbuf = dev.createBuffer({ size: params.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    dev.queue.writeBuffer(pbuf, 0, params);
+    const bkts = dev.createBuffer({ size: words.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    dev.queue.writeBuffer(bkts, 0, words);
+
+    const one = async (entry) => {
+      const pipe = dev.createComputePipeline({ layout: 'auto', compute: { module: mod, entryPoint: entry } });
+      const wsums = dev.createBuffer({ size: windows * PT, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+      const bg = dev.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [
+        { binding: 0, resource: { buffer: pbuf } },
+        { binding: 1, resource: { buffer: bkts } },
+        { binding: 8, resource: { buffer: wsums } }] });
+      const rb = dev.createBuffer({ size: windows * PT, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+      const enc = dev.createCommandEncoder();
+      const p = enc.beginComputePass(); p.setPipeline(pipe); p.setBindGroup(0, bg); p.dispatchWorkgroups(windows); p.end();
+      enc.copyBufferToBuffer(wsums, 0, rb, 0, windows * PT);
+      const t0 = performance.now();
+      dev.queue.submit([enc.finish()]);
+      await rb.mapAsync(GPUMapMode.READ);
+      const got = new Uint32Array(rb.getMappedRange().slice(0));
+      rb.unmap();
+      log(`${entry}: ${(performance.now() - t0).toFixed(0)} ms`);
+      return got;
+    };
+
+    // Folded first: on the phone under test the direct spelling can take the device
+    // down with it, and the interesting comparison needs both outputs when both survive.
+    let a, b;
+    try {
+      b = await one('repro_folded');
+      a = await one('repro_direct');
+    } catch (e) {
+      await new Promise((r) => setTimeout(r, 800));
+      log(`${b ? 'repro_direct' : 'repro_folded'} failed: ${e}`);
+      log('device: ' + (lost ?? 'alive'));
+      return 'LOST';
+    }
+    let firstBad = -1, zeroA = true, zeroB = true;
+    for (let i = 0; i < a.length; i++) {
+      if (a[i] !== b[i] && firstBad < 0) firstBad = i;
+      if (a[i] !== 0) zeroA = false;
+      if (b[i] !== 0) zeroB = false;
+    }
+    if (zeroA !== zeroB) log(`all-zero output: direct ${zeroA}, folded ${zeroB}`);
+    log(firstBad < 0 ? 'outputs MATCH' : `outputs DIFFER from word ${firstBad} (window ${Math.floor(firstBad / (PT / 4))})`);
+    log('device: ' + (lost ?? 'alive'));
+    return firstBad < 0 ? 'MATCH' : 'DIFFER';
+  };
+</script>

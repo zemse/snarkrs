@@ -36,6 +36,10 @@ g16-core.workspace = true
 g16-zkey.workspace = true
 # `Fr`. The gather packs and unpacks Montgomery limbs, which is arkworks' own representation.
 g16-field.workspace = true
+# One call, in `src/wasm.rs`: escaping a trace's text into a JSON string member. Already in
+# the tree through g16-core, and a hand-rolled escaper for something the page parses is how a
+# newline in a diagnostic becomes a syntax error nobody can reproduce.
+serde_json.workspace = true
 # `AdditiveGroup::double_in_place`, for the Horner tail of an MSM. Reached through g16-field
 # until now, which is exactly the transitive dependency the house rules forbid: g16-field
 # re-exports seven ark-ff traits and this is not one of them.

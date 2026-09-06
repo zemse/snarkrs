@@ -37,15 +37,56 @@ const reportSink: Plugin = {
   }
 };
 
-export default defineConfig({
-  plugins: [sveltekit(), reportSink],
-  server: {
-    proxy: {
-      '/s3': {
-        target: `https://${BUCKET}.s3.amazonaws.com`,
-        changeOrigin: true,
-        rewrite: (p) => p.replace(/^\/s3/, '')
-      }
-    }
+/// A self-signed certificate, if one has been generated, so a phone on the same Wi-Fi can
+/// reach this machine over **https**.
+///
+/// WebGPU needs a secure context and only `localhost` is exempt, so `http://192.168.x.x`
+/// hands the page a browser with no `navigator.gpu` at all: the site reports "unsupported"
+/// and nothing is testable. Serving the LAN address over TLS is the whole difference between
+/// iterating against a real iPhone in seconds and redeploying for every one-line change.
+/// The certificate is trusted by nothing, so Safari shows an interstitial once per device;
+/// accepting it still leaves the origin `https:` and therefore secure.
+///
+/// Absent by default and entirely optional. Generate with:
+///
+///     ip=$(ipconfig getifaddr en0)
+///     mkdir -p .certs && openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 365 \
+///       -keyout .certs/key.pem -out .certs/cert.pem -subj "/CN=$ip" \
+///       -addext "subjectAltName=IP:$ip,DNS:localhost,IP:127.0.0.1"
+///
+/// `readFileSync` is typed here rather than by adding @types/node, for the same reason the
+/// request stream is typed inside `reportSink`: one function is the whole surface. The
+/// specifier is a variable so it stays out of the module graph and out of type resolution.
+async function selfSigned() {
+  try {
+    const spec = 'node:fs';
+    const fs = (await import(/* @vite-ignore */ spec)) as {
+      readFileSync(path: string): Uint8Array;
+    };
+    return { key: fs.readFileSync('.certs/key.pem'), cert: fs.readFileSync('.certs/cert.pem') };
+  } catch {
+    return undefined;
   }
+}
+
+export default defineConfig(async () => {
+  const https = await selfSigned();
+  // `host` only when there is a certificate to serve with. Exposing the server on the
+  // network over plain http would be worse than not exposing it at all: the page would
+  // load and then report that this browser has no WebGPU.
+  const lan = { host: https ? true : undefined, https };
+  return {
+    plugins: [sveltekit(), reportSink],
+    server: {
+      ...lan,
+      proxy: {
+        '/s3': {
+          target: `https://${BUCKET}.s3.amazonaws.com`,
+          changeOrigin: true,
+          rewrite: (p: string) => p.replace(/^\/s3/, '')
+        }
+      }
+    },
+    preview: lan
+  };
 });

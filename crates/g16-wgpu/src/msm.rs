@@ -80,7 +80,17 @@ pub const MAX_WINDOW: u32 = 16;
 /// `2^(top_bits - 1)` buckets instead of `2^(c-1)`. At c=11 that is two buckets holding half
 /// the scalars each. On the CPU a serial bucket loop only cares about the total; on the GPU
 /// those runs span thousands of slices and the merge walks one in a single lane.
+/// Forces the window width, or 0 to compute it. The browser's counterpart to
+/// `G16_WGPU_MSM_C`, which cannot work there: `std::env::var` on wasm always fails, so a
+/// page has no way to reach the environment variable at all. Set through `set_msm_c` in the
+/// wasm bindings, and read by [`window_size`] below.
+pub static WINDOW_OVERRIDE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 pub fn window_size(m: usize) -> u32 {
+    let forced = WINDOW_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if forced > 0 {
+        return forced.clamp(2, MAX_WINDOW);
+    }
     if let Ok(v) = std::env::var("G16_WGPU_MSM_C") {
         if let Ok(c) = v.parse::<u32>() {
             return c.clamp(2, MAX_WINDOW);

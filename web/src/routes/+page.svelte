@@ -24,6 +24,28 @@
     if (support.ok && new URLSearchParams(location.search).get('auto') === '1') run.start();
   });
 
+  const diagAlways =
+    typeof location !== 'undefined' && new URLSearchParams(location.search).get('diag') === '1';
+  let copied = $state(false);
+  async function copyDiag() {
+    try {
+      await navigator.clipboard.writeText(run.diagnostics);
+      copied = true;
+      setTimeout(() => (copied = false), 2000);
+    } catch {
+      // Clipboard access can be refused outright. The text is on screen and selectable
+      // either way, so this is a convenience failing, not the feature failing.
+    }
+  }
+
+  /// `?trace=1` puts its entire output in the diagnostics block, so that block is the page
+  /// rather than an appendix to it.
+  const traced = $derived(run.rows.some((r) => r.trace));
+
+  const failed = $derived(
+    run.fatal != null || run.rows.some((r) => r.status === 'error')
+  );
+
   const busy = $derived(run.phase === 'running' || run.phase === 'starting');
   // Capped just short of full until the run says it is done. The ring is priced from
   // estimates, so a run that outlasts them would otherwise show a full ring with circuits
@@ -215,6 +237,24 @@
         </tbody>
       </table>
     </section>
+  {/if}
+
+  {#if failed || run.env?.selftest || diagAlways || traced}
+    <!-- Open, and on by default, whenever anything failed. A diagnosis nobody can reach
+         without being handed a query parameter is a diagnosis that only reaches the people
+         who already know to ask for one. -->
+    <details class="diag" open={failed || traced}>
+      <summary>diagnostics</summary>
+      {#if failed}
+        <p class="fine">
+          Something failed on this device. Copying this and sending it is the whole bug
+          report: it carries the browser, the GPU, every limit the device granted, the
+          self-test verdicts and each circuit's outcome.
+        </p>
+      {/if}
+      <button class="link" onclick={copyDiag}>{copied ? 'copied' : 'copy to clipboard'}</button>
+      <pre>{run.diagnostics}</pre>
+    </details>
   {/if}
 
   <footer>
@@ -436,6 +476,30 @@
     color: var(--fg);
   }
 
+  .diag {
+    max-width: 60rem;
+    margin: 1.5rem auto 0;
+    padding: 0 1rem;
+    color: var(--dim);
+    font-size: 0.8rem;
+  }
+  .diag summary {
+    cursor: pointer;
+  }
+  .diag pre {
+    /* Wrapped rather than scrolled: on a phone a horizontal scroller inside a details
+       element is close to unusable, and this text exists to be selected and pasted. */
+    white-space: pre-wrap;
+    word-break: break-word;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 0.75rem;
+    margin: 0.5rem 0 0;
+    font-size: 0.72rem;
+    line-height: 1.45;
+  }
+
   .verdict {
     display: grid;
     grid-template-columns: 1fr auto 1fr;
@@ -587,7 +651,31 @@
     .word {
       font-size: 3rem;
     }
-    .verdict {
+    .diag {
+    max-width: 60rem;
+    margin: 1.5rem auto 0;
+    padding: 0 1rem;
+    color: var(--dim);
+    font-size: 0.8rem;
+  }
+  .diag summary {
+    cursor: pointer;
+  }
+  .diag pre {
+    /* Wrapped rather than scrolled: on a phone a horizontal scroller inside a details
+       element is close to unusable, and this text exists to be selected and pasted. */
+    white-space: pre-wrap;
+    word-break: break-word;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 0.75rem;
+    margin: 0.5rem 0 0;
+    font-size: 0.72rem;
+    line-height: 1.45;
+  }
+
+  .verdict {
       grid-template-columns: 1fr;
     }
     th:nth-child(2),

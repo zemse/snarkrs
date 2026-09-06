@@ -435,6 +435,11 @@ impl PreparedCircuit for WgpuCircuit {
         let _gpu = self.device.exclusive();
         pollster::block_on(self.msms_async(witness, h, t))
     }
+
+    fn h_to_host(&self, h: &HPoly) -> Option<Vec<Fr>> {
+        let _gpu = self.device.exclusive();
+        pollster::block_on(self.h_to_host_async(h))
+    }
 }
 
 impl WgpuCircuit {
@@ -621,6 +626,120 @@ impl WgpuCircuit {
         };
         t.msm_us += start.elapsed().as_micros() as u64;
         Ok(outputs)
+    }
+
+    /// `H` copied down from the device, awaited. **Debugging only**: see
+    /// [`g16_core::PreparedCircuit::h_to_host`], whose native impl is `block_on` over this,
+    /// and which the browser cannot use because every readback here is asynchronous.
+    ///
+    /// `None` for an `HPoly` this backend did not write, rather than a guess at how to read
+    /// somebody else's handle.
+    pub async fn h_to_host_async(&self, h: &HPoly) -> Option<Vec<Fr>> {
+        let handle = h.device_handle::<WgpuHandle>(crate::stages::TAG)?;
+        handle.to_host(&self.device).await.ok()
+    }
+
+    /// Stages 5 to 9, one MSM at a time, for bisecting a device loss. Not a proving path.
+    ///
+    /// `msms_async` submits all five jobs in three groups, so when the device dies there is
+    /// nothing to say which of them killed it. This runs exactly one and reports how long it
+    /// took. It builds its own group rather than filtering that function's, so the proving
+    /// path keeps no branch it does not need and cannot be broken by a change made for a
+    /// bisection.
+    ///
+    /// Device-resident `H` only, because the browser is the only caller and the whole point
+    /// is to reproduce what the browser does. The result is discarded: a single MSM is not a
+    /// proof and this returns no proof, only whether the GPU survived it.
+    pub async fn msm_probe_async(
+        &self,
+        witness: &[Fr],
+        h: &HPoly,
+        which: &str,
+    ) -> Result<u64, ProveError> {
+        self.check_witness(witness)?;
+        let handle = h
+            .device_handle::<WgpuHandle>(crate::stages::TAG)
+            .ok_or_else(|| bad("msm_probe needs an H that is still on the device"))?;
+
+        let private_from = self.pk.n_public + 1;
+        let (g_all, g_private) = general_counts(witness, private_from);
+        let n_vars = self.pk.n_vars as u32;
+        let w = handle.witness_std();
+        let mont = Some(MontConvert {
+            src: handle.witness_mont(),
+            dst: w,
+            n: n_vars,
+        });
+
+        let jobs = [match which {
+            "a-g1" => Job::G1 {
+                bases: &self.a_bases,
+                base_off: 0,
+            },
+            "b-g2" => Job::G2 {
+                bases: &self.b_g2_bases,
+                base_off: 0,
+            },
+            "b-g1" => Job::G1 {
+                bases: &self.b_g1_bases,
+                base_off: 0,
+            },
+            "l-g1" => Job::G1 {
+                bases: &self.l_bases,
+                base_off: 0,
+            },
+            "h-g1" => Job::G1 {
+                bases: &self.h_bases,
+                base_off: 0,
+            },
+            _ => {
+                return Err(bad(format!(
+                    "unknown msm probe {which:?}; expected one of a-g1, b-g2, b-g1, l-g1, h-g1"
+                )))
+            }
+        }];
+
+        // Each job reads a different range of a different scalar source, and getting that
+        // wrong would measure a different circuit rather than a smaller one.
+        let group = match which {
+            "l-g1" => Group {
+                scalars: Source::Device {
+                    buf: w,
+                    general: Some(g_private),
+                },
+                scalar_off: private_from as u32,
+                n: self.l_bases.len() as u32,
+                jobs: &jobs,
+            },
+            "h-g1" => Group {
+                scalars: Source::Device {
+                    buf: handle.h_std(),
+                    general: None,
+                },
+                scalar_off: 0,
+                n: self.pk.domain_size as u32,
+                jobs: &jobs,
+            },
+            _ => Group {
+                scalars: Source::Device {
+                    buf: w,
+                    general: Some(g_all),
+                },
+                scalar_off: 0,
+                n: n_vars,
+                jobs: &jobs,
+            },
+        };
+
+        let start = Instant::now();
+        let out = self.msm.run(&self.device, mont, &[group]).await?;
+        if out.len() != 1 {
+            return Err(bad(format!(
+                "the MSM batch returned {} results for 1 job",
+                out.len()
+            )));
+        }
+        Ok(start.elapsed().as_micros() as u64)
     }
 }
 

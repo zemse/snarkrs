@@ -1,0 +1,42 @@
+<!doctype html>
+<meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>pt_add_g2 probe</title>
+<style>body{font:14px system-ui;margin:1rem;background:#0a0e17;color:#eaeef6}pre{white-space:pre-wrap;background:#111725;padding:.6rem;border-radius:8px}</style>
+<h1>pt_add_g2 probe</h1>
+<pre id="out">idle</pre>
+<script type="module">
+  const out = document.getElementById('out');
+  const log = (s) => { out.textContent += '\n' + s; };
+  globalThis.__run = async (groups = 64) => {
+    out.textContent = 'running, ' + groups + ' workgroups';
+    const src = await (await fetch('./ptadd.wgsl')).text();
+    const dev = await (await navigator.gpu.requestAdapter()).requestDevice();
+    let lost = null;
+    dev.lost.then((e) => { lost = `${e.reason}: ${e.message}`; });
+    const mod = dev.createShaderModule({ code: src });
+    for (const m of (await mod.getCompilationInfo()).messages) log(`compile ${m.type}: ${m.message} @${m.lineNum}`);
+    const pipe = dev.createComputePipeline({ layout: 'auto', compute: { module: mod, entryPoint: 'pt_add_probe' } });
+
+    const PT = 256, n = groups * 64;
+    // Non-identity inputs. `zz == 0` is the identity sentinel and short-circuits the add, so
+    // zeroed memory would exercise none of the arithmetic under suspicion.
+    const words = new Uint32Array(n * 2 * PT / 4);
+    let x = 0x9e3779b9;
+    for (let i = 0; i < words.length; i++) { x ^= x << 13; x ^= x >>> 17; x ^= x << 5; words[i] = x >>> 0; }
+    const inb = dev.createBuffer({ size: words.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    dev.queue.writeBuffer(inb, 0, words);
+    const outb = dev.createBuffer({ size: n * PT, usage: GPUBufferUsage.STORAGE });
+    const bg = dev.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: outb } }, { binding: 1, resource: { buffer: inb } }] });
+
+    const t0 = performance.now();
+    const enc = dev.createCommandEncoder();
+    const p = enc.beginComputePass(); p.setPipeline(pipe); p.setBindGroup(0, bg); p.dispatchWorkgroups(groups); p.end();
+    dev.queue.submit([enc.finish()]);
+    await dev.queue.onSubmittedWorkDone();
+    log(`dispatch of ${groups} workgroups: ${(performance.now() - t0).toFixed(0)} ms`);
+    await new Promise((r) => setTimeout(r, 1200));
+    log('final: ' + (lost ? 'DEVICE LOST ' + lost : 'device alive'));
+    return lost ? 'LOST' : 'alive';
+  };
+</script>

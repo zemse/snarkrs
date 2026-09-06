@@ -61,6 +61,9 @@ pub mod cpu;
 /// filesystem and still has to hand `snarkjs.groth16.verify` exactly these bytes.
 pub mod json;
 pub mod prove;
+/// A deterministic execution trace, for diffing one machine's intermediate values against
+/// another's. Debugging only: it pins stage 10's blinders, which no proving path may do.
+pub mod trace;
 pub mod verify;
 
 use g16_field::*;
@@ -216,4 +219,14 @@ pub trait PreparedCircuit: Send + Sync {
         h: &HPoly,
         t: &mut StageTimings,
     ) -> Result<MsmOutputs, ProveError>;
+
+    /// `H` in host memory, copying it down if that is where it is not.
+    ///
+    /// **Debugging only**, and the default is the honest answer for a backend that has not
+    /// implemented it: `None`, rather than a silent empty vector that would read as "H is
+    /// fine" in a trace. Forcing the copy is the round trip [`HPoly`] exists to avoid, and
+    /// [`crate::trace`] is the only caller.
+    fn h_to_host(&self, h: &HPoly) -> Option<Vec<Fr>> {
+        h.to_host().map(<[Fr]>::to_vec)
+    }
 }

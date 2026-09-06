@@ -42,17 +42,52 @@ export class Prover {
     });
   }
 
-  init(pkgBase: string, profile: string) {
-    return this.call('init', { pkgBase, profile });
+  init(
+    pkgBase: string,
+    profile: string,
+    reduceTg = 0,
+    msmC = 0,
+    upto = 0,
+    mergeBody = 0,
+    windowDebug = 0,
+    reduceBody = 0,
+    mulSmallBody = 0
+  ) {
+    return this.call('init', {
+      pkgBase,
+      profile,
+      reduceTg,
+      msmC,
+      upto,
+      mergeBody,
+      windowDebug,
+      reduceBody,
+      mulSmallBody
+    });
   }
-  load(base: string, name: string, onProgress: (p: any) => void) {
-    return this.call('load', { base, name }, onProgress);
+  /// `keepZkey` is trace mode: the worker holds the raw key instead of handing it over, so
+  /// the CPU control can re-parse it. Nothing on this side wants it then, because trace mode
+  /// runs no snarkjs.
+  load(base: string, name: string, onProgress: (p: any) => void, keepZkey = false) {
+    return this.call('load', { base, name, keepZkey }, onProgress);
   }
   prepare() {
     return this.call('prepare');
   }
   prove() {
     return this.call('prove');
+  }
+  proveHOnly() {
+    return this.call('prove_h_only');
+  }
+  proveMsmProbe(which: string) {
+    return this.call('prove_msm_probe', { which });
+  }
+  trace() {
+    return this.call<{ backend: string; total_us: number; text: string }>('trace');
+  }
+  cpuTrace() {
+    return this.call<{ backend: string; total_us: number; text: string }>('cpu_trace');
   }
   selftest() {
     return this.call('selftest');

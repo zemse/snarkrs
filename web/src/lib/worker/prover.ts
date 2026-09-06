@@ -18,6 +18,8 @@
 /// its own `ok` field overwrote the envelope's: `verify` reporting a good proof came out as
 /// a rejected promise. Nesting makes the collision impossible rather than documented.
 
+import { PKG_VERSION } from '../pkg-version';
+
 type Wasm = {
   default: (m?: unknown) => Promise<unknown>;
   start: () => void;
@@ -31,6 +33,18 @@ type Wasm = {
   unload: () => void;
   prepare: () => Promise<string>;
   prove: () => Promise<string>;
+  prove_h_only: () => Promise<string>;
+  prove_msm_probe: (which: string) => Promise<string>;
+  prove_trace: () => Promise<string>;
+  cpu_prepare: () => string;
+  cpu_prove_trace: () => string;
+  set_reduce_tg: (tg: number) => void;
+  set_msm_c: (c: number) => void;
+  set_msm_stop_after: (n: number) => void;
+  set_merge_body: (level: number) => void;
+  set_window_debug: (on: number) => void;
+  set_reduce_body: (level: number) => void;
+  set_mul_small_body: (level: number) => void;
   selftest: () => Promise<string>;
   shader_diagnostics: () => Promise<string>;
   verify: (vkey: string, pub: string, proof: string) => boolean;
@@ -40,6 +54,8 @@ type Wasm = {
 
 let wasm: Wasm | null = null;
 let ready = false;
+/// The raw zkey, kept only in trace mode. See the `load` handler.
+let traceZkey: Uint8Array | null = null;
 
 function w(): Wasm {
   if (!wasm || !ready) throw new Error('the prover worker is not initialised');
@@ -77,7 +93,7 @@ async function streamInto(
     throw new Error(
       cross
         ? `could not fetch ${url}: ${e?.message ?? e}. The artifact host has to allow ` +
-          `cross-origin reads from ${self.location.origin}; see web/s3-cors.json.`
+            `cross-origin reads from ${self.location.origin}; see web/s3-cors.json.`
         : `could not fetch ${url}: ${e?.message ?? e}`
     );
   });
@@ -120,13 +136,40 @@ const handlers: Record<string, (a: Args, emit: (p: unknown) => void) => Promise<
   /// cold start that this page's numbers deliberately exclude. snarkjs pays the equivalent
   /// (building its BN254 module with wasmbuilder, then compiling it again inside every
   /// worker it spawns) and it is not in snarkjs' number either.
-  async init({ pkgBase, profile }) {
+  async init({
+    pkgBase,
+    profile,
+    reduceTg,
+    msmC,
+    upto,
+    mergeBody,
+    windowDebug,
+    reduceBody,
+    mulSmallBody
+  }) {
     const t0 = performance.now();
     // A variable URL, so Vite leaves it alone. static/pkg is produced by
     // scripts/build-wasm.sh and is not part of the module graph.
-    const mod = (await import(/* @vite-ignore */ `${pkgBase}/g16_wasm.js`)) as Wasm;
-    await mod.default();
+    //
+    // `?v=` is the wasm's own content hash, and it is load bearing rather than decorative.
+    // Both files in static/pkg have names that never change, and both are served immutable
+    // for a year, so a returning visitor kept whichever prover they downloaded first while
+    // the page around it moved on. The wasm path is passed explicitly for the same reason:
+    // the glue resolves it against its own module URL, and that resolution drops the query,
+    // so leaving it implicit would version the glue and pin the wasm.
+    const v = `?v=${PKG_VERSION}`;
+    const mod = (await import(/* @vite-ignore */ `${pkgBase}/g16_wasm.js${v}`)) as Wasm;
+    await mod.default({ module_or_path: `${pkgBase}/g16_wasm_bg.wasm${v}` });
     mod.start();
+    // Before create_prover, which is where the pipelines are compiled. See `set_reduce_tg`
+    // in crates/g16-wgpu/src/wasm.rs.
+    if (typeof reduceTg === 'number' && reduceTg > 0) mod.set_reduce_tg(reduceTg);
+    if (typeof msmC === 'number' && msmC > 0) mod.set_msm_c(msmC);
+    if (typeof upto === 'number' && upto > 0) mod.set_msm_stop_after(upto);
+    if (typeof mergeBody === 'number' && mergeBody > 0) mod.set_merge_body(mergeBody);
+    if (typeof windowDebug === 'number' && windowDebug > 0) mod.set_window_debug(windowDebug);
+    if (typeof reduceBody === 'number' && reduceBody > 0) mod.set_reduce_body(reduceBody);
+    if (typeof mulSmallBody === 'number' && mulSmallBody > 0) mod.set_mul_small_body(mulSmallBody);
     const t1 = performance.now();
     wasm = mod;
     await mod.create_prover(profile ?? 'floor');
@@ -148,15 +191,13 @@ const handlers: Record<string, (a: Args, emit: (p: unknown) => void) => Promise<
   /// Returns the raw bytes as well, because snarkjs needs the same two files and downloading
   /// them twice would be both slow and a different test. They leave wasm as a copy; that is
   /// unavoidable, since snarkjs cannot read another module's linear memory.
-  async load({ base, name }, emit) {
+  async load({ base, name, keepZkey }, emit) {
     const t0 = performance.now();
     const z = await streamInto(`${base}/${name}/circuit.zkey`, w().zkey_alloc, (d, t) =>
       emit({ file: 'zkey', done: d, total: t })
     );
     // Copied out before `zkey_take` consumes the allocation. snarkjs gets this array.
-    const zkeyBytes = new Uint8Array(
-      new Uint8Array(w().wasm_memory().buffer, z.ptr, z.len)
-    );
+    const zkeyBytes = new Uint8Array(new Uint8Array(w().wasm_memory().buffer, z.ptr, z.len));
     const tz = performance.now();
     w().zkey_take(z.ptr, z.len);
     const zkeyParseMs = performance.now() - tz;
@@ -164,9 +205,7 @@ const handlers: Record<string, (a: Args, emit: (p: unknown) => void) => Promise<
     const wt = await streamInto(`${base}/${name}/circuit.wtns`, w().wtns_alloc, (d, t) =>
       emit({ file: 'wtns', done: d, total: t })
     );
-    const wtnsBytes = new Uint8Array(
-      new Uint8Array(w().wasm_memory().buffer, wt.ptr, wt.len)
-    );
+    const wtnsBytes = new Uint8Array(new Uint8Array(w().wasm_memory().buffer, wt.ptr, wt.len));
     w().wtns_take(wt.ptr, wt.len);
 
     // Small enough to keep as JSON. The vkey is what both provers get verified against.
@@ -181,8 +220,14 @@ const handlers: Record<string, (a: Args, emit: (p: unknown) => void) => Promise<
       })
     );
 
+    // Trace mode runs no snarkjs, so nobody on the main thread wants the key. Keeping it
+    // here instead of transferring it out is what lets the CPU control re-parse it later
+    // without a second download or a second copy: `zkey_take` consumed the wasm-side
+    // allocation and `cpu_prepare` consumes the parse.
+    if (keepZkey) traceZkey = zkeyBytes;
+
     return {
-      zkeyBytes,
+      zkeyBytes: keepZkey ? undefined : zkeyBytes,
       wtnsBytes,
       vkey,
       publicSignals,
@@ -206,6 +251,45 @@ const handlers: Record<string, (a: Args, emit: (p: unknown) => void) => Promise<
     const t0 = performance.now();
     const r = JSON.parse(await w().prove());
     return { ...r, wallMs: performance.now() - t0 };
+  },
+
+  /// Stages 0 to 4 and stop. See `prove_h_only` in crates/g16-wgpu/src/wasm.rs: it splits a
+  /// proof in half so a device lost part way through one can be blamed on a half.
+  async prove_h_only() {
+    const t0 = performance.now();
+    const r = JSON.parse(await w().prove_h_only());
+    return { ...r, wallMs: performance.now() - t0 };
+  },
+
+  /// Stages 0 to 4 and then one named MSM. See `prove_msm_probe` in the same file: it splits
+  /// the half that `prove_h_only` blamed into its five jobs, so a lost device can be pinned
+  /// on one of them.
+  async prove_msm_probe({ which }: Args) {
+    const t0 = performance.now();
+    const r = JSON.parse(await w().prove_msm_probe(String(which)));
+    return { ...r, wallMs: performance.now() - t0 };
+  },
+
+  /// One deterministic GPU trace. See `prove_trace` in crates/g16-wgpu/src/wasm.rs: the
+  /// blinders are fixed, so what comes back is diffable against another machine's and is not
+  /// a proof anybody may publish.
+  async trace() {
+    return JSON.parse(await w().prove_trace());
+  },
+
+  /// The CPU control, from the same witness in the same worker.
+  ///
+  /// It re-parses the key rather than sharing the GPU's, because `zkey_take` consumed the
+  /// streamed allocation and `cpu_prepare` consumes the parse. Destructive on purpose and
+  /// therefore last: `zkey_take` clears the GPU circuit, so the order here is GPU trace,
+  /// then this, then nothing. The witness survives both.
+  async cpu_trace() {
+    if (!traceZkey) throw new Error('cpu_trace needs load({ keepZkey: true }) first');
+    const ptr = w().zkey_alloc(traceZkey.length);
+    new Uint8Array(w().wasm_memory().buffer, ptr, traceZkey.length).set(traceZkey);
+    w().zkey_take(ptr, traceZkey.length);
+    JSON.parse(w().cpu_prepare());
+    return JSON.parse(w().cpu_prove_trace());
   },
 
   /// The GPU known-answer battery, plus whatever the browser's WGSL compiler said about the
@@ -233,6 +317,7 @@ const handlers: Record<string, (a: Args, emit: (p: unknown) => void) => Promise<
   /// Drops the key, the witness and every device buffer, between circuits. Without it the
   /// peak is two circuits rather than one, and a sweep dies at a circuit that fits on its own.
   async unload() {
+    traceZkey = null;
     w().unload();
     return { memBytes: w().wasm_memory_bytes() };
   }

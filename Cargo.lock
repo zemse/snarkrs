@@ -889,6 +889,7 @@ dependencies = [
  "num-traits",
  "pollster",
  "rayon",
+ "serde_json",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",

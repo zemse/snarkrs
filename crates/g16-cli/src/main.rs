@@ -3,6 +3,7 @@
 //!   g16 prove  --zkey c.zkey --witness c.wtns --proof p.json --public pub.json
 //!              [--backend cpu|wgpu|metal|cuda] [--stage-timings]
 //!   g16 verify --vkey vkey.json --proof p.json --public pub.json
+//!   g16 trace  --zkey c.zkey --witness c.wtns [--backend cpu|wgpu|...] [--out t.txt]
 //!   g16 bench  --artifacts DIR [--variant NAME]... [--reps 15] [--backend cpu|wgpu|...]
 //!              [--mode cold|warm|both] [--csv out.csv]
 //!
@@ -16,7 +17,11 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use g16_cli::{bench, json, make_backend, BackendKind};
-use g16_core::{prove::prove, verify::verify, StageTimings};
+use g16_core::{
+    prove::{prove, prove_trace},
+    verify::verify,
+    StageTimings,
+};
 use g16_zkey::{wtns::Witness, ProvingKey, VerifyingKey};
 
 #[derive(Parser)]
@@ -61,6 +66,21 @@ enum Cmd {
         #[arg(long, value_name = "FILE")]
         public: PathBuf,
     },
+    /// Print a deterministic execution trace, for diffing against another machine.
+    ///
+    /// Debugging only. It pins stage 10's blinders, so it emits no proof.json: see
+    /// `g16_core::trace`.
+    Trace {
+        #[arg(long, value_name = "FILE")]
+        zkey: PathBuf,
+        #[arg(long, value_name = "FILE")]
+        witness: PathBuf,
+        #[arg(long, value_enum, default_value_t = BackendKind::Cpu)]
+        backend: BackendKind,
+        /// Write the trace here instead of to stdout, so two of them can be diffed.
+        #[arg(long, value_name = "FILE")]
+        out: Option<PathBuf>,
+    },
     /// Benchmark proving, cold and warm, verifying every proof.
     Bench(bench::Args),
 }
@@ -89,6 +109,12 @@ fn main() -> Result<()> {
             proof,
             public,
         } => run_verify(&vkey, &proof, &public),
+        Cmd::Trace {
+            zkey,
+            witness,
+            backend,
+            out,
+        } => run_trace(&zkey, &witness, backend, out.as_deref()),
         Cmd::Bench(args) => bench::run(args),
     }
 }
@@ -109,9 +135,9 @@ fn run_prove(
         .0;
     let circuit = make_backend(backend)?.prepare(pk)?;
 
-    // Stage 10's blinders come from the OS CSPRNG. Nothing in this binary offers a seed
-    // override: a reused (r, s) across two proofs of different witnesses leaks the
-    // witness, so the deterministic path stays a test-only entry point in g16-core.
+    // Stage 10's blinders come from the OS CSPRNG. Nothing on this command offers a seed
+    // override: a reused (r, s) across two proofs of different witnesses leaks the witness.
+    // `g16 trace` does fix them, and writes no proof.json for exactly that reason.
     let mut rng = ark_std::rand::thread_rng();
     let mut t = StageTimings::default();
     let started = std::time::Instant::now();
@@ -164,6 +190,37 @@ fn run_prove(
         println!("attributed  us {:>10}", known);
         println!("total       us {:>10}", total);
         println!("proved in {:.1} ms", elapsed.as_secs_f64() * 1000.0);
+    }
+    Ok(())
+}
+
+/// Prints what two machines must agree on, given the same zkey and witness.
+///
+/// No `--self-verify` and no `--proof`: this is not a way to obtain a proof. The blinders are
+/// fixed constants, so the proof it computes is one nobody may publish, and the only reason
+/// stage 11 runs at all is that a difference which first shows up in the assembled points and
+/// not in any MSM would say the fault is in `assemble` rather than on the device.
+fn run_trace(
+    zkey: &std::path::Path,
+    witness: &std::path::Path,
+    backend: BackendKind,
+    out: Option<&std::path::Path>,
+) -> Result<()> {
+    let pk = ProvingKey::load(zkey).with_context(|| format!("loading {}", zkey.display()))?;
+    let w = Witness::load(witness)
+        .with_context(|| format!("loading {}", witness.display()))?
+        .0;
+    let circuit = make_backend(backend)?.prepare(pk)?;
+    let mut t = StageTimings::default();
+    let trace = prove_trace(circuit.as_ref(), &w, &mut t)?;
+
+    match out {
+        Some(path) => {
+            std::fs::write(path, trace.to_text())
+                .with_context(|| format!("writing {}", path.display()))?;
+            eprintln!("wrote {}", path.display());
+        }
+        None => print!("{}", trace.to_text()),
     }
     Ok(())
 }

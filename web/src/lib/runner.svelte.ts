@@ -17,10 +17,11 @@ import {
 import { Estimator } from './estimate';
 import { Prover } from './prover';
 import { snarkjsProve, snarkjsVerify } from './snarkjs';
-import { median } from './format';
+import { count, median } from './format';
 import { visible, Discards } from './visibility';
 
-export type RowStatus = 'pending' | 'downloading' | 'webgpu' | 'snarkjs' | 'done' | 'error' | 'skipped';
+export type RowStatus =
+  'pending' | 'downloading' | 'webgpu' | 'snarkjs' | 'done' | 'error' | 'skipped';
 
 export type Row = {
   circuit: Circuit;
@@ -44,6 +45,9 @@ export type Row = {
   /// not run.
   stages?: Record<string, number>;
   snarkjsWorkers?: number | null;
+  /// `?trace=1` only: the GPU's deterministic trace and the CPU control's, as the plain text
+  /// `g16 trace` writes, so the two are `diff`-able against a laptop's with no reformatting.
+  trace?: { gpu?: string; cpu?: string; error?: string };
   /// Each prover's proof, checked by the other one's verifier.
   crossVerified?: boolean;
   note?: string;
@@ -94,6 +98,9 @@ export class Run {
   /// then eleven seconds lower. Subtracting the time already spent inside the current
   /// operation is what lets the number move while nothing is reporting.
   private inFlight: { estMs: number; startedAt: number } | null = null;
+  /// Set when the GPU device is lost. A lost device does not come back: every later circuit
+  /// would fail the same way, after paying for its own key first, so the run stops here.
+  private deviceLost = false;
   private ticker: ReturnType<typeof setInterval> | null = null;
 
   /// Downloads and proofs are timed for real; the ETA has to guess. Both curves live in
@@ -110,6 +117,47 @@ export class Run {
   /// specification's guarantees, which is what to use when the question is what a stock
   /// browser elsewhere would do rather than what this machine can do.
   private readonly profile = new URLSearchParams(q()).get('profile') ?? 'auto';
+  /// Bisection modes. None of them prove anything, and none of them are benchmarks: the row
+  /// they produce has no complete proof in it and no snarkjs beside it.
+  ///
+  /// * `?stages=h` runs stages 0 to 4 and stops, which is how a device lost part way through
+  ///   a proof gets blamed on a half of one.
+  /// * `?stages=msm:b-g2` runs stages 0 to 4 and then exactly one MSM, splitting the other
+  ///   half five ways. `a-g1`, `b-g2`, `b-g1`, `l-g1` and `h-g1` are the five.
+  private readonly stages = new URLSearchParams(q()).get('stages') ?? '';
+  /// `?tg=32` forces the MSM reduction width instead of using each curve's measured one.
+  /// See `REDUCE_TG_OVERRIDE` in crates/g16-wgpu/src/points.rs: the shipped G2 width holds
+  /// exactly the workgroup storage an iPhone grants, with nothing spare.
+  private readonly reduceTg = param('tg', 0);
+  /// `?c=8` forces the MSM window width instead of computing it from the scalar count.
+  private readonly msmC = param('c', 0);
+  /// `?upto=3` stops a point MSM after its nth kernel: 1 clear, 2 segmented, 3 merge,
+  /// 4 reduce, 5 ones. The answer it produces is wrong on purpose; see `STOP_AFTER`.
+  private readonly upto = param('upto', 0);
+  /// `?trace=1` proves each circuit once on the GPU and once on the CPU with stage 10's
+  /// blinders pinned, and prints both traces instead of a timing. Neither is a proof anybody
+  /// may publish and neither is a measurement; see `g16_core::trace`.
+  ///
+  /// This is the tool for a device that completes a proof and gets it rejected. `diff` the
+  /// GPU block against `g16 trace --backend cpu` on a laptop and the first row that differs
+  /// names the stage. The CPU block is the control that says whether to suspect the GPU at
+  /// all: every browser on iOS is WebKit, so there is no second engine there to ask.
+  private readonly traceMode = new URLSearchParams(q()).get('trace') === '1';
+  /// `?mergebody=1` replaces the merge kernel with an immediate return, so the dispatch
+  /// happens and none of its code runs. See `MERGE_BODY` in crates/g16-wgpu/src/gen/points.rs.
+  private readonly mergeBody = param('mergebody', 0);
+  /// `?windows=1` records every MSM window sum and `ones` partial into the trace text, each
+  /// as affine coordinates plus an on-curve flag. See `WINDOW_DEBUG` in
+  /// crates/g16-wgpu/src/points.rs: the wrong `msm_b_g2` is off the curve, and this says
+  /// which window put it there.
+  private readonly windowDebug = param('windows', 0);
+  /// `?reducebody=1` restores the reduce kernel's pre-fix per-thread body, the one that makes
+  /// every G2 window sum wrong on an iPhone. See `REDUCE_BODY` in
+  /// crates/g16-wgpu/src/gen/points.rs. Read it through `?windows=1`, comparing two machines.
+  private readonly reduceBody = param('reducebody', 0);
+  /// `?mulsmall=1` restores pt_mul_small's two-call-site spelling, the one that loses an
+  /// iPhone's device. See `MUL_SMALL_BODY` in crates/g16-wgpu/src/gen/points.rs.
+  private readonly mulSmallBody = param('mulsmall', 0);
   /// Where the artifacts come from. In dev this is the Vite proxy, which exists so a
   /// checkout with no AWS access still runs the whole benchmark; in a build it is the bucket
   /// directly, which is what makes the CORS rule in s3-cors.json load-bearing.
@@ -119,9 +167,7 @@ export class Run {
   /// is also the way out if the bucket cannot be given a CORS rule at all.
   private readonly base =
     import.meta.env.VITE_ARTIFACT_BASE ??
-    (import.meta.env.DEV
-      ? '/s3/artifacts'
-      : 'https://gpu-snark-bench.s3.amazonaws.com/artifacts');
+    (import.meta.env.DEV ? '/s3/artifacts' : 'https://gpu-snark-bench.s3.amazonaws.com/artifacts');
 
   get circuits() {
     return selectCircuits(q());
@@ -161,6 +207,18 @@ export class Run {
     }
   }
 
+  /// The limits the device actually granted, in one line, for an error a visitor can paste.
+  private grantSummary() {
+    const l = this.env?.limits ?? {};
+    const g = (k: string) => (typeof l[k]?.[1] === 'number' ? l[k][1] : null);
+    const mib = (n: number | null) => (n == null ? '?' : `${(n / 1024 ** 2).toFixed(0)} MiB`);
+    return (
+      `${mib(g('max_storage_buffer_binding_size'))} per storage binding, ` +
+      `${mib(g('max_buffer_size'))} per buffer, ` +
+      `${g('max_compute_invocations_per_workgroup') ?? '?'} invocations per workgroup`
+    );
+  }
+
   /// Circuits this run will prove that a stock floor-only device could not hold.
   ///
   /// Worth stating once, because a seven-circuit result from here and a six-circuit result
@@ -179,6 +237,7 @@ export class Run {
   async start() {
     if (this.phase === 'running' || this.phase === 'starting') return;
     this.cancelled = false;
+    this.deviceLost = false;
     this.fatal = null;
     this.phase = 'starting';
     // A handle for reading the raw per-rep timings out of the console. The page shows a
@@ -211,7 +270,17 @@ export class Run {
     try {
       this.activity = 'opening the GPU';
       this.prover = new Prover();
-      const init = await this.prover.init(`${location.origin}/pkg`, this.profile);
+      const init = await this.prover.init(
+        `${location.origin}/pkg`,
+        this.profile,
+        this.reduceTg,
+        this.msmC,
+        this.upto,
+        this.mergeBody,
+        this.windowDebug,
+        this.reduceBody,
+        this.mulSmallBody
+      );
       this.env = {
         ...init.caps,
         moduleMs: init.moduleMs,
@@ -251,24 +320,23 @@ export class Run {
       this.phase = 'running';
 
       for (const row of this.rows) {
-        if (this.cancelled) break;
+        if (this.cancelled || this.deviceLost) break;
         if (row.status === 'skipped') continue;
         await this.runOne(row);
         this.recomputeEta();
       }
+      if (this.deviceLost) {
+        for (const r of this.rows) {
+          if (r.status === 'pending') {
+            r.status = 'skipped';
+            r.note = 'not attempted: the GPU device was already lost';
+          }
+        }
+      }
       this.phase = this.cancelled ? 'idle' : 'done';
-      await this.report();
-      this.activity = '';
-      this.etaMs = null;
-      if (this.phase === 'done') this.progress = 1;
     } catch (e: any) {
       this.phase = 'error';
       this.fatal = String(e?.message ?? e);
-      // Reported too, and not only on the happy path. The failure worth reading is usually
-      // the one that stopped the run before it produced a row: a device that refused to
-      // open, or a GPU self-test that refused to let it prove. Without this, `?report=1`
-      // posts nothing at all and the log looks like the page never ran.
-      await this.report();
     } finally {
       if (this.ticker != null) {
         clearInterval(this.ticker);
@@ -278,6 +346,107 @@ export class Run {
       this.prover?.terminate();
       this.prover = null;
     }
+    // Both of these after the prover is gone, and on every path rather than only the happy
+    // one. The failure worth reading is usually the one that stopped the run before it
+    // produced a row: a device that refused to open, or a self-test that refused to let it
+    // prove. `report()` used to be called separately in each branch, which is how it came
+    // to be missing from neither but duplicated in both.
+    await this.selftestAfterFailure();
+    await this.report();
+    this.activity = '';
+    this.etaMs = null;
+    if (this.phase === 'done') this.progress = 1;
+  }
+
+  /// Puts a self-test verdict into a failed run's report, without anybody having to be told
+  /// a URL first.
+  ///
+  /// This is the whole difference between a report that localises a fault and one that says
+  /// only that something broke. An iPhone lost its GPU device on the smallest circuit in
+  /// the ladder, and the seven known-answer checks that would have said whether the
+  /// primitives work only ran because the visitor was handed `?selftest=1` by hand. Nobody
+  /// else would get that far.
+  ///
+  /// On a **fresh** device, because a lost one does not come back and cannot answer
+  /// anything. Best effort throughout: this runs when the run has already failed, so it
+  /// must not be able to turn a bad report into no report, and a device that will not open
+  /// a second time is itself worth recording.
+  private async selftestAfterFailure() {
+    if (this.env?.selftest) return;
+    if (this.fatal == null && !this.rows.some((r) => r.status === 'error')) return;
+    this.activity = 'running the GPU self-test, to say more about what failed';
+    const p = new Prover();
+    try {
+      const init = await p.init(`${location.origin}/pkg`, this.profile);
+      this.env ??= {};
+      this.env.limits ??= init.caps?.limits;
+      this.env.adapter ??= await adapterInfo();
+      this.env.selftest = await p.selftest();
+    } catch (e: any) {
+      this.env ??= {};
+      this.env.selftest = { error: String(e?.message ?? e) };
+    } finally {
+      p.terminate();
+    }
+  }
+
+  /// Everything a failure report needs, as text the visitor can copy off the device.
+  ///
+  /// `?report=1` posts the same facts to the dev server, which is how they are read out of a
+  /// browser this machine can drive. A phone is not one of those. An iPhone lost its GPU
+  /// device on the smallest circuit in the ladder and the only thing that reached anybody
+  /// was one sentence: no browser version, no adapter, and in particular no self-test
+  /// result, even though the self-test battery exists precisely to say which kernel is
+  /// wrong. It was written to `env.selftest` and displayed nowhere.
+  get diagnostics() {
+    const l = this.env?.limits ?? {};
+    const limits = Object.keys(l)
+      .sort()
+      .map((k) => `  ${k}: requested ${l[k][0]}, granted ${l[k][1]}`)
+      .join('\n');
+    return [
+      `url        ${typeof location === 'undefined' ? '' : location.href}`,
+      `userAgent  ${navigator.userAgent}`,
+      `adapter    ${JSON.stringify(this.env?.adapter ?? null)}`,
+      `profile    ${this.profile}${this.reduceTg ? `  reduce_tg ${this.reduceTg}` : ''}${this.msmC ? `  msm_c ${this.msmC}` : ''}${this.upto ? `  upto ${this.upto}` : ''}${this.mergeBody ? `  merge_body ${this.mergeBody}` : ''}${this.windowDebug ? `  window_debug ${this.windowDebug}` : ''}${this.reduceBody ? `  reduce_body ${this.reduceBody}` : ''}${this.mulSmallBody ? `  mul_small_body ${this.mulSmallBody}` : ''}` +
+        (this.env?.auto_fallback ? `  auto_fallback ${this.env.auto_fallback}` : ''),
+      `cores      ${navigator.hardwareConcurrency}`,
+      `startup    wasm module ${Math.round(this.env?.moduleMs ?? 0)} ms, adapter ${Math.round(this.env?.deviceMs ?? 0)} ms`,
+      `phase      ${this.phase}`,
+      this.fatal ? `fatal      ${this.fatal}` : '',
+      `selftest   ${this.env?.selftest ? JSON.stringify(this.env.selftest) : 'not run (add ?selftest=1)'}`,
+      'limits',
+      limits || '  (device never opened)',
+      'rows',
+      ...this.rows.map(
+        (r) =>
+          `  ${r.circuit.name} ${r.status}` +
+          // Whether prepare() completed is the first fork in any device-loss report: it
+          // separates a device that died building and uploading from one that died proving.
+          (r.downloadMs ? ` download ${Math.round(r.downloadMs)}ms` : '') +
+          (r.prepareMs ? ` prepare ${Math.round(r.prepareMs)}ms` : '') +
+          (r.webgpuMs ? ` webgpu ${Math.round(r.webgpuMs)}ms` : '') +
+          (r.snarkjsMs ? ` snarkjs ${Math.round(r.snarkjsMs)}ms` : '') +
+          (r.error ? ` error ${r.error}` : '') +
+          (r.note ? ` note ${r.note}` : '')
+      ),
+      // Last, and verbatim. This block is the whole output of `?trace=1` and the reader's
+      // next move is to paste it into a file and `diff` it against `g16 trace` on a laptop,
+      // so nothing here may be summarised, wrapped or re-ordered.
+      ...this.rows.flatMap((r) =>
+        r.trace
+          ? [
+              '',
+              `trace ${r.circuit.name} gpu`,
+              r.trace.gpu ?? '  (none)',
+              `trace ${r.circuit.name} cpu`,
+              r.trace.cpu ?? '  (none)'
+            ]
+          : []
+      )
+    ]
+      .filter(Boolean)
+      .join('\n');
   }
 
   /// Posts the finished rows to the dev server when `?report=1`. See the `g16-report-sink`
@@ -300,6 +469,7 @@ export class Run {
         webgpuReps: r.webgpuReps,
         snarkjsReps: r.snarkjsReps,
         stages: r.stages,
+        trace: r.trace,
         error: r.error,
         note: r.note
       }))
@@ -322,12 +492,17 @@ export class Run {
     try {
       row.status = 'downloading';
       this.activity = `downloading ${c.label} (${(c.zkeyBytes / 1024 ** 2).toFixed(0)} MB)`;
-      const loaded = await p.load(this.base, c.name, (pr: any) => {
-        // zkey then witness, so the bar covers both files rather than resetting between them.
-        const done = pr.file === 'zkey' ? pr.done : c.zkeyBytes + pr.done;
-        row.downloaded = done;
-        this.recomputeEta();
-      });
+      const loaded = await p.load(
+        this.base,
+        c.name,
+        (pr: any) => {
+          // zkey then witness, so the bar covers both files rather than resetting between them.
+          const done = pr.file === 'zkey' ? pr.done : c.zkeyBytes + pr.done;
+          row.downloaded = done;
+          this.recomputeEta();
+        },
+        this.traceMode
+      );
       row.downloaded = loaded.downloadedBytes;
       row.downloadMs = loaded.downloadMs;
       this.est.observeDownload(loaded.downloadedBytes, loaded.downloadMs);
@@ -340,12 +515,51 @@ export class Run {
       row.prepareMs = prep.wallMs;
       this.est.observePrepare();
 
+      if (this.traceMode) {
+        row.trace = {};
+        this.activity = `${c.label}: tracing on the GPU`;
+        try {
+          row.trace.gpu = (await p.trace()).text;
+        } catch (e: any) {
+          row.trace.error = `gpu: ${String(e?.message ?? e)}`;
+        }
+        // Second, and unconditionally: a GPU trace that threw is exactly when the control
+        // matters most. It is destructive (see the worker's `cpu_trace`), so nothing may
+        // run on this circuit after it.
+        this.activity = `${c.label}: tracing on the CPU`;
+        try {
+          row.trace.cpu = (await p.cpuTrace()).text;
+        } catch (e: any) {
+          row.trace.error = `${row.trace.error ? row.trace.error + '; ' : ''}cpu: ${String(e?.message ?? e)}`;
+        }
+        row.webgpuDone = row.snarkjsDone = this.warmup + this.reps;
+        row.status = row.trace.gpu || row.trace.cpu ? 'done' : 'error';
+        row.error = row.trace.error;
+        row.note = 'deterministic trace, not a proof and not a measurement. See diagnostics.';
+        return;
+      }
+
+      if (this.stages) {
+        const probe = this.stages.startsWith('msm:') ? this.stages.slice(4) : null;
+        const r: any = await this.timed(this.est.proveMs('webgpu', c), () =>
+          probe ? p.proveMsmProbe(probe) : p.proveHOnly()
+        );
+        row.webgpuMs = r.wallMs;
+        row.stages = r;
+        row.webgpuDone = row.snarkjsDone = this.warmup + this.reps;
+        row.status = 'done';
+        row.note = probe
+          ? `stages 0 to 4 and the ${probe} MSM only. A bisection run, not a measurement.`
+          : 'stages 0 to 4 only, no MSM and no snarkjs. A bisection run, not a measurement.';
+        return;
+      }
+
       const ours: number[] = [];
       let ourProof: any = null;
       const gpuDiscards = new Discards(this.reps + 5);
       // `i` advances only on a rep that counted. A warm-up is never discarded: it is not
       // measured, so a hidden tab does not spoil it, and re-taking it would only be slower.
-      for (let i = 0; i < this.warmup + this.reps; ) {
+      for (let i = 0; i < this.warmup + this.reps;) {
         await visible();
         // Warm-ups counted, and counted the same way snarkjs counts them, because the two
         // lines sit in the same place on screen one after the other and a reader comparing
@@ -443,6 +657,20 @@ export class Run {
       if (/over the \d+ byte (storage binding|buffer) limit/.test(msg)) {
         row.status = 'skipped';
         row.note = `could not run on this device: ${msg}`;
+      } else if (/device was lost/.test(msg)) {
+        // WebKit hands over a reason of Unknown and an empty message, so everything useful
+        // about a device loss has to come from our side of it. What the circuit was and
+        // what the device granted is the difference between a report that can be acted on
+        // and one that cannot.
+        this.deviceLost = true;
+        row.status = 'error';
+        row.error = msg;
+        this.fatal =
+          `${msg} This happened on ${c.label} ` +
+          `(${count(c.constraints)} constraints, ${(c.zkeyBytes / 1024 ** 2).toFixed(0)} MB key, ` +
+          `${(c.wtnsBytes / 1024 ** 2).toFixed(0)} MB witness). ` +
+          `The device granted ${this.grantSummary()}. A lost device does not come back, so ` +
+          `the rest of the run was not attempted.`;
       } else {
         row.status = 'error';
         row.error = msg;

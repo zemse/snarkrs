@@ -14,3 +14,4 @@ build
 # upload, and anything the build genuinely needs belongs in the project's environment
 # variables rather than in a file that rides along with the source.
 .env*
+.certs

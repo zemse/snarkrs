@@ -39,6 +39,42 @@ pub fn prove_with_blinders(
     Ok(assemble(circuit.key(), &m, r, s, timings))
 }
 
+/// A full proof plus every intermediate value that two machines must agree on.
+///
+/// **Debugging only**, for the reasons in [`crate::trace`]: the blinders are the fixed
+/// constants there, so this is not a proof anybody may publish. It exists because a wrong
+/// 256-bit number at the end of a proof says nothing about which stage wrote it, and the
+/// backend that produces one only does so on a device that is not on this desk.
+///
+/// Synchronous, so the GPU backends reach it only through their blocking `PreparedCircuit`
+/// impl. The browser prover cannot use it at all and assembles the same `Trace` itself, for
+/// the same reason [`assemble`] is public: every WebGPU readback is asynchronous.
+pub fn prove_trace(
+    circuit: &dyn PreparedCircuit,
+    witness: &[Fr],
+    timings: &mut StageTimings,
+) -> Result<crate::trace::Trace, ProveError> {
+    let (r, s) = crate::trace::blinders();
+    let h = circuit.compute_h(witness, timings)?;
+    let m = circuit.msms(witness, &h, timings)?;
+    let proof = assemble(circuit.key(), &m, r, s, timings);
+    // After the MSMs, not before: a readback inserted ahead of them is an extra submit in
+    // the middle of the sequence being investigated, and one hypothesis for the iPhone is
+    // that the sequence itself is what goes wrong. The MSMs only read that buffer, so
+    // copying it down afterwards sees the same values.
+    let host_h = circuit.h_to_host(&h);
+    Ok(crate::trace::Trace::build(
+        circuit.backend_name(),
+        circuit.n_vars(),
+        circuit.n_public(),
+        circuit.domain_size(),
+        witness,
+        host_h.as_deref(),
+        &m,
+        &proof,
+    ))
+}
+
 /// Stage 11 alone: blind the five MSM outputs into `(A, B, C)`.
 ///
 /// Split out of [`prove_with_blinders`] because the browser prover cannot go through
@@ -351,6 +387,69 @@ mod tests {
 
             let vk = VerifyingKey::from_json(&a.dir.join("vkey.json")).unwrap();
             verify(&vk, &public_inputs(&a.dir), &p1).unwrap();
+        });
+    }
+
+    /// The whole comparison rests on this: two runs of the same code over the same witness
+    /// must produce byte-identical traces. If they do not, a difference between a laptop and
+    /// a phone means nothing, because the laptop already disagrees with itself.
+    ///
+    /// It also verifies the proof the trace carries. A trace whose proof does not verify is
+    /// a trace of something that is not a proof, and every row in it would be a comparison
+    /// between two wrong answers.
+    #[test]
+    fn a_trace_is_reproducible_and_its_proof_verifies() {
+        for_each_artifact("a_trace_is_reproducible", |a| {
+            let (circuit, witness) = prepared(&a.dir);
+            let mut t = StageTimings::default();
+            let t1 = prove_trace(circuit.as_ref(), &witness, &mut t).unwrap();
+            let t2 = prove_trace(circuit.as_ref(), &witness, &mut t).unwrap();
+            assert!(crate::trace::diff(&t1, &t2).is_empty());
+            assert_eq!(t1.to_text(), t2.to_text());
+            assert_eq!(t1.to_json(), t2.to_json());
+
+            // Not an empty trace dressed as a matching one: the H chunks are the part that
+            // would silently vanish if `compute_h` ever stopped handing back host memory.
+            let text = t1.to_text();
+            assert!(text.contains("h_chunk[00]"), "{text}");
+            assert!(!text.contains("msm_a_g1        infinity"), "{text}");
+
+            let (r, s) = crate::trace::blinders();
+            let proof = prove_with_blinders(circuit.as_ref(), &witness, r, s, &mut t).unwrap();
+            let vk = VerifyingKey::from_json(&a.dir.join("vkey.json")).unwrap();
+            verify(&vk, &public_inputs(&a.dir), &proof).unwrap();
+        });
+    }
+
+    /// A trace that could not tell two different executions apart would report "no
+    /// difference" for the bug it exists to find.
+    #[test]
+    fn a_trace_reports_the_stage_that_differs() {
+        for_each_artifact("a_trace_reports_the_stage_that_differs", |a| {
+            let (circuit, witness) = prepared(&a.dir);
+            let mut t = StageTimings::default();
+            let good = prove_trace(circuit.as_ref(), &witness, &mut t).unwrap();
+
+            // One wire changed, which is the smallest thing a miscomputed stage can look
+            // like. Not the public prefix: that would move the shape block too and the
+            // point here is that a matching shape does not imply a matching execution.
+            let mut bent = witness.clone();
+            let last = bent.len() - 1;
+            bent[last] += Fr::one();
+            let bad = prove_trace(circuit.as_ref(), &bent, &mut t).unwrap();
+
+            // Section 8 covers every private wire, so the L MSM is the one row that has to
+            // move whichever wire this is, and C carries L into the proof. The rest depend
+            // on whether that wire appears in the A, B or C matrices, and on a real circuit
+            // most of them do not: the last wire of `railgun-01x01` leaves `h_digest`
+            // untouched. Asserting on the first differing row would be asserting on the
+            // fixture rather than on the trace.
+            let names: Vec<&str> = crate::trace::diff(&good, &bad)
+                .iter()
+                .map(|(n, _, _)| *n)
+                .collect();
+            assert!(names.contains(&"msm_l_g1"), "{names:?}");
+            assert!(names.contains(&"proof_c"), "{names:?}");
         });
     }
 

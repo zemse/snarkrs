@@ -47,8 +47,8 @@
 use std::marker::PhantomData;
 
 use ark_ff::AdditiveGroup;
-use g16_core::ProveError;
-use g16_field::{Fq, Fq2, G1Projective, G2Projective, Zero};
+use g16_core::{json, ProveError};
+use g16_field::{AffineRepr, CurveGroup, Fq, Fq2, G1Projective, G2Projective, Zero};
 use g16_gpu_layout::{PackedFq, PackedFq2, LIMBS};
 
 use crate::device::{bad, WgpuBackend};
@@ -314,6 +314,9 @@ pub trait PointCurve {
     type Projective: AdditiveGroup;
     /// One `Xyzz<F>` as the kernel wrote it to a projective point, with no field inversion.
     fn from_xyzz_bytes(raw: &[u8]) -> Result<Self::Projective, ProveError>;
+    /// One window sum rendered for the [`WINDOW_DEBUG`] log: whether its affine form is on
+    /// the curve, then the coordinates in decimal, the rendering `g16_core::trace` uses.
+    fn debug_point(p: &Self::Projective) -> String;
 }
 
 /// BN254's G1: the A, B-G1, L and H MSMs, four of a proof's five.
@@ -330,6 +333,14 @@ impl PointCurve for G1Curve {
     fn from_xyzz_bytes(raw: &[u8]) -> Result<G1Projective, ProveError> {
         xyzz_g1_from_bytes(raw)
     }
+    fn debug_point(p: &G1Projective) -> String {
+        let a = p.into_affine();
+        let tag = if a.is_on_curve() { "on " } else { "OFF" };
+        match a.xy() {
+            Some((x, y)) => format!("{tag} {} {}", json::dec(x), json::dec(y)),
+            None => format!("{tag} infinity"),
+        }
+    }
 }
 
 impl PointCurve for G2Curve {
@@ -337,6 +348,20 @@ impl PointCurve for G2Curve {
     type Projective = G2Projective;
     fn from_xyzz_bytes(raw: &[u8]) -> Result<G2Projective, ProveError> {
         xyzz_g2_from_bytes(raw)
+    }
+    fn debug_point(p: &G2Projective) -> String {
+        let a = p.into_affine();
+        let tag = if a.is_on_curve() { "on " } else { "OFF" };
+        match a.xy() {
+            Some((x, y)) => format!(
+                "{tag} {} {} {} {}",
+                json::dec(x.c0),
+                json::dec(x.c1),
+                json::dec(y.c0),
+                json::dec(y.c1)
+            ),
+            None => format!("{tag} infinity"),
+        }
     }
 }
 
@@ -378,6 +403,55 @@ const MERGE: usize = 2;
 const REDUCE: usize = 3;
 const ONES: usize = 4;
 
+/// Overrides the reduction width for every curve, or 0 to use each curve's measured one.
+///
+/// A knob rather than a constant because the shipped width is a measurement taken on one
+/// class of GPU and it does not travel. An iPhone 15 Pro loses its WebGPU device inside the
+/// G2 MSM alone, on the smallest circuit in the ladder, while all four G1 MSMs and stages 0
+/// to 4 complete; the shipped G2 reduction holds `array<Pt, 64>` at 256 bytes a point, which
+/// is exactly the 16384 byte workgroup storage that device grants, with nothing spare.
+///
+/// A global rather than a parameter because the browser has no environment to read and the
+/// pipelines are built long before any query string reaches this crate. Set through
+/// `set_reduce_tg` in the wasm bindings.
+pub static REDUCE_TG_OVERRIDE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Stop a point MSM after the nth kernel, or 0 to run all five. 1 is clear, 2 segmented,
+/// 3 merge, 4 reduce, 5 ones. See [`MsmPoints::encode`] for why: they share one pass and
+/// one submit, so a lost device names none of them.
+pub static STOP_AFTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Record every window sum and `ones` partial that [`MsmPoints::combine`] folds, or 0 to
+/// record nothing. Drained by [`window_log_take`]; the wasm trace entry point appends the
+/// lines to the trace text, where the diff tools treat them as ordinary rows.
+///
+/// The iPhone above still computes the G2 MSM wrong under every knob so far: `?tg=1` leaves
+/// no `workgroupBarrier` in the module, `?split=2` submits every dispatch on the spot,
+/// `?upto=4` excludes `ones` and `?mergebody=1` excludes `merge`, and the answer still
+/// varies between runs. The wrong point is not on the curve, so a coordinate is being
+/// corrupted rather than a contribution lost. Nothing in the trace looks between the bucket
+/// array and the final point, and that is the gap this fills: one corrupt window against all
+/// of them corrupt is the difference between a stray write and a broken kernel.
+pub static WINDOW_DEBUG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Lines recorded under [`WINDOW_DEBUG`]. A `Mutex` rather than a cell because the native
+/// tests prove from several threads; the browser has one and never contends.
+static WINDOW_LOG: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Appends to the [`WINDOW_DEBUG`] log. `batch.rs` writes it after each `combine`.
+pub(crate) fn window_log(text: &str) {
+    WINDOW_LOG
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push_str(text);
+}
+
+/// Takes everything recorded since the last take. The trace entry point drains this once
+/// per run, so one run's lines cannot leak into the next one's text.
+pub fn window_log_take() -> String {
+    std::mem::take(&mut *WINDOW_LOG.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
 impl<C: PointCurve> MsmPoints<C> {
     /// Compiles at this curve's measured shape and this device's workgroup-per-dimension
     /// limit.
@@ -385,7 +459,14 @@ impl<C: PointCurve> MsmPoints<C> {
         let max_wg = backend
             .granted_limits()
             .max_compute_workgroups_per_dimension;
-        Self::with_shape(backend, C::WGSL.wg, max_wg)
+        let mut wg = C::WGSL.wg;
+        // Clamped to what the curve can hold, so an override cannot ask for a workgroup
+        // array larger than the floor guarantees and turn a diagnostic into a build failure.
+        let forced = REDUCE_TG_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+        if forced > 0 {
+            wg.tg = forced.min(C::WGSL.max_tg());
+        }
+        Self::with_shape(backend, wg, max_wg)
     }
 
     /// Same, with the workgroup sizes and the per-dispatch workgroup cap forced.
@@ -849,10 +930,29 @@ impl<C: PointCurve> MsmPoints<C> {
         binds: &PointBinds,
         offsets: &PointOffsets,
     ) -> Result<(), ProveError> {
+        // A bisection gate, and normally not one: `stop` is 0 unless something has set it.
+        // The five kernels share one pass and one submit, so when the device dies there is
+        // nothing to say which of them killed it. Encoding a prefix and stopping produces a
+        // wrong answer on purpose; the only question it answers is whether the GPU is still
+        // alive, which is the question when it is not.
+        let stop = STOP_AFTER.load(std::sync::atomic::Ordering::Relaxed);
+        let run = |n: u32| stop == 0 || n <= stop;
         self.encode_clear(pass, digits, binds, offsets)?;
+        if !run(2) {
+            return Ok(());
+        }
         self.encode_segmented(pass, digits, points, binds, offsets)?;
+        if !run(3) {
+            return Ok(());
+        }
         self.encode_merge(pass, digits, binds, offsets)?;
+        if !run(4) {
+            return Ok(());
+        }
         self.encode_reduce(pass, digits, binds, offsets)?;
+        if !run(5) {
+            return Ok(());
+        }
         self.encode_ones(pass, points, binds, offsets)
     }
 
@@ -1007,6 +1107,47 @@ impl<C: PointCurve> MsmPoints<C> {
             acc += at(ones + g * pt)?;
         }
         Ok(acc)
+    }
+
+    /// The same readback [`combine`](Self::combine) folds, one line per window sum and
+    /// `ones` partial, for the [`WINDOW_DEBUG`] log.
+    ///
+    /// Affine and decimal, the discipline `g16_core::trace` uses for the five MSM outputs:
+    /// the buckets accumulate in XYZZ through an atomically built scatter, so the projective
+    /// coordinates are not stable even between two correct runs, and affine is the only form
+    /// two machines can be held to. The on-curve flag is the sharper signal, because the
+    /// wrong `msm_b_g2` this exists for is off the curve, which correct group arithmetic
+    /// over curve points cannot produce.
+    ///
+    /// Runs after `combine` over the same slice, so its length check has already passed.
+    pub fn debug_windows(
+        &self,
+        label: &str,
+        raw: &[u8],
+        digits: &DigitPlan,
+        points: &PointPlan,
+        bufs: &PointBuffers,
+    ) -> Result<String, ProveError> {
+        let pt = self.curve.point_bytes as usize;
+        let mut out = String::new();
+        for k in 0..digits.n_windows() as usize {
+            let p = C::from_xyzz_bytes(&raw[k * pt..(k + 1) * pt])?;
+            out.push_str(&format!(
+                "{:<16} {}\n",
+                format!("{label}_w{k:02}"),
+                C::debug_point(&p)
+            ));
+        }
+        let ones = bufs.ones_off as usize;
+        for g in 0..points.ones_groups as usize {
+            let p = C::from_xyzz_bytes(&raw[ones + g * pt..ones + (g + 1) * pt])?;
+            out.push_str(&format!(
+                "{:<16} {}\n",
+                format!("{label}_o{g:02}"),
+                C::debug_point(&p)
+            ));
+        }
+        Ok(out)
     }
 
     // ---- reporting ----

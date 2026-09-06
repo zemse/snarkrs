@@ -547,13 +547,167 @@ pub async fn prove() -> Result<String, JsError> {
     // Everything needed is cloned out under a short borrow, and the borrow is dropped before
     // the first `.await`. A `RefCell` borrow held across an await panics the moment the page
     // calls anything else on this module.
+    let (circuit, witness) = claim("prove")?;
+
+    let out = prove_inner(&circuit, &witness).await;
+    with_state(|s| {
+        s.busy = false;
+        Ok(())
+    })?;
+    out
+}
+
+/// Stages 0 to 4 alone, and then stop.
+///
+/// A bisection tool, not a benchmark. A device that survives every known-answer check in
+/// [`selftest`] and every pipeline build in [`prepare`], and is then lost part way through a
+/// proof, has told us nothing about *which* half of the proof killed it: the device-lost
+/// callback is asynchronous and sticky, so the site that reports it is only the first place
+/// anybody looked afterwards, not the place it happened. Running the front half on its own
+/// splits the proof in two. If this returns, the fault is in stages 5 to 9; if it loses the
+/// device, the fault is in stages 0 to 4.
+///
+/// Written for an iPhone on iOS 18.7 and Safari 26.6 that loses its device on the smallest
+/// circuit in the ladder, at both the `auto` and `floor` limit profiles, with all seven
+/// known-answer checks passing and all shader modules compiling clean.
+#[wasm_bindgen]
+pub async fn prove_h_only() -> Result<String, JsError> {
+    let (circuit, witness) = claim("prove_h_only")?;
+
+    let t0 = Instant::now();
+    let mut t = StageTimings::default();
+    let out = circuit.compute_h_async(&witness, &mut t).await;
+    with_state(|s| {
+        s.busy = false;
+        Ok(())
+    })?;
+    let h = out.map_err(js)?;
+
+    Ok(format!(
+        r#"{{"h_len":{},"gather_us":{},"ntt_us":{},"pointwise_us":{},"total_us":{}}}"#,
+        h.len(),
+        t.gather_us,
+        t.ntt_us,
+        t.pointwise_us,
+        t0.elapsed().as_micros() as u64,
+    ))
+}
+
+/// A deterministic execution trace of one GPU proof, for diffing against another machine.
+///
+/// **Debugging only.** Stage 10's blinders are the fixed constants in [`g16_core::trace`], so
+/// what this computes is not a proof anybody may publish, and it returns a trace rather than
+/// one for exactly that reason.
+///
+/// This is the tool for the iPhone that runs the whole pipeline, loses no device, agrees on
+/// every public signal and still produces a proof snarkjs rejects. Public signals matching
+/// says the witness arrived intact; the rejection says something between there and the five
+/// MSM outputs is wrong. Diff this against `g16 trace --backend cpu` on a laptop and the
+/// first row that differs names the stage.
+///
+/// `H` is copied down after the MSMs have run, which costs `domain_size * 32` bytes of
+/// readback and is why this is not the proving path. After, not before: the sequence of
+/// submits is itself one of the things under suspicion, and an extra one inserted in the
+/// middle of it changes the experiment.
+#[wasm_bindgen]
+pub async fn prove_trace() -> Result<String, JsError> {
+    let (circuit, witness) = claim("prove_trace")?;
+    let out = trace_inner(&circuit, &witness).await;
+    with_state(|s| {
+        s.busy = false;
+        Ok(())
+    })?;
+    out
+}
+
+async fn trace_inner(circuit: &WgpuCircuit, witness: &[Fr]) -> Result<String, JsError> {
+    let mut t = StageTimings::default();
+    let t0 = Instant::now();
+
+    // Drained before the run, so a previous run's window lines cannot land in this text.
+    let _ = crate::points::window_log_take();
+    let h = circuit.compute_h_async(witness, &mut t).await.map_err(js)?;
+    let m = circuit.msms_async(witness, &h, &mut t).await.map_err(js)?;
+    let windows = crate::points::window_log_take();
+    let (r, s) = g16_core::trace::blinders();
+    let proof = g16_core::prove::assemble(circuit.key(), &m, r, s, &mut t);
+    let host_h = circuit.h_to_host_async(&h).await;
+
+    Ok(trace_json(
+        g16_core::trace::Trace::build(
+            "wgpu",
+            circuit.n_vars(),
+            circuit.n_public(),
+            circuit.domain_size(),
+            witness,
+            host_h.as_deref(),
+            &m,
+            &proof,
+        ),
+        t0,
+        &windows,
+    ))
+}
+
+/// The same trace from the CPU backend, in the same worker.
+///
+/// The cheapest way to halve the search space, and it needs no second machine: if the phone's
+/// CPU trace also disagrees with the laptop's, the fault is in the wasm field arithmetic on
+/// iOS and the GPU is a bystander. Every browser on iOS is WebKit, so there is no second
+/// engine there to ask instead.
+#[wasm_bindgen]
+pub fn cpu_prove_trace() -> Result<String, JsError> {
     let (circuit, witness) = with_state(|s| {
+        let c = s
+            .cpu
+            .clone()
+            .ok_or_else(|| JsError::new("not prepared; call cpu_prepare() first"))?;
+        let w = s
+            .witness
+            .clone()
+            .ok_or_else(|| JsError::new("no witness; call wtns_alloc and wtns_take first"))?;
+        Ok((c, w))
+    })?;
+    let t0 = Instant::now();
+    let mut t = StageTimings::default();
+    let trace =
+        g16_core::prove::prove_trace(circuit.as_ref() as &dyn PreparedCircuit, &witness, &mut t)
+            .map_err(js)?;
+    Ok(trace_json(trace, t0, ""))
+}
+
+/// A trace plus how long it took, as one JSON object. The page prints `text` verbatim, so
+/// what lands in a report is diffable against the CLI's output with no reformatting.
+///
+/// `extra` is the window-sum log, appended after a blank line like the `h_chunk` block, or
+/// empty when the knob is off. Text only: the diff tools read the text, and the posted JSON
+/// rows stay the rows two backends share.
+fn trace_json(trace: g16_core::trace::Trace, started: Instant, extra: &str) -> String {
+    let text = if extra.is_empty() {
+        trace.to_text()
+    } else {
+        format!("{}\n{}", trace.to_text(), extra)
+    };
+    format!(
+        r#"{{"backend":"{}","total_us":{},"text":{},"trace":{}}}"#,
+        trace.backend(),
+        started.elapsed().as_micros() as u64,
+        serde_json::Value::String(text),
+        trace.to_json(),
+    )
+}
+
+/// The `busy` handshake every non-reentrant entry point does. `what` is the caller's own
+/// name, because "a proof is already running" with no name is the least useful thing a
+/// worker with five entry points can say.
+fn claim(what: &str) -> Result<(Rc<WgpuCircuit>, Rc<Vec<Fr>>), JsError> {
+    with_state(|s| {
         if s.busy {
             // Not a queue. See the module docs: `exclusive()` is a std Mutex and on one
             // browser thread a second caller would deadlock rather than wait.
-            return Err(JsError::new(
-                "a proof is already running in this worker; prove() is not re-entrant",
-            ));
+            return Err(JsError::new(&format!(
+                "a proof is already running in this worker; {what}() is not re-entrant"
+            )));
         }
         let circuit = s
             .circuit
@@ -565,14 +719,99 @@ pub async fn prove() -> Result<String, JsError> {
             .ok_or_else(|| JsError::new("no witness; call wtns_alloc and wtns_take first"))?;
         s.busy = true;
         Ok((circuit, witness))
-    })?;
+    })
+}
 
-    let out = prove_inner(&circuit, &witness).await;
+/// Forces the MSM reduction width, or 0 to use each curve's measured one.
+///
+/// Must be called before `create_prover`, because that is when the pipelines are compiled.
+/// See [`g16_wgpu::points::REDUCE_TG_OVERRIDE`] for why this is a knob: the shipped widths
+/// are a measurement from one class of GPU, and the G2 one lands exactly on the workgroup
+/// storage an iPhone grants.
+#[wasm_bindgen]
+pub fn set_reduce_tg(tg: u32) {
+    crate::points::REDUCE_TG_OVERRIDE.store(tg, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Replaces the merge kernel's body, or 0 to keep it. 1 makes it return immediately, so
+/// the dispatch still happens and none of the code runs. A bisection gate; the result is
+/// wrong on purpose. Must be called before `create_prover`, because the shader text is
+/// generated when the pipelines are built.
+#[wasm_bindgen]
+pub fn set_merge_body(level: u32) {
+    crate::gen::points::MERGE_BODY.store(level, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Restores the reduce kernel's pre-fix per-thread body at level 1, or 0 for the one that
+/// ships. See [`g16_wgpu::gen::points::REDUCE_BODY`]: the pre-fix spelling computes the same
+/// window sum and gets it wrong on an iPhone, so this is how to ask a future Safari whether
+/// that is still true. Before `create_prover`, like `set_merge_body`.
+#[wasm_bindgen]
+pub fn set_reduce_body(level: u32) {
+    crate::gen::points::REDUCE_BODY.store(level, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Restores the two-call-site `pt_mul_small_*`, or 0 for the folded spelling that ships.
+/// See [`g16_wgpu::gen::points::MUL_SMALL_BODY`]. Before `create_prover`, like
+/// `set_merge_body`.
+#[wasm_bindgen]
+pub fn set_mul_small_body(level: u32) {
+    crate::gen::points::MUL_SMALL_BODY.store(level, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Stops a point MSM after the nth kernel, or 0 to run all five: 1 clear, 2 segmented,
+/// 3 merge, 4 reduce, 5 ones. A bisection gate; the result is wrong on purpose.
+#[wasm_bindgen]
+pub fn set_msm_stop_after(n: u32) {
+    crate::points::STOP_AFTER.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Forces the MSM window width, or 0 to compute it. Before `create_prover`, like
+/// `set_reduce_tg`. The browser's way in to what `G16_WGPU_MSM_C` does natively; a page
+/// cannot use that variable, because `std::env::var` on wasm always fails.
+#[wasm_bindgen]
+pub fn set_msm_c(c: u32) {
+    crate::msm::WINDOW_OVERRIDE.store(c, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Stages 0 to 4 and then exactly **one** MSM, named by `which`, for bisecting a device loss.
+///
+/// `prove_h_only` splits a proof in half and said the MSM half is the guilty one. This splits
+/// that half five ways. `which` is one of `a-g1`, `b-g2`, `b-g1`, `l-g1`, `h-g1`. `b-g2` is
+/// the interesting one: G2 points are 128 bytes and its accumulators 256, so it puts more
+/// register and memory pressure on a kernel than anything else in the pipeline.
+///
+/// Returns no proof. One MSM is not a proof, and the question this answers is only whether
+/// the GPU is still alive afterwards.
+#[wasm_bindgen]
+pub async fn prove_msm_probe(which: String) -> Result<String, JsError> {
+    let (circuit, witness) = claim("prove_msm_probe")?;
+
+    let t0 = Instant::now();
+    let mut t = StageTimings::default();
+    // Stages 0 to 4 first, because the MSM reads the H buffer they write, and because they
+    // are already known to survive: anything that dies here is a change of behaviour, not
+    // the fault being hunted.
+    let h = circuit.compute_h_async(&witness, &mut t).await;
+    let out = match h {
+        Ok(h) => circuit.msm_probe_async(&witness, &h, &which).await,
+        Err(e) => Err(e),
+    };
     with_state(|s| {
         s.busy = false;
         Ok(())
     })?;
-    out
+    let msm_us = out.map_err(js)?;
+
+    Ok(format!(
+        r#"{{"which":"{}","gather_us":{},"ntt_us":{},"pointwise_us":{},"msm_us":{},"total_us":{}}}"#,
+        which,
+        t.gather_us,
+        t.ntt_us,
+        t.pointwise_us,
+        msm_us,
+        t0.elapsed().as_micros() as u64,
+    ))
 }
 
 async fn prove_inner(circuit: &WgpuCircuit, witness: &[Fr]) -> Result<String, JsError> {
