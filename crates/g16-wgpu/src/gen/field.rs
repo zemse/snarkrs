@@ -378,13 +378,19 @@ impl Field {
     /// # Why this is not `return Fr(x0, x1, ..)`
     ///
     /// It was, and it made every proof this backend produced in Safari 26.6 garbage. WebKit
-    /// translates WGSL to MSL itself, and it emits a WGSL array value constructor as a Metal
+    /// translates WGSL to MSL itself, and it emits this construct as a Metal
     /// `array<unsigned, 8>(a, b, ..)`. `metal::array` is an aggregate with no such
     /// constructor, so the Metal compiler answers "no matching constructor for
     /// initialization of 'array<unsigned int, 8>'" and every pipeline built from the module
-    /// is invalid. WebKit does not have the same problem with a *constant*: `const FR_R =
-    /// Fr(..)` comes out as `array<unsigned, 8>{..}`, with braces, which compiles. Only the
-    /// runtime form is affected, and only these six functions ever used it.
+    /// is invalid.
+    ///
+    /// The trigger is narrower than "an array constructor", and it was bisected rather than
+    /// guessed at: it is naming the type through the **alias**. Seven lines of WGSL are
+    /// enough to show `Fr(a, b, ..)` failing while `array<u32, 8>(a, b,
+    /// ..)` in the same position with the same arguments compiles, along with an alias of a
+    /// vector, an alias of a struct and a module-scope `const` of the same alias, all of
+    /// which compile. `const FR_R = Fr(..)` is therefore safe and is left alone; only these
+    /// six functions were in the failing shape.
     ///
     /// Nothing downstream notices. An invalid pipeline invalidates the command buffer that
     /// set it, an invalid command buffer makes `submit` a no-op, and the prover reads the

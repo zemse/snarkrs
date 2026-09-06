@@ -467,12 +467,17 @@ impl WgpuBackend {
     ///
     /// # Why this exists on top of `on_uncaptured_error`
     ///
-    /// Because on Safari 26.6 the uncaptured-error channel reported nothing at all for a
-    /// device error that a scope catches in full. WebKit's WGSL to MSL translation emitted a
-    /// Metal construct that does not compile (`gen::field::Field::ret_limbs` has the detail),
-    /// every `createComputePipeline` in the prover failed, every submit became a no-op, and
-    /// [`Self::take_error`] returned `None` at all five places this crate calls it. The
-    /// proof came out in 3 ms and snarkjs rejected it.
+    /// Because on Safari 26.6 the uncaptured-error channel reports nothing at all, for any
+    /// error, ever. `wgpu` installs its handler by assigning `device.onuncapturederror`
+    /// (`wgpu-30.0.1/src/backend/webgpu.rs:2641`) and Safari does not implement that IDL
+    /// attribute: `"onuncapturederror" in device` is `false` there, so the assignment makes
+    /// an ordinary expando property and nothing ever calls it. `addEventListener` works, and
+    /// wgpu does not use it.
+    ///
+    /// That is what made the WGSL bug in `gen::field::Field::ret_limbs` cost a day. Every
+    /// `createComputePipeline` in the prover failed, every submit became a no-op,
+    /// [`Self::take_error`] returned `None` at all five places this crate calls it, and the
+    /// proof came out in 3 ms for snarkjs to reject.
     ///
     /// A scope is the channel that is *specified* to answer: `popErrorScope` resolves after
     /// the operations inside it have finished their error checking, so it does not race the
