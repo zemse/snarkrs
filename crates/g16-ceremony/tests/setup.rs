@@ -46,9 +46,13 @@ struct Case {
 /// that only shows up at 2^18, and the cheap cases should report first.
 ///
 /// `tiny_mul`'s shipped zkey came from a ptau this repo does not carry, so it is marked
-/// `shipped: false` and only the live snarkjs run judges it. `anon-aadhaar` is absent
-/// entirely: at 2^21 it writes 631 MB per run, which is too much to spend on every
-/// `cargo test`, and it was checked by hand against snarkjs instead.
+/// `shipped: false` and only the live snarkjs run judges it.
+///
+/// `anon-aadhaar` is absent entirely. It is the largest artifact at `cirPower` 21 against
+/// `ppot_0080_21`, so it is another exact fit, and it does pass: 29 s, sections 3 to 7 and
+/// the csHash all equal to the shipped key, 3.29M section-4 records. But it peaks at 3.7 GB
+/// resident and writes 631 MB, and cargo runs the tests in this file concurrently, so
+/// putting it in the table would double that. Run it by hand when the H path changes.
 #[rustfmt::skip]
 const CASES: &[Case] = &[
     Case { dir: "tiny_mul",      r1cs: "circuit.r1cs", ptau: "local_13.ptau",      cir_power: 3,  n_vars: 6,      n_public: 3,  shipped: false },

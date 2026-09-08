@@ -685,8 +685,16 @@ pub fn write_hs(ptau: &Ptau, domain_size: usize) -> Result<Vec<G1Affine>, Ceremo
 /// This is the shipped behaviour and `csHash` is defined by it, so reproduce it. Which is
 /// why the reads below go through the whole-file buffer and the section's start offset
 /// rather than [`Ptau::section_elements`]: a bounds-checked read would refuse the last
-/// chunk of exactly the case that matters. Confirmed against snarkjs on `tornado` at
-/// `cirPower == power == 15` and `sha256` at 16, both byte-identical.
+/// chunk of exactly the case that matters, and why the subtraction goes through
+/// [`h_difference`] rather than straight to arkworks.
+///
+/// The overrun affects only that one point, which is worth knowing because it is not
+/// obvious: `batchToAffine` chains all 16384 z values through a single inversion, so a
+/// non-congruent one could have polluted the whole chunk, and snarkjs splits that chunk
+/// across `os.cpus().length` threads, which would then have made `csHash` depend on the
+/// machine. Checked directly against ffjavascript: the whole-chunk and the eight-way split
+/// results are identical, so the chain stays congruent and only the last point differs.
+///
 /// The verifier is immune because `sameRatioH` multiplies index `domainSize - 1` by zero.
 pub fn hash_h_points(
     ptau: &Ptau,
@@ -1003,9 +1011,13 @@ mod noncanonical {
     }
 
     /// `f1m_square` is a separate function from `f1m_mul` (`build_f1m.js:437`), but only as
-    /// a schedule: it accumulates the same partial products and ends in the same carry-or-gte
-    /// reduction. Verified to agree with `mul(x, x)` on the out-of-range point this module
-    /// exists for; see `tests/setup.rs`.
+    /// a schedule: it accumulates the same partial products and ends in the same
+    /// carry-or-gte reduction.
+    ///
+    /// Treating it as `mul(x, x)` is therefore an assumption, and it is the one assumption
+    /// in this module. It holds on the inputs that reach here: [`sub_affine`] squares `H`
+    /// and `r`, and the six exact-fit circuits in `tests/setup.rs` all come out
+    /// byte-identical to snarkjs, which they could not if a square had diverged.
     fn square(x: &U256) -> U256 {
         mul(x, x)
     }
