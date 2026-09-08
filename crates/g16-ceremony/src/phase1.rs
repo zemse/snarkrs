@@ -36,15 +36,18 @@ use std::path::Path;
 
 use ark_ec::short_weierstrass::Affine;
 use blake2::{Blake2b512, Digest as _};
-use g16_field::{g1, g2, AffineRepr, CurveGroup, Field, Fr, G1Affine, G2Affine};
+use g16_field::{g1, g2, AffineRepr, CurveGroup, Domain, Field, Fr, G1Affine, G2Affine, Zero};
+use g16_msm::{CpuMsm, MsmBackend};
+use g16_ntt::{CpuNtt, Direction, NttBackend};
 use g16_zkey::binfile;
 use rayon::prelude::*;
 
 use crate::ptau::{self, Ptau, PtauContribution, PtauHeader};
 use crate::transcript::{
-    g1_compressed, g1_uncompressed, g2_compressed, g2_uncompressed, rng_from_beacon_params,
-    rng_from_entropy, write_ptau_pubkey, CeremonyRng, Digest, PtauKey, Transcript,
-    PARTIAL_HASH_BYTES,
+    g1_compressed, g1_uncompressed, g2_compressed, g2_uncompressed, get_g2_sp,
+    rng_from_beacon_params, rng_from_entropy, same_ratio, write_ptau_pubkey, CeremonyRng, Digest,
+    PtauKey, PtauPubKey, Transcript, PARTIAL_HASH_BYTES, PERSONALIZATION_ALPHA,
+    PERSONALIZATION_BETA, PERSONALIZATION_TAU,
 };
 use crate::write::BinFileWriter;
 use crate::{CeremonyError, ContributionKind, ContributionParams, SCG1, SCG2, SG1, SG2};
@@ -107,6 +110,15 @@ trait PtauGroup: AffineRepr<ScalarField = Fr> + Send + Sync {
     fn write_lem(&self, out: &mut [u8]);
     fn write_compressed(&self, out: &mut [u8]);
     fn write_uncompressed(&self, out: &mut [u8]);
+    /// The one call `verify` makes that the group cannot express generically: the backend
+    /// trait has a separate entry point per group.
+    fn msm(backend: &dyn MsmBackend, bases: &[Self], scalars: &[Fr]) -> Self::Group;
+    fn read_points(
+        file: &Ptau,
+        id: u32,
+        offset: usize,
+        n: usize,
+    ) -> Result<Vec<Self>, CeremonyError>;
 }
 
 // Written against the short-Weierstrass types directly rather than the `G1Affine` /
@@ -131,6 +143,19 @@ impl PtauGroup for Affine<g1::Config> {
     fn write_uncompressed(&self, out: &mut [u8]) {
         out.copy_from_slice(&g1_uncompressed(self));
     }
+
+    fn msm(backend: &dyn MsmBackend, bases: &[Self], scalars: &[Fr]) -> Self::Group {
+        backend.msm_g1(bases, scalars)
+    }
+
+    fn read_points(
+        file: &Ptau,
+        id: u32,
+        offset: usize,
+        n: usize,
+    ) -> Result<Vec<Self>, CeremonyError> {
+        file.g1_points(id, offset, n)
+    }
 }
 
 impl PtauGroup for Affine<g2::Config> {
@@ -151,6 +176,19 @@ impl PtauGroup for Affine<g2::Config> {
 
     fn write_uncompressed(&self, out: &mut [u8]) {
         out.copy_from_slice(&g2_uncompressed(self));
+    }
+
+    fn msm(backend: &dyn MsmBackend, bases: &[Self], scalars: &[Fr]) -> Self::Group {
+        backend.msm_g2(bases, scalars)
+    }
+
+    fn read_points(
+        file: &Ptau,
+        id: u32,
+        offset: usize,
+        n: usize,
+    ) -> Result<Vec<Self>, CeremonyError> {
+        file.g2_points(id, offset, n)
     }
 }
 
@@ -654,12 +692,474 @@ pub struct PtauVerifyReport {
     pub next_challenge_checked: bool,
 }
 
+/// Points per chunk in every `verify` loop, `MAX_CHUNK_SIZE` (`powersoftau_verify.js:339`).
+/// Nothing depends on it: no partial hash is snapshotted here.
+const VERIFY_CHUNK: usize = 1 << 16;
+
+/// One link of the chain, as the checks see it. Contribution #1's predecessor is the
+/// unmodified accumulator, whose five points are the generators and whose "next
+/// challenge" is the first challenge hash (`powersoftau_verify.js:139-148`).
+struct Predecessor {
+    tau_g1: G1Affine,
+    tau_g2: G2Affine,
+    alpha_g1: G1Affine,
+    beta_g1: G1Affine,
+    beta_g2: G2Affine,
+    next_challenge: Digest,
+}
+
+impl Predecessor {
+    /// `initialContribution`. Note it seeds from `ceremonyPower`, not `power`: a truncated
+    /// file's chain was built over the full ceremony
+    /// (`powersoftau_verify.js:146`).
+    fn initial(ceremony_power: u32) -> Self {
+        Self {
+            tau_g1: G1Affine::generator(),
+            tau_g2: G2Affine::generator(),
+            alpha_g1: G1Affine::generator(),
+            beta_g1: G1Affine::generator(),
+            beta_g2: G2Affine::generator(),
+            next_challenge: first_challenge_hash(ceremony_power),
+        }
+    }
+
+    fn of(c: &PtauContribution) -> Self {
+        Self {
+            tau_g1: c.tau_g1,
+            tau_g2: c.tau_g2,
+            alpha_g1: c.alpha_g1,
+            beta_g1: c.beta_g1,
+            beta_g2: c.beta_g2,
+            next_challenge: c.next_challenge,
+        }
+    }
+}
+
+fn failed(what: impl Into<String>) -> CeremonyError {
+    CeremonyError::Verification(what.into())
+}
+
+/// `verifyContribution` (`powersoftau_verify.js:29-127`): a beacon's key has to be the one
+/// its own parameters produce, every key has to satisfy its own same-ratio pair, and each
+/// of the five stored points has to be the predecessor's scaled by the committed exponent.
+///
+/// `g2_sp` is recomputed here rather than taken from the record, because it is not stored:
+/// it is `getG2sp(personalization, prevChallenge, g1_s, g1_sx)`, which is the only thing
+/// binding a contribution to its predecessor's challenge (`:73-75`).
+fn verify_contribution(
+    index: usize,
+    cur: &PtauContribution,
+    prev: &Predecessor,
+) -> Result<(), CeremonyError> {
+    let named = |what: &str| format!("{what} in contribution #{index}");
+
+    if cur.kind == ContributionKind::Beacon {
+        let exp = cur
+            .params
+            .num_iterations_exp
+            .ok_or_else(|| failed(named("beacon record has no numIterationsExp")))?;
+        let hash = cur
+            .params
+            .beacon_hash
+            .as_deref()
+            .ok_or_else(|| failed(named("beacon record has no beaconHash")))?;
+        check_beacon(hash, exp)?;
+        let mut rng = rng_from_beacon_params(hash, exp);
+        let expected = crate::transcript::create_ptau_key(&mut rng, &prev.next_challenge);
+        for (name, got, want) in [
+            ("tau", cur.pubkeys.tau, expected.tau.pubkey),
+            ("alpha", cur.pubkeys.alpha, expected.alpha.pubkey),
+            ("beta", cur.pubkeys.beta, expected.beta.pubkey),
+        ] {
+            if got.g1_s != want.g1_s || got.g1_sx != want.g1_sx || got.g2_spx != want.g2_spx {
+                return Err(failed(named(&format!(
+                    "BEACON key ({name}) is not generated correctly"
+                ))));
+            }
+        }
+    }
+
+    // The stored `g2_sp` came from whatever challenge the reader guessed; this is the one
+    // the chain actually commits to.
+    let bound = |k: &PtauPubKey, personalization: u8| PtauPubKey {
+        g2_sp: get_g2_sp(personalization, &prev.next_challenge, &k.g1_s, &k.g1_sx),
+        ..*k
+    };
+    let tau = bound(&cur.pubkeys.tau, PERSONALIZATION_TAU);
+    let alpha = bound(&cur.pubkeys.alpha, PERSONALIZATION_ALPHA);
+    let beta = bound(&cur.pubkeys.beta, PERSONALIZATION_BETA);
+
+    for (name, k) in [("tau", &tau), ("alpha", &alpha), ("beta", &beta)] {
+        if !same_ratio(&k.g1_s, &k.g1_sx, &k.g2_sp, &k.g2_spx) {
+            return Err(failed(named(&format!("INVALID key ({name})"))));
+        }
+    }
+
+    // Each of these says "the same exponent that the key commits to was applied to the
+    // accumulator". The two `sameRatio` argument orders are not interchangeable: the G1
+    // pair carries the ratio for tauG1, alphaG1 and betaG1, and the G2 pair carries it for
+    // tauG2 and betaG2 (`powersoftau_verify.js:95-123`).
+    let checks: [(&str, bool); 5] = [
+        (
+            "INVALID tau*G1: it does not follow the previous contribution",
+            same_ratio(&prev.tau_g1, &cur.tau_g1, &tau.g2_sp, &tau.g2_spx),
+        ),
+        (
+            "INVALID tau*G2: it does not follow the previous contribution",
+            same_ratio(&tau.g1_s, &tau.g1_sx, &prev.tau_g2, &cur.tau_g2),
+        ),
+        (
+            "INVALID alpha*G1: it does not follow the previous contribution",
+            same_ratio(&prev.alpha_g1, &cur.alpha_g1, &alpha.g2_sp, &alpha.g2_spx),
+        ),
+        (
+            "INVALID beta*G1: it does not follow the previous contribution",
+            same_ratio(&prev.beta_g1, &cur.beta_g1, &beta.g2_sp, &beta.g2_spx),
+        ),
+        (
+            "INVALID beta*G2: it does not follow the previous contribution",
+            same_ratio(&beta.g1_s, &beta.g1_sx, &prev.beta_g2, &cur.beta_g2),
+        ),
+    ];
+    for (message, ok) in checks {
+        if !ok {
+            return Err(failed(named(message)));
+        }
+    }
+    Ok(())
+}
+
+/// What one point section's random linear combination produced.
+struct PowersCheck<C: PtauGroup> {
+    /// `sum r_i * P_i` over `i < n-1`.
+    r1: C::Group,
+    /// The same scalars against `P_{i+1}`, so `sameRatio(R1, R2, ...)` proves the whole
+    /// section is a geometric sequence in one pairing rather than `n`.
+    r2: C::Group,
+    /// The points at the indexes the contribution record is supposed to have kept.
+    singular: Vec<C>,
+}
+
+/// `processSection` (`powersoftau_verify.js:338-395`): absorb the section's uncompressed
+/// form into the next-challenge hash and build the two-sided random combination that
+/// proves the powers step by a single exponent.
+///
+/// The cross-chunk link is not decoration. `r1`/`r2` inside a chunk only relate that
+/// chunk's own points, so a fresh scalar ties the last point of one chunk to the first of
+/// the next; without it a file could restart the sequence at every chunk boundary.
+fn verify_powers<C: PtauGroup>(
+    file: &Ptau,
+    id: u32,
+    n_points: usize,
+    singular_indexes: &[usize],
+    rng: &mut CeremonyRng,
+    hasher: &mut Transcript,
+    msm: &dyn MsmBackend,
+) -> Result<PowersCheck<C>, CeremonyError> {
+    let mut r1 = C::Group::zero();
+    let mut r2 = C::Group::zero();
+    let mut singular = Vec::new();
+    let mut last_base: Option<C> = None;
+    let mut u = vec![0u8; VERIFY_CHUNK.min(n_points.max(1)) * C::SG];
+
+    let mut done = 0usize;
+    while done < n_points {
+        let n = (n_points - done).min(VERIFY_CHUNK);
+        let bases = C::read_points(file, id, done, n)?;
+
+        let u_out = &mut u[..n * C::SG];
+        bases
+            .par_iter()
+            .zip(u_out.par_chunks_exact_mut(C::SG))
+            .for_each(|(p, dst)| p.write_uncompressed(dst));
+        hasher.update(u_out);
+
+        // 32-bit scalars, the width `misc.getRandomBytes(4*(n-1))` gives multiExpAffine.
+        let scalars: Vec<Fr> = (0..n.saturating_sub(1))
+            .map(|_| Fr::from(rng.next_u32()))
+            .collect();
+        if let Some(last) = last_base {
+            let r = Fr::from(rng.next_u32());
+            r1 += last * r;
+            r2 += bases[0] * r;
+        }
+        if n > 1 {
+            r1 += C::msm(msm, &bases[..n - 1], &scalars);
+            r2 += C::msm(msm, &bases[1..], &scalars);
+        }
+        last_base = Some(bases[n - 1]);
+
+        for &sp in singular_indexes {
+            if sp >= done && sp < done + n {
+                singular.push(bases[sp - done]);
+            }
+        }
+        done += n;
+    }
+    Ok(PowersCheck { r1, r2, singular })
+}
+
+/// `verifyLagrangeEvaluations` (`powersoftau_verify.js:398-489`): the prepared section is
+/// the group iFFT of the raw one, so for a random `r`, `<raw, r>` must equal
+/// `<lagrange, fft(r)>`.
+///
+/// That identity holds for any consistent root of unity, since the DFT matrix is symmetric
+/// and `iFFT^T * fft` is the identity, and it needs no group FFT on the verifier's side:
+/// the transform moves onto the scalars, where the existing `g16-ntt` can do it.
+///
+/// The `power+1` block of section 12 is the exception the whole section table turns on.
+/// tauG1 holds `2n-1` points, so the top block's last input is the point at infinity and
+/// its scalar is forced to zero (`:428-433`, `:444-446`); reading `2n` points from a
+/// `2n-1` point section would run past the end.
+fn verify_lagrange<C: PtauGroup>(
+    file: &Ptau,
+    tau_section: u32,
+    lagrange_section: u32,
+    power: u32,
+    seed: [u32; 8],
+    msm: &dyn MsmBackend,
+    ntt: &CpuNtt,
+) -> Result<(), CeremonyError> {
+    let top = if tau_section == ptau::S_TAU_G1 {
+        power + 1
+    } else {
+        power
+    };
+    for p in 0..=top {
+        let n = 1usize << p;
+        let padded = tau_section == ptau::S_TAU_G1 && p == power + 1;
+
+        let mut scalars: Vec<Fr> = {
+            let mut rng = CeremonyRng::from_seed_words(seed);
+            (0..n)
+                .map(|i| {
+                    if padded && i == n - 1 {
+                        Fr::zero()
+                    } else {
+                        Fr::from(rng.next_u32())
+                    }
+                })
+                .collect()
+        };
+
+        let mut bases = C::read_points(file, tau_section, 0, if padded { n - 1 } else { n })?;
+        if padded {
+            bases.push(C::zero());
+        }
+        let raw = C::msm(msm, &bases, &scalars);
+
+        // `Fr.fft` over the same random vector. snarkjs re-seeds the RNG to rebuild it
+        // rather than keeping it, which is why the zero at the top of the padded block has
+        // to be reproduced in both copies.
+        let domain = Domain::new(n)
+            .map_err(|e| CeremonyError::malformed(lagrange_section, e.to_string()))?;
+        ntt.ntt(&domain, &mut scalars, Direction::Forward);
+
+        // Block `p` starts at element `2^p - 1`, the same seek `powersoftau_verify.js:478`
+        // makes.
+        let block = C::read_points(file, lagrange_section, n - 1, n)?;
+        let transformed = C::msm(msm, &block, &scalars);
+
+        if raw != transformed {
+            return Err(failed(format!(
+                "phase2 calculation of section {lagrange_section} does not match the powers of tau at 2^{p}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// `powersoftau verify`: walk the contribution chain, check each key's same-ratio pairs
 /// against the recomputed `g2_sp`, check the stored generators at the head of each
 /// section, and recompute the final next-challenge hash.
+///
+/// The order is snarkjs': the last contribution first, because everything else in the file
+/// is checked against it, then the powers, then the earlier records
+/// (`powersoftau_verify.js:129-285`).
 pub fn verify(ptau: &Path) -> Result<PtauVerifyReport, CeremonyError> {
-    let _ = ptau;
-    todo!("phase1::verify")
+    let file = Ptau::open(ptau)?;
+    let header = *file.header();
+    let contributions = file.contributions()?;
+    if contributions.is_empty() {
+        return Err(failed(
+            "this file has no contribution, it cannot be used in production",
+        ));
+    }
+    let n = 1usize << header.power;
+    let msm = CpuMsm::new();
+    let ntt = CpuNtt::new();
+    let last = contributions.len() - 1;
+
+    let predecessor = |i: usize| match i {
+        0 => Predecessor::initial(header.ceremony_power),
+        _ => Predecessor::of(&contributions[i - 1]),
+    };
+
+    verify_contribution(last + 1, &contributions[last], &predecessor(last))?;
+
+    // The next-challenge hash is rebuilt from the file's own bytes, seeded with the last
+    // contribution's reconstructed response hash.
+    let cur = &contributions[last];
+    let mut hasher = Transcript::new();
+    hasher.update(&cur.response_hash()?);
+    let mut rng = rng_from_entropy("g16 ptau verify");
+
+    let tau1 = verify_powers::<G1Affine>(
+        &file,
+        ptau::S_TAU_G1,
+        n * 2 - 1,
+        &[0, 1],
+        &mut rng,
+        &mut hasher,
+        &msm,
+    )?;
+    if !same_ratio(
+        &tau1.r1.into_affine(),
+        &tau1.r2.into_affine(),
+        &G2Affine::generator(),
+        &cur.tau_g2,
+    ) {
+        return Err(failed("tauG1 section: powers do not match"));
+    }
+    if tau1.singular[0] != G1Affine::generator() {
+        return Err(failed(
+            "first element of the tau*G1 section must be the generator",
+        ));
+    }
+    if tau1.singular[1] != cur.tau_g1 {
+        return Err(failed(
+            "second element of the tau*G1 section does not match the contribution section",
+        ));
+    }
+
+    let tau2 = verify_powers::<G2Affine>(
+        &file,
+        ptau::S_TAU_G2,
+        n,
+        &[0, 1],
+        &mut rng,
+        &mut hasher,
+        &msm,
+    )?;
+    if !same_ratio(
+        &G1Affine::generator(),
+        &cur.tau_g1,
+        &tau2.r1.into_affine(),
+        &tau2.r2.into_affine(),
+    ) {
+        return Err(failed("tauG2 section: powers do not match"));
+    }
+    if tau2.singular[0] != G2Affine::generator() {
+        return Err(failed(
+            "first element of the tau*G2 section must be the generator",
+        ));
+    }
+    if tau2.singular[1] != cur.tau_g2 {
+        return Err(failed(
+            "second element of the tau*G2 section does not match the contribution section",
+        ));
+    }
+
+    for (id, head, what) in [
+        (ptau::S_ALPHA_TAU_G1, cur.alpha_g1, "alpha*tau*G1"),
+        (ptau::S_BETA_TAU_G1, cur.beta_g1, "beta*tau*G1"),
+    ] {
+        let r = verify_powers::<G1Affine>(&file, id, n, &[0], &mut rng, &mut hasher, &msm)?;
+        if !same_ratio(
+            &r.r1.into_affine(),
+            &r.r2.into_affine(),
+            &G2Affine::generator(),
+            &cur.tau_g2,
+        ) {
+            return Err(failed(format!("{what} section: powers do not match")));
+        }
+        if r.singular[0] != head {
+            return Err(failed(format!(
+                "first element of the {what} section does not match the contribution section"
+            )));
+        }
+    }
+
+    // Section 6 is one point, so it gets no combination, only the hash and the comparison.
+    let beta_g2 = file.g2_points(ptau::S_BETA_G2, 0, 1)?[0];
+    hasher.update(&g2_uncompressed(&beta_g2));
+    if beta_g2 != cur.beta_g2 {
+        return Err(failed(
+            "the betaG2 section does not match the contribution section",
+        ));
+    }
+
+    // Skipped on a truncated file, whose points are a prefix of the ones that were hashed
+    // (`powersoftau_verify.js:247-252`).
+    let next_challenge_checked = !header.is_truncated_ceremony();
+    if next_challenge_checked && hasher.finalize() != cur.next_challenge {
+        return Err(failed(
+            "hash of the values does not match the next challenge of the last contributor",
+        ));
+    }
+
+    for i in (0..last).rev() {
+        verify_contribution(i + 1, &contributions[i], &predecessor(i))?;
+    }
+
+    let prepared = file.is_prepared();
+    if prepared {
+        // One seed for all four sections and every power, the way snarkjs draws it once
+        // outside the loop (`powersoftau_verify.js:404-407`).
+        let mut seed = [0u32; 8];
+        for w in seed.iter_mut() {
+            *w = rng.next_u32();
+        }
+        verify_lagrange::<G1Affine>(
+            &file,
+            ptau::S_TAU_G1,
+            ptau::S_LAGRANGE_TAU_G1,
+            header.power,
+            seed,
+            &msm,
+            &ntt,
+        )?;
+        verify_lagrange::<G2Affine>(
+            &file,
+            ptau::S_TAU_G2,
+            ptau::S_LAGRANGE_TAU_G2,
+            header.power,
+            seed,
+            &msm,
+            &ntt,
+        )?;
+        verify_lagrange::<G1Affine>(
+            &file,
+            ptau::S_ALPHA_TAU_G1,
+            ptau::S_LAGRANGE_ALPHA_TAU_G1,
+            header.power,
+            seed,
+            &msm,
+            &ntt,
+        )?;
+        verify_lagrange::<G1Affine>(
+            &file,
+            ptau::S_BETA_TAU_G1,
+            ptau::S_LAGRANGE_BETA_TAU_G1,
+            header.power,
+            seed,
+            &msm,
+            &ntt,
+        )?;
+    }
+
+    let contribution_hashes = contributions
+        .iter()
+        .map(|c| c.response_hash())
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(PtauVerifyReport {
+        power: header.power,
+        ceremony_power: header.ceremony_power,
+        prepared,
+        contribution_hashes,
+        next_challenge_checked,
+    })
 }
 
 /// The two bounds snarkjs enforces on a beacon before it opens a file

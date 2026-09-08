@@ -480,6 +480,151 @@ fn multi_chunk_sections_reproduce_snarkjs() {
     );
 }
 
+// -------------------------------------------------------------------- verify
+
+/// Build a two-record chain at power 8 and hand it to our own verifier.
+///
+/// The chain is the one `a_contribution_then_a_beacon_reproduces_snarkjs` pins to
+/// snarkjs' bytes, so "our verifier accepts it" and "snarkjs' verifier accepts it" are the
+/// same statement about the same file.
+fn a_chain(dir: &Path) -> PathBuf {
+    let fresh = dir.join("new_8.ptau");
+    let first = dir.join("c_8.ptau");
+    let second = dir.join("cb_8.ptau");
+    phase1::ptau_new(8, &fresh).unwrap();
+    phase1::contribute_with(
+        &fresh,
+        &first,
+        ContributionParams {
+            name: Some("phase1 test".into()),
+            ..Default::default()
+        },
+        rng_from_entropy_with(&os_bytes(), "some fixed entropy"),
+    )
+    .unwrap();
+    phase1::beacon(&first, &second, None, &beacon_bytes(), 10).unwrap();
+    second
+}
+
+#[test]
+fn verify_accepts_a_chain_we_built() {
+    let dir = tmp_dir("verify-ok");
+    let chain = a_chain(&dir);
+    let report = phase1::verify(&chain).unwrap();
+    assert_eq!(report.power, 8);
+    assert_eq!(report.ceremony_power, 8);
+    assert!(!report.prepared);
+    assert!(report.next_challenge_checked);
+    assert_eq!(report.contribution_hashes.len(), 2);
+    assert_eq!(
+        hex(&report.contribution_hashes[1]),
+        "745133b3975ecf62c7006219f4d809d4ef3a8ceeff02290535641bfde25dbb0236b37cdd75f0b3c159ddd6f1ba51342be6204c06f0ab658c0078d567e2094d58"
+    );
+}
+
+/// A fresh accumulator is well-formed and worthless: snarkjs refuses it outright rather
+/// than reporting it valid (`powersoftau_verify.js:151-154`).
+#[test]
+fn verify_refuses_a_file_with_no_contribution() {
+    let dir = tmp_dir("verify-empty");
+    let fresh = dir.join("new_8.ptau");
+    phase1::ptau_new(8, &fresh).unwrap();
+    assert!(matches!(
+        phase1::verify(&fresh),
+        Err(CeremonyError::Verification(_))
+    ));
+}
+
+/// Overwrite `len` bytes at `at` and return the path to the damaged copy.
+fn tampered(src: &Path, dst: &Path, at: usize, bytes: &[u8]) -> PathBuf {
+    let mut data = std::fs::read(src).unwrap();
+    data[at..at + bytes.len()].copy_from_slice(bytes);
+    std::fs::write(dst, data).unwrap();
+    dst.to_path_buf()
+}
+
+/// A single replaced point inside section 2 is what the random linear combination exists
+/// to catch: it costs one pairing rather than `2n-1` of them, and nothing else in the file
+/// notices.
+#[test]
+fn verify_catches_a_replaced_point_in_the_powers() {
+    let dir = tmp_dir("verify-points");
+    let chain = a_chain(&dir);
+    // Section 2's payload starts after the 12-byte preamble, the 12-byte header entry plus
+    // its 44 bytes, and its own 12-byte entry: element 5 is 5 * 64 bytes into that.
+    let at = 12 + 12 + 44 + 12 + 5 * 64;
+    let broken = tampered(&chain, &dir.join("broken.ptau"), at, &[0u8; 64]);
+    let err = phase1::verify(&broken).unwrap_err();
+    assert!(
+        matches!(&err, CeremonyError::Verification(m) if m.contains("tauG1")),
+        "expected a tauG1 powers failure, got {err}"
+    );
+}
+
+/// The contribution record is what a verifier trusts about the chain, so a record whose
+/// `tauG1` no longer matches the section it claims to describe has to fail even though
+/// every point in the file is still a valid group element and the container still parses.
+#[test]
+fn verify_catches_a_rewritten_contribution_record() {
+    let dir = tmp_dir("verify-record");
+    let chain = a_chain(&dir);
+    let data = std::fs::read(&chain).unwrap();
+
+    // Everything before section 7 is fixed by power 8: the 12-byte preamble, then each
+    // section's 12-byte entry header and its payload.
+    let n = 256usize;
+    let s7 = 12
+        + (12 + 44)
+        + (12 + (2 * n - 1) * 64)
+        + (12 + n * 128)
+        + 2 * (12 + n * 64)
+        + (12 + 128)
+        + 12;
+    assert_eq!(
+        u32::from_le_bytes(data[s7..s7 + 4].try_into().unwrap()),
+        2,
+        "section 7 is not where the layout says it is"
+    );
+    // `paramLength` is the last four bytes of the 1504-byte fixed prefix.
+    let first_params =
+        u32::from_le_bytes(data[s7 + 4 + 1500..s7 + 4 + 1504].try_into().unwrap()) as usize;
+    let first_tau_g1 = data[s7 + 4..s7 + 4 + 64].to_vec();
+    let second = s7 + 4 + 1504 + first_params;
+    assert_ne!(
+        first_tau_g1,
+        data[second..second + 64],
+        "record layout moved"
+    );
+
+    // Swap the beacon's `tauG1` for the earlier contribution's, which is a real point from
+    // the same ceremony rather than random bytes.
+    let broken = tampered(&chain, &dir.join("record.ptau"), second, &first_tau_g1);
+    let err = phase1::verify(&broken).unwrap_err();
+    assert!(
+        matches!(&err, CeremonyError::Verification(_)),
+        "expected a verification failure, got {err}"
+    );
+}
+
+/// A prepared file adds four Lagrange sections, and the check that they belong to this
+/// accumulator moves the transform onto the scalars: `<raw, r>` against
+/// `<lagrange, fft(r)>`. `bench/ptau/local_13.ptau` is snarkjs' own
+/// `powersoftau preparephase2` output, so this also pins that our forward NTT agrees with
+/// ffjavascript's root-of-unity convention, which no `.ptau` header states.
+#[test]
+fn verify_checks_the_lagrange_sections_of_a_prepared_file() {
+    let local = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/ptau/local_13.ptau");
+    if !local.exists() {
+        eprintln!("skipping: {} is not present", local.display());
+        return;
+    }
+    let report = phase1::verify(&local).unwrap();
+    assert_eq!(report.power, 13);
+    assert!(report.prepared);
+    assert!(report.next_challenge_checked);
+    assert_eq!(report.contribution_hashes.len(), 1);
+}
+
 // -------------------------------------------------------------------- refusals
 
 /// `power != ceremonyPower` marks a `powersoftau truncate` output, whose points are a
