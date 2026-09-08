@@ -13,7 +13,9 @@
 
 use g16_core::ProveError;
 use g16_field::raw::{RawFq, RawFq2};
-use g16_field::{Field, Fq, Fq2, Fr, G1Affine, G1Projective, G2Affine, G2Projective};
+use g16_field::{
+    AffineRepr, CurveGroup, Field, Fq, Fq2, Fr, G1Affine, G1Projective, G2Affine, G2Projective,
+};
 use g16_msm::xyzz::Xyzz;
 use g16_msm::{AccelError, GroupFft, KeyScale, MsmBackend};
 use metal::{
@@ -21,6 +23,7 @@ use metal::{
     MTLResourceOptions, MTLSize,
 };
 
+use crate::fft::FftKernels;
 use crate::kernels::{CEREMONY_MSL, FR_MSL, MSM_MSL};
 use crate::layout::{
     as_bytes, Packed, PackedFq, PackedFq2, PackedFr, PackedG1Affine, PackedG2Affine, PackedScalar,
@@ -98,27 +101,41 @@ impl MsmBackend for MetalMsmBackend {
 
 /// The group inverse FFT behind `ptau prepare`, the slowest command in the project.
 ///
-/// Not implemented yet. The device is opened here anyway, so `--backend metal` on a
-/// machine with no Metal device fails for that reason and not this one.
+/// A wrapper over [`FftKernels`], which owns the kernels, the twiddle table and the
+/// single-command-buffer submission. What the trait adds on top is the error mapping and
+/// the crossover: `min_block` is the backend's own number, so `prepare::ifft_block`
+/// (prepare.rs:352) carries no backend-shaped branch and the threshold can move without
+/// touching the ceremony crate.
 pub struct MetalGroupFft {
-    device: Device,
+    fft: FftKernels,
 }
 
 impl MetalGroupFft {
+    /// Compiles the FFT library. Expensive (runtime MSL compilation plus 16 pipelines),
+    /// so it belongs once at the top of a command, the same as [`MetalMsmBackend::new`].
     pub fn new() -> Result<Self, ProveError> {
-        let device = Device::system_default().ok_or_else(|| ProveError::Backend {
-            backend: "metal",
-            reason: "no Metal device; this machine cannot run the metal backend".into(),
-        })?;
-        Ok(Self::with_device(device))
+        Ok(Self {
+            fft: FftKernels::new()?,
+        })
     }
 
-    pub fn with_device(device: Device) -> Self {
-        Self { device }
+    /// Fallible, where the seam that stubbed this type had it infallible: the pipelines
+    /// are built here now, and a pipeline that will not build has to be reported.
+    /// [`MetalMsmBackend::with_device`] already had this signature for the same reason.
+    pub fn with_device(device: Device) -> Result<Self, ProveError> {
+        Ok(Self {
+            fft: FftKernels::with_device(device)?,
+        })
     }
 
     pub fn device(&self) -> &Device {
-        &self.device
+        self.fft.device()
+    }
+
+    /// The kernel layer, for a measurement that wants to set a window or a block size
+    /// without going through `ptau prepare`.
+    pub fn kernels(&self) -> &FftKernels {
+        &self.fft
     }
 }
 
@@ -127,43 +144,101 @@ impl GroupFft for MetalGroupFft {
         BACKEND
     }
 
-    fn ifft_g1(&self, _a: &mut [Xyzz<RawFq>]) -> Result<(), AccelError> {
-        Err(AccelError::Unimplemented {
-            backend: BACKEND,
-            op: "group ifft over G1",
-        })
+    fn min_block(&self) -> usize {
+        self.fft.min_block()
     }
 
-    fn ifft_g2(&self, _a: &mut [Xyzz<RawFq2>]) -> Result<(), AccelError> {
-        Err(AccelError::Unimplemented {
-            backend: BACKEND,
-            op: "group ifft over G2",
-        })
+    fn ifft_g1(&self, a: &mut [Xyzz<RawFq>]) -> Result<(), AccelError> {
+        self.fft
+            .ifft_g1(a)
+            .map_err(|e| AccelError::device(BACKEND, "group ifft over G1", e.to_string()))
+    }
+
+    fn ifft_g2(&self, a: &mut [Xyzz<RawFq2>]) -> Result<(), AccelError> {
+        self.fft
+            .ifft_g2(a)
+            .map_err(|e| AccelError::device(BACKEND, "group ifft over G2", e.to_string()))
     }
 }
 
 /// `batchApplyKey` behind the four contribute and beacon commands.
 ///
-/// Not implemented yet, on the same terms as [`MetalGroupFft`].
+/// Holds one [`CeremonyKernels`] for its whole life. Compiling the library is ~60 ms and
+/// the four commands call this trait once per file chunk: `zkey contribute` at 2^20 hands
+/// over 1,664,401 points in 26 calls, and `ptau contribute` hands over one
+/// `response_chunk` at a time, so a per-call compile would cost more than the arithmetic.
 pub struct MetalKeyScale {
-    device: Device,
+    kernels: CeremonyKernels,
+    min_points: usize,
 }
+
+/// Below this many points in one call the CPU wins and the device is not asked.
+///
+/// Measured on an M2 Max over the whole call, host pack and unpack included, against
+/// `CpuKeyScale` on the same vector (`g16-ceremony/tests/contribute_metal.rs`,
+/// `crossover_sweep`), milliseconds:
+///
+/// ```text
+///     n      G1 cpu   G1 gpu    G2 cpu   G2 gpu
+///    64       2.09     5.83      5.94    25.60
+///   128       6.83     7.09     19.20    27.88
+///   256      16.64     6.78     45.55    28.74
+///   512      36.27     6.79    101.17    28.68
+/// ```
+///
+/// Both groups cross between 128 and 256, so one number serves both. Note the CPU side is
+/// single-threaded below `KEY_SUBCHUNK` (1024) points, which is not a flaw in the
+/// comparison: a short call is exactly what a section's last partial chunk is, and the
+/// CPU really does run it on one thread.
+///
+/// The device's cost is nearly flat to 4096 points, so anything from 128 to 1024 costs at
+/// most a few milliseconds a call; 256 is the crossover rather than a tuned optimum. It
+/// is a live path either way: a power-8 `.ptau` has 511 points in its largest section.
+const KEY_MIN_POINTS: usize = 256;
 
 impl MetalKeyScale {
     pub fn new() -> Result<Self, ProveError> {
-        let device = Device::system_default().ok_or_else(|| ProveError::Backend {
-            backend: "metal",
-            reason: "no Metal device; this machine cannot run the metal backend".into(),
-        })?;
-        Ok(Self::with_device(device))
+        Ok(Self::from_kernels(CeremonyKernels::new()?))
     }
 
-    pub fn with_device(device: Device) -> Self {
-        Self { device }
+    /// Returns a `Result` where the stub it replaced returned `Self`: this now compiles
+    /// the MSL library, which is the call that can fail.
+    pub fn with_device(device: Device) -> Result<Self, ProveError> {
+        Ok(Self::from_kernels(CeremonyKernels::with_device(device)?))
+    }
+
+    fn from_kernels(kernels: CeremonyKernels) -> Self {
+        Self {
+            kernels,
+            min_points: env_usize("G16_METAL_KEY_MIN", KEY_MIN_POINTS),
+        }
     }
 
     pub fn device(&self) -> &Device {
-        &self.device
+        self.kernels.device()
+    }
+
+    pub fn kernels(&self) -> &CeremonyKernels {
+        &self.kernels
+    }
+
+    /// The crossover this instance uses. See [`KEY_MIN_POINTS`].
+    pub fn min_points(&self) -> usize {
+        self.min_points
+    }
+
+    /// The crossover, for a sweep and for the tests that need every call on the device
+    /// however short it is. Zero and one both mean "everything".
+    pub fn with_min_points(mut self, n: usize) -> Self {
+        self.min_points = n;
+        self
+    }
+
+    /// Points per command buffer, forwarded to [`CeremonyKernels::with_chunk`]. Only the
+    /// tests move it.
+    pub fn with_chunk(mut self, chunk: usize) -> Self {
+        self.kernels = self.kernels.with_chunk(chunk);
+        self
     }
 }
 
@@ -172,29 +247,45 @@ impl KeyScale for MetalKeyScale {
         BACKEND
     }
 
-    fn apply_key_g1(
-        &self,
-        _points: &mut [G1Affine],
-        _first: Fr,
-        _inc: Fr,
-    ) -> Result<(), AccelError> {
-        Err(AccelError::Unimplemented {
-            backend: BACKEND,
-            op: "batch apply key over G1",
-        })
+    fn apply_key_g1(&self, points: &mut [G1Affine], first: Fr, inc: Fr) -> Result<(), AccelError> {
+        if points.len() < self.min_points {
+            apply_key_on_host(points, first, inc);
+            return Ok(());
+        }
+        self.kernels
+            .apply_key_g1(points, first, inc)
+            .map_err(|e| AccelError::device(BACKEND, "batch apply key over G1", e.to_string()))
     }
 
-    fn apply_key_g2(
-        &self,
-        _points: &mut [G2Affine],
-        _first: Fr,
-        _inc: Fr,
-    ) -> Result<(), AccelError> {
-        Err(AccelError::Unimplemented {
-            backend: BACKEND,
-            op: "batch apply key over G2",
-        })
+    fn apply_key_g2(&self, points: &mut [G2Affine], first: Fr, inc: Fr) -> Result<(), AccelError> {
+        if points.len() < self.min_points {
+            apply_key_on_host(points, first, inc);
+            return Ok(());
+        }
+        self.kernels
+            .apply_key_g2(points, first, inc)
+            .map_err(|e| AccelError::device(BACKEND, "batch apply key over G2", e.to_string()))
     }
+}
+
+/// `P_i *= first * inc^i` on this thread, for a call under [`KEY_MIN_POINTS`].
+///
+/// The same arithmetic as `g16_ceremony::CpuKeyScale` without the rayon split, written out
+/// here because g16-ceremony is not a dependency of this crate and the accel traits live
+/// in g16-msm precisely so that it need not be. Duplicating it cannot cost byte identity:
+/// the output is affine and affine is canonical, so a correct implementation has no room
+/// to differ. One inversion for the batch, as there.
+fn apply_key_on_host<C: AffineRepr<ScalarField = Fr>>(points: &mut [C], first: Fr, inc: Fr) {
+    let mut t = first;
+    let scaled: Vec<C::Group> = points
+        .iter()
+        .map(|p| {
+            let q = *p * t;
+            t *= inc;
+            q
+        })
+        .collect();
+    points.copy_from_slice(&C::Group::normalize_batch(&scaled));
 }
 
 // ---------------------------------------------------------------------------
@@ -211,7 +302,7 @@ impl KeyScale for MetalKeyScale {
 /// The pipeline names are built from this list (`cer_point_mul_g1_c4` and so on), so a
 /// width added here without a matching `CER_LADDER_KERNELS` line fails at construction,
 /// where the message names the missing kernel, rather than at dispatch.
-const CER_WINDOWS: [u32; 4] = [2, 3, 4, 5];
+pub(crate) const CER_WINDOWS: [u32; 4] = [2, 3, 4, 5];
 
 /// Ladder window for G1. Measured, not derived: see [`WINDOW_G2`].
 const WINDOW_G1: u32 = 4;
@@ -259,7 +350,7 @@ const SEG_LEN: usize = 32;
 /// worth trading memory for.
 const DEFAULT_CHUNK: usize = 1 << 18;
 
-fn cer_err(reason: impl Into<String>) -> ProveError {
+pub(crate) fn cer_err(reason: impl Into<String>) -> ProveError {
     ProveError::Backend {
         backend: BACKEND,
         reason: reason.into(),
@@ -296,7 +387,7 @@ struct GroupPipelines {
 /// Position of `c` in [`CER_WINDOWS`], clamped to the compiled range rather than
 /// rejected: an out-of-range width can only come from the env override, and a sweep that
 /// silently ran the wrong width would be reported as a measurement.
-fn window_index(c: u32) -> usize {
+pub(crate) fn window_index(c: u32) -> usize {
     CER_WINDOWS
         .iter()
         .position(|w| *w == c)
@@ -822,11 +913,20 @@ fn build_seeds<G: CerGroup>(segprod: &[G::PackedField]) -> Result<Vec<G::PackedF
 /// unparseable or uncompiled value falls back to the default rather than failing, because
 /// the only caller is a measurement and a typo that silently picked a different width
 /// would be reported as a result.
-fn env_window(var: &str, default: u32) -> u32 {
+pub(crate) fn env_window(var: &str, default: u32) -> u32 {
     std::env::var(var)
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .filter(|c| CER_WINDOWS.contains(c))
+        .unwrap_or(default)
+}
+
+/// `G16_METAL_KEY_MIN` overrides the apply-key crossover, for the same sweep and on the
+/// same terms as [`env_window`].
+fn env_usize(var: &str, default: usize) -> usize {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(default)
 }
 
@@ -843,7 +943,7 @@ fn set_params(enc: &ComputeCommandEncoderRef, index: u64, p: &CerParams) {
 /// A copy of `msm::dispatch_1d`, which is private to that module. Same contract: the
 /// preferred threadgroup size is clamped to what the pipeline reports, and the kernel
 /// bounds-checks its own index because `dispatch_threads` rounds the grid up.
-fn dispatch_1d(
+pub(crate) fn dispatch_1d(
     enc: &ComputeCommandEncoderRef,
     pso: &ComputePipelineState,
     n: usize,
@@ -862,7 +962,7 @@ fn dispatch_1d(
 ///
 /// The buffer must hold at least `len` `T`s written by a completed command buffer, and
 /// `T` must be a `Packed` type, so every bit pattern is valid.
-unsafe fn cer_read_back<T: Packed>(buf: &Buffer, len: usize) -> &[T] {
+pub(crate) unsafe fn cer_read_back<T: Packed>(buf: &Buffer, len: usize) -> &[T] {
     core::slice::from_raw_parts(buf.contents().cast::<T>(), len)
 }
 
@@ -871,7 +971,6 @@ mod tests {
     use super::*;
     use g16_ceremony::prepare::{batch_to_affine, point_times_fr};
     use g16_ceremony::CpuKeyScale;
-    use g16_field::{AffineRepr, CurveGroup};
 
     /// Bits the recoding covers. Same value and same reason as `msm::RECODE_BITS`, which
     /// is private to that module: `g16_msm::RECODE_BITS` is private to its crate too, so

@@ -33,6 +33,9 @@ pub mod backend;
 /// apply-key behind the four contribute and beacon commands.
 #[cfg(target_os = "macos")]
 pub mod ceremony;
+/// The group inverse FFT behind `ptau prepare`: `ceremony::MetalGroupFft` is its seam.
+#[cfg(target_os = "macos")]
+pub mod fft;
 #[cfg(target_os = "macos")]
 pub mod kernels;
 #[cfg(target_os = "macos")]

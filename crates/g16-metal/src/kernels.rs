@@ -18,3 +18,6 @@ pub const MSM_MSL: &str = include_str!("shaders/msm.metal");
 /// multiplication, batch projective-to-affine, and the batch apply-key. Reuses the point
 /// arithmetic in `msm.metal`, so it must be concatenated after it.
 pub const CEREMONY_MSL: &str = include_str!("shaders/ceremony.metal");
+/// The group inverse FFT behind `ptau prepare`. Reuses the `pt_mul` ladder in
+/// `ceremony.metal`, so it must be concatenated after it.
+pub const FFT_MSL: &str = include_str!("shaders/fft.metal");
