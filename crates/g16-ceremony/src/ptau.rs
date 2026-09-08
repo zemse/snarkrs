@@ -519,7 +519,15 @@ impl Ptau {
         let n = read_u32(&mut data)? as usize;
         // A lying count would otherwise reserve 2^32 records before the first read.
         let mut out = Vec::with_capacity(n.min(data.len() / CONTRIBUTION_PREFIX_BYTES));
-        let mut prev = crate::phase1::first_challenge_hash(self.header.power);
+        // `ceremonyPower`, not `power`. This is the one first-challenge hash snarkjs takes
+        // at the ceremony's size (`powersoftau_verify.js:146`); its five other call sites
+        // pass `power` and are all on paths that reject a truncated file first. Record 0
+        // was made against the full-size accumulator, so seeding from `power` derives its
+        // `g2_sp` off the wrong challenge on any file where the two differ: on
+        // `ppot_0080_15.ptau` that breaks `e(g1_s, g2_spx) == e(g1_sx, g2_sp)` for record 0
+        // and no other, since every later record is seeded from the stored
+        // `next_challenge`.
+        let mut prev = crate::phase1::first_challenge_hash(self.header.ceremony_power);
         for _ in 0..n {
             let c = PtauContribution::read(&mut data, &prev)?;
             prev = c.next_challenge;
@@ -540,6 +548,10 @@ impl Ptau {
     /// The challenge hash the next contribution must build on: the last contribution's
     /// `next_challenge`, or [`crate::phase1::first_challenge_hash`] when there are none
     /// (`powersoftau_contribute.js:54-58`).
+    ///
+    /// `power` here, against [`Ptau::contributions`]' `ceremony_power`, and the difference
+    /// is snarkjs': both `contribute` and `beacon` refuse a file where the two differ
+    /// before they reach this hash, so on every path that can reach it they are equal.
     ///
     /// Walks the records by length instead of decoding them. Every pubkey in between would
     /// otherwise cost three `getG2sp` derivations, and none of them are part of the answer.

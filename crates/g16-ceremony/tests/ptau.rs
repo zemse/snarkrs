@@ -8,13 +8,15 @@
 //! section 7's declared length alone, so a single wrong element count misses the real byte
 //! total and the assertion names the file it missed on.
 //!
-//! `Ptau::contributions` is deliberately not exercised here. It recomputes `g2_sp` per
-//! contribution through `transcript::read_ptau_pubkey`, which the record walk itself does
-//! not need; `last_challenge` covers the same 62-record walk without it.
+//! `Ptau::contributions` is covered only by `recomputed_g2_sp_matches_the_stored_pubkey`,
+//! since `last_challenge` walks the same 62 records without paying for a pubkey. That one
+//! test is not optional: `g2_sp` is the single field in a record that is recomputed rather
+//! than read, so nothing else here would notice it being derived off the wrong challenge.
 
 use std::path::{Path, PathBuf};
 
 use g16_ceremony::ptau::*;
+use g16_ceremony::transcript::same_ratio;
 use g16_field::{AffineRepr, G1Affine, G2Affine};
 
 /// power, ceremony power, contributions, and the byte total the formulas have to land on.
@@ -392,6 +394,50 @@ fn pick_names_the_smallest_sufficient_file() {
     assert_eq!(
         pick_in_dir(&dir, smallest).expect("pick").map(|c| c.power),
         Some(smallest)
+    );
+}
+
+/// `g2_sp` is not stored (`powersoftau_utils.js:81-99` reads six G1 and three G2, and none
+/// of them is it), so `contributions` rebuilds it from the challenge each record was made
+/// against. `e(g1_s, g2_spx) == e(g1_sx, g2_sp)` holds only when that challenge is right,
+/// which makes it a direct test of the seed.
+///
+/// Record 0 is the whole point. Every later record seeds from the stored `next_challenge`,
+/// so a wrong seed shows up once per file and only where `power != ceremonyPower`: seeding
+/// from `power` leaves all three of record 0's keys failing this on the ppot files and
+/// passing on the local ones.
+#[test]
+fn recomputed_g2_sp_matches_the_stored_pubkey() {
+    let files = present();
+    assert!(!files.is_empty(), "no .ptau in {}", ptau_dir().display());
+    let mut saw_truncated = false;
+    for (want, path) in files {
+        // 62 pubkeys is 186 pairings, so one truncated file and one untruncated is the
+        // whole matrix; the rest are the same 62 records at another power.
+        if want.name != "ppot_0080_15.ptau" && want.name != "local_13.ptau" {
+            continue;
+        }
+        saw_truncated |= want.power != want.ceremony_power;
+        let file = Ptau::open(&path).unwrap_or_else(|e| panic!("{}: {e}", want.name));
+        let contributions = file.contributions().expect("section 7 decodes");
+        assert_eq!(contributions.len(), want.n_contributions, "{}", want.name);
+        for (i, c) in contributions.iter().enumerate() {
+            for (which, k) in [
+                ("tau", &c.pubkeys.tau),
+                ("alpha", &c.pubkeys.alpha),
+                ("beta", &c.pubkeys.beta),
+            ] {
+                assert!(
+                    same_ratio(&k.g1_s, &k.g1_sx, &k.g2_sp, &k.g2_spx),
+                    "{}: record {i} {which} g2_sp was derived off the wrong challenge",
+                    want.name
+                );
+            }
+        }
+    }
+    assert!(
+        saw_truncated,
+        "the truncated case is the one that regressed"
     );
 }
 
