@@ -139,7 +139,17 @@ impl BinFileWriter {
         self.section_len
     }
 
+    /// Every payload byte goes through here, which is why the "is a section open" check
+    /// lives here and not in each typed writer. Writing outside a section would land bytes
+    /// between two entry headers, where the scanner reads them as the next entry's id and
+    /// length: the file then parses, into sections that are not the ones written.
     pub fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), CeremonyError> {
+        if self.open_at.is_none() {
+            return Err(CeremonyError::malformed(
+                0,
+                "write outside a section; call start_section first",
+            ));
+        }
         self.out.write_all(bytes)?;
         self.section_len += bytes.len() as u64;
         Ok(())
@@ -223,7 +233,7 @@ impl BinFileWriter {
     /// returns.
     pub fn write_g1_repeated(&mut self, p: &G1Affine, n: usize) -> Result<(), CeremonyError> {
         let one = g1_lem(p);
-        let mut buf = Vec::with_capacity(POINT_BATCH * SG1);
+        let mut buf = Vec::with_capacity(POINT_BATCH.min(n.max(1)) * SG1);
         for _ in 0..POINT_BATCH.min(n.max(1)) {
             buf.extend_from_slice(&one);
         }
@@ -238,7 +248,7 @@ impl BinFileWriter {
 
     pub fn write_g2_repeated(&mut self, p: &G2Affine, n: usize) -> Result<(), CeremonyError> {
         let one = g2_lem(p);
-        let mut buf = Vec::with_capacity(POINT_BATCH * SG2);
+        let mut buf = Vec::with_capacity(POINT_BATCH.min(n.max(1)) * SG2);
         for _ in 0..POINT_BATCH.min(n.max(1)) {
             buf.extend_from_slice(&one);
         }
