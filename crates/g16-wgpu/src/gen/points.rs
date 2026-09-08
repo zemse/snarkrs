@@ -567,12 +567,34 @@ struct {pt} {{ x: {fty}, y: {fty}, zz: {fty}, zzz: {fty} }}
 /// of a 2000-instruction multiply have live ranges no register file holds, and one copy over
 /// a small `array<{fty}, N>` does.
 ///
-/// 0 stays reachable for [`MERGE_BODY`]'s reason, and because it is the only way to ask a
-/// future compiler whether the cliff is still there.
-pub static POINT_BODY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+/// # Why the default is 2 and not 1
+///
+/// 1 spells the register file as one `array<{fty}, N>`. On G2 that is an array of `Fq2`,
+/// which is a struct of two structs, and it is indexed by a value the compiler cannot fold.
+/// Adreno 840 (Galaxy S26 Ultra, Chrome 152) kills the renderer outright on that, inside five
+/// seconds, on `msm_segmented_g2` and `msm_merge_g2` but not on `msm_clear_g2`, while
+/// compiling the identically shaped G1 in 332 ms. 2 splits the G2 array into one `array<Fq,
+/// N>` per component, which is the shape G1 already survives, and emits byte-identical text
+/// for G1. Measured on real devices, worst single pipeline in the G2 module:
+///
+/// ```text
+/// device                    straight-line   table   split
+/// Adreno 840 (S26 Ultra)      device lost   crash   2309 ms
+/// Mali-G715 (Pixel 9 Pro)               -   4556    4605 ms
+/// PowerVR (Pixel 11)                    -   1896    3202 ms
+/// ```
+///
+/// So it costs PowerVR compile time, buys nothing on Mali, and is the difference between a
+/// dead renderer and a working one on Adreno. Whole G2 MSMs on this M2 Max are unchanged
+/// within noise (147.9 -> 153.5, 169.3 -> 171.4, 176.5 -> 177.9 ms), so this is not gated on
+/// the adapter: one spelling everywhere, for [`MERGE_BODY`]'s reason.
+///
+/// 0 and 1 stay reachable for that same reason, and because they are the only way to ask a
+/// future compiler whether either cliff is still there.
+pub static POINT_BODY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(2);
 
 fn microcoded() -> bool {
-    // `G16_WGPU_POINT_BODY=1` runs the whole native suite against the other spelling without
+    // `G16_WGPU_POINT_BODY=0` or `=1` runs the whole native suite against another spelling without
     // a second copy of any test, the same way `G16_WGPU_LIMITS` does for the limits profile.
     // A browser has no environment and sets the atomic directly.
     #[cfg(not(target_arch = "wasm32"))]
@@ -587,7 +609,70 @@ fn microcoded() -> bool {
             }
         });
     }
-    POINT_BODY.load(std::sync::atomic::Ordering::Relaxed) == 1
+    POINT_BODY.load(std::sync::atomic::Ordering::Relaxed) != 0
+}
+
+/// Whether the microcoded register file is spelled as one `array<Fq, N>` per Fq2 component
+/// rather than one `array<{fty}, N>`.
+///
+/// Adreno 840 compiles the one-array spelling of G1 in 332 ms and kills the renderer outright
+/// on the same spelling of G2, inside five seconds, on `msm_segmented_g2` and `msm_merge_g2`
+/// but not on `msm_clear_g2`. The only difference between the two is the element type: `Fq` is
+/// a struct wrapping an array, `Fq2` is a struct wrapping two of those, and the register file
+/// is the one place either is indexed by a value the compiler cannot fold. Splitting the Fq2
+/// array into two Fq arrays hands G2 exactly the shape G1 already survives.
+///
+/// G1 emits identical text either way, so this only ever changes the curve that is broken.
+fn split_regs(c: Curve) -> bool {
+    c.needs_fq2 && POINT_BODY.load(std::sync::atomic::Ordering::Relaxed) == 2
+}
+
+/// Rewrite a microcoded body's register file from one `array<Fq2, N>` into two `array<Fq, N>`.
+///
+/// Done as a pass over the generated text rather than by branching inside the two body
+/// templates, so there stays exactly one copy of each schedule. The text is entirely ours and
+/// `R[` only ever names the register file, which is what makes a scan this blunt safe.
+fn split_reg_file(c: Curve, n: usize, body: &str) -> String {
+    let decl = format!("var R: array<{}, {n}>;", c.fty);
+    let split = format!("var R0: array<Fq, {n}>;\n    var R1: array<Fq, {n}>;");
+    debug_assert!(body.contains(&decl), "register file declaration moved");
+    rewrite_regs(&body.replace(&decl, &split))
+}
+
+/// `R[i] = v;` becomes a two-component store and `R[i]` becomes an `Fq2` built from both
+/// halves. Writes are taken first because their values contain reads.
+fn rewrite_regs(src: &str) -> String {
+    let mut out = String::with_capacity(src.len() * 2);
+    let mut i = 0;
+    while i < src.len() {
+        // A bare `R`, not the tail of a longer identifier such as `MADD_OPS_G2`.
+        let standalone = src[i..].starts_with("R[")
+            && !src[..i]
+                .chars()
+                .next_back()
+                .is_some_and(|p| p.is_alphanumeric() || p == '_');
+        if standalone {
+            let close = i + 2 + src[i + 2..].find(']').expect("register index closes");
+            let idx = &src[i + 2..close];
+            let rest = &src[close + 1..];
+            if let Some(after_eq) = rest.strip_prefix(" = ") {
+                let semi = after_eq.find(';').expect("register write ends");
+                let value = rewrite_regs(&after_eq[..semi]);
+                out.push_str(&format!(
+                    "{{ let t_ = {value}; R0[{idx}] = t_.c0; R1[{idx}] = t_.c1; }}"
+                ));
+                i = close + 1 + " = ".len() + semi + 1;
+                continue;
+            }
+            out.push_str(&format!("Fq2(R0[{idx}], R1[{idx}])"));
+            i = close + 1;
+            continue;
+        }
+        let ch = src[i..].chars().next().expect("in bounds");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
 }
 
 /// madd-2008-s: XYZZ += affine, 7M + 2S. The inner loop of bucket accumulation and therefore
@@ -626,7 +711,7 @@ fn pt_madd_{sfx}(acc: {pt}, p: {aff}) -> {pt} {{
     }
     let fty = c.fty;
     let up = sfx.to_uppercase();
-    format!(
+    let body = format!(
         "
 // madd-2008-s, microcoded. See gen::points::POINT_BODY for why this spelling exists and what
 // it costs. Same 10 multiplies in the same order as the straight-line form above it in git;
@@ -707,7 +792,11 @@ fn pt_madd_{sfx}(acc: {pt}, p: {aff}) -> {pt} {{
     return {pt}(R[7], R[6], R[2], R[3]);
 }}
 "
-    )
+    );
+    if split_regs(c) {
+        return split_reg_file(c, 12, &body);
+    }
+    body
 }
 
 /// add-2008-s: XYZZ + XYZZ, 12M + 2S. Used by the merge and the window reduction, which run
@@ -745,7 +834,7 @@ fn pt_add_{sfx}(a: {pt}, b: {pt}) -> {pt} {{
     }
     let fty = c.fty;
     let up = sfx.to_uppercase();
-    format!(
+    let body = format!(
         "
 // add-2008-s, microcoded, for POINT_BODY's reason. 14 multiplies against madd's 10, and the
 // same shape: steps 0..3 are shared, the mode is known after them, and the doubling schedule
@@ -828,7 +917,11 @@ fn pt_add_{sfx}(a: {pt}, b: {pt}) -> {pt} {{
 }}
 
 "
-    )
+    );
+    if split_regs(c) {
+        return split_reg_file(c, 16, &body);
+    }
+    body
 }
 
 /// Every curve routine, written once in terms of `c.f`.
