@@ -786,6 +786,7 @@ dependencies = [
  "blake2",
  "byteorder",
  "g16-field",
+ "g16-metal",
  "g16-msm",
  "g16-ntt",
  "g16-zkey",

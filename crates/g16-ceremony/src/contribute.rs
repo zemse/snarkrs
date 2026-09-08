@@ -207,6 +207,35 @@ pub fn contribute(
     )
 }
 
+/// [`contribute`] with the RNG supplied, so a run can be held against another one.
+///
+/// `zkey contribute` mixes 64 OS-random bytes into its seed and is deliberately not
+/// reproducible otherwise; [`crate::transcript::rng_from_entropy_with`] is the hook, and
+/// this is phase 2's twin of [`crate::phase1::contribute_with`]. Made public for the
+/// cpu-against-metal comparison, which needs both runs to draw the same delta: without it
+/// the only byte-comparable phase 2 command is `beacon`.
+pub fn contribute_with(
+    zkey_in: &Path,
+    zkey_out: &Path,
+    name: Option<&str>,
+    mut rng: CeremonyRng,
+    key: &dyn KeyScale,
+) -> Result<ContributionReport, CeremonyError> {
+    let params = ContributionParams {
+        name: name.map(str::to_owned),
+        num_iterations_exp: None,
+        beacon_hash: None,
+    };
+    apply(
+        zkey_in,
+        zkey_out,
+        ContributionKind::Contribute,
+        params,
+        &mut rng,
+        key,
+    )
+}
+
 /// `zkey beacon`: the same contribution with a reproducible key, derived by iterating
 /// SHA-256 `2^num_iterations_exp` times over `beacon_hash`.
 ///

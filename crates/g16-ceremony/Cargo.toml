@@ -25,3 +25,16 @@ rand_chacha.workspace = true
 # browser proves; this one reads and writes multi-gigabyte ceremony files by path, so
 # there is no wasm target to keep a filesystem API out of.
 memmap2.workspace = true
+
+[dev-dependencies]
+# The Metal ceremony seams, which the `*_metal.rs` tests hold the CPU ones against.
+# g16-metal dev-depends on this crate for the same reason; a dev-dependency in both
+# directions is not a cycle, because neither library depends on the other.
+g16-metal.workspace = true
+
+[features]
+default = []
+# Compiles the cpu-against-metal comparisons under `tests/`. Off by default because they
+# need a Metal device, and a machine without one would report a failure where it should
+# report nothing.
+metal = []
