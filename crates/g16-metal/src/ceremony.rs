@@ -137,6 +137,13 @@ impl MetalGroupFft {
     pub fn kernels(&self) -> &FftKernels {
         &self.fft
     }
+
+    /// [`FftKernels::with_min_block`], so a test can put a file the shipped crossover
+    /// would route home onto the device instead.
+    pub fn with_min_block(mut self, n: usize) -> Self {
+        self.fft = self.fft.with_min_block(n);
+        self
+    }
 }
 
 impl GroupFft for MetalGroupFft {

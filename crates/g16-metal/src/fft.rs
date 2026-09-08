@@ -51,8 +51,10 @@ const FFT_WINDOW_G2: u32 = 4;
 /// to stop caring at 2^12 is the distribution rather than the crossover: every block below
 /// 2^12 together is 0.18% of a power-20 run and the top two blocks are 78.4% of it, so the
 /// threshold's only real job is to keep the GPU path from being embarrassing on a power-8
-/// test file. `G16_METAL_FFT_MIN_BLOCK` overrides it, which is how the test suite forces
-/// the device path onto small blocks.
+/// test file. [`FftKernels::with_min_block`] moves it, which is how the test suite forces
+/// the device path onto blocks a real ptau would route home, and
+/// `G16_METAL_FFT_MIN_BLOCK` moves it from outside the process, which is how the
+/// crossover is swept from the CLI without a rebuild.
 const MIN_BLOCK: usize = 1 << 12;
 
 /// Threads per threadgroup asked for, clamped by [`dispatch_1d`] to what the pipeline
@@ -243,6 +245,15 @@ impl FftKernels {
     /// Shortest block this instance will run on the device. See [`MIN_BLOCK`].
     pub fn min_block(&self) -> usize {
         self.min_block
+    }
+
+    /// Moves the crossover. A test passes 1 so that a power-10 file, whose largest block
+    /// is 2^11, reaches the device at all; a measurement passes a sweep. Consuming rather
+    /// than a setter because the pipelines are already built and nothing else about the
+    /// instance changes.
+    pub fn with_min_block(mut self, n: usize) -> Self {
+        self.min_block = n;
+        self
     }
 
     /// The ladder window this instance uses for G1. See [`FFT_WINDOW_G1`].
