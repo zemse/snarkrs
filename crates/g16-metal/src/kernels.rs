@@ -14,3 +14,7 @@ pub const NTT_MSL: &str = include_str!("shaders/ntt.metal");
 pub const POINTWISE_MSL: &str = include_str!("shaders/pointwise.metal");
 /// Stages 5-9: G1/G2 point arithmetic and Pippenger buckets.
 pub const MSM_MSL: &str = include_str!("shaders/msm.metal");
+/// The ceremony primitives that are not a multiexp: a general point scalar
+/// multiplication, batch projective-to-affine, and the batch apply-key. Reuses the point
+/// arithmetic in `msm.metal`, so it must be concatenated after it.
+pub const CEREMONY_MSL: &str = include_str!("shaders/ceremony.metal");

@@ -18,6 +18,13 @@ thiserror.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = "0.29"
 
+[dev-dependencies]
+# The CPU reference the ceremony kernels are tested against: `prepare::point_times_fr`,
+# `prepare::batch_to_affine` and `CpuKeyScale` are the implementations `--backend cpu`
+# runs, and byte-identity with snarkjs rests on them. No cycle: g16-ceremony does not
+# depend on this crate.
+g16-ceremony.workspace = true
+
 [features]
 default = []
 

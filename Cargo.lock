@@ -891,6 +891,7 @@ version = "0.1.0"
 dependencies = [
  "ark-ec",
  "ark-ff",
+ "g16-ceremony",
  "g16-core",
  "g16-field",
  "g16-msm",
