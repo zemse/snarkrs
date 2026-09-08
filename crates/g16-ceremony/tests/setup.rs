@@ -262,6 +262,10 @@ fn refuses_a_ptau_it_cannot_use() {
 /// Opt in with `G16_SNARKJS=/path/to/snarkjs/cli.js`, since it needs node and a snarkjs
 /// checkout with its dependencies installed. This is the only test that covers sections 8
 /// and 9, which a contributed zkey has divided by delta.
+///
+/// Unset `G16_SNARKJS` and this reports itself as passing, which is the one way it can be
+/// green without having compared anything: absent artifacts are counted, and zero of them
+/// fails. A run that matters says so in its output.
 #[test]
 fn matches_snarkjs_bytes() {
     let Ok(cli) = std::env::var("G16_SNARKJS") else {
@@ -269,6 +273,7 @@ fn matches_snarkjs_bytes() {
         return;
     };
     let dir = tmp_dir("snarkjs");
+    let mut ran = 0;
     for case in CASES {
         let Some((r1cs, ptau, _)) = inputs(case) else {
             eprintln!("skipping {}: artifact missing", case.dir);
@@ -313,8 +318,10 @@ fn matches_snarkjs_bytes() {
             case.dir,
             String::from_utf8_lossy(&out.stdout)
         );
+        ran += 1;
         let _ = std::fs::remove_file(&ours);
         let _ = std::fs::remove_file(&theirs);
     }
+    assert!(ran > 0, "no artifacts present, nothing was checked");
     let _ = std::fs::remove_dir_all(&dir);
 }
