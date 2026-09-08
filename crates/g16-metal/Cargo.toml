@@ -8,6 +8,9 @@ license.workspace = true
 g16-field.workspace = true
 g16-zkey.workspace = true
 g16-core.workspace = true
+# Direct because `ceremony` implements three of its traits. It was already here through
+# g16-core, and a transitive presence is not a version constraint.
+g16-msm.workspace = true
 ark-ff.workspace = true
 ark-ec.workspace = true
 thiserror.workspace = true

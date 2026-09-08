@@ -60,6 +60,7 @@ use g16_field::{
     G2Projective, One, PrimeField, Zero,
 };
 use g16_msm::xyzz::{to_projective, RawCurve, Xyzz};
+use g16_msm::{AccelError, GroupFft};
 use rayon::prelude::*;
 
 use crate::ptau::{
@@ -108,6 +109,9 @@ fn shift() -> Fr {
 pub trait PrepareCurve: RawCurve {
     fn raw(f: &Self::BaseField) -> Self::RF;
     fn invert(f: Self::RF) -> Option<Self::RF>;
+    /// The one call the transform cannot express generically: [`GroupFft`] has a separate
+    /// entry point per group, the same way [`g16_msm::MsmBackend`] does.
+    fn ifft(fft: &dyn GroupFft, a: &mut [Xyzz<Self::RF>]) -> Result<(), AccelError>;
 }
 
 impl PrepareCurve for g16_field::g1::Config {
@@ -118,6 +122,9 @@ impl PrepareCurve for g16_field::g1::Config {
     fn invert(f: RawFq) -> Option<RawFq> {
         f.to_fq().inverse().map(|i| RawFq::from_fq(&i))
     }
+    fn ifft(fft: &dyn GroupFft, a: &mut [Xyzz<RawFq>]) -> Result<(), AccelError> {
+        fft.ifft_g1(a)
+    }
 }
 
 impl PrepareCurve for g16_field::g2::Config {
@@ -127,6 +134,9 @@ impl PrepareCurve for g16_field::g2::Config {
     }
     fn invert(f: RawFq2) -> Option<RawFq2> {
         f.to_fq2().inverse().map(|i| RawFq2::from_fq2(&i))
+    }
+    fn ifft(fft: &dyn GroupFft, a: &mut [Xyzz<RawFq2>]) -> Result<(), AccelError> {
+        fft.ifft_g2(a)
     }
 }
 
@@ -317,7 +327,10 @@ fn butterflies<F: RawField>(lo: &mut [Xyzz<F>], hi: &mut [Xyzz<F>], w: Fr, first
 
 /// In-place inverse FFT over the group. `a.len()` must be a power of two no larger than
 /// `2^Fr::TWO_ADICITY`; the caller has already checked both.
-fn ifft<F: RawField>(a: &mut [Xyzz<F>]) {
+///
+/// This is the whole of what a [`GroupFft`] backend replaces, which is why it is one
+/// function taking one slice: every pass is here and nothing else is.
+pub(crate) fn ifft<F: RawField>(a: &mut [Xyzz<F>]) {
     let n = a.len();
     if n <= 1 {
         return;
@@ -338,6 +351,24 @@ fn ifft<F: RawField>(a: &mut [Xyzz<F>]) {
     a.par_iter_mut()
         .for_each(|p| *p = point_times_fr(p, &size_inv));
     a[1..].reverse();
+}
+
+/// One block, to the backend or to the CPU.
+///
+/// The crossover is the backend's own number, not this file's: a block below
+/// [`GroupFft::min_block`] is a transform a device loses on, and at power 20 every block
+/// under 2^12 together is 0.18% of the command, so routing them home costs nothing to
+/// measure and nothing to get slightly wrong.
+fn ifft_block<P: PrepareCurve>(
+    fft: &dyn GroupFft,
+    a: &mut [Xyzz<P::RF>],
+) -> Result<(), CeremonyError> {
+    if a.len() >= fft.min_block() {
+        P::ifft(fft, a)?;
+    } else {
+        ifft(a);
+    }
+    Ok(())
 }
 
 /// `prepareLagrangeEvaluation` (`build_fft.js:991-1113`), the elementwise preamble of the
@@ -383,6 +414,7 @@ fn lagrange_split<F: RawField>(a: &mut [Xyzz<F>]) {
 /// `G.lagrangeEvaluations` (`engine_fft.js:466-518`) over one block.
 fn lagrange_evaluations<P: PrepareCurve>(
     points: &[Affine<P>],
+    fft: &dyn GroupFft,
 ) -> Result<Vec<Affine<P>>, CeremonyError> {
     let n = points.len();
     if !n.is_power_of_two() {
@@ -397,11 +429,15 @@ fn lagrange_evaluations<P: PrepareCurve>(
 
     let mut a: Vec<Xyzz<P::RF>> = points.par_iter().map(xyzz_from_affine::<P>).collect();
     if bits <= Fr::TWO_ADICITY {
-        ifft(&mut a);
+        ifft_block::<P>(fft, &mut a)?;
     } else {
         lagrange_split(&mut a);
         let (t0, t1) = a.split_at_mut(n / 2);
-        rayon::join(|| ifft(t0), || ifft(t1));
+        // Serial rather than `rayon::join`, because the two halves would otherwise submit
+        // to the same device at once. This branch needs `bits == TWO_ADICITY + 1` and no
+        // ptau this crate will ever see reaches it.
+        ifft_block::<P>(fft, t0)?;
+        ifft_block::<P>(fft, t1)?;
     }
     Ok(batch_to_affine::<P>(&a))
 }
@@ -447,29 +483,38 @@ fn xyzz_from_projective<P: PrepareCurve>(p: &Projective<P>) -> Xyzz<P::RF> {
 ///
 /// `points.len()` must be a power of two. Above `2^(TWO_ADICITY + 1)` there is no root of
 /// unity to build from, and that is [`CeremonyError::CircuitTooBig`].
-pub fn lagrange_evaluations_g1(points: &[G1Affine]) -> Result<Vec<G1Affine>, CeremonyError> {
-    lagrange_evaluations::<g16_field::g1::Config>(points)
+pub fn lagrange_evaluations_g1(
+    points: &[G1Affine],
+    fft: &dyn GroupFft,
+) -> Result<Vec<G1Affine>, CeremonyError> {
+    lagrange_evaluations::<g16_field::g1::Config>(points, fft)
 }
 
 /// [`lagrange_evaluations_g1`] over G2, for section 13.
-pub fn lagrange_evaluations_g2(points: &[G2Affine]) -> Result<Vec<G2Affine>, CeremonyError> {
-    lagrange_evaluations::<g16_field::g2::Config>(points)
+pub fn lagrange_evaluations_g2(
+    points: &[G2Affine],
+    fft: &dyn GroupFft,
+) -> Result<Vec<G2Affine>, CeremonyError> {
+    lagrange_evaluations::<g16_field::g2::Config>(points, fft)
 }
 
 /// In-place radix-2 inverse FFT over G1, twiddles applied as scalar multiplications.
 ///
 /// Projective in and out because the butterflies are additions and the caller batches back
 /// to affine once, not `2^p` times.
-pub fn group_ifft_g1(a: &mut [G1Projective]) -> Result<(), CeremonyError> {
-    group_ifft::<g16_field::g1::Config>(a)
+pub fn group_ifft_g1(a: &mut [G1Projective], fft: &dyn GroupFft) -> Result<(), CeremonyError> {
+    group_ifft::<g16_field::g1::Config>(a, fft)
 }
 
 /// [`group_ifft_g1`] over G2.
-pub fn group_ifft_g2(a: &mut [G2Projective]) -> Result<(), CeremonyError> {
-    group_ifft::<g16_field::g2::Config>(a)
+pub fn group_ifft_g2(a: &mut [G2Projective], fft: &dyn GroupFft) -> Result<(), CeremonyError> {
+    group_ifft::<g16_field::g2::Config>(a, fft)
 }
 
-fn group_ifft<P: PrepareCurve>(a: &mut [Projective<P>]) -> Result<(), CeremonyError> {
+fn group_ifft<P: PrepareCurve>(
+    a: &mut [Projective<P>],
+    fft: &dyn GroupFft,
+) -> Result<(), CeremonyError> {
     let n = a.len();
     if !n.is_power_of_two() {
         return Err(CeremonyError::BadParams(format!(
@@ -480,7 +525,7 @@ fn group_ifft<P: PrepareCurve>(a: &mut [Projective<P>]) -> Result<(), CeremonyEr
         return Err(CeremonyError::CircuitTooBig(n.trailing_zeros()));
     }
     let mut work: Vec<Xyzz<P::RF>> = a.par_iter().map(xyzz_from_projective::<P>).collect();
-    ifft(&mut work);
+    ifft_block::<P>(fft, &mut work)?;
     a.par_iter_mut()
         .zip(work.par_iter())
         .for_each(|(out, p)| *out = to_projective::<P>(p));
@@ -502,7 +547,11 @@ pub fn prepared_element_count(section: u32, power: u32) -> Option<usize> {
 
 /// Run the whole command: read sections 2 to 5, write 12 to 15, and copy everything else
 /// through. The output declares 11 sections.
-pub fn prepare_phase2(ptau_in: &Path, ptau_out: &Path) -> Result<(), CeremonyError> {
+pub fn prepare_phase2(
+    ptau_in: &Path,
+    ptau_out: &Path,
+    fft: &dyn GroupFft,
+) -> Result<(), CeremonyError> {
     let src = Ptau::open(ptau_in)?;
     let power = src.header().power;
     // Section 12's last block is `2^(power+1)` points, and `lagrangeEvaluations` refuses
@@ -531,10 +580,10 @@ pub fn prepare_phase2(ptau_in: &Path, ptau_out: &Path) -> Result<(), CeremonyErr
         out.write_section_verbatim(*id, src.section(*id)?)?;
     }
 
-    process_section_g1(&src, &mut out, S_TAU_G1, S_LAGRANGE_TAU_G1)?;
-    process_section_g2(&src, &mut out, S_TAU_G2, S_LAGRANGE_TAU_G2)?;
-    process_section_g1(&src, &mut out, S_ALPHA_TAU_G1, S_LAGRANGE_ALPHA_TAU_G1)?;
-    process_section_g1(&src, &mut out, S_BETA_TAU_G1, S_LAGRANGE_BETA_TAU_G1)?;
+    process_section_g1(&src, &mut out, S_TAU_G1, S_LAGRANGE_TAU_G1, fft)?;
+    process_section_g2(&src, &mut out, S_TAU_G2, S_LAGRANGE_TAU_G2, fft)?;
+    process_section_g1(&src, &mut out, S_ALPHA_TAU_G1, S_LAGRANGE_ALPHA_TAU_G1, fft)?;
+    process_section_g1(&src, &mut out, S_BETA_TAU_G1, S_LAGRANGE_BETA_TAU_G1, fft)?;
 
     out.finish()
 }
@@ -549,11 +598,12 @@ fn process_section_g1(
     out: &mut BinFileWriter,
     from: u32,
     to: u32,
+    fft: &dyn GroupFft,
 ) -> Result<(), CeremonyError> {
     let power = src.header().power;
     out.start_section(to)?;
     for p in 0..=power {
-        let block = lagrange_evaluations_g1(&src.g1_points(from, 0, 1usize << p)?)?;
+        let block = lagrange_evaluations_g1(&src.g1_points(from, 0, 1usize << p)?, fft)?;
         out.write_g1_slice(&block)?;
     }
     if from == S_TAU_G1 {
@@ -562,7 +612,7 @@ fn process_section_g1(
         let n = 1usize << (power + 1);
         let mut input = src.g1_points(from, 0, n - 1)?;
         input.push(G1Affine::identity());
-        let block = lagrange_evaluations_g1(&input)?;
+        let block = lagrange_evaluations_g1(&input, fft)?;
         out.write_g1_slice(&block)?;
     }
     out.end_section()
@@ -574,11 +624,12 @@ fn process_section_g2(
     out: &mut BinFileWriter,
     from: u32,
     to: u32,
+    fft: &dyn GroupFft,
 ) -> Result<(), CeremonyError> {
     let power = src.header().power;
     out.start_section(to)?;
     for p in 0..=power {
-        let block = lagrange_evaluations_g2(&src.g2_points(from, 0, 1usize << p)?)?;
+        let block = lagrange_evaluations_g2(&src.g2_points(from, 0, 1usize << p)?, fft)?;
         out.write_g2_slice(&block)?;
     }
     out.end_section()
@@ -625,7 +676,7 @@ mod tests {
         let tau = Fr::from(123_456_789u64);
         for bits in 0..7u32 {
             let n = 1usize << bits;
-            let got = lagrange_evaluations_g1(&powers(tau, n)).unwrap();
+            let got = lagrange_evaluations_g1(&powers(tau, n), &crate::CpuGroupFft).unwrap();
 
             let root = root_table(bits)[bits as usize];
             let mut domain = Vec::with_capacity(n);

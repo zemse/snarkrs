@@ -893,6 +893,7 @@ dependencies = [
  "ark-ff",
  "g16-core",
  "g16-field",
+ "g16-msm",
  "g16-zkey",
  "metal",
  "thiserror 2.0.19",
@@ -908,6 +909,7 @@ dependencies = [
  "ark-std",
  "g16-field",
  "rayon",
+ "thiserror 2.0.19",
 ]
 
 [[package]]

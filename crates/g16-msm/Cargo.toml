@@ -9,6 +9,8 @@ g16-field.workspace = true
 ark-ff.workspace = true
 ark-ec.workspace = true
 rayon.workspace = true
+# `accel`'s error type only. The rest of the crate is infallible.
+thiserror.workspace = true
 
 [dev-dependencies]
 # test_rng and UniformRand for the oracles; tests only, nothing in the library path.

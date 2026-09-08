@@ -29,7 +29,7 @@ use g16_ceremony::prepare::{
 };
 use g16_ceremony::ptau::{Ptau, LAGRANGE_SECTIONS, PTAU_MAGIC, S_CONTRIBUTIONS};
 use g16_ceremony::write::BinFileWriter;
-use g16_ceremony::{phase1, ptau, CeremonyError};
+use g16_ceremony::{phase1, ptau, CeremonyError, CpuGroupFft, CpuKeyScale};
 use g16_field::{CurveGroup, FftField, Fr, G1Projective, One, PrimeField, PrimeGroup};
 use sha2::{Digest as _, Sha256};
 
@@ -133,6 +133,7 @@ fn the_pinned_chain_reproduces_snarkjs_byte_for_byte() {
             Some(BEACON_NAME),
             &beacon_bytes(),
             BEACON_ITERATIONS,
+            &CpuKeyScale,
         )
         .unwrap();
         assert_eq!(
@@ -142,7 +143,7 @@ fn the_pinned_chain_reproduces_snarkjs_byte_for_byte() {
         );
 
         let started = Instant::now();
-        prepare_phase2(&input, &out).unwrap();
+        prepare_phase2(&input, &out, &CpuGroupFft).unwrap();
         eprintln!("power {power} prepare: {:.2?}", started.elapsed());
 
         assert_eq!(
@@ -197,7 +198,7 @@ fn local_13_prepare_reproduces_the_snarkjs_file_byte_for_byte() {
     w.finish().unwrap();
 
     let started = Instant::now();
-    prepare_phase2(&raw, &mine).unwrap();
+    prepare_phase2(&raw, &mine, &CpuGroupFft).unwrap();
     eprintln!("power 13 prepare: {:.2?}", started.elapsed());
 
     assert_same_bytes(
@@ -279,9 +280,9 @@ fn the_projective_entry_point_agrees_with_the_affine_one() {
         .collect();
 
     let mut projective: Vec<G1Projective> = affine.iter().map(|p| (*p).into()).collect();
-    group_ifft_g1(&mut projective).unwrap();
+    group_ifft_g1(&mut projective, &CpuGroupFft).unwrap();
 
-    let want = lagrange_evaluations_g1(&affine).unwrap();
+    let want = lagrange_evaluations_g1(&affine, &CpuGroupFft).unwrap();
     for (i, (got, want)) in projective.iter().zip(&want).enumerate() {
         assert_eq!(got.into_affine(), *want, "element {i}");
     }
@@ -294,7 +295,7 @@ fn the_projective_entry_point_agrees_with_the_affine_one() {
 fn a_non_power_of_two_block_is_rejected() {
     let p = G1Projective::generator().into_affine();
     assert!(matches!(
-        lagrange_evaluations_g1(&[p, p, p]),
+        lagrange_evaluations_g1(&[p, p, p], &CpuGroupFft),
         Err(CeremonyError::BadParams(_))
     ));
 }

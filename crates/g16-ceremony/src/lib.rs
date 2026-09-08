@@ -27,9 +27,10 @@
 //!
 //! Module map: [`r1cs`] and [`ptau`] read the two inputs, [`write`] is the container
 //! writer every output goes through, [`transcript`] is the hash-and-RNG layer shared by
-//! both phases, and [`phase1`], [`prepare`], [`setup`], [`contribute`] and [`vkey`] are
-//! the commands.
+//! both phases, [`accel`] is the CPU side of the two seams a GPU can take over, and
+//! [`phase1`], [`prepare`], [`setup`], [`contribute`] and [`vkey`] are the commands.
 
+pub mod accel;
 pub mod contribute;
 pub mod phase1;
 pub mod prepare;
@@ -43,6 +44,8 @@ pub mod write;
 use g16_field::{BigInteger, Fq, Fr, G1Affine, G2Affine, PrimeField};
 use g16_zkey::binfile::{Cursor, G1_BYTES, G2_BYTES};
 use g16_zkey::ZkeyError;
+
+pub use accel::{CpuGroupFft, CpuKeyScale};
 
 use write::BinFileWriter;
 
@@ -73,6 +76,10 @@ pub enum CeremonyError {
     Zkey(#[from] g16_zkey::ZkeyError),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    /// A backend the caller selected could not do the work. Never a numeric failure: see
+    /// [`g16_msm::AccelError`].
+    #[error(transparent)]
+    Accel(#[from] g16_msm::AccelError),
     #[error("malformed section {section}: {reason}")]
     Malformed { section: u32, reason: String },
     #[error("missing section {0}")]

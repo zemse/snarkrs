@@ -29,6 +29,10 @@ pub mod layout;
 
 #[cfg(target_os = "macos")]
 pub mod backend;
+/// The three ceremony seams: `setup`'s MSM, `ptau prepare`'s group FFT, and the batch
+/// apply-key behind the four contribute and beacon commands.
+#[cfg(target_os = "macos")]
+pub mod ceremony;
 #[cfg(target_os = "macos")]
 pub mod kernels;
 #[cfg(target_os = "macos")]
@@ -40,3 +44,5 @@ pub mod stages;
 
 #[cfg(target_os = "macos")]
 pub use backend::{MetalBackend, MetalCircuit, PrepareCost};
+#[cfg(target_os = "macos")]
+pub use ceremony::{MetalGroupFft, MetalKeyScale, MetalMsmBackend};

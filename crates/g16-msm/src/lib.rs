@@ -25,9 +25,12 @@ use rayon::prelude::*;
 
 use g16_field::{Fr, G1Affine, G1Projective, G2Affine, G2Projective};
 
+pub mod accel;
 pub mod xyzz;
 use g16_field::raw::RawField;
 use xyzz::{to_projective, RawCurve, Xyzz};
+
+pub use accel::{AccelError, GroupFft, KeyScale};
 
 pub trait MsmBackend: Send + Sync {
     fn name(&self) -> &'static str;

@@ -7,20 +7,23 @@
 //!   g16 bench  --artifacts DIR [--variant NAME]... [--reps 15] [--backend cpu|wgpu|...]
 //!              [--mode cold|warm|both] [--csv out.csv]
 //!
-//!   g16 setup  --r1cs c.r1cs --ptau prepared.ptau --out c_0000.zkey
+//!   g16 setup  --r1cs c.r1cs --ptau prepared.ptau --out c_0000.zkey [--backend cpu|metal]
 //!
 //!   g16 ptau info       --ptau p.ptau
 //!   g16 ptau new        --power 12 --out p_0000.ptau
 //!   g16 ptau contribute --ptau p_0000.ptau --out p_0001.ptau --entropy STRING [--name S]
+//!                       [--backend cpu|metal]
 //!   g16 ptau beacon     --ptau p_0001.ptau --out p_final.ptau
 //!                       --beacon-hash HEX --num-iterations-exp N [--name S]
-//!   g16 ptau prepare    --ptau p_final.ptau --out prepared.ptau
+//!                       [--backend cpu|metal]
+//!   g16 ptau prepare    --ptau p_final.ptau --out prepared.ptau [--backend cpu|metal]
 //!   g16 ptau verify     --ptau p.ptau
 //!
 //!   g16 zkey contribute               --zkey c_0000.zkey --out c_0001.zkey
-//!                                     --entropy STRING [--name S]
+//!                                     --entropy STRING [--name S] [--backend cpu|metal]
 //!   g16 zkey beacon                   --zkey c_0001.zkey --out c_final.zkey
 //!                                     --beacon-hash HEX --num-iterations-exp N [--name S]
+//!                                     [--backend cpu|metal]
 //!   g16 zkey verify                   --zkey c_final.zkey --ptau prepared.ptau
 //!                                     (--r1cs c.r1cs | --init c_0000.zkey)
 //!   g16 zkey export-verificationkey   --zkey c_final.zkey --out vkey.json
@@ -34,19 +37,28 @@
 //! snarkjs itself has to accept, so their formats are not ours to choose. `g16-ceremony`
 //! carries the byte-level reasoning and the snarkjs line numbers; this file only parses
 //! arguments and prints what came back.
+//!
+//! Their `--backend` is not `prove`'s. `prove` selects a whole `g16_core::Backend`; a
+//! ceremony command selects one primitive, and the six that have the flag are the six with
+//! a primitive worth moving. The bar every one of them is held to is that
+//! `--backend cpu` and `--backend metal` write **byte-identical** files, which is what
+//! carries the snarkjs equivalence the CPU path already has.
 
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use g16_ceremony::{contribute as zkey_mpc, phase1, prepare, ptau as ptau_file, setup, vkey};
+use g16_ceremony::{
+    contribute as zkey_mpc, phase1, prepare, ptau as ptau_file, setup, vkey, CpuGroupFft,
+    CpuKeyScale,
+};
 use g16_cli::{bench, json, make_backend, BackendKind};
 use g16_core::{
     prove::{prove, prove_trace},
     verify::verify,
     StageTimings,
 };
-use g16_msm::{CpuMsm, MsmBackend};
+use g16_msm::{CpuMsm, GroupFft, KeyScale, MsmBackend};
 use g16_zkey::{wtns::Witness, ProvingKey, VerifyingKey};
 
 #[derive(Parser)]
@@ -119,6 +131,10 @@ enum Cmd {
         ptau: PathBuf,
         #[arg(long, value_name = "FILE")]
         out: PathBuf,
+        /// cpu or metal. Both must write byte-identical output; that equivalence is what
+        /// carries the snarkjs one.
+        #[arg(long, value_enum, default_value_t = BackendKind::Cpu)]
+        backend: BackendKind,
     },
     /// Powers of tau: the circuit-independent phase-1 ceremony.
     Ptau {
@@ -165,6 +181,10 @@ enum PtauCmd {
         /// Recorded in the contribution and printed by every later `verify`.
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
+        /// cpu or metal. Both must write byte-identical output; that equivalence is what
+        /// carries the snarkjs one.
+        #[arg(long, value_enum, default_value_t = BackendKind::Cpu)]
+        backend: BackendKind,
     },
     /// Add the final contribution from a public beacon, the one anyone can reproduce.
     Beacon {
@@ -180,6 +200,10 @@ enum PtauCmd {
         num_iterations_exp: String,
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
+        /// cpu or metal. Both must write byte-identical output; that equivalence is what
+        /// carries the snarkjs one.
+        #[arg(long, value_enum, default_value_t = BackendKind::Cpu)]
+        backend: BackendKind,
     },
     /// Precompute the Lagrange sections phase 2 needs. This is the expensive one: every
     /// butterfly of its inverse FFT is a full point scalar multiplication.
@@ -188,6 +212,10 @@ enum PtauCmd {
         ptau: PathBuf,
         #[arg(long, value_name = "FILE")]
         out: PathBuf,
+        /// cpu or metal. Both must write byte-identical output; that equivalence is what
+        /// carries the snarkjs one.
+        #[arg(long, value_enum, default_value_t = BackendKind::Cpu)]
+        backend: BackendKind,
     },
     /// Check the contribution chain and recompute the challenge hashes.
     Verify {
@@ -209,6 +237,10 @@ enum ZkeyCmd {
         entropy: String,
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
+        /// cpu or metal. Both must write byte-identical output; that equivalence is what
+        /// carries the snarkjs one.
+        #[arg(long, value_enum, default_value_t = BackendKind::Cpu)]
+        backend: BackendKind,
     },
     /// Add the final contribution from a public beacon.
     Beacon {
@@ -222,6 +254,10 @@ enum ZkeyCmd {
         num_iterations_exp: String,
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
+        /// cpu or metal. Both must write byte-identical output; that equivalence is what
+        /// carries the snarkjs one.
+        #[arg(long, value_enum, default_value_t = BackendKind::Cpu)]
+        backend: BackendKind,
     },
     /// Check the contribution chain and that the final key is a consistent rescaling of
     /// the initial one.
@@ -280,7 +316,12 @@ fn main() -> Result<()> {
             out,
         } => run_trace(&zkey, &witness, backend, out.as_deref()),
         Cmd::Bench(args) => bench::run(args),
-        Cmd::Setup { r1cs, ptau, out } => run_setup(&r1cs, &ptau, &out),
+        Cmd::Setup {
+            r1cs,
+            ptau,
+            out,
+            backend,
+        } => run_setup(&r1cs, &ptau, &out, backend),
         Cmd::Ptau { cmd } => run_ptau(cmd),
         Cmd::Zkey { cmd } => run_zkey(cmd),
     }
@@ -288,18 +329,128 @@ fn main() -> Result<()> {
 
 /// The MSM behind `setup` and the two same-ratio checks.
 ///
-/// Only the CPU backend exists as an `MsmBackend` today: `g16-metal` and `g16-cuda`
-/// implement `g16_core::Backend`, the whole prover, not this trait, so there is nothing yet
-/// to select between and no `--backend` flag that would not be a lie. The parameter is
-/// threaded through the library anyway, so putting setup on a GPU is a constructor swap
-/// here rather than a change to every ceremony signature.
-fn msm_backend() -> impl MsmBackend {
-    CpuMsm::new()
+/// The three constructors below are `make_backend` for the ceremony: same three failure
+/// modes, same three messages, same refusal to fall back to the CPU when the asked-for
+/// backend is not there. A benchmark that silently measures the other backend is worse than
+/// no number, and a `.zkey` that silently came from the other backend is worse than no key.
+fn msm_backend(kind: BackendKind) -> Result<Box<dyn MsmBackend>> {
+    match kind {
+        BackendKind::Cpu => Ok(Box::new(CpuMsm::new())),
+        BackendKind::Wgpu => Err(no_wgpu()),
+        BackendKind::Metal => metal_msm(),
+        BackendKind::Cuda => Err(no_cuda()),
+    }
 }
 
-fn run_setup(r1cs: &std::path::Path, ptau: &std::path::Path, out: &std::path::Path) -> Result<()> {
-    let msm = msm_backend();
-    let report = setup::setup(r1cs, ptau, out, &msm)
+/// The group inverse FFT behind `ptau prepare`.
+fn fft_backend(kind: BackendKind) -> Result<Box<dyn GroupFft>> {
+    match kind {
+        BackendKind::Cpu => Ok(Box::new(CpuGroupFft)),
+        BackendKind::Wgpu => Err(no_wgpu()),
+        BackendKind::Metal => metal_fft(),
+        BackendKind::Cuda => Err(no_cuda()),
+    }
+}
+
+/// The batch apply-key behind the four contribute and beacon commands.
+fn key_backend(kind: BackendKind) -> Result<Box<dyn KeyScale>> {
+    match kind {
+        BackendKind::Cpu => Ok(Box::new(CpuKeyScale)),
+        BackendKind::Wgpu => Err(no_wgpu()),
+        BackendKind::Metal => metal_key(),
+        BackendKind::Cuda => Err(no_cuda()),
+    }
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn metal_msm() -> Result<Box<dyn MsmBackend>> {
+    Ok(Box::new(g16_metal::MetalMsmBackend::new().map_err(
+        |e| anyhow::anyhow!("backend `metal` is unavailable: {e}"),
+    )?))
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn metal_fft() -> Result<Box<dyn GroupFft>> {
+    Ok(Box::new(g16_metal::MetalGroupFft::new().map_err(|e| {
+        anyhow::anyhow!("backend `metal` is unavailable: {e}")
+    })?))
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn metal_key() -> Result<Box<dyn KeyScale>> {
+    Ok(Box::new(g16_metal::MetalKeyScale::new().map_err(|e| {
+        anyhow::anyhow!("backend `metal` is unavailable: {e}")
+    })?))
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn metal_msm() -> Result<Box<dyn MsmBackend>> {
+    Err(no_metal())
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn metal_fft() -> Result<Box<dyn GroupFft>> {
+    Err(no_metal())
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn metal_key() -> Result<Box<dyn KeyScale>> {
+    Err(no_metal())
+}
+
+/// The feature is off, or it is on and the target is not macOS. Two different fixes, so
+/// two different messages, as in `make_backend`.
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn no_metal() -> anyhow::Error {
+    if cfg!(feature = "metal") {
+        anyhow::anyhow!(
+            "backend `metal` is unavailable: the `metal` feature is enabled but this target \
+             is not macOS, so g16-metal compiled to nothing"
+        )
+    } else {
+        anyhow::anyhow!(
+            "backend `metal` is unavailable: this binary was built WITHOUT the `metal` \
+             feature. Rebuild with `cargo build --release --features metal`."
+        )
+    }
+}
+
+/// CUDA has kernels for the prover and none for the ceremony. Saying "not built in" when
+/// the feature *is* on would send someone to rebuild a binary that already has everything
+/// it is going to get.
+fn no_cuda() -> anyhow::Error {
+    if cfg!(feature = "cuda") {
+        anyhow::anyhow!(
+            "backend `cuda` is unavailable for the ceremony: g16-cuda implements the prover, \
+             not the ceremony seams, so there is nothing to select yet"
+        )
+    } else {
+        anyhow::anyhow!(
+            "backend `cuda` is unavailable: this binary was built WITHOUT the `cuda` \
+             feature. Rebuild with `cargo build --release --features cuda`."
+        )
+    }
+}
+
+/// Unlike the other two this is not a "yet". A ceremony kernel is a point scalar
+/// multiplication, which inlines the point operations three or more times over a 256-byte
+/// `Xyzz<Fq2>`, and that is exactly the shape WebKit 323560 miscompiles on iOS.
+fn no_wgpu() -> anyhow::Error {
+    anyhow::anyhow!(
+        "backend `wgpu` is unavailable for the ceremony: these kernels are Metal and CUDA \
+         only, because a scalar-multiplication ladder is the shape WebKit 323560 \
+         miscompiles. Use `--backend cpu` or `--backend metal`."
+    )
+}
+
+fn run_setup(
+    r1cs: &std::path::Path,
+    ptau: &std::path::Path,
+    out: &std::path::Path,
+    backend: BackendKind,
+) -> Result<()> {
+    let msm = msm_backend(backend)?;
+    let report = setup::setup(r1cs, ptau, out, msm.as_ref())
         .with_context(|| format!("setting up {}", r1cs.display()))?;
     println!("constraints    {}", report.n_constraints);
     println!("vars           {}", report.n_vars);
@@ -367,8 +518,10 @@ fn run_ptau(cmd: PtauCmd) -> Result<()> {
             out,
             entropy,
             name,
+            backend,
         } => {
-            let report = phase1::contribute(&ptau, &out, name.as_deref(), &entropy)
+            let key = key_backend(backend)?;
+            let report = phase1::contribute(&ptau, &out, name.as_deref(), &entropy, key.as_ref())
                 .with_context(|| format!("contributing to {}", ptau.display()))?;
             print_phase1(&report);
             eprintln!("wrote {}", out.display());
@@ -380,16 +533,19 @@ fn run_ptau(cmd: PtauCmd) -> Result<()> {
             beacon_hash,
             num_iterations_exp,
             name,
+            backend,
         } => {
             let (hash, exp) = phase1::parse_beacon_args(&beacon_hash, &num_iterations_exp)?;
-            let report = phase1::beacon(&ptau, &out, name.as_deref(), &hash, exp)
+            let key = key_backend(backend)?;
+            let report = phase1::beacon(&ptau, &out, name.as_deref(), &hash, exp, key.as_ref())
                 .with_context(|| format!("beaconing {}", ptau.display()))?;
             print_phase1(&report);
             eprintln!("wrote {}", out.display());
             Ok(())
         }
-        PtauCmd::Prepare { ptau, out } => {
-            prepare::prepare_phase2(&ptau, &out)
+        PtauCmd::Prepare { ptau, out, backend } => {
+            let fft = fft_backend(backend)?;
+            prepare::prepare_phase2(&ptau, &out, fft.as_ref())
                 .with_context(|| format!("preparing {}", ptau.display()))?;
             eprintln!("wrote {}", out.display());
             Ok(())
@@ -428,9 +584,10 @@ fn run_zkey(cmd: ZkeyCmd) -> Result<()> {
             out,
             entropy,
             name,
+            backend,
         } => {
-            let msm = msm_backend();
-            let report = zkey_mpc::contribute(&zkey, &out, name.as_deref(), &entropy, &msm)
+            let key = key_backend(backend)?;
+            let report = zkey_mpc::contribute(&zkey, &out, name.as_deref(), &entropy, key.as_ref())
                 .with_context(|| format!("contributing to {}", zkey.display()))?;
             println!("contribution   {}", report.index);
             println!("hash           {}", hex::encode(report.hash));
@@ -443,10 +600,11 @@ fn run_zkey(cmd: ZkeyCmd) -> Result<()> {
             beacon_hash,
             num_iterations_exp,
             name,
+            backend,
         } => {
             let (hash, exp) = phase1::parse_beacon_args(&beacon_hash, &num_iterations_exp)?;
-            let msm = msm_backend();
-            let report = zkey_mpc::beacon(&zkey, &out, name.as_deref(), &hash, exp, &msm)
+            let key = key_backend(backend)?;
+            let report = zkey_mpc::beacon(&zkey, &out, name.as_deref(), &hash, exp, key.as_ref())
                 .with_context(|| format!("beaconing {}", zkey.display()))?;
             println!("contribution   {}", report.index);
             println!("hash           {}", hex::encode(report.hash));
@@ -459,10 +617,12 @@ fn run_zkey(cmd: ZkeyCmd) -> Result<()> {
             r1cs,
             init,
         } => {
-            let msm = msm_backend();
+            // No `--backend`: with `--r1cs` this re-runs the whole setup, and a verifier
+            // that shares the accelerator with the thing it is checking checks less.
+            let msm = msm_backend(BackendKind::Cpu)?;
             let report = match (&r1cs, &init) {
-                (Some(r1cs), _) => zkey_mpc::verify_from_r1cs(r1cs, &ptau, &zkey, &msm),
-                (None, Some(init)) => zkey_mpc::verify_from_init(init, &ptau, &zkey, &msm),
+                (Some(r1cs), _) => zkey_mpc::verify_from_r1cs(r1cs, &ptau, &zkey, msm.as_ref()),
+                (None, Some(init)) => zkey_mpc::verify_from_init(init, &ptau, &zkey, msm.as_ref()),
                 // clap's `required_unless_present` already rules this out; the arm exists
                 // so the match is total rather than a panic waiting for a flag change.
                 (None, None) => anyhow::bail!("one of --r1cs or --init is required"),
@@ -607,4 +767,53 @@ fn run_verify(
     verify(&vk, &public, &proof)?;
     println!("OK");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every seam needs a CPU implementation under the same spelling, because
+    /// `--backend cpu` is the file every accelerated run is `cmp`'d against and the only
+    /// one already held against snarkjs byte for byte.
+    #[test]
+    fn every_ceremony_seam_has_a_cpu_backend() {
+        assert_eq!(msm_backend(BackendKind::Cpu).unwrap().name(), "cpu");
+        assert_eq!(fft_backend(BackendKind::Cpu).unwrap().name(), "cpu");
+        assert_eq!(key_backend(BackendKind::Cpu).unwrap().name(), "cpu");
+    }
+
+    /// A backend that cannot run says which one and why. It never falls back: a `.zkey`
+    /// that silently came from the other backend is worse than no key at all.
+    #[test]
+    fn an_unavailable_ceremony_backend_names_itself() {
+        for kind in [BackendKind::Wgpu, BackendKind::Cuda] {
+            let e = match msm_backend(kind) {
+                Ok(_) => panic!(
+                    "built a {} ceremony backend that does not exist",
+                    kind.as_str()
+                ),
+                Err(e) => e.to_string(),
+            };
+            assert!(e.contains(kind.as_str()), "{e}");
+            assert!(e.contains("unavailable"), "{e}");
+        }
+    }
+
+    /// Without the feature the error names the feature, so the fix is the message.
+    #[cfg(not(feature = "metal"))]
+    #[test]
+    fn metal_without_the_feature_says_so() {
+        let msg = |r: Result<_>| match r {
+            Ok(_) => panic!("built a metal backend without the metal feature"),
+            Err(e) => e.to_string(),
+        };
+        for e in [
+            msg(msm_backend(BackendKind::Metal).map(|_| ())),
+            msg(fft_backend(BackendKind::Metal).map(|_| ())),
+            msg(key_backend(BackendKind::Metal).map(|_| ())),
+        ] {
+            assert!(e.contains("--features metal"), "{e}");
+        }
+    }
 }

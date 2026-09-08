@@ -24,7 +24,7 @@ use std::path::Path;
 use g16_field::{
     AffineRepr, CurveGroup, Domain, Field, Fr, G1Affine, G1Projective, G2Affine, Zero,
 };
-use g16_msm::MsmBackend;
+use g16_msm::{KeyScale, MsmBackend};
 use g16_ntt::{CpuNtt, Direction, NttBackend};
 use rayon::prelude::*;
 
@@ -189,9 +189,8 @@ pub fn contribute(
     zkey_out: &Path,
     name: Option<&str>,
     entropy: &str,
-    msm: &dyn MsmBackend,
+    key: &dyn KeyScale,
 ) -> Result<ContributionReport, CeremonyError> {
-    let _ = msm;
     let mut rng = transcript::rng_from_entropy(entropy);
     let params = ContributionParams {
         name: name.map(str::to_owned),
@@ -204,6 +203,7 @@ pub fn contribute(
         ContributionKind::Contribute,
         params,
         &mut rng,
+        key,
     )
 }
 
@@ -218,9 +218,8 @@ pub fn beacon(
     name: Option<&str>,
     beacon_hash: &[u8],
     num_iterations_exp: u8,
-    msm: &dyn MsmBackend,
+    key: &dyn KeyScale,
 ) -> Result<ContributionReport, CeremonyError> {
-    let _ = msm;
     let mut rng = transcript::rng_from_beacon_params(beacon_hash, num_iterations_exp);
     let params = ContributionParams {
         name: name.map(str::to_owned),
@@ -233,6 +232,7 @@ pub fn beacon(
         ContributionKind::Beacon,
         params,
         &mut rng,
+        key,
     )
 }
 
@@ -245,6 +245,7 @@ fn apply(
     kind: ContributionKind,
     params: ContributionParams,
     rng: &mut CeremonyRng,
+    key: &dyn KeyScale,
 ) -> Result<ContributionReport, CeremonyError> {
     let file = BinFile::open(zkey_in, ZKEY_MAGIC, ZKEY_MAX_VERSION)?;
     check_protocol(&file)?;
@@ -289,7 +290,7 @@ fn apply(
         w.write_section_verbatim(id, file.unique_section(id)?)?;
     }
     for id in [S_C, S_H] {
-        apply_key_to_section(&mut w, file.unique_section(id)?, id, inv_delta)?;
+        apply_key_to_section(&mut w, file.unique_section(id)?, id, inv_delta, key)?;
     }
     w.start_section(S_MPC_PARAMS)?;
     mpc.write(&mut w)?;
@@ -320,11 +321,16 @@ fn check_protocol(file: &BinFile) -> Result<(), CeremonyError> {
 /// the whole array, so the `Fr.exp(inc, n)` at the end of its loop is a no-op and there is
 /// no geometric sequence to carry across chunks. Reading it as a running power is the
 /// mistake that produces a file whose first point is right and whose second is not.
+///
+/// It goes through the same [`KeyScale`] seam phase 1 uses, with `inc = 1`, because it is
+/// the same loop: 97% of this command is here, and a backend that has the geometric case
+/// has this one for free.
 fn apply_key_to_section(
     w: &mut BinFileWriter,
     body: &[u8],
     id: u32,
     k: Fr,
+    key: &dyn KeyScale,
 ) -> Result<(), CeremonyError> {
     if !body.len().is_multiple_of(SG1) {
         return Err(CeremonyError::malformed(
@@ -335,20 +341,10 @@ fn apply_key_to_section(
     w.start_section(id)?;
     for chunk in body.chunks(CHUNK_POINTS * SG1) {
         let mut points: Vec<G1Affine> = chunk.par_chunks_exact(SG1).map(binfile::g1).collect();
-        scale_g1(&mut points, k);
+        key.apply_key_g1(&mut points, k, Fr::ONE)?;
         w.write_g1_slice(&points)?;
     }
     w.end_section()
-}
-
-/// `points[i] *= k`, the one primitive a GPU backend would replace.
-///
-/// The batch normalisation is not an optimisation detail: `into_affine()` per point is one
-/// modular inversion each, and at the 1.7M points of a 2^20 circuit that is the whole
-/// running time. `normalize_batch` pays one inversion for the lot.
-fn scale_g1(points: &mut [G1Affine], k: Fr) {
-    let projective: Vec<G1Projective> = points.par_iter().map(|p| *p * k).collect();
-    points.copy_from_slice(&G1Projective::normalize_batch(&projective));
 }
 
 /// What `zkey verify` checked, in the order it checked it.

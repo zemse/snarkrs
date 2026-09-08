@@ -19,7 +19,7 @@ use std::process::Command;
 
 use g16_ceremony::contribute::{self, MpcParams};
 use g16_ceremony::vkey;
-use g16_ceremony::Groth16Header;
+use g16_ceremony::{CpuKeyScale, Groth16Header};
 use g16_msm::CpuMsm;
 
 fn artifacts() -> Vec<(String, PathBuf)> {
@@ -168,7 +168,6 @@ fn beacon_output_is_byte_identical_to_snarkjs() {
     let inputs = small_inputs();
     assert!(!inputs.is_empty(), "no artifacts to beacon");
     let dir = tmp_dir("beacon");
-    let msm = CpuMsm::new();
 
     // Named and unnamed are different params blobs, and the name is the only field whose
     // length is not fixed, so both go through.
@@ -192,8 +191,15 @@ fn beacon_output_is_byte_identical_to_snarkjs() {
             }
             expect_snarkjs(&bin, &args);
 
-            let report =
-                contribute::beacon(input, &ours, label, &beacon_bytes(), BEACON_EXP, &msm).unwrap();
+            let report = contribute::beacon(
+                input,
+                &ours,
+                label,
+                &beacon_bytes(),
+                BEACON_EXP,
+                &CpuKeyScale,
+            )
+            .unwrap();
             assert_same_bytes(&format!("{name} ({tag})"), &ours, &theirs);
 
             if name == "tiny_mul-init" && label.is_none() {
@@ -225,14 +231,19 @@ fn a_contribution_is_pinned_by_the_beacon_that_follows_it() {
     let inputs = small_inputs();
     assert!(!inputs.is_empty(), "no artifacts to contribute to");
     let dir = tmp_dir("contribute");
-    let msm = CpuMsm::new();
 
     for (name, input) in &inputs {
         for source in ["ours", "snarkjs"] {
             let c1 = dir.join(format!("{name}-{source}-c1.zkey"));
             if source == "ours" {
-                contribute::contribute(input, &c1, Some("alice"), "phase2 test entropy", &msm)
-                    .unwrap();
+                contribute::contribute(
+                    input,
+                    &c1,
+                    Some("alice"),
+                    "phase2 test entropy",
+                    &CpuKeyScale,
+                )
+                .unwrap();
             } else {
                 expect_snarkjs(
                     &bin,
@@ -261,8 +272,15 @@ fn a_contribution_is_pinned_by_the_beacon_that_follows_it() {
                     "-n=final",
                 ],
             );
-            contribute::beacon(&c1, &ours, Some("final"), &beacon_bytes(), BEACON_EXP, &msm)
-                .unwrap();
+            contribute::beacon(
+                &c1,
+                &ours,
+                Some("final"),
+                &beacon_bytes(),
+                BEACON_EXP,
+                &CpuKeyScale,
+            )
+            .unwrap();
             assert_same_bytes(
                 &format!("{name} after a {source} contribution"),
                 &ours,
@@ -349,8 +367,14 @@ fn both_verifiers_accept_every_chain_and_reject_a_tampered_one() {
     ] {
         let c1 = dir.join(format!("{chain}-c1.zkey"));
         if by_us[0] {
-            contribute::contribute(&init, &c1, Some("alice"), "phase2 verify entropy", &msm)
-                .unwrap();
+            contribute::contribute(
+                &init,
+                &c1,
+                Some("alice"),
+                "phase2 verify entropy",
+                &CpuKeyScale,
+            )
+            .unwrap();
         } else {
             expect_snarkjs(
                 &bin,
@@ -367,7 +391,15 @@ fn both_verifiers_accept_every_chain_and_reject_a_tampered_one() {
 
         let c2 = dir.join(format!("{chain}-c2.zkey"));
         if by_us[1] {
-            contribute::beacon(&c1, &c2, Some("final"), &beacon_bytes(), BEACON_EXP, &msm).unwrap();
+            contribute::beacon(
+                &c1,
+                &c2,
+                Some("final"),
+                &beacon_bytes(),
+                BEACON_EXP,
+                &CpuKeyScale,
+            )
+            .unwrap();
         } else {
             expect_snarkjs(
                 &bin,

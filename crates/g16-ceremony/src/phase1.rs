@@ -37,7 +37,7 @@ use std::path::Path;
 use ark_ec::short_weierstrass::Affine;
 use blake2::{Blake2b512, Digest as _};
 use g16_field::{g1, g2, AffineRepr, CurveGroup, Domain, Field, Fr, G1Affine, G2Affine, Zero};
-use g16_msm::{CpuMsm, MsmBackend};
+use g16_msm::{AccelError, CpuMsm, KeyScale, MsmBackend};
 use g16_ntt::{CpuNtt, Direction, NttBackend};
 use g16_zkey::binfile;
 use rayon::prelude::*;
@@ -68,15 +68,6 @@ pub const BEACON_HASH_MAX_BYTES: usize = 255;
 /// two-adicity of `Fr`, so a larger accumulator could never be prepared for phase 2.
 pub const POWER_MIN: u32 = 1;
 pub const POWER_MAX: u32 = 28;
-
-/// Points per rayon task inside one applied-key chunk.
-///
-/// The scalar sequence `first * inc^i` is a serial recurrence, so each task recovers its
-/// own head with a single `inc^(k*SUBCHUNK)` exponentiation and then carries the product
-/// forward locally. Per-point exponentiation would also parallelise but costs a 254-bit
-/// `Fr` power per point next to one point multiplication, which is a few percent of the
-/// work for nothing.
-const KEY_SUBCHUNK: usize = 1024;
 
 /// Points hashed into the response per `update`, `floor((1<<20)/sG)`: 16384 G1 or 8192
 /// G2 (`powersoftau_contribute.js:137`, `powersoftau_beacon.js:143`).
@@ -113,6 +104,13 @@ trait PtauGroup: AffineRepr<ScalarField = Fr> + Send + Sync {
     /// The one call `verify` makes that the group cannot express generically: the backend
     /// trait has a separate entry point per group.
     fn msm(backend: &dyn MsmBackend, bases: &[Self], scalars: &[Fr]) -> Self::Group;
+    /// [`Self::msm`] for the contribution's own primitive.
+    fn apply_key(
+        scale: &dyn KeyScale,
+        points: &mut [Self],
+        first: Fr,
+        inc: Fr,
+    ) -> Result<(), AccelError>;
     fn read_points(
         file: &Ptau,
         id: u32,
@@ -146,6 +144,15 @@ impl PtauGroup for Affine<g1::Config> {
 
     fn msm(backend: &dyn MsmBackend, bases: &[Self], scalars: &[Fr]) -> Self::Group {
         backend.msm_g1(bases, scalars)
+    }
+
+    fn apply_key(
+        scale: &dyn KeyScale,
+        points: &mut [Self],
+        first: Fr,
+        inc: Fr,
+    ) -> Result<(), AccelError> {
+        scale.apply_key_g1(points, first, inc)
     }
 
     fn read_points(
@@ -182,6 +189,15 @@ impl PtauGroup for Affine<g2::Config> {
         backend.msm_g2(bases, scalars)
     }
 
+    fn apply_key(
+        scale: &dyn KeyScale,
+        points: &mut [Self],
+        first: Fr,
+        inc: Fr,
+    ) -> Result<(), AccelError> {
+        scale.apply_key_g2(points, first, inc)
+    }
+
     fn read_points(
         file: &Ptau,
         id: u32,
@@ -190,39 +206,6 @@ impl PtauGroup for Affine<g2::Config> {
     ) -> Result<Vec<Self>, CeremonyError> {
         file.g2_points(id, offset, n)
     }
-}
-
-/// `batchApplyKey` (`build_curve_jacobian_a0.js:1289-1310`): replace `P_i` by
-/// `P_i * (first * inc^i)` in place, over one chunk.
-///
-/// This is the whole arithmetic cost of a phase-1 contribution and the one loop a GPU
-/// kernel would replace. It takes a plain `&mut [C]` and no context, so a backend swap is
-/// a change of this function's body and nothing at the call sites.
-///
-/// The multiplier is the scalar's mathematical value, not its Montgomery residue:
-/// `g1m_timesFr` de-Montgomeries before multiplying (`build_bn128.js:54-72`), which is
-/// what arkworks' `Mul<Fr>` does too.
-fn apply_key<C>(points: &mut [C], first: Fr, inc: Fr)
-where
-    C: AffineRepr<ScalarField = Fr> + Send + Sync,
-{
-    points
-        .par_chunks_mut(KEY_SUBCHUNK)
-        .enumerate()
-        .for_each(|(k, chunk)| {
-            let mut t = first * inc.pow([(k * KEY_SUBCHUNK) as u64]);
-            let scaled: Vec<C::Group> = chunk
-                .iter()
-                .map(|p| {
-                    let q = *p * t;
-                    t *= inc;
-                    q
-                })
-                .collect();
-            // One inversion per task instead of one per point, which is what makes the
-            // affine output cheaper than the multiplications that produced it.
-            chunk.copy_from_slice(&C::Group::normalize_batch(&scaled));
-        });
 }
 
 /// `calculateFirstChallengeHash` (`powersoftau_utils.js:312-358`), the challenge a file
@@ -379,6 +362,7 @@ fn process_section<C: PtauGroup>(
     w: &mut BinFileWriter,
     plan: &SectionPlan,
     response: &mut Transcript,
+    scale: &dyn KeyScale,
 ) -> Result<C, CeremonyError> {
     let chunk = response_chunk(C::SG).min(plan.n_points.max(1));
     let mut lem = vec![0u8; chunk * C::SG];
@@ -392,7 +376,7 @@ fn process_section<C: PtauGroup>(
         let n = (plan.n_points - done).min(chunk);
         let raw = ptau.section_elements(plan.id, C::SG, done, n)?;
         let mut points: Vec<C> = raw.par_chunks_exact(C::SG).map(C::from_lem).collect();
-        apply_key(&mut points, t, plan.inc);
+        C::apply_key(scale, &mut points, t, plan.inc)?;
 
         let lem_out = &mut lem[..n * C::SG];
         let comp_out = &mut comp[..n * C::SCG];
@@ -462,6 +446,7 @@ fn apply_contribution(
     kind: ContributionKind,
     params: ContributionParams,
     make_key: impl FnOnce(&Digest) -> PtauKey,
+    scale: &dyn KeyScale,
 ) -> Result<Phase1Report, CeremonyError> {
     let ptau = Ptau::open(ptau_in)?;
     let header = *ptau.header();
@@ -562,11 +547,11 @@ fn apply_contribution(
             };
     }
 
-    let tau_g1 = process_section::<G1Affine>(&ptau, &mut w, &plans[0], &mut response)?;
-    let tau_g2 = process_section::<G2Affine>(&ptau, &mut w, &plans[1], &mut response)?;
-    let alpha_g1 = process_section::<G1Affine>(&ptau, &mut w, &plans[2], &mut response)?;
-    let beta_g1 = process_section::<G1Affine>(&ptau, &mut w, &plans[3], &mut response)?;
-    let beta_g2 = process_section::<G2Affine>(&ptau, &mut w, &plans[4], &mut response)?;
+    let tau_g1 = process_section::<G1Affine>(&ptau, &mut w, &plans[0], &mut response, scale)?;
+    let tau_g2 = process_section::<G2Affine>(&ptau, &mut w, &plans[1], &mut response, scale)?;
+    let alpha_g1 = process_section::<G1Affine>(&ptau, &mut w, &plans[2], &mut response, scale)?;
+    let beta_g1 = process_section::<G1Affine>(&ptau, &mut w, &plans[3], &mut response, scale)?;
+    let beta_g2 = process_section::<G2Affine>(&ptau, &mut w, &plans[4], &mut response, scale)?;
 
     // Snapshot before the pubkey, which is the only reason `partialHash` is stored
     // (`powersoftau_contribute.js:86`).
@@ -627,12 +612,13 @@ pub fn contribute(
     ptau_out: &Path,
     name: Option<&str>,
     entropy: &str,
+    key: &dyn KeyScale,
 ) -> Result<Phase1Report, CeremonyError> {
     let params = ContributionParams {
         name: name.map(str::to_owned),
         ..Default::default()
     };
-    contribute_with(ptau_in, ptau_out, params, rng_from_entropy(entropy))
+    contribute_with(ptau_in, ptau_out, params, rng_from_entropy(entropy), key)
 }
 
 /// [`contribute`] with the RNG supplied, so a run can be held against snarkjs' bytes.
@@ -643,6 +629,7 @@ pub fn contribute_with(
     ptau_out: &Path,
     params: ContributionParams,
     mut rng: CeremonyRng,
+    key: &dyn KeyScale,
 ) -> Result<Phase1Report, CeremonyError> {
     apply_contribution(
         ptau_in,
@@ -650,6 +637,7 @@ pub fn contribute_with(
         ContributionKind::Contribute,
         params,
         |challenge| crate::transcript::create_ptau_key(&mut rng, challenge),
+        key,
     )
 }
 
@@ -661,6 +649,7 @@ pub fn beacon(
     name: Option<&str>,
     beacon_hash: &[u8],
     num_iterations_exp: u8,
+    key: &dyn KeyScale,
 ) -> Result<Phase1Report, CeremonyError> {
     check_beacon(beacon_hash, num_iterations_exp)?;
     let params = ContributionParams {
@@ -675,6 +664,7 @@ pub fn beacon(
         ContributionKind::Beacon,
         params,
         |challenge| crate::transcript::create_ptau_key(&mut rng, challenge),
+        key,
     )
 }
 

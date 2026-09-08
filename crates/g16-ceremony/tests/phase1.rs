@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 use g16_ceremony::phase1;
 use g16_ceremony::ptau::Ptau;
 use g16_ceremony::transcript::{blake2b512, rng_from_entropy_with, Digest};
-use g16_ceremony::{CeremonyError, ContributionKind, ContributionParams};
+use g16_ceremony::{CeremonyError, ContributionKind, ContributionParams, CpuKeyScale};
 use g16_field::AffineRepr;
 use sha2::{Digest as _, Sha256};
 
@@ -225,8 +225,15 @@ fn beacon_on_a_fresh_file_reproduces_snarkjs() {
         let fresh = dir.join(format!("new_{power}.ptau"));
         let out = dir.join(format!("beacon_{power}.ptau"));
         phase1::ptau_new(power, &fresh).unwrap();
-        let report =
-            phase1::beacon(&fresh, &out, Some("final beacon"), &beacon_bytes(), 12).unwrap();
+        let report = phase1::beacon(
+            &fresh,
+            &out,
+            Some("final beacon"),
+            &beacon_bytes(),
+            12,
+            &CpuKeyScale,
+        )
+        .unwrap();
         assert_eq!(report.index, 1);
         assert_eq!(report.kind, ContributionKind::Beacon);
         assert_matches(&format!("beacon power {power}"), &report, &out, &oracle);
@@ -275,6 +282,7 @@ fn contribute_with_pinned_entropy_reproduces_snarkjs() {
             &out,
             params,
             rng_from_entropy_with(&os_bytes(), "some fixed entropy"),
+            &CpuKeyScale,
         )
         .unwrap();
         assert_eq!(report.index, 1);
@@ -309,12 +317,13 @@ fn a_contribution_then_a_beacon_reproduces_snarkjs() {
         &first,
         params,
         rng_from_entropy_with(&os_bytes(), "some fixed entropy"),
+        &CpuKeyScale,
     )
     .unwrap();
 
     // snarkjs was called with `null` for the name here, so the beacon record's params are
     // just the two beacon fields and there is no type-1 entry.
-    let report = phase1::beacon(&first, &second, None, &beacon_bytes(), 10).unwrap();
+    let report = phase1::beacon(&first, &second, None, &beacon_bytes(), 10, &CpuKeyScale).unwrap();
     assert_eq!(report.index, 2);
     assert_matches(
         "chained beacon",
@@ -360,7 +369,7 @@ fn the_record_holds_the_points_the_verifier_looks_for() {
     let fresh = dir.join("new_8.ptau");
     let out = dir.join("beacon_8.ptau");
     phase1::ptau_new(8, &fresh).unwrap();
-    phase1::beacon(&fresh, &out, None, &beacon_bytes(), 10).unwrap();
+    phase1::beacon(&fresh, &out, None, &beacon_bytes(), 10, &CpuKeyScale).unwrap();
 
     let ptau = Ptau::open(&out).unwrap();
     let c = &ptau.contributions().unwrap()[0];
@@ -401,6 +410,7 @@ fn the_same_entropy_twice_reuses_the_key_but_still_moves_the_accumulator() {
         &one,
         ContributionParams::default(),
         rng_from_entropy_with(&os_bytes(), "same"),
+        &CpuKeyScale,
     )
     .unwrap();
     let b = phase1::contribute_with(
@@ -408,6 +418,7 @@ fn the_same_entropy_twice_reuses_the_key_but_still_moves_the_accumulator() {
         &two,
         ContributionParams::default(),
         rng_from_entropy_with(&os_bytes(), "same"),
+        &CpuKeyScale,
     )
     .unwrap();
     assert_ne!(a.response_hash, b.response_hash);
@@ -454,6 +465,7 @@ fn multi_chunk_sections_reproduce_snarkjs() {
         &first,
         params,
         rng_from_entropy_with(&os_bytes(), "some fixed entropy"),
+        &CpuKeyScale,
     )
     .unwrap();
     assert_matches(
@@ -467,7 +479,7 @@ fn multi_chunk_sections_reproduce_snarkjs() {
         },
     );
 
-    let report = phase1::beacon(&first, &second, None, &beacon_bytes(), 10).unwrap();
+    let report = phase1::beacon(&first, &second, None, &beacon_bytes(), 10, &CpuKeyScale).unwrap();
     assert_matches(
         "power 14 beacon",
         &report,
@@ -500,9 +512,10 @@ fn a_chain(dir: &Path) -> PathBuf {
             ..Default::default()
         },
         rng_from_entropy_with(&os_bytes(), "some fixed entropy"),
+        &CpuKeyScale,
     )
     .unwrap();
-    phase1::beacon(&first, &second, None, &beacon_bytes(), 10).unwrap();
+    phase1::beacon(&first, &second, None, &beacon_bytes(), 10, &CpuKeyScale).unwrap();
     second
 }
 
@@ -641,7 +654,7 @@ fn a_truncated_ceremony_refuses_both_commands() {
     let dir = tmp_dir("truncated");
     let out = dir.join("nope.ptau");
     assert!(matches!(
-        phase1::beacon(&ppot, &out, None, &beacon_bytes(), 10),
+        phase1::beacon(&ppot, &out, None, &beacon_bytes(), 10, &CpuKeyScale),
         Err(CeremonyError::TruncatedCeremony {
             power: 15,
             ceremony_power: 28
@@ -652,7 +665,8 @@ fn a_truncated_ceremony_refuses_both_commands() {
             &ppot,
             &out,
             ContributionParams::default(),
-            rng_from_entropy_with(&os_bytes(), "x")
+            rng_from_entropy_with(&os_bytes(), "x"),
+            &CpuKeyScale,
         ),
         Err(CeremonyError::TruncatedCeremony { .. })
     ));
@@ -706,7 +720,7 @@ fn the_beacon_entry_point_rechecks_its_own_bounds() {
     ] {
         assert!(
             matches!(
-                phase1::beacon(&fresh, &out, None, &hash, exp),
+                phase1::beacon(&fresh, &out, None, &hash, exp, &CpuKeyScale),
                 Err(CeremonyError::BadParams(_))
             ),
             "{} bytes / exponent {exp} should be refused",
@@ -739,6 +753,7 @@ fn a_long_name_is_truncated_the_way_snarkjs_truncates_it() {
         &out,
         params,
         rng_from_entropy_with(&os_bytes(), "x"),
+        &CpuKeyScale,
     )
     .unwrap();
     let ptau = Ptau::open(&out).unwrap();
