@@ -15,14 +15,33 @@
 //
 // WHAT THIS FILE DECIDES, AND WHY
 //
-// 1. ONE THREAD PER BUTTERFLY, IN PLACE, DISPATCHED ONCE PER PASS.
+// 1. ONE THREAD PER BUTTERFLY, ONE PASS PER COMMAND BUFFER, AND OUT OF PLACE.
 //    `ifft` (prepare.rs:320) is `bits` strictly sequential passes over one vector, and a
-//    pass is `n/2` independent butterflies on disjoint index pairs. So each pass is one
-//    `dispatch_threads` of `n/2` threads over the same buffer, and the passes go into one
-//    serial compute encoder where consecutive dispatches are ordered with an implicit
-//    barrier. `fft.rs` submits all `bits + 1` of them in a single command buffer: the
-//    vector never leaves the device between passes, and a power-20 run pays 85
-//    commit-and-waits in total rather than 946.
+//    pass is `n/2` independent butterflies on disjoint index pairs. In place, one thread
+//    per butterfly is correct and one command buffer could hold every pass of a block:
+//    consecutive dispatches on a serial compute encoder are ordered with an implicit
+//    barrier, which is the whole of the dependency the transform needs.
+//
+//    macOS does not allow that, and not for a reason a smaller command buffer fixes. A
+//    submission that keeps the GPU busy while the GPU is also driving a display comes back
+//    as `kIOGPUCommandBufferCallbackErrorImpactingInteractivity`, and it is not a duration
+//    limit: measured on this M2 Max, the same 2^19-point G2 block was killed 6.8 s into a
+//    run whose command buffers were 210 ms each, and completed in 16.6 s with exactly those
+//    command buffers once the machine was quiet. Shrinking them to 13 ms did not save a
+//    power-20 run either. The trigger is contention for the display, so the only reliable
+//    answer is to make the kill survivable rather than to try to stay under it.
+//
+//    That is what decides the shape here. A pass reads one buffer and writes another, so a
+//    killed command buffer has damaged only the destination and the pass can be run again
+//    unchanged; `fft.rs` ping-pongs the two buffers and retries. In place, a kill leaves
+//    the vector half-transformed with no way to tell which half. One pass per command
+//    buffer follows from the same requirement: a buffer holding two passes has already
+//    overwritten the first one's input by the time the second runs. The price is the
+//    0.149 ms round trip, 946 of them in a power-20 run, 0.141 s, 0.015% of it.
+//
+//    A pass larger than the ladder budget is split further by `gid_off`. That is a
+//    throughput and blast-radius knob, not a correctness one: the pieces stay idempotent
+//    because the source buffer is read-only for the whole pass.
 //
 // 2. THE TWIDDLE COMES OUT OF A TABLE, NOT A RECURRENCE.
 //    snarkjs walks `W` forward one `Fr` multiply at a time (`build_fft.js:657-748`), which
@@ -63,24 +82,28 @@ struct FftParams {
     uint span;     // butterflies per group in this pass, 1 << (exp - 1)
     uint log_span; // exp - 1
     uint tw_shift; // bits - exp, the stride into the twiddle table
+    uint gid_off;  // index of the first butterfly this dispatch owns
 };
 
 // ---------------------------------------------------------------------------
 // One `fftMix` pass
 // ---------------------------------------------------------------------------
 
-// `lo, hi <- lo + [w^j] hi, lo - [w^j] hi` for the butterfly `gid` owns.
+// `out[lo], out[hi] <- in[lo] + [w^j] in[hi], in[lo] - [w^j] in[hi]` for one butterfly.
 //
-// `gid` splits into the group `gid >> log_span` and the position `j` inside it, which is
-// the mapping that makes the pairs disjoint: group `g` occupies `[g << exp, (g+1) << exp)`
-// and pairs its lower half with its upper half elementwise. `u` is read before either
-// store, so the in-place write of `lo` cannot be seen by this thread's read of it, and no
-// other thread touches either index.
+// `gid`, this thread's index plus the dispatch's `gid_off`, splits into the group
+// `gid >> log_span` and the position `j` inside it, which is the mapping that makes the
+// pairs disjoint: group `g` occupies `[g << exp, (g+1) << exp)` and pairs its lower half
+// with its upper half elementwise. Every index of `out` is written by exactly one thread
+// and `in` is never written, so any sub-range of a pass can be dispatched again after a
+// failure and produce the same answer.
 template <typename F, uint C>
-inline void fft_mix_impl(device Xyzz<F>* a,
+inline void fft_mix_impl(device const Xyzz<F>* in,
+                         device Xyzz<F>* out,
                          device const uint* tw,
                          constant FftParams& p,
-                         uint gid) {
+                         uint tid) {
+    uint gid = tid + p.gid_off;
     if (gid >= (p.n >> 1u)) {
         return;
     }
@@ -88,8 +111,8 @@ inline void fft_mix_impl(device Xyzz<F>* a,
     uint lo = ((gid >> p.log_span) << (p.log_span + 1u)) + j;
     uint hi = lo + p.span;
 
-    Xyzz<F> u = a[lo];
-    Xyzz<F> t = a[hi];
+    Xyzz<F> u = in[lo];
+    Xyzz<F> t = in[hi];
     if (j != 0u) {
         uint k[8];
         uint base = (j << p.tw_shift) * 8u;
@@ -98,28 +121,31 @@ inline void fft_mix_impl(device Xyzz<F>* a,
         }
         t = pt_mul<F, C>(t, k);
     }
-    a[lo] = pt_add(u, t);
-    a[hi] = pt_add(u, pt_neg(t));
+    out[lo] = pt_add(u, t);
+    out[hi] = pt_add(u, pt_neg(t));
 }
 
 // ---------------------------------------------------------------------------
 // The `1/n` pass
 // ---------------------------------------------------------------------------
 
-// `a[i] <- [1/n] a[i]`, the `fftFinal` scaling. One scalar for the whole dispatch, so it
-// arrives as a single standard-form `Scalar` in a buffer rather than through the params
+// `out[i] <- [1/n] in[i]`, the `fftFinal` scaling. One scalar for the whole dispatch, so
+// it arrives as a single standard-form `Scalar` in a buffer rather than through the params
 // struct, which holds only `uint`s.
 //
 // This is 12.8% of the command on the CPU and it is the same 12.8% here: a full-width
 // ladder per point either way. It is not fused into the first pass, whose twiddles are all
 // one, because scaling both butterfly inputs is `n` ladders and a separate pass is also
 // `n` ladders, and the transform is 400x compute bound, so the pass over the vector it
-// would save is not worth a second kernel that can be wrong.
+// would save is not worth a second kernel that can be wrong. It ping-pongs like a mix
+// pass, for the same retry reason.
 template <typename F, uint C>
-inline void fft_scale_impl(device Xyzz<F>* a,
+inline void fft_scale_impl(device const Xyzz<F>* in,
+                           device Xyzz<F>* out,
                            device const uint* k,
                            constant FftParams& p,
-                           uint gid) {
+                           uint tid) {
+    uint gid = tid + p.gid_off;
     if (gid >= p.n) {
         return;
     }
@@ -127,7 +153,7 @@ inline void fft_scale_impl(device Xyzz<F>* a,
     for (uint i = 0; i < 8u; i++) {
         s[i] = k[i];
     }
-    a[gid] = pt_mul<F, C>(a[gid], s);
+    out[gid] = pt_mul<F, C>(in[gid], s);
 }
 
 // ---------------------------------------------------------------------------
@@ -138,18 +164,20 @@ inline void fft_scale_impl(device Xyzz<F>* a,
 // names from the same width list `ceremony.rs` uses.
 // ---------------------------------------------------------------------------
 
-#define FFT_KERNELS(SUF, FT, PTT, C)                                                      \
-    kernel void fft_mix_##SUF(device PTT* a [[buffer(0)]],                                \
-                              device const uint* tw [[buffer(1)]],                        \
-                              constant FftParams& p [[buffer(2)]],                        \
-                              uint gid [[thread_position_in_grid]]) {                     \
-        fft_mix_impl<FT, C>(a, tw, p, gid);                                               \
-    }                                                                                     \
-    kernel void fft_scale_##SUF(device PTT* a [[buffer(0)]],                              \
-                                device const uint* k [[buffer(1)]],                       \
-                                constant FftParams& p [[buffer(2)]],                      \
-                                uint gid [[thread_position_in_grid]]) {                   \
-        fft_scale_impl<FT, C>(a, k, p, gid);                                              \
+#define FFT_KERNELS(SUF, FT, PTT, C)                                     \
+    kernel void fft_mix_##SUF(device const PTT* in [[buffer(0)]],        \
+                              device PTT* out [[buffer(1)]],             \
+                              device const uint* tw [[buffer(2)]],       \
+                              constant FftParams& p [[buffer(3)]],       \
+                              uint tid [[thread_position_in_grid]]) {    \
+        fft_mix_impl<FT, C>(in, out, tw, p, tid);                        \
+    }                                                                    \
+    kernel void fft_scale_##SUF(device const PTT* in [[buffer(0)]],      \
+                                device PTT* out [[buffer(1)]],           \
+                                device const uint* k [[buffer(2)]],      \
+                                constant FftParams& p [[buffer(3)]],     \
+                                uint tid [[thread_position_in_grid]]) {  \
+        fft_scale_impl<FT, C>(in, out, k, p, tid);                       \
     }
 
 FFT_KERNELS(g1_c2, Fq, PtG1, 2u)

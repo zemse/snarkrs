@@ -144,6 +144,13 @@ impl MetalGroupFft {
         self.fft = self.fft.with_min_block(n);
         self
     }
+
+    /// [`FftKernels::with_budget`], so a test can make a cheap file cross a
+    /// command-buffer boundary that only a power-20 block would reach otherwise.
+    pub fn with_budget(mut self, ladders: usize) -> Self {
+        self.fft = self.fft.with_budget(ladders);
+        self
+    }
 }
 
 impl GroupFft for MetalGroupFft {

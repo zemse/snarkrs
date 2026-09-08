@@ -5,11 +5,11 @@
 //! submission, the twiddle table, and the two permutations that a kernel deliberately does
 //! not do.
 //!
-//! The CPU twin is `g16_ceremony::prepare::ifft` (prepare.rs:320) and the measurement that
-//! decided every constant below is in
-//! `bench/results/` alongside the prepare profile: 99.2% of `ptau prepare` is inside
-//! `point_times_fr` (prepare.rs:149), so there is one primitive to move and nothing else
-//! in the command worth touching.
+//! The CPU twin is `g16_ceremony::prepare::ifft` (prepare.rs:320), and the reason only that
+//! one function is ported is that a profile of the command put 99.2% of it inside
+//! `point_times_fr` (prepare.rs:149). `batch_to_affine` is 0.07% and the file I/O is
+//! 0.05%, so both stay on the host permanently; moving `batch_to_affine` would buy 0.07%
+//! and force a device field inversion into the design for it.
 //!
 //! The result agrees with the CPU as a curve point, not limb for limb, because the ladder
 //! here is a fixed signed window and the ladder there is wNAF, and XYZZ is projective. The
@@ -32,15 +32,32 @@ use crate::kernels::{CEREMONY_MSL, FFT_MSL, FR_MSL, MSM_MSL};
 use crate::layout::{as_bytes, Packed, PackedFq, PackedFq2, PackedScalar};
 use crate::msm::{PackedXyzzG1, PackedXyzzG2};
 
-/// Ladder window for both groups, the same widths and the same measurement as
-/// `ceremony::WINDOW_G1`: a sweep of 2^16 full-width scalars put c=4 fastest on G1 and on
-/// G2, and the register-pressure argument that predicted G2 would want a narrower window
-/// was wrong. `tests::window_sweep` in `ceremony.rs` is the measurement; `fft_window_sweep`
-/// below re-runs it through a whole transform in case the FFT's memory traffic moves it,
-/// and it does not.
-const FFT_WINDOW_G1: u32 = 4;
-/// See [`FFT_WINDOW_G1`].
-const FFT_WINDOW_G2: u32 = 4;
+/// Ladder window for G1, and one wider than the ceremony ladders take.
+///
+/// `ceremony::WINDOW_G1` is 4 because a sweep of isolated 2^16-point multiplications put
+/// c=4 and c=3 in a dead tie on G1 and c=4 ahead on G2. Re-swept here through a whole
+/// `ptau prepare` on `ppot_0080_16.ptau`, medians of three or more on this M2 Max, both
+/// groups moved together at c=5:
+///
+/// | c | wall s |
+/// |---|---:|
+/// | 2 | 12.83 |
+/// | 3 | 10.76 |
+/// | 4 | 10.12 |
+/// | 5 | **9.86** |
+///
+/// and crossing the two widths separately shows it is both of them, not one carrying the
+/// other: (g1, g2) of (4,4) is 10.11, (4,5) 10.00, (5,4) 10.02, (5,5) 9.86.
+///
+/// It is 2.6%, which is small, but it is reproducible to 0.02 s and it goes the opposite
+/// way to the isolated sweep, so it is worth having the two numbers differ rather than
+/// sharing one. The likely reason is that the ladders here run with far more of them
+/// resident at once, so the wider table's extra spill traffic overlaps with work in a way
+/// a benchmark of one dispatch does not show. c=6 is not compiled: `CER_WINDOWS` stops at
+/// 5, the gain is flattening, and 16 entries of 256 bytes is 4 KB a thread on G2.
+const FFT_WINDOW_G1: u32 = 5;
+/// See [`FFT_WINDOW_G1`]; G2 wants the same width and gains the same 1%.
+const FFT_WINDOW_G2: u32 = 5;
 
 /// Blocks shorter than this go back to the CPU.
 ///
@@ -62,8 +79,15 @@ const MIN_BLOCK: usize = 1 << 12;
 /// chain per thread, so occupancy comes from the grid, not the group.
 const THREADGROUP: usize = 64;
 
+/// Attempts at one command buffer before giving up. See
+/// [`FftKernels::dispatch_with_retry`]: a macOS interactivity kill is a scheduling event,
+/// not an arithmetic one, and a power-20 `ptau prepare` is seventeen minutes of work to
+/// throw away over one.
+const RETRIES: u32 = 4;
+
 /// Mirrors `struct FftParams` in `shaders/fft.metal`. Passed by `setBytes`, which copies
-/// at encode time, so one encoder can carry a different pass in every dispatch.
+/// at encode time, so a re-submitted command buffer carries its own values rather than
+/// whatever the next piece of the pass overwrote them with.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 struct FftParams {
@@ -71,12 +95,23 @@ struct FftParams {
     span: u32,
     log_span: u32,
     tw_shift: u32,
+    gid_off: u32,
 }
 
 const _: () = {
-    assert!(core::mem::size_of::<FftParams>() == 16);
+    assert!(core::mem::size_of::<FftParams>() == 20);
     assert!(core::mem::align_of::<FftParams>() == 4);
 };
+
+/// One pass: what [`FftKernels::run_pass`] encodes into one command buffer, split across
+/// several if it is bigger than the budget. `third` is the twiddle table for a mix pass
+/// and the single `1/n` scalar for the scaling pass.
+struct Pass<'a> {
+    pso: &'a ComputePipelineState,
+    third: &'a Buffer,
+    params: FftParams,
+    threads: usize,
+}
 
 /// The pipelines for one group, parallel to [`CER_WINDOWS`].
 struct FftPipelines {
@@ -96,6 +131,10 @@ trait FftGroup {
 
     /// Names this group in an error, in the spelling [`g16_msm::AccelError`] uses.
     const OP: &'static str;
+    /// Ladder invocations one command buffer may hold. See [`FftKernels::run_pass`].
+    const BUDGET: usize;
+    /// Bytes one packed point takes, for the ping-pong scratch allocation.
+    const SCRATCH: usize;
 
     fn pack(p: &Xyzz<Self::Raw>) -> Self::PackedPoint;
     fn unpack(p: &Self::PackedPoint) -> Xyzz<Self::Raw>;
@@ -111,6 +150,10 @@ impl FftGroup for FftG1 {
     type PackedPoint = PackedXyzzG1;
 
     const OP: &'static str = "G1";
+    // 2^19 ladders, from the 30.9 ms `ceremony.rs` measured for 2^16 G1 point
+    // multiplications: about 250 ms of GPU work.
+    const BUDGET: usize = 1 << 19;
+    const SCRATCH: usize = core::mem::size_of::<PackedXyzzG1>();
 
     fn pack(p: &Xyzz<RawFq>) -> PackedXyzzG1 {
         PackedXyzzG1 {
@@ -144,6 +187,10 @@ impl FftGroup for FftG2 {
     type PackedPoint = PackedXyzzG2;
 
     const OP: &'static str = "G2";
+    // 2^17 ladders, from the 104 ms `ceremony.rs` measured for 2^16 G2 point
+    // multiplications: about 210 ms, the same target G1 gets from a wider slice.
+    const BUDGET: usize = 1 << 17;
+    const SCRATCH: usize = core::mem::size_of::<PackedXyzzG2>();
 
     fn pack(p: &Xyzz<RawFq2>) -> PackedXyzzG2 {
         PackedXyzzG2 {
@@ -186,6 +233,7 @@ pub struct FftKernels {
     window_g1: u32,
     window_g2: u32,
     min_block: usize,
+    budget: Option<usize>,
 }
 
 impl FftKernels {
@@ -235,6 +283,7 @@ impl FftKernels {
             window_g1: env_window("G16_METAL_FFT_C_G1", FFT_WINDOW_G1),
             window_g2: env_window("G16_METAL_FFT_C_G2", FFT_WINDOW_G2),
             min_block: env_min_block(),
+            budget: env_usize("G16_METAL_FFT_BUDGET"),
         })
     }
 
@@ -253,6 +302,17 @@ impl FftKernels {
     /// instance changes.
     pub fn with_min_block(mut self, n: usize) -> Self {
         self.min_block = n;
+        self
+    }
+
+    /// Overrides [`FftGroup::BUDGET`], the ladders one command buffer may hold.
+    ///
+    /// The tests set it small. The shipped budget is 2^19 ladders on G1, so a block big
+    /// enough to split a pass across command buffers on its own is a block too big to put
+    /// in a unit test, and the `gid_off` arithmetic would go untested at every size the
+    /// suite can afford to run.
+    pub fn with_budget(mut self, ladders: usize) -> Self {
+        self.budget = Some(ladders.max(1));
         self
     }
 
@@ -302,16 +362,29 @@ impl FftKernels {
         let mix = &pipelines.mix[idx];
         let scale = &pipelines.scale[idx];
 
-        // `bit_reverse` (prepare.rs:256) folded into the upload. The permutation is an
-        // involution, so writing `packed[rev(i)] = a[i]` and reading `packed[rev(i)]` back
-        // are the same map; only this direction is applied, and the inverse rotation below
-        // is the one that is NOT an involution.
-        let mut packed = vec![G::PackedPoint::default(); n];
+        // Ping-pong. `src` holds the input of the pass about to run and is never written
+        // by it, which is the whole reason a killed command buffer can simply be re-run;
+        // `dst` is scratch and its contents after a failure are not looked at.
+        let mut src = self.scratch(n * G::SCRATCH);
+        let mut dst = self.scratch(n * G::SCRATCH);
+
+        // The input goes straight into the buffer rather than into a `Vec` that is then
+        // copied in. Metal buffers here are `StorageModeShared` (msm.rs:460), so the two
+        // are the same memory and the copy would be a second 268 MB of traffic per block
+        // at power 20 for nothing.
+        //
+        // `bit_reverse` (prepare.rs:256) is folded into that write. The permutation is an
+        // involution, so `src[rev(i)] = a[i]` and reading back at `rev(i)` are the same
+        // map; only this direction is applied, and the rotation at the bottom is the one
+        // that is NOT an involution.
+        //
+        // SAFETY: the buffer was just allocated with room for `n` of this type and nothing
+        // has been encoded against it, so no dispatch can be reading it.
+        let slots: &mut [G::PackedPoint] =
+            unsafe { core::slice::from_raw_parts_mut(src.contents().cast(), n) };
         for (i, p) in a.iter().enumerate() {
-            packed[bit_reverse_index(i, bits)] = G::pack(p);
+            slots[bit_reverse_index(i, bits)] = G::pack(p);
         }
-        let work = self.buffer(&packed);
-        drop(packed);
 
         let tw = self.buffer(&twiddle_table(bits));
         let size_inv = Fr::from(n as u64)
@@ -319,42 +392,44 @@ impl FftKernels {
             .expect("a power of two is a unit mod r");
         let inv = self.buffer(&[PackedScalar::from_fr(&size_inv)]);
 
-        // Every pass and the scaling go into ONE serial compute encoder and one command
-        // buffer. Metal orders consecutive dispatches on a serial encoder with an implicit
-        // barrier, which is the dependency the transform needs and the only one it needs,
-        // so the vector never leaves the device between passes. `Plan::encode`
-        // (msm.rs:917) relies on the same property.
-        let cb = self.queue.new_command_buffer();
-        let enc = cb.new_compute_command_encoder();
         for exp in 1..=bits {
-            let p = FftParams {
-                n: n as u32,
-                span: 1 << (exp - 1),
-                log_span: exp - 1,
-                tw_shift: bits - exp,
-            };
-            enc.set_compute_pipeline_state(mix);
-            enc.set_buffer(0, Some(&work), 0);
-            enc.set_buffer(1, Some(&tw), 0);
-            set_params(enc, 2, &p);
-            dispatch_1d(enc, mix, n / 2, THREADGROUP);
+            self.run_pass::<G>(
+                &src,
+                &dst,
+                &Pass {
+                    pso: mix,
+                    third: &tw,
+                    params: FftParams {
+                        n: n as u32,
+                        span: 1 << (exp - 1),
+                        log_span: exp - 1,
+                        tw_shift: bits - exp,
+                        gid_off: 0,
+                    },
+                    threads: n / 2,
+                },
+            )?;
+            core::mem::swap(&mut src, &mut dst);
         }
-        let p = FftParams {
-            n: n as u32,
-            ..Default::default()
-        };
-        enc.set_compute_pipeline_state(scale);
-        enc.set_buffer(0, Some(&work), 0);
-        enc.set_buffer(1, Some(&inv), 0);
-        set_params(enc, 2, &p);
-        dispatch_1d(enc, scale, n, THREADGROUP);
-        enc.end_encoding();
-        cb.commit();
-        crate::cb::wait_ok(cb, "ceremony group inverse fft")?;
+        self.run_pass::<G>(
+            &src,
+            &dst,
+            &Pass {
+                pso: scale,
+                third: &inv,
+                params: FftParams {
+                    n: n as u32,
+                    ..Default::default()
+                },
+                threads: n,
+            },
+        )?;
+        core::mem::swap(&mut src, &mut dst);
 
         // SAFETY: the command buffer completed, `n` points of this type is exactly what
-        // the passes wrote, and `PackedPoint` is `Packed`, so every bit pattern is valid.
-        let got: &[G::PackedPoint] = unsafe { cer_read_back(&work, n) };
+        // the last pass wrote into what is now `src`, and `PackedPoint` is `Packed`, so
+        // every bit pattern is valid.
+        let got: &[G::PackedPoint] = unsafe { cer_read_back(&src, n) };
 
         // The `a[1..].reverse()` that finishes the inverse (prepare.rs:340), folded into
         // the read back: `ifft(a)[0] = X[0]/n` and `ifft(a)[i] = X[n-i]/n`. Splitting this
@@ -365,6 +440,99 @@ impl FftKernels {
             *out = G::unpack(&got[n - i]);
         }
         Ok(())
+    }
+
+    /// Run one pass, `src` to `dst`, and retry it if macOS kills the submission.
+    ///
+    /// The obvious design was one command buffer for the whole block: consecutive
+    /// dispatches on a serial compute encoder are already ordered with an implicit
+    /// barrier, so 85 commit-and-waits in a power-20 run rather than 946 at 0.149 ms each
+    /// was there for the taking. macOS took it back. A submission that keeps the GPU busy
+    /// while the GPU is also driving a display returns
+    /// `kIOGPUCommandBufferCallbackErrorImpactingInteractivity`, and it is NOT a duration
+    /// limit that a smaller buffer stays under. Measured on this M2 Max: the same
+    /// 2^19-point G2 block was killed 6.8 s into a run whose command buffers were 210 ms
+    /// each, and finished in 16.6 s with exactly those command buffers when the machine
+    /// was quiet; a power-20 run died with 13 ms ones. The trigger is contention with
+    /// whatever else wants the GPU, so this survives the kill instead of trying to avoid
+    /// it.
+    ///
+    /// Surviving it is what fixes the pass boundary in place. `src` is read-only for the
+    /// whole pass, so a killed command buffer has damaged only `dst` and re-running it is
+    /// exact. Two passes in one command buffer would not be, because the second has
+    /// already overwritten the first one's input.
+    ///
+    /// [`FftGroup::BUDGET`] splits a pass further, into roughly 200 ms pieces. That is a
+    /// throughput and blast-radius knob rather than a safety one, and it has a floor for a
+    /// measured reason: at 1,024 ladders a command buffer a 2^19-point G2 block takes
+    /// 138 s against 16.6 s, because a dispatch that small does not fill the device.
+    ///
+    /// Every commit goes through `cb::wait_ok` (cb.rs:57). A faulted buffer that went
+    /// unnoticed would leave the previous pass's points in `dst`, which is a wrong point
+    /// in a file that is otherwise perfectly formed.
+    fn run_pass<G: FftGroup>(
+        &self,
+        src: &Buffer,
+        dst: &Buffer,
+        pass: &Pass,
+    ) -> Result<(), ProveError> {
+        let budget = self.budget.unwrap_or(G::BUDGET);
+        let mut done = 0usize;
+        while done < pass.threads {
+            let take = budget.min(pass.threads - done);
+            let p = FftParams {
+                gid_off: done as u32,
+                ..pass.params
+            };
+            self.dispatch_with_retry(src, dst, pass, &p, take)?;
+            done += take;
+        }
+        Ok(())
+    }
+
+    /// One command buffer, re-submitted unchanged if it comes back anything but
+    /// `Completed`.
+    ///
+    /// Retrying blind rather than on the interactivity error specifically: the error text
+    /// is not an API, and a fault that is genuinely the kernel's (an out-of-range index,
+    /// a lost device) fails all four attempts and is reported with the last message. The
+    /// backoff exists because the failure means something else wants the GPU, and coming
+    /// straight back with the same work is how a `ptau prepare` at power 20 loses a
+    /// seventeen-minute run to a window being dragged.
+    fn dispatch_with_retry(
+        &self,
+        src: &Buffer,
+        dst: &Buffer,
+        pass: &Pass,
+        p: &FftParams,
+        threads: usize,
+    ) -> Result<(), ProveError> {
+        let mut err = None;
+        for attempt in 0..RETRIES {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(200 << attempt));
+            }
+            let cb = self.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(pass.pso);
+            enc.set_buffer(0, Some(src), 0);
+            enc.set_buffer(1, Some(dst), 0);
+            enc.set_buffer(2, Some(pass.third), 0);
+            set_params(enc, 3, p);
+            dispatch_1d(enc, pass.pso, threads, THREADGROUP);
+            enc.end_encoding();
+            cb.commit();
+            match crate::cb::wait_ok(cb, "ceremony group inverse fft") {
+                Ok(()) => return Ok(()),
+                Err(e) => err = Some(e),
+            }
+        }
+        Err(err.expect("RETRIES is at least 1"))
+    }
+
+    fn scratch(&self, bytes: usize) -> Buffer {
+        self.device
+            .new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared)
     }
 
     fn buffer<T: Packed>(&self, items: &[T]) -> Buffer {
@@ -422,10 +590,15 @@ fn bit_reverse_index(i: usize, bits: u32) -> usize {
 /// it to 0 so that a block small enough to run in a second still takes the device path;
 /// with the default in force a power-13 file would be compared against itself.
 fn env_min_block() -> usize {
-    std::env::var("G16_METAL_FFT_MIN_BLOCK")
+    env_usize("G16_METAL_FFT_MIN_BLOCK").unwrap_or(MIN_BLOCK)
+}
+
+/// `G16_METAL_FFT_BUDGET` overrides [`FftGroup::BUDGET`] from outside the process, which
+/// is how the command-buffer size was swept against macOS's tolerance from the CLI.
+fn env_usize(var: &str) -> Option<usize> {
+    std::env::var(var)
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(MIN_BLOCK)
 }
 
 /// `setBytes` for the params struct. `FftParams` is `repr(C)` and all-`u32`, so its bytes
@@ -637,6 +810,36 @@ mod tests {
             k.ifft_g2(&mut got_g2).expect("ifft_g2");
             assert!(same_g1(&got_g1, &want_g1), "G1 disagrees at c={c}");
             assert!(same_g2(&got_g2, &want_g2), "G2 disagrees at c={c}");
+        }
+    }
+
+    /// The `gid_off` split, which no block a unit test can afford to run would reach on
+    /// its own: the shipped budget is 2^19 ladders and the largest block here is 2^12
+    /// points, so without [`FftKernels::with_budget`] every pass fits in one command
+    /// buffer and the offset is always zero.
+    ///
+    /// 7 and 100 are deliberately not divisors of anything: they split every pass at a
+    /// different point inside its groups, so a `gid_off` applied to the wrong side of the
+    /// group/position split, or a piece that silently re-runs the butterflies the previous
+    /// one already did, comes out as a wrong point rather than as luck.
+    #[test]
+    fn a_pass_split_across_command_buffers_agrees() {
+        let Some(_) = kernels() else { return };
+        let device = Device::system_default().expect("device");
+        // 2^10 rather than the 2^12 the size sweep uses, because a budget of 1 means one
+        // command buffer per butterfly and 2^12 would be 30,000 of them.
+        let n = 1 << 10;
+        let base = block_g1(0x5eed_5000, n);
+        let mut want = base.clone();
+        CpuGroupFft.ifft_g1(&mut want).expect("cpu ifft_g1");
+
+        for budget in [1usize, 7, 100, 1 << 9] {
+            let k = FftKernels::with_device(device.clone())
+                .expect("fft kernels")
+                .with_budget(budget);
+            let mut got = base.clone();
+            k.ifft_g1(&mut got).expect("ifft_g1");
+            assert!(same_g1(&got, &want), "budget {budget} disagrees");
         }
     }
 

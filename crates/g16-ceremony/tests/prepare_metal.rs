@@ -11,17 +11,23 @@
 //! of its input file: no entropy, no beacon, no RNG. So every test below is a plain diff
 //! of two outputs.
 //!
-//! Three crossovers, and the middle one is the only one that tests anything on a small
-//! file. `MetalGroupFft::min_block` is 4,096, so at the shipped setting a power-10 file,
-//! whose largest block is 2^11, never reaches the device and the test would be comparing
-//! the CPU against itself. `usize::MAX` is the opposite end and it is not redundant
-//! either: it is the only case that runs `prepare::ifft_block`'s fallback arm
+//! Four settings, and only one of them is the shipped one. `MetalGroupFft::min_block` is
+//! 4,096, so at the shipped setting a power-10 file, whose largest block is 2^11, never
+//! reaches the device and the test would be comparing the CPU against itself; hence the
+//! `device` pass at `min_block` 1. `host fallback` at `usize::MAX` is not redundant
+//! either, being the only case that runs `prepare::ifft_block`'s fallback arm
 //! (prepare.rs:352) on a backend that is not `CpuGroupFft`.
 //!
-//! There is no chunking boundary to cross. A block is one buffer and one command buffer
-//! for all `log n` of its passes, so the only boundaries this file has are the block
-//! sizes themselves and the crossover, and a power-13 input crosses both: it holds every
-//! block from 2^0 to 2^14, three of them above the shipped threshold and eleven below.
+//! The fourth crosses the command-buffer boundary. A pass larger than the backend's ladder
+//! budget is split across submissions with a `gid_off`, and the shipped budget is 2^19
+//! ladders, which no file small enough to test reaches: only section 12's top block at
+//! power 20 and above does, and that is the block whose first version macOS killed. So the
+//! `split` pass shrinks the budget to 300 and makes a power-10 file cross it hundreds of
+//! times.
+//!
+//! Block sizes are the other boundary and a power-13 input crosses the crossover on its
+//! own: it holds every block from 2^0 to 2^14, three of them above the shipped threshold
+//! and eleven below.
 
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
@@ -59,12 +65,18 @@ fn bench_path(rel: &str) -> PathBuf {
 ///
 /// A skip rather than a failure: this file is compiled by a feature, and the feature says
 /// "test the Metal path", not "this machine has a GPU". Every caller prints why.
-fn metal(min_block: Option<usize>) -> Option<MetalGroupFft> {
+fn metal(min_block: Option<usize>, budget: Option<usize>) -> Option<MetalGroupFft> {
     match MetalGroupFft::new() {
-        Ok(k) => Some(match min_block {
-            Some(n) => k.with_min_block(n),
-            None => k,
-        }),
+        Ok(k) => {
+            let k = match min_block {
+                Some(n) => k.with_min_block(n),
+                None => k,
+            };
+            Some(match budget {
+                Some(b) => k.with_budget(b),
+                None => k,
+            })
+        }
         Err(e) => {
             eprintln!("SKIPPED: no Metal backend: {e}");
             None
@@ -72,12 +84,13 @@ fn metal(min_block: Option<usize>) -> Option<MetalGroupFft> {
     }
 }
 
-/// The shipped crossover, one that forces even a two-point block onto the device, and one
-/// that sends every block home.
-const CROSSOVERS: [(Option<usize>, &str); 3] = [
-    (None, "shipped"),
-    (Some(1), "device"),
-    (Some(usize::MAX), "host fallback"),
+/// The shipped crossover, one that forces even a two-point block onto the device, one that
+/// sends every block home, and one that splits every pass across command buffers.
+const CROSSOVERS: [(Option<usize>, Option<usize>, &str); 4] = [
+    (None, None, "shipped"),
+    (Some(1), None, "device"),
+    (Some(usize::MAX), None, "host fallback"),
+    (Some(1), Some(300), "split"),
 ];
 
 fn assert_same_bytes(what: &str, cpu: &Path, gpu: &Path) {
@@ -150,9 +163,17 @@ fn inputs(dir: &Path) -> Vec<(String, PathBuf)> {
 fn prepare_is_byte_identical_across_backends() {
     let dir = tmp_dir("prepare");
     let inputs = inputs(&dir);
-    for (min_block, label) in CROSSOVERS {
-        let Some(fft) = metal(min_block) else { return };
+    for (min_block, budget, label) in CROSSOVERS {
+        let Some(fft) = metal(min_block, budget) else {
+            return;
+        };
         for (name, ptau) in &inputs {
+            // `local_13` at a budget of 300 is 200,000 command buffers, which is a
+            // different test from the one this pass is for: the split arithmetic is the
+            // same at every block size and the power-10 files already cross it.
+            if budget.is_some() && name == "local_13" {
+                continue;
+            }
             compare(&dir, name, label, ptau, &fft);
         }
     }
@@ -170,7 +191,9 @@ fn prepare_is_byte_identical_across_backends() {
 #[ignore = "minutes: two full CPU prepares at powers 15 and 16"]
 fn prepare_is_byte_identical_at_the_powers_that_matter() {
     let dir = tmp_dir("prepare-big");
-    let Some(fft) = metal(None) else { return };
+    let Some(fft) = metal(None, None) else {
+        return;
+    };
     let mut ran = 0;
     for power in [15u32, 16] {
         let ptau = bench_path(&format!("ptau/ppot_0080_{power}.ptau"));
@@ -193,7 +216,9 @@ fn prepare_is_byte_identical_at_the_powers_that_matter() {
 /// nothing about why. This says which block.
 #[test]
 fn the_identity_padding_survives_the_device_transform() {
-    let Some(fft) = metal(Some(1)) else { return };
+    let Some(fft) = metal(Some(1), None) else {
+        return;
+    };
     for bits in [1u32, 4, 12, 13] {
         let n = 1usize << bits;
         let mut points: Vec<G1Affine> = Vec::with_capacity(n);
@@ -231,7 +256,9 @@ fn snarkjs_verifies_a_metal_prepared_ptau() {
         eprintln!("SKIPPED snarkjs_verifies_a_metal_prepared_ptau: no snarkjs on PATH");
         return;
     };
-    let Some(fft) = metal(Some(1)) else { return };
+    let Some(fft) = metal(Some(1), None) else {
+        return;
+    };
     let ptau = bench_path("ptau/local_13.ptau");
     if !ptau.is_file() {
         eprintln!("SKIPPED snarkjs_verifies_a_metal_prepared_ptau: no local_13.ptau");
