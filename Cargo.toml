@@ -6,6 +6,7 @@ members = [
     "crates/g16-ntt",
     "crates/g16-msm",
     "crates/g16-core",
+    "crates/g16-ceremony",
     "crates/g16-gpu-layout",
     "crates/g16-gpu-kernels",
     "crates/g16-metal",
@@ -51,6 +52,16 @@ serde_json   = "1"
 clap         = { version = "4", features = ["derive"] }
 hex          = "0.4"
 
+# The ceremony transcript, and nothing else in the workspace, needs these three. Every
+# hash snarkjs takes in phase 1 and phase 2 is unkeyed BLAKE2b-512; the beacon derives its
+# seed by iterating SHA-256; and ffjavascript's `ChaCha` is RFC 8439 ChaCha20 with a zero
+# nonce, so `rand_chacha` serves once the seed words are byte-swapped (ffjavascript reads
+# them big-endian per 32-bit word). See `transcript.rs` for the two calls that are NOT
+# interoperable and must be hand-written on top of `next_u32`.
+blake2       = "0.10"
+sha2         = "0.10"
+rand_chacha  = "0.3"
+
 # Measurement only. None of these are reachable from a release build: dhat and
 # hotpath sit behind cargo features that default off, criterion is a dev-dependency.
 dhat         = "0.3"
@@ -62,6 +73,7 @@ g16-zkey  = { path = "crates/g16-zkey" }
 g16-ntt   = { path = "crates/g16-ntt" }
 g16-msm   = { path = "crates/g16-msm" }
 g16-core  = { path = "crates/g16-core" }
+g16-ceremony = { path = "crates/g16-ceremony" }
 g16-gpu-layout = { path = "crates/g16-gpu-layout" }
 g16-gpu-kernels = { path = "crates/g16-gpu-kernels" }
 g16-metal = { path = "crates/g16-metal" }

@@ -14,7 +14,7 @@
 //! plain form. All three conventions are decoded in [`binfile`], which documents where
 //! each one was read out of the snarkjs source.
 
-pub(crate) mod binfile;
+pub mod binfile;
 pub mod wtns;
 
 use binfile::*;

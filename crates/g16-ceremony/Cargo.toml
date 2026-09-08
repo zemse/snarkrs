@@ -1,0 +1,27 @@
+[package]
+name = "g16-ceremony"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+g16-field.workspace = true
+g16-zkey.workspace = true
+g16-msm.workspace = true
+g16-ntt.workspace = true
+ark-bn254.workspace = true
+ark-ff.workspace = true
+ark-ec.workspace = true
+ark-serialize.workspace = true
+byteorder.workspace = true
+thiserror.workspace = true
+serde_json.workspace = true
+rayon.workspace = true
+blake2.workspace = true
+sha2.workspace = true
+rand_chacha.workspace = true
+
+# Not target gated the way g16-zkey's is. That crate compiles for wasm32 because the
+# browser proves; this one reads and writes multi-gigabyte ceremony files by path, so
+# there is no wasm target to keep a filesystem API out of.
+memmap2.workspace = true

@@ -32,6 +32,8 @@ required-features = ["metal"]
 g16-field.workspace = true
 g16-zkey.workspace = true
 g16-core.workspace = true
+g16-ceremony.workspace = true
+g16-msm.workspace = true
 g16-metal = { workspace = true, optional = true }
 g16-cuda  = { workspace = true, optional = true }
 g16-wgpu  = { workspace = true, optional = true }
