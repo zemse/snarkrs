@@ -24,6 +24,24 @@ pub fn prove<R: ark_std::rand::RngCore + ark_std::rand::CryptoRng>(
     prove_with_blinders(circuit, witness, r, s, timings)
 }
 
+/// Refuse to prove in a build that would take tens of minutes to do it.
+///
+/// The guard sits here rather than in the backends because this is the one choke point every
+/// proving test reaches, and putting it in nine test files leaves the tenth unprotected.
+/// [`prove_trace`] is deliberately exempt: a trace is one proof produced on purpose to debug a
+/// device, which is the single case where a slow build is the point.
+///
+/// `cfg(unoptimized)` comes from build.rs, so at opt-level 2 or above this compiles to nothing
+/// and there is no branch on the hot path to inline away.
+#[inline]
+fn refuse_if_unoptimized() -> Result<(), ProveError> {
+    #[cfg(unoptimized)]
+    if std::env::var_os("G16_ALLOW_UNOPTIMIZED_PROVING").is_none() {
+        return Err(ProveError::Unoptimized);
+    }
+    Ok(())
+}
+
 /// Deterministic variant with caller-supplied `r`, `s`. Used only by tests, so a proof
 /// can be compared against a reference implementation bit for bit. Never use in
 /// production: reusing `r`/`s` across proofs of different witnesses leaks the witness.
@@ -34,6 +52,7 @@ pub fn prove_with_blinders(
     s: Fr,
     timings: &mut StageTimings,
 ) -> Result<Proof, ProveError> {
+    refuse_if_unoptimized()?;
     let h = stage!("stages 0-4 compute_h", circuit.compute_h(witness, timings))?;
     let m = stage!("stages 5-9 msms", circuit.msms(witness, &h, timings))?;
     Ok(assemble(circuit.key(), &m, r, s, timings))

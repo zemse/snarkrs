@@ -69,7 +69,7 @@ pub mod verify;
 use g16_field::*;
 use g16_zkey::ProvingKey;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum ProveError {
     #[error("witness has {got} entries, proving key expects {want}")]
     WitnessLength { got: usize, want: usize },
@@ -78,6 +78,32 @@ pub enum ProveError {
         backend: &'static str,
         reason: String,
     },
+    /// Raised by [`prove::prove_with_blinders`] when the crate was built at opt-level 0 or 1.
+    ///
+    /// Not a safety rail on the arithmetic, a rail on wall clock. `cargo test` defaults to
+    /// the dev profile, this workspace declares no `[profile.dev]`, and so the default is
+    /// opt-level 0 with `overflow-checks` branching on every limb of the CIOS multiply. The
+    /// campaign sweep that `campaign.rs` measures at under a minute took 19 minutes and
+    /// 187 CPU-minutes that way before it was killed, with twelve variants still to go.
+    #[error(
+        "refusing to prove at opt-level 0 or 1: overflow checks on every limb of the CIOS \
+         multiply make this tens of times slower than the numbers in README.md, which is how \
+         a bare `cargo test` comes to saturate every core for the better part of an hour.\n\
+         \n  release:  cargo test --release --workspace\
+         \n  filtered: cargo test --workspace -- --skip campaign --skip roundtrip\
+         \n  override: G16_ALLOW_UNOPTIMIZED_PROVING=1 (no effect on wasm32, which has no env)"
+    )]
+    Unoptimized,
+}
+
+/// `Debug` delegates to `Display`, because `Debug` is what `.expect()` and `.unwrap()` print
+/// and the derived form throws the message away. `campaign.rs:279` reaches `prove` through an
+/// `.expect`, and with the derive in place a variant carrying three lines of instructions
+/// printed as the single word `Unoptimized`.
+impl core::fmt::Debug for ProveError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Display::fmt(self, f)
+    }
 }
 
 /// A Groth16 proof. Serialises to snarkjs' `proof.json` shape so `snarkjs groth16 verify`
