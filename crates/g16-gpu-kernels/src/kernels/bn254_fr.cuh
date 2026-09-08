@@ -34,8 +34,8 @@
 // mad.lo.cc.u32 / madc.hi.cc.u32 chains written as inline PTX remove the explicit
 // shift-and-mask carry propagation entirely and are what sppark and the other fast CUDA
 // MSM libraries use. That path now exists in this file, behind `G16_FF_PTX` (defined by
-// the host when `G16_CUDA_FF_PTX=1`, see kernels.rs), OFF by default: it has been
-// checked against a bit-exact host simulation of the exact chain shape, but it has NOT
+// the host when `G16_CUDA_FF_PTX=1`, see g16-cuda/src/kernels.rs), OFF by default: it has
+// been checked against a bit-exact host simulation of the exact chain shape, but it has NOT
 // run on an NVIDIA card yet, and it stays opt-in until `fr_probe` has validated it and
 // `bench_chain` has priced it on real hardware. The portable version below remains the
 // default and the reference.

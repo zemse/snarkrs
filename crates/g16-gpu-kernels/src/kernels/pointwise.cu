@@ -5,10 +5,10 @@
 //
 // ORDERING NOTE. In the Metal backend this file is concatenated BEFORE ntt.metal, because
 // the fused NTT epilogue calls g16_store_h and MSL needs the definition in scope. Here
-// kernels::unit_stages fixes the order as gather / ntt / pointwise, so ntt.cu carries a
-// forward declaration of g16_store_h and the definition stays here, next to the stage it
-// belongs to. Same translation unit, so the function still inlines into the NTT epilogue.
-// If you move this file's contents, move the declaration in ntt.cu with it.
+// g16_gpu_kernels::unit_stages fixes the order as gather / ntt / pointwise, so ntt.cu
+// carries a forward declaration of g16_store_h and the definition stays here, next to the
+// stage it belongs to. Same translation unit, so the function still inlines into the NTT
+// epilogue. If you move this file's contents, move the declaration in ntt.cu with it.
 //
 // ============================================================================
 // NO DIVISION BY Z(coset). THIS IS NOT AN OMISSION.

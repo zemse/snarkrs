@@ -102,13 +102,13 @@
 #ifndef G16_NTT_CU
 #define G16_NTT_CU
 
-// Defined in pointwise.cu, which kernels::unit_stages concatenates AFTER this file.
+// Defined in pointwise.cu, which g16_gpu_kernels::unit_stages concatenates AFTER this file.
 //
 // Note the ordering differs from the Metal backend on purpose. There, pointwise.metal is
 // placed ahead of ntt.metal so the definition is in scope. Here the unit order is fixed
-// as gather / ntt / pointwise by kernels.rs, so the fused store epilogue below reaches
-// its helper through this forward declaration instead. Same translation unit, so
-// __forceinline__ still applies; only the textual order changed.
+// as gather / ntt / pointwise by g16_gpu_kernels::unit_stages, so the fused store
+// epilogue below reaches its helper through this forward declaration instead. Same
+// translation unit, so __forceinline__ still applies; only the textual order changed.
 __device__ __forceinline__ void g16_store_h(Fr* h_mont, Fr* h_std, u32 i, Fr v);
 
 // Load-time scaling and the store-time epilogue. Both are uniform across the whole

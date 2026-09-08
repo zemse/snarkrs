@@ -16,6 +16,7 @@ g16-field.workspace = true
 g16-zkey.workspace = true
 g16-core.workspace = true
 g16-gpu-layout.workspace = true
+g16-gpu-kernels.workspace = true
 ark-ff.workspace = true
 ark-ec.workspace = true
 thiserror.workspace = true

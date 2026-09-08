@@ -801,6 +801,7 @@ dependencies = [
  "cudarc",
  "g16-core",
  "g16-field",
+ "g16-gpu-kernels",
  "g16-gpu-layout",
  "g16-zkey",
  "thiserror 2.0.19",
@@ -817,6 +818,10 @@ dependencies = [
  "ark-std",
  "thiserror 2.0.19",
 ]
+
+[[package]]
+name = "g16-gpu-kernels"
+version = "0.1.0"
 
 [[package]]
 name = "g16-gpu-layout"

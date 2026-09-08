@@ -1,0 +1,5 @@
+[package]
+name = "g16-gpu-kernels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true

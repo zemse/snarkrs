@@ -6,8 +6,8 @@
 //
 // This file is compiled at run time by NVRTC, concatenated AFTER `bn254_fr.cuh`, which
 // supplies `struct Fr` and the `fr_*` routines. NVRTC has no filesystem, so there is no
-// `#include` anywhere here; kernels.rs pastes the two sources together and the `#ifndef`
-// guard in the prelude makes that safe.
+// `#include` anywhere here; g16_gpu_kernels::unit_msm pastes the two sources together and
+// the `#ifndef` guard in the prelude makes that safe.
 //
 // ============================================================================
 // THE CONSTANTS BELOW MIRROR g16_gpu_layout's FQ_MODULUS and FQ_N0. A Rust test greps

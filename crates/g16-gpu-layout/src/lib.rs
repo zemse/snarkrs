@@ -4,7 +4,7 @@
 //!
 //! Every `#[repr(C)]` type below has a byte-for-byte twin in each GPU backend's kernel
 //! source: `g16-metal/src/shaders/bn254_fr.metal` in MSL and
-//! `g16-cuda/src/kernels/bn254_fr.cuh` in CUDA C. Each kernel side carries a
+//! `g16-gpu-kernels/src/kernels/bn254_fr.cuh` in CUDA C. Each kernel side carries a
 //! `static_assert` on `sizeof`, this side carries a `const` assertion on `size_of`, and
 //! each backend keeps a test that greps its own kernel source for the exact constant
 //! lines so the copies cannot drift silently. If you change a struct here you are

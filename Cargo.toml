@@ -7,6 +7,7 @@ members = [
     "crates/g16-msm",
     "crates/g16-core",
     "crates/g16-gpu-layout",
+    "crates/g16-gpu-kernels",
     "crates/g16-metal",
     "crates/g16-cuda",
     "crates/g16-wgpu",
@@ -62,6 +63,7 @@ g16-ntt   = { path = "crates/g16-ntt" }
 g16-msm   = { path = "crates/g16-msm" }
 g16-core  = { path = "crates/g16-core" }
 g16-gpu-layout = { path = "crates/g16-gpu-layout" }
+g16-gpu-kernels = { path = "crates/g16-gpu-kernels" }
 g16-metal = { path = "crates/g16-metal" }
 g16-cuda  = { path = "crates/g16-cuda" }
 g16-wgpu  = { path = "crates/g16-wgpu" }

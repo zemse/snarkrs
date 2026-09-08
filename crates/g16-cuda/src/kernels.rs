@@ -1,30 +1,12 @@
 //! Kernel sources, compiled at run time by NVRTC.
 //!
-//! NVRTC has no filesystem, so a translation unit is assembled here by concatenating the
-//! headers a kernel needs with the kernel itself. That is why the `.cu` files carry no
-//! `#include` of their own: the include graph lives in this file, in Rust, where it is
-//! checked by the compiler rather than by a preprocessor search path that only exists on
-//! the machine that happened to build it.
+//! The sources and the include graph live in `g16-gpu-kernels`, because hipRTC compiles the
+//! same six files and a second copy of the CIOS Montgomery multiply would be two
+//! implementations of one algorithm that only a failing proof could tell apart. What is left
+//! here is the one NVIDIA-only knob: the preprocessor prelude each translation unit is
+//! prefixed with.
 
-/// BN254 scalar field. Twin of `g16_gpu_layout`'s `PackedFr`, guarded by
-/// [`crate::tests::cuda_declares_the_same_constants`].
-pub const FR_CUH: &str = include_str!("kernels/bn254_fr.cuh");
-
-/// Stage 0: gather the A and B coefficient columns out of the CSR proving key.
-pub const GATHER_CU: &str = include_str!("kernels/gather.cu");
-
-/// Stages 1 to 3: the six transforms, iNTT then coset shift then forward NTT.
-pub const NTT_CU: &str = include_str!("kernels/ntt.cu");
-
-/// Stage 4: `H = A*B - C`, fused into the tail of the last transform where possible.
-pub const POINTWISE_CU: &str = include_str!("kernels/pointwise.cu");
-
-/// Stages 5 to 9: Fq, Fq2, the curve, and the CSR Pippenger MSM.
-pub const MSM_CU: &str = include_str!("kernels/msm.cu");
-
-/// Field correctness probe. Test-only, but compiled the same way as everything else so
-/// that a change which breaks compilation cannot hide behind a `cfg(test)`.
-pub const FIELD_PROBE_CU: &str = include_str!("kernels/field_probe.cu");
+pub use g16_gpu_kernels::{FIELD_PROBE_CU, FR_CUH, GATHER_CU, MSM_CU, NTT_CU, POINTWISE_CU};
 
 /// Source-level feature defines, prepended to every unit.
 ///
@@ -49,16 +31,16 @@ fn defines() -> String {
 /// Stages 0 to 4, one translation unit. They share `Fr` and nothing else, and compiling
 /// them together means one NVRTC invocation instead of three.
 pub fn unit_stages() -> String {
-    format!("{}{FR_CUH}\n{GATHER_CU}\n{NTT_CU}\n{POINTWISE_CU}", defines())
+    g16_gpu_kernels::unit_stages(&defines())
 }
 
 /// Stages 5 to 9. Separate from the stages unit because it is by far the largest and
 /// compiling it is most of the prepare cost.
 pub fn unit_msm() -> String {
-    format!("{}{FR_CUH}\n{MSM_CU}", defines())
+    g16_gpu_kernels::unit_msm(&defines())
 }
 
 /// The `fr_probe` / `fr_constants` translation unit.
 pub fn unit_field_probe() -> String {
-    format!("{}{FR_CUH}\n{FIELD_PROBE_CU}", defines())
+    g16_gpu_kernels::unit_field_probe(&defines())
 }
