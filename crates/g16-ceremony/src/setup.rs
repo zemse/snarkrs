@@ -28,8 +28,8 @@ use std::ops::Mul;
 use std::path::Path;
 
 use g16_field::{
-    AffineRepr, CurveGroup, FftField, Fq, Fr, G1Affine, G1Projective, G2Affine,
-    G2Projective, One, PrimeField, Zero,
+    AffineRepr, CurveGroup, FftField, Fq, Fr, G1Affine, G1Projective, G2Affine, G2Projective, One,
+    PrimeField, Zero,
 };
 use g16_msm::MsmBackend;
 use g16_zkey::binfile;
@@ -749,7 +749,11 @@ fn h_difference(hi: &[u8], lo: &[u8]) -> G1Projective {
     if noncanonical::is_zero(&z) {
         return G1Projective::zero();
     }
-    G1Projective::new_unchecked(montgomery_limbs(&x), montgomery_limbs(&y), montgomery_limbs(&z))
+    G1Projective::new_unchecked(
+        montgomery_limbs(&x),
+        montgomery_limbs(&y),
+        montgomery_limbs(&z),
+    )
 }
 
 /// Limbs wasmcurves left above `q` become the arkworks element with the same value: the
@@ -841,7 +845,9 @@ mod noncanonical {
         let mut out = ZERO;
         let mut borrow = 0u64;
         for i in 0..8 {
-            let acc = u64::from(x[i]).wrapping_sub(u64::from(y[i])).wrapping_sub(borrow);
+            let acc = u64::from(x[i])
+                .wrapping_sub(u64::from(y[i]))
+                .wrapping_sub(borrow);
             out[i] = acc as u32;
             borrow = (acc >> 32) & 1;
         }
