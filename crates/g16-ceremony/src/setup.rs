@@ -7,11 +7,12 @@
 //!   `zkey_new.js:127-129` writes the plain generators as `gamma2`, `delta1` and `delta2`,
 //!   so sections 3 and 8 are undivided. `zkey contribute` is what introduces a delta at
 //!   all (`zkey_contribute.js:63-64, :90-92`).
-//! * **This is not one big MSM.** `composeAndWritePoints` produces one output point per
-//!   signal, dispatching a single scalar multiplication when a signal appears once and a
-//!   multiexp when it appears more than once, then one batch-to-affine over the chunk
-//!   (`zkey_new.js:459-491`). It is MSM-bound overall, which is why the backend is a
-//!   parameter, but the shape is per-signal.
+//! * **This is not one big MSM, and it is not even MSM-bound.** `composeAndWritePoints`
+//!   produces one output point per signal, dispatching a single scalar multiplication when
+//!   a signal appears once and a multiexp when it appears more than once, then one
+//!   batch-to-affine over the chunk (`zkey_new.js:459-491`). The shape is per-signal and
+//!   the slots are tiny, so most of the arithmetic never reaches a multiexp at all. See
+//!   [`setup`] for the measured split and what it means for a device.
 //! * **Section 9 involves no arithmetic at all.** `writeHs` is a strided gather: read the
 //!   `2*domainSize` Lagrange block of ptau section 12 and take every odd element
 //!   (`zkey_new.js:186-191`). The `cirPower == Fr::TWO_ADICITY` case is different because
@@ -83,6 +84,12 @@ const H_CHUNK: usize = 1 << 14;
 /// round trip into a wasm worker either way. The sum is the same however it is computed,
 /// and slots here are tiny: on `anon-aadhaar` the mean A slot holds three terms, so
 /// dispatching a full MSM per slot would be several million bucket allocations.
+///
+/// 32 is tuned for [`g16_msm::CpuMsm`], where it earns 3.3x to 4.6x per term over the loop
+/// below it, and even the slots above it are small: the mean slot that reaches the multiexp
+/// on the two dense production circuits holds 85 terms, so this bucket is "32 to 255", not
+/// thousands. A backend whose dispatch costs more than 85 terms of arithmetic wants a much
+/// higher threshold than this, and the trait has no way to say so. See [`setup`].
 const MULTIEXP_MIN_TERMS: usize = 32;
 
 /// What a setup produced, for the CLI to print and a test to assert on.
@@ -114,9 +121,34 @@ pub fn circuit_power(n_constraints: usize, n_public: usize) -> u32 {
 
 /// Run the whole setup.
 ///
-/// `msm` is threaded through rather than hardcoded because this command is MSM-bound and
-/// is the first thing in the ceremony worth putting on a GPU. Nothing else about it wants
-/// a device.
+/// # `msm` accelerates a minority of this command, and on a device it costs more than it saves
+///
+/// The five [`compose_points_g1`] and [`compose_points_g2`] calls are 97.5% to 98.7% of the
+/// run: the r1cs parse, the ptau read, the section-4 encode, the H gather and every write
+/// together are under 2.5%. So the command is compute bound. What it is *not* is multiexp
+/// bound, because [`MULTIEXP_MIN_TERMS`] sends almost everything to the loop below it:
+///
+/// | circuit | domain | terms in slots >= 32 | share of compose the MSM path holds |
+/// |---|---|---:|---:|
+/// | `prod_large_O1` | 2^20 | 4.8% | 0.50% |
+/// | `prod_small_O1` | 2^17 | 3.8% | 0.25% |
+/// | `prod_small_O2` | 2^16 | 75.8% | 45.1% |
+/// | `prod_large_O2` | 2^18 | 74.2% | 42.9% |
+///
+/// The split inverts with circom's `-O` level, and `--O1` is the default, so on the output
+/// circom produces with no flags an MSM that ran in zero time takes the 2^20 circuit from
+/// 15.12 s to 15.04 s. What holds the rest is millions of scalar multiplications of one to
+/// thirty terms each, which is a different kernel and would need a different seam: N terms
+/// in, N products out, reduced per slot, rather than one multiexp per output point.
+///
+/// A device behind *this* parameter loses, and the reason is the per-slot dispatch. A
+/// `--backend metal` run measures 1.15 ms per `msm_g1` call against 0.149 ms for a bare
+/// Metal commit-and-wait, so the 97,648 slots of `prod_large_O2` are 112 s
+/// of round trip on a command the CPU finishes in 46.8 s. Measured end to end on an M2 Max,
+/// `--backend metal` against `--backend cpu`: 16.09 s vs 16.67 s at 2^20 `--O1`, 2.94 s vs
+/// 3.00 s at 2^17 `--O1`, 28.2 s vs 9.5 s at 2^16 `--O2`, 144.5 s vs 46.8 s at 2^18 `--O2`.
+/// Every one of those pairs is byte-identical, which is the property that matters here; the
+/// numbers are why the backend that produced them is not the default.
 pub fn setup(
     r1cs_path: &Path,
     ptau_path: &Path,
