@@ -441,3 +441,32 @@ fn both_verifiers_accept_every_chain_and_reject_a_tampered_one() {
         eprintln!("section {id} tampered: {err}");
     }
 }
+
+/// The contribution hash snarkjs prints for `js_1x1_d8`'s own record, taken from its
+/// `zkey verify r1cs` output ("contribution #1 bench").
+///
+/// This is the one assertion here that needs no snarkjs at run time, and it is the only
+/// one that pins [`contribute::contribution_hash`] against a chain nobody in this workspace
+/// wrote. The file is a `zkey contribute` from `gen-artifacts.sh:58`, so the record it
+/// checks was produced years before this crate existed.
+const JS_1X1_D8_CONTRIBUTION_HASH: &str =
+    "d16dedad2f5c4e7b9b99c7c3b6c33eb939da1bc952ca57d282995856e869f8b4\
+     236cb5e2fdef93de041cbbe56eb2b895dd20aa9fe27ff3adf3b62bb6cfd5bfee";
+
+#[test]
+fn a_checked_in_contribution_hashes_to_what_snarkjs_printed() {
+    let zkey =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/artifacts/js_1x1_d8/circuit.zkey");
+    if !zkey.is_file() {
+        eprintln!("SKIPPED a_checked_in_contribution_hashes_...: no js_1x1_d8");
+        return;
+    }
+    let file = g16_zkey::binfile::BinFile::open(&zkey, b"zkey", 2).unwrap();
+    let mpc = MpcParams::read(file.unique_section(10).unwrap()).unwrap();
+    assert_eq!(mpc.contributions.len(), 1);
+    assert_eq!(
+        hex(&contribute::contribution_hash(&mpc.contributions[0])),
+        JS_1X1_D8_CONTRIBUTION_HASH.replace(' ', "")
+    );
+    assert_eq!(mpc.contributions[0].params.name.as_deref(), Some("bench"));
+}
