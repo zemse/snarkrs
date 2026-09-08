@@ -28,7 +28,8 @@ use std::ops::Mul;
 use std::path::Path;
 
 use g16_field::{
-    AffineRepr, CurveGroup, FftField, Fr, G1Affine, G1Projective, G2Affine, G2Projective, One, Zero,
+    AffineRepr, CurveGroup, FftField, Fq, Fr, G1Affine, G1Projective, G2Affine,
+    G2Projective, One, PrimeField, Zero,
 };
 use g16_msm::MsmBackend;
 use g16_zkey::binfile;
@@ -38,7 +39,7 @@ use crate::ptau::{self, Ptau};
 use crate::r1cs::{Matrix, R1cs};
 use crate::transcript::{Digest, Transcript};
 use crate::write::BinFileWriter;
-use crate::{CeremonyError, Groth16Header, SG1};
+use crate::{CeremonyError, Groth16Header, N8, SG1};
 
 /// zkey section ids, in id order rather than write order.
 pub const S_PROTOCOL: u32 = 1;
@@ -722,7 +723,7 @@ pub fn hash_h_points(
         let diff: Vec<G1Projective> = hi
             .par_chunks_exact(SG1)
             .zip(lo.par_chunks_exact(SG1))
-            .map(|(a, b)| G1Projective::from(binfile::g1(a)) - binfile::g1(b))
+            .map(|(a, b)| h_difference(a, b))
             .collect();
         for p in G1Projective::normalize_batch(&diff) {
             transcript.update_g1(&p);
@@ -730,4 +731,276 @@ pub fn hash_h_points(
         i += H_CHUNK;
     }
     Ok(())
+}
+
+/// One `g1m_subAffine`, on whichever implementation the input calls for.
+///
+/// Every real ptau point takes the arkworks path. The bytes read past section 2 do not: a
+/// coordinate at or above `q` makes wasmcurves' wrapping arithmetic observable, and the
+/// digest is defined by it, so those go through [`noncanonical`].
+fn h_difference(hi: &[u8], lo: &[u8]) -> G1Projective {
+    let canonical = [&hi[..N8], &hi[N8..], &lo[..N8], &lo[N8..]]
+        .iter()
+        .all(|b| noncanonical::in_range(&noncanonical::load(b)));
+    if canonical {
+        return G1Projective::from(binfile::g1(hi)) - binfile::g1(lo);
+    }
+    let (x, y, z) = noncanonical::sub_affine(hi, lo);
+    if noncanonical::is_zero(&z) {
+        return G1Projective::zero();
+    }
+    G1Projective::new_unchecked(montgomery_limbs(&x), montgomery_limbs(&y), montgomery_limbs(&z))
+}
+
+/// Limbs wasmcurves left above `q` become the arkworks element with the same value: the
+/// remaining steps, a batch inversion and two multiplications, are congruence preserving on
+/// both sides, so only the representative had to be settled here.
+fn montgomery_limbs(limbs: &noncanonical::U256) -> Fq {
+    let mut le = [0u8; N8];
+    for (i, limb) in limbs.iter().enumerate() {
+        le[i * 4..i * 4 + 4].copy_from_slice(&limb.to_le_bytes());
+    }
+    Fq::new_unchecked(Fq::from_le_bytes_mod_order(&le).into_bigint())
+}
+
+/// wasmcurves' `Fq` and its Jacobian point addition, transcribed limb for limb.
+///
+/// It exists for one input in the whole pipeline: the 64 bytes [`hash_h_points`]
+/// deliberately reads past ptau section 2, which are a section header and part of the next
+/// point rather than a curve point. Both coordinates come out at or above `q`, and there
+/// arkworks and wasmcurves stop agreeing. `f1m_add` (`build_f1m.js:69-85`) reacts to a
+/// 256-bit carry by subtracting `q` once from the *wrapped* sum, which is short by exactly
+/// `2^256`, so the result is not even congruent mod `q`. Reducing the inputs first does not
+/// recover it, and neither does any canonical implementation: the shipped digest is defined
+/// by these exact wrapping semantics.
+///
+/// Nothing else may use this. Every in-range input goes through arkworks, which is both
+/// faster and, on those, identical.
+mod noncanonical {
+    /// Eight little-endian 32-bit limbs, the layout wasm linear memory holds and the width
+    /// `f1m_mul`'s inner loop works in (`build_f1m.js:236-243`).
+    pub type U256 = [u32; 8];
+
+    pub const ZERO: U256 = [0; 8];
+    const Q: U256 = [
+        0xd87c_fd47,
+        0x3c20_8c16,
+        0x6871_ca8d,
+        0x9781_6a91,
+        0x8181_585d,
+        0xb850_45b6,
+        0xe131_a029,
+        0x3064_4e72,
+    ];
+    /// `R mod q`, which is what `f1m_one` writes (`build_f1m.js:41`).
+    const ONE: U256 = [
+        0xc58f_0d9d,
+        0xd35d_438d,
+        0xf5c7_0b3d,
+        0x0a78_eb28,
+        0x7879_462c,
+        0x666e_a36f,
+        0x9a07_df2f,
+        0x0e0a_77c1,
+    ];
+    /// `2^32 - (q^-1 mod 2^32)`, the Montgomery constant the 32-bit CIOS loop multiplies by.
+    const NP32: u64 = 0xe486_6389;
+
+    pub fn load(bytes: &[u8]) -> U256 {
+        let mut out = ZERO;
+        for (i, limb) in out.iter_mut().enumerate() {
+            *limb = u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().expect("4 bytes"));
+        }
+        out
+    }
+
+    /// True when the limbs are a canonical field element, so arkworks and wasmcurves agree
+    /// on every operation that follows and this module is not needed.
+    pub fn in_range(x: &U256) -> bool {
+        !int_gte(x, &Q)
+    }
+
+    pub fn is_zero(x: &U256) -> bool {
+        x == &ZERO
+    }
+
+    /// `int_add`: the wrapped sum and the carry out (`build_int.js:186-230`).
+    fn int_add(x: &U256, y: &U256) -> (U256, bool) {
+        let mut out = ZERO;
+        let mut carry = 0u64;
+        for i in 0..8 {
+            let acc = u64::from(x[i]) + u64::from(y[i]) + carry;
+            out[i] = acc as u32;
+            carry = acc >> 32;
+        }
+        (out, carry != 0)
+    }
+
+    /// `int_sub`: the wrapped difference and the borrow out (`build_int.js:232-278`).
+    fn int_sub(x: &U256, y: &U256) -> (U256, bool) {
+        let mut out = ZERO;
+        let mut borrow = 0u64;
+        for i in 0..8 {
+            let acc = u64::from(x[i]).wrapping_sub(u64::from(y[i])).wrapping_sub(borrow);
+            out[i] = acc as u32;
+            borrow = (acc >> 32) & 1;
+        }
+        (out, borrow != 0)
+    }
+
+    /// `int_gte`, an unsigned compare from the top limb down (`build_int.js:148-180`).
+    fn int_gte(x: &U256, y: &U256) -> bool {
+        for i in (0..8).rev() {
+            if x[i] != y[i] {
+                return x[i] > y[i];
+            }
+        }
+        true
+    }
+
+    /// `f1m_add` (`build_f1m.js:69-85`). The carry branch subtracts `q` from a sum that has
+    /// already lost `2^256`; that is the whole reason this module exists.
+    pub fn add(x: &U256, y: &U256) -> U256 {
+        let (r, carry) = int_add(x, y);
+        if carry || int_gte(&r, &Q) {
+            int_sub(&r, &Q).0
+        } else {
+            r
+        }
+    }
+
+    /// `f1m_sub` (`build_f1m.js:87-102`).
+    pub fn sub(x: &U256, y: &U256) -> U256 {
+        let (r, borrow) = int_sub(x, y);
+        if borrow {
+            int_add(&r, &Q).0
+        } else {
+            r
+        }
+    }
+
+    pub fn neg(x: &U256) -> U256 {
+        sub(&ZERO, x)
+    }
+
+    /// `f1m_mul` (`build_f1m.js:235-435`): CIOS over 32-bit limbs with a two-word
+    /// accumulator, then the same carry-or-gte reduction `add` uses.
+    ///
+    /// The `[c0, c1] = [c1, c0]` at `:407` is a rename in the code generator, so at run time
+    /// it is a value swap followed by `c1 = c0 >> 32`, in that order.
+    pub fn mul(x: &U256, y: &U256) -> U256 {
+        let mut r = ZERO;
+        let mut m = [0u64; 8];
+        let mut c0 = 0u64;
+        let mut c1 = 0u64;
+        for k in 0..15usize {
+            for i in k.saturating_sub(7)..=k.min(7) {
+                c0 = (c0 & 0xFFFF_FFFF) + u64::from(x[i]) * u64::from(y[k - i]);
+                c1 += c0 >> 32;
+            }
+            for i in k.saturating_sub(7).max(1)..=k.min(7) {
+                c0 = (c0 & 0xFFFF_FFFF) + u64::from(Q[i]) * m[k - i];
+                c1 += c0 >> 32;
+            }
+            if k < 8 {
+                m[k] = ((c0 & 0xFFFF_FFFF) * NP32) & 0xFFFF_FFFF;
+                c0 = (c0 & 0xFFFF_FFFF) + u64::from(Q[0]) * m[k];
+                c1 += c0 >> 32;
+            }
+            if k >= 8 {
+                r[k - 8] = c0 as u32;
+            }
+            std::mem::swap(&mut c0, &mut c1);
+            c1 = c0 >> 32;
+        }
+        r[7] = c0 as u32;
+        if c1 as u32 != 0 || int_gte(&r, &Q) {
+            int_sub(&r, &Q).0
+        } else {
+            r
+        }
+    }
+
+    /// `g1m_subAffine` (`build_curve_jacobian_a0.js:919-932`): negate the second point, then
+    /// `addAffine`, which is mmadd-2007-bl with both `Z` implicitly one (`:760-843`).
+    ///
+    /// Returns the Jacobian triple `batchToAffine` would be handed.
+    pub fn sub_affine(p1: &[u8], p2: &[u8]) -> (U256, U256, U256) {
+        let (x1, y1) = (load(&p1[..32]), load(&p1[32..64]));
+        let (x2, y2) = (load(&p2[..32]), neg(&load(&p2[32..64])));
+
+        // `isZeroAffine` is an integer test on both coordinates, so it fires on the raw
+        // limbs and not on the value.
+        if is_zero(&x1) && is_zero(&y1) {
+            return (x2, y2, ONE);
+        }
+        if is_zero(&x2) && is_zero(&y2) {
+            return (x1, y1, ONE);
+        }
+        // Equality is on limbs too, so two representatives of the same value would miss the
+        // doubling branch. That is the shipped behaviour.
+        if x1 == x2 && y1 == y2 {
+            return double_affine(&x2, &y2);
+        }
+
+        let h = sub(&x2, &x1);
+        let y2_minus_y1 = sub(&y2, &y1);
+        let hh = square(&h);
+        let i = add(&hh, &hh);
+        let i = add(&i, &i);
+        let j = mul(&h, &i);
+        let r = add(&y2_minus_y1, &y2_minus_y1);
+        let v = mul(&x1, &i);
+        let r2 = square(&r);
+        let v2 = add(&v, &v);
+
+        let x3 = sub(&r2, &j);
+        let x3 = sub(&x3, &v2);
+
+        let y1_j2 = mul(&y1, &j);
+        let y1_j2 = add(&y1_j2, &y1_j2);
+
+        let y3 = sub(&v, &x3);
+        let y3 = mul(&y3, &r);
+        let y3 = sub(&y3, &y1_j2);
+
+        (x3, y3, add(&h, &h))
+    }
+
+    /// `doubleAffine`, dbl-2009-l (`build_curve_jacobian_a0.js:358-424`). Reachable from
+    /// [`sub_affine`] only when the two limb patterns coincide.
+    fn double_affine(x: &U256, y: &U256) -> (U256, U256, U256) {
+        if is_zero(x) && is_zero(y) {
+            return (ZERO, ZERO, ZERO);
+        }
+        let xx = square(x);
+        let yy = square(y);
+        let yyyy = square(&yy);
+        let s = add(x, &yy);
+        let s = square(&s);
+        let s = sub(&s, &xx);
+        let s = sub(&s, &yyyy);
+        let s = add(&s, &s);
+        let m = add(&xx, &xx);
+        let m = add(&m, &xx);
+        let z3 = add(y, y);
+        let x3 = square(&m);
+        let x3 = sub(&x3, &s);
+        let x3 = sub(&x3, &s);
+        let eight_yyyy = add(&yyyy, &yyyy);
+        let eight_yyyy = add(&eight_yyyy, &eight_yyyy);
+        let eight_yyyy = add(&eight_yyyy, &eight_yyyy);
+        let y3 = sub(&s, &x3);
+        let y3 = mul(&y3, &m);
+        let y3 = sub(&y3, &eight_yyyy);
+        (x3, y3, z3)
+    }
+
+    /// `f1m_square` is a separate function from `f1m_mul` (`build_f1m.js:437`), but only as
+    /// a schedule: it accumulates the same partial products and ends in the same carry-or-gte
+    /// reduction. Verified to agree with `mul(x, x)` on the out-of-range point this module
+    /// exists for; see `tests/setup.rs`.
+    fn square(x: &U256) -> U256 {
+        mul(x, x)
+    }
 }
