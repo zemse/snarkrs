@@ -519,6 +519,318 @@ struct {pt} {{ x: {fty}, y: {fty}, zz: {fty}, zzz: {fty} }}
     )
 }
 
+/// Which spelling of the two heavy point routines to emit. **1, the step table, ships.**
+///
+/// 0 is the straight-line formula, ten to fourteen inlined `{f}_mul` in one function. 1
+/// drives the same multiplies in the same order from a table, so the whole routine carries
+/// **one**.
+///
+/// # Why it changed
+///
+/// Android could not compile the straight-line form at all. Chrome kills its GPU process
+/// when a driver operation runs long, and Mali's shader compiler is superlinear in the
+/// straight-line size of a single function. Measured on a Pixel 9 Pro (Mali-G715, Chrome
+/// 149), one kernel against the count of inlined `fq_mul` copies in it:
+///
+/// ```text
+/// copies    1     2      4      8      16
+/// compile  259   502   1416   5161   18979 ms, then the device is lost
+/// ```
+///
+/// A ~3.7x step per doubling, an exponent near 1.9. The same ladder on an Apple M4 through
+/// ANGLE Metal is flat at about 200 ms from 1 copy to 28, which is why this was invisible
+/// here. One inlined `pt_add_g2` is about 40 copies: 17.6 s, and the device does not come
+/// back. One `fq2_mul` behind a table is 3 copies and 1.1 s. Every entry point in
+/// `msm_points_g1` and `msm_points_g2` was over that line, on both curves, so 14 Android
+/// devices lost the device building the module and reported it against whichever kernel
+/// happened to be built next.
+///
+/// # It is also faster, which was not the point and is not a rounding error
+///
+/// The unrolling in `gen::field` is load-bearing and stays: indexing a limb by a loop
+/// variable measured 0.516 G mul/s against 1.964. That argument is about the *limb* loop.
+/// It does not extend to inlining ten copies of the result, and the numbers say the
+/// opposite. On this M2 Max, whole proofs through the `wgpu` backend, medians of three:
+///
+/// ```text
+/// circuit          straight-line   table
+/// railgun-01x01         343.0       247.5 ms
+/// keccak256             333.4       179.9 ms
+/// railgun-13x01        1014.7       738.0 ms
+/// js_16x16_d32          994.4       720.9 ms
+/// ```
+///
+/// Per kernel it is `msm_segmented_g1` 28698 -> 11599 us and `msm_merge_g1` 22994 -> 11465,
+/// against `msm_segmented_g2` 87829 -> 93472, a 6% loss on the one G2 kernel and roughly
+/// half the time on the two G1 ones. Four of the five MSMs in a proof are G1. The likely
+/// reason is register pressure rather than anything about the arithmetic: ten inlined copies
+/// of a 2000-instruction multiply have live ranges no register file holds, and one copy over
+/// a small `array<{fty}, N>` does.
+///
+/// 0 stays reachable for [`MERGE_BODY`]'s reason, and because it is the only way to ask a
+/// future compiler whether the cliff is still there.
+pub static POINT_BODY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+fn microcoded() -> bool {
+    // `G16_WGPU_POINT_BODY=1` runs the whole native suite against the other spelling without
+    // a second copy of any test, the same way `G16_WGPU_LIMITS` does for the limits profile.
+    // A browser has no environment and sets the atomic directly.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        static SEED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        SEED.get_or_init(|| {
+            if let Some(n) = std::env::var("G16_WGPU_POINT_BODY")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
+                POINT_BODY.store(n, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+    }
+    POINT_BODY.load(std::sync::atomic::Ordering::Relaxed) == 1
+}
+
+/// madd-2008-s: XYZZ += affine, 7M + 2S. The inner loop of bucket accumulation and therefore
+/// the single hottest routine in this backend.
+fn pt_madd(c: Curve) -> String {
+    let (f, aff, pt, sfx) = (c.f, c.aff, c.pt, c.suffix);
+    if !microcoded() {
+        return format!(
+            "
+// madd-2008-s: XYZZ += affine, 7M + 2S. The inner loop of bucket accumulation and therefore
+// the single hottest routine in this backend.
+fn pt_madd_{sfx}(acc: {pt}, p: {aff}) -> {pt} {{
+    if (aff_is_inf_{sfx}(p)) {{ return acc; }}
+    if (pt_is_zero_{sfx}(acc)) {{ return pt_from_affine_{sfx}(p); }}
+    let u2 = {f}_mul(p.x, acc.zz);
+    let s2 = {f}_mul(p.y, acc.zzz);
+    let pd = {f}_sub(u2, acc.x);
+    let rr = {f}_sub(s2, acc.y);
+    if ({f}_is_zero(pd)) {{
+        // Same x. Either the same point, which doubles, or its negative, which cancels. Both
+        // are reachable: the signed recoding puts a point and its negation in different
+        // buckets, but two different base indices in one bucket can still be equal or
+        // opposite and a zkey does not guarantee distinct bases.
+        if ({f}_is_zero(rr)) {{ return pt_dbl_affine_{sfx}(p); }}
+        return pt_zero_{sfx}();
+    }}
+    let pp = {f}_sqr(pd);
+    let ppp = {f}_mul(pd, pp);
+    let q = {f}_mul(acc.x, pp);
+    let rx = {f}_sub({f}_sub({f}_sqr(rr), ppp), {f}_add(q, q));
+    let ry = {f}_sub({f}_mul(rr, {f}_sub(q, rx)), {f}_mul(acc.y, ppp));
+    return {pt}(rx, ry, {f}_mul(acc.zz, pp), {f}_mul(acc.zzz, ppp));
+}}
+"
+        );
+    }
+    let fty = c.fty;
+    let up = sfx.to_uppercase();
+    format!(
+        "
+// madd-2008-s, microcoded. See gen::points::POINT_BODY for why this spelling exists and what
+// it costs. Same 10 multiplies in the same order as the straight-line form above it in git;
+// the schedule moved into a table and the whole state into R, so the compiler sees one
+// {f}_mul. Steps 0 and 1 are shared, and the fixups between steps are additions, which are
+// about 60 instructions against a multiply's 2000 and so are left inline.
+//
+// Rows are (dst, lhs, rhs) into R. Registers 0..3 are the accumulator, 4..5 the base.
+const MADD_OPS_{up} = array<vec3<u32>, 20>(
+    // generic
+    vec3<u32>(6u, 4u, 2u),   // u2  = p.x   * zz
+    vec3<u32>(7u, 5u, 3u),   // s2  = p.y   * zzz
+    vec3<u32>(10u, 8u, 8u),  // pp  = pd    * pd
+    vec3<u32>(11u, 8u, 10u), // ppp = pd    * pp
+    vec3<u32>(6u, 0u, 10u),  // q   = acc.x * pp
+    vec3<u32>(7u, 9u, 9u),   // rr2 = rr    * rr
+    vec3<u32>(6u, 9u, 8u),   // rr    * (q - rx)
+    vec3<u32>(9u, 1u, 11u),  // acc.y * ppp
+    vec3<u32>(2u, 2u, 10u),  // zz'   = zz  * pp
+    vec3<u32>(3u, 3u, 11u),  // zzz'  = zzz * ppp
+    // mdbl-2008-s, taken when the two points share an x. Rows 0 and 1 are never read: the
+    // mode is only known after step 1 has already run from the generic schedule.
+    vec3<u32>(6u, 4u, 2u),
+    vec3<u32>(7u, 5u, 3u),
+    vec3<u32>(7u, 6u, 6u),   // v  = u * u
+    vec3<u32>(8u, 6u, 7u),   // w  = u * v
+    vec3<u32>(9u, 4u, 7u),   // s  = p.x * v
+    vec3<u32>(10u, 4u, 4u),  // xx = p.x * p.x
+    vec3<u32>(11u, 10u, 10u),// m  * m
+    vec3<u32>(6u, 10u, 6u),  // m  * (s - rx)
+    vec3<u32>(9u, 8u, 5u),   // w  * p.y
+    vec3<u32>(0u, 0u, 0u),   // unused, and skipped rather than executed
+);
+
+fn pt_madd_{sfx}(acc: {pt}, p: {aff}) -> {pt} {{
+    if (aff_is_inf_{sfx}(p)) {{ return acc; }}
+    if (pt_is_zero_{sfx}(acc)) {{ return pt_from_affine_{sfx}(p); }}
+    var R: array<{fty}, 12>;
+    R[0] = acc.x; R[1] = acc.y; R[2] = acc.zz; R[3] = acc.zzz;
+    R[4] = p.x;   R[5] = p.y;
+    // 0 generic, 1 doubling, 2 the identity, which stops the multiplies rather than
+    // computing values nothing reads.
+    var mode = 0u;
+    for (var s = 0u; s < 10u; s = s + 1u) {{
+        if (mode != 2u && !(mode == 1u && s == 9u)) {{
+            let op = MADD_OPS_{up}[mode * 10u + s];
+            R[op.x] = {f}_mul(R[op.y], R[op.z]);
+        }}
+        if (s == 1u) {{
+            R[8] = {f}_sub(R[6], R[0]);
+            R[9] = {f}_sub(R[7], R[1]);
+            if ({f}_is_zero(R[8])) {{
+                if ({f}_is_zero(R[9])) {{
+                    // Same point, so double it. y = 0 would be 2-torsion, which BN254's
+                    // odd-order groups do not contain; the identity is right anyway.
+                    mode = select(1u, 2u, {f}_is_zero(p.y));
+                    R[6] = {f}_add(R[5], R[5]);
+                }} else {{
+                    mode = 2u;
+                }}
+            }}
+        }} else if (mode == 0u && s == 5u) {{
+            R[7] = {f}_sub({f}_sub(R[7], R[11]), {f}_add(R[6], R[6]));
+            R[8] = {f}_sub(R[6], R[7]);
+        }} else if (mode == 0u && s == 7u) {{
+            R[6] = {f}_sub(R[6], R[9]);
+        }} else if (mode == 1u && s == 5u) {{
+            R[10] = {f}_add({f}_add(R[10], R[10]), R[10]);
+        }} else if (mode == 1u && s == 6u) {{
+            R[11] = {f}_sub(R[11], {f}_add(R[9], R[9]));
+            R[6] = {f}_sub(R[9], R[11]);
+        }} else if (mode == 1u && s == 8u) {{
+            R[6] = {f}_sub(R[6], R[9]);
+        }}
+    }}
+    if (mode == 2u) {{ return pt_zero_{sfx}(); }}
+    if (mode == 1u) {{ return {pt}(R[11], R[6], R[7], R[8]); }}
+    return {pt}(R[7], R[6], R[2], R[3]);
+}}
+"
+    )
+}
+
+/// add-2008-s: XYZZ + XYZZ, 12M + 2S. Used by the merge and the window reduction, which run
+/// 2 * 2^(c-1) times per window against n mixed additions in the accumulation.
+fn pt_add(c: Curve) -> String {
+    let (f, pt, sfx) = (c.f, c.pt, c.suffix);
+    if !microcoded() {
+        return format!(
+            "
+// add-2008-s: XYZZ + XYZZ, 12M + 2S. Used by the merge and the window reduction, which run
+// 2 * 2^(c-1) times per window against n mixed additions in the accumulation.
+fn pt_add_{sfx}(a: {pt}, b: {pt}) -> {pt} {{
+    if (pt_is_zero_{sfx}(a)) {{ return b; }}
+    if (pt_is_zero_{sfx}(b)) {{ return a; }}
+    let u1 = {f}_mul(a.x, b.zz);
+    let u2 = {f}_mul(b.x, a.zz);
+    let s1 = {f}_mul(a.y, b.zzz);
+    let s2 = {f}_mul(b.y, a.zzz);
+    let pd = {f}_sub(u2, u1);
+    let rr = {f}_sub(s2, s1);
+    if ({f}_is_zero(pd)) {{
+        if ({f}_is_zero(rr)) {{ return pt_dbl_{sfx}(a); }}
+        return pt_zero_{sfx}();
+    }}
+    let pp = {f}_sqr(pd);
+    let ppp = {f}_mul(pd, pp);
+    let q = {f}_mul(u1, pp);
+    let rx = {f}_sub({f}_sub({f}_sqr(rr), ppp), {f}_add(q, q));
+    let ry = {f}_sub({f}_mul(rr, {f}_sub(q, rx)), {f}_mul(s1, ppp));
+    return {pt}(rx, ry, {f}_mul({f}_mul(a.zz, b.zz), pp), {f}_mul({f}_mul(a.zzz, b.zzz), ppp));
+}}
+
+"
+        );
+    }
+    let fty = c.fty;
+    let up = sfx.to_uppercase();
+    format!(
+        "
+// add-2008-s, microcoded, for POINT_BODY's reason. 14 multiplies against madd's 10, and the
+// same shape: steps 0..3 are shared, the mode is known after them, and the doubling schedule
+// is dbl-2008-s-1 with a = 0.
+//
+// Registers 0..3 are a, 4..7 are b, 8..15 scratch.
+const ADD_OPS_{up} = array<vec3<u32>, 28>(
+    // generic
+    vec3<u32>(8u, 0u, 6u),   // u1 = a.x * b.zz
+    vec3<u32>(9u, 4u, 2u),   // u2 = b.x * a.zz
+    vec3<u32>(10u, 1u, 7u),  // s1 = a.y * b.zzz
+    vec3<u32>(11u, 5u, 3u),  // s2 = b.y * a.zzz
+    vec3<u32>(14u, 12u, 12u),// pp  = pd * pd
+    vec3<u32>(15u, 12u, 14u),// ppp = pd * pp
+    vec3<u32>(9u, 8u, 14u),  // q   = u1 * pp
+    vec3<u32>(11u, 13u, 13u),// rr  * rr
+    vec3<u32>(9u, 13u, 12u), // rr  * (q - rx)
+    vec3<u32>(13u, 10u, 15u),// s1  * ppp
+    vec3<u32>(2u, 2u, 6u),   // a.zz  * b.zz
+    vec3<u32>(2u, 2u, 14u),  // * pp
+    vec3<u32>(3u, 3u, 7u),   // a.zzz * b.zzz
+    vec3<u32>(3u, 3u, 15u),  // * ppp
+    // dbl-2008-s-1 on a. Rows 0..3 are never read, as above.
+    vec3<u32>(8u, 0u, 6u),
+    vec3<u32>(9u, 4u, 2u),
+    vec3<u32>(10u, 1u, 7u),
+    vec3<u32>(11u, 5u, 3u),
+    vec3<u32>(9u, 8u, 8u),   // v  = u * u
+    vec3<u32>(10u, 8u, 9u),  // w  = u * v
+    vec3<u32>(11u, 0u, 9u),  // s  = a.x * v
+    vec3<u32>(12u, 0u, 0u),  // xx = a.x * a.x
+    vec3<u32>(13u, 12u, 12u),// m  * m
+    vec3<u32>(14u, 12u, 14u),// m  * (s - rx)
+    vec3<u32>(15u, 10u, 1u), // w  * a.y
+    vec3<u32>(2u, 9u, 2u),   // zz'  = v * a.zz
+    vec3<u32>(3u, 10u, 3u),  // zzz' = w * a.zzz
+    vec3<u32>(0u, 0u, 0u),   // unused, and skipped
+);
+
+fn pt_add_{sfx}(a: {pt}, b: {pt}) -> {pt} {{
+    if (pt_is_zero_{sfx}(a)) {{ return b; }}
+    if (pt_is_zero_{sfx}(b)) {{ return a; }}
+    var R: array<{fty}, 16>;
+    R[0] = a.x; R[1] = a.y; R[2] = a.zz; R[3] = a.zzz;
+    R[4] = b.x; R[5] = b.y; R[6] = b.zz; R[7] = b.zzz;
+    var mode = 0u;
+    for (var s = 0u; s < 14u; s = s + 1u) {{
+        if (mode != 2u && !(mode == 1u && s == 13u)) {{
+            let op = ADD_OPS_{up}[mode * 14u + s];
+            R[op.x] = {f}_mul(R[op.y], R[op.z]);
+        }}
+        if (s == 3u) {{
+            R[12] = {f}_sub(R[9], R[8]);
+            R[13] = {f}_sub(R[11], R[10]);
+            if ({f}_is_zero(R[12])) {{
+                if ({f}_is_zero(R[13])) {{
+                    mode = select(1u, 2u, {f}_is_zero(a.y));
+                    R[8] = {f}_add(R[1], R[1]);
+                }} else {{
+                    mode = 2u;
+                }}
+            }}
+        }} else if (mode == 0u && s == 7u) {{
+            R[11] = {f}_sub({f}_sub(R[11], R[15]), {f}_add(R[9], R[9]));
+            R[12] = {f}_sub(R[9], R[11]);
+        }} else if (mode == 0u && s == 9u) {{
+            R[9] = {f}_sub(R[9], R[13]);
+        }} else if (mode == 1u && s == 7u) {{
+            R[12] = {f}_add({f}_add(R[12], R[12]), R[12]);
+        }} else if (mode == 1u && s == 8u) {{
+            R[13] = {f}_sub(R[13], {f}_add(R[11], R[11]));
+            R[14] = {f}_sub(R[11], R[13]);
+        }} else if (mode == 1u && s == 10u) {{
+            R[14] = {f}_sub(R[14], R[15]);
+        }}
+    }}
+    if (mode == 2u) {{ return pt_zero_{sfx}(); }}
+    if (mode == 1u) {{ return {pt}(R[13], R[14], R[2], R[3]); }}
+    return {pt}(R[11], R[9], R[2], R[3]);
+}}
+
+"
+    )
+}
+
 /// Every curve routine, written once in terms of `c.f`.
 fn point_ops(c: Curve) -> String {
     let (f, aff, pt, sfx) = (c.f, c.aff, c.pt, c.suffix);
@@ -573,56 +885,10 @@ fn pt_dbl_{sfx}(p: {pt}) -> {pt} {{
     return {pt}(rx, ry, {f}_mul(v, p.zz), {f}_mul(w, p.zzz));
 }}
 
-// madd-2008-s: XYZZ += affine, 7M + 2S. The inner loop of bucket accumulation and therefore
-// the single hottest routine in this backend.
-fn pt_madd_{sfx}(acc: {pt}, p: {aff}) -> {pt} {{
-    if (aff_is_inf_{sfx}(p)) {{ return acc; }}
-    if (pt_is_zero_{sfx}(acc)) {{ return pt_from_affine_{sfx}(p); }}
-    let u2 = {f}_mul(p.x, acc.zz);
-    let s2 = {f}_mul(p.y, acc.zzz);
-    let pd = {f}_sub(u2, acc.x);
-    let rr = {f}_sub(s2, acc.y);
-    if ({f}_is_zero(pd)) {{
-        // Same x. Either the same point, which doubles, or its negative, which cancels. Both
-        // are reachable: the signed recoding puts a point and its negation in different
-        // buckets, but two different base indices in one bucket can still be equal or
-        // opposite and a zkey does not guarantee distinct bases.
-        if ({f}_is_zero(rr)) {{ return pt_dbl_affine_{sfx}(p); }}
-        return pt_zero_{sfx}();
-    }}
-    let pp = {f}_sqr(pd);
-    let ppp = {f}_mul(pd, pp);
-    let q = {f}_mul(acc.x, pp);
-    let rx = {f}_sub({f}_sub({f}_sqr(rr), ppp), {f}_add(q, q));
-    let ry = {f}_sub({f}_mul(rr, {f}_sub(q, rx)), {f}_mul(acc.y, ppp));
-    return {pt}(rx, ry, {f}_mul(acc.zz, pp), {f}_mul(acc.zzz, ppp));
-}}
-
-// add-2008-s: XYZZ + XYZZ, 12M + 2S. Used by the merge and the window reduction, which run
-// 2 * 2^(c-1) times per window against n mixed additions in the accumulation.
-fn pt_add_{sfx}(a: {pt}, b: {pt}) -> {pt} {{
-    if (pt_is_zero_{sfx}(a)) {{ return b; }}
-    if (pt_is_zero_{sfx}(b)) {{ return a; }}
-    let u1 = {f}_mul(a.x, b.zz);
-    let u2 = {f}_mul(b.x, a.zz);
-    let s1 = {f}_mul(a.y, b.zzz);
-    let s2 = {f}_mul(b.y, a.zzz);
-    let pd = {f}_sub(u2, u1);
-    let rr = {f}_sub(s2, s1);
-    if ({f}_is_zero(pd)) {{
-        if ({f}_is_zero(rr)) {{ return pt_dbl_{sfx}(a); }}
-        return pt_zero_{sfx}();
-    }}
-    let pp = {f}_sqr(pd);
-    let ppp = {f}_mul(pd, pp);
-    let q = {f}_mul(u1, pp);
-    let rx = {f}_sub({f}_sub({f}_sqr(rr), ppp), {f}_add(q, q));
-    let ry = {f}_sub({f}_mul(rr, {f}_sub(q, rx)), {f}_mul(s1, ppp));
-    return {pt}(rx, ry, {f}_mul({f}_mul(a.zz, b.zz), pp), {f}_mul({f}_mul(a.zzz, b.zzz), ppp));
-}}
-
 "
     );
+    s.push_str(&pt_madd(c));
+    s.push_str(&pt_add(c));
     // k * P for a small k: here k is a bucket index inside one window, so it is below 2^15.
     // Plain MSB-first double-and-add, once per reduce thread against a whole segment of
     // bucket additions, so a windowed ladder would not pay for itself.

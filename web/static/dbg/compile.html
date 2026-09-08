@@ -1,0 +1,105 @@
+<!doctype html>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>shader compile timer</title>
+<style>
+  body { font: 14px -apple-system, system-ui, sans-serif; margin: 1rem; background: #0a0e17; color: #eaeef6 }
+  pre { white-space: pre-wrap; word-break: break-word; background: #111725; padding: .6rem; border-radius: 8px }
+  button { font: inherit; padding: .6rem 1rem; margin-right: .5rem }
+</style>
+<h1>shader compile timer</h1>
+<!--
+  How long one pipeline takes to build, on the device that dies building it.
+
+  `kernels.html` says which entry point a device died on and nothing else. What decides
+  whether a device survives is the longest *single* driver operation, because Chrome kills
+  its GPU process when one runs too long, so the number that matters is per pipeline rather
+  than per module. On a Pixel 9 Pro (Mali-G715, Chrome 149) every entry point in either point
+  module took 17 to 29 s and lost the device; the same modules after gen::points::POINT_BODY
+  went to the step table build in 1.7 to 5.1 s and the device lives. An iPhone 15 Pro and an
+  M4 through ANGLE Metal never came close to the line either way, which is why this needed a
+  phone to find.
+
+  Two things here are not optional. Dawn defers over its wire, so createComputePipeline
+  returns in well under a millisecond and every timing taken around it alone reads zero: each
+  one is followed by onSubmittedWorkDone, which is what forces the GPU process to have caught
+  up. And a lost device never settles that promise, so every await races dev.lost; without
+  that a run that kills the device hangs instead of reporting the number it was measuring.
+
+  `?mode=async` builds with createComputePipelineAsync instead. On the Pixel that never
+  returned at all, in ten minutes, which is why the shipped path does not use it (wgpu 30
+  does not expose it either).
+-->
+<p>
+  <button id="g1">G1</button><button id="g2">G2</button><button id="ptadd">ptadd</button>
+</p>
+<pre id="out">idle</pre>
+<script type="module">
+  const out = document.getElementById('out');
+  const log = (s) => { out.textContent += '\n' + s; console.log(s); };
+  const q = new URLSearchParams(location.search);
+  const MODE = q.get('mode') === 'async' ? 'async' : 'sync';
+  const ms = (t) => `${Math.round(t)} ms`;
+
+  const ENTRIES = {
+    g1: ['msm_clear_g1', 'msm_segmented_g1', 'msm_merge_g1', 'msm_reduce_g1', 'msm_ones_g1'],
+    g2: ['msm_clear_g2', 'msm_segmented_g2', 'msm_merge_g2', 'msm_reduce_g2', 'msm_ones_g2'],
+    ptadd: ['main']
+  };
+
+  async function run(name) {
+    out.textContent = `${name} mode=${MODE}`;
+    const src = await (await fetch(`./${name}.wgsl`)).text();
+    log(`source ${src.length} bytes`);
+
+    const t0 = performance.now();
+    const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+    if (!adapter) { log('no adapter'); return; }
+    const dev = await adapter.requestDevice();
+    const info = adapter.info || {};
+    log(`adapter ${[info.vendor, info.architecture, info.device].filter(Boolean).join(' ') || 'unnamed'}`);
+
+    let lost = null;
+    const lostP = dev.lost.then((e) => {
+      lost = `${e.reason}: ${e.message}`;
+      log(`LOST at t+${ms(performance.now() - t0)}: ${lost}`);
+      return 'lost';
+    });
+    const race = (p) => Promise.race([p, lostP]);
+
+    const tm = performance.now();
+    const mod = dev.createShaderModule({ code: src });
+    const ci = await mod.getCompilationInfo();
+    await race(dev.queue.onSubmittedWorkDone());
+    log(`module ${ms(performance.now() - tm)}, ${ci.messages.length} messages`);
+    for (const m of ci.messages) log(`  ${m.type} line ${m.lineNum}: ${m.message}`);
+
+    let worst = 0;
+    for (const entry of ENTRIES[name]) {
+      if (lost) { log(`${entry}: SKIPPED, device already lost`); continue; }
+      const t = performance.now();
+      try {
+        if (MODE === 'async') {
+          await race(dev.createComputePipelineAsync({ layout: 'auto', compute: { module: mod, entryPoint: entry } }));
+        } else {
+          dev.createComputePipeline({ layout: 'auto', compute: { module: mod, entryPoint: entry } });
+          await race(dev.queue.onSubmittedWorkDone());
+        }
+        const took = performance.now() - t;
+        worst = Math.max(worst, took);
+        log(`${entry}: ${ms(took)} (t+${ms(performance.now() - t0)})`);
+      } catch (e) {
+        log(`${entry}: threw after ${ms(performance.now() - t)}: ${e}`);
+      }
+    }
+
+    // The loss is reported asynchronously, so a run that ends the moment the last pipeline
+    // returns can print "alive" for a device that is already gone.
+    await new Promise((r) => setTimeout(r, 2500));
+    log(`worst single pipeline ${ms(worst)}, total ${ms(performance.now() - t0)}`);
+    log('final: ' + (lost ? 'DEVICE LOST ' + lost : 'device alive'));
+  }
+
+  for (const n of ['g1', 'g2', 'ptadd']) document.getElementById(n).onclick = () => run(n);
+  globalThis.__run = run;
+</script>
