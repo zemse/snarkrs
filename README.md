@@ -15,7 +15,7 @@
 
 > note: our CPU benchmarks appear faster than rapidsnark (CPU only) on apple silicon
 
-**warm**:
+**proving (warm)**:
 
 | program         | constraints | g16 cpu | g16 metal | g16 cuda | rapidsnark | snarkjs |
 | --------------- | ----------: | ------: | --------: | -------: | ---------: | ------: |
@@ -27,17 +27,25 @@
 | `keccak256`     |     239,176 |   216.1 |      38.8 |          |      289.0 |         |
 | `anon-aadhaar`  |   1,115,080 |  1764.5 |     263.2 |          |     2120.0 |         |
 
-**cold**:
+**trusted setup** (seconds, not milliseconds; faster of cpu/metal in bold):
 
-| program         | constraints | g16 cpu | g16 metal | g16 cuda | rapidsnark | snarkjs |
-| --------------- | ----------: | ------: | --------: | -------: | ---------: | ------: |
-| `railgun-01x01` |      20,135 |    65.1 |      46.3 |          |       77.0 |   879.7 |
-| `tornado`       |      28,275 |   107.3 |      59.0 |          |      123.1 |  1260.3 |
-| `sha256`        |      59,281 |    64.9 |      46.5 |          |       80.4 |  1141.2 |
-| `railgun-13x01` |     141,276 |   401.7 |     168.9 |          |      436.8 |  4340.2 |
-| `rsa2048`       |     190,945 |   244.9 |     110.8 |          |      360.4 |  3928.5 |
-| `keccak256`     |     239,176 |   231.2 |      87.3 |          |      308.3 |  3380.8 |
-| `anon-aadhaar`  |   1,115,080 |  1894.5 |     523.1 |          |     2195.3 | 22392.5 |
+phase 1, powers of tau, run once for every circuit that follows:
+
+| command            | input    | g16 cpu | g16 metal | snarkjs |
+| ------------------ | -------- | ------: | --------: | ------: |
+| `ptau new`         | power 14 |**0.01** |         — |     0.5 |
+| `ptau contribute`  | power 19 |    36.9 |  **5.6**  |   162.3 |
+| `ptau beacon`      | power 19 |    37.0 |  **5.6**  |   162.0 |
+| `ptau prepare`     | power 20 |   963.9 |**142.6**  |  ~9,300 |
+| `ptau verify`      | power 20 |**16.9** |         — |   116.4 |
+
+phase 2, the proving key, run once per circuit:
+
+| command                | domain | g16 cpu  | g16 metal | snarkjs |
+| ---------------------- | ------ | -------: | --------: | ------: |
+| `setup` circom         | 2^20   |     17.4 | **17.1**  |    86.4 |
+| `zkey contribute`      | 2^20   |     16.4 |  **1.8**  |    72.6 |
+| `zkey beacon`          | 2^20   |     16.3 |  **1.8**  |    73.6 |
 
 ### g4dn.2xlarge
 
@@ -52,18 +60,6 @@
 | `rsa2048`       |     190,945 |   776.9 |           |     64.7 |      790.5 |         |
 | `keccak256`     |     239,176 |   758.1 |           |     51.4 |      682.0 |         |
 | `anon-aadhaar`  |   1,115,080 |  5925.0 |           |    406.5 |     5774.0 |         |
-
-**cold**:
-
-| program         | constraints | g16 cpu | g16 metal | g16 cuda | rapidsnark | snarkjs |
-| --------------- | ----------: | ------: | --------: | -------: | ---------: | ------: |
-| `railgun-01x01` |      20,135 |   238.8 |           |    266.5 |      171.0 |  1757.4 |
-| `tornado`       |      28,275 |   407.2 |           |    281.2 |      298.2 |  2517.4 |
-| `sha256`        |      59,281 |   214.9 |           |    269.1 |      183.4 |  2318.1 |
-| `railgun-13x01` |     141,276 |  1496.9 |           |    429.8 |     1187.4 |  8157.4 |
-| `rsa2048`       |     190,945 |   846.2 |           |    401.2 |      797.9 |  6904.7 |
-| `keccak256`     |     239,176 |   788.1 |           |    388.8 |      703.3 |  6807.9 |
-| `anon-aadhaar`  |   1,115,080 |  6296.8 |           |   1735.9 |     5627.8 | 44888.9 |
 
 > note: constraint count is a poor predictor of proving time. e.g. `railgun-13x01` has fewer constraints than `keccak256` but takes more to prove.
 
