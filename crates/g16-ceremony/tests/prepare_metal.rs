@@ -18,12 +18,12 @@
 //! either, being the only case that runs `prepare::ifft_block`'s fallback arm
 //! (prepare.rs:352) on a backend that is not `CpuGroupFft`.
 //!
-//! The fourth crosses the command-buffer boundary. A pass larger than the backend's ladder
-//! budget is split across submissions with a `gid_off`, and the shipped budget is 2^19
-//! ladders, which no file small enough to test reaches: only section 12's top block at
-//! power 20 and above does, and that is the block whose first version macOS killed. So the
+//! The fourth crosses the command-buffer boundary. The backend runs one pass per command
+//! buffer and splits a pass larger than its ladder budget across several with a `gid_off`;
+//! the shipped budget is 2^19 ladders on G1, which only section 12's top block at power 20
+//! and above reaches, so on any file a test can afford `gid_off` would always be zero. The
 //! `split` pass shrinks the budget to 300 and makes a power-10 file cross it hundreds of
-//! times.
+//! times instead.
 //!
 //! Block sizes are the other boundary and a power-13 input crosses the crossover on its
 //! own: it holds every block from 2^0 to 2^14, three of them above the shipped threshold
