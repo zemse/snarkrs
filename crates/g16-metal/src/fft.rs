@@ -283,7 +283,10 @@ impl FftKernels {
             window_g1: env_window("G16_METAL_FFT_C_G1", FFT_WINDOW_G1),
             window_g2: env_window("G16_METAL_FFT_C_G2", FFT_WINDOW_G2),
             min_block: env_min_block(),
-            budget: env_usize("G16_METAL_FFT_BUDGET"),
+            // Floored at 1 for the reason `with_budget` floors it: `run_pass` advances by
+            // `budget.min(remaining)`, so a budget of 0 never advances and the command
+            // hangs with no error and no output.
+            budget: env_usize("G16_METAL_FFT_BUDGET").map(|n| n.max(1)),
         })
     }
 
