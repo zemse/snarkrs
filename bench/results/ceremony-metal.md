@@ -11,22 +11,43 @@ run anyway, but the `cmp` is the check that catches a wrong point.
 ## The result
 
 Median of 3 whole-process runs, seconds, on the largest production input each command has.
+Ordered the way a ceremony is actually run, not by how well the GPU does: every phase-1
+command once for the whole ecosystem, then every phase-2 command once per circuit.
 
-| command | input | snarkjs 0.7.6 | g16 cpu | g16 metal | metal vs cpu | metal vs snarkjs |
-|---|---|---:|---:|---:|---:|---:|
-| `ptau prepare` | power 20 | ~9,300 (extrapolated) | 963.85 | **142.62** | **6.76x** | ~65x |
-| `zkey contribute` | 2^20, `--O1` | 72.57 | 16.35 | **1.80** | **9.08x** | 40.3x |
-| `zkey beacon` | 2^20, `--O1` | 73.55 | 16.29 | **1.80** | **9.05x** | 40.9x |
-| `ptau beacon` | power 19 | 161.97 | 36.98 | **5.57** | **6.64x** | 29.1x |
-| `ptau contribute` | power 19 | 162.28 | 36.90 | **5.59** | **6.60x** | 29.0x |
-| `setup`, circom `--O1` | 2^20 | 86.44 | **17.36** | 17.14 | 1.01x | 5.0x |
-| `setup`, circom `--O2` | 2^18 | 329.39 | **52.40** | 137.14 | **0.38x** | 2.4x |
+### Phase 1, powers of tau, circuit independent
 
-Five of the six win. `setup` is the sixth and it is bold in the CPU column on purpose: on
-circom's default output the GPU is a wash, and on the dense `--O2` output it is a 2.6x loss.
-Its `--backend cpu` stays the default and the reason is in its own section below.
+| # | command | input | snarkjs 0.7.6 | g16 cpu | g16 metal | metal vs cpu |
+|---|---|---|---:|---:|---:|---:|
+| 1 | `ptau new` | power 14 | 0.51 | **0.01** | no group operation | — |
+| 2 | `ptau contribute` | power 19 | 162.28 | 36.90 | **5.59** | **6.60x** |
+| 3 | `ptau beacon` | power 19 | 161.97 | 36.98 | **5.57** | **6.64x** |
+| 4 | `ptau prepare` | power 20 | ~9,300 (extrapolated) | 963.85 | **142.62** | **6.76x** |
+| 5 | `ptau verify` | power 20, prepared | 116.41 | **16.90** | pairings, not scalar mul | — |
+| — | `ptau info` | any | none | **0.00** | reads no point | — |
 
-Every one of those Metal outputs is byte-identical to the CPU one it is timed against.
+### Phase 2, the proving key, once per circuit
+
+| # | command | input | snarkjs 0.7.6 | g16 cpu | g16 metal | metal vs cpu |
+|---|---|---|---:|---:|---:|---:|
+| 6 | `setup`, circom `--O1` | 2^20 | 86.44 | **17.36** | 17.14 | 1.01x |
+| 6 | `setup`, circom `--O2` | 2^18 | 329.39 | **52.40** | 137.14 | **0.38x** |
+| 7 | `zkey contribute` | 2^20, `--O1` | 72.57 | 16.35 | **1.80** | **9.08x** |
+| 8 | `zkey beacon` | 2^20, `--O1` | 73.55 | 16.29 | **1.80** | **9.05x** |
+| 9 | `zkey verify` | 2^20, `--O1` | see below | pinned to cpu | deliberately none | — |
+| 10 | `zkey export-verificationkey` | any build | none | **0.008** | reads five sections | — |
+
+Read down the phase-1 table and the case for this backend is `ptau prepare` on line 4: it is
+the only step in the ceremony that costs hours, and it is the one the GPU takes furthest.
+Read down phase 2 and the case is lines 7 and 8, where the constant-scalar rescaling beats
+the arithmetic ceiling. Line 6 is the exception in both tables, and it is bold in the CPU
+column on purpose: on circom's default output the GPU is a wash, and on the dense `--O2`
+output it is a 2.6x loss. Its `--backend cpu` stays the default and the reason is in its own
+section below.
+
+Four rows carry a dash rather than a number because those commands have no Metal path, and
+none of that is an oversight. `## The commands with no Metal path` says why for each.
+
+Every one of the Metal outputs above is byte-identical to the CPU one it is timed against.
 
 ## Method
 
