@@ -112,6 +112,10 @@ pub trait PrepareCurve: RawCurve {
     /// The one call the transform cannot express generically: [`GroupFft`] has a separate
     /// entry point per group, the same way [`g16_msm::MsmBackend`] does.
     fn ifft(fft: &dyn GroupFft, a: &mut [Xyzz<Self::RF>]) -> Result<(), AccelError>;
+    /// The section read and write, which [`Ptau`] and [`BinFileWriter`] also split per
+    /// group. Carried here so [`process_section`] is one function rather than a pair.
+    fn read_points(src: &Ptau, id: u32, n: usize) -> Result<Vec<Affine<Self>>, CeremonyError>;
+    fn write_block(out: &mut BinFileWriter, block: &[Affine<Self>]) -> Result<(), CeremonyError>;
 }
 
 impl PrepareCurve for g16_field::g1::Config {
@@ -125,6 +129,12 @@ impl PrepareCurve for g16_field::g1::Config {
     fn ifft(fft: &dyn GroupFft, a: &mut [Xyzz<RawFq>]) -> Result<(), AccelError> {
         fft.ifft_g1(a)
     }
+    fn read_points(src: &Ptau, id: u32, n: usize) -> Result<Vec<G1Affine>, CeremonyError> {
+        src.g1_points(id, 0, n)
+    }
+    fn write_block(out: &mut BinFileWriter, block: &[G1Affine]) -> Result<(), CeremonyError> {
+        out.write_g1_slice(block)
+    }
 }
 
 impl PrepareCurve for g16_field::g2::Config {
@@ -137,6 +147,12 @@ impl PrepareCurve for g16_field::g2::Config {
     }
     fn ifft(fft: &dyn GroupFft, a: &mut [Xyzz<RawFq2>]) -> Result<(), AccelError> {
         fft.ifft_g2(a)
+    }
+    fn read_points(src: &Ptau, id: u32, n: usize) -> Result<Vec<G2Affine>, CeremonyError> {
+        src.g2_points(id, 0, n)
+    }
+    fn write_block(out: &mut BinFileWriter, block: &[G2Affine]) -> Result<(), CeremonyError> {
+        out.write_g2_slice(block)
     }
 }
 
@@ -580,46 +596,58 @@ pub fn prepare_phase2(
         out.write_section_verbatim(*id, src.section(*id)?)?;
     }
 
-    process_section_g1(&src, &mut out, S_TAU_G1, S_LAGRANGE_TAU_G1, fft)?;
-    process_section_g2(&src, &mut out, S_TAU_G2, S_LAGRANGE_TAU_G2, fft)?;
-    process_section_g1(&src, &mut out, S_ALPHA_TAU_G1, S_LAGRANGE_ALPHA_TAU_G1, fft)?;
-    process_section_g1(&src, &mut out, S_BETA_TAU_G1, S_LAGRANGE_BETA_TAU_G1, fft)?;
+    process_section::<g16_field::g1::Config>(&src, &mut out, S_TAU_G1, S_LAGRANGE_TAU_G1, fft)?;
+    process_section::<g16_field::g2::Config>(&src, &mut out, S_TAU_G2, S_LAGRANGE_TAU_G2, fft)?;
+    process_section::<g16_field::g1::Config>(
+        &src,
+        &mut out,
+        S_ALPHA_TAU_G1,
+        S_LAGRANGE_ALPHA_TAU_G1,
+        fft,
+    )?;
+    process_section::<g16_field::g1::Config>(
+        &src,
+        &mut out,
+        S_BETA_TAU_G1,
+        S_LAGRANGE_BETA_TAU_G1,
+        fft,
+    )?;
 
     out.finish()
 }
 
-/// `processSection` for a G1 pair (`powersoftau_preparephase2.js:52-70`).
-///
-/// One block per power, ascending, and one extra block for section 2. Blocks are
-/// transformed and written one at a time so the resident set is the largest block rather
-/// than the whole section: at power 28 the difference is 32 GB against 1 TB.
-fn process_section_g1(
+/// The input of block `p`: the first `2^p` points of the section. The one exception is
+/// section 12's `power+1` block, whose section holds `2n - 1` points against the `2n` the
+/// block wants, so the last input slot is the point at infinity
+/// (`powersoftau_preparephase2.js:78-81`).
+fn block_input<P: PrepareCurve>(
     src: &Ptau,
-    out: &mut BinFileWriter,
     from: u32,
-    to: u32,
-    fft: &dyn GroupFft,
-) -> Result<(), CeremonyError> {
-    let power = src.header().power;
-    out.start_section(to)?;
-    for p in 0..=power {
-        let block = lagrange_evaluations_g1(&src.g1_points(from, 0, 1usize << p)?, fft)?;
-        out.write_g1_slice(&block)?;
+    p: u32,
+    power: u32,
+) -> Result<Vec<Affine<P>>, CeremonyError> {
+    let n = 1usize << p;
+    if p <= power {
+        P::read_points(src, from, n)
+    } else {
+        let mut input = P::read_points(src, from, n - 1)?;
+        input.push(Affine::<P>::identity());
+        Ok(input)
     }
-    if from == S_TAU_G1 {
-        // Section 2 holds `2n - 1` points and this block wants `2n`, so the last input
-        // slot is the point at infinity (`powersoftau_preparephase2.js:78-81`).
-        let n = 1usize << (power + 1);
-        let mut input = src.g1_points(from, 0, n - 1)?;
-        input.push(G1Affine::identity());
-        let block = lagrange_evaluations_g1(&input, fft)?;
-        out.write_g1_slice(&block)?;
-    }
-    out.end_section()
 }
 
-/// [`process_section_g1`] for section 3, the only G2 pair, which has no `power+1` block.
-fn process_section_g2(
+/// `processSection` for one pair (`powersoftau_preparephase2.js:52-70`).
+///
+/// One block per power, ascending, and one extra block for section 2. Blocks at the
+/// backend are transformed and written one at a time so the resident set is the largest
+/// block rather than the whole section: at power 28 the difference is 32 GB against 1 TB.
+///
+/// Blocks below the backend's crossover are a different schedule. Each of them would run
+/// on the CPU through `ifft_block` anyway, and run in the gaps between device blocks they
+/// serialize with a device that sits idle for them: measured at power 15 on an M2 Max,
+/// 1.12 s of a 5.87 s wall. They are independent transforms, so a worker thread runs them
+/// while the device blocks proceed, and only the writes keep the ascending block order.
+fn process_section<P: PrepareCurve>(
     src: &Ptau,
     out: &mut BinFileWriter,
     from: u32,
@@ -627,11 +655,47 @@ fn process_section_g2(
     fft: &dyn GroupFft,
 ) -> Result<(), CeremonyError> {
     let power = src.header().power;
+    let last = if from == S_TAU_G1 { power + 1 } else { power };
+    let small = (0..=last)
+        .take_while(|&p| (1usize << p) < fft.min_block())
+        .count() as u32;
     out.start_section(to)?;
-    for p in 0..=power {
-        let block = lagrange_evaluations_g2(&src.g2_points(from, 0, 1usize << p)?, fft)?;
-        out.write_g2_slice(&block)?;
-    }
+    std::thread::scope(|s| -> Result<(), CeremonyError> {
+        let mut cpu = Some(s.spawn(move || -> Result<Vec<_>, CeremonyError> {
+            (0..small)
+                .map(|p| lagrange_evaluations::<P>(&block_input::<P>(src, from, p, power)?, fft))
+                .collect()
+        }));
+        // Device blocks finished before the worker are held rather than written. The
+        // worker's blocks together are smaller than one device block, so in practice it
+        // finishes during the first one or two and this never holds much of the section.
+        let mut held: Vec<Vec<Affine<P>>> = Vec::new();
+        for p in small..=last {
+            let block = lagrange_evaluations::<P>(&block_input::<P>(src, from, p, power)?, fft)?;
+            if let Some(h) = cpu.take_if(|h| h.is_finished()) {
+                for b in h.join().expect("cpu ifft worker panicked")? {
+                    P::write_block(out, &b)?;
+                }
+            }
+            if cpu.is_none() {
+                for b in held.drain(..) {
+                    P::write_block(out, &b)?;
+                }
+                P::write_block(out, &block)?;
+            } else {
+                held.push(block);
+            }
+        }
+        if let Some(h) = cpu.take() {
+            for b in h.join().expect("cpu ifft worker panicked")? {
+                P::write_block(out, &b)?;
+            }
+            for b in held.drain(..) {
+                P::write_block(out, &b)?;
+            }
+        }
+        Ok(())
+    })?;
     out.end_section()
 }
 
