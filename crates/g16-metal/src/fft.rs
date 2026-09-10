@@ -52,9 +52,17 @@ use crate::msm::{PackedXyzzG1, PackedXyzzG2};
 ///
 /// It is 2.6%, which is small, but it is reproducible to 0.02 s and it goes the opposite
 /// way to the isolated sweep, so it is worth having the two numbers differ rather than
-/// sharing one. The likely reason is that the ladders here run with far more of them
-/// resident at once, so the wider table's extra spill traffic overlaps with work in a way
-/// a benchmark of one dispatch does not show. c=6 is not compiled: `CER_WINDOWS` stops at
+/// sharing one. The disagreement is the isolated sweep's: its scalars come from
+/// `ceremony::tests::Lcg`, which stops well short of the top of the field, and a ladder
+/// pays nothing for a window above a scalar's highest set bit, so its table build is
+/// amortised over fewer windows than a real twiddle's and the narrow widths come out
+/// flattered. The twiddles here are full-width by construction.
+///
+/// Those wall times are the build before the dense grid, the fused scale and the
+/// co-dispatch, so read the table as a ranking and not as what the command costs now.
+/// Re-swept on the current build the four uniform widths keep that order; the crossed
+/// pair no longer separates from (5,5) on a machine this loaded, so the split between the
+/// two constants stands on the older reading. c=6 is not compiled: `CER_WINDOWS` stops at
 /// 5, the gain is flattening, and 16 entries of 256 bytes is 4 KB a thread on G2.
 const FFT_WINDOW_G1: u32 = 5;
 /// See [`FFT_WINDOW_G1`]; G2 wants the same width and gains the same 1%.
@@ -170,8 +178,9 @@ impl FftGroup for FftG1 {
     type PackedPoint = PackedXyzzG1;
 
     const OP: &'static str = "G1";
-    // 2^19 ladders, from the 30.9 ms `ceremony.rs` measured for 2^16 G1 point
-    // multiplications: about 250 ms of GPU work.
+    // 2^19 ladders, four times G2's because a G1 ladder is the cheaper one, so a command
+    // buffer holds comparable work whichever group it is. A throughput and blast-radius
+    // knob rather than a safety one; see `run_round`.
     const BUDGET: usize = 1 << 19;
     const SCRATCH: usize = core::mem::size_of::<PackedXyzzG1>();
 
@@ -207,8 +216,8 @@ impl FftGroup for FftG2 {
     type PackedPoint = PackedXyzzG2;
 
     const OP: &'static str = "G2";
-    // 2^17 ladders, from the 104 ms `ceremony.rs` measured for 2^16 G2 point
-    // multiplications: about 210 ms, the same target G1 gets from a wider slice.
+    // 2^17 ladders, a quarter of G1's because a G2 ladder is several times a G1 one. The
+    // same target from a narrower slice; see `FftG1::BUDGET`.
     const BUDGET: usize = 1 << 17;
     const SCRATCH: usize = core::mem::size_of::<PackedXyzzG2>();
 

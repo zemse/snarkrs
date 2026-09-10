@@ -330,7 +330,8 @@ fn apply_key_on_host<C: AffineRepr<ScalarField = Fr>>(points: &mut [C], first: F
 /// where the message names the missing kernel, rather than at dispatch.
 pub(crate) const CER_WINDOWS: [u32; 4] = [2, 3, 4, 5];
 
-/// Ladder window for G1. Measured, not derived: see [`WINDOW_G2`].
+/// Ladder window for G1. Swept, not derived, and the sweep has a caveat: see
+/// [`WINDOW_G2`].
 const WINDOW_G1: u32 = 4;
 
 /// Ladder window for G2, and the same width G1 takes.
@@ -340,23 +341,22 @@ const WINDOW_G1: u32 = 4;
 /// digit, so it cannot live in registers at all: `Xyzz<Fq>` is 128 bytes and `Xyzz<Fq2>`
 /// is 256, and `2^(c-1)` multiples is 1 KB per thread at c=4 on G1 and at c=3 on G2.
 ///
-/// The sweep is `tests::window_sweep`, 2^16 full-width scalars, medians of four on this
-/// M2 Max:
+/// The sweep behind both is `tests::window_sweep`, 2^16 isolated multiplications on this
+/// M2 Max, and its milliseconds are not quotable. Its scalars come from `tests::Lcg`,
+/// which stops around 2^107, and `pt_mul` pays nothing for a window above a scalar's
+/// highest set bit, so every rate it printed is optimistic by roughly the ratio of 254
+/// bits to 107. The bias is not flat in `c` either: the table is `2^(c-1)` point
+/// operations whatever the scalar is, so a short scalar amortises it over fewer windows
+/// and the sweep leans narrow.
 ///
-/// | c | G1 ms | G2 ms |
-/// |---|---:|---:|
-/// | 2 | 41.2 | 126.1 |
-/// | 3 | **30.9** | 109.5 |
-/// | 4 | **30.9** | **103.9** |
-/// | 5 | 32.5 | 105.1 |
-///
-/// Two results worth keeping. G1 at c=3 and c=4 is a dead tie, so 4 is taken for having
-/// the smaller multiply count and therefore the more headroom; the choice is worth about
-/// 2% either way and is not worth re-tuning. And G2 does NOT want a narrower window than
-/// G1, which is what the register-pressure argument predicted: 8 entries of 256 bytes is
-/// 2 KB a thread and it still beats c=3 by 5%. The spill is real, the ladder is simply
-/// not latency bound on it, because the doublings between two table reads are enough work
-/// to cover the load.
+/// The result that survives the lean is the one the lean was against. G2 does NOT want a
+/// narrower window than G1, which is what the register-pressure argument predicted: 8
+/// entries of 256 bytes is 2 KB a thread and it still beat c=3. The spill is real, the
+/// ladder is simply not latency bound on it, because the doublings between two table
+/// reads are enough work to cover the load. What does not survive is the choice of 4 over
+/// 5: `fft::FFT_WINDOW_G1`, swept through a whole `ptau prepare` whose twiddles are
+/// full-width, lands on 5 for both groups. These two constants have never been swept on a
+/// scalar that reaches the top of the field.
 const WINDOW_G2: u32 = 4;
 
 /// Points one thread owns in each of the two batch-to-affine passes.
@@ -1034,9 +1034,15 @@ mod tests {
         assert!(CER_WINDOWS.contains(&WINDOW_G2));
     }
 
-    /// Deterministic full-width `Fr`, so a failure is reproducible without a seed to
-    /// record. Three 64-bit draws combined multiplicatively, which reaches the top of the
-    /// field rather than the bottom 64 bits `Fr::from(u64)` alone would give.
+    /// Deterministic `Fr`, so a failure is reproducible without a seed to record. Three
+    /// draws combined as `a*b + c`, which reaches past the bottom 64 bits `Fr::from(u64)`
+    /// alone would give and nowhere near the top of the field: `word` yields 53 bits, so
+    /// the value is under 2^107.
+    ///
+    /// That is enough for the correctness tests, whose extremes come from
+    /// `corner_scalars`, and it disqualifies these scalars for a timing one. `pt_mul` pays
+    /// nothing for a window above the highest set bit, so more than half the ladder is
+    /// skipped and any rate measured on them is optimistic by roughly 254/107.
     struct Lcg(u64);
 
     impl Lcg {

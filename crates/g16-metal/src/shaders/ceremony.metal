@@ -34,8 +34,8 @@
 //    `Xyzz<Fq>` is 128 bytes and `Xyzz<Fq2>` is 256, so a table of `2^(c-1)` multiples is
 //    1 KB per thread at c=4 on G1 and at c=3 on G2. That is past what the register file
 //    holds and the spill is what actually decides the width, not the multiply count, so
-//    the width cannot be reasoned out. `ceremony.rs` sweeps the compiled widths and its
-//    doc comment carries the measurement.
+//    the width cannot be reasoned out. `ceremony.rs` sweeps the compiled widths, and
+//    `WINDOW_G2` there says what that sweep can and cannot be read for.
 //
 // 3. THE ONE INVERSION PER BATCH GOES BACK TO THE HOST.
 //    There is no `f_inv` in any shader in this crate and this file does not add one. A
