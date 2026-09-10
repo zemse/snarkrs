@@ -556,14 +556,14 @@ impl FftKernels {
     ///
     /// The obvious design was one command buffer for a whole block: consecutive
     /// dispatches on a serial compute encoder are already ordered with an implicit
-    /// barrier, so 85 commit-and-waits in a power-20 run rather than 946 at 0.149 ms each
-    /// was there for the taking. macOS took it back. A submission that keeps the GPU busy
+    /// barrier, so one commit-and-wait per block rather than one per budget piece was
+    /// there for the taking. macOS took it back. A submission that keeps the GPU busy
     /// while the GPU is also driving a display returns
     /// `kIOGPUCommandBufferCallbackErrorImpactingInteractivity`, and it is NOT a duration
     /// limit that a smaller buffer stays under. Measured on this M2 Max: the same
-    /// 2^19-point G2 block was killed 6.8 s into a run whose command buffers were 210 ms
-    /// each, and finished in 16.6 s with exactly those command buffers when the machine
-    /// was quiet; a power-20 run died with 13 ms ones. The trigger is contention with
+    /// 2^19-point G2 block was killed 6.8 s into a run, and finished in 16.6 s with
+    /// exactly the same command-buffer split when the machine was quiet; a power-20 run
+    /// died on buffers an order of magnitude smaller still. The trigger is contention with
     /// whatever else wants the GPU, so this survives the kill instead of trying to avoid
     /// it.
     ///
