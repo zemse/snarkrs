@@ -126,34 +126,48 @@ inline void fft_mix_impl(device const Xyzz<F>* in,
 }
 
 // ---------------------------------------------------------------------------
-// The `1/n` pass
+// The last mix pass, with the `1/n` scaling fused in
 // ---------------------------------------------------------------------------
 
-// `out[i] <- [1/n] in[i]`, the `fftFinal` scaling. One scalar for the whole dispatch, so
-// it arrives as a single standard-form `Scalar` in a buffer rather than through the params
-// struct, which holds only `uint`s.
+// `out[lo], out[hi] <- [s] in[lo] + [s w^j] in[hi], [s] in[lo] - [s w^j] in[hi]` with
+// `s = 1/n`, for pass `exp == bits` only. Exact by distributivity:
+// `[s](u + [w^j]v) == [s]u + [s w^j]v`, and the exit through `batch_to_affine` is what
+// keeps the different representative from mattering, as ever.
 //
-// This is 12.8% of the command on the CPU and it is the same 12.8% here: a full-width
-// ladder per point either way. It is not fused into the first pass, whose twiddles are all
-// one, because scaling both butterfly inputs is `n` ladders and a separate pass is also
-// `n` ladders, and the transform is 400x compute bound, so the pass over the vector it
-// would save is not worth a second kernel that can be wrong. It ping-pongs like a mix
-// pass, for the same retry reason.
+// The `fftFinal` scaling used to be its own pass, on the argument that scaling both
+// butterfly inputs is `n` ladders and a separate pass is also `n` ladders. What that
+// argument misses is the last mix pass it can absorb: separate, the two cost
+// `n/2 - 1 + n` ladders; fused they cost `n`, because the host folds `s` into the
+// twiddle table (`stw[j] = s * W^j`, so `stw[0] == s` covers the `u` side) and each
+// thread runs exactly two ladders. That is `n/2 - 1` ladders saved per block, 1/bits of
+// the block's total, and the `j == 0` skip is gone: `[s]v` is a real ladder now, so the
+// pass has no idle lanes at all.
+//
+// The last pass has exactly one group, so `lo` is `gid` and `hi` is `gid + n/2` with no
+// group arithmetic. Still out of place and read-only on `in`, so the retry story is
+// unchanged; each thread is two ladders, so `fft.rs` halves this pass's thread budget to
+// keep command-buffer duration flat.
 template <typename F, uint C>
-inline void fft_scale_impl(device const Xyzz<F>* in,
-                           device Xyzz<F>* out,
-                           device const uint* k,
-                           constant FftParams& p,
-                           uint tid) {
+inline void fft_mix_scale_impl(device const Xyzz<F>* in,
+                               device Xyzz<F>* out,
+                               device const uint* stw,
+                               constant FftParams& p,
+                               uint tid) {
     uint gid = tid + p.gid_off;
-    if (gid >= p.n) {
+    uint half_n = p.n >> 1u;
+    if (gid >= half_n) {
         return;
     }
     uint s[8];
+    uint k[8];
     for (uint i = 0; i < 8u; i++) {
-        s[i] = k[i];
+        s[i] = stw[i];
+        k[i] = stw[gid * 8u + i];
     }
-    out[gid] = pt_mul<F, C>(in[gid], s);
+    Xyzz<F> t = pt_mul<F, C>(in[gid + half_n], k);
+    Xyzz<F> u = pt_mul<F, C>(in[gid], s);
+    out[gid] = pt_add(u, t);
+    out[gid + half_n] = pt_add(u, pt_neg(t));
 }
 
 // ---------------------------------------------------------------------------
@@ -164,20 +178,20 @@ inline void fft_scale_impl(device const Xyzz<F>* in,
 // names from the same width list `ceremony.rs` uses.
 // ---------------------------------------------------------------------------
 
-#define FFT_KERNELS(SUF, FT, PTT, C)                                     \
-    kernel void fft_mix_##SUF(device const PTT* in [[buffer(0)]],        \
-                              device PTT* out [[buffer(1)]],             \
-                              device const uint* tw [[buffer(2)]],       \
-                              constant FftParams& p [[buffer(3)]],       \
-                              uint tid [[thread_position_in_grid]]) {    \
-        fft_mix_impl<FT, C>(in, out, tw, p, tid);                        \
-    }                                                                    \
-    kernel void fft_scale_##SUF(device const PTT* in [[buffer(0)]],      \
-                                device PTT* out [[buffer(1)]],           \
-                                device const uint* k [[buffer(2)]],      \
-                                constant FftParams& p [[buffer(3)]],     \
-                                uint tid [[thread_position_in_grid]]) {  \
-        fft_scale_impl<FT, C>(in, out, k, p, tid);                       \
+#define FFT_KERNELS(SUF, FT, PTT, C)                                         \
+    kernel void fft_mix_##SUF(device const PTT* in [[buffer(0)]],            \
+                              device PTT* out [[buffer(1)]],                 \
+                              device const uint* tw [[buffer(2)]],           \
+                              constant FftParams& p [[buffer(3)]],           \
+                              uint tid [[thread_position_in_grid]]) {        \
+        fft_mix_impl<FT, C>(in, out, tw, p, tid);                            \
+    }                                                                        \
+    kernel void fft_mix_scale_##SUF(device const PTT* in [[buffer(0)]],      \
+                                    device PTT* out [[buffer(1)]],           \
+                                    device const uint* stw [[buffer(2)]],    \
+                                    constant FftParams& p [[buffer(3)]],     \
+                                    uint tid [[thread_position_in_grid]]) {  \
+        fft_mix_scale_impl<FT, C>(in, out, stw, p, tid);                     \
     }
 
 FFT_KERNELS(g1_c2, Fq, PtG1, 2u)

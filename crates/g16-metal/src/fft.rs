@@ -105,18 +105,21 @@ const _: () = {
 
 /// One pass: what [`FftKernels::run_pass`] encodes into one command buffer, split across
 /// several if it is bigger than the budget. `third` is the twiddle table for a mix pass
-/// and the single `1/n` scalar for the scaling pass.
+/// and the `1/n`-scaled twiddle table for the fused final pass. `ladders_per_thread` is
+/// what the budget divides by: 1 for a mix pass, 2 for the fused one, so a command
+/// buffer's duration does not double where every thread runs two ladders.
 struct Pass<'a> {
     pso: &'a ComputePipelineState,
     third: &'a Buffer,
     params: FftParams,
     threads: usize,
+    ladders_per_thread: usize,
 }
 
 /// The pipelines for one group, parallel to [`CER_WINDOWS`].
 struct FftPipelines {
     mix: Vec<ComputePipelineState>,
-    scale: Vec<ComputePipelineState>,
+    mix_scale: Vec<ComputePipelineState>,
 }
 
 /// What the two kernels need to know about a group, so the submission code is written
@@ -264,12 +267,12 @@ impl FftKernels {
 
         let group = |g: &str| -> Result<FftPipelines, ProveError> {
             let mut mix = Vec::with_capacity(CER_WINDOWS.len());
-            let mut scale = Vec::with_capacity(CER_WINDOWS.len());
+            let mut mix_scale = Vec::with_capacity(CER_WINDOWS.len());
             for c in CER_WINDOWS {
                 mix.push(pso(&format!("fft_mix_{g}_c{c}"))?);
-                scale.push(pso(&format!("fft_scale_{g}_c{c}"))?);
+                mix_scale.push(pso(&format!("fft_mix_scale_{g}_c{c}"))?);
             }
-            Ok(FftPipelines { mix, scale })
+            Ok(FftPipelines { mix, mix_scale })
         };
 
         let g1 = group("g1")?;
@@ -363,7 +366,7 @@ impl FftKernels {
         let pipelines = G::pipelines(self);
         let idx = window_index(G::window(self));
         let mix = &pipelines.mix[idx];
-        let scale = &pipelines.scale[idx];
+        let mix_scale = &pipelines.mix_scale[idx];
 
         // Ping-pong. `src` holds the input of the pass about to run and is never written
         // by it, which is the whole reason a killed command buffer can simply be re-run;
@@ -389,13 +392,16 @@ impl FftKernels {
             slots[bit_reverse_index(i, bits)] = G::pack(p);
         }
 
-        let tw = self.buffer(&twiddle_table(bits));
+        let tw = self.buffer(&twiddle_table(bits, Fr::ONE));
         let size_inv = Fr::from(n as u64)
             .inverse()
             .expect("a power of two is a unit mod r");
-        let inv = self.buffer(&[PackedScalar::from_fr(&size_inv)]);
+        // The `1/n` scaling rides the last mix pass (see `fft_mix_scale_impl`), so the
+        // final pass reads a second table with `s` folded into every entry, and `stw[0]`
+        // doubles as the plain `[s]` the `lo` side needs.
+        let stw = self.buffer(&twiddle_table(bits, size_inv));
 
-        for exp in 1..=bits {
+        for exp in 1..bits {
             self.run_pass::<G>(
                 &src,
                 &dst,
@@ -410,6 +416,7 @@ impl FftKernels {
                         gid_off: 0,
                     },
                     threads: n / 2,
+                    ladders_per_thread: 1,
                 },
             )?;
             core::mem::swap(&mut src, &mut dst);
@@ -418,13 +425,14 @@ impl FftKernels {
             &src,
             &dst,
             &Pass {
-                pso: scale,
-                third: &inv,
+                pso: mix_scale,
+                third: &stw,
                 params: FftParams {
                     n: n as u32,
                     ..Default::default()
                 },
-                threads: n,
+                threads: n / 2,
+                ladders_per_thread: 2,
             },
         )?;
         core::mem::swap(&mut src, &mut dst);
@@ -479,7 +487,10 @@ impl FftKernels {
         dst: &Buffer,
         pass: &Pass,
     ) -> Result<(), ProveError> {
-        let budget = self.budget.unwrap_or(G::BUDGET);
+        // Threads, not ladders: the fused final pass runs two ladders per thread, and
+        // dividing here is what keeps its command buffers the same duration as a mix
+        // pass's. Floored at 1 so a tiny test budget still advances.
+        let budget = (self.budget.unwrap_or(G::BUDGET) / pass.ladders_per_thread).max(1);
         let mut done = 0usize;
         while done < pass.threads {
             let take = budget.min(pass.threads - done);
@@ -553,9 +564,11 @@ impl FftKernels {
     }
 }
 
-/// `W^i` for `i < 2^(bits-1)`, with `W` the primitive `2^bits`-th root, in STANDARD form.
+/// `first * W^i` for `i < 2^(bits-1)`, with `W` the primitive `2^bits`-th root, in
+/// STANDARD form. `first` is `Fr::ONE` for the table every mix pass shares and `1/n` for
+/// the fused final pass's copy, which is how the scaling costs no scalar of its own.
 ///
-/// One table serves every pass of the block. snarkjs uses a different root per pass,
+/// One plain table serves every mix pass of the block. snarkjs uses a different root per pass,
 /// `roots[exp]` the primitive `2^exp`-th root (`build_fft.js:44-63`, mirrored by
 /// `prepare::root_table`), and `roots[exp] == W^(2^(bits-exp))`, so pass `exp`'s twiddle
 /// `roots[exp]^j` is this table at `j << (bits - exp)`. The largest index a pass reads is
@@ -567,13 +580,13 @@ impl FftKernels {
 /// window digit of a Montgomery representative is a digit of `a*R mod r`, which is a
 /// different number: getting it backwards produces points that are wrong by a factor of R
 /// and a file that verifies against nothing.
-fn twiddle_table(bits: u32) -> Vec<PackedScalar> {
+fn twiddle_table(bits: u32, first: Fr) -> Vec<PackedScalar> {
     let half = 1usize << (bits - 1);
     let mut root = Fr::TWO_ADIC_ROOT_OF_UNITY;
     for _ in bits..Fr::TWO_ADICITY {
         root.square_in_place();
     }
-    let mut w = Fr::ONE;
+    let mut w = first;
     let mut out = Vec::with_capacity(half);
     for _ in 0..half {
         out.push(PackedScalar::from_fr(&w));
