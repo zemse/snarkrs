@@ -173,6 +173,18 @@ impl GroupFft for MetalGroupFft {
             .ifft_g2(a)
             .map_err(|e| AccelError::device(BACKEND, "group ifft over G2", e.to_string()))
     }
+
+    fn ifft_g1_many(&self, blocks: &mut [&mut [Xyzz<RawFq>]]) -> Result<(), AccelError> {
+        self.fft
+            .ifft_g1_many(blocks)
+            .map_err(|e| AccelError::device(BACKEND, "group ifft over G1", e.to_string()))
+    }
+
+    fn ifft_g2_many(&self, blocks: &mut [&mut [Xyzz<RawFq2>]]) -> Result<(), AccelError> {
+        self.fft
+            .ifft_g2_many(blocks)
+            .map_err(|e| AccelError::device(BACKEND, "group ifft over G2", e.to_string()))
+    }
 }
 
 /// `batchApplyKey` behind the four contribute and beacon commands.

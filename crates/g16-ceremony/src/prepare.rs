@@ -94,6 +94,14 @@ const BUTTERFLIES_PER_TASK: usize = 32;
 /// inversion disappears; past a few hundred it buys nothing and costs residency.
 const AFFINE_BATCH: usize = 1024;
 
+/// Largest block [`process_section`] hands to the backend together with its smaller
+/// neighbours in one [`PrepareCurve::ifft_many`] call. Blocks above it go one at a time,
+/// for two reasons that stop at the same size: one pass of such a block is already a
+/// dispatch big enough to fill a device on its own, and the co-submitted blocks are
+/// resident together, so the cap is what keeps the resident set near the largest block
+/// rather than the whole section.
+const COSCHEDULE_MAX: usize = 1 << 18;
+
 /// The coset generator ffjavascript uses for the two-coset split, `nqr^2` with `nqr` the
 /// smallest quadratic non-residue (`f1field.js:55`, `build_fft.js:79`). On BN254's `Fr`
 /// that is `5^2`.
@@ -112,6 +120,12 @@ pub trait PrepareCurve: RawCurve {
     /// The one call the transform cannot express generically: [`GroupFft`] has a separate
     /// entry point per group, the same way [`g16_msm::MsmBackend`] does.
     fn ifft(fft: &dyn GroupFft, a: &mut [Xyzz<Self::RF>]) -> Result<(), AccelError>;
+    /// [`PrepareCurve::ifft`] over several blocks in one call, so a device backend can
+    /// co-schedule them. See [`GroupFft::ifft_g1_many`].
+    fn ifft_many(
+        fft: &dyn GroupFft,
+        blocks: &mut [&mut [Xyzz<Self::RF>]],
+    ) -> Result<(), AccelError>;
     /// The section read and write, which [`Ptau`] and [`BinFileWriter`] also split per
     /// group. Carried here so [`process_section`] is one function rather than a pair.
     fn read_points(src: &Ptau, id: u32, n: usize) -> Result<Vec<Affine<Self>>, CeremonyError>;
@@ -128,6 +142,9 @@ impl PrepareCurve for g16_field::g1::Config {
     }
     fn ifft(fft: &dyn GroupFft, a: &mut [Xyzz<RawFq>]) -> Result<(), AccelError> {
         fft.ifft_g1(a)
+    }
+    fn ifft_many(fft: &dyn GroupFft, blocks: &mut [&mut [Xyzz<RawFq>]]) -> Result<(), AccelError> {
+        fft.ifft_g1_many(blocks)
     }
     fn read_points(src: &Ptau, id: u32, n: usize) -> Result<Vec<G1Affine>, CeremonyError> {
         src.g1_points(id, 0, n)
@@ -147,6 +164,9 @@ impl PrepareCurve for g16_field::g2::Config {
     }
     fn ifft(fft: &dyn GroupFft, a: &mut [Xyzz<RawFq2>]) -> Result<(), AccelError> {
         fft.ifft_g2(a)
+    }
+    fn ifft_many(fft: &dyn GroupFft, blocks: &mut [&mut [Xyzz<RawFq2>]]) -> Result<(), AccelError> {
+        fft.ifft_g2_many(blocks)
     }
     fn read_points(src: &Ptau, id: u32, n: usize) -> Result<Vec<G2Affine>, CeremonyError> {
         src.g2_points(id, 0, n)
@@ -638,9 +658,12 @@ fn block_input<P: PrepareCurve>(
 
 /// `processSection` for one pair (`powersoftau_preparephase2.js:52-70`).
 ///
-/// One block per power, ascending, and one extra block for section 2. Blocks at the
-/// backend are transformed and written one at a time so the resident set is the largest
-/// block rather than the whole section: at power 28 the difference is 32 GB against 1 TB.
+/// One block per power, ascending, and one extra block for section 2. Blocks above
+/// [`COSCHEDULE_MAX`] are transformed and written one at a time so the resident set is
+/// the largest block rather than the whole section: at power 28 the difference is 32 GB
+/// against 1 TB. Blocks at or below it are co-submitted, which costs nothing there (they
+/// sum to at most twice the cap) and is what lets a device fill itself from passes too
+/// small to fill it alone.
 ///
 /// Blocks below the backend's crossover are a different schedule. Each of them would run
 /// on the CPU through `ifft_block` anyway, and run in the gaps between device blocks they
@@ -659,32 +682,43 @@ fn process_section<P: PrepareCurve>(
     let small = (0..=last)
         .take_while(|&p| (1usize << p) < fft.min_block())
         .count() as u32;
+    // Backend blocks up to [`COSCHEDULE_MAX`] go to the backend in one call, so a device
+    // can co-dispatch their passes instead of running each under-filled block alone.
+    let batched = (small..=last)
+        .take_while(|&p| (1usize << p) <= COSCHEDULE_MAX)
+        .count() as u32;
     out.start_section(to)?;
     std::thread::scope(|s| -> Result<(), CeremonyError> {
-        let mut cpu = Some(s.spawn(move || -> Result<Vec<_>, CeremonyError> {
-            (0..small)
-                .map(|p| lagrange_evaluations::<P>(&block_input::<P>(src, from, p, power)?, fft))
-                .collect()
-        }));
-        // Device blocks finished before the worker are held rather than written. The
-        // worker's blocks together are smaller than one device block, so in practice it
-        // finishes during the first one or two and this never holds much of the section.
+        let mut cpu = Some(
+            s.spawn(move || -> Result<Vec<Vec<Affine<P>>>, CeremonyError> {
+                (0..small)
+                    .map(|p| {
+                        lagrange_evaluations::<P>(&block_input::<P>(src, from, p, power)?, fft)
+                    })
+                    .collect()
+            }),
+        );
         let mut held: Vec<Vec<Affine<P>>> = Vec::new();
-        for p in small..=last {
+
+        if batched > 0 {
+            let mut works: Vec<Vec<Xyzz<P::RF>>> = (small..small + batched)
+                .map(|p| -> Result<Vec<Xyzz<P::RF>>, CeremonyError> {
+                    Ok(block_input::<P>(src, from, p, power)?
+                        .par_iter()
+                        .map(xyzz_from_affine::<P>)
+                        .collect())
+                })
+                .collect::<Result<_, _>>()?;
+            let mut refs: Vec<&mut [Xyzz<P::RF>]> =
+                works.iter_mut().map(|w| w.as_mut_slice()).collect();
+            P::ifft_many(fft, &mut refs)?;
+            for w in &works {
+                emit_block::<P>(&mut cpu, &mut held, out, batch_to_affine::<P>(w))?;
+            }
+        }
+        for p in small + batched..=last {
             let block = lagrange_evaluations::<P>(&block_input::<P>(src, from, p, power)?, fft)?;
-            if let Some(h) = cpu.take_if(|h| h.is_finished()) {
-                for b in h.join().expect("cpu ifft worker panicked")? {
-                    P::write_block(out, &b)?;
-                }
-            }
-            if cpu.is_none() {
-                for b in held.drain(..) {
-                    P::write_block(out, &b)?;
-                }
-                P::write_block(out, &block)?;
-            } else {
-                held.push(block);
-            }
+            emit_block::<P>(&mut cpu, &mut held, out, block)?;
         }
         if let Some(h) = cpu.take() {
             for b in h.join().expect("cpu ifft worker panicked")? {
@@ -697,6 +731,36 @@ fn process_section<P: PrepareCurve>(
         Ok(())
     })?;
     out.end_section()
+}
+
+/// Write one backend block, or hold it while the sub-crossover worker still owes the
+/// blocks that precede it in the file.
+///
+/// The worker's blocks together are smaller than one backend block, so in practice it
+/// finishes during the first backend block or two and `held` never grows to much of the
+/// section.
+fn emit_block<'scope, P: PrepareCurve>(
+    cpu: &mut Option<
+        std::thread::ScopedJoinHandle<'scope, Result<Vec<Vec<Affine<P>>>, CeremonyError>>,
+    >,
+    held: &mut Vec<Vec<Affine<P>>>,
+    out: &mut BinFileWriter,
+    block: Vec<Affine<P>>,
+) -> Result<(), CeremonyError> {
+    if let Some(h) = cpu.take_if(|h| h.is_finished()) {
+        for b in h.join().expect("cpu ifft worker panicked")? {
+            P::write_block(out, &b)?;
+        }
+    }
+    if cpu.is_none() {
+        for b in held.drain(..) {
+            P::write_block(out, &b)?;
+        }
+        P::write_block(out, &block)
+    } else {
+        held.push(block);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

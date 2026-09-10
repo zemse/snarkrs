@@ -92,6 +92,26 @@ pub trait GroupFft: Send + Sync {
 
     fn ifft_g1(&self, a: &mut [Xyzz<RawFq>]) -> Result<(), AccelError>;
     fn ifft_g2(&self, a: &mut [Xyzz<RawFq2>]) -> Result<(), AccelError>;
+
+    /// [`Self::ifft_g1`] over several independent blocks in one call.
+    ///
+    /// The blocks are separate transforms and the implementation may run them in any
+    /// order, or together. The default runs them one at a time, which is all the CPU
+    /// wants; a device overrides it to co-schedule their passes, because a small block's
+    /// passes cannot fill it alone and a ptau section is mostly blocks like that.
+    fn ifft_g1_many(&self, blocks: &mut [&mut [Xyzz<RawFq>]]) -> Result<(), AccelError> {
+        for a in blocks.iter_mut() {
+            self.ifft_g1(a)?;
+        }
+        Ok(())
+    }
+
+    fn ifft_g2_many(&self, blocks: &mut [&mut [Xyzz<RawFq2>]]) -> Result<(), AccelError> {
+        for a in blocks.iter_mut() {
+            self.ifft_g2(a)?;
+        }
+        Ok(())
+    }
 }
 
 /// `batchApplyKey` (`build_curve_jacobian_a0.js:1289-1310`): replace `P_i` by

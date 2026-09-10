@@ -24,7 +24,7 @@ use g16_field::{FftField, Field, Fr};
 use g16_msm::xyzz::Xyzz;
 use metal::{
     Buffer, CommandQueue, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device,
-    MTLResourceOptions,
+    MTLDispatchType, MTLResourceOptions,
 };
 
 use crate::ceremony::{cer_err, cer_read_back, dispatch_1d, env_window, window_index, CER_WINDOWS};
@@ -103,14 +103,27 @@ const _: () = {
     assert!(core::mem::align_of::<FftParams>() == 4);
 };
 
-/// One pass: what [`FftKernels::run_pass`] encodes into one command buffer, split across
-/// several if it is bigger than the budget. `third` is the twiddle table for a mix pass
-/// and the single `1/n` scalar for the scaling pass.
+/// One block's pass in a round: what [`FftKernels::run_round`] batches into command
+/// buffers, split across several if the round is bigger than the budget. `third` is the
+/// twiddle table for a mix pass and the single `1/n` scalar for the scaling pass.
 struct Pass<'a> {
     pso: &'a ComputePipelineState,
+    src: &'a Buffer,
+    dst: &'a Buffer,
     third: &'a Buffer,
     params: FftParams,
     threads: usize,
+}
+
+/// One block's live state across the lockstep rounds of [`FftKernels::ifft_many`]: its
+/// ping-pong pair, its own `1/n`, and where in the caller's slice of blocks it came from.
+struct Block {
+    idx: usize,
+    n: usize,
+    bits: u32,
+    src: Buffer,
+    dst: Buffer,
+    inv: Buffer,
 }
 
 /// The pipelines for one group, parallel to [`CER_WINDOWS`].
@@ -131,7 +144,8 @@ trait FftGroup {
 
     /// Names this group in an error, in the spelling [`g16_msm::AccelError`] uses.
     const OP: &'static str;
-    /// Ladder invocations one command buffer may hold. See [`FftKernels::run_pass`].
+    /// Ladder invocations one command buffer may hold, summed across its pieces. See
+    /// [`FftKernels::run_round`].
     const BUDGET: usize;
     /// Bytes one packed point takes, for the ping-pong scratch allocation.
     const SCRATCH: usize;
@@ -283,7 +297,7 @@ impl FftKernels {
             window_g1: env_window("G16_METAL_FFT_C_G1", FFT_WINDOW_G1),
             window_g2: env_window("G16_METAL_FFT_C_G2", FFT_WINDOW_G2),
             min_block: env_min_block(),
-            // Floored at 1 for the reason `with_budget` floors it: `run_pass` advances by
+            // Floored at 1 for the reason `with_budget` floors it: `run_round` advances by
             // `budget.min(remaining)`, so a budget of 0 never advances and the command
             // hangs with no error and no output.
             budget: env_usize("G16_METAL_FFT_BUDGET").map(|n| n.max(1)),
@@ -331,33 +345,58 @@ impl FftKernels {
     /// In-place inverse FFT over G1, the whole of what `prepare::ifft` (prepare.rs:320)
     /// does and in the same order.
     pub fn ifft_g1(&self, a: &mut [Xyzz<RawFq>]) -> Result<(), ProveError> {
-        self.ifft::<FftG1>(a)
+        self.ifft_many::<FftG1>(&mut [a])
     }
 
     /// [`Self::ifft_g1`] over G2, which is 44% of `ptau prepare` on 20% of its scalar
     /// multiplications.
     pub fn ifft_g2(&self, a: &mut [Xyzz<RawFq2>]) -> Result<(), ProveError> {
-        self.ifft::<FftG2>(a)
+        self.ifft_many::<FftG2>(&mut [a])
     }
 
-    fn ifft<G: FftGroup>(&self, a: &mut [Xyzz<G::Raw>]) -> Result<(), ProveError> {
-        let n = a.len();
-        if n <= 1 {
-            return Ok(());
-        }
-        if !n.is_power_of_two() {
-            return Err(cer_err(format!(
-                "group ifft over {}: {n} points is not a power of two",
-                G::OP
-            )));
-        }
-        let bits = n.trailing_zeros();
-        if bits > Fr::TWO_ADICITY {
-            return Err(cer_err(format!(
-                "group ifft over {}: 2^{bits} is past the {}-bit two-adic subgroup",
-                G::OP,
-                Fr::TWO_ADICITY
-            )));
+    /// [`Self::ifft_g1`] over several independent blocks, their passes co-dispatched.
+    pub fn ifft_g1_many(&self, blocks: &mut [&mut [Xyzz<RawFq>]]) -> Result<(), ProveError> {
+        self.ifft_many::<FftG1>(blocks)
+    }
+
+    pub fn ifft_g2_many(&self, blocks: &mut [&mut [Xyzz<RawFq2>]]) -> Result<(), ProveError> {
+        self.ifft_many::<FftG2>(blocks)
+    }
+
+    /// The transform over one or more independent blocks, in lockstep rounds: round `exp`
+    /// is pass `exp` of every block still deep enough to have one, and the last round is
+    /// every block's `1/n` scaling pass.
+    ///
+    /// Co-dispatching is where the rounds pay. A ptau section is one block per power, so
+    /// no pass of a power-15 section dispatches more than 33k threads and most dispatch
+    /// far fewer, on a device that does not near peak until several times that are in
+    /// flight; one block at a time leaves it mostly idle at exactly the powers where the
+    /// CPU fallback does not already cover the loss. A round holds one pass of every
+    /// block, 30k to 127k threads a command buffer for those sections, and that alone is
+    /// a whole ppot_0080_15 prepare in 3.61 s against 4.78 s (medians of 3, M2 Max).
+    /// Blocks of different depths co-exist because the rounds align on the pass
+    /// exponent: a block joins every round up to its own depth and then waits in its
+    /// `src` buffer for the scaling round.
+    fn ifft_many<G: FftGroup>(&self, blocks: &mut [&mut [Xyzz<G::Raw>]]) -> Result<(), ProveError> {
+        for a in blocks.iter() {
+            let n = a.len();
+            if n <= 1 {
+                continue;
+            }
+            if !n.is_power_of_two() {
+                return Err(cer_err(format!(
+                    "group ifft over {}: {n} points is not a power of two",
+                    G::OP
+                )));
+            }
+            if n.trailing_zeros() > Fr::TWO_ADICITY {
+                return Err(cer_err(format!(
+                    "group ifft over {}: 2^{} is past the {}-bit two-adic subgroup",
+                    G::OP,
+                    n.trailing_zeros(),
+                    Fr::TWO_ADICITY
+                )));
+            }
         }
 
         let pipelines = G::pipelines(self);
@@ -365,89 +404,128 @@ impl FftKernels {
         let mix = &pipelines.mix[idx];
         let scale = &pipelines.scale[idx];
 
-        // Ping-pong. `src` holds the input of the pass about to run and is never written
-        // by it, which is the whole reason a killed command buffer can simply be re-run;
-        // `dst` is scratch and its contents after a failure are not looked at.
-        let mut src = self.scratch(n * G::SCRATCH);
-        let mut dst = self.scratch(n * G::SCRATCH);
+        // Per-block ping-pong. `src` holds the input of the pass about to run and is
+        // never written by it, which is the whole reason a killed command buffer can
+        // simply be re-run; `dst` is scratch and its contents after a failure are not
+        // looked at.
+        let mut live: Vec<Block> = Vec::with_capacity(blocks.len());
+        for (bi, a) in blocks.iter().enumerate() {
+            let n = a.len();
+            if n <= 1 {
+                continue;
+            }
+            let bits = n.trailing_zeros();
+            let src = self.scratch(n * G::SCRATCH);
+            let dst = self.scratch(n * G::SCRATCH);
 
-        // The input goes straight into the buffer rather than into a `Vec` that is then
-        // copied in. Metal buffers here are `StorageModeShared` (msm.rs:460), so the two
-        // are the same memory and the copy would be a second 268 MB of traffic per block
-        // at power 20 for nothing.
-        //
-        // `bit_reverse` (prepare.rs:256) is folded into that write. The permutation is an
-        // involution, so `src[rev(i)] = a[i]` and reading back at `rev(i)` are the same
-        // map; only this direction is applied, and the rotation at the bottom is the one
-        // that is NOT an involution.
-        //
-        // SAFETY: the buffer was just allocated with room for `n` of this type and nothing
-        // has been encoded against it, so no dispatch can be reading it.
-        let slots: &mut [G::PackedPoint] =
-            unsafe { core::slice::from_raw_parts_mut(src.contents().cast(), n) };
-        for (i, p) in a.iter().enumerate() {
-            slots[bit_reverse_index(i, bits)] = G::pack(p);
+            // The input goes straight into the buffer rather than into a `Vec` that is
+            // then copied in. Metal buffers here are `StorageModeShared` (msm.rs:460), so
+            // the two are the same memory and the copy would be a second 268 MB of
+            // traffic per block at power 20 for nothing.
+            //
+            // `bit_reverse` (prepare.rs:256) is folded into that write. The permutation
+            // is an involution, so `src[rev(i)] = a[i]` and reading back at `rev(i)` are
+            // the same map; only this direction is applied, and the rotation at the
+            // bottom is the one that is NOT an involution.
+            //
+            // SAFETY: the buffer was just allocated with room for `n` of this type and
+            // nothing has been encoded against it, so no dispatch can be reading it.
+            let slots: &mut [G::PackedPoint] =
+                unsafe { core::slice::from_raw_parts_mut(src.contents().cast(), n) };
+            for (i, p) in a.iter().enumerate() {
+                slots[bit_reverse_index(i, bits)] = G::pack(p);
+            }
+
+            let size_inv = Fr::from(n as u64)
+                .inverse()
+                .expect("a power of two is a unit mod r");
+            let inv = self.buffer(&[PackedScalar::from_fr(&size_inv)]);
+            live.push(Block {
+                idx: bi,
+                n,
+                bits,
+                src,
+                dst,
+                inv,
+            });
         }
+        let Some(max_bits) = live.iter().map(|b| b.bits).max() else {
+            return Ok(());
+        };
 
-        let tw = self.buffer(&twiddle_table(bits));
-        let size_inv = Fr::from(n as u64)
-            .inverse()
-            .expect("a power of two is a unit mod r");
-        let inv = self.buffer(&[PackedScalar::from_fr(&size_inv)]);
+        // One table serves every pass of every block. Pass `exp` wants `roots[exp]^j`,
+        // and `roots[exp] == W^(2^(max_bits - exp))` for `W` the primitive
+        // `2^max_bits`-th root whatever the block's own depth is, so `tw_shift =
+        // max_bits - exp` reads the deepest block's table at the right stride for all of
+        // them and no block carries its own.
+        let tw = self.buffer(&twiddle_table(max_bits));
 
-        for exp in 1..=bits {
-            self.run_pass::<G>(
-                &src,
-                &dst,
-                &Pass {
+        for exp in 1..=max_bits {
+            let round: Vec<Pass> = live
+                .iter()
+                .filter(|b| b.bits >= exp)
+                .map(|b| Pass {
                     pso: mix,
+                    src: &b.src,
+                    dst: &b.dst,
                     third: &tw,
                     params: FftParams {
-                        n: n as u32,
+                        n: b.n as u32,
                         span: 1 << (exp - 1),
                         log_span: exp - 1,
-                        tw_shift: bits - exp,
+                        tw_shift: max_bits - exp,
                         gid_off: 0,
                     },
-                    threads: n / 2,
-                },
-            )?;
-            core::mem::swap(&mut src, &mut dst);
+                    threads: b.n / 2,
+                })
+                .collect();
+            self.run_round::<G>(&round)?;
+            for b in live.iter_mut().filter(|b| b.bits >= exp) {
+                core::mem::swap(&mut b.src, &mut b.dst);
+            }
         }
-        self.run_pass::<G>(
-            &src,
-            &dst,
-            &Pass {
+        let round: Vec<Pass> = live
+            .iter()
+            .map(|b| Pass {
                 pso: scale,
-                third: &inv,
+                src: &b.src,
+                dst: &b.dst,
+                third: &b.inv,
                 params: FftParams {
-                    n: n as u32,
+                    n: b.n as u32,
                     ..Default::default()
                 },
-                threads: n,
-            },
-        )?;
-        core::mem::swap(&mut src, &mut dst);
+                threads: b.n,
+            })
+            .collect();
+        self.run_round::<G>(&round)?;
+        for b in live.iter_mut() {
+            core::mem::swap(&mut b.src, &mut b.dst);
+        }
 
-        // SAFETY: the command buffer completed, `n` points of this type is exactly what
-        // the last pass wrote into what is now `src`, and `PackedPoint` is `Packed`, so
-        // every bit pattern is valid.
-        let got: &[G::PackedPoint] = unsafe { cer_read_back(&src, n) };
+        for b in &live {
+            // SAFETY: the command buffer completed, `n` points of this type is exactly
+            // what the last pass wrote into what is now `src`, and `PackedPoint` is
+            // `Packed`, so every bit pattern is valid.
+            let got: &[G::PackedPoint] = unsafe { cer_read_back(&b.src, b.n) };
 
-        // The `a[1..].reverse()` that finishes the inverse (prepare.rs:340), folded into
-        // the read back: `ifft(a)[0] = X[0]/n` and `ifft(a)[i] = X[n-i]/n`. Splitting this
-        // off from the scaling gives an answer that is a rotation away from correct and
-        // still looks plausible, which is why the module doc there says so twice.
-        a[0] = G::unpack(&got[0]);
-        for (i, out) in a.iter_mut().enumerate().skip(1) {
-            *out = G::unpack(&got[n - i]);
+            // The `a[1..].reverse()` that finishes the inverse (prepare.rs:340), folded
+            // into the read back: `ifft(a)[0] = X[0]/n` and `ifft(a)[i] = X[n-i]/n`.
+            // Splitting this off from the scaling gives an answer that is a rotation away
+            // from correct and still looks plausible, which is why the module doc there
+            // says so twice.
+            let a = &mut *blocks[b.idx];
+            a[0] = G::unpack(&got[0]);
+            for (i, out) in a.iter_mut().enumerate().skip(1) {
+                *out = G::unpack(&got[b.n - i]);
+            }
         }
         Ok(())
     }
 
-    /// Run one pass, `src` to `dst`, and retry it if macOS kills the submission.
+    /// Run one round, each pass `src` to `dst`, and retry what macOS kills.
     ///
-    /// The obvious design was one command buffer for the whole block: consecutive
+    /// The obvious design was one command buffer for a whole block: consecutive
     /// dispatches on a serial compute encoder are already ordered with an implicit
     /// barrier, so 85 commit-and-waits in a power-20 run rather than 946 at 0.149 ms each
     /// was there for the taking. macOS took it back. A submission that keeps the GPU busy
@@ -460,41 +538,52 @@ impl FftKernels {
     /// whatever else wants the GPU, so this survives the kill instead of trying to avoid
     /// it.
     ///
-    /// Surviving it is what fixes the pass boundary in place. `src` is read-only for the
-    /// whole pass, so a killed command buffer has damaged only `dst` and re-running it is
-    /// exact. Two passes in one command buffer would not be, because the second has
-    /// already overwritten the first one's input.
+    /// Surviving it is what fixes the round boundary in place. Every `src` in the round
+    /// is read-only for the whole round and every `dst` is scratch, so a killed command
+    /// buffer has damaged only destinations and re-running it is exact. Two passes of one
+    /// block in one command buffer would not be, because the second has already
+    /// overwritten the first one's input; one pass each of several blocks is, because the
+    /// pairs are disjoint.
     ///
-    /// [`FftGroup::BUDGET`] splits a pass further, into roughly 200 ms pieces. That is a
+    /// [`FftGroup::BUDGET`] splits a round into command buffers of at most that many
+    /// summed ladders, a pass bigger than the budget splitting on `gid_off`. That is a
     /// throughput and blast-radius knob rather than a safety one, and it has a floor for a
     /// measured reason: at 1,024 ladders a command buffer a 2^19-point G2 block takes
     /// 138 s against 16.6 s, because a dispatch that small does not fill the device.
     ///
     /// Every commit goes through `cb::wait_ok` (cb.rs:57). A faulted buffer that went
-    /// unnoticed would leave the previous pass's points in `dst`, which is a wrong point
-    /// in a file that is otherwise perfectly formed.
-    fn run_pass<G: FftGroup>(
-        &self,
-        src: &Buffer,
-        dst: &Buffer,
-        pass: &Pass,
-    ) -> Result<(), ProveError> {
+    /// unnoticed would leave the previous pass's points in a `dst`, which is a wrong
+    /// point in a file that is otherwise perfectly formed.
+    fn run_round<G: FftGroup>(&self, round: &[Pass]) -> Result<(), ProveError> {
         let budget = self.budget.unwrap_or(G::BUDGET);
-        let mut done = 0usize;
-        while done < pass.threads {
-            let take = budget.min(pass.threads - done);
-            let p = FftParams {
-                gid_off: done as u32,
-                ..pass.params
-            };
-            self.dispatch_with_retry(src, dst, pass, &p, take)?;
-            done += take;
+        let mut batch: Vec<(&Pass, FftParams, usize)> = Vec::new();
+        let mut used = 0usize;
+        for pass in round {
+            let mut done = 0usize;
+            while done < pass.threads {
+                let take = (budget - used).min(pass.threads - done);
+                let p = FftParams {
+                    gid_off: done as u32,
+                    ..pass.params
+                };
+                batch.push((pass, p, take));
+                used += take;
+                done += take;
+                if used == budget {
+                    self.dispatch_with_retry(&batch)?;
+                    batch.clear();
+                    used = 0;
+                }
+            }
+        }
+        if !batch.is_empty() {
+            self.dispatch_with_retry(&batch)?;
         }
         Ok(())
     }
 
-    /// One command buffer, re-submitted unchanged if it comes back anything but
-    /// `Completed`.
+    /// One command buffer holding one round's worth of pieces, re-submitted unchanged if
+    /// it comes back anything but `Completed`.
     ///
     /// Retrying blind rather than on the interactivity error specifically: the error text
     /// is not an API, and a fault that is genuinely the kernel's (an out-of-range index,
@@ -502,27 +591,27 @@ impl FftKernels {
     /// backoff exists because the failure means something else wants the GPU, and coming
     /// straight back with the same work is how a `ptau prepare` at power 20 loses a
     /// seventeen-minute run to a window being dragged.
-    fn dispatch_with_retry(
-        &self,
-        src: &Buffer,
-        dst: &Buffer,
-        pass: &Pass,
-        p: &FftParams,
-        threads: usize,
-    ) -> Result<(), ProveError> {
+    fn dispatch_with_retry(&self, batch: &[(&Pass, FftParams, usize)]) -> Result<(), ProveError> {
         let mut err = None;
         for attempt in 0..RETRIES {
             if attempt > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(200 << attempt));
             }
             let cb = self.queue.new_command_buffer();
-            let enc = cb.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(pass.pso);
-            enc.set_buffer(0, Some(src), 0);
-            enc.set_buffer(1, Some(dst), 0);
-            enc.set_buffer(2, Some(pass.third), 0);
-            set_params(enc, 3, p);
-            dispatch_1d(enc, pass.pso, threads, THREADGROUP);
+            // Concurrent rather than the serial default: the pieces touch disjoint
+            // buffer pairs, or disjoint index ranges of one pair, so there is no hazard
+            // for the implicit serial barrier to protect, and with the barrier in place
+            // the co-dispatched blocks would run one after another, which is exactly the
+            // underfill co-dispatching exists to remove.
+            let enc = cb.compute_command_encoder_with_dispatch_type(MTLDispatchType::Concurrent);
+            for (pass, p, threads) in batch {
+                enc.set_compute_pipeline_state(pass.pso);
+                enc.set_buffer(0, Some(pass.src), 0);
+                enc.set_buffer(1, Some(pass.dst), 0);
+                enc.set_buffer(2, Some(pass.third), 0);
+                set_params(enc, 3, p);
+                dispatch_1d(enc, pass.pso, *threads, THREADGROUP);
+            }
             enc.end_encoding();
             cb.commit();
             match crate::cb::wait_ok(cb, "ceremony group inverse fft") {
