@@ -402,6 +402,10 @@ impl FftKernels {
         let stw = self.buffer(&twiddle_table(bits, size_inv));
 
         for exp in 1..bits {
+            // The mix grid is dense over the `j != 0` butterflies (see `fft_mix_impl`):
+            // `groups * (span - 1)` ladder threads, except at `exp == 1`, where every
+            // butterfly is `j == 0` and the pass is all of them.
+            let threads = if exp == 1 { n / 2 } else { n / 2 - (n >> exp) };
             self.run_pass::<G>(
                 &src,
                 &dst,
@@ -415,7 +419,7 @@ impl FftKernels {
                         tw_shift: bits - exp,
                         gid_off: 0,
                     },
-                    threads: n / 2,
+                    threads,
                     ladders_per_thread: 1,
                 },
             )?;
