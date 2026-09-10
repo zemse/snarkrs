@@ -117,6 +117,24 @@ pub struct PackedScalar {
     pub v: [u32; LIMBS],
 }
 
+/// A scalar already through the GLV lattice: `k == +-k1 + lambda * (+-k2)`, 36 bytes,
+/// both magnitudes **standard form** and under `2^127`.
+///
+/// `k[0..4]` is `|k1|` and `k[4..8]` is `|k2|`, four 32-bit limbs each rather than eight,
+/// which is the whole point: a half-width magnitude is half the ladder. `sign` carries
+/// bit 0 for `k1 < 0` and bit 1 for `k2 < 0`, and a signed ladder spends nothing on
+/// either, since negating a point is negating one coordinate.
+///
+/// MSL twin: nine consecutive `uint` read out of a `device const uint*`, `GLV_WORDS` in
+/// `shaders/fft.metal`. There is no struct on that side because the twiddle table is
+/// bound as a flat word array, the same way [`PackedScalar`] tables are.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct PackedGlv {
+    pub k: [u32; LIMBS],
+    pub sign: u32,
+}
+
 /// BN254 base field element, 32 bytes, **Montgomery form**, little-endian 32-bit limbs.
 ///
 /// MSL twin: `struct Fq { uint v[8]; }`.
@@ -177,6 +195,8 @@ pub struct PackedG2Affine {
 const _: () = {
     assert!(size_of::<PackedFr>() == 32);
     assert!(size_of::<PackedScalar>() == 32);
+    assert!(size_of::<PackedGlv>() == 36);
+    assert!(align_of::<PackedGlv>() == 4);
     assert!(size_of::<PackedFq>() == 32);
     assert!(size_of::<PackedFq2>() == 64);
     assert!(size_of::<PackedG1Affine>() == 64);
@@ -435,6 +455,7 @@ pub unsafe trait Packed: Copy {}
 
 unsafe impl Packed for PackedFr {}
 unsafe impl Packed for PackedScalar {}
+unsafe impl Packed for PackedGlv {}
 unsafe impl Packed for PackedFq {}
 unsafe impl Packed for PackedFq2 {}
 unsafe impl Packed for PackedG1Affine {}

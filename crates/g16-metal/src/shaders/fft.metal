@@ -1,16 +1,16 @@
 // The group inverse FFT behind `ptau prepare`, in MSL.
 //
 // Compiled at runtime after `bn254_fr.metal`, `msm.metal` and `ceremony.metal`, in that
-// order. Every piece of arithmetic here comes from those three unchanged: `Xyzz<F>`,
-// `pt_add`, `pt_neg` and `pt_zero` from `msm.metal`, and the fixed-window ladder
-// `pt_mul<F, C>` from `ceremony.metal`. A mismatch against the CPU is therefore a
-// scheduling bug in this file, not a formula bug in one of those.
+// order. Every field and point operation comes from `msm.metal` unchanged: `Xyzz<F>`,
+// `pt_add`, `pt_neg`, `pt_zero`, the `jac_*` Jacobian representation and the signed-digit
+// recoding. What this file adds on top of them is one thing, the GLV ladder of item 4,
+// and it is the only formula here that a mismatch against the CPU can be blamed on.
 //
 // ============================================================================
 // NOTHING IN THIS FILE MAY BE SHARED INTO g16-wgpu.
-// It calls `pt_mul`, which inlines `pt_add` and `pt_dbl` far more than three times over
-// `Xyzz<Fq2>`, which is exactly 256 bytes. That is the shape of WebKit 323560, filed by
-// this project. Metal on macOS and CUDA only.
+// `pt_mul_glv` inlines `jac_add` and `jac_dbl` far more than three times over
+// `Jac<Fq2>`, which is 192 bytes, and hands them XYZZ points that are 256. That is the
+// shape of WebKit 323560, filed by this project. Metal on macOS and CUDA only.
 // ============================================================================
 //
 // WHAT THIS FILE DECIDES, AND WHY
@@ -64,7 +64,28 @@
 //    is therefore dense over the `j != 0` butterflies, with the ladderless ones riding
 //    the first `groups` threads; see `fft_mix_impl`.
 //
-// 4. BIT REVERSAL AND THE OUTPUT ROTATION ARE NOT KERNELS.
+// 4. THE LADDER IS GLV, AND THE LATTICE IS THE HOST'S PROBLEM.
+//    BN254 has an endomorphism `phi(x, y) = (beta x, y)`, `beta` a primitive cube root of
+//    one in Fq, which acts on the r-torsion as multiplication by a primitive cube root of
+//    one in Fr. Its characteristic polynomial `x^2 + x + 1` has two roots mod r and the
+//    two eigenspaces are exactly G1 and G2, so the eigenvalue is `lambda` on one and
+//    `lambda^2` on the other: one `beta`, two decomposition lattices. `[k]P` becomes
+//    `[k1]P + [k2]phi(P)` with both magnitudes under 2^127 (the widest the lattice was
+//    measured to produce; see `GLV_RECODE_BITS`), so the doubling chain is 130 long at
+//    c=5 rather than 255, against one more addition per window.
+//
+//    The usual objection to GLV is that the decomposition is paid per multiplication.
+//    Here it is not paid at all. The twiddles are powers of a fixed root, the host builds
+//    the whole table already, and `twiddle_table` (fft.rs) hands each thread `|k1|`,
+//    `|k2|` and two sign bits. Nothing in this file decomposes anything.
+//
+//    The second window table is free as well, which is what makes GLV affordable in a
+//    kernel whose binding constraint is the window table's register footprint. `phi` is a
+//    group homomorphism, so `phi(i P) == i phi(P)`: the `phi` side reads the SAME table
+//    and applies one `Fq` multiply to X on the way out. Doubling the table would have
+//    spent exactly what halving the doublings saved.
+//
+// 5. BIT REVERSAL AND THE OUTPUT ROTATION ARE NOT KERNELS.
 //    `bit_reverse` (prepare.rs:256) and the `a[1..].reverse()` that finishes the inverse
 //    (prepare.rs:340) are both pure permutations, and the host is copying every point into
 //    and out of a buffer regardless. `fft.rs` folds them into that copy, so neither costs
@@ -90,6 +111,152 @@ struct FftParams {
     uint tw_shift; // bits - exp, the stride into the twiddle table
     uint gid_off;  // index of the first butterfly this dispatch owns
 };
+
+// ---------------------------------------------------------------------------
+// The GLV ladder
+// ---------------------------------------------------------------------------
+
+// Words one twiddle takes in the table: `|k1|`, `|k2|`, then the sign word. Mirrors
+// `layout::PackedGlv`, which `fft.rs` greps for this exact line.
+#define GLV_WORDS 9
+
+// Bits a magnitude is recoded over. The lattice bounds `|k1|` and `|k2|` by
+// `|n11| + |n21|`, which is 1.4795e38, so 127 bits is the true width; 128 is what the
+// window count is taken from, and every compiled `C` divides into it with `C * nw >= 128`,
+// which is what stops the top window from borrowing off the end of the value.
+// `fft.rs` greps this line.
+#define GLV_RECODE_BITS 128
+
+// `beta`, a primitive cube root of one in Fq, Montgomery form. Equal to
+// `ark_bn254::g1::Config::ENDO_COEFFS[0]` and to the G2 one's `c0`, which `fft.rs`
+// asserts rather than trusts. The G2 endomorphism is the same `beta` embedded in Fq2
+// with `c1 == 0`, so it is two Fq multiplies there and one here, never a full Fq2 one.
+constant uint FQ_BETA[8] = { 0x13e80b9cu, 0x3350c88eu, 0xdb5e56b9u, 0x7dce557cu, 0xb615564au, 0x6001b4b8u, 0x020217e0u, 0x2682e617u };
+
+inline Fq fq_beta() {
+    Fq b;
+    for (uint i = 0; i < 8u; i++) {
+        b.v[i] = FQ_BETA[i];
+    }
+    return b;
+}
+
+inline Fq  f_beta_mul(Fq x)  { return fq_mul(x, fq_beta()); }
+inline Fq2 f_beta_mul(Fq2 x) {
+    Fq b = fq_beta();
+    Fq2 r;
+    r.c0 = fq_mul(x.c0, b);
+    r.c1 = fq_mul(x.c1, b);
+    return r;
+}
+
+// `phi(X, Y, Z) = (beta X, Y, Z)`. In Jacobian the point is `(X/Z^2, Y/Z^3)`, so scaling
+// X by beta scales the affine x by beta and leaves y alone, which is the endomorphism
+// exactly. Negation is on Y, so `phi` and `jac_neg` commute and the digit's sign can be
+// applied on either side.
+template <typename F>
+inline Jac<F> jac_endo(Jac<F> p) {
+    Jac<F> r = p;
+    r.x = f_beta_mul(p.x);
+    return r;
+}
+
+// `width` bits at `bit_off` of the 128-bit magnitude in `v[0..4]`, reading past the top
+// as zero.
+//
+// `sc_read_bits` cannot serve: it spans all eight limbs, and here the two magnitudes are
+// consecutive halves of one array, so a top window of `|k1|` would pull in the bottom bits
+// of `|k2|` and silently produce a different scalar.
+inline uint glv_read_bits(thread const uint* v, uint bit_off, uint width) {
+    uint idx = bit_off >> 5;
+    if (idx >= 4u) {
+        return 0u;
+    }
+    uint sh = bit_off & 31u;
+    ulong buf = (ulong)v[idx] >> sh;
+    if (sh + width > 32u && idx + 1u < 4u) {
+        buf |= (ulong)v[idx + 1u] << (32u - sh);
+    }
+    return (uint)(buf & (((ulong)1 << width) - (ulong)1));
+}
+
+// `sc_signed_digit` over a 128-bit magnitude, digit for digit. Split out only because of
+// the read above; the recoding itself is the same one the MSM and the ceremony ladder use.
+inline void glv_signed_digit(thread const uint* v, uint i, uint c, thread uint& mag, thread bool& neg) {
+    uint off = i * c;
+    uint b = glv_read_bits(v, off, c);
+    uint carry = (off == 0u) ? 0u : glv_read_bits(v, off - 1u, 1u);
+    bool borrow = ((b >> (c - 1u)) & 1u) != 0u;
+    if (borrow) {
+        uint m = (1u << c) - b - carry;
+        mag = m;
+        neg = true;
+        if (m == 0u) {
+            neg = false;
+        }
+    } else {
+        mag = b + carry;
+        neg = false;
+    }
+}
+
+// `[k] p` for a twiddle the host has already put through the lattice: `k[0..4]` is
+// `|k1|`, `k[4..8]` is `|k2|`, `sign` bit 0 is `k1 < 0` and bit 1 is `k2 < 0`, and
+// `k == +-k1 + lambda * (+-k2)` for that group's `lambda`.
+//
+// Interleaved, not joint: one accumulator, `C` doublings a window, then up to two
+// additions off ONE table of `2^(C-1)` multiples of `p`. The `phi` side reads that same
+// table because `phi` is a homomorphism, so the register footprint is a plain fixed-window
+// ladder's at the same `C` while the doubling chain is half as long.
+//
+// The two signs cost nothing. `k1`'s is folded into the base point once, before the table
+// is built, and `k2`'s then rides as `flip`: the table is multiples of `s1 p`, so a `phi`
+// entry carries an extra factor of `s1` and the digit's own sign is XORed with
+// `s1 != s2`. Both are a negated Y.
+//
+// The point arrives and leaves in XYZZ, and the ladder runs in Jacobian with a = 0, for
+// the reason `pt_mul` (ceremony.metal) gives: the doubling chain dominates and dbl-2009-l
+// is 7 multiplies against XYZZ's 9. That argument is weaker here, since GLV halves the
+// doublings and adds an addition per window, but it is still the right way round.
+template <typename F, uint C>
+inline Xyzz<F> pt_mul_glv(Xyzz<F> p, thread const uint* k, uint sign) {
+    if (pt_is_zero(p)) {
+        return pt_zero<F>();
+    }
+    Jac<F> q = jac_from_xyzz(p);
+    if ((sign & 1u) != 0u) {
+        q = jac_neg(q);
+    }
+    bool flip = ((sign ^ (sign >> 1u)) & 1u) != 0u;
+    Jac<F> acc = jac_zero<F>();
+
+    Jac<F> tbl[1u << (C - 1u)];
+    tbl[0] = q;
+    for (uint i = 1u; i < (1u << (C - 1u)); i++) {
+        tbl[i] = ((i & 1u) != 0u) ? jac_dbl(tbl[(i - 1u) >> 1u]) : jac_add(tbl[i - 1u], q);
+    }
+
+    const uint nw = (GLV_RECODE_BITS + C - 1u) / C;
+    for (uint w = 0; w < nw; w++) {
+        for (uint j = 0; j < C; j++) {
+            // A no-op while `acc` is still the identity, which `jac_dbl` exits on.
+            acc = jac_dbl(acc);
+        }
+        uint mag;
+        bool neg;
+        glv_signed_digit(k, nw - 1u - w, C, mag, neg);
+        if (mag != 0u) {
+            Jac<F> t = tbl[mag - 1u];
+            acc = jac_add(acc, neg ? jac_neg(t) : t);
+        }
+        glv_signed_digit(k + 4u, nw - 1u - w, C, mag, neg);
+        if (mag != 0u) {
+            Jac<F> t = jac_endo(tbl[mag - 1u]);
+            acc = jac_add(acc, (neg != flip) ? jac_neg(t) : t);
+        }
+    }
+    return xyzz_from_jac(acc);
+}
 
 // ---------------------------------------------------------------------------
 // One `fftMix` pass
@@ -143,11 +310,11 @@ inline void fft_mix_impl(device const Xyzz<F>* in,
     uint hi = lo + p.span;
 
     uint k[8];
-    uint base = (j << p.tw_shift) * 8u;
+    uint base = (j << p.tw_shift) * GLV_WORDS;
     for (uint i = 0; i < 8u; i++) {
         k[i] = tw[base + i];
     }
-    Xyzz<F> t = pt_mul<F, C>(in[hi], k);
+    Xyzz<F> t = pt_mul_glv<F, C>(in[hi], k, tw[base + 8u]);
     Xyzz<F> u = in[lo];
     out[lo] = pt_add(u, t);
     out[hi] = pt_add(u, pt_neg(t));
@@ -197,12 +364,13 @@ inline void fft_mix_scale_impl(device const Xyzz<F>* in,
     }
     uint s[8];
     uint k[8];
+    uint base = gid * GLV_WORDS;
     for (uint i = 0; i < 8u; i++) {
         s[i] = stw[i];
-        k[i] = stw[gid * 8u + i];
+        k[i] = stw[base + i];
     }
-    Xyzz<F> t = pt_mul<F, C>(in[gid + half_n], k);
-    Xyzz<F> u = pt_mul<F, C>(in[gid], s);
+    Xyzz<F> t = pt_mul_glv<F, C>(in[gid + half_n], k, stw[base + 8u]);
+    Xyzz<F> u = pt_mul_glv<F, C>(in[gid], s, stw[8]);
     out[gid] = pt_add(u, t);
     out[gid + half_n] = pt_add(u, pt_neg(t));
 }
