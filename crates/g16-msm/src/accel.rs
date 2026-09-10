@@ -82,10 +82,10 @@ pub trait GroupFft: Send + Sync {
     /// the CPU transform instead.
     ///
     /// Default 1, meaning "everything", which is what the CPU implementation wants. A
-    /// device wants a real number here: at power 20 every block below 2^12 together is
-    /// 0.18% of the command while the top two are 78.4%, so a crossover that is roughly
-    /// right costs nothing and one that is missing ships a path that loses on 21 of the 22
-    /// blocks.
+    /// device wants a real number here: nearly all of a section's work sits in its top two
+    /// blocks, and the ones under any sane crossover are the same short handful at every
+    /// power, so a crossover that is roughly right costs nothing and a missing one ships a
+    /// path that loses to the CPU on most of the blocks in the section.
     fn min_block(&self) -> usize {
         1
     }

@@ -15,7 +15,7 @@
 //
 // WHAT THIS FILE DECIDES, AND WHY
 //
-// 1. ONE THREAD PER BUTTERFLY, ONE PASS PER COMMAND BUFFER, AND OUT OF PLACE.
+// 1. ONE PASS OF A BLOCK PER COMMAND BUFFER, AND OUT OF PLACE.
 //    `ifft` (prepare.rs:320) is `bits` strictly sequential passes over one vector, and a
 //    pass is `n/2` independent butterflies on disjoint index pairs. In place, one thread
 //    per butterfly is correct and one command buffer could hold every pass of a block:
@@ -26,18 +26,20 @@
 //    submission that keeps the GPU busy while the GPU is also driving a display comes back
 //    as `kIOGPUCommandBufferCallbackErrorImpactingInteractivity`, and it is not a duration
 //    limit: measured on this M2 Max, the same 2^19-point G2 block was killed 6.8 s into a
-//    run whose command buffers were 210 ms each, and completed in 16.6 s with exactly those
-//    command buffers once the machine was quiet. Shrinking them to 13 ms did not save a
+//    run and completed in 16.6 s with exactly the same command-buffer split once the
+//    machine was quiet. Shrinking the buffers by an order of magnitude did not save a
 //    power-20 run either. The trigger is contention for the display, so the only reliable
 //    answer is to make the kill survivable rather than to try to stay under it.
 //
 //    That is what decides the shape here. A pass reads one buffer and writes another, so a
 //    killed command buffer has damaged only the destination and the pass can be run again
 //    unchanged; `fft.rs` ping-pongs the two buffers and retries. In place, a kill leaves
-//    the vector half-transformed with no way to tell which half. One pass per command
-//    buffer follows from the same requirement: a buffer holding two passes has already
-//    overwritten the first one's input by the time the second runs. The price is the
-//    0.149 ms round trip, 946 of them in a power-20 run, 0.141 s, 0.015% of it.
+//    the vector half-transformed with no way to tell which half. What follows from the
+//    same requirement is about one block rather than about one buffer: a buffer holding
+//    two passes of the SAME block has already overwritten the first one's input by the
+//    time the second runs, while one pass each of several independent blocks stays
+//    disjoint and re-runnable. `fft.rs` fills its buffers that way, so the 0.149 ms round
+//    trip is spread across a whole round instead of paid per block.
 //
 //    A pass larger than the ladder budget is split further by `gid_off`. That is a
 //    throughput and blast-radius knob, not a correctness one: the pieces stay idempotent

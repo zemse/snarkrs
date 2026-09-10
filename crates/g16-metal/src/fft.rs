@@ -70,17 +70,18 @@ const FFT_WINDOW_G2: u32 = 5;
 
 /// Blocks shorter than this go back to the CPU.
 ///
-/// Not a crossover measurement, and deliberately not tuned to one. At power 20 the GPU is
-/// still ahead of the CPU at 2^10 on paper (8.7 ms of arithmetic against 36 ms), and what
-/// the paper leaves out is the buffer allocation, the pipeline binding and the repack,
-/// each tens of microseconds, plus a 2^9-thread dispatch not filling 38 cores. The reason
-/// to stop caring at 2^12 is the distribution rather than the crossover: every block below
-/// 2^12 together is 0.18% of a power-20 run and the top two blocks are 78.4% of it, so the
-/// threshold's only real job is to keep the GPU path from being embarrassing on a power-8
-/// test file. [`FftKernels::with_min_block`] moves it, which is how the test suite forces
-/// the device path onto blocks a real ptau would route home, and
-/// `G16_METAL_FFT_MIN_BLOCK` moves it from outside the process, which is how the
-/// crossover is swept from the CLI without a rebuild.
+/// Not a crossover measurement, and deliberately not tuned to one. On paper the GPU is
+/// still ahead of the CPU at 2^10, and what the paper leaves out is the buffer
+/// allocation, the pipeline binding and the repack, each tens of microseconds, plus a
+/// 2^9-thread dispatch not filling 38 cores. The reason to stop caring at 2^12 is the
+/// distribution rather than the crossover: a section's work is concentrated in its top
+/// two blocks, the blocks under 2^12 are the same twelve at every power, and since
+/// `process_section` (prepare.rs:673) gives them their own worker thread they no longer
+/// serialize with the device at all. The threshold's only real job is to keep the GPU
+/// path from being embarrassing on a power-8 test file. [`FftKernels::with_min_block`]
+/// moves it, which is how the test suite forces the device path onto blocks a real ptau
+/// would route home, and `G16_METAL_FFT_MIN_BLOCK` moves it from outside the process,
+/// which is how the crossover is swept from the CLI without a rebuild.
 const MIN_BLOCK: usize = 1 << 12;
 
 /// Threads per threadgroup asked for, clamped by [`dispatch_1d`] to what the pipeline

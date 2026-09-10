@@ -392,9 +392,9 @@ pub(crate) fn ifft<F: RawField>(a: &mut [Xyzz<F>]) {
 /// One block, to the backend or to the CPU.
 ///
 /// The crossover is the backend's own number, not this file's: a block below
-/// [`GroupFft::min_block`] is a transform a device loses on, and at power 20 every block
-/// under 2^12 together is 0.18% of the command, so routing them home costs nothing to
-/// measure and nothing to get slightly wrong.
+/// [`GroupFft::min_block`] is a transform a device loses on, and those blocks are the same
+/// short handful whatever the power, so routing them home costs nothing to measure and
+/// nothing to get slightly wrong.
 fn ifft_block<P: PrepareCurve>(
     fft: &dyn GroupFft,
     a: &mut [Xyzz<P::RF>],
