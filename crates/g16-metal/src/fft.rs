@@ -169,6 +169,7 @@ trait FftGroup {
     fn unpack(p: &Self::PackedPoint) -> Xyzz<Self::Raw>;
     fn pipelines(k: &FftKernels) -> &FftPipelines;
     fn window(k: &FftKernels) -> u32;
+    fn budget(k: &FftKernels) -> Option<usize>;
 }
 
 struct FftG1;
@@ -210,6 +211,10 @@ impl FftGroup for FftG1 {
     fn window(k: &FftKernels) -> u32 {
         k.window_g1
     }
+
+    fn budget(k: &FftKernels) -> Option<usize> {
+        k.budget_g1
+    }
 }
 
 impl FftGroup for FftG2 {
@@ -247,6 +252,10 @@ impl FftGroup for FftG2 {
     fn window(k: &FftKernels) -> u32 {
         k.window_g2
     }
+
+    fn budget(k: &FftKernels) -> Option<usize> {
+        k.budget_g2
+    }
 }
 
 /// The two FFT kernels, compiled once.
@@ -263,7 +272,8 @@ pub struct FftKernels {
     window_g1: u32,
     window_g2: u32,
     min_block: usize,
-    budget: Option<usize>,
+    budget_g1: Option<usize>,
+    budget_g2: Option<usize>,
 }
 
 impl FftKernels {
@@ -313,10 +323,8 @@ impl FftKernels {
             window_g1: env_window("G16_METAL_FFT_C_G1", FFT_WINDOW_G1),
             window_g2: env_window("G16_METAL_FFT_C_G2", FFT_WINDOW_G2),
             min_block: env_min_block(),
-            // Floored at 1 for the reason `with_budget` floors it: `run_round` advances by
-            // `budget.min(remaining)`, so a budget of 0 never advances and the command
-            // hangs with no error and no output.
-            budget: env_usize("G16_METAL_FFT_BUDGET").map(|n| n.max(1)),
+            budget_g1: env_budget("G16_METAL_FFT_BUDGET_G1"),
+            budget_g2: env_budget("G16_METAL_FFT_BUDGET_G2"),
         })
     }
 
@@ -340,12 +348,14 @@ impl FftKernels {
 
     /// Overrides [`FftGroup::BUDGET`], the ladders one command buffer may hold.
     ///
-    /// The tests set it small. The shipped budget is 2^19 ladders on G1, so a block big
-    /// enough to split a pass across command buffers on its own is a block too big to put
-    /// in a unit test, and the `gid_off` arithmetic would go untested at every size the
-    /// suite can afford to run.
+    /// Both groups at once, which is what a test wants and a sweep does not; a sweep uses
+    /// the two [`env_budget`] variables. The tests set it small because the shipped budget
+    /// is 2^19 ladders on G1, so a block big enough to split a pass across command buffers
+    /// on its own is a block too big to put in a unit test, and the `gid_off` arithmetic
+    /// would go untested at every size the suite can afford to run.
     pub fn with_budget(mut self, ladders: usize) -> Self {
-        self.budget = Some(ladders.max(1));
+        self.budget_g1 = Some(ladders.max(1));
+        self.budget_g2 = Some(ladders.max(1));
         self
     }
 
@@ -595,7 +605,7 @@ impl FftKernels {
     /// unnoticed would leave the previous pass's points in a `dst`, which is a wrong
     /// point in a file that is otherwise perfectly formed.
     fn run_round<G: FftGroup>(&self, round: &[Pass]) -> Result<(), ProveError> {
-        let budget = self.budget.unwrap_or(G::BUDGET);
+        let budget = G::budget(self).unwrap_or(G::BUDGET);
         let mut batch: Vec<(&Pass, FftParams, usize)> = Vec::new();
         let mut used = 0usize;
         for pass in round {
@@ -738,8 +748,18 @@ fn env_min_block() -> usize {
     env_usize("G16_METAL_FFT_MIN_BLOCK").unwrap_or(MIN_BLOCK)
 }
 
-/// `G16_METAL_FFT_BUDGET` overrides [`FftGroup::BUDGET`] from outside the process, which
-/// is how the command-buffer size was swept against macOS's tolerance from the CLI.
+/// `G16_METAL_FFT_BUDGET_G1` and `_G2` override [`FftGroup::BUDGET`] for one group and
+/// `G16_METAL_FFT_BUDGET` overrides both, which is how the two were crossed from the CLI
+/// without a rebuild. Split the same way and for the same reason as `G16_METAL_FFT_C_G1`:
+/// the two groups do not have to move together, and the sweep in [`FftGroup::BUDGET`]
+/// holds one of them still while the other moves. Floored at 1, since `run_round` advances
+/// by at most the budget and a budget of 0 would hang the command.
+fn env_budget(var: &str) -> Option<usize> {
+    env_usize(var)
+        .or_else(|| env_usize("G16_METAL_FFT_BUDGET"))
+        .map(|n| n.max(1))
+}
+
 fn env_usize(var: &str) -> Option<usize> {
     std::env::var(var)
         .ok()
