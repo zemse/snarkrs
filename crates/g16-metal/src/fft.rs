@@ -26,6 +26,7 @@ use metal::{
     Buffer, CommandQueue, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device,
     MTLDispatchType, MTLResourceOptions,
 };
+use rayon::prelude::*;
 
 use crate::ceremony::{cer_err, cer_read_back, dispatch_1d, env_window, window_index, CER_WINDOWS};
 use crate::kernels::{CEREMONY_MSL, FFT_MSL, FR_MSL, MSM_MSL};
@@ -139,8 +140,8 @@ struct FftPipelines {
 /// only in the packing, and keeping this module's marker types here is what lets the whole
 /// FFT be added without touching the ladder and apply-key code it shares a crate with.
 trait FftGroup {
-    type Raw: Copy;
-    type PackedPoint: Packed + Default;
+    type Raw: Copy + Send + Sync;
+    type PackedPoint: Packed + Default + Send + Sync;
 
     /// Names this group in an error, in the spelling [`g16_msm::AccelError`] uses.
     const OP: &'static str;
@@ -423,18 +424,20 @@ impl FftKernels {
             // the two are the same memory and the copy would be a second 268 MB of
             // traffic per block at power 20 for nothing.
             //
-            // `bit_reverse` (prepare.rs:256) is folded into that write. The permutation
-            // is an involution, so `src[rev(i)] = a[i]` and reading back at `rev(i)` are
-            // the same map; only this direction is applied, and the rotation at the
-            // bottom is the one that is NOT an involution.
+            // `bit_reverse` (prepare.rs:256) is folded into that write, in gather form
+            // so the loop splits over the pool: the permutation is an involution, so
+            // `src[rev(i)] = a[i]` and `src[j] = a[rev(j)]` are the same map. Only this
+            // direction is applied, and the rotation at the bottom is the one that is
+            // NOT an involution.
             //
             // SAFETY: the buffer was just allocated with room for `n` of this type and
             // nothing has been encoded against it, so no dispatch can be reading it.
             let slots: &mut [G::PackedPoint] =
                 unsafe { core::slice::from_raw_parts_mut(src.contents().cast(), n) };
-            for (i, p) in a.iter().enumerate() {
-                slots[bit_reverse_index(i, bits)] = G::pack(p);
-            }
+            slots
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(j, s)| *s = G::pack(&a[bit_reverse_index(j, bits)]));
 
             let size_inv = Fr::from(n as u64)
                 .inverse()
@@ -516,9 +519,10 @@ impl FftKernels {
             // says so twice.
             let a = &mut *blocks[b.idx];
             a[0] = G::unpack(&got[0]);
-            for (i, out) in a.iter_mut().enumerate().skip(1) {
-                *out = G::unpack(&got[b.n - i]);
-            }
+            let n = b.n;
+            a[1..].par_iter_mut().enumerate().for_each(|(i, out)| {
+                *out = G::unpack(&got[n - 1 - i]);
+            });
         }
         Ok(())
     }

@@ -11,6 +11,9 @@ g16-core.workspace = true
 # Direct because `ceremony` implements three of its traits. It was already here through
 # g16-core, and a transitive presence is not a version constraint.
 g16-msm.workspace = true
+# Direct for the same reason: the FFT packs and unpacks its blocks on the pool. Already
+# here through g16-core.
+rayon.workspace = true
 ark-ff.workspace = true
 ark-ec.workspace = true
 thiserror.workspace = true

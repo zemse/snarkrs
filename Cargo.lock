@@ -898,6 +898,7 @@ dependencies = [
  "g16-msm",
  "g16-zkey",
  "metal",
+ "rayon",
  "thiserror 2.0.19",
 ]
 
