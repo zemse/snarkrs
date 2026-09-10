@@ -161,6 +161,30 @@ trait FftGroup {
     const OP: &'static str;
     /// Ladder invocations one command buffer may hold, summed across its pieces. See
     /// [`FftKernels::run_round`].
+    ///
+    /// Set by the duration it buys. `GPUStartTime` to `GPUEndTime` on every buffer of a
+    /// `ppot_0080_17.ptau` prepare on this M2 Max gives 0.817 us a G1 ladder and 2.840 us
+    /// a G2 ladder, both flat to within 7% from the 10th to the 90th percentile over the
+    /// buffers carrying at least 100k ladders, so a budget's duration is just the budget
+    /// times its group's rate and that rate is the whole of the difference between the two
+    /// numbers below.
+    ///
+    /// What a budget COSTS, though, does not depend on the group. `G16_METAL_FFT_BUDGET_G1`
+    /// and `_G2` swept one at a time over `ppot_0080_17.ptau`, each column that group's own
+    /// GPU-busy total against the same total at a budget loose enough not to bind there at
+    /// all (2^18 for G1, 2^17 for G2), medians of 3 round-robin:
+    ///
+    /// | budget | G1 | G2 |
+    /// |---|---:|---:|
+    /// | 2^16 | +5.6% | +4.7% |
+    /// | 2^15 | +17.8% | +16.8% |
+    /// | 2^14 | +34.4% | +36.2% |
+    ///
+    /// The two columns agree because the loss is the ramp and drain of a dispatch that no
+    /// longer fills the device, which follows the thread count, and `ladders_per_thread` is
+    /// 1 or 2 in either group. So the price of a budget is its own value, not the group's,
+    /// and the 4:1 ratio the two constants keep buys equal duration per buffer at very
+    /// unequal cost: nearly all of what the shipped pair costs is G2's.
     const BUDGET: usize;
     /// Bytes one packed point takes, for the ping-pong scratch allocation.
     const SCRATCH: usize;
@@ -180,10 +204,11 @@ impl FftGroup for FftG1 {
     type PackedPoint = PackedXyzzG1;
 
     const OP: &'static str = "G1";
-    // 2^19 ladders, four times G2's because a G1 ladder is the cheaper one, so a command
-    // buffer holds comparable work whichever group it is. A throughput and blast-radius
-    // knob rather than a safety one; see `run_round`.
-    const BUDGET: usize = 1 << 19;
+    // 2^19 ladders was 428 ms a command buffer. Measured at power 19, where a 2^20-point
+    // block is the first to reach it: 132 buffers, 208 ms median, 422 ms at the top. 2^18
+    // caps the top at 216 ms, which is the median it already had, for +0.4% of G1's
+    // GPU-busy time there.
+    const BUDGET: usize = 1 << 18;
     const SCRATCH: usize = core::mem::size_of::<PackedXyzzG1>();
 
     fn pack(p: &Xyzz<RawFq>) -> PackedXyzzG1 {
@@ -222,9 +247,13 @@ impl FftGroup for FftG2 {
     type PackedPoint = PackedXyzzG2;
 
     const OP: &'static str = "G2";
-    // 2^17 ladders, a quarter of G1's because a G2 ladder is several times a G1 one. The
-    // same target from a narrower slice; see `FftG1::BUDGET`.
-    const BUDGET: usize = 1 << 17;
+    // A quarter of G1's, because a G2 ladder is 3.5 times a G1 one and the two are meant to
+    // produce the same buffer; see `FftG1::BUDGET`. 2^17 was 350 ms median and 390 ms at
+    // the top at power 19, and that is the size macOS objects to: at power 17 on a machine
+    // also driving a display it lost 5 of 6 runs to `ImpactingInteractivity` after all four
+    // retries, where every budget at or below 2^16 finished 24 of 24 in the same window.
+    // 2^16 is 179 ms median, 210 ms at the top, for +3.7% of G2's GPU-busy time.
+    const BUDGET: usize = 1 << 16;
     const SCRATCH: usize = core::mem::size_of::<PackedXyzzG2>();
 
     fn pack(p: &Xyzz<RawFq2>) -> PackedXyzzG2 {
@@ -350,7 +379,7 @@ impl FftKernels {
     ///
     /// Both groups at once, which is what a test wants and a sweep does not; a sweep uses
     /// the two [`env_budget`] variables. The tests set it small because the shipped budget
-    /// is 2^19 ladders on G1, so a block big enough to split a pass across command buffers
+    /// is 2^18 ladders on G1, so a block big enough to split a pass across command buffers
     /// on its own is a block too big to put in a unit test, and the `gid_off` arithmetic
     /// would go untested at every size the suite can afford to run.
     pub fn with_budget(mut self, ladders: usize) -> Self {
@@ -596,10 +625,11 @@ impl FftKernels {
     ///
     /// [`FftGroup::BUDGET`] splits a round into command buffers of at most that many
     /// summed ladders, a fused piece counting two a thread, a pass bigger than the
-    /// budget splitting on `gid_off`. That is a
-    /// throughput and blast-radius knob rather than a safety one, and it has a floor for a
-    /// measured reason: at 1,024 ladders a command buffer a 2^19-point G2 block takes
-    /// 138 s against 16.6 s, because a dispatch that small does not fill the device.
+    /// budget splitting on `gid_off`. Smaller buffers do not avoid the kill, so that is a
+    /// throughput and blast-radius knob rather than a safety one: what it decides is how
+    /// much work one kill throws away, against a floor with a measured reason. At 1,024
+    /// ladders a command buffer a 2^19-point G2 block takes 138 s against 16.6 s, because a
+    /// dispatch that small does not fill the device.
     ///
     /// Every commit goes through `cb::wait_ok` (cb.rs:57). A faulted buffer that went
     /// unnoticed would leave the previous pass's points in a `dst`, which is a wrong
@@ -979,7 +1009,7 @@ mod tests {
     }
 
     /// The `gid_off` split, which no block a unit test can afford to run would reach on
-    /// its own: the shipped budget is 2^19 ladders and the largest block here is 2^12
+    /// its own: the shipped budget is 2^18 ladders and the largest block here is 2^12
     /// points, so without [`FftKernels::with_budget`] every pass fits in one command
     /// buffer and the offset is always zero.
     ///

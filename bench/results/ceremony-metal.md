@@ -209,7 +209,8 @@ fails outright if a browser wants the GPU at the wrong moment, after having done
 work. The retry budget is the thing to change, not the kernel.
 
 One datum on the knob that exists for this. `G16_METAL_FFT_BUDGET=8192`, sixteen times shorter
-than G2's default submission, completed power 20 in **184.88 s** with byte-identical output.
+than the G2 default of the day (`FftG2::BUDGET` was 2^17 then), completed power 20 in
+**184.88 s** with byte-identical output.
 That is 30% slower than the default 142.62 s. It is one run, so it says what the shorter
 submission costs and nothing at all about whether it survives contention better.
 
