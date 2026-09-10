@@ -1,10 +1,11 @@
 // The three ceremony primitives that are not a multiexp, in MSL.
 //
 // Compiled at runtime after `bn254_fr.metal` and `msm.metal`, in that order: this file
-// adds no curve arithmetic of its own. `Aff<F>`, `Xyzz<F>`, `pt_add`, `pt_dbl`, `pt_neg`,
-// `pt_from_affine`, the `f_*` field overloads and the signed-digit recoding all come from
-// `msm.metal` unchanged, which is what makes a mismatch against the CPU provably a
-// scheduling bug here rather than a formula bug there.
+// adds no curve arithmetic of its own. `Aff<F>`, `Xyzz<F>`, `Jac<F>`, `pt_add`,
+// `pt_from_affine`, the `jac_*` ladder representation, the `f_*` field overloads and the
+// signed-digit recoding all come from `msm.metal` unchanged, which is what makes a
+// mismatch against the CPU provably a scheduling bug here rather than a formula bug
+// there.
 //
 // ============================================================================
 // NOTHING IN THIS FILE MAY BE SHARED INTO g16-wgpu.
@@ -97,42 +98,49 @@ inline Fr fr_pow_u32(Fr base, uint e) {
 // window of width `C`.
 //
 // The CPU twin is `point_times_fr`, which this must agree with as a curve point, not limb
-// for limb: XYZZ is a projective representation and the two ladders reach the same point
-// through different representatives. The ceremony's byte-identity survives that because
-// every path out of here ends in `cer_affine_finish_*`, and affine is canonical.
+// for limb: the representations here are projective and the two ladders reach the same
+// point through different representatives. The ceremony's byte-identity survives that
+// because every path out of here ends in `cer_affine_finish_*`, and affine is canonical.
+//
+// The point arrives and leaves in XYZZ, the crate's interchange representation, but the
+// ladder itself runs in Jacobian with a = 0 (`jac_*` in `msm.metal`): the doubling chain
+// is ~82% of the ladder's multiplies and dbl-2009-l is 7 against XYZZ's 9, which the
+// slightly dearer general addition does not eat. The conversions cost 8 multiplies once
+// per call against ~3,000 inside it.
 //
 // `tbl[i]` holds `(i+1) p`, so digit magnitude `m` in `1 ..= 2^(C-1)` indexes `tbl[m-1]`
 // directly. An even multiple is one doubling of half of it and an odd one is an addition,
-// which is 9 multiplies instead of 14 on half the table.
+// which is 7 multiplies instead of 16 on half the table.
 template <typename F, uint C>
 inline Xyzz<F> pt_mul(Xyzz<F> p, thread const uint* k) {
-    Xyzz<F> acc = pt_zero<F>();
     if (pt_is_zero(p)) {
-        return acc;
+        return pt_zero<F>();
     }
+    Jac<F> q = jac_from_xyzz(p);
+    Jac<F> acc = jac_zero<F>();
 
-    Xyzz<F> tbl[1u << (C - 1u)];
-    tbl[0] = p;
+    Jac<F> tbl[1u << (C - 1u)];
+    tbl[0] = q;
     for (uint i = 1u; i < (1u << (C - 1u)); i++) {
-        tbl[i] = ((i & 1u) != 0u) ? pt_dbl(tbl[(i - 1u) >> 1u]) : pt_add(tbl[i - 1u], p);
+        tbl[i] = ((i & 1u) != 0u) ? jac_dbl(tbl[(i - 1u) >> 1u]) : jac_add(tbl[i - 1u], q);
     }
 
     const uint nw = (CER_RECODE_BITS + C - 1u) / C;
     for (uint w = 0; w < nw; w++) {
         for (uint j = 0; j < C; j++) {
-            // A no-op while `acc` is still the identity, which `pt_dbl` exits on, so the
+            // A no-op while `acc` is still the identity, which `jac_dbl` exits on, so the
             // top window pays nothing for the loop staying uniform across every lane.
-            acc = pt_dbl(acc);
+            acc = jac_dbl(acc);
         }
         uint mag;
         bool neg;
         sc_signed_digit(k, nw - 1u - w, C, mag, neg);
         if (mag != 0u) {
-            Xyzz<F> t = tbl[mag - 1u];
-            acc = pt_add(acc, neg ? pt_neg(t) : t);
+            Jac<F> t = tbl[mag - 1u];
+            acc = jac_add(acc, neg ? jac_neg(t) : t);
         }
     }
-    return acc;
+    return xyzz_from_jac(acc);
 }
 
 // ---------------------------------------------------------------------------

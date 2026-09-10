@@ -106,7 +106,10 @@ const _: () = {
 
 /// One block's pass in a round: what [`FftKernels::run_round`] batches into command
 /// buffers, split across several if the round is bigger than the budget. `third` is the
-/// twiddle table for a mix pass and the single `1/n` scalar for the scaling pass.
+/// round's shared twiddle table for a mix pass and the block's own `1/n`-scaled table
+/// for the fused final pass. `ladders_per_thread` is the pass's weight against the
+/// ladder budget: 1 for a mix pass, 2 for the fused one, so a command buffer's duration
+/// does not double where every thread runs two ladders.
 struct Pass<'a> {
     pso: &'a ComputePipelineState,
     src: &'a Buffer,
@@ -114,23 +117,25 @@ struct Pass<'a> {
     third: &'a Buffer,
     params: FftParams,
     threads: usize,
+    ladders_per_thread: usize,
 }
 
 /// One block's live state across the lockstep rounds of [`FftKernels::ifft_many`]: its
-/// ping-pong pair, its own `1/n`, and where in the caller's slice of blocks it came from.
+/// ping-pong pair, its own `1/n`-scaled twiddle table, and where in the caller's slice
+/// of blocks it came from.
 struct Block {
     idx: usize,
     n: usize,
     bits: u32,
     src: Buffer,
     dst: Buffer,
-    inv: Buffer,
+    stw: Buffer,
 }
 
 /// The pipelines for one group, parallel to [`CER_WINDOWS`].
 struct FftPipelines {
     mix: Vec<ComputePipelineState>,
-    scale: Vec<ComputePipelineState>,
+    mix_scale: Vec<ComputePipelineState>,
 }
 
 /// What the two kernels need to know about a group, so the submission code is written
@@ -279,12 +284,12 @@ impl FftKernels {
 
         let group = |g: &str| -> Result<FftPipelines, ProveError> {
             let mut mix = Vec::with_capacity(CER_WINDOWS.len());
-            let mut scale = Vec::with_capacity(CER_WINDOWS.len());
+            let mut mix_scale = Vec::with_capacity(CER_WINDOWS.len());
             for c in CER_WINDOWS {
                 mix.push(pso(&format!("fft_mix_{g}_c{c}"))?);
-                scale.push(pso(&format!("fft_scale_{g}_c{c}"))?);
+                mix_scale.push(pso(&format!("fft_mix_scale_{g}_c{c}"))?);
             }
-            Ok(FftPipelines { mix, scale })
+            Ok(FftPipelines { mix, mix_scale })
         };
 
         let g1 = group("g1")?;
@@ -365,19 +370,20 @@ impl FftKernels {
     }
 
     /// The transform over one or more independent blocks, in lockstep rounds: round `exp`
-    /// is pass `exp` of every block still deep enough to have one, and the last round is
-    /// every block's `1/n` scaling pass.
+    /// is pass `exp` of every block still deep enough to have one, and a block's own
+    /// depth `exp == bits` is its fused mix+scale pass, so each block retires in its own
+    /// last round and no scaling round follows.
     ///
     /// Co-dispatching is where the rounds pay. A ptau section is one block per power, so
     /// no pass of a power-15 section dispatches more than 33k threads and most dispatch
     /// far fewer, on a device that does not near peak until several times that are in
     /// flight; one block at a time leaves it mostly idle at exactly the powers where the
     /// CPU fallback does not already cover the loss. A round holds one pass of every
-    /// block, 30k to 127k threads a command buffer for those sections, and that alone is
-    /// a whole ppot_0080_15 prepare in 3.61 s against 4.78 s (medians of 3, M2 Max).
+    /// block, and co-dispatch alone (before the dense grid and the fused pass) was a
+    /// whole ppot_0080_15 prepare in 3.61 s against 4.78 s (medians of 3, M2 Max).
     /// Blocks of different depths co-exist because the rounds align on the pass
-    /// exponent: a block joins every round up to its own depth and then waits in its
-    /// `src` buffer for the scaling round.
+    /// exponent: a block joins every round up to its own depth and then waits, finished,
+    /// in its `src` buffer while the deeper blocks run on.
     fn ifft_many<G: FftGroup>(&self, blocks: &mut [&mut [Xyzz<G::Raw>]]) -> Result<(), ProveError> {
         for a in blocks.iter() {
             let n = a.len();
@@ -403,7 +409,7 @@ impl FftKernels {
         let pipelines = G::pipelines(self);
         let idx = window_index(G::window(self));
         let mix = &pipelines.mix[idx];
-        let scale = &pipelines.scale[idx];
+        let mix_scale = &pipelines.mix_scale[idx];
 
         // Per-block ping-pong. `src` holds the input of the pass about to run and is
         // never written by it, which is the whole reason a killed command buffer can
@@ -442,68 +448,87 @@ impl FftKernels {
             let size_inv = Fr::from(n as u64)
                 .inverse()
                 .expect("a power of two is a unit mod r");
-            let inv = self.buffer(&[PackedScalar::from_fr(&size_inv)]);
+            // The `1/n` scaling rides the block's last mix pass (see
+            // `fft_mix_scale_impl`), which reads a second table with `s = 1/n` folded
+            // into every entry, `stw[0]` doubling as the plain `[s]` the `lo` side
+            // needs. `s` differs per block, so unlike `tw` this table cannot be shared
+            // across a round; it costs 16 bytes a point next to the ping-pong pair's
+            // 256 or 512.
+            let stw = self.buffer(&twiddle_table(bits, size_inv));
             live.push(Block {
                 idx: bi,
                 n,
                 bits,
                 src,
                 dst,
-                inv,
+                stw,
             });
         }
         let Some(max_bits) = live.iter().map(|b| b.bits).max() else {
             return Ok(());
         };
 
-        // One table serves every pass of every block. Pass `exp` wants `roots[exp]^j`,
-        // and `roots[exp] == W^(2^(max_bits - exp))` for `W` the primitive
-        // `2^max_bits`-th root whatever the block's own depth is, so `tw_shift =
-        // max_bits - exp` reads the deepest block's table at the right stride for all of
-        // them and no block carries its own.
-        let tw = self.buffer(&twiddle_table(max_bits));
+        // One plain table serves every mix pass of every block. Pass `exp` wants
+        // `roots[exp]^j`, and `roots[exp] == W^(2^(max_bits - exp))` for `W` the
+        // primitive `2^max_bits`-th root whatever the block's own depth is, so
+        // `tw_shift = max_bits - exp` reads the deepest block's table at the right
+        // stride for all of them and no block carries its own. Only the fused final
+        // passes read their per-block `stw` instead.
+        let tw = self.buffer(&twiddle_table(max_bits, Fr::ONE));
 
         for exp in 1..=max_bits {
             let round: Vec<Pass> = live
                 .iter()
                 .filter(|b| b.bits >= exp)
-                .map(|b| Pass {
-                    pso: mix,
-                    src: &b.src,
-                    dst: &b.dst,
-                    third: &tw,
-                    params: FftParams {
-                        n: b.n as u32,
-                        span: 1 << (exp - 1),
-                        log_span: exp - 1,
-                        tw_shift: max_bits - exp,
-                        gid_off: 0,
-                    },
-                    threads: b.n / 2,
+                .map(|b| {
+                    if b.bits == exp {
+                        // The block's last pass: the mix with `1/n` fused in (see
+                        // `fft_mix_scale_impl`), dense over all `n/2` butterflies at
+                        // two ladders each, on the block's own scaled table.
+                        Pass {
+                            pso: mix_scale,
+                            src: &b.src,
+                            dst: &b.dst,
+                            third: &b.stw,
+                            params: FftParams {
+                                n: b.n as u32,
+                                ..Default::default()
+                            },
+                            threads: b.n / 2,
+                            ladders_per_thread: 2,
+                        }
+                    } else {
+                        // The mix grid is dense over the `j != 0` butterflies (see
+                        // `fft_mix_impl`): `groups * (span - 1)` ladder threads, except
+                        // at `exp == 1`, where every butterfly is `j == 0` and the pass
+                        // is all of them.
+                        let threads = if exp == 1 {
+                            b.n / 2
+                        } else {
+                            b.n / 2 - (b.n >> exp)
+                        };
+                        Pass {
+                            pso: mix,
+                            src: &b.src,
+                            dst: &b.dst,
+                            third: &tw,
+                            params: FftParams {
+                                n: b.n as u32,
+                                span: 1 << (exp - 1),
+                                log_span: exp - 1,
+                                tw_shift: max_bits - exp,
+                                gid_off: 0,
+                            },
+                            threads,
+                            ladders_per_thread: 1,
+                        }
+                    }
                 })
                 .collect();
             self.run_round::<G>(&round)?;
             for b in live.iter_mut().filter(|b| b.bits >= exp) {
                 core::mem::swap(&mut b.src, &mut b.dst);
             }
-        }
-        let round: Vec<Pass> = live
-            .iter()
-            .map(|b| Pass {
-                pso: scale,
-                src: &b.src,
-                dst: &b.dst,
-                third: &b.inv,
-                params: FftParams {
-                    n: b.n as u32,
-                    ..Default::default()
-                },
-                threads: b.n,
-            })
-            .collect();
-        self.run_round::<G>(&round)?;
-        for b in live.iter_mut() {
-            core::mem::swap(&mut b.src, &mut b.dst);
         }
 
         for b in &live {
@@ -550,7 +575,8 @@ impl FftKernels {
     /// pairs are disjoint.
     ///
     /// [`FftGroup::BUDGET`] splits a round into command buffers of at most that many
-    /// summed ladders, a pass bigger than the budget splitting on `gid_off`. That is a
+    /// summed ladders, a fused piece counting two a thread, a pass bigger than the
+    /// budget splitting on `gid_off`. That is a
     /// throughput and blast-radius knob rather than a safety one, and it has a floor for a
     /// measured reason: at 1,024 ladders a command buffer a 2^19-point G2 block takes
     /// 138 s against 16.6 s, because a dispatch that small does not fill the device.
@@ -565,15 +591,26 @@ impl FftKernels {
         for pass in round {
             let mut done = 0usize;
             while done < pass.threads {
-                let take = (budget - used).min(pass.threads - done);
+                // Room in threads at this pass's weight, so a fused piece spends the
+                // budget twice as fast as a mix piece and a command buffer's duration
+                // stays flat across the mixture.
+                let take = ((budget - used) / pass.ladders_per_thread).min(pass.threads - done);
+                if take == 0 && !batch.is_empty() {
+                    self.dispatch_with_retry(&batch)?;
+                    batch.clear();
+                    used = 0;
+                    continue;
+                }
+                // Floored at 1 so a test budget below one fused thread still advances.
+                let take = take.max(1);
                 let p = FftParams {
                     gid_off: done as u32,
                     ..pass.params
                 };
                 batch.push((pass, p, take));
-                used += take;
+                used += take * pass.ladders_per_thread;
                 done += take;
-                if used == budget {
+                if used >= budget {
                     self.dispatch_with_retry(&batch)?;
                     batch.clear();
                     used = 0;
@@ -646,9 +683,11 @@ impl FftKernels {
     }
 }
 
-/// `W^i` for `i < 2^(bits-1)`, with `W` the primitive `2^bits`-th root, in STANDARD form.
+/// `first * W^i` for `i < 2^(bits-1)`, with `W` the primitive `2^bits`-th root, in
+/// STANDARD form. `first` is `Fr::ONE` for the table every mix pass shares and `1/n` for
+/// the fused final pass's copy, which is how the scaling costs no scalar of its own.
 ///
-/// One table serves every pass of the block. snarkjs uses a different root per pass,
+/// One plain table serves every mix pass of the block. snarkjs uses a different root per pass,
 /// `roots[exp]` the primitive `2^exp`-th root (`build_fft.js:44-63`, mirrored by
 /// `prepare::root_table`), and `roots[exp] == W^(2^(bits-exp))`, so pass `exp`'s twiddle
 /// `roots[exp]^j` is this table at `j << (bits - exp)`. The largest index a pass reads is
@@ -660,13 +699,13 @@ impl FftKernels {
 /// window digit of a Montgomery representative is a digit of `a*R mod r`, which is a
 /// different number: getting it backwards produces points that are wrong by a factor of R
 /// and a file that verifies against nothing.
-fn twiddle_table(bits: u32) -> Vec<PackedScalar> {
+fn twiddle_table(bits: u32, first: Fr) -> Vec<PackedScalar> {
     let half = 1usize << (bits - 1);
     let mut root = Fr::TWO_ADIC_ROOT_OF_UNITY;
     for _ in bits..Fr::TWO_ADICITY {
         root.square_in_place();
     }
-    let mut w = Fr::ONE;
+    let mut w = first;
     let mut out = Vec::with_capacity(half);
     for _ in 0..half {
         out.push(PackedScalar::from_fr(&w));

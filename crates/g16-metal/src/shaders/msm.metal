@@ -543,6 +543,137 @@ inline Xyzz<F> pt_mul_small(Xyzz<F> p, uint k) {
 }
 
 // ---------------------------------------------------------------------------
+// Jacobian with a = 0, for the fixed-window ladder in `ceremony.metal`.
+//
+// The Pippenger kernels above stay in XYZZ, where the mixed addition that decides them
+// is cheapest. The ladder is the opposite shape, ~263 doublings against ~58 additions
+// per call, and Jacobian doubling with a = 0 (dbl-2009-l) is 2M + 5S against XYZZ's
+// 6M + 3S, while the general addition (add-2007-bl, 11M + 5S against 12M + 2S) gives
+// only a little back. With `fq_sqr` costing a full multiply that is 7 against 9 per
+// doubling and 16 against 14 per addition. A Jacobian point is also 96 bytes to XYZZ's
+// 128, a quarter off the ladder's spilled window table.
+// ---------------------------------------------------------------------------
+
+template <typename F>
+struct Jac {
+    F x;
+    F y;
+    F z;
+};
+
+// Identity is Z == 0 with X and Y both zero, so converting it to XYZZ lands exactly on
+// `pt_zero`'s all-zero pattern rather than on garbage coordinates with a zero ZZ.
+template <typename F>
+inline Jac<F> jac_zero() {
+    Jac<F> r;
+    f_set_zero(r.x);
+    f_set_zero(r.y);
+    f_set_zero(r.z);
+    return r;
+}
+
+template <typename F>
+inline bool jac_is_zero(Jac<F> p) {
+    return f_is_zero(p.z);
+}
+
+template <typename F>
+inline Jac<F> jac_neg(Jac<F> p) {
+    Jac<F> r = p;
+    r.y = f_neg(p.y);
+    return r;
+}
+
+// XYZZ -> Jacobian without the inversion `Z = ZZZ / ZZ` would take: scaling the class
+// by ZZ*ZZZ gives Z' = ZZ*ZZZ, X' = X*ZZ*ZZZ^2, Y' = Y*ZZ^3*ZZZ^2, and
+// X'/Z'^2 == X/ZZ, Y'/Z'^3 == Y/ZZZ. A zero ZZ stays a zero Z'.
+template <typename F>
+inline Jac<F> jac_from_xyzz(Xyzz<F> p) {
+    F zzz2 = f_sqr(p.zzz);
+    F zz2 = f_sqr(p.zz);
+    Jac<F> r;
+    r.x = f_mul(f_mul(p.x, p.zz), zzz2);
+    r.y = f_mul(f_mul(p.y, f_mul(zz2, p.zz)), zzz2);
+    r.z = f_mul(p.zz, p.zzz);
+    return r;
+}
+
+// Jacobian -> XYZZ is the definition of XYZZ: ZZ = Z^2, ZZZ = Z^3.
+template <typename F>
+inline Xyzz<F> xyzz_from_jac(Jac<F> p) {
+    Xyzz<F> r;
+    r.x = p.x;
+    r.y = p.y;
+    r.zz = f_sqr(p.z);
+    r.zzz = f_mul(r.zz, p.z);
+    return r;
+}
+
+// dbl-2009-l with a = 0. The identity exits early for the reason `pt_mul` gives: the
+// ladder doubles an identity accumulator until the scalar's first nonzero digit, and
+// the exit keeps those doublings nearly free. A 2-torsion point (Y == 0) would come out
+// as Z3 == 0, the identity, which is correct and which BN254's odd-order groups never
+// reach anyway.
+template <typename F>
+inline Jac<F> jac_dbl(Jac<F> p) {
+    if (jac_is_zero(p)) {
+        return p;
+    }
+    F a = f_sqr(p.x);
+    F b = f_sqr(p.y);
+    F c = f_sqr(b);
+    F t = f_sub(f_sub(f_sqr(f_add(p.x, b)), a), c);
+    F d = f_add(t, t);
+    F e = f_add(f_add(a, a), a);
+    F f = f_sqr(e);
+    F c4 = f_add(c, c);
+    c4 = f_add(c4, c4);
+    Jac<F> r;
+    r.x = f_sub(f, f_add(d, d));
+    r.y = f_sub(f_mul(e, f_sub(d, r.x)), f_add(c4, c4));
+    r.z = f_mul(f_add(p.y, p.y), p.z);
+    return r;
+}
+
+// add-2007-bl. The same-x fork mirrors `pt_add`: equal points double, opposite points
+// cancel to the identity, and both are live paths for an accumulator that can land on
+// any multiple of the base.
+template <typename F>
+inline Jac<F> jac_add(Jac<F> a, Jac<F> b) {
+    if (jac_is_zero(a)) {
+        return b;
+    }
+    if (jac_is_zero(b)) {
+        return a;
+    }
+    F z1z1 = f_sqr(a.z);
+    F z2z2 = f_sqr(b.z);
+    F u1 = f_mul(a.x, z2z2);
+    F u2 = f_mul(b.x, z1z1);
+    F s1 = f_mul(f_mul(a.y, b.z), z2z2);
+    F s2 = f_mul(f_mul(b.y, a.z), z1z1);
+    F h = f_sub(u2, u1);
+    F rr = f_sub(s2, s1);
+    if (f_is_zero(h)) {
+        if (f_is_zero(rr)) {
+            return jac_dbl(a);
+        }
+        return jac_zero<F>();
+    }
+    F h2 = f_add(h, h);
+    F i = f_sqr(h2);
+    F j = f_mul(h, i);
+    F r2 = f_add(rr, rr);
+    F v = f_mul(u1, i);
+    F s1j = f_mul(s1, j);
+    Jac<F> out;
+    out.x = f_sub(f_sub(f_sqr(r2), j), f_add(v, v));
+    out.y = f_sub(f_mul(r2, f_sub(v, out.x)), f_add(s1j, s1j));
+    out.z = f_mul(f_sub(f_sub(f_sqr(f_add(a.z, b.z)), z1z1), z2z2), h);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
 // Scalar window decomposition.
 //
 // The recoding is the carry-free signed one from `g16-msm`, reproduced digit for digit so
