@@ -224,6 +224,15 @@ fn legacy_accumulate() -> bool {
 ///   is 8300x the cost of a bucket fill because it happens in one lane with the rest of
 ///   the device idle, which is exactly why it dominates when the top window degenerates.
 ///
+/// `ROW_US` was refitted after [`reduce_groups_for`] landed, because most of what it
+/// priced was the old one-threadgroup-per-window reduce sitting idle: 2.06 ms over
+/// 81,920 rows is 0.025 us, down from 0.058. That refit is what moves H from c=8 to
+/// c=13 at 2^16, which does 37% fewer bucket fills and measured 6.16 ms against 7.36.
+/// Checked against a c sweep of {8, 10, 12, 13, 14, 16} on both csp artifacts: the
+/// model ranks c=13 first at both sizes, as the sweep does, and its largest absolute
+/// error (c=16, where the reduce's per-bucket cost keeps falling with bucket count) is
+/// on a width 78% off the winner.
+///
 /// Override with `G16_METAL_MSM_C` to sweep it.
 pub fn window_size(m: usize) -> u32 {
     if let Ok(v) = std::env::var("G16_METAL_MSM_C") {
@@ -234,7 +243,7 @@ pub fn window_size(m: usize) -> u32 {
     /// One mixed addition in the segmented accumulation, microseconds.
     const MADD_US: f64 = 0.00324;
     /// One bucket's share of the clear, merge and reduction kernels, microseconds.
-    const ROW_US: f64 = 0.0580;
+    const ROW_US: f64 = 0.025;
     /// One iteration of the merge loop on the busiest bucket, microseconds. Serial.
     const MERGE_US: f64 = 27.0;
 
