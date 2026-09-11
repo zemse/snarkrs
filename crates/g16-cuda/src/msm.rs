@@ -1620,13 +1620,13 @@ mod tests {
                 .join(", ")
         );
         assert!(
-            kernels::MSM_CU.contains(&want_n),
-            "kernels/msm.cu does not contain the line:\n{want_n}"
+            kernels::CURVE_CUH.contains(&want_n),
+            "kernels/bn254_curve.cuh does not contain the line:\n{want_n}"
         );
         let want_n0 = format!("__constant__ u32 FQ_N0 = 0x{FQ_N0:08x}u;");
         assert!(
-            kernels::MSM_CU.contains(&want_n0),
-            "kernels/msm.cu does not contain the line:\n{want_n0}"
+            kernels::CURVE_CUH.contains(&want_n0),
+            "kernels/bn254_curve.cuh does not contain the line:\n{want_n0}"
         );
     }
 

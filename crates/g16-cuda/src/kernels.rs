@@ -6,7 +6,9 @@
 //! here is the one NVIDIA-only knob: the preprocessor prelude each translation unit is
 //! prefixed with.
 
-pub use g16_gpu_kernels::{FIELD_PROBE_CU, FR_CUH, GATHER_CU, MSM_CU, NTT_CU, POINTWISE_CU};
+pub use g16_gpu_kernels::{
+    CURVE_CUH, FFT_CU, FIELD_PROBE_CU, FR_CUH, GATHER_CU, MSM_CU, NTT_CU, POINTWISE_CU,
+};
 
 /// Source-level feature defines, prepended to every unit.
 ///
@@ -38,6 +40,12 @@ pub fn unit_stages() -> String {
 /// compiling it is most of the prepare cost.
 pub fn unit_msm() -> String {
     g16_gpu_kernels::unit_msm(&defines())
+}
+
+/// The ceremony group FFT unit. See `g16_gpu_kernels::unit_fft` for why it is not part
+/// of the MSM unit.
+pub fn unit_fft() -> String {
+    g16_gpu_kernels::unit_fft(&defines())
 }
 
 /// The `fr_probe` / `fr_constants` translation unit.

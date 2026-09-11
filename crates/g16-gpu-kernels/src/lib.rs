@@ -30,8 +30,17 @@ pub const NTT_CU: &str = include_str!("kernels/ntt.cu");
 /// Stage 4: `H = A*B - C`, fused into the tail of the last transform where possible.
 pub const POINTWISE_CU: &str = include_str!("kernels/pointwise.cu");
 
-/// Stages 5 to 9: Fq, Fq2, the curve, and the CSR Pippenger MSM.
+/// BN254 Fq, Fq2 and the G1/G2 point arithmetic, shared by the MSM and FFT units. Split
+/// out of `msm.cu` so the FFT unit does not recompile the seventeen MSM entry points;
+/// everything in it is a template or a `__forceinline__` helper, so a unit pays only for
+/// what its own kernels instantiate.
+pub const CURVE_CUH: &str = include_str!("kernels/bn254_curve.cuh");
+
+/// Stages 5 to 9: the CSR Pippenger MSM kernels.
 pub const MSM_CU: &str = include_str!("kernels/msm.cu");
+
+/// The group inverse FFT behind `ptau prepare`: the GLV ladder and the two mix kernels.
+pub const FFT_CU: &str = include_str!("kernels/fft.cu");
 
 /// Field correctness probe. Test-only, but compiled the same way as everything else so
 /// that a change which breaks compilation cannot hide behind a `cfg(test)`.
@@ -50,7 +59,17 @@ pub fn unit_stages(defines: &str) -> String {
 /// Stages 5 to 9. Separate from the stages unit because it is by far the largest and
 /// compiling it is most of the prepare cost.
 pub fn unit_msm(defines: &str) -> String {
-    format!("{defines}{FR_CUH}\n{MSM_CU}")
+    format!("{defines}{FR_CUH}\n{CURVE_CUH}\n{MSM_CU}")
+}
+
+/// The ceremony group FFT. Its own unit rather than a rider on the MSM one: a unit
+/// compiles every `extern "C" __global__` it contains whether or not the host loads it,
+/// the MSM unit already costs 113.6 s of NVRTC on a cold T4, and `ptau prepare` never
+/// launches an MSM kernel. The price is that the shared curve arithmetic is compiled
+/// twice on a box that runs both the prover and the ceremony, once per unit, which the
+/// on-disk PTX cache pays only on the first run of each.
+pub fn unit_fft(defines: &str) -> String {
+    format!("{defines}{FR_CUH}\n{CURVE_CUH}\n{FFT_CU}")
 }
 
 /// The `fr_probe` / `fr_constants` translation unit.
