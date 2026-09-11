@@ -242,18 +242,19 @@ impl PreparedCircuit for CpuCircuit {
         // rows), so `sum_i P(inc^(2i+1)) * hExps[i]` already equals `[P(tau)]_1`, which
         // is `[H(tau) * Z(tau)]_1`. Dividing here as well would double-count the Z.
         let start = Instant::now();
-        let h: Vec<Fr> = stage!(
+        // In place into `a`: a fourth `collect` here would spend most of the stage on
+        // allocation and first-touch page faults, not on the n multiplies it exists for.
+        stage!(
             "s4 H = A*B - C",
-            a.par_iter()
+            a.par_iter_mut()
                 .zip(b.par_iter())
                 .zip(c.par_iter())
-                .map(|((x, y), z)| *x * y - z)
-                .collect()
+                .for_each(|((x, y), z)| *x = *x * y - z)
         );
         pointwise_us += start.elapsed().as_micros() as u64;
         t.pointwise_us += pointwise_us;
 
-        Ok(HPoly::Host(h))
+        Ok(HPoly::Host(a))
     }
 
     fn msms(
