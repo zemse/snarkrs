@@ -55,6 +55,15 @@ const TASKS_PER_THREAD: usize = 4;
 /// (where a "block" is two elements) from degenerating into one rayon task per butterfly.
 const MIN_BUTTERFLIES_PER_TASK: usize = 64;
 
+/// Elements per fused-pass block: all passes whose butterflies stay inside a block of
+/// this size run back to back on it while it sits in cache, so `log2(CACHE_BLOCK)` of a
+/// transform's passes cost one trip through memory rather than one each. 2^11 is 64 KB
+/// of `Fr`, half a performance core's 128 KB L1d. Swept against 2^10 and 2^12 on the
+/// csp artifacts (warm median of 25, ntt_ms at 2^16 / 2^17): 11.58/23.09, 11.87/22.92,
+/// 11.78/23.40. All three tie within run-to-run noise, so the middle one stays: it fits
+/// L1d with room for the twiddle lines and leaves 32 blocks at 2^16 for a 12-thread pool.
+const CACHE_BLOCK: usize = 1 << 11;
+
 /// Twiddle tables are keyed by `(size, root)` rather than by size alone because `Domain`
 /// exposes its fields publicly, so a hand-built `Domain` could carry a root that is not
 /// the one `Domain::new` derives for that size.
@@ -156,6 +165,22 @@ impl CpuNtt {
     fn dit_passes(&self, a: &mut [Fr], twiddles: &[Fr], parallel: bool) {
         let n = a.len();
         let mut half = 1usize;
+        if parallel && n > CACHE_BLOCK {
+            // Every pass with `2 * half <= CACHE_BLOCK` moves data only within one
+            // aligned CACHE_BLOCK-sized block, so all of them run back to back per
+            // block: one fork/join and one trip through memory instead of one of each
+            // per pass. The twiddle indexing is unchanged because a butterfly's table
+            // index depends on its offset within its 2*half block, not on where the
+            // block sits in the array.
+            a.par_chunks_mut(CACHE_BLOCK).for_each(|block| {
+                let mut h = 1usize;
+                while h < CACHE_BLOCK {
+                    serial_pass::<false>(block, h, twiddles, n / (2 * h));
+                    h <<= 1;
+                }
+            });
+            half = CACHE_BLOCK;
+        }
         while half < n {
             // Butterfly `j` of a block needs `root^(j * n / 2half)`, and the table holds
             // `root^i` in natural order, so a pass is a strided read into it.
@@ -170,11 +195,15 @@ impl CpuNtt {
     }
 
     /// Decimation in frequency: natural input, bit-reversed output, half-size halving
-    /// per pass. Same twiddle tables, same per-pass indexing, opposite pass order.
+    /// per pass. Same twiddle tables, same per-pass indexing, opposite pass order, and
+    /// the mirror image of the fusion above: here it is the *final* passes that stay
+    /// inside one block.
     fn dif_passes(&self, a: &mut [Fr], twiddles: &[Fr], parallel: bool) {
         let n = a.len();
+        let fused = parallel && n > CACHE_BLOCK;
+        let floor = if fused { CACHE_BLOCK / 2 } else { 0 };
         let mut half = n / 2;
-        while half >= 1 {
+        while half > floor {
             let stride = n / (2 * half);
             if parallel {
                 parallel_pass::<true>(a, half, twiddles, stride, self.tasks());
@@ -182,6 +211,15 @@ impl CpuNtt {
                 serial_pass::<true>(a, half, twiddles, stride);
             }
             half >>= 1;
+        }
+        if fused {
+            a.par_chunks_mut(CACHE_BLOCK).for_each(|block| {
+                let mut h = CACHE_BLOCK / 2;
+                while h >= 1 {
+                    serial_pass::<true>(block, h, twiddles, n / (2 * h));
+                    h >>= 1;
+                }
+            });
         }
     }
 
