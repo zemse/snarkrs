@@ -34,9 +34,9 @@ phase 1, powers of tau, run once for every circuit that follows:
 | command            | input    | g16 cpu | g16 metal | snarkjs |
 | ------------------ | -------- | ------: | --------: | ------: |
 | `ptau new`         | power 14 |**0.01** |         — |     0.5 |
-| `ptau contribute`  | power 19 |    36.9 |  **5.6**  |   162.3 |
-| `ptau beacon`      | power 19 |    37.0 |  **5.6**  |   162.0 |
-| `ptau prepare`     | power 20 |   963.9 |**142.6**  |  ~9,300 |
+| `ptau contribute`  | power 19 |    36.3 |  **5.2**  |   162.3 |
+| `ptau beacon`      | power 19 |    36.2 |  **5.2**  |   162.0 |
+| `ptau prepare`     | power 20 |   929.8 | **83.8**  |  ~9,300 |
 | `ptau verify`      | power 20 |**16.9** |         — |   116.4 |
 
 phase 2, the proving key, run once per circuit:
