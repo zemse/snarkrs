@@ -383,15 +383,18 @@ impl CpuNtt {
         let n = domain.size;
         let mut table = vec![Fr::ONE; n];
         let chunk = chunk_len(n, self.tasks());
-        table.par_chunks_mut(chunk).enumerate().for_each(|(c, part)| {
-            // The same per-chunk ladder re-entry as `distribute`, seeded with `1/n` so
-            // the scale costs nothing extra.
-            let mut acc = domain.size_inv * shift.pow([(c * chunk) as u64]);
-            for x in part.iter_mut() {
-                *x = acc;
-                acc *= shift;
-            }
-        });
+        table
+            .par_chunks_mut(chunk)
+            .enumerate()
+            .for_each(|(c, part)| {
+                // The same per-chunk ladder re-entry as `distribute`, seeded with `1/n` so
+                // the scale costs nothing extra.
+                let mut acc = domain.size_inv * shift.pow([(c * chunk) as u64]);
+                for x in part.iter_mut() {
+                    *x = acc;
+                    acc *= shift;
+                }
+            });
         bit_reverse_permute(&mut table, domain.log_size);
 
         let built = Arc::new(table);
@@ -499,16 +502,8 @@ fn butterflies<const DIF: bool>(
 /// stores. `s2` is the second pass's stride `n / (4 * half)`; the first pass's is twice
 /// that.
 #[inline]
-fn quad_dit(
-    x0: &mut [Fr],
-    x1: &mut [Fr],
-    x2: &mut [Fr],
-    x3: &mut [Fr],
-    twiddles: &[Fr],
-    s2: usize,
-    half: usize,
-    j0: usize,
-) {
+fn quad_dit(strips: [&mut [Fr]; 4], twiddles: &[Fr], s2: usize, half: usize, j0: usize) {
+    let [x0, x1, x2, x3] = strips;
     for k in 0..x0.len() {
         let j = j0 + k;
         let w1 = twiddles[2 * j * s2];
@@ -532,16 +527,8 @@ fn quad_dit(
 /// `2 * half` block. `s1` is the first pass's stride `n / (2 * half)`; the second's is
 /// twice that, and `hh` is `half / 2`.
 #[inline]
-fn quad_dif(
-    y0: &mut [Fr],
-    y1: &mut [Fr],
-    y2: &mut [Fr],
-    y3: &mut [Fr],
-    twiddles: &[Fr],
-    s1: usize,
-    hh: usize,
-    j0: usize,
-) {
+fn quad_dif(strips: [&mut [Fr]; 4], twiddles: &[Fr], s1: usize, hh: usize, j0: usize) {
+    let [y0, y1, y2, y3] = strips;
     for k in 0..y0.len() {
         let j = j0 + k;
         let a0 = y0[k] + y2[k];
@@ -605,11 +592,11 @@ fn parallel_pass<const DIF: bool>(
 }
 
 /// Splits one `4 * half`-sized quad block into its four strips.
-fn quad_strips(block: &mut [Fr], half: usize) -> (&mut [Fr], &mut [Fr], &mut [Fr], &mut [Fr]) {
+fn quad_strips(block: &mut [Fr], half: usize) -> [&mut [Fr]; 4] {
     let (lo, hi) = block.split_at_mut(2 * half);
     let (x0, x1) = lo.split_at_mut(half);
     let (x2, x3) = hi.split_at_mut(half);
-    (x0, x1, x2, x3)
+    [x0, x1, x2, x3]
 }
 
 /// [`parallel_pass`] for a fused DIT pass pair. Only the outer passes come here, so a
@@ -622,8 +609,7 @@ fn parallel_quad_pass_dit(a: &mut [Fr], half: usize, twiddles: &[Fr], tasks: usi
     let blocks = n / block_len;
     if blocks >= tasks {
         a.par_chunks_mut(block_len).for_each(|block| {
-            let (x0, x1, x2, x3) = quad_strips(block, half);
-            quad_dit(x0, x1, x2, x3, twiddles, s2, half, 0);
+            quad_dit(quad_strips(block, half), twiddles, s2, half, 0);
         });
     } else {
         let chunk = half
@@ -631,14 +617,14 @@ fn parallel_quad_pass_dit(a: &mut [Fr], half: usize, twiddles: &[Fr], tasks: usi
             .max(MIN_BUTTERFLIES_PER_TASK)
             .min(half);
         a.par_chunks_mut(block_len).for_each(|block| {
-            let (x0, x1, x2, x3) = quad_strips(block, half);
+            let [x0, x1, x2, x3] = quad_strips(block, half);
             x0.par_chunks_mut(chunk)
                 .zip(x1.par_chunks_mut(chunk))
                 .zip(x2.par_chunks_mut(chunk))
                 .zip(x3.par_chunks_mut(chunk))
                 .enumerate()
                 .for_each(|(c, (((p0, p1), p2), p3))| {
-                    quad_dit(p0, p1, p2, p3, twiddles, s2, half, c * chunk)
+                    quad_dit([p0, p1, p2, p3], twiddles, s2, half, c * chunk)
                 });
         });
     }
@@ -653,8 +639,7 @@ fn parallel_quad_pass_dif(a: &mut [Fr], half: usize, twiddles: &[Fr], tasks: usi
     let blocks = n / block_len;
     if blocks >= tasks {
         a.par_chunks_mut(block_len).for_each(|block| {
-            let (y0, y1, y2, y3) = quad_strips(block, hh);
-            quad_dif(y0, y1, y2, y3, twiddles, s1, hh, 0);
+            quad_dif(quad_strips(block, hh), twiddles, s1, hh, 0);
         });
     } else {
         let chunk = hh
@@ -662,14 +647,14 @@ fn parallel_quad_pass_dif(a: &mut [Fr], half: usize, twiddles: &[Fr], tasks: usi
             .max(MIN_BUTTERFLIES_PER_TASK)
             .min(hh);
         a.par_chunks_mut(block_len).for_each(|block| {
-            let (y0, y1, y2, y3) = quad_strips(block, hh);
+            let [y0, y1, y2, y3] = quad_strips(block, hh);
             y0.par_chunks_mut(chunk)
                 .zip(y1.par_chunks_mut(chunk))
                 .zip(y2.par_chunks_mut(chunk))
                 .zip(y3.par_chunks_mut(chunk))
                 .enumerate()
                 .for_each(|(c, (((p0, p1), p2), p3))| {
-                    quad_dif(p0, p1, p2, p3, twiddles, s1, hh, c * chunk)
+                    quad_dif([p0, p1, p2, p3], twiddles, s1, hh, c * chunk)
                 });
         });
     }
