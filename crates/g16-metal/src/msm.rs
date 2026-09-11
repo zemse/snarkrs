@@ -1335,17 +1335,6 @@ impl Outputs {
         }
     }
 
-    fn encode(
-        &self,
-        msm: &MetalMsm,
-        enc: &ComputeCommandEncoderRef,
-        job: &Job<'_>,
-        plan: &Plan<'_>,
-    ) {
-        self.encode_buckets(msm, enc, job, plan);
-        self.encode_ones(msm, enc, job, plan);
-    }
-
     /// The Pippenger half: clear, segmented accumulation, merge, reduce. Split from
     /// [`Self::encode_ones`] so phase mode can time the bucket machinery and the ones
     /// scan separately. The production path in [`MetalMsm::msm_batch`] does not call
