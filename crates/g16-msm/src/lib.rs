@@ -657,6 +657,9 @@ where
 }
 
 #[cfg(test)]
+mod batch_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use ark_ec::{CurveGroup, VariableBaseMSM};
