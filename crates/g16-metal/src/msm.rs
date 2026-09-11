@@ -799,8 +799,15 @@ impl MetalMsm {
                 let p = &plans[job_plan[i]];
                 let kind = if out.is_g2 { "g2" } else { "g1" };
                 run(
-                    format!("points job{i} {kind} n={} cap={} c={}", p.n, p.cap, p.c),
-                    &mut |enc| out.encode(self, enc, job, p),
+                    format!("buckets job{i} {kind} n={} cap={} c={}", p.n, p.cap, p.c),
+                    &mut |enc| out.encode_buckets(self, enc, job, p),
+                )?;
+                run(
+                    format!(
+                        "ones    job{i} {kind} n={} groups={}",
+                        p.n, out.ones_groups
+                    ),
+                    &mut |enc| out.encode_ones(self, enc, job, p),
                 )?;
             }
         } else {
@@ -1015,18 +1022,31 @@ impl Outputs {
         job: &Job<'_>,
         plan: &Plan<'_>,
     ) {
+        self.encode_buckets(msm, enc, job, plan);
+        self.encode_ones(msm, enc, job, plan);
+    }
+
+    /// The Pippenger half: clear, segmented accumulation, merge, reduce. Split from
+    /// [`Self::encode_ones`] so phase mode can time the bucket machinery and the ones
+    /// scan separately; the production path encodes both into the same encoder.
+    fn encode_buckets(
+        &self,
+        msm: &MetalMsm,
+        enc: &ComputeCommandEncoderRef,
+        job: &Job<'_>,
+        plan: &Plan<'_>,
+    ) {
         let mut p = plan.params();
         p.base_off = self.base_off as u32;
         p.ones_groups = self.ones_groups as u32;
 
-        let (clear_pso, acc_pso, seg_pso, merge_pso, red_pso, ones_pso, bases) = match job {
+        let (clear_pso, acc_pso, seg_pso, merge_pso, red_pso, bases) = match job {
             Job::G1(j) => (
                 &msm.pipelines.clear_g1,
                 &msm.pipelines.accumulate_g1,
                 &msm.pipelines.segmented_g1,
                 &msm.pipelines.merge_g1,
                 &msm.pipelines.reduce_g1,
-                &msm.pipelines.ones_g1,
                 &j.bases.buf,
             ),
             Job::G2(j) => (
@@ -1035,7 +1055,6 @@ impl Outputs {
                 &msm.pipelines.segmented_g2,
                 &msm.pipelines.merge_g2,
                 &msm.pipelines.reduce_g2,
-                &msm.pipelines.ones_g2,
                 &j.bases.buf,
             ),
         };
@@ -1087,7 +1106,23 @@ impl Outputs {
             MTLSize::new(plan.n_windows as u64, 1, 1),
             MTLSize::new(tg as u64, 1, 1),
         );
+    }
 
+    /// The scalar-of-1 half: one `msm_ones_*` dispatch.
+    fn encode_ones(
+        &self,
+        msm: &MetalMsm,
+        enc: &ComputeCommandEncoderRef,
+        job: &Job<'_>,
+        plan: &Plan<'_>,
+    ) {
+        let mut p = plan.params();
+        p.base_off = self.base_off as u32;
+        p.ones_groups = self.ones_groups as u32;
+        let (ones_pso, bases) = match job {
+            Job::G1(j) => (&msm.pipelines.ones_g1, &j.bases.buf),
+            Job::G2(j) => (&msm.pipelines.ones_g2, &j.bases.buf),
+        };
         enc.set_compute_pipeline_state(ones_pso);
         enc.set_buffer(0, Some(plan.scalars), 0);
         enc.set_buffer(1, Some(bases), 0);
