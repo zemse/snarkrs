@@ -151,7 +151,21 @@ impl CpuCircuit {
                 let hi = row_ptr[c + 1] as usize;
                 let mut acc = Fr::zero();
                 for k in lo..hi {
-                    acc += value[k] * witness[signal[k] as usize];
+                    // Most witness values on the profiled circuits are bits (an audit of
+                    // matrix A found only 27,776 of its 225,290 nonzeros touch a witness
+                    // value that is neither 0 nor 1), and a limb compare is far cheaper
+                    // than the Montgomery multiply it skips. Exact either way: adding
+                    // zero and multiplying by one are both bit-identical to the slow
+                    // path.
+                    let w = witness[signal[k] as usize];
+                    if w.is_zero() {
+                        continue;
+                    }
+                    if w.is_one() {
+                        acc += value[k];
+                    } else {
+                        acc += value[k] * w;
+                    }
                 }
                 acc
             })
