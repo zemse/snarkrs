@@ -48,7 +48,7 @@
 //
 // 3. POINTS ACCUMULATE IN XYZZ, BASES STAY AFFINE.
 //    Extended Jacobian (X, Y, ZZ, ZZZ) with x = X/ZZ, y = Y/ZZZ and ZZ^3 = ZZZ^2. Mixed
-//    addition (madd-2008-s) is 7M + 2S against 7M + 4S for Jacobian madd-2007-bl, and
+//    addition (madd-2008-s) is 8M + 2S against 7M + 4S for Jacobian madd-2007-bl, and
 //    the general addition (add-2008-s) is 12M + 2S against 11M + 5S, with roughly a
 //    third of the field additions. Bucket accumulation is essentially all mixed
 //    additions, so this is the operation that decides the kernel.
@@ -60,9 +60,9 @@
 //    per accumulation round, and the rounds have to be re-planned as the runs shorten.
 //    At the domain sizes this prover targets, where a bare command buffer already costs
 //    0.16 ms and an extra dispatch 2-3 us, paying six extra dispatches per window to
-//    save 2M per addition is not obviously a win, and it is certainly not the first
-//    thing to build. The honest statement is that this is untested here, not that it
-//    loses.
+//    save field products per addition is not obviously a win, and it is certainly not
+//    the first thing to build. The honest statement is that this is untested here, not
+//    that it loses.
 //
 //    Identity is ZZ == 0, which is what a freshly allocated Metal buffer already
 //    contains, so a bucket array needs no memset kernel.
@@ -435,7 +435,7 @@ inline Xyzz<F> pt_dbl_affine(Aff<F> p) {
     return r;
 }
 
-// dbl-2008-s-1 with a = 0.
+// dbl-2008-s-1 with a = 0, 6M + 3S.
 template <typename F>
 inline Xyzz<F> pt_dbl(Xyzz<F> p) {
     if (pt_is_zero(p) || f_is_zero(p.y)) {
@@ -455,8 +455,8 @@ inline Xyzz<F> pt_dbl(Xyzz<F> p) {
     return r;
 }
 
-// madd-2008-s: XYZZ += affine, 7M + 2S. This is the inner loop of bucket accumulation
-// and therefore the single hottest routine in the whole backend.
+// madd-2008-s: XYZZ += affine, 8M + 2S. fq_sqr is fq_mul, so G1 pays ten products.
+// This is the inner loop of bucket accumulation and the hottest routine in the backend.
 template <typename F>
 inline Xyzz<F> pt_madd(Xyzz<F> acc, Aff<F> p) {
     if (aff_is_inf(p)) {
