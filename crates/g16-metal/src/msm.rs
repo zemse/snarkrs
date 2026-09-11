@@ -618,21 +618,57 @@ impl MetalMsm {
     ///
     /// One pass, and the classification it produces is what keeps the zero and one
     /// scalars out of Pippenger entirely.
+    ///
+    /// This is per-proof work on the MSM stage's critical path, and `from_fr` is a full
+    /// Montgomery reduction per scalar, so the pass is chunked over the thread pool and
+    /// writes straight into the Metal buffer rather than through an intermediate `Vec`.
+    /// Each chunk counts its own generals and builds its stretch of the prefix locally;
+    /// a serial fix-up then shifts every stretch by the chunks before it, which is one
+    /// add per scalar against the reduction the parallel pass just paid.
     pub fn upload_scalars(&self, scalars: &[Fr]) -> ScalarBuf {
-        let mut packed = Vec::with_capacity(scalars.len());
-        let mut prefix = Vec::with_capacity(scalars.len() + 1);
-        let mut general = 0u32;
-        prefix.push(0);
-        for s in scalars {
-            if !(s.is_zero() || s.is_one()) {
-                general += 1;
+        use rayon::prelude::*;
+        const CHUNK: usize = 4096;
+
+        let n = scalars.len();
+        let bytes = (n.max(1) * core::mem::size_of::<PackedScalar>()) as u64;
+        let buf = self
+            .device
+            .new_buffer(bytes, MTLResourceOptions::StorageModeShared);
+        let mut prefix = vec![0u32; n + 1];
+        if n > 0 {
+            // SAFETY: the buffer was just allocated with room for `n` packed scalars
+            // and nothing has been encoded against it, so no dispatch can be reading it.
+            let slots: &mut [PackedScalar] =
+                unsafe { core::slice::from_raw_parts_mut(buf.contents().cast(), n) };
+            let totals: Vec<u32> = slots
+                .par_chunks_mut(CHUNK)
+                .zip_eq(scalars.par_chunks(CHUNK))
+                .zip_eq(prefix[1..].par_chunks_mut(CHUNK))
+                .map(|((dst, src), pre)| {
+                    let mut general = 0u32;
+                    for ((d, s), p) in dst.iter_mut().zip(src).zip(pre.iter_mut()) {
+                        if !(s.is_zero() || s.is_one()) {
+                            general += 1;
+                        }
+                        *p = general;
+                        *d = PackedScalar::from_fr(s);
+                    }
+                    general
+                })
+                .collect();
+            let mut off = 0u32;
+            for (chunk, total) in prefix[1..].chunks_mut(CHUNK).zip(&totals) {
+                if off > 0 {
+                    for p in chunk {
+                        *p += off;
+                    }
+                }
+                off += total;
             }
-            prefix.push(general);
-            packed.push(PackedScalar::from_fr(s));
         }
         ScalarBuf {
-            buf: self.shared_buffer(&packed),
-            len: scalars.len(),
+            buf,
+            len: n,
             general_prefix: Some(prefix),
         }
     }
@@ -908,11 +944,17 @@ impl MetalMsm {
         }
 
         // ---- combine ----
-        let mut results = Vec::with_capacity(jobs.len());
-        for (i, out) in outs.iter().enumerate() {
-            let plan = &plans[job_plan[i]];
-            results.push(out.combine(plan));
-        }
+        //
+        // Independent per job, and each one is a serial Horner plus a partial sum, so
+        // the five jobs split over the thread pool rather than queueing behind B_g2's
+        // G2 arithmetic.
+        let results: Vec<MsmResult> = {
+            use rayon::prelude::*;
+            outs.par_iter()
+                .enumerate()
+                .map(|(i, out)| out.combine(&plans[job_plan[i]]))
+                .collect()
+        };
 
         // Buffers go home. Anything the plan and the outputs still reference is dead
         // now: `wait_until_completed` returned, so the GPU is finished with all of it.
