@@ -246,6 +246,20 @@ pub trait PreparedCircuit: Send + Sync {
         t: &mut StageTimings,
     ) -> Result<MsmOutputs, ProveError>;
 
+    /// Stages 0-9 in one call, which is the shape [`prove::prove`] drives.
+    ///
+    /// Only stage 9's MSM reads `H`; stages 5-8 read the witness, which exists before
+    /// `compute_h` starts. Whether starting them early buys anything is a property of
+    /// the backend, not of the proof: on the CPU backend an overlapped schedule measured
+    /// even with this sequential one, because work stealing already absorbs the witness
+    /// MSMs into stage 9's idle capacity either way. So the default runs the two stage
+    /// groups in sequence, and a backend that has somewhere concurrent to put stages 5-8
+    /// overrides this; the Metal backend does, on its second command queue.
+    fn h_and_msms(&self, witness: &[Fr], t: &mut StageTimings) -> Result<MsmOutputs, ProveError> {
+        let h = stage!("stages 0-4 compute_h", self.compute_h(witness, t))?;
+        stage!("stages 5-9 msms", self.msms(witness, &h, t))
+    }
+
     /// `H` in host memory, copying it down if that is where it is not.
     ///
     /// **Debugging only**, and the default is the honest answer for a backend that has not

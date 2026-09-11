@@ -53,8 +53,10 @@ pub fn prove_with_blinders(
     timings: &mut StageTimings,
 ) -> Result<Proof, ProveError> {
     refuse_if_unoptimized()?;
-    let h = stage!("stages 0-4 compute_h", circuit.compute_h(witness, timings))?;
-    let m = stage!("stages 5-9 msms", circuit.msms(witness, &h, timings))?;
+    // One call for stages 0-9 rather than `compute_h` then `msms`: only stage 9 needs
+    // `H`, and a backend may overlap stages 5-8 with 0-4. The trait's default is the
+    // old sequence, so nothing changes for a backend that has not opted in.
+    let m = circuit.h_and_msms(witness, timings)?;
     Ok(assemble(circuit.key(), &m, r, s, timings))
 }
 
