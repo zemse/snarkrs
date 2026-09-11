@@ -3,7 +3,7 @@
 //! This is the CPU twin of the point arithmetic in `g16-metal/src/shaders/msm.metal`
 //! (stanzas madd-2008-s, mdbl-2008-s, add-2008-s, dbl-2008-s-1), formula for formula:
 //! x = X/ZZ, y = Y/ZZZ with the invariant ZZ^3 = ZZZ^2, identity encoded as ZZ == 0.
-//! Mixed addition is 7M + 2S against ark's Jacobian madd at 7M + 4S, and, because the
+//! Mixed addition is 8M + 2S against ark's Jacobian madd at 7M + 4S, and, because the
 //! field layer is `g16_field::raw`, none of those operations ends in a compare-and-branch
 //! reduction. Profiling put a G1 mixed add through `ark_ec` at 247 ns against a 148 ns
 //! multiply floor; this module exists to close that gap in the MSM bucket loop, which is
@@ -17,7 +17,7 @@
 //! including the doubling and cancellation corners a random sweep essentially never hits.
 
 use ark_ec::short_weierstrass::{Affine, Projective, SWCurveConfig};
-use ark_ff::Zero;
+use ark_ff::{Field, Zero};
 use g16_field::raw::{RawField, RawFq, RawFq2};
 
 /// The accumulator. `ZZ == 0` is the identity, matching the GPU layout.
@@ -68,7 +68,12 @@ impl<F: RawField> Xyzz<F> {
         let m = xx.double().add(xx);
         let x = m.sqr().sub(s.double());
         let y = m.mul(s.sub(x)).sub(w.mul(py));
-        Xyzz { x, y, zz: v, zzz: w }
+        Xyzz {
+            x,
+            y,
+            zz: v,
+            zzz: w,
+        }
     }
 
     /// dbl-2008-s-1 with a = 0.
@@ -93,7 +98,7 @@ impl<F: RawField> Xyzz<F> {
         }
     }
 
-    /// madd-2008-s: `self += (px, py)`, 7M + 2S. The bucket-loop workhorse.
+    /// madd-2008-s: `self += (px, py)`, 8M + 2S. The bucket-loop workhorse.
     ///
     /// The caller guarantees `(px, py)` is NOT the point at infinity; the prescan filters
     /// those out before anything reaches a bucket (34% of the B query on real keys).
@@ -168,6 +173,9 @@ pub trait RawCurve: SWCurveConfig + Sized {
     /// `(x, y)` as raw limbs. Caller must have excluded the point at infinity.
     fn raw_xy(p: &Affine<Self>) -> (Self::RF, Self::RF);
     fn field_back(f: Self::RF) -> Self::BaseField;
+    /// Inverse of a nonzero element, through ark's extended Euclid. Off the hot path:
+    /// the batch-affine fill calls it once per shared-inversion round, never per point.
+    fn raw_inv(f: Self::RF) -> Self::RF;
 }
 
 impl RawCurve for g16_field::g1::Config {
@@ -180,6 +188,9 @@ impl RawCurve for g16_field::g1::Config {
     fn field_back(f: RawFq) -> g16_field::Fq {
         f.to_fq()
     }
+    fn raw_inv(f: RawFq) -> RawFq {
+        RawFq::from_fq(&f.to_fq().inverse().expect("inverse of zero"))
+    }
 }
 
 impl RawCurve for g16_field::g2::Config {
@@ -191,6 +202,9 @@ impl RawCurve for g16_field::g2::Config {
     #[inline(always)]
     fn field_back(f: RawFq2) -> g16_field::Fq2 {
         f.to_fq2()
+    }
+    fn raw_inv(f: RawFq2) -> RawFq2 {
+        RawFq2::from_fq2(&f.to_fq2().inverse().expect("inverse of zero"))
     }
 }
 

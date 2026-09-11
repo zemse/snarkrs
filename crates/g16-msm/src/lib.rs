@@ -60,6 +60,21 @@ const SCAN_CHUNK: usize = 1 << 12;
 /// so at 16x the reduction overhead of the split stays under a fifth of the chunk's work.
 const CHUNK_BUCKET_RATIO: usize = 16;
 
+/// Entries per shared inversion in the batch-affine fill. Conflicts (a second point for
+/// a bucket that already has a pending addition) grow as `BATCH^2 / n_buckets` while the
+/// inversion amortises as `1 / BATCH`; at 1024 over the 4096 buckets H uses, ~12% of
+/// points conflict (nearly all rescued by the retry pass, see [`BatchFill`]) and the
+/// shared inversion costs well under one Fq product per point.
+const BATCH: usize = 1024;
+
+/// The batch-affine fill only runs with at least this many buckets. Two reasons: the
+/// busy map caps a round at one pending addition per bucket, so `BATCH` must sit below
+/// the bucket count or the flush trigger starves, and a window this narrow means a small
+/// `m`, where the fill is not the cost that matters. On this ladder the split lands
+/// where the arithmetic wants it: the dense H MSM (c = 13) batches, the sparse witness
+/// MSMs (c = 7) keep the XYZZ fill.
+const BATCH_MIN_BUCKETS: usize = 2 * BATCH;
+
 /// Window size for `n` points. Pippenger's cost is minimised near `ln(n)`; sppark uses
 /// `min(floor(lg2(1.5n)) - 8, 18)` floored at 10 on GPU, but the CPU optimum is smaller
 /// because there is no bucket-sort machinery to amortise.
@@ -280,7 +295,7 @@ where
 /// prescanned scalars. Returns `sum_j j * B_j` for that slice.
 ///
 /// The buckets are XYZZ over the branch-free raw field layer (`crate::xyzz`), not ark
-/// Jacobian. Two reasons, both measured: madd-2008-s is 7M + 2S against ark's Jacobian
+/// Jacobian. Two reasons, both measured: madd-2008-s is 8M + 2S against ark's Jacobian
 /// madd at 7M + 4S, and `ark-ff` ends every field operation in a compare-and-branch
 /// reduction that profiling showed costs a G1 mixed add 247 ns against its 148 ns
 /// multiply floor. This loop is 15.5 million additions per 140k-constraint proof; it is
@@ -327,6 +342,227 @@ fn window_chunk<P: RawCurve>(
         total.add_assign(&running);
     }
     to_projective(&total)
+}
+
+/// Affine buckets filled by batched affine additions sharing one field inversion
+/// (Montgomery's trick). An affine addition with its inverse in hand is 2M + 1S, and the
+/// inversion machinery costs 3M per entry, so a bucket visit is 5M + 1S against the XYZZ
+/// madd's 8M + 2S; the buckets are also half the size, 64 against 128 bytes of G1.
+///
+/// The scheduling constraint is that one round may hold at most one pending addition per
+/// bucket, because every entry snapshots its bucket at flush time. `busy` enforces it: a
+/// second point for a busy bucket waits in `retry` and is rescheduled as soon as a flush
+/// clears the round, and a third (two retries sharing one bucket) drops to the lazily
+/// allocated XYZZ `side` buckets. That last hop is what bounds the degenerate case of a
+/// whole chunk landing in one bucket (equal scalars over equal bases) at one madd per
+/// point instead of a one-entry flush per point.
+struct BatchFill<P: RawCurve> {
+    bx: Vec<P::RF>,
+    by: Vec<P::RF>,
+    /// Bucket holds a point. Set by the first point, cleared again by a cancellation.
+    occupied: Vec<bool>,
+    /// Bucket has a pending addition in the current round.
+    busy: Vec<bool>,
+    /// The current round: bucket index and the point to add, sign already applied.
+    pending: Vec<(u32, P::RF, P::RF)>,
+    /// Conflicts waiting for the next flush.
+    retry: Vec<(u32, P::RF, P::RF)>,
+    /// XYZZ escape hatch for buckets too contended for the round machinery.
+    side: Option<Vec<Xyzz<P::RF>>>,
+    dens: Vec<P::RF>,
+    prefix: Vec<P::RF>,
+    ops: Vec<u8>,
+}
+
+impl<P: RawCurve> BatchFill<P> {
+    fn new(n_buckets: usize) -> Self {
+        // Retries rescheduled after a flush ride on top of the trigger threshold, so
+        // the round vectors get headroom past BATCH.
+        let cap = BATCH + BATCH / 2;
+        BatchFill {
+            bx: vec![P::RF::ZERO; n_buckets],
+            by: vec![P::RF::ZERO; n_buckets],
+            occupied: vec![false; n_buckets],
+            busy: vec![false; n_buckets],
+            pending: Vec::with_capacity(cap),
+            retry: Vec::new(),
+            side: None,
+            dens: Vec::with_capacity(cap),
+            prefix: Vec::with_capacity(cap),
+            ops: Vec::with_capacity(cap),
+        }
+    }
+
+    /// `bucket b += (x, y)`, eventually. Free when the bucket is empty, one pending
+    /// entry when it is quiet, a retry when it is contended.
+    fn insert(&mut self, b: usize, x: P::RF, y: P::RF) {
+        if !self.occupied[b] {
+            self.bx[b] = x;
+            self.by[b] = y;
+            self.occupied[b] = true;
+            return;
+        }
+        if self.busy[b] {
+            self.retry.push((b as u32, x, y));
+            // Also a flush trigger: with degenerate digits it is the conflicts, not
+            // the pending entries, that accumulate, and this bounds them.
+            if self.retry.len() >= BATCH {
+                self.flush();
+                self.reschedule();
+            }
+            return;
+        }
+        self.busy[b] = true;
+        self.pending.push((b as u32, x, y));
+        if self.pending.len() >= BATCH {
+            self.flush();
+            self.reschedule();
+        }
+    }
+
+    /// Second chance for conflicts after a flush cleared the busy map. A retry that
+    /// conflicts again shares its bucket with another retry and drops to the side
+    /// buckets rather than looping.
+    fn reschedule(&mut self) {
+        while let Some((b, x, y)) = self.retry.pop() {
+            let b = b as usize;
+            if !self.occupied[b] {
+                self.bx[b] = x;
+                self.by[b] = y;
+                self.occupied[b] = true;
+            } else if self.busy[b] {
+                self.side
+                    .get_or_insert_with(|| vec![Xyzz::ZERO; self.bx.len()])[b]
+                    .madd(x, y);
+            } else {
+                self.busy[b] = true;
+                self.pending.push((b as u32, x, y));
+            }
+        }
+    }
+
+    /// One shared-inversion round: decide each entry's case, batch-invert the
+    /// denominators with Montgomery's trick, apply. The case split runs before the
+    /// product so a zero never reaches the inversion: a cancellation contributes ONE,
+    /// and the doubling denominator `2y` is nonzero because the odd-order BN254 groups
+    /// have no 2-torsion.
+    fn flush(&mut self) {
+        const ADD: u8 = 0;
+        const DBL: u8 = 1;
+        const CANCEL: u8 = 2;
+        if self.pending.is_empty() {
+            return;
+        }
+        self.dens.clear();
+        self.prefix.clear();
+        self.ops.clear();
+        let mut acc = P::RF::ONE;
+        for &(b, px, py) in &self.pending {
+            let b = b as usize;
+            let dx = px.sub(self.bx[b]);
+            let (op, den) = if !dx.is_zero() {
+                (ADD, dx)
+            } else if py == self.by[b] {
+                (DBL, self.by[b].double())
+            } else {
+                // Same x, different y: the negative. The bucket empties.
+                (CANCEL, P::RF::ONE)
+            };
+            self.ops.push(op);
+            self.dens.push(den);
+            self.prefix.push(acc);
+            acc = acc.mul(den);
+        }
+        let mut inv = P::raw_inv(acc);
+        for i in (0..self.pending.len()).rev() {
+            let (b, px, py) = self.pending[i];
+            let b = b as usize;
+            let d_inv = inv.mul(self.prefix[i]);
+            inv = inv.mul(self.dens[i]);
+            match self.ops[i] {
+                ADD => {
+                    let lambda = py.sub(self.by[b]).mul(d_inv);
+                    let x3 = lambda.sqr().sub(self.bx[b]).sub(px);
+                    self.by[b] = lambda.mul(self.bx[b].sub(x3)).sub(self.by[b]);
+                    self.bx[b] = x3;
+                }
+                DBL => {
+                    let xx = self.bx[b].sqr();
+                    let lambda = xx.double().add(xx).mul(d_inv);
+                    let x3 = lambda.sqr().sub(self.bx[b].double());
+                    self.by[b] = lambda.mul(self.bx[b].sub(x3)).sub(self.by[b]);
+                    self.bx[b] = x3;
+                }
+                _ => self.occupied[b] = false,
+            }
+            self.busy[b] = false;
+        }
+        self.pending.clear();
+    }
+
+    /// Flush the stragglers, then reduce. Two flushes settle everything: after the
+    /// first, a retry either schedules cleanly or drops to the side buckets in
+    /// [`Self::reschedule`].
+    fn finish(mut self) -> Projective<P> {
+        self.flush();
+        self.reschedule();
+        self.flush();
+
+        // The same running sum as [`window_chunk`], with the occupied buckets entering
+        // as mixed additions (8M + 2S against the XYZZ-bucket add's 12M + 2S) and the
+        // side buckets, when the chunk was degenerate enough to have any, folded in.
+        let mut running = Xyzz::<P::RF>::ZERO;
+        let mut total = Xyzz::<P::RF>::ZERO;
+        match &self.side {
+            Some(side) => {
+                for j in (0..self.bx.len()).rev() {
+                    if self.occupied[j] {
+                        running.madd(self.bx[j], self.by[j]);
+                    }
+                    running.add_assign(&side[j]);
+                    total.add_assign(&running);
+                }
+            }
+            None => {
+                for j in (0..self.bx.len()).rev() {
+                    if self.occupied[j] {
+                        running.madd(self.bx[j], self.by[j]);
+                    }
+                    total.add_assign(&running);
+                }
+            }
+        }
+        to_projective(&total)
+    }
+}
+
+/// [`window_chunk`] with the fill batched: affine buckets, additions applied in rounds
+/// that share one field inversion. See [`BatchFill`] for the machinery and the conflict
+/// story. Only worth it with buckets to spare; [`pippenger`] switches on
+/// [`BATCH_MIN_BUCKETS`].
+fn window_chunk_batch<P: RawCurve>(
+    bases: &[Affine<P>],
+    scan: &Prescan<P>,
+    range: core::ops::Range<usize>,
+    window: usize,
+    c: u32,
+    n_buckets: usize,
+) -> Projective<P> {
+    let mut fill = BatchFill::<P>::new(n_buckets);
+    for k in range {
+        let d = signed_digit(scan.bigints[k].as_ref(), window, c);
+        if d == 0 {
+            continue;
+        }
+        // Never infinity: prescan filtered those, so raw_xy is total here.
+        let (x, y) = P::raw_xy(&bases[scan.idx[k] as usize]);
+        if d > 0 {
+            fill.insert((d - 1) as usize, x, y);
+        } else {
+            fill.insert((-d - 1) as usize, x, y.neg());
+        }
+    }
+    fill.finish()
 }
 
 fn pippenger<P: RawCurve>(bases: &[Affine<P>], scalars: &[Fr], threads: usize) -> Projective<P>
@@ -392,7 +628,14 @@ where
                     if lo >= hi {
                         return Projective::zero();
                     }
-                    window_chunk(bases, &scan, lo..hi, w, c, n_buckets)
+                    // The wide windows batch their fill behind a shared inversion; the
+                    // narrow ones stay on the XYZZ fill, which has no round overhead
+                    // to amortise.
+                    if n_buckets >= BATCH_MIN_BUCKETS {
+                        window_chunk_batch(bases, &scan, lo..hi, w, c, n_buckets)
+                    } else {
+                        window_chunk(bases, &scan, lo..hi, w, c, n_buckets)
+                    }
                 })
                 .reduce(Projective::zero, |a, b| a + b)
         })
@@ -666,6 +909,87 @@ mod tests {
         // Every base at infinity is still identity, whatever the scalars are.
         let all_inf = vec![G1Affine::identity(); n];
         assert!(msm.msm_g1(&all_inf, &s).is_zero());
+    }
+
+    /// Drives the batch-affine fill against the XYZZ fill window by window, at windows
+    /// narrow enough that every scheduling path fires: direct sets, pending rounds,
+    /// retries, and the side buckets.
+    fn batch_fill_case<P: RawCurve>(bases: &[Affine<P>], scalars: &[Fr]) {
+        let scan = Prescan::<P> {
+            idx: (0..bases.len() as u32).collect(),
+            bigints: scalars.iter().map(|s| s.into_bigint()).collect(),
+            ones_sum: Projective::zero(),
+        };
+        for c in [5u32, 8] {
+            let n_buckets = 1usize << (c - 1);
+            for w in 0..RECODE_BITS.div_ceil(c as usize) {
+                assert_eq!(
+                    window_chunk_batch(bases, &scan, 0..bases.len(), w, c, n_buckets),
+                    window_chunk(bases, &scan, 0..bases.len(), w, c, n_buckets),
+                    "window {w} at c = {c}"
+                );
+            }
+        }
+    }
+
+    /// A base set with duplicates (the flush's doubling case) and cancelling pairs (its
+    /// cancellation case), under shared scalars so they meet in the same buckets.
+    #[test]
+    fn batch_fill_matches_the_xyzz_fill() {
+        let mut rng = test_rng();
+        let n = 600;
+        let mut g1: Vec<G1Affine> = rand_points(n, &mut rng);
+        let mut s = rand_scalars(n, &mut rng);
+        for i in 0..n / 4 {
+            // One point under one scalar: every window funnels into a single bucket,
+            // which is the contention the retry queue and side buckets exist for.
+            g1[i] = g1[0];
+            s[i] = s[0];
+        }
+        for i in n / 4..n / 2 {
+            // Cancelling pairs: the same base negated, under one scalar, meets its
+            // partner in every bucket it touches.
+            g1[i] = if i % 2 == 0 { g1[n / 4] } else { -g1[n / 4] };
+            s[i] = s[n / 4];
+        }
+        s[n - 1] = Fr::zero();
+        batch_fill_case::<g16_field::g1::Config>(&g1, &s);
+
+        let mut g2: Vec<G2Affine> = rand_points(n / 2, &mut rng);
+        for i in 0..n / 8 {
+            g2[i] = if i % 2 == 0 { g2[0] } else { -g2[0] };
+            s[i] = s[1];
+        }
+        batch_fill_case::<g16_field::g2::Config>(&g2, &s[..n / 2]);
+    }
+
+    /// 2^15 points is where [`window_size`] first picks a window wide enough (c = 12,
+    /// 2048 buckets) for the batch-affine fill to engage through the public API; every
+    /// smaller test in this file runs the XYZZ fill.
+    #[test]
+    fn matches_arkworks_g1_through_the_batch_fill() {
+        let mut rng = test_rng();
+        let n = 1usize << 15;
+        assert!(
+            (1usize << (window_size(n) - 1)) >= BATCH_MIN_BUCKETS,
+            "2^15 no longer reaches the batch fill; move this test"
+        );
+        let bases: Vec<G1Affine> = walk_points(n, &mut rng);
+        let scalars = rand_scalars(n, &mut rng);
+        let want = G1Projective::msm(&bases, &scalars).unwrap();
+        assert_eq!(CpuMsm::new().msm_g1(&bases, &scalars), want);
+    }
+
+    /// One base, one scalar value, 2^15 copies: every point of every window lands in
+    /// the same bucket, so the whole MSM runs down the retry and side-bucket path.
+    #[test]
+    fn batch_fill_survives_a_single_hot_bucket() {
+        let mut rng = test_rng();
+        let n = 1usize << 15;
+        let p: Vec<G1Affine> = rand_points(1, &mut rng);
+        let s = Fr::rand(&mut rng);
+        let want = p[0] * (s * Fr::from(n as u64));
+        assert_eq!(CpuMsm::new().msm_g1(&vec![p[0]; n], &vec![s; n]), want);
     }
 
     /// `cargo test -p g16-msm --release -- --ignored --nocapture bench`
