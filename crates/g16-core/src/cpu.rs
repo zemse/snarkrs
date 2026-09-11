@@ -384,6 +384,50 @@ impl PreparedCircuit for CpuCircuit {
 mod tests {
     use super::*;
 
+    fn tiny_key() -> Option<ProvingKey> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../bench/artifacts/tiny_mul/circuit.zkey");
+        if !path.is_file() {
+            eprintln!("SKIPPED: no tiny_mul artifact");
+            return None;
+        }
+        Some(ProvingKey::load(&path).unwrap())
+    }
+
+    #[test]
+    fn rejects_a_domain_that_would_round_up() {
+        for size in [0, 3, 3072] {
+            let Some(mut pk) = tiny_key() else { return };
+            pk.domain_size = size;
+            let Err(err) = CpuCircuit::new(pk) else {
+                panic!("accepted domain size {size}");
+            };
+            assert!(err.to_string().contains("not a power of two"), "{err}");
+        }
+    }
+
+    #[test]
+    fn gather_bit_shortcuts_match_multiplication() {
+        let Some(pk) = tiny_key() else { return };
+        let circuit = CpuCircuit::new(pk).unwrap();
+        let mut rng = ark_std::test_rng();
+        for value in [Fr::zero(), Fr::one(), -Fr::one(), Fr::rand(&mut rng)] {
+            let witness = vec![value; circuit.n_vars()];
+            for m in 0..2 {
+                let coeffs = &circuit.pk.coeffs;
+                let want: Vec<Fr> = coeffs.row_ptr[m]
+                    .windows(2)
+                    .map(|row| {
+                        (row[0] as usize..row[1] as usize)
+                            .map(|k| coeffs.value[m][k] * witness[coeffs.signal[m][k] as usize])
+                            .sum()
+                    })
+                    .collect();
+                assert_eq!(circuit.gather(m, &witness), want);
+            }
+        }
+    }
+
     /// The coset the prover evaluates on is fixed by the zkey's section 9 bases, so these
     /// two identities are a contract with snarkjs, not an implementation detail:
     /// `shift^2` must be the domain's own generator (so evaluation index `i` lands on

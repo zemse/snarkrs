@@ -76,10 +76,9 @@ pub struct CpuNtt {
     /// six transforms per proof over the same two tables. The cache has to live here:
     /// `NttBackend::ntt` receives a `&Domain`, not a prepared table.
     twiddles: TwiddleCache,
-    /// Tables for [`Self::coset_scale_bitrev`], keyed the same way. A separate map
-    /// because these fold in `size_inv` and a bit-reversal, so a `(size, shift)` entry
-    /// here holds different values than a twiddle table for the same key would.
-    coset_tables: TwiddleCache,
+    /// Tables for [`Self::coset_scale_bitrev`], keyed by size, shift and `size_inv`.
+    /// The scale is public on `Domain`, so two same-sized domains can differ in it.
+    coset_tables: RwLock<HashMap<(usize, Fr, Fr), Arc<Vec<Fr>>>>,
 }
 
 impl CpuNtt {
@@ -130,11 +129,7 @@ impl CpuNtt {
     /// The transform, with the serial/parallel choice left to the caller so tests can
     /// drive both paths over one input.
     fn transform(&self, domain: &Domain, a: &mut [Fr], dir: Direction, parallel: bool) {
-        assert_eq!(
-            a.len(),
-            domain.size,
-            "ntt input length must equal the domain size"
-        );
+        check_domain(domain, a.len());
         let n = a.len();
         // Size 1 has an empty twiddle table and `size_inv == 1`, so both directions are
         // the identity. Bailing here also keeps the `usize::BITS - log_size` shift below
@@ -264,11 +259,7 @@ impl CpuNtt {
     /// a transform's wall clock at 2^16, and it was the only serial loop inside an
     /// otherwise parallel stage.
     pub fn intt_to_bitrev(&self, domain: &Domain, a: &mut [Fr]) {
-        assert_eq!(
-            a.len(),
-            domain.size,
-            "ntt input length must equal the domain size"
-        );
+        check_domain(domain, a.len());
         if a.len() <= 1 {
             return;
         }
@@ -279,11 +270,7 @@ impl CpuNtt {
     /// Forward transform, *bit-reversed* input to natural output. The other half of the
     /// [`Self::intt_to_bitrev`] pairing.
     pub fn ntt_from_bitrev(&self, domain: &Domain, a: &mut [Fr]) {
-        assert_eq!(
-            a.len(),
-            domain.size,
-            "ntt input length must equal the domain size"
-        );
+        check_domain(domain, a.len());
         if a.len() <= 1 {
             return;
         }
@@ -297,11 +284,7 @@ impl CpuNtt {
     /// order, permuted once, and cached; `shift` is fixed per circuit, so per proof this
     /// stage is three sequential table reads.
     pub fn coset_scale_bitrev(&self, domain: &Domain, a: &mut [Fr], shift: Fr) {
-        assert_eq!(
-            a.len(),
-            domain.size,
-            "ntt input length must equal the domain size"
-        );
+        check_domain(domain, a.len());
         let table = self.coset_table(domain, shift);
         if a.len() < PARALLEL_THRESHOLD {
             for (x, s) in a.iter_mut().zip(table.iter()) {
@@ -327,11 +310,7 @@ impl CpuNtt {
     /// aligned CACHE_BLOCK, so here the entire middle runs per block in a single
     /// dispatch and the hand-off costs one trip through memory instead of three.
     pub fn intt_coset_ntt(&self, domain: &Domain, a: &mut [Fr], shift: Fr) {
-        assert_eq!(
-            a.len(),
-            domain.size,
-            "ntt input length must equal the domain size"
-        );
+        check_domain(domain, a.len());
         let n = a.len();
         if n <= CACHE_BLOCK || n < PARALLEL_THRESHOLD {
             // Below the block size the three stages are one cache-resident sweep each
@@ -370,7 +349,7 @@ impl CpuNtt {
     /// Cached `[shift^bitrev(p) / n]` table for [`Self::coset_scale_bitrev`], built and
     /// raced exactly like [`Self::twiddles`].
     fn coset_table(&self, domain: &Domain, shift: Fr) -> Arc<Vec<Fr>> {
-        let key = (domain.size, shift);
+        let key = (domain.size, shift, domain.size_inv);
         if let Some(hit) = self
             .coset_tables
             .read()
@@ -444,6 +423,23 @@ impl NttBackend for CpuNtt {
     fn distribute_powers(&self, a: &mut [Fr], shift: Fr) {
         self.distribute(a, shift, a.len() >= PARALLEL_THRESHOLD);
     }
+}
+
+/// Public domain fields must still describe the radix-2 layout before any mutation.
+fn check_domain(domain: &Domain, len: usize) {
+    assert_eq!(
+        len, domain.size,
+        "ntt input length must equal the domain size"
+    );
+    assert!(
+        domain.size.is_power_of_two(),
+        "ntt domain size must be a power of two"
+    );
+    assert_eq!(
+        domain.log_size,
+        domain.size.trailing_zeros(),
+        "ntt domain log_size must match its size"
+    );
 }
 
 /// Elements per rayon task, floored so a task always carries real work.
@@ -757,7 +753,7 @@ mod tests {
     #[test]
     fn matches_the_naive_dft() {
         let ntt = CpuNtt::new();
-        for log in [3u32, 4] {
+        for log in [0u32, 1, 2, 3, 4] {
             let n = 1usize << log;
             let d = domain(n);
             let x = sample(n, 0xABCD + log as u64);
@@ -859,7 +855,7 @@ mod tests {
         // so the two must agree to the bit, not approximately. Sizes straddle
         // PARALLEL_THRESHOLD so both path choices inside each method are covered.
         let ntt = CpuNtt::new();
-        for log in [2u32, 6, 10, 12, 14, 15] {
+        for log in 0..=20u32 {
             let n = 1usize << log;
             let d = domain(n);
             // The shift the real caller uses: the 2n-th root whose square is the
@@ -868,9 +864,11 @@ mod tests {
             let x = sample(n, 0xC05E7 + log as u64);
 
             let mut want = x.clone();
-            ntt.ntt(&d, &mut want, Direction::Inverse);
-            ntt.distribute_powers(&mut want, shift);
-            ntt.ntt(&d, &mut want, Direction::Forward);
+            // The serial radix-2 path shares neither the fused blocks nor the outer
+            // radix-4 kernels. Comparing two fused paths could hide a paired error.
+            ntt.transform(&d, &mut want, Direction::Inverse, false);
+            ntt.distribute(&mut want, shift, false);
+            ntt.transform(&d, &mut want, Direction::Forward, false);
 
             let mut got = x.clone();
             ntt.intt_to_bitrev(&d, &mut got);
@@ -878,6 +876,10 @@ mod tests {
             ntt.ntt_from_bitrev(&d, &mut got);
 
             assert_eq!(got, want, "n = {n}");
+
+            let mut fused = x;
+            ntt.intt_coset_ntt(&d, &mut fused, shift);
+            assert_eq!(fused, want, "fused, n = {n}");
         }
     }
 
@@ -909,7 +911,7 @@ mod tests {
         // Pins each half of the pairing on its own, so a failure in the pipeline test
         // above points at one method rather than at their composition.
         let ntt = CpuNtt::new();
-        for log in [3u32, 8, 11] {
+        for log in [0u32, 1, 3, 8, 11, 12, 13, 16, 17] {
             let n = 1usize << log;
             let d = domain(n);
             let x = sample(n, 0xB17 + log as u64);
@@ -966,6 +968,79 @@ mod tests {
             .collect();
         for (i, got) in results.iter().enumerate() {
             assert_eq!(*got, want, "thread {i}");
+        }
+    }
+
+    #[test]
+    fn coset_cache_tracks_the_domain_and_shift() {
+        let ntt = CpuNtt::new();
+        for n in [1, 2, 4096, 8192, 4096] {
+            let mut d = domain(n);
+            for shift in [Fr::ZERO, Fr::ONE, Fr::from(7u64), domain(2 * n).group_gen] {
+                for scale in [d.size_inv, Fr::from(3u64), d.size_inv] {
+                    d.size_inv = scale;
+                    let mut got = vec![Fr::ONE; n];
+                    ntt.coset_scale_bitrev(&d, &mut got, shift);
+                    let mut want: Vec<_> = (0..n).map(|i| scale * shift.pow([i as u64])).collect();
+                    bit_reverse_permute(&mut want, d.log_size);
+                    assert_eq!(got, want, "n = {n}, shift = {shift}, scale = {scale}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn changed_roots_and_cold_concurrent_cosets_match_serial() {
+        let ntt = CpuNtt::new();
+        let mut d = domain(4096);
+        for _ in 0..3 {
+            std::mem::swap(&mut d.group_gen, &mut d.group_gen_inv);
+            let shift = d.group_gen + Fr::ONE;
+            let x = sample(d.size, 42);
+            let mut want = x.clone();
+            ntt.transform(&d, &mut want, Direction::Inverse, false);
+            ntt.distribute(&mut want, shift, false);
+            ntt.transform(&d, &mut want, Direction::Forward, false);
+            (0..8).into_par_iter().for_each(|_| {
+                let mut got = x.clone();
+                ntt.intt_coset_ntt(&d, &mut got, shift);
+                assert_eq!(got, want);
+            });
+        }
+    }
+
+    #[test]
+    fn malformed_domains_are_rejected_before_mutation() {
+        type Entry = fn(&CpuNtt, &Domain, &mut [Fr]);
+        let entries: [Entry; 6] = [
+            |ntt, d, a| ntt.ntt(d, a, Direction::Forward),
+            |ntt, d, a| ntt.ntt(d, a, Direction::Inverse),
+            CpuNtt::intt_to_bitrev,
+            CpuNtt::ntt_from_bitrev,
+            |ntt, d, a| ntt.coset_scale_bitrev(d, a, Fr::ONE),
+            |ntt, d, a| ntt.intt_coset_ntt(d, a, Fr::ONE),
+        ];
+        let ntt = CpuNtt::new();
+        // 3072 would leave a partial fused block; 1024 and 2048 are handled without
+        // block fusion. CACHE_BLOCK divides every valid larger radix-2 domain exactly.
+        assert!(CACHE_BLOCK.is_power_of_two());
+        for (size, log_size, len) in [(0, 0, 0), (3, 2, 3), (3072, 12, 3072), (8, 2, 8), (8, 3, 7)]
+        {
+            let mut d = domain(8);
+            d.size = size;
+            d.log_size = log_size;
+            for entry in entries {
+                let original = sample(len, 17);
+                let mut a = original.clone();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    entry(&ntt, &d, &mut a);
+                }));
+                assert!(
+                    result.is_err(),
+                    "accepted size {size}, log {log_size}, len {len}"
+                );
+                assert_eq!(a, original, "mutated invalid input");
+            }
         }
     }
 
