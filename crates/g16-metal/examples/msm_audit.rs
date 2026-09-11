@@ -11,8 +11,8 @@ mod audit {
     use std::path::Path;
 
     use g16_core::{cpu::CpuBackend, Backend, StageTimings};
-    use g16_field::{AffineRepr, Fr, One, PrimeField, Zero};
-    use g16_metal::msm::window_size;
+    use g16_field::{AffineRepr, BigInteger, Fr, One, PrimeField, Zero};
+    use g16_metal::msm::window_size_for;
     use g16_zkey::{wtns::Witness, ProvingKey};
 
     // Same carry-free recoding as sc_signed_digit. Reconstructing each scalar below
@@ -50,9 +50,22 @@ mod audit {
         } else {
             general
         };
-        let c = window_size(cap) as usize;
+        // Same per-upload bit bound as `Plan::new`: one past the longest scalar for
+        // the signed carry. Device-resident scalars are unclassified and keep the
+        // full-width layout.
+        let recode_bits = if device_scalars {
+            255
+        } else {
+            scalars
+                .iter()
+                .map(|s| s.into_bigint().num_bits() as usize + 1)
+                .max()
+                .unwrap_or(1)
+                .min(255)
+        };
+        let c = window_size_for(cap, recode_bits) as usize;
         let cap = cap.max(1);
-        let windows = 255usize.div_ceil(c);
+        let windows = recode_bits.div_ceil(c);
         let buckets = 1 << (c - 1);
         let mut rows = vec![0usize; windows * buckets];
         let mut live_entries = 0usize;

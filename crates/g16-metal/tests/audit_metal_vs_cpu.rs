@@ -541,6 +541,16 @@ fn adversarial_scalars_agree_with_arkworks() {
             "small values",
             (0..n).map(|i| Fr::from((i % 5) as u64)).collect(),
         ),
+        (
+            // All bits set in a short scalar: every bounded window borrows, so the
+            // recoding's carry out of the per-upload top window (see `Plan::new`'s
+            // bit bound) must be provably zero, not merely usually zero.
+            "bounded-window borrow",
+            vec![Fr::from((1u64 << 35) - 1); n],
+        ),
+        ("word-sized values", {
+            (0..n).map(|_| Fr::from(next() & 0xFFFF_FFFF)).collect()
+        }),
     ];
     // Five more random draws, so the fixed shapes are not the whole sample.
     for _ in 0..5 {

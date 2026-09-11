@@ -243,6 +243,15 @@ fn legacy_accumulate() -> bool {
 ///
 /// Override with `G16_METAL_MSM_C` to sweep it.
 pub fn window_size(m: usize) -> u32 {
+    window_size_for(m, RECODE_BITS)
+}
+
+/// [`window_size`] with the recoding laid out over `recode_bits` instead of the full
+/// 255. A plan whose scalars are provably short (see [`ScalarBuf::bits_in`]) prices its
+/// windows over the bits it will actually dispatch, so the `windows * m` term stops
+/// charging for digit rows that hold nothing: at sha256_128 the four witness plans use
+/// 8 of the 51 windows a full-width layout would emit at c = 5.
+pub fn window_size_for(m: usize, recode_bits: usize) -> u32 {
     if let Ok(v) = std::env::var("G16_METAL_MSM_C") {
         if let Ok(c) = v.parse::<u32>() {
             return c.clamp(2, MAX_WINDOW);
@@ -260,9 +269,9 @@ pub fn window_size(m: usize) -> u32 {
     let mut best_cost = f64::MAX;
     for c in 3..=MAX_WINDOW {
         let cu = c as usize;
-        let w = RECODE_BITS.div_ceil(cu);
+        let w = recode_bits.div_ceil(cu);
         // Bits the top window actually reaches, hence how many of its buckets are live.
-        let top_bits = RECODE_BITS - (w - 1) * cu;
+        let top_bits = recode_bits - (w - 1) * cu;
         let top_buckets = (1u64 << (top_bits.min(cu) - 1)) as f64;
         let fattest = m as f64 / top_buckets;
 
@@ -407,6 +416,18 @@ impl G2Bases {
     }
 }
 
+/// Chunk width of the classification pass in [`MetalMsm::upload_scalars`], and hence
+/// the granularity of [`ScalarBuf::bits_in`].
+const CLASSIFY_CHUNK: usize = 4096;
+
+/// Bit length of a packed standard-form scalar: one past the highest set bit, 0 for 0.
+fn scalar_bits(v: &[u32; 8]) -> u32 {
+    match v.iter().rposition(|w| *w != 0) {
+        Some(i) => i as u32 * 32 + 32 - v[i].leading_zeros(),
+        None => 0,
+    }
+}
+
 /// Scalars in **standard** form (see `layout`'s module docs for why not Montgomery),
 /// resident on the device.
 ///
@@ -424,6 +445,12 @@ pub struct ScalarBuf {
     /// list [`Outputs::alloc`] filters from it, since which of these indices matter
     /// also depends on the job's bases. `None` when the buffer was never classified.
     ones_idx: Option<Vec<u32>>,
+    /// Per-[`CLASSIFY_CHUNK`] maximum scalar bit length, from the same pass. This is
+    /// what lets a plan drop its empty high windows: a scalar of `b` bits recodes
+    /// exactly in `ceil((b + 1) / c)` signed windows, and on the csp circuits the
+    /// witness values are mostly 32-bit words, so 43 of the 51 windows a full-width
+    /// layout emits at c = 5 hold nothing. `None` when the buffer was never classified.
+    chunk_bits: Option<Vec<u32>>,
 }
 
 impl ScalarBuf {
@@ -441,6 +468,21 @@ impl ScalarBuf {
         match &self.general_prefix {
             Some(p) => (p[range.end] - p[range.start]) as usize,
             None => range.len(),
+        }
+    }
+
+    /// Maximum scalar bit length in `range`, rounded out to classification chunks, or
+    /// the field's full width when the buffer came from the device and was never
+    /// classified. Overestimating is safe for the same reason as [`Self::general_in`]:
+    /// the extra windows' digits are all zero, so they only cost empty bucket rows.
+    fn bits_in(&self, range: &Range<usize>) -> usize {
+        match &self.chunk_bits {
+            Some(b) => {
+                let lo = range.start / CLASSIFY_CHUNK;
+                let hi = range.end.div_ceil(CLASSIFY_CHUNK).min(b.len());
+                b[lo..hi].iter().copied().max().unwrap_or(0) as usize
+            }
+            None => RECODE_BITS - 1,
         }
     }
 }
@@ -697,7 +739,6 @@ impl MetalMsm {
     /// add per scalar against the reduction the parallel pass just paid.
     pub fn upload_scalars(&self, scalars: &[Fr]) -> ScalarBuf {
         use rayon::prelude::*;
-        const CHUNK: usize = 4096;
 
         let n = scalars.len();
         let bytes = (n.max(1) * core::mem::size_of::<PackedScalar>()) as u64;
@@ -706,34 +747,37 @@ impl MetalMsm {
             .new_buffer(bytes, MTLResourceOptions::StorageModeShared);
         let mut prefix = vec![0u32; n + 1];
         let mut ones_idx = Vec::new();
+        let mut chunk_bits = Vec::new();
         if n > 0 {
             // SAFETY: the buffer was just allocated with room for `n` packed scalars
             // and nothing has been encoded against it, so no dispatch can be reading it.
             let slots: &mut [PackedScalar] =
                 unsafe { core::slice::from_raw_parts_mut(buf.contents().cast(), n) };
-            let parts: Vec<(u32, Vec<u32>)> = slots
-                .par_chunks_mut(CHUNK)
-                .zip_eq(scalars.par_chunks(CHUNK))
-                .zip_eq(prefix[1..].par_chunks_mut(CHUNK))
+            let parts: Vec<(u32, Vec<u32>, u32)> = slots
+                .par_chunks_mut(CLASSIFY_CHUNK)
+                .zip_eq(scalars.par_chunks(CLASSIFY_CHUNK))
+                .zip_eq(prefix[1..].par_chunks_mut(CLASSIFY_CHUNK))
                 .enumerate()
                 .map(|(ci, ((dst, src), pre))| {
                     let mut general = 0u32;
                     let mut ones = Vec::new();
+                    let mut bits = 0u32;
                     for (i, ((d, s), p)) in dst.iter_mut().zip(src).zip(pre.iter_mut()).enumerate()
                     {
                         if s.is_one() {
-                            ones.push((ci * CHUNK + i) as u32);
+                            ones.push((ci * CLASSIFY_CHUNK + i) as u32);
                         } else if !s.is_zero() {
                             general += 1;
                         }
                         *p = general;
                         *d = PackedScalar::from_fr(s);
+                        bits = bits.max(scalar_bits(&d.v));
                     }
-                    (general, ones)
+                    (general, ones, bits)
                 })
                 .collect();
             let mut off = 0u32;
-            for (chunk, (total, ones)) in prefix[1..].chunks_mut(CHUNK).zip(&parts) {
+            for (chunk, (total, ones, bits)) in prefix[1..].chunks_mut(CLASSIFY_CHUNK).zip(&parts) {
                 if off > 0 {
                     for p in chunk {
                         *p += off;
@@ -741,6 +785,7 @@ impl MetalMsm {
                 }
                 off += total;
                 ones_idx.extend_from_slice(ones);
+                chunk_bits.push(*bits);
             }
         }
         ScalarBuf {
@@ -748,6 +793,7 @@ impl MetalMsm {
             len: n,
             general_prefix: Some(prefix),
             ones_idx: Some(ones_idx),
+            chunk_bits: Some(chunk_bits),
         }
     }
 
@@ -783,6 +829,7 @@ impl MetalMsm {
             len,
             general_prefix: None,
             ones_idx: None,
+            chunk_bits: None,
         })
     }
 
@@ -809,6 +856,7 @@ impl MetalMsm {
             len,
             general_prefix: None,
             ones_idx: None,
+            chunk_bits: None,
         }
     }
 
@@ -1089,8 +1137,14 @@ impl<'a> Plan<'a> {
     fn new(scalars: &'a ScalarBuf, scalar_off: usize, n: usize) -> Self {
         let range = scalar_off..scalar_off + n;
         let general = scalars.general_in(&range);
-        let c = window_size(general);
-        let n_windows = RECODE_BITS.div_ceil(c as usize);
+        // One bit past the range's longest scalar, for the signed carry: a scalar of
+        // `b` bits recodes exactly in `ceil((b + 1) / c)` windows, with zero carry out
+        // of the top one. Windows above that hold no digit on any scalar in the range,
+        // so planning them would only clear, merge and reduce empty rows. H's scalars
+        // are device-resident and unclassified, so `bits_in` keeps its full bound.
+        let recode_bits = (scalars.bits_in(&range) + 1).min(RECODE_BITS);
+        let c = window_size_for(general, recode_bits);
+        let n_windows = recode_bits.div_ceil(c as usize);
         let n_buckets = 1usize << (c - 1);
         let cap = general.max(1);
         let slice_len = slice_len_for(n_windows, cap);
