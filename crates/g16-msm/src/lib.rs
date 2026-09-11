@@ -228,14 +228,14 @@ struct Prescan<P: SWCurveConfig> {
 ///
 /// A constant-time variant would have to process every scalar through the general path,
 /// giving up both fast paths and the compaction.
-fn prescan<P: SWCurveConfig>(bases: &[Affine<P>], scalars: &[Fr], n: usize) -> Prescan<P>
+fn prescan<P: RawCurve>(bases: &[Affine<P>], scalars: &[Fr], n: usize) -> Prescan<P>
 where
     P::BaseField: Send + Sync,
 {
     let run = |lo: usize, hi: usize| {
         let mut idx = Vec::new();
         let mut bigints = Vec::new();
-        let mut ones_sum = Projective::<P>::zero();
+        let mut ones_sum = Xyzz::<P::RF>::ZERO;
         for i in lo..hi {
             let s = &scalars[i];
             if s.is_zero() {
@@ -252,8 +252,12 @@ where
                 continue;
             }
             if s.is_one() {
-                // One mixed addition, total, for the whole scalar.
-                ones_sum += &bases[i];
+                // One mixed addition, total, for the whole scalar. Through the raw
+                // XYZZ madd, not ark's Jacobian one: on a bit-heavy witness this loop
+                // runs tens of thousands of times per MSM, and the branchy ark madd
+                // was profiled at 247 ns against the raw path's multiply floor.
+                let (x, y) = P::raw_xy(&bases[i]);
+                ones_sum.madd(x, y);
                 continue;
             }
             idx.push(i as u32);
@@ -262,7 +266,7 @@ where
         Prescan {
             idx,
             bigints,
-            ones_sum,
+            ones_sum: to_projective(&ones_sum),
         }
     };
 
