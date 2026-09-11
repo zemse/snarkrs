@@ -323,6 +323,39 @@ impl MetalCircuit {
     }
 }
 
+/// The smallest domain where [`MetalCircuit::h_and_msms`] splits the five-job batch to
+/// overlap the witness MSMs with the transforms. See [`overlap_pays`].
+const OVERLAP_MIN_DOMAIN: usize = 1 << 17;
+
+/// Whether the two-queue overlap in [`MetalCircuit::h_and_msms`] pays at this size.
+///
+/// The split has no ordering control: the witness batch and the compute_h buffers sit on
+/// different queues, and whether the device hides one inside the other or serialises
+/// them is its arbitration, not ours. Both outcomes are real, and which one a session
+/// gets is machine state that can flip between rounds and then stick. At 2^16 the same
+/// binary measured csp minima of 12.0 to 12.3 ms for two interleaved rounds and then
+/// 13.0 to 16.6 for the next six, against an unsplit base flat at 12.5 to 12.7; a
+/// full-ladder sweep an hour later, forced both ways, read 10.6 against 12.0 in every
+/// round, and an independent session reproduced the losing mode at 15.1 to 16.9 against
+/// a settled 12.3. A schedule that wins 1.4 ms in one arbitration state and loses 3 in
+/// the other is priced above its best case, so below the crossover the sequential path
+/// stands. At 2^17 and up the witness work is large enough that even the lost race
+/// nets, and no observed round in any session has lost there: the ladder sweep's minima
+/// read -1.0 ms at 2^17 (js_8x8_d32), -1.1 (sha256_256), -1.9 (keccak256), -3.1
+/// (rsa2048) and -6.9 (anon-aadhaar, 2^21), with the eight-round interleaved csp
+/// campaign and the independent session agreeing on the sign. Sweep it again with
+/// `G16_METAL_OVERLAP=0` or `=1`, which forces the path regardless of size.
+fn overlap_pays(domain_size: usize) -> bool {
+    match std::env::var("G16_METAL_OVERLAP")
+        .ok()
+        .and_then(|v| v.parse::<u8>().ok())
+    {
+        Some(0) => false,
+        Some(_) => true,
+        None => domain_size >= OVERLAP_MIN_DOMAIN,
+    }
+}
+
 impl PreparedCircuit for MetalCircuit {
     /// Always "metal", and that is a claim about what ran: no stage in this backend has a
     /// CPU fallback, so the name cannot be describing a proof the CPU did.
@@ -403,14 +436,19 @@ impl PreparedCircuit for MetalCircuit {
     /// thread while the compute_h command buffers run, and the device interleaves the
     /// two. The H MSM then goes out as its own batch once `compute_h` has returned.
     ///
-    /// Splitting the five-job batch is not free: the witness jobs lose their seat in the
-    /// concurrent encoder beside H's accumulation, and a second submission is paid.
-    /// Measured against those costs the overlap still wins about 1.2 ms at 2^16 and
-    /// 1.1 ms at 2^17 (csp warm medians and minima alike), because the four witness
-    /// MSMs' marginal GPU time fits inside the 2.5 to 3.9 ms the transforms take. The
-    /// CPU backend keeps the sequential default: there the same overlap measured even,
-    /// since work stealing already absorbs the witness MSMs either way.
+    /// Splitting the five-job batch is not free, and worse, its price is not fixed: the
+    /// witness jobs lose their seat in the concurrent encoder beside H's accumulation,
+    /// a second submission is paid, and the device arbitrates the two queues however it
+    /// likes. See [`overlap_pays`] for the measured consequences and for why the split
+    /// only happens at [`OVERLAP_MIN_DOMAIN`] and above; below it this method takes the
+    /// trait's own sequence, bit for bit. The CPU backend keeps the sequential default
+    /// everywhere: there the same overlap measured even, since work stealing already
+    /// absorbs the witness MSMs either way.
     fn h_and_msms(&self, witness: &[Fr], t: &mut StageTimings) -> Result<MsmOutputs, ProveError> {
+        if !overlap_pays(self.pk.domain_size) {
+            let h = self.compute_h(witness, t)?;
+            return self.msms(witness, &h, t);
+        }
         self.check_witness(witness)?;
         let start = Instant::now();
 
