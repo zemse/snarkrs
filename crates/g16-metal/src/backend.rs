@@ -33,7 +33,7 @@ use g16_field::Fr;
 use g16_zkey::ProvingKey;
 use metal::Device;
 
-use crate::msm::{G1Bases, G2Bases, Job, JobG1, JobG2, MetalMsm};
+use crate::msm::{G1Bases, G2Bases, Job, JobG1, JobG2, MetalMsm, ScalarBuf};
 use crate::stages::{HHandle, HResident, HStages};
 
 fn bad(reason: impl Into<String>) -> ProveError {
@@ -234,6 +234,93 @@ impl MetalCircuit {
         }
         Ok(())
     }
+
+    /// Stages 5-8: the four MSM jobs whose scalars are the witness. One upload of the
+    /// witness serves all four. Passing the same `ScalarBuf` over the same range is what
+    /// makes the first three share a single counting sort inside `msm_batch`; a second
+    /// upload would silently cost two more digit pipelines as well as the copy.
+    fn witness_jobs<'a>(&'a self, w: &'a ScalarBuf) -> [Job<'a>; 4] {
+        [
+            Job::G1(JobG1 {
+                bases: &self.a_bases,
+                base_off: 0,
+                scalars: w,
+                scalar_off: 0,
+                n: self.pk.n_vars,
+            }),
+            Job::G2(JobG2 {
+                bases: &self.b_g2_bases,
+                base_off: 0,
+                scalars: w,
+                scalar_off: 0,
+                n: self.pk.n_vars,
+            }),
+            Job::G1(JobG1 {
+                bases: &self.b_g1_bases,
+                base_off: 0,
+                scalars: w,
+                scalar_off: 0,
+                n: self.pk.n_vars,
+            }),
+            Job::G1(JobG1 {
+                bases: &self.l_bases,
+                base_off: 0,
+                scalars: w,
+                // Section 8 covers the private wires only: witness[0] is the constant 1
+                // and witness[1..=n_public] are the public inputs, which the verifier
+                // folds in through IC instead.
+                scalar_off: self.pk.n_public + 1,
+                n: self.l_bases.len(),
+            }),
+        ]
+    }
+
+    /// Stage 9's scalars. The normal path is the device buffer stage 4 wrote, which
+    /// never touches the host. `HPoly::device_handle` returns `None` for a handle from
+    /// some other backend, and in that case the only thing left is a host vector, so
+    /// a CPU `compute_h` can still be finished on the GPU rather than rejected.
+    ///
+    /// The returned `ScalarBuf` reads the buffer `h` owns, so `h` (and with it the
+    /// scratch behind the handle) must outlive the `msm_batch` that consumes it; that
+    /// is the lifetime `scalars_from_device_std` requires.
+    fn h_scalars(&self, h: &HPoly) -> Result<ScalarBuf, ProveError> {
+        match h.device_handle::<HHandle>(crate::stages::TAG) {
+            Some(handle) => {
+                if handle.len() != self.pk.domain_size {
+                    return Err(bad(format!(
+                        "device h holds {} entries, domain size is {}",
+                        handle.len(),
+                        self.pk.domain_size
+                    )));
+                }
+                // Stage 4 wrote H in both Montgomery and standard form; the MSM reads
+                // the standard copy directly. Re-deriving it from `h_mont` through
+                // `scalars_from_device_mont` was the old path here, and it cost one
+                // extra command buffer plus a full-domain Montgomery reduction that the
+                // pointwise kernel had already performed.
+                Ok(self
+                    .msm
+                    .scalars_from_device_std(handle.h_std(), handle.len()))
+            }
+            None => {
+                let host = h.to_host().ok_or_else(|| {
+                    bad("compute_h output is neither a metal handle nor a host vector")
+                })?;
+                Ok(self.msm.upload_scalars(host))
+            }
+        }
+    }
+
+    /// Stage 9's MSM job over `h_scalars`.
+    fn h_job<'a>(&'a self, h_scalars: &'a ScalarBuf) -> Job<'a> {
+        Job::G1(JobG1 {
+            bases: &self.h_bases,
+            base_off: 0,
+            scalars: h_scalars,
+            scalar_off: 0,
+            n: self.pk.domain_size,
+        })
+    }
 }
 
 impl PreparedCircuit for MetalCircuit {
@@ -276,85 +363,13 @@ impl PreparedCircuit for MetalCircuit {
 
         let start = Instant::now();
 
-        // One upload of the witness for the A, B-in-G2, B-in-G1 and L MSMs. Passing the
-        // same `ScalarBuf` over the same range is what makes the first three share a
-        // single counting sort inside `msm_batch`; a second upload would silently cost
-        // two more digit pipelines as well as the copy.
         let w = self.msm.upload_scalars(witness);
-
-        // Stage 9's scalars. The normal path is the device buffer stage 4 wrote, which
-        // never touches the host. `HPoly::device_handle` returns `None` for a handle from
-        // some other backend, and in that case the only thing left is a host vector, so
-        // a CPU `compute_h` can still be finished on the GPU rather than rejected.
-        let h_scalars = match h.device_handle::<HHandle>(crate::stages::TAG) {
-            Some(handle) => {
-                if handle.len() != self.pk.domain_size {
-                    return Err(bad(format!(
-                        "device h holds {} entries, domain size is {}",
-                        handle.len(),
-                        self.pk.domain_size
-                    )));
-                }
-                // Stage 4 wrote H in both Montgomery and standard form; the MSM reads
-                // the standard copy directly. Re-deriving it from `h_mont` through
-                // `scalars_from_device_mont` was the old path here, and it cost one
-                // extra command buffer plus a full-domain Montgomery reduction that the
-                // pointwise kernel had already performed. `handle` (and with it the
-                // scratch that owns the buffer) outlives the `msm_batch` below, which
-                // is the lifetime `scalars_from_device_std` requires.
-                self.msm
-                    .scalars_from_device_std(handle.h_std(), handle.len())
-            }
-            None => {
-                let host = h.to_host().ok_or_else(|| {
-                    bad("compute_h output is neither a metal handle nor a host vector")
-                })?;
-                self.msm.upload_scalars(host)
-            }
-        };
+        let h_scalars = self.h_scalars(h)?;
 
         // One command buffer for all five. Order matches the stage numbering, and
         // `msm_batch` returns results in job order.
-        let jobs = [
-            Job::G1(JobG1 {
-                bases: &self.a_bases,
-                base_off: 0,
-                scalars: &w,
-                scalar_off: 0,
-                n: self.pk.n_vars,
-            }),
-            Job::G2(JobG2 {
-                bases: &self.b_g2_bases,
-                base_off: 0,
-                scalars: &w,
-                scalar_off: 0,
-                n: self.pk.n_vars,
-            }),
-            Job::G1(JobG1 {
-                bases: &self.b_g1_bases,
-                base_off: 0,
-                scalars: &w,
-                scalar_off: 0,
-                n: self.pk.n_vars,
-            }),
-            Job::G1(JobG1 {
-                bases: &self.l_bases,
-                base_off: 0,
-                scalars: &w,
-                // Section 8 covers the private wires only: witness[0] is the constant 1
-                // and witness[1..=n_public] are the public inputs, which the verifier
-                // folds in through IC instead.
-                scalar_off: self.pk.n_public + 1,
-                n: self.l_bases.len(),
-            }),
-            Job::G1(JobG1 {
-                bases: &self.h_bases,
-                base_off: 0,
-                scalars: &h_scalars,
-                scalar_off: 0,
-                n: self.pk.domain_size,
-            }),
-        ];
+        let [j5, j6, j7, j8] = self.witness_jobs(&w);
+        let jobs = [j5, j6, j7, j8, self.h_job(&h_scalars)];
         let out = self.msm.msm_batch(&jobs)?;
         if out.len() != jobs.len() {
             return Err(bad(format!(
@@ -370,6 +385,72 @@ impl PreparedCircuit for MetalCircuit {
         let l_g1 = out[3].g1()?;
         let h_g1 = out[4].g1()?;
         t.msm_us += start.elapsed().as_micros() as u64;
+
+        Ok(MsmOutputs {
+            a_g1,
+            b_g2,
+            b_g1,
+            l_g1,
+            h_g1,
+        })
+    }
+
+    /// Stages 0-9, with stages 5-8 started before `H` exists.
+    ///
+    /// Only stage 9 reads the buffer stage 4 writes; the other four MSMs read the
+    /// witness, which is in hand before `compute_h` starts. [`HStages`] and [`MetalMsm`]
+    /// own separate command queues, so the witness batch is committed from a second
+    /// thread while the compute_h command buffers run, and the device interleaves the
+    /// two. The H MSM then goes out as its own batch once `compute_h` has returned.
+    ///
+    /// Splitting the five-job batch is not free: the witness jobs lose their seat in the
+    /// concurrent encoder beside H's accumulation, and a second submission is paid.
+    /// Measured against those costs the overlap still wins about 1.2 ms at 2^16 and
+    /// 1.1 ms at 2^17 (csp warm medians and minima alike), because the four witness
+    /// MSMs' marginal GPU time fits inside the 2.5 to 3.9 ms the transforms take. The
+    /// CPU backend keeps the sequential default: there the same overlap measured even,
+    /// since work stealing already absorbs the witness MSMs either way.
+    fn h_and_msms(&self, witness: &[Fr], t: &mut StageTimings) -> Result<MsmOutputs, ProveError> {
+        self.check_witness(witness)?;
+        let start = Instant::now();
+
+        let mut compute_h_us = 0u64;
+        let (h_out, wit_out) = std::thread::scope(|s| {
+            let wit = s.spawn(|| {
+                let w = self.msm.upload_scalars(witness);
+                self.msm.msm_batch(&self.witness_jobs(&w))
+            });
+            let h_out = (|| {
+                let t0 = Instant::now();
+                let h = self.compute_h(witness, t)?;
+                compute_h_us = t0.elapsed().as_micros() as u64;
+                let h_scalars = self.h_scalars(&h)?;
+                // `h` stays alive across the batch: the scratch behind its handle owns
+                // the buffer `h_scalars` reads.
+                self.msm.msm_batch(&[self.h_job(&h_scalars)])
+            })();
+            (h_out, wit.join())
+        });
+        let wit_out = wit_out.unwrap_or_else(|e| std::panic::resume_unwind(e))?;
+        let h_out = h_out?;
+        if wit_out.len() != 4 || h_out.len() != 1 {
+            return Err(bad(format!(
+                "msm_batch returned {} witness results and {} h results",
+                wit_out.len(),
+                h_out.len()
+            )));
+        }
+
+        let a_g1 = wit_out[0].g1()?;
+        let b_g2 = wit_out[1].g2()?;
+        let b_g1 = wit_out[2].g1()?;
+        let l_g1 = wit_out[3].g1()?;
+        let h_g1 = h_out[0].g1()?;
+        // The witness batch overlaps stages 0-4 here, so the MSMs no longer have a wall
+        // window of their own. `msm_us` takes what they add beyond `compute_h`, which
+        // keeps the stage fields summing to the proof instead of double-counting the
+        // overlap. `compute_h` filled `gather_us` and `ntt_us` itself, above.
+        t.msm_us += (start.elapsed().as_micros() as u64).saturating_sub(compute_h_us);
 
         Ok(MsmOutputs {
             a_g1,
