@@ -117,6 +117,34 @@ fn slice_len() -> usize {
         .unwrap_or(SLICE_LEN)
 }
 
+/// Slice length the segmented accumulation actually dispatches with, per plan.
+///
+/// [`SLICE_LEN`] balances accumulation against merge for a plan big enough to fill the
+/// machine, and it is the constant the window cost model was fitted with, so
+/// [`window_size`] keeps reading it. But a witness plan has a few hundred general
+/// scalars: at 64 entries a slice that is ~500 threads, each a *dependent* chain of 64
+/// mixed additions, on a device that wants thousands of threads before it can hide any
+/// latency. Occupancy binds long before the merge does, so small plans trade slice
+/// length for threads until the dispatch reaches [`SEG_TARGET_THREADS`]. Measured on
+/// the csp artifacts: the witness plans' bucket half drops 2x in G1 and G2 both, and a
+/// plan at H's size keeps slice 64 and does not move.
+const SEG_TARGET_THREADS: usize = 4096;
+
+fn slice_len_for(n_windows: usize, cap: usize) -> usize {
+    let forced = std::env::var("G16_METAL_MSM_L")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0);
+    if let Some(l) = forced {
+        return l;
+    }
+    let mut l = SLICE_LEN;
+    while l > 8 && n_windows * cap.div_ceil(l) < SEG_TARGET_THREADS {
+        l /= 2;
+    }
+    l
+}
+
 /// `G16_METAL_MSM_LEGACY_ACC=1` swaps the segmented accumulation for the simple
 /// one-thread-per-bucket kernel. Kept only so the load-imbalance claim in
 /// `shaders/msm.metal` can be reproduced rather than taken on trust.
@@ -871,7 +899,7 @@ impl<'a> Plan<'a> {
         let n_windows = RECODE_BITS.div_ceil(c as usize);
         let n_buckets = 1usize << (c - 1);
         let cap = general.max(1);
-        let slice_len = slice_len();
+        let slice_len = slice_len_for(n_windows, cap);
         Self {
             n,
             scalar_off,
@@ -977,10 +1005,24 @@ struct Outputs {
     is_g2: bool,
 }
 
-/// Threadgroups in the ones kernel. Enough that a 2^18-long witness gives each thread
-/// about sixty scalars to scan, few enough that the host adds a few dozen points.
+/// Threadgroups in the ones kernel.
+///
+/// The scan is a *dependent* chain: each thread's accumulator waits on its previous
+/// mixed addition, and about every other scalar of a bit-decomposition witness is a
+/// one, so a thread's chain is as long as its stretch of the input. The first shape of
+/// this function handed each thread 64 scalars regardless of `n`, which is 832 threads
+/// at 2^16 on a device with 4,864 ALUs: the four witness MSMs' ones scans were flat in
+/// `n` because they were latency chains at a sixth of occupancy. Eight scalars per
+/// thread puts thousands of threads in flight; the price is that the host sums up to
+/// 256 partials per MSM instead of 64, which is still under 0.1 ms. Swept via
+/// `G16_METAL_MSM_ONES_SPT`: 4 and 8 tie, 16 and up climb back toward the old shape.
 fn ones_groups_for(n: usize) -> usize {
-    n.div_ceil(REDUCE_TG * 64).clamp(1, 64)
+    let spt = std::env::var("G16_METAL_MSM_ONES_SPT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(8);
+    n.div_ceil(REDUCE_TG * spt).clamp(1, 256)
 }
 
 impl Outputs {
