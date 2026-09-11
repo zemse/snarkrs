@@ -102,17 +102,11 @@ fn main() {
         // ---- stages 5-9 ----
         println!("\n-- stages 5-9, five MSMs --");
         let l = &w[pk.n_public + 1..];
-        let mut h_ones = 0usize;
         println!(
             "{:<8} {:>9} {:>9} {:>9} {:>6} {:>5} {:>8} {:>9} {:>12}",
             "msm", "len", "general", "ones", "inf", "c", "windows", "buckets", "base MB"
         );
-        let mut row = |tag: &str,
-                       len: usize,
-                       general: usize,
-                       ones: usize,
-                       inf: usize,
-                       pt: usize| {
+        let row = |tag: &str, len: usize, general: usize, ones: usize, inf: usize, pt: usize| {
             let c = window_size(general);
             let nw = 255usize.div_ceil(c as usize);
             let nb = 1usize << (c - 1);
@@ -156,16 +150,8 @@ fn main() {
             inf_count(&pk.l_query),
             G1A,
         );
-        h_ones += 0;
-        let (hc, hnw, _) = row(
-            "H_g1",
-            pk.h_query.len(),
-            n,
-            h_ones,
-            inf_count(&pk.h_query),
-            G1A,
-        );
-        let _ = hc;
+        // H carries no scalar equal to one: every entry is a general evaluation.
+        let (_, hnw, _) = row("H_g1", pk.h_query.len(), n, 0, inf_count(&pk.h_query), G1A);
 
         // The dense MSM is the one worth costing out: every scalar reaches the bucket
         // loop, so its adds are exactly one per window per scalar plus the bucket merge.
