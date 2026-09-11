@@ -60,9 +60,10 @@ use std::ops::Range;
 use std::sync::Mutex;
 
 use ark_ff::{AdditiveGroup, One, Zero};
+use metal::objc::{msg_send, sel, sel_impl};
 use metal::{
     Buffer, CommandQueue, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device,
-    MTLResourceOptions, MTLSize,
+    MTLDispatchType, MTLResourceOptions, MTLSize,
 };
 
 use g16_core::ProveError;
@@ -839,13 +840,64 @@ impl MetalMsm {
                 )?;
             }
         } else {
+            // A concurrent encoder, staged. The default serial encoder barriers every
+            // dispatch against the previous one, so the 37 dispatches ran strictly one
+            // at a time and the per-phase GPU times summed exactly to the batch total:
+            // zero overlap. But most of these dispatches are independent, and the small
+            // ones are latency chains that leave nearly the whole device idle: the four
+            // witness MSMs' accumulations and ones scans are a few thousand threads
+            // each, while H's accumulation is throughput-bound and can absorb them.
+            //
+            // Grouping by stage keeps the hazards trivial to state: every dispatch of
+            // one phase is independent of every other dispatch of that phase (disjoint
+            // outputs; shared inputs are read-only), and each phase reads only what
+            // earlier phases wrote, so one full barrier between phases is both
+            // necessary and sufficient. metal-rs 0.29 does not bind
+            // memoryBarrierWithScope:, so it is called the way `cb` reads the
+            // unbound timing properties.
+            //
+            // The ones scans have no dependency at all (scalars and bases in, own
+            // buffer out) and are encoded into the accumulation phase, the widest one.
             let cb = self.queue.new_command_buffer();
-            let enc = cb.new_compute_command_encoder();
+            let enc = cb.compute_command_encoder_with_dispatch_type(MTLDispatchType::Concurrent);
+            let barrier = |enc: &ComputeCommandEncoderRef| {
+                // SAFETY: `ComputeCommandEncoderRef` is `objc::Message`, and
+                // memoryBarrierWithScope: is a documented MTLComputeCommandEncoder
+                // method taking MTLBarrierScope; MTLBarrierScopeBuffers is 1 << 0.
+                unsafe {
+                    let () = msg_send![enc, memoryBarrierWithScope: 1u64];
+                }
+            };
             for p in &plans {
-                p.encode(self, enc);
+                p.encode_zero(self, enc);
             }
             for (i, (job, out)) in jobs.iter().zip(&outs).enumerate() {
-                out.encode(self, enc, job, &plans[job_plan[i]]);
+                out.encode_clear(self, enc, job, &plans[job_plan[i]]);
+            }
+            barrier(enc);
+            for p in &plans {
+                p.encode_count(self, enc);
+            }
+            barrier(enc);
+            for p in &plans {
+                p.encode_scan(self, enc);
+            }
+            barrier(enc);
+            for p in &plans {
+                p.encode_scatter(self, enc);
+            }
+            barrier(enc);
+            for (i, (job, out)) in jobs.iter().zip(&outs).enumerate() {
+                out.encode_accumulate(self, enc, job, &plans[job_plan[i]]);
+                out.encode_ones(self, enc, job, &plans[job_plan[i]]);
+            }
+            barrier(enc);
+            for (i, (job, out)) in jobs.iter().zip(&outs).enumerate() {
+                out.encode_merge(self, enc, job, &plans[job_plan[i]]);
+            }
+            barrier(enc);
+            for (i, (job, out)) in jobs.iter().zip(&outs).enumerate() {
+                out.encode_reduce(self, enc, job, &plans[job_plan[i]]);
             }
             enc.end_encoding();
             cb.commit();
@@ -950,41 +1002,52 @@ impl<'a> Plan<'a> {
     }
 
     fn encode(&self, msm: &MetalMsm, enc: &ComputeCommandEncoderRef) {
-        let p = self.params();
-        let rows = self.n_windows * self.n_buckets;
-        let counts = self.counts.as_ref().expect("plan not allocated");
-        let cursor = self.cursor.as_ref().expect("plan not allocated");
-        let entries = self.entries.as_ref().expect("plan not allocated");
+        self.encode_zero(msm, enc);
+        self.encode_count(msm, enc);
+        self.encode_scan(msm, enc);
+        self.encode_scatter(msm, enc);
+    }
 
-        // The counters must start at zero, and unlike the bucket array (whose kernel
-        // writes rather than accumulates) they cannot rely on a fresh allocation, since
-        // the pool hands back used buffers.
+    /// The counters must start at zero, and unlike the bucket array (whose kernel
+    /// writes rather than accumulates) they cannot rely on a fresh allocation, since
+    /// the pool hands back used buffers.
+    fn encode_zero(&self, msm: &MetalMsm, enc: &ComputeCommandEncoderRef) {
+        let rows = self.n_windows * self.n_buckets;
         enc.set_compute_pipeline_state(&msm.pipelines.zero_u32);
-        enc.set_buffer(0, Some(counts), 0);
+        enc.set_buffer(0, Some(self.counts.as_ref().expect("plan not allocated")), 0);
         let len = rows as u32;
         enc.set_bytes(1, 4, (&len as *const u32).cast());
         dispatch_1d(enc, &msm.pipelines.zero_u32, rows, 256);
+    }
 
+    fn encode_count(&self, msm: &MetalMsm, enc: &ComputeCommandEncoderRef) {
+        let p = self.params();
         enc.set_compute_pipeline_state(&msm.pipelines.count);
         enc.set_buffer(0, Some(self.scalars), 0);
-        enc.set_buffer(1, Some(counts), 0);
+        enc.set_buffer(1, Some(self.counts.as_ref().expect("plan not allocated")), 0);
         set_params(enc, 2, &p);
         dispatch_1d(enc, &msm.pipelines.count, self.n, 64);
+    }
 
+    fn encode_scan(&self, msm: &MetalMsm, enc: &ComputeCommandEncoderRef) {
+        let p = self.params();
         enc.set_compute_pipeline_state(&msm.pipelines.scan);
-        enc.set_buffer(0, Some(counts), 0);
-        enc.set_buffer(1, Some(cursor), 0);
+        enc.set_buffer(0, Some(self.counts.as_ref().expect("plan not allocated")), 0);
+        enc.set_buffer(1, Some(self.cursor.as_ref().expect("plan not allocated")), 0);
         set_params(enc, 2, &p);
         let scan_tg = SCAN_TG.min(msm.pipelines.scan.max_total_threads_per_threadgroup() as usize);
         enc.dispatch_thread_groups(
             MTLSize::new(self.n_windows as u64, 1, 1),
             MTLSize::new(scan_tg as u64, 1, 1),
         );
+    }
 
+    fn encode_scatter(&self, msm: &MetalMsm, enc: &ComputeCommandEncoderRef) {
+        let p = self.params();
         enc.set_compute_pipeline_state(&msm.pipelines.scatter);
         enc.set_buffer(0, Some(self.scalars), 0);
-        enc.set_buffer(1, Some(cursor), 0);
-        enc.set_buffer(2, Some(entries), 0);
+        enc.set_buffer(1, Some(self.cursor.as_ref().expect("plan not allocated")), 0);
+        enc.set_buffer(2, Some(self.entries.as_ref().expect("plan not allocated")), 0);
         set_params(enc, 3, &p);
         dispatch_1d(enc, &msm.pipelines.scatter, self.n, 64);
     }
@@ -1070,7 +1133,9 @@ impl Outputs {
 
     /// The Pippenger half: clear, segmented accumulation, merge, reduce. Split from
     /// [`Self::encode_ones`] so phase mode can time the bucket machinery and the ones
-    /// scan separately; the production path encodes both into the same encoder.
+    /// scan separately. The production path in [`MetalMsm::msm_batch`] does not call
+    /// this: it encodes the individual stages itself, grouped across jobs, so that
+    /// independent dispatches share a concurrent phase.
     fn encode_buckets(
         &self,
         msm: &MetalMsm,
@@ -1078,31 +1143,57 @@ impl Outputs {
         job: &Job<'_>,
         plan: &Plan<'_>,
     ) {
+        self.encode_clear(msm, enc, job, plan);
+        self.encode_accumulate(msm, enc, job, plan);
+        self.encode_merge(msm, enc, job, plan);
+        self.encode_reduce(msm, enc, job, plan);
+    }
+
+    fn params_for(&self, plan: &Plan<'_>) -> MsmParams {
         let mut p = plan.params();
         p.base_off = self.base_off as u32;
         p.ones_groups = self.ones_groups as u32;
+        p
+    }
 
-        let (clear_pso, acc_pso, seg_pso, merge_pso, red_pso, bases) = match job {
-            Job::G1(j) => (
-                &msm.pipelines.clear_g1,
-                &msm.pipelines.accumulate_g1,
-                &msm.pipelines.segmented_g1,
-                &msm.pipelines.merge_g1,
-                &msm.pipelines.reduce_g1,
-                &j.bases.buf,
-            ),
-            Job::G2(j) => (
-                &msm.pipelines.clear_g2,
-                &msm.pipelines.accumulate_g2,
-                &msm.pipelines.segmented_g2,
-                &msm.pipelines.merge_g2,
-                &msm.pipelines.reduce_g2,
-                &j.bases.buf,
-            ),
+    /// A pooled bucket array holds the previous proof's points, and a bucket that no
+    /// slice writes directly has to read as the identity. The legacy accumulation
+    /// writes every bucket, so it needs no clear.
+    fn encode_clear(
+        &self,
+        msm: &MetalMsm,
+        enc: &ComputeCommandEncoderRef,
+        job: &Job<'_>,
+        plan: &Plan<'_>,
+    ) {
+        if legacy_accumulate() {
+            return;
+        }
+        let p = self.params_for(plan);
+        let clear_pso = match job {
+            Job::G1(_) => &msm.pipelines.clear_g1,
+            Job::G2(_) => &msm.pipelines.clear_g2,
         };
+        enc.set_compute_pipeline_state(clear_pso);
+        enc.set_buffer(0, Some(&self.buckets), 0);
+        set_params(enc, 1, &p);
+        dispatch_1d(enc, clear_pso, plan.n_windows * plan.n_buckets, 256);
+    }
 
+    fn encode_accumulate(
+        &self,
+        msm: &MetalMsm,
+        enc: &ComputeCommandEncoderRef,
+        job: &Job<'_>,
+        plan: &Plan<'_>,
+    ) {
+        let p = self.params_for(plan);
         let rows = plan.n_windows * plan.n_buckets;
         if legacy_accumulate() {
+            let (acc_pso, bases) = match job {
+                Job::G1(j) => (&msm.pipelines.accumulate_g1, &j.bases.buf),
+                Job::G2(j) => (&msm.pipelines.accumulate_g2, &j.bases.buf),
+            };
             enc.set_compute_pipeline_state(acc_pso);
             enc.set_buffer(0, Some(plan.entries.as_ref().unwrap()), 0);
             enc.set_buffer(1, Some(bases), 0);
@@ -1112,13 +1203,10 @@ impl Outputs {
             set_params(enc, 5, &p);
             dispatch_1d(enc, acc_pso, rows, 64);
         } else {
-            // A pooled bucket array holds the previous proof's points, and a bucket that
-            // no slice writes directly has to read as the identity.
-            enc.set_compute_pipeline_state(clear_pso);
-            enc.set_buffer(0, Some(&self.buckets), 0);
-            set_params(enc, 1, &p);
-            dispatch_1d(enc, clear_pso, rows, 256);
-
+            let (seg_pso, bases) = match job {
+                Job::G1(j) => (&msm.pipelines.segmented_g1, &j.bases.buf),
+                Job::G2(j) => (&msm.pipelines.segmented_g2, &j.bases.buf),
+            };
             enc.set_compute_pipeline_state(seg_pso);
             enc.set_buffer(0, Some(plan.entries.as_ref().unwrap()), 0);
             enc.set_buffer(1, Some(bases), 0);
@@ -1128,17 +1216,46 @@ impl Outputs {
             enc.set_buffer(5, Some(&self.spill_rows), 0);
             set_params(enc, 6, &p);
             dispatch_1d(enc, seg_pso, plan.n_windows * plan.slices, 64);
-
-            enc.set_compute_pipeline_state(merge_pso);
-            enc.set_buffer(0, Some(&self.buckets), 0);
-            enc.set_buffer(1, Some(&self.spill_pts), 0);
-            enc.set_buffer(2, Some(&self.spill_rows), 0);
-            enc.set_buffer(3, Some(plan.counts.as_ref().unwrap()), 0);
-            enc.set_buffer(4, Some(plan.cursor.as_ref().unwrap()), 0);
-            set_params(enc, 5, &p);
-            dispatch_1d(enc, merge_pso, rows, 64);
         }
+    }
 
+    fn encode_merge(
+        &self,
+        msm: &MetalMsm,
+        enc: &ComputeCommandEncoderRef,
+        job: &Job<'_>,
+        plan: &Plan<'_>,
+    ) {
+        if legacy_accumulate() {
+            return;
+        }
+        let p = self.params_for(plan);
+        let merge_pso = match job {
+            Job::G1(_) => &msm.pipelines.merge_g1,
+            Job::G2(_) => &msm.pipelines.merge_g2,
+        };
+        enc.set_compute_pipeline_state(merge_pso);
+        enc.set_buffer(0, Some(&self.buckets), 0);
+        enc.set_buffer(1, Some(&self.spill_pts), 0);
+        enc.set_buffer(2, Some(&self.spill_rows), 0);
+        enc.set_buffer(3, Some(plan.counts.as_ref().unwrap()), 0);
+        enc.set_buffer(4, Some(plan.cursor.as_ref().unwrap()), 0);
+        set_params(enc, 5, &p);
+        dispatch_1d(enc, merge_pso, plan.n_windows * plan.n_buckets, 64);
+    }
+
+    fn encode_reduce(
+        &self,
+        msm: &MetalMsm,
+        enc: &ComputeCommandEncoderRef,
+        job: &Job<'_>,
+        plan: &Plan<'_>,
+    ) {
+        let p = self.params_for(plan);
+        let red_pso = match job {
+            Job::G1(_) => &msm.pipelines.reduce_g1,
+            Job::G2(_) => &msm.pipelines.reduce_g2,
+        };
         enc.set_compute_pipeline_state(red_pso);
         enc.set_buffer(0, Some(&self.buckets), 0);
         enc.set_buffer(1, Some(&self.window_sums), 0);
@@ -1150,7 +1267,8 @@ impl Outputs {
         );
     }
 
-    /// The scalar-of-1 half: one `msm_ones_*` dispatch.
+    /// The scalar-of-1 half: one `msm_ones_*` dispatch. Independent of the digit
+    /// pipeline and of every bucket stage; it reads only the scalars and the bases.
     fn encode_ones(
         &self,
         msm: &MetalMsm,
@@ -1158,9 +1276,7 @@ impl Outputs {
         job: &Job<'_>,
         plan: &Plan<'_>,
     ) {
-        let mut p = plan.params();
-        p.base_off = self.base_off as u32;
-        p.ones_groups = self.ones_groups as u32;
+        let p = self.params_for(plan);
         let (ones_pso, bases) = match job {
             Job::G1(j) => (&msm.pipelines.ones_g1, &j.bases.buf),
             Job::G2(j) => (&msm.pipelines.ones_g2, &j.bases.buf),
