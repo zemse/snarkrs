@@ -225,11 +225,7 @@ impl PreparedCircuit for CpuCircuit {
         // covers stage 4 only.
         let mut pointwise_us = 0u64;
         let start = Instant::now();
-        let pipeline = |v: &mut [Fr]| {
-            self.ntt.intt_to_bitrev(&self.domain, v);
-            self.ntt.coset_scale_bitrev(&self.domain, v, self.coset_shift);
-            self.ntt.ntt_from_bitrev(&self.domain, v);
-        };
+        let pipeline = |v: &mut [Fr]| self.ntt.intt_coset_ntt(&self.domain, v, self.coset_shift);
         rayon::join(
             || stage!("s1-3 A: iNTT, coset, NTT", pipeline(&mut a)),
             || {

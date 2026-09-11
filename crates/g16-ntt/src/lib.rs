@@ -289,6 +289,62 @@ impl CpuNtt {
             });
     }
 
+    /// Stages 1-3 for one vector: iNTT, coset shift with the deferred `1/n`, forward
+    /// NTT, natural order in and out. Equal to the bit to [`Self::intt_to_bitrev`] then
+    /// [`Self::coset_scale_bitrev`] then [`Self::ntt_from_bitrev`], and the reason it
+    /// exists is what those three would each pay for separately: the final DIF passes,
+    /// the table multiply and the initial DIT passes all move data only within one
+    /// aligned CACHE_BLOCK, so here the entire middle runs per block in a single
+    /// dispatch and the hand-off costs one trip through memory instead of three.
+    pub fn intt_coset_ntt(&self, domain: &Domain, a: &mut [Fr], shift: Fr) {
+        assert_eq!(
+            a.len(),
+            domain.size,
+            "ntt input length must equal the domain size"
+        );
+        let n = a.len();
+        if n <= CACHE_BLOCK || n < PARALLEL_THRESHOLD {
+            // Below the block size the three stages are one cache-resident sweep each
+            // anyway, so the composition is the fused path.
+            self.intt_to_bitrev(domain, a);
+            self.coset_scale_bitrev(domain, a, shift);
+            self.ntt_from_bitrev(domain, a);
+            return;
+        }
+
+        let inv = self.twiddles(domain, Direction::Inverse);
+        let fwd = self.twiddles(domain, Direction::Forward);
+        let table = self.coset_table(domain, shift);
+
+        let mut half = n / 2;
+        while half > CACHE_BLOCK / 2 {
+            parallel_pass::<true>(a, half, &inv, n / (2 * half), self.tasks());
+            half >>= 1;
+        }
+        a.par_chunks_mut(CACHE_BLOCK)
+            .zip(table.par_chunks(CACHE_BLOCK))
+            .for_each(|(block, tab)| {
+                let mut h = CACHE_BLOCK / 2;
+                while h >= 1 {
+                    serial_pass::<true>(block, h, &inv, n / (2 * h));
+                    h >>= 1;
+                }
+                for (x, s) in block.iter_mut().zip(tab.iter()) {
+                    *x *= s;
+                }
+                let mut h = 1usize;
+                while h < CACHE_BLOCK {
+                    serial_pass::<false>(block, h, &fwd, n / (2 * h));
+                    h <<= 1;
+                }
+            });
+        let mut half = CACHE_BLOCK;
+        while half < n {
+            parallel_pass::<false>(a, half, &fwd, n / (2 * half), self.tasks());
+            half <<= 1;
+        }
+    }
+
     /// Cached `[shift^bitrev(p) / n]` table for [`Self::coset_scale_bitrev`], built and
     /// raced exactly like [`Self::twiddles`].
     fn coset_table(&self, domain: &Domain, shift: Fr) -> Arc<Vec<Fr>> {
@@ -679,6 +735,29 @@ mod tests {
             ntt.coset_scale_bitrev(&d, &mut got, shift);
             ntt.ntt_from_bitrev(&d, &mut got);
 
+            assert_eq!(got, want, "n = {n}");
+        }
+    }
+
+    #[test]
+    fn the_fused_pipeline_matches_its_three_stages() {
+        // Sizes on both sides of CACHE_BLOCK, so the fall-through composition and the
+        // fused middle are both exercised, plus the fused path at more than one depth
+        // of outer passes.
+        let ntt = CpuNtt::new();
+        for log in [4u32, 10, 11, 12, 14] {
+            let n = 1usize << log;
+            let d = domain(n);
+            let shift = domain(2 * n).group_gen;
+            let x = sample(n, 0xF05E + log as u64);
+
+            let mut want = x.clone();
+            ntt.intt_to_bitrev(&d, &mut want);
+            ntt.coset_scale_bitrev(&d, &mut want, shift);
+            ntt.ntt_from_bitrev(&d, &mut want);
+
+            let mut got = x.clone();
+            ntt.intt_coset_ntt(&d, &mut got, shift);
             assert_eq!(got, want, "n = {n}");
         }
     }
