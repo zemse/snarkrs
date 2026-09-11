@@ -222,6 +222,10 @@ enum PtauCmd {
         #[arg(long, value_name = "FILE")]
         ptau: PathBuf,
     },
+    /// Sweep the CUDA FFT kernel variants: one NVRTC compile carries every candidate,
+    /// and the fixed context and compile cost is paid once for the whole table.
+    #[cfg(feature = "cuda")]
+    FftBench(g16_cli::fftbench::Args),
 }
 
 #[derive(Subcommand)]
@@ -481,6 +485,8 @@ fn run_setup(
 
 fn run_ptau(cmd: PtauCmd) -> Result<()> {
     match cmd {
+        #[cfg(feature = "cuda")]
+        PtauCmd::FftBench(args) => g16_cli::fftbench::run(args),
         PtauCmd::Info { ptau } => {
             let file = ptau_file::Ptau::open_lenient(&ptau)
                 .with_context(|| format!("opening {}", ptau.display()))?;

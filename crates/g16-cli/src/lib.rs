@@ -5,6 +5,8 @@
 
 pub mod artifacts;
 pub mod bench;
+#[cfg(feature = "cuda")]
+pub mod fftbench;
 pub mod json;
 
 use anyhow::Result;
