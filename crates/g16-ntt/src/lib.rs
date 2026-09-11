@@ -67,6 +67,10 @@ pub struct CpuNtt {
     /// six transforms per proof over the same two tables. The cache has to live here:
     /// `NttBackend::ntt` receives a `&Domain`, not a prepared table.
     twiddles: TwiddleCache,
+    /// Tables for [`Self::coset_scale_bitrev`], keyed the same way. A separate map
+    /// because these fold in `size_inv` and a bit-reversal, so a `(size, shift)` entry
+    /// here holds different values than a twiddle table for the same key would.
+    coset_tables: TwiddleCache,
 }
 
 impl CpuNtt {
@@ -76,6 +80,7 @@ impl CpuNtt {
             // tasks against any other number would be a lie.
             threads: rayon::current_num_threads().max(1),
             twiddles: RwLock::new(HashMap::new()),
+            coset_tables: RwLock::new(HashMap::new()),
         }
     }
 
@@ -131,20 +136,7 @@ impl CpuNtt {
 
         let twiddles = self.twiddles(domain, dir);
         bit_reverse_permute(a, domain.log_size);
-
-        // Decimation in time: permuted input, natural output, half-size doubling per pass.
-        let mut half = 1usize;
-        while half < n {
-            // Butterfly `j` of a block needs `root^(j * n / 2half)`, and the table holds
-            // `root^i` in natural order, so a pass is a strided read into it.
-            let stride = n / (2 * half);
-            if parallel {
-                parallel_pass(a, half, &twiddles, stride, self.tasks());
-            } else {
-                serial_pass(a, half, &twiddles, stride);
-            }
-            half <<= 1;
-        }
+        self.dit_passes(a, &twiddles, parallel);
 
         if dir == Direction::Inverse {
             // The Domain hands out `1/n` but never applies it; the iNTT owns that.
@@ -157,6 +149,138 @@ impl CpuNtt {
                 a.iter_mut().for_each(|x| *x *= scale);
             }
         }
+    }
+
+    /// Decimation in time: bit-reversed input, natural output, half-size doubling per
+    /// pass.
+    fn dit_passes(&self, a: &mut [Fr], twiddles: &[Fr], parallel: bool) {
+        let n = a.len();
+        let mut half = 1usize;
+        while half < n {
+            // Butterfly `j` of a block needs `root^(j * n / 2half)`, and the table holds
+            // `root^i` in natural order, so a pass is a strided read into it.
+            let stride = n / (2 * half);
+            if parallel {
+                parallel_pass::<false>(a, half, twiddles, stride, self.tasks());
+            } else {
+                serial_pass::<false>(a, half, twiddles, stride);
+            }
+            half <<= 1;
+        }
+    }
+
+    /// Decimation in frequency: natural input, bit-reversed output, half-size halving
+    /// per pass. Same twiddle tables, same per-pass indexing, opposite pass order.
+    fn dif_passes(&self, a: &mut [Fr], twiddles: &[Fr], parallel: bool) {
+        let n = a.len();
+        let mut half = n / 2;
+        while half >= 1 {
+            let stride = n / (2 * half);
+            if parallel {
+                parallel_pass::<true>(a, half, twiddles, stride, self.tasks());
+            } else {
+                serial_pass::<true>(a, half, twiddles, stride);
+            }
+            half >>= 1;
+        }
+    }
+
+    /// Inverse transform, natural input to *bit-reversed* output, and deliberately
+    /// without the `1/n` scale: [`Self::coset_scale_bitrev`] folds it into its table, so
+    /// applying it here as well would scale twice.
+    ///
+    /// The point of the bit-reversed order is [`Self::ntt_from_bitrev`]: a decimation-
+    /// in-frequency inverse feeding a decimation-in-time forward cancels both
+    /// permutations, which for the prover's iNTT -> coset shift -> NTT chain removes six
+    /// serial passes per proof. Measured before the change, the permutation was 12.5% of
+    /// a transform's wall clock at 2^16, and it was the only serial loop inside an
+    /// otherwise parallel stage.
+    pub fn intt_to_bitrev(&self, domain: &Domain, a: &mut [Fr]) {
+        assert_eq!(
+            a.len(),
+            domain.size,
+            "ntt input length must equal the domain size"
+        );
+        if a.len() <= 1 {
+            return;
+        }
+        let twiddles = self.twiddles(domain, Direction::Inverse);
+        self.dif_passes(a, &twiddles, a.len() >= PARALLEL_THRESHOLD);
+    }
+
+    /// Forward transform, *bit-reversed* input to natural output. The other half of the
+    /// [`Self::intt_to_bitrev`] pairing.
+    pub fn ntt_from_bitrev(&self, domain: &Domain, a: &mut [Fr]) {
+        assert_eq!(
+            a.len(),
+            domain.size,
+            "ntt input length must equal the domain size"
+        );
+        if a.len() <= 1 {
+            return;
+        }
+        let twiddles = self.twiddles(domain, Direction::Forward);
+        self.dit_passes(a, &twiddles, a.len() >= PARALLEL_THRESHOLD);
+    }
+
+    /// `a[p] *= shift^bitrev(p) / n` for a vector in bit-reversed coefficient order: the
+    /// coset shift *and* the iNTT's deferred scale in one multiply per element. The
+    /// power ladder cannot run in bit-reversed order, so the table is built in natural
+    /// order, permuted once, and cached; `shift` is fixed per circuit, so per proof this
+    /// stage is three sequential table reads.
+    pub fn coset_scale_bitrev(&self, domain: &Domain, a: &mut [Fr], shift: Fr) {
+        assert_eq!(
+            a.len(),
+            domain.size,
+            "ntt input length must equal the domain size"
+        );
+        let table = self.coset_table(domain, shift);
+        if a.len() < PARALLEL_THRESHOLD {
+            for (x, s) in a.iter_mut().zip(table.iter()) {
+                *x *= s;
+            }
+            return;
+        }
+        let chunk = chunk_len(a.len(), self.tasks());
+        a.par_chunks_mut(chunk)
+            .zip(table.par_chunks(chunk))
+            .for_each(|(part, tab)| {
+                for (x, s) in part.iter_mut().zip(tab.iter()) {
+                    *x *= s;
+                }
+            });
+    }
+
+    /// Cached `[shift^bitrev(p) / n]` table for [`Self::coset_scale_bitrev`], built and
+    /// raced exactly like [`Self::twiddles`].
+    fn coset_table(&self, domain: &Domain, shift: Fr) -> Arc<Vec<Fr>> {
+        let key = (domain.size, shift);
+        if let Some(hit) = self
+            .coset_tables
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            return Arc::clone(hit);
+        }
+
+        let n = domain.size;
+        let mut table = vec![Fr::ONE; n];
+        let chunk = chunk_len(n, self.tasks());
+        table.par_chunks_mut(chunk).enumerate().for_each(|(c, part)| {
+            // The same per-chunk ladder re-entry as `distribute`, seeded with `1/n` so
+            // the scale costs nothing extra.
+            let mut acc = domain.size_inv * shift.pow([(c * chunk) as u64]);
+            for x in part.iter_mut() {
+                *x = acc;
+                acc *= shift;
+            }
+        });
+        bit_reverse_permute(&mut table, domain.log_size);
+
+        let built = Arc::new(table);
+        let mut guard = self.coset_tables.write().unwrap_or_else(|e| e.into_inner());
+        Arc::clone(guard.entry(key).or_insert(built))
     }
 
     /// `a[i] *= shift^i`, with the path choice exposed for the same reason as
@@ -228,26 +352,46 @@ fn bit_reverse_permute(a: &mut [Fr], log_n: u32) {
 }
 
 /// One run of butterflies. `j0` is the index of `lo[0]` within its block, which is nonzero
-/// only when a block has been split across tasks.
+/// only when a block has been split across tasks. `DIF` selects the decimation: `false`
+/// multiplies by the twiddle on the way in (time), `true` on the way out (frequency).
+/// A const generic so the branch is compiled away rather than sitting in the hot loop.
 #[inline]
-fn butterflies(lo: &mut [Fr], hi: &mut [Fr], twiddles: &[Fr], stride: usize, j0: usize) {
+fn butterflies<const DIF: bool>(
+    lo: &mut [Fr],
+    hi: &mut [Fr],
+    twiddles: &[Fr],
+    stride: usize,
+    j0: usize,
+) {
     for (k, (x, y)) in lo.iter_mut().zip(hi.iter_mut()).enumerate() {
-        let t = *y * twiddles[(j0 + k) * stride];
-        *y = *x - t;
-        *x += t;
+        if DIF {
+            let t = (*x - *y) * twiddles[(j0 + k) * stride];
+            *x += *y;
+            *y = t;
+        } else {
+            let t = *y * twiddles[(j0 + k) * stride];
+            *y = *x - t;
+            *x += t;
+        }
     }
 }
 
-fn serial_pass(a: &mut [Fr], half: usize, twiddles: &[Fr], stride: usize) {
+fn serial_pass<const DIF: bool>(a: &mut [Fr], half: usize, twiddles: &[Fr], stride: usize) {
     for block in a.chunks_mut(2 * half) {
         let (lo, hi) = block.split_at_mut(half);
-        butterflies(lo, hi, twiddles, stride, 0);
+        butterflies::<DIF>(lo, hi, twiddles, stride, 0);
     }
 }
 
 /// The passes themselves are sequential (pass `k+1` reads what pass `k` wrote), but every
 /// butterfly inside a pass is independent, so the parallelism goes here.
-fn parallel_pass(a: &mut [Fr], half: usize, twiddles: &[Fr], stride: usize, tasks: usize) {
+fn parallel_pass<const DIF: bool>(
+    a: &mut [Fr],
+    half: usize,
+    twiddles: &[Fr],
+    stride: usize,
+    tasks: usize,
+) {
     let block_len = 2 * half;
     let blocks = a.len() / block_len;
 
@@ -260,7 +404,7 @@ fn parallel_pass(a: &mut [Fr], half: usize, twiddles: &[Fr], stride: usize, task
         a.par_chunks_mut(per_task * block_len).for_each(|group| {
             for block in group.chunks_mut(block_len) {
                 let (lo, hi) = block.split_at_mut(half);
-                butterflies(lo, hi, twiddles, stride, 0);
+                butterflies::<DIF>(lo, hi, twiddles, stride, 0);
             }
         });
     } else {
@@ -275,7 +419,7 @@ fn parallel_pass(a: &mut [Fr], half: usize, twiddles: &[Fr], stride: usize, task
             lo.par_chunks_mut(chunk)
                 .zip(hi.par_chunks_mut(chunk))
                 .enumerate()
-                .for_each(|(c, (l, h))| butterflies(l, h, twiddles, stride, c * chunk));
+                .for_each(|(c, (l, h))| butterflies::<DIF>(l, h, twiddles, stride, c * chunk));
         });
     }
 }
@@ -470,6 +614,62 @@ mod tests {
                 ntt.transform(&d, &mut parallel, dir, true);
                 assert_eq!(serial, parallel, "{dir:?} disagreed at n = {n}");
             }
+        }
+    }
+
+    #[test]
+    fn bitrev_pipeline_matches_the_natural_order_stages() {
+        // The prover's stages 1-3 for one vector, both ways. Field arithmetic is exact,
+        // so the two must agree to the bit, not approximately. Sizes straddle
+        // PARALLEL_THRESHOLD so both path choices inside each method are covered.
+        let ntt = CpuNtt::new();
+        for log in [2u32, 6, 10, 12, 14] {
+            let n = 1usize << log;
+            let d = domain(n);
+            // The shift the real caller uses: the 2n-th root whose square is the
+            // domain's own generator.
+            let shift = domain(2 * n).group_gen;
+            let x = sample(n, 0xC05E7 + log as u64);
+
+            let mut want = x.clone();
+            ntt.ntt(&d, &mut want, Direction::Inverse);
+            ntt.distribute_powers(&mut want, shift);
+            ntt.ntt(&d, &mut want, Direction::Forward);
+
+            let mut got = x.clone();
+            ntt.intt_to_bitrev(&d, &mut got);
+            ntt.coset_scale_bitrev(&d, &mut got, shift);
+            ntt.ntt_from_bitrev(&d, &mut got);
+
+            assert_eq!(got, want, "n = {n}");
+        }
+    }
+
+    #[test]
+    fn intt_to_bitrev_is_the_unscaled_intt_permuted() {
+        // Pins each half of the pairing on its own, so a failure in the pipeline test
+        // above points at one method rather than at their composition.
+        let ntt = CpuNtt::new();
+        for log in [3u32, 8, 11] {
+            let n = 1usize << log;
+            let d = domain(n);
+            let x = sample(n, 0xB17 + log as u64);
+
+            let mut want = x.clone();
+            ntt.ntt(&d, &mut want, Direction::Inverse);
+            let n_as_fr = Fr::from(n as u64);
+            want.iter_mut().for_each(|v| *v *= n_as_fr);
+            bit_reverse_permute(&mut want, d.log_size);
+
+            let mut got = x.clone();
+            ntt.intt_to_bitrev(&d, &mut got);
+            assert_eq!(got, want, "n = {n}");
+
+            // And feeding it forward restores the scaled input, since the pair is a
+            // round trip up to the deferred 1/n.
+            ntt.ntt_from_bitrev(&d, &mut got);
+            let want_scaled: Vec<Fr> = x.iter().map(|v| *v * n_as_fr).collect();
+            assert_eq!(got, want_scaled, "round trip, n = {n}");
         }
     }
 

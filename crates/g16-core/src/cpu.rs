@@ -10,7 +10,7 @@ use web_time::Instant;
 use crate::{Backend, HPoly, MsmOutputs, PreparedCircuit, ProveError, StageTimings};
 use g16_field::*;
 use g16_msm::{CpuMsm, MsmBackend};
-use g16_ntt::{CpuNtt, Direction, NttBackend};
+use g16_ntt::CpuNtt;
 use g16_zkey::ProvingKey;
 use rayon::prelude::*;
 
@@ -209,22 +209,28 @@ impl PreparedCircuit for CpuCircuit {
         // Stages 1-3, three vectors through iNTT -> coset shift -> NTT. Each transform is
         // already internally parallel, so the three run one after another rather than
         // fighting each other for the same pool.
+        //
+        // The bit-reversed forms rather than `NttBackend::ntt`: a decimation-in-frequency
+        // inverse hands its output to a decimation-in-time forward with both permutations
+        // cancelled, and the shift stage between them indexes its cached table in the
+        // same order. Only the intermediate order changes; the stage 3 output is
+        // identical to the bit, and the iNTT's 1/n rides the shift table for free.
         let mut ntt_us = 0u64;
         let mut pointwise_us = 0u64;
         for v in [&mut a, &mut b, &mut c] {
             let start = Instant::now();
-            stage!("s1 iNTT", self.ntt.ntt(&self.domain, v, Direction::Inverse));
+            stage!("s1 iNTT (to bitrev)", self.ntt.intt_to_bitrev(&self.domain, v));
             ntt_us += start.elapsed().as_micros() as u64;
 
             let start = Instant::now();
             stage!(
-                "s2 coset shift (distribute_powers)",
-                self.ntt.distribute_powers(v, self.coset_shift)
+                "s2 coset shift and 1/n (bitrev order)",
+                self.ntt.coset_scale_bitrev(&self.domain, v, self.coset_shift)
             );
             pointwise_us += start.elapsed().as_micros() as u64;
 
             let start = Instant::now();
-            stage!("s3 NTT", self.ntt.ntt(&self.domain, v, Direction::Forward));
+            stage!("s3 NTT (from bitrev)", self.ntt.ntt_from_bitrev(&self.domain, v));
             ntt_us += start.elapsed().as_micros() as u64;
         }
         t.ntt_us += ntt_us;
