@@ -1687,8 +1687,8 @@ mod tests {
     /// The window sizes this ships with, written down so a change to [`window_size`] shows
     /// up as a diff here rather than as a silent 2x in a benchmark nobody reran.
     ///
-    /// The values themselves are the unmeasured heuristic described on [`window_size`], so
-    /// this test pins behaviour, not optimality.
+    /// The values themselves are the T4-measured cap over the heuristic described on
+    /// [`window_size`], so this test pins behaviour, not optimality.
     #[test]
     fn the_default_window_sizes_are_what_we_think_they_are() {
         // The degenerate top windows the correction is there to avoid.
@@ -1697,11 +1697,11 @@ mod tests {
         assert_eq!(top_bits(13), 8);
         assert_eq!(top_bits(15), 15);
 
-        // A 140k witness with about 140k general scalars: the heuristic says 14, whose top
-        // window holds four live buckets, so the correction steps down to 13.
-        assert_eq!(window_size(140_261), 13);
-        // A 2^18 H vector, dense by construction.
-        assert_eq!(window_size(1 << 18), 15);
+        // A 140k witness with about 140k general scalars: the heuristic says 14, and
+        // [`MEASURED_MAX_WINDOW`] caps it at the swept 8 (1.09x over 13 there).
+        assert_eq!(window_size(140_261), 8);
+        // A 2^18 H vector, dense by construction: capped the same way.
+        assert_eq!(window_size(1 << 18), 8);
         // Small inputs clamp rather than underflow.
         assert_eq!(window_size(0), 3);
         assert_eq!(window_size(1), 3);
