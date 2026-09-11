@@ -55,7 +55,31 @@ fn error_text(cb: &CommandBufferRef) -> String {
 /// Commit already done by the caller: wait, then refuse to continue unless the GPU actually
 /// completed the work. `context` names the dispatch, so a fault says which one died.
 pub(crate) fn wait_ok(cb: &CommandBufferRef, context: &str) -> Result<(), ProveError> {
+    let submitted = std::time::Instant::now();
     cb.wait_until_completed();
+    // `G16_METAL_CB_TIMES=1` prints the driver's own GPU-busy window next to the wall
+    // time the host waited. The gap between them is submission latency and host work,
+    // which no amount of kernel tuning will remove, so the two numbers have to be read
+    // together before anything is attributed to the kernels.
+    if std::env::var_os("G16_METAL_CB_TIMES").is_some() {
+        // SAFETY: same mechanism and same justification as `error_text` above. All four
+        // are documented MTLCommandBuffer properties returning a CFTimeInterval, valid
+        // once the buffer has completed, which `wait_until_completed` has just ensured.
+        // metal-rs 0.29 binds none of them.
+        let (gpu, kern) = unsafe {
+            let gs: f64 = msg_send![cb, GPUStartTime];
+            let ge: f64 = msg_send![cb, GPUEndTime];
+            let ks: f64 = msg_send![cb, kernelStartTime];
+            let ke: f64 = msg_send![cb, kernelEndTime];
+            ((ge - gs) * 1e3, (ke - ks) * 1e3)
+        };
+        eprintln!(
+            "[cb] {context}: wall {:.2} ms  gpu {:.2} ms  kernel {:.2} ms",
+            submitted.elapsed().as_secs_f64() * 1e3,
+            gpu,
+            kern
+        );
+    }
     let status = cb.status();
     if status == MTLCommandBufferStatus::Completed {
         return Ok(());
