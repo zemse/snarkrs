@@ -117,23 +117,11 @@ pub struct PackedScalar {
     pub v: [u32; LIMBS],
 }
 
-/// A scalar already through the GLV lattice: `k == +-k1 + lambda * (+-k2)`, 36 bytes,
-/// both magnitudes **standard form** and under `2^127`.
-///
-/// `k[0..4]` is `|k1|` and `k[4..8]` is `|k2|`, four 32-bit limbs each rather than eight,
-/// which is the whole point: a half-width magnitude is half the ladder. `sign` carries
-/// bit 0 for `k1 < 0` and bit 1 for `k2 < 0`, and a signed ladder spends nothing on
-/// either, since negating a point is negating one coordinate.
-///
-/// MSL twin: nine consecutive `uint` read out of a `device const uint*`, `GLV_WORDS` in
-/// `shaders/fft.metal`. There is no struct on that side because the twiddle table is
-/// bound as a flat word array, the same way [`PackedScalar`] tables are.
-#[repr(C)]
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub struct PackedGlv {
-    pub k: [u32; LIMBS],
-    pub sign: u32,
-}
+/// A scalar already through the GLV lattice. Lives in `g16-gpu-layout` because the CUDA
+/// FFT reads the identical nine-word layout; re-exported so this crate's callers keep one
+/// import path. MSL twin: nine consecutive `uint` read out of a `device const uint*`,
+/// `GLV_WORDS` in `shaders/fft.metal`.
+pub use g16_gpu_layout::PackedGlv;
 
 /// BN254 base field element, 32 bytes, **Montgomery form**, little-endian 32-bit limbs.
 ///
@@ -195,8 +183,6 @@ pub struct PackedG2Affine {
 const _: () = {
     assert!(size_of::<PackedFr>() == 32);
     assert!(size_of::<PackedScalar>() == 32);
-    assert!(size_of::<PackedGlv>() == 36);
-    assert!(align_of::<PackedGlv>() == 4);
     assert!(size_of::<PackedFq>() == 32);
     assert!(size_of::<PackedFq2>() == 64);
     assert!(size_of::<PackedG1Affine>() == 64);

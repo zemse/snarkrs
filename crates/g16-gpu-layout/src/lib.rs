@@ -45,6 +45,13 @@ use core::mem::{align_of, size_of};
 use ark_ff::{BigInt, PrimeField};
 use g16_field::{Fq, Fq2, Fr, G1Affine, G2Affine};
 
+/// The GLV twiddle table behind `ptau prepare`'s group FFT: the 36-byte decomposed-scalar
+/// layout and the host-side lattice work that fills it, shared by the Metal and CUDA FFT
+/// drivers so the two cannot disagree about what a twiddle is.
+pub mod glv;
+
+pub use glv::PackedGlv;
+
 /// Limbs per field element. 32-bit limbs, not 64.
 ///
 /// Justification, in order of weight:

@@ -14,6 +14,10 @@ g16-msm.workspace = true
 # Direct for the same reason: the FFT packs and unpacks its blocks on the pool. Already
 # here through g16-core.
 rayon.workspace = true
+# The GLV twiddle layout and decomposition, shared with g16-cuda so the two FFT drivers
+# feed their kernels bit-identical tables. Everything else in layout.rs stays this
+# crate's own copy.
+g16-gpu-layout.workspace = true
 ark-ff.workspace = true
 ark-ec.workspace = true
 thiserror.workspace = true

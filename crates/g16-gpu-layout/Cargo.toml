@@ -8,3 +8,7 @@ license.workspace = true
 g16-field.workspace = true
 ark-ff.workspace = true
 ark-ec.workspace = true
+# Direct because `glv::twiddle_table` decomposes on the pool: a power-15 prepare
+# decomposes 237,568 twiddles at 1.1 us each, which serially is a quarter second of
+# device idle.
+rayon.workspace = true
