@@ -86,7 +86,7 @@ use g16_zkey::ProvingKey;
 use crate::stages::{HHandle, TAG};
 use crate::{as_words, from_words, kernels, Cuda};
 
-fn bad(reason: impl Into<String>) -> ProveError {
+pub(crate) fn bad(reason: impl Into<String>) -> ProveError {
     ProveError::Backend {
         backend: "cuda",
         reason: reason.into(),
@@ -96,7 +96,7 @@ fn bad(reason: impl Into<String>) -> ProveError {
 /// Wraps a driver failure with the operation that produced it. The driver's own message is
 /// `CUDA_ERROR_ILLEGAL_ADDRESS` and nothing else, so without the `what` there is no way to
 /// tell which of thirty-seven launches died.
-fn drv(what: &str, e: impl std::fmt::Display) -> ProveError {
+pub(crate) fn drv(what: &str, e: impl std::fmt::Display) -> ProveError {
     bad(format!("{what}: {e}"))
 }
 
@@ -587,13 +587,13 @@ impl MsmResult {
 /// ceiling, which puts their limit at 256 threads. That is above every block size this file
 /// asks for, so the clamp does not bind today; it is here so that it still does not bind on
 /// a card or a CUDA version where the compiler spends registers differently.
-struct Kernel {
-    f: CudaFunction,
+pub(crate) struct Kernel {
+    pub(crate) f: CudaFunction,
     max_block: u32,
 }
 
 impl Kernel {
-    fn load(module: &Arc<CudaModule>, name: &'static str) -> Result<Self, ProveError> {
+    pub(crate) fn load(module: &Arc<CudaModule>, name: &'static str) -> Result<Self, ProveError> {
         let f = module
             .load_function(name)
             .map_err(|e| bad(format!("kernel {name} missing: {e}")))?;
@@ -611,7 +611,7 @@ impl Kernel {
     /// block launched for an empty MSM, return without touching memory. That is cheaper
     /// than special-casing `items == 0` at five call sites, and a `grid_dim` of zero is a
     /// launch error rather than a no-op.
-    fn cfg_1d(&self, items: usize, prefer: u32) -> LaunchConfig {
+    pub(crate) fn cfg_1d(&self, items: usize, prefer: u32) -> LaunchConfig {
         let block = prefer.min(self.max_block).max(1);
         let grid = (items as u64).div_ceil(block as u64).max(1) as u32;
         LaunchConfig {
@@ -1511,7 +1511,10 @@ impl Outputs {
 /// the witness upload and the honest place to pay it; making it asynchronous means staging
 /// through page-locked memory, which is what `stages::CudaStages` does for the witness and
 /// what this file would copy if the upload ever shows up in a profile.
-fn upload_words(stream: &Arc<CudaStream>, data: &[u32]) -> Result<CudaSlice<u32>, ProveError> {
+pub(crate) fn upload_words(
+    stream: &Arc<CudaStream>,
+    data: &[u32],
+) -> Result<CudaSlice<u32>, ProveError> {
     let src: &[u32] = if data.is_empty() { &[0u32] } else { data };
     let buf = stream
         .clone_htod(src)
@@ -1541,7 +1544,10 @@ fn upload_g2(stream: &Arc<CudaStream>, bases: &[G2Affine]) -> Result<G2Bases, Pr
 /// Device to host, then wait. The wait is not optional: `cudarc` issues the copy into a
 /// plain `Vec` asynchronously and does not synchronize afterwards, so reading the `Vec`
 /// without this returns whatever was in the uninitialised allocation.
-fn download(stream: &Arc<CudaStream>, buf: &CudaSlice<u32>) -> Result<Vec<u32>, ProveError> {
+pub(crate) fn download(
+    stream: &Arc<CudaStream>,
+    buf: &CudaSlice<u32>,
+) -> Result<Vec<u32>, ProveError> {
     let v = stream
         .clone_dtoh(buf)
         .map_err(|e| drv("download MSM points", e))?;

@@ -82,9 +82,9 @@ fn artifact_dirs() -> Vec<(String, PathBuf)> {
     // A GPU correctness suite that silently tests zero artifacts is worse than one that
     // does not run, because it reports success.
     let root = match std::env::var_os("G16_ARTIFACTS") {
-        Some(p) => PathBuf::from(p).canonicalize().unwrap_or_else(|e| {
-            panic!("G16_ARTIFACTS is set but unusable: {e}")
-        }),
+        Some(p) => PathBuf::from(p)
+            .canonicalize()
+            .unwrap_or_else(|e| panic!("G16_ARTIFACTS is set but unusable: {e}")),
         None => match Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../bench/artifacts")
             .canonicalize()

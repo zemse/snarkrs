@@ -857,7 +857,9 @@ dependencies = [
  "g16-field",
  "g16-gpu-kernels",
  "g16-gpu-layout",
+ "g16-msm",
  "g16-zkey",
+ "rayon",
  "thiserror 2.0.19",
 ]
 

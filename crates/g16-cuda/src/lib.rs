@@ -27,8 +27,14 @@
 
 #[cfg(feature = "cuda")]
 mod backend;
+/// The ceremony seam that has CUDA kernels: `ptau prepare`'s group FFT.
+#[cfg(feature = "cuda")]
+mod ceremony;
 #[cfg(feature = "cuda")]
 mod context;
+/// The group inverse FFT behind `ptau prepare`: `ceremony::CudaGroupFft` is its seam.
+#[cfg(feature = "cuda")]
+pub mod fft;
 #[cfg(feature = "cuda")]
 pub mod kernels;
 #[cfg(feature = "cuda")]
@@ -38,6 +44,8 @@ pub mod stages;
 
 #[cfg(feature = "cuda")]
 pub use backend::{CudaBackend, CudaCircuit, PrepareCost};
+#[cfg(feature = "cuda")]
+pub use ceremony::CudaGroupFft;
 #[cfg(feature = "cuda")]
 pub use context::{Cuda, CudaError};
 

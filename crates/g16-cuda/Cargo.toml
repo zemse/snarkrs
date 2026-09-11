@@ -17,6 +17,12 @@ g16-zkey.workspace = true
 g16-core.workspace = true
 g16-gpu-layout.workspace = true
 g16-gpu-kernels.workspace = true
+# Direct because `ceremony` implements one of its traits, the same reason g16-metal
+# declares it.
+g16-msm.workspace = true
+# Direct because the FFT packs and unpacks its blocks on the pool, as the Metal twin
+# does.
+rayon.workspace = true
 ark-ff.workspace = true
 ark-ec.workspace = true
 thiserror.workspace = true
