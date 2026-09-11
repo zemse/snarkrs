@@ -157,7 +157,13 @@ fn slice_len_for(n_windows: usize, cap: usize) -> usize {
 /// one `pt_mul_small` per thread (the segment identity already carries the window-global
 /// bucket offset) plus `reduce_groups - 1` host-side additions per window, both noise.
 /// Groups double until the dispatch reaches [`REDUCE_TARGET_THREADS`], floored so every
-/// thread keeps at least [`REDUCE_TG`] buckets per group. The target is higher than the
+/// thread keeps at least two buckets per group. One bucket per thread is where the split
+/// stops paying: at c=8 it halves 128 buckets into a lane each, and the fixed
+/// `pt_mul_small` every lane owes then outweighs the segment it saves. Counting the
+/// shader's segment loop, `pt_mul_small` and the threadgroup tree for a full window gives
+/// 8,251 G1 field products at one group against 13,809 at two, and the mid-ladder
+/// circuits measure the difference: `js_1x1_d8` 7.24 ms against 7.57, `js_2x2_d16` 12.88
+/// against 13.16, `railgun-01x01` 18.46 against 18.81, `tornado` 24.85 against 25.07. The target is higher than the
 /// accumulation's because a reduce thread pays a fixed `pt_mul_small` on top of its
 /// segment, so past the sweet spot more threads mean more of that tax: at c=13 on the
 /// csp artifacts the sweep read 2.52 ms at 4 groups, 2.06 at 8, 2.48 at 16, 3.68 at 32.
@@ -173,7 +179,9 @@ fn reduce_groups_for(n_windows: usize, n_buckets: usize) -> usize {
         return g.min(n_buckets.max(1));
     }
     let mut g = 1;
-    while n_buckets / (2 * g) >= REDUCE_TG && n_windows * g * REDUCE_TG < REDUCE_TARGET_THREADS {
+    while n_buckets / (2 * g) >= 2 * REDUCE_TG
+        && n_windows * g * REDUCE_TG < REDUCE_TARGET_THREADS
+    {
         g *= 2;
     }
     g
