@@ -54,6 +54,7 @@ impl Cuda {
         // The default hook prints a panic message and a backtrace for something that is
         // not a crash. Silenced for the duration of this one call and restored straight
         // after, so a panic anywhere else still prints normally.
+        let t_open = std::time::Instant::now();
         let hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let opened = std::panic::catch_unwind(|| CudaContext::new(ordinal));
@@ -79,6 +80,17 @@ impl Cuda {
         let sm_count = ctx.attribute(
             cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
         )?;
+        // Context creation is a fixed per-process cost the FFT numbers say is worth
+        // knowing: on a box without nvidia-persistenced it includes bringing the whole
+        // GPU up, which is seconds, not milliseconds.
+        if time_enabled() {
+            eprintln!(
+                "g16-cuda time: open context {:.1} ms ({name}, cc {}.{})",
+                t_open.elapsed().as_secs_f64() * 1e3,
+                cc.0,
+                cc.1
+            );
+        }
         Ok(Self {
             ctx,
             stream,
@@ -182,7 +194,19 @@ impl Cuda {
                 // that lost power mid-write, and the failure mode of a truncated PTX is a
                 // confusing driver error rather than a clean miss.
                 if cached.len() > 64 && cached.contains(".visible .entry") {
+                    let bytes = cached.len();
+                    let t_load = std::time::Instant::now();
                     if let Ok(m) = self.ctx.load_module(cudarc::nvrtc::Ptx::from_src(cached)) {
+                        // With a warm ~/.nv this is a load of already-JITted SASS; with
+                        // a cold one it is the full PTX-to-SASS pass, which is where the
+                        // startup seconds hide.
+                        if time_enabled() {
+                            eprintln!(
+                                "g16-cuda time: unit {unit}: ptx cache hit ({bytes} bytes), \
+                                 load_module {:.1} ms",
+                                t_load.elapsed().as_secs_f64() * 1e3
+                            );
+                        }
                         return Ok(m);
                     }
                 }
@@ -196,11 +220,13 @@ impl Cuda {
             options: vec!["--std=c++17".into()],
             ..Default::default()
         };
+        let t_nvrtc = std::time::Instant::now();
         let ptx =
             cudarc::nvrtc::compile_ptx_with_opts(src, opts).map_err(|e| CudaError::Compile {
                 unit,
                 log: e.to_string(),
             })?;
+        let nvrtc_ms = t_nvrtc.elapsed().as_secs_f64() * 1e3;
 
         if let Some(p) = path.as_ref().filter(|_| !cache_disabled()) {
             let text = ptx.to_src();
@@ -220,7 +246,15 @@ impl Cuda {
             }
         }
 
-        Ok(self.ctx.load_module(ptx)?)
+        let t_load = std::time::Instant::now();
+        let module = self.ctx.load_module(ptx)?;
+        if time_enabled() {
+            eprintln!(
+                "g16-cuda time: unit {unit}: nvrtc {nvrtc_ms:.1} ms, load_module {:.1} ms",
+                t_load.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        Ok(module)
     }
 
     /// Compile and pull out a named set of kernels in one go.
@@ -240,6 +274,13 @@ impl Cuda {
 
 fn cache_disabled() -> bool {
     std::env::var_os("G16_CUDA_NO_CACHE").is_some_and(|v| v != "0")
+}
+
+/// `G16_CUDA_TIME=1` prints the fixed per-process costs (context open, compile, module
+/// load) to stderr. This is the breakdown of the flat seconds a `ptau prepare` pays
+/// before the first kernel runs, which at small powers is most of the command.
+pub(crate) fn time_enabled() -> bool {
+    std::env::var("G16_CUDA_TIME").as_deref() == Ok("1")
 }
 
 /// FNV-1a over the source and the architecture.

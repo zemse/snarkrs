@@ -21,11 +21,19 @@
 //!   arithmetic: a pass moves `n` points each way once per transform, against ~3,000 Fq
 //!   multiplies per ladder per pass.
 //!
-//! Co-dispatch note: `ifft_many` keeps the Metal lockstep rounds, but launches within a
-//! round still serialize on the one stream, so a round of small blocks does not fill the
-//! device the way Metal's `Concurrent` encoder does. Fixing that needs one fat launch
-//! with a per-block parameter array, or a stream per block; neither is taken for the
-//! first port, whose bar is byte identity, not underfill.
+//! Co-dispatch note: `ifft_many` keeps the Metal lockstep rounds, and by default the
+//! launches within a round still serialize on the one stream, so a round of small
+//! blocks does not fill the device the way Metal's `Concurrent` encoder does.
+//! `G16_CUDA_FFT_STREAMS=N` (or [`FftKernels::with_streams`]) round-robins the blocks
+//! over N streams instead; 1 stays the default until a measurement on a real card says
+//! what the fill is worth.
+//!
+//! The experiment knobs, all run-time and none costing a recompile:
+//! `G16_CUDA_FFT_VARIANT` picks a kernel variant ([`VARIANTS`]), `G16_CUDA_FFT_BLOCK`
+//! the threads per block, `G16_CUDA_FFT_STREAMS` the stream count, and
+//! `G16_CUDA_FFT_TIME=1` wraps every launch in CUDA events and prints per-pass device
+//! times. The one thing that does cost a compile is `G16_CUDA_FFT_VARIANTS=1`, which
+//! instantiates the whole variant set into the unit, once.
 //!
 //! The result agrees with the CPU as a curve point, not limb for limb, and the
 //! ceremony's byte identity survives because `lagrange_evaluations` (prepare.rs:414)
@@ -35,7 +43,9 @@
 use std::sync::Arc;
 
 use ark_ec::scalar_mul::glv::GLVConfig;
-use cudarc::driver::{CudaModule, CudaSlice, CudaStream, DeviceRepr, PushKernelArg};
+use cudarc::driver::{
+    sys, CudaContext, CudaEvent, CudaModule, CudaSlice, CudaStream, DeviceRepr, PushKernelArg,
+};
 use g16_core::ProveError;
 use g16_field::raw::{RawFq, RawFq2};
 use g16_field::{FftField, Field, Fr};
@@ -47,14 +57,13 @@ use rayon::prelude::*;
 use crate::msm::{bad, download, drv, upload_words, Kernel, PackedXyzzG1, PackedXyzzG2};
 use crate::{as_words, from_words, kernels, Cuda};
 
-/// Ladder window for both groups, and the only width `kernels/fft.cu` instantiates.
+/// Ladder window of the shipped variant, for both groups.
 ///
 /// 5 is the Metal sweep's answer for both groups over a whole `ppot_0080_16.ptau`
 /// prepare (`g16-metal/src/fft.rs`, `FFT_WINDOW_G1`), carried over rather than re-swept:
-/// there is no NVIDIA sweep yet, and compiling the other widths to enable one would cost
-/// every fresh machine NVRTC time for a knob the shipped configuration does not use
-/// (`fft.cu`'s banner has the numbers). To sweep on NVIDIA, add `FFT_KERNELS` lines to
-/// `fft.cu` and widths here, and take the compile hit once.
+/// there is no NVIDIA sweep yet. The sweep exists as [`VARIANTS`] behind
+/// `G16_CUDA_FFT_VARIANTS=1`, one compile for the whole set; this constant names the
+/// default until that sweep says otherwise.
 const FFT_WINDOW: u32 = 5;
 
 /// Blocks shorter than this go back to the CPU.
@@ -70,8 +79,60 @@ const MIN_BLOCK: usize = 1 << 12;
 
 /// Threads per block. The ladder is one long dependent chain per thread, the same shape
 /// as the MSM point kernels, so the same choice as `msm.rs`'s `POINT_BLOCK` and the same
-/// caveat: not swept on a real card.
+/// caveat: not swept on a real card. `G16_CUDA_FFT_BLOCK` overrides it without a
+/// rebuild; the launch clamps to the kernel's own maximum, which matters for the
+/// `__launch_bounds__` variants.
 const FFT_BLOCK: u32 = 128;
+
+/// The kernel variants `kernels/fft.cu` can instantiate, in the order they appear
+/// there. Row 0 is the shipped configuration and always exists; the `gated` rows exist
+/// only when the unit was assembled with `G16_FFT_VARIANTS`
+/// (`G16_CUDA_FFT_VARIANTS=1`), which is what makes one NVRTC compile carry the whole
+/// sweep. `G16_CUDA_FFT_VARIANT=<name>` selects one per run; the hypothesis each row
+/// tests is documented at the instantiation site in `fft.cu`.
+struct VariantDef {
+    name: &'static str,
+    mix_g1: &'static str,
+    scale_g1: &'static str,
+    mix_g2: &'static str,
+    scale_g2: &'static str,
+    gated: bool,
+}
+
+const VARIANTS: [VariantDef; 4] = [
+    VariantDef {
+        name: "c5",
+        mix_g1: "fft_mix_g1_c5",
+        scale_g1: "fft_mix_scale_g1_c5",
+        mix_g2: "fft_mix_g2_c5",
+        scale_g2: "fft_mix_scale_g2_c5",
+        gated: false,
+    },
+    VariantDef {
+        name: "c4",
+        mix_g1: "fft_mix_g1_c4",
+        scale_g1: "fft_mix_scale_g1_c4",
+        mix_g2: "fft_mix_g2_c4",
+        scale_g2: "fft_mix_scale_g2_c4",
+        gated: true,
+    },
+    VariantDef {
+        name: "c3r",
+        mix_g1: "fft_mix_g1_c3r",
+        scale_g1: "fft_mix_scale_g1_c3r",
+        mix_g2: "fft_mix_g2_c3r",
+        scale_g2: "fft_mix_scale_g2_c3r",
+        gated: true,
+    },
+    VariantDef {
+        name: "c5r128",
+        mix_g1: "fft_mix_g1_c5r128",
+        scale_g1: "fft_mix_scale_g1_c5r128",
+        mix_g2: "fft_mix_g2_c5r128",
+        scale_g2: "fft_mix_scale_g2_c5r128",
+        gated: true,
+    },
+];
 
 /// Mirrors `struct FftParams` in `kernels/fft.cu`: five `u32`, 20 bytes, no padding on
 /// either side. Passed by value through the parameter space, like `MsmParams`.
@@ -99,8 +160,8 @@ const _: () = {
 unsafe impl DeviceRepr for FftParams {}
 
 /// One block's live state across the lockstep rounds of [`FftKernels::ifft_many`]: its
-/// ping-pong pair, its own `1/n`-scaled twiddle table, and where in the caller's slice
-/// of blocks it came from.
+/// ping-pong pair, its own `1/n`-scaled twiddle table, the stream its passes run on,
+/// and where in the caller's slice of blocks it came from.
 struct Block {
     idx: usize,
     n: usize,
@@ -108,12 +169,32 @@ struct Block {
     src: CudaSlice<u32>,
     dst: CudaSlice<u32>,
     stw: CudaSlice<u32>,
+    stream: Arc<CudaStream>,
 }
 
-/// The two kernels for one group at the shipped width.
+/// The two kernels for one group of one variant.
 struct FftPair {
     mix: Kernel,
     mix_scale: Kernel,
+}
+
+/// One loaded variant: both groups' pairs under the name the environment selects by.
+struct Variant {
+    name: &'static str,
+    g1: FftPair,
+    g2: FftPair,
+}
+
+/// An event pair around one launch, read back after the stream drains. Only allocated
+/// when timing is on; the launch path stays event-free otherwise.
+struct PassTime {
+    idx: usize,
+    bits: u32,
+    exp: u32,
+    fused: bool,
+    threads: usize,
+    start: CudaEvent,
+    end: CudaEvent,
 }
 
 /// What the two kernels need to know about a group, so the submission code is written
@@ -163,7 +244,7 @@ impl FftGroup for FftG1 {
     }
 
     fn kernels(k: &FftKernels) -> &FftPair {
-        &k.g1
+        &k.variants[k.active].g1
     }
 }
 
@@ -193,7 +274,7 @@ impl FftGroup for FftG2 {
     }
 
     fn kernels(k: &FftKernels) -> &FftPair {
-        &k.g2
+        &k.variants[k.active].g2
     }
 }
 
@@ -203,14 +284,18 @@ impl FftGroup for FftG2 {
 /// both caches; see `context.rs` for the measured cliff) and it belongs once at the top
 /// of a command, exactly as `CudaMsm::compile` does for the prover.
 pub struct FftKernels {
+    ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
     /// Kept alive explicitly. `CudaFunction` holds an `Arc<CudaModule>` internally, so
     /// this field documents the ownership rather than being what keeps the module loaded.
     #[allow(dead_code)]
     module: Arc<CudaModule>,
-    g1: FftPair,
-    g2: FftPair,
+    variants: Vec<Variant>,
+    active: usize,
     min_block: usize,
+    block: u32,
+    streams: usize,
+    timing: bool,
 }
 
 impl FftKernels {
@@ -230,25 +315,95 @@ impl FftKernels {
     /// Bind the kernel handles out of an already-compiled module. `module` must have
     /// come from [`Self::compile`] against this same [`Cuda`], for the reason
     /// `CudaMsm::from_module` gives.
+    ///
+    /// Loads every variant the unit was assembled with: the shipped row always, the
+    /// gated rows exactly when `G16_CUDA_FFT_VARIANTS=1`, because that same env decided
+    /// whether their entry points exist in the module at all (`kernels::defines`).
     pub fn from_module(cuda: &Cuda, module: Arc<CudaModule>) -> Result<Self, ProveError> {
-        // The names are `FFT_WINDOW` spelled out, because `Kernel::load` wants 'static
-        // names; a width added to `FFT_WINDOWS` needs its pair added here, and the
-        // grep test below fails on a width whose kernels do not exist in the source.
-        let g1 = FftPair {
-            mix: Kernel::load(&module, "fft_mix_g1_c5")?,
-            mix_scale: Kernel::load(&module, "fft_mix_scale_g1_c5")?,
-        };
-        let g2 = FftPair {
-            mix: Kernel::load(&module, "fft_mix_g2_c5")?,
-            mix_scale: Kernel::load(&module, "fft_mix_scale_g2_c5")?,
-        };
-        Ok(Self {
+        let mut variants = Vec::new();
+        for def in VARIANTS
+            .iter()
+            .filter(|d| !d.gated || kernels::fft_variants_enabled())
+        {
+            variants.push(Variant {
+                name: def.name,
+                g1: FftPair {
+                    mix: Kernel::load(&module, def.mix_g1)?,
+                    mix_scale: Kernel::load(&module, def.scale_g1)?,
+                },
+                g2: FftPair {
+                    mix: Kernel::load(&module, def.mix_g2)?,
+                    mix_scale: Kernel::load(&module, def.scale_g2)?,
+                },
+            });
+        }
+        let k = Self {
+            ctx: cuda.context().clone(),
             stream: cuda.stream().clone(),
             module,
-            g1,
-            g2,
+            variants,
+            active: 0,
             min_block: env_min_block(),
-        })
+            block: env_block(),
+            streams: env_streams(),
+            timing: env_timing(),
+        };
+        match std::env::var("G16_CUDA_FFT_VARIANT") {
+            Ok(v) => k.with_variant(&v),
+            Err(_) => Ok(k),
+        }
+    }
+
+    /// Selects the kernel variant every later transform launches. See [`VARIANTS`].
+    pub fn with_variant(mut self, name: &str) -> Result<Self, ProveError> {
+        match self.variants.iter().position(|v| v.name == name) {
+            Some(i) => {
+                self.active = i;
+                Ok(self)
+            }
+            None => Err(bad(format!(
+                "fft variant {name:?} is not loaded; available: [{}]{}",
+                self.variants
+                    .iter()
+                    .map(|v| v.name)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if kernels::fft_variants_enabled() {
+                    ""
+                } else {
+                    "; the experiment set needs G16_CUDA_FFT_VARIANTS=1 at compile"
+                }
+            ))),
+        }
+    }
+
+    /// The active variant's name.
+    pub fn variant(&self) -> &'static str {
+        self.variants[self.active].name
+    }
+
+    /// Every variant the compiled unit carries, in [`VARIANTS`] order.
+    pub fn variant_names(&self) -> Vec<&'static str> {
+        self.variants.iter().map(|v| v.name).collect()
+    }
+
+    /// Threads per block for every launch. See [`FFT_BLOCK`].
+    pub fn with_block(mut self, threads: u32) -> Self {
+        self.block = threads.max(1);
+        self
+    }
+
+    /// Streams the independent blocks of one call spread over. See the module docs'
+    /// co-dispatch note: 1 keeps the proven serial shape.
+    pub fn with_streams(mut self, n: usize) -> Self {
+        self.streams = n.max(1);
+        self
+    }
+
+    /// Per-pass device timing to stderr, the same switch as `G16_CUDA_FFT_TIME=1`.
+    pub fn with_timing(mut self, on: bool) -> Self {
+        self.timing = on;
+        self
     }
 
     /// Shortest block this instance will run on the device. See [`MIN_BLOCK`].
@@ -318,6 +473,25 @@ impl FftKernels {
         let pair = G::kernels(self);
         let point_words = core::mem::size_of::<G::PackedPoint>() / 4;
 
+        // The stream each block's passes run on. One stream is the proven serial shape;
+        // `G16_CUDA_FFT_STREAMS=N` round-robins the independent blocks over N streams so
+        // a round of small blocks can fill the device instead of queuing behind each
+        // other. No cross-stream ordering is needed: blocks are independent transforms
+        // and each one's uploads, passes and download stay on its own stream, while the
+        // shared `tw` upload below completes (host-blocking) before any launch is
+        // issued anywhere.
+        let pool: Vec<Arc<CudaStream>> = if self.streams > 1 {
+            (0..self.streams.min(blocks.len().max(1)))
+                .map(|_| {
+                    self.ctx
+                        .new_stream()
+                        .map_err(|e| drv("create fft stream", e))
+                })
+                .collect::<Result<_, _>>()?
+        } else {
+            vec![self.stream.clone()]
+        };
+
         // Per-block ping-pong. `src` holds the input of the pass about to run and is
         // never written by it; `dst` starts zeroed (msm.rs's allocation policy: an
         // uninitialised limb array is a plausible field element) and every pass
@@ -329,6 +503,7 @@ impl FftKernels {
                 continue;
             }
             let bits = n.trailing_zeros();
+            let stream = pool[live.len() % pool.len()].clone();
 
             // `bit_reverse` (prepare.rs:256) folded into the pack, in gather form so the
             // loop splits over the pool: the permutation is an involution, so
@@ -341,9 +516,8 @@ impl FftKernels {
                 .par_iter_mut()
                 .enumerate()
                 .for_each(|(j, s)| *s = G::pack(&a[bit_reverse_index(j, bits)]));
-            let src = upload_words(&self.stream, as_words(&packed))?;
-            let dst = self
-                .stream
+            let src = upload_words(&stream, as_words(&packed))?;
+            let dst = stream
                 .alloc_zeros::<u32>(n * point_words)
                 .map_err(|e| drv("allocate fft scratch", e))?;
 
@@ -354,10 +528,7 @@ impl FftKernels {
             // which reads a second table with `s = 1/n` folded into every entry,
             // `stw[0]` doubling as the plain `[s]` the `lo` side needs. `s` differs per
             // block, so unlike `tw` this table cannot be shared across a round.
-            let stw = upload_words(
-                &self.stream,
-                as_words(&twiddle_table::<G::Cfg>(bits, size_inv)),
-            )?;
+            let stw = upload_words(&stream, as_words(&twiddle_table::<G::Cfg>(bits, size_inv)))?;
             live.push(Block {
                 idx: bi,
                 n,
@@ -365,6 +536,7 @@ impl FftKernels {
                 src,
                 dst,
                 stw,
+                stream,
             });
         }
         let Some(max_bits) = live.iter().map(|b| b.bits).max() else {
@@ -379,6 +551,7 @@ impl FftKernels {
             as_words(&twiddle_table::<G::Cfg>(max_bits, Fr::ONE)),
         )?;
 
+        let mut times: Vec<PassTime> = Vec::new();
         for exp in 1..=max_bits {
             for b in live.iter().filter(|b| b.bits >= exp) {
                 let (kernel, third, params, threads) = if b.bits == exp {
@@ -409,8 +582,9 @@ impl FftKernels {
                     };
                     (&pair.mix, &tw, params, threads)
                 };
-                let cfg = kernel.cfg_1d(threads, FFT_BLOCK);
-                let mut lb = self.stream.launch_builder(&kernel.f);
+                let cfg = kernel.cfg_1d(threads, self.block);
+                let start = self.timed_event(&b.stream)?;
+                let mut lb = b.stream.launch_builder(&kernel.f);
                 lb.arg(&b.src).arg(&b.dst).arg(third).arg(&params);
                 // SAFETY: four parameters bound in order and with matching types; `src`
                 // and `dst` each hold `n` points of this group, every in-bounds index
@@ -418,19 +592,31 @@ impl FftKernels {
                 // `(n/2) * GLV_WORDS` words by construction, and the surplus threads of
                 // the last CUDA block exit on the kernel's own bounds guard.
                 unsafe { lb.launch(cfg) }.map_err(|e| drv("launch fft mix", e))?;
+                if let Some(start) = start {
+                    let end = self.timed_event(&b.stream)?.expect("timing is on");
+                    times.push(PassTime {
+                        idx: b.idx,
+                        bits: b.bits,
+                        exp,
+                        fused: b.bits == exp,
+                        threads,
+                        start,
+                        end,
+                    });
+                }
             }
-            // Launches on the one stream execute in issue order, so pass `exp + 1` reads
-            // what pass `exp` wrote with no event and no host wait; the swap is pure
-            // host bookkeeping.
+            // Launches on one stream execute in issue order, so pass `exp + 1` of a
+            // block reads what its pass `exp` wrote with no event and no host wait; the
+            // swap is pure host bookkeeping.
             for b in live.iter_mut().filter(|b| b.bits >= exp) {
                 core::mem::swap(&mut b.src, &mut b.dst);
             }
         }
 
         for b in &live {
-            // The one wait per block: `download` synchronizes the stream before the
-            // `Vec` is read, which also orders it after every launch above.
-            let words = download(&self.stream, &b.src)?;
+            // The one wait per block: `download` synchronizes the block's stream before
+            // the `Vec` is read, which also orders it after every launch above.
+            let words = download(&b.stream, &b.src)?;
             let got = from_words::<G::PackedPoint>(&words)
                 .ok_or_else(|| bad("fft read back is not a whole number of points"))?;
 
@@ -446,7 +632,59 @@ impl FftKernels {
                 *out = G::unpack(&got[n - 1 - i]);
             });
         }
+
+        // Every stream is drained by its block's download above, so the event pairs are
+        // complete and reading them costs nothing on the device.
+        if self.timing {
+            let mut total = 0f64;
+            for t in &times {
+                let ms = f64::from(
+                    t.start
+                        .elapsed_ms(&t.end)
+                        .map_err(|e| drv("read fft event pair", e))?,
+                );
+                total += ms;
+                eprintln!(
+                    "g16-cuda fft-time: {} block {} n=2^{} pass {:>2}{} threads {:>8} {:>10.3} ms",
+                    G::OP,
+                    t.idx,
+                    t.bits,
+                    t.exp,
+                    if t.fused { " fused" } else { "      " },
+                    t.threads,
+                    ms
+                );
+            }
+            // A sum of per-launch times, so under more than one stream it can exceed
+            // the wall the launches actually took together.
+            eprintln!(
+                "g16-cuda fft-time: {} device sum {:.3} ms over {} launches \
+                 (variant {}, block {}, streams {})",
+                G::OP,
+                total,
+                times.len(),
+                self.variant(),
+                self.block,
+                pool.len()
+            );
+        }
         Ok(())
+    }
+
+    /// An event recorded on `stream` now, or `None` with timing off. `CU_EVENT_DEFAULT`
+    /// and not the cudarc default, which is `CU_EVENT_DISABLE_TIMING`: that one records
+    /// fine and then fails at `elapsed_ms`, the same trap `msm.rs` documents.
+    fn timed_event(&self, stream: &CudaStream) -> Result<Option<CudaEvent>, ProveError> {
+        if !self.timing {
+            return Ok(None);
+        }
+        let e = self
+            .ctx
+            .new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+            .map_err(|e| drv("create fft timing event", e))?;
+        e.record(stream)
+            .map_err(|e| drv("record fft timing event", e))?;
+        Ok(Some(e))
     }
 }
 
@@ -467,30 +705,87 @@ fn env_min_block() -> usize {
         .unwrap_or(MIN_BLOCK)
 }
 
+/// `G16_CUDA_FFT_BLOCK` overrides [`FFT_BLOCK`], the threads-per-block sweep knob.
+fn env_block() -> u32 {
+    std::env::var("G16_CUDA_FFT_BLOCK")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|&b| b > 0)
+        .unwrap_or(FFT_BLOCK)
+}
+
+/// `G16_CUDA_FFT_STREAMS` spreads independent blocks over that many streams; 1, the
+/// default, is the proven serial shape.
+fn env_streams() -> usize {
+    std::env::var("G16_CUDA_FFT_STREAMS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(1)
+}
+
+/// `G16_CUDA_FFT_TIME=1` wraps every launch in a CUDA event pair and prints per-pass
+/// device times to stderr after the read back.
+fn env_timing() -> bool {
+    std::env::var("G16_CUDA_FFT_TIME").as_deref() == Ok("1")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use g16_gpu_layout::PackedGlv;
 
-    /// Widths with a kernel pair per group in `kernels/fft.cu`, parallel to the
-    /// `FFT_KERNELS` lines there.
-    const FFT_WINDOWS: [u32; 1] = [FFT_WINDOW];
-
-    /// Every width in [`FFT_WINDOWS`] has a kernel pair in the source, and the shipped
-    /// width is among them. Construction would catch a missing kernel, but only on a
-    /// machine with a device; this runs anywhere.
+    /// Every row of [`VARIANTS`] has an instantiation line in the source, and the gated
+    /// rows sit behind the `G16_FFT_VARIANTS` guard their loading is keyed on.
+    /// Construction would catch a missing kernel, but only on a machine with a device
+    /// and minutes into a compile; this runs anywhere.
     #[test]
-    fn every_compiled_window_has_a_kernel_pair() {
-        for c in FFT_WINDOWS {
-            for g in ["g1", "g2"] {
+    fn every_variant_has_an_instantiation_line() {
+        assert!(kernels::FFT_CU.contains("#ifdef G16_FFT_VARIANTS"));
+        for def in VARIANTS {
+            for suffix in [
+                def.mix_g1.trim_start_matches("fft_mix_"),
+                def.mix_g2.trim_start_matches("fft_mix_"),
+            ] {
+                // Matches both macro forms: `FFT_KERNELS(g1_c5,` and
+                // `FFT_KERNELS_LB(g1_c5r128,`.
                 assert!(
-                    kernels::FFT_CU.contains(&format!("FFT_KERNELS({g}_c{c},")),
-                    "kernels/fft.cu has no FFT_KERNELS line for {g} c={c}, so \
-                     fft_mix_{g}_c{c} does not exist and load_function will fail"
+                    kernels::FFT_CU.contains(&format!("({suffix},")),
+                    "kernels/fft.cu has no FFT_KERNELS line for {suffix}, so \
+                     fft_mix_{suffix} does not exist and load_function will fail"
                 );
             }
+            assert_eq!(
+                def.scale_g1,
+                format!(
+                    "fft_mix_scale_{}",
+                    def.mix_g1.trim_start_matches("fft_mix_")
+                )
+            );
+            assert_eq!(
+                def.scale_g2,
+                format!(
+                    "fft_mix_scale_{}",
+                    def.mix_g2.trim_start_matches("fft_mix_")
+                )
+            );
         }
-        assert!(FFT_WINDOWS.contains(&FFT_WINDOW));
+        // The shipped row is ungated and named after the shipped window.
+        assert!(!VARIANTS[0].gated);
+        assert_eq!(VARIANTS[0].name, format!("c{FFT_WINDOW}"));
+        // The gated rows are inside the guard: everything after `#ifdef` and before the
+        // closing `#endif // G16_FFT_VARIANTS` is the experiment block, and each gated
+        // instantiation must appear after the `#ifdef`.
+        let guard = kernels::FFT_CU.find("#ifdef G16_FFT_VARIANTS").unwrap();
+        for def in VARIANTS.iter().filter(|d| d.gated) {
+            let suffix = def.mix_g1.trim_start_matches("fft_mix_");
+            let at = kernels::FFT_CU.find(&format!("({suffix},")).unwrap();
+            assert!(
+                at > guard,
+                "{suffix} is instantiated outside the G16_FFT_VARIANTS guard, so every \
+                 user pays its compile time"
+            );
+        }
     }
 
     /// Without `extern "C"` NVRTC mangles the entry names and `load_function` fails at
@@ -501,6 +796,7 @@ mod tests {
         for want in [
             "extern \"C\" __global__ void fft_mix_##SUF(",
             "extern \"C\" __global__ void fft_mix_scale_##SUF(",
+            "extern \"C\" __global__ void __launch_bounds__(MAXT, MINB)",
         ] {
             assert!(
                 kernels::FFT_CU.contains(want),

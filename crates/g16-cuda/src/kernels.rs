@@ -19,15 +19,29 @@ pub use g16_gpu_kernels::{
 /// hardware: check `fr_probe` passes with the flag on, then compare `bench_chain` with
 /// the flag off/on; only then is it a candidate for the default.
 ///
+/// `G16_CUDA_FFT_VARIANTS=1` defines `G16_FFT_VARIANTS`, which instantiates the FFT
+/// experiment entry points (`kernels/fft.cu`, bottom) alongside the shipped pair. One
+/// define covering the whole candidate set is the point: the sweep costs one compile,
+/// and a machine that never sweeps never pays for it.
+///
 /// Going through the source text rather than an NVRTC `-D` option is deliberate: the PTX
 /// cache key in `context.rs` hashes the source, so a define spliced into the source can
 /// never collide with a cached portable build.
 fn defines() -> String {
+    let mut d = String::new();
     if std::env::var("G16_CUDA_FF_PTX").as_deref() == Ok("1") {
-        "#define G16_FF_PTX 1\n".to_string()
-    } else {
-        String::new()
+        d.push_str("#define G16_FF_PTX 1\n");
     }
+    if fft_variants_enabled() {
+        d.push_str("#define G16_FFT_VARIANTS 1\n");
+    }
+    d
+}
+
+/// Whether the FFT unit carries the experiment entry points. `fft.rs` consults this too,
+/// so the host never tries to load a kernel the unit was assembled without.
+pub(crate) fn fft_variants_enabled() -> bool {
+    std::env::var("G16_CUDA_FFT_VARIANTS").as_deref() == Ok("1")
 }
 
 /// Stages 0 to 4, one translation unit. They share `Fr` and nothing else, and compiling
