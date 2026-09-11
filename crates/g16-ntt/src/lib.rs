@@ -179,7 +179,8 @@ impl CpuNtt {
                     h <<= 1;
                 }
             });
-            half = CACHE_BLOCK;
+            self.dit_outer_passes(a, twiddles, CACHE_BLOCK);
+            return;
         }
         while half < n {
             // Butterfly `j` of a block needs `root^(j * n / 2half)`, and the table holds
@@ -194,25 +195,43 @@ impl CpuNtt {
         }
     }
 
+    /// The DIT passes above the fused block, radix-4: consecutive passes at `half` and
+    /// `2 * half` run as one trip through the vector, so what the block fusion did for
+    /// the small-half passes this does for the large-stride ones, halving their number.
+    /// One radix-2 pass mops up when the remaining count is odd.
+    fn dit_outer_passes(&self, a: &mut [Fr], twiddles: &[Fr], mut half: usize) {
+        let n = a.len();
+        while half * 4 <= n {
+            parallel_quad_pass_dit(a, half, twiddles, self.tasks());
+            half <<= 2;
+        }
+        if half < n {
+            parallel_pass::<false>(a, half, twiddles, n / (2 * half), self.tasks());
+        }
+    }
+
+    /// The mirror for DIF: passes at `half` and `half / 2` pair up, walking down until
+    /// only the fused-block passes below `floor` remain.
+    fn dif_outer_passes(&self, a: &mut [Fr], twiddles: &[Fr], floor: usize) {
+        let n = a.len();
+        let mut half = n / 2;
+        while half > 2 * floor {
+            parallel_quad_pass_dif(a, half, twiddles, self.tasks());
+            half >>= 2;
+        }
+        if half > floor {
+            parallel_pass::<true>(a, half, twiddles, n / (2 * half), self.tasks());
+        }
+    }
+
     /// Decimation in frequency: natural input, bit-reversed output, half-size halving
     /// per pass. Same twiddle tables, same per-pass indexing, opposite pass order, and
     /// the mirror image of the fusion above: here it is the *final* passes that stay
     /// inside one block.
     fn dif_passes(&self, a: &mut [Fr], twiddles: &[Fr], parallel: bool) {
         let n = a.len();
-        let fused = parallel && n > CACHE_BLOCK;
-        let floor = if fused { CACHE_BLOCK / 2 } else { 0 };
-        let mut half = n / 2;
-        while half > floor {
-            let stride = n / (2 * half);
-            if parallel {
-                parallel_pass::<true>(a, half, twiddles, stride, self.tasks());
-            } else {
-                serial_pass::<true>(a, half, twiddles, stride);
-            }
-            half >>= 1;
-        }
-        if fused {
+        if parallel && n > CACHE_BLOCK {
+            self.dif_outer_passes(a, twiddles, CACHE_BLOCK / 2);
             a.par_chunks_mut(CACHE_BLOCK).for_each(|block| {
                 let mut h = CACHE_BLOCK / 2;
                 while h >= 1 {
@@ -220,6 +239,17 @@ impl CpuNtt {
                     h >>= 1;
                 }
             });
+            return;
+        }
+        let mut half = n / 2;
+        while half >= 1 {
+            let stride = n / (2 * half);
+            if parallel {
+                parallel_pass::<true>(a, half, twiddles, stride, self.tasks());
+            } else {
+                serial_pass::<true>(a, half, twiddles, stride);
+            }
+            half >>= 1;
         }
     }
 
@@ -316,11 +346,7 @@ impl CpuNtt {
         let fwd = self.twiddles(domain, Direction::Forward);
         let table = self.coset_table(domain, shift);
 
-        let mut half = n / 2;
-        while half > CACHE_BLOCK / 2 {
-            parallel_pass::<true>(a, half, &inv, n / (2 * half), self.tasks());
-            half >>= 1;
-        }
+        self.dif_outer_passes(a, &inv, CACHE_BLOCK / 2);
         a.par_chunks_mut(CACHE_BLOCK)
             .zip(table.par_chunks(CACHE_BLOCK))
             .for_each(|(block, tab)| {
@@ -338,11 +364,7 @@ impl CpuNtt {
                     h <<= 1;
                 }
             });
-        let mut half = CACHE_BLOCK;
-        while half < n {
-            parallel_pass::<false>(a, half, &fwd, n / (2 * half), self.tasks());
-            half <<= 1;
-        }
+        self.dit_outer_passes(a, &fwd, CACHE_BLOCK);
     }
 
     /// Cached `[shift^bitrev(p) / n]` table for [`Self::coset_scale_bitrev`], built and
@@ -470,6 +492,70 @@ fn butterflies<const DIF: bool>(
     }
 }
 
+/// Two consecutive DIT passes, `half` and `2 * half`, over one run of quads. The quad at
+/// `j` is `(x0, x1, x2, x3) = (a[j], a[j+half], a[j+2half], a[j+3half])` within a
+/// `4 * half` block; the first pass pairs (x0,x1) and (x2,x3), the second (x0,x2) and
+/// (x1,x3). Same four multiplies the two passes would spend, half their loads and
+/// stores. `s2` is the second pass's stride `n / (4 * half)`; the first pass's is twice
+/// that.
+#[inline]
+fn quad_dit(
+    x0: &mut [Fr],
+    x1: &mut [Fr],
+    x2: &mut [Fr],
+    x3: &mut [Fr],
+    twiddles: &[Fr],
+    s2: usize,
+    half: usize,
+    j0: usize,
+) {
+    for k in 0..x0.len() {
+        let j = j0 + k;
+        let w1 = twiddles[2 * j * s2];
+        let t0 = x1[k] * w1;
+        let a0 = x0[k] + t0;
+        let a1 = x0[k] - t0;
+        let t1 = x3[k] * w1;
+        let a2 = x2[k] + t1;
+        let a3 = x2[k] - t1;
+        let u0 = a2 * twiddles[j * s2];
+        x0[k] = a0 + u0;
+        x2[k] = a0 - u0;
+        let u1 = a3 * twiddles[(j + half) * s2];
+        x1[k] = a1 + u1;
+        x3[k] = a1 - u1;
+    }
+}
+
+/// The DIF mirror: passes `half` then `half / 2` over quads
+/// `(y0, y1, y2, y3) = (a[j], a[j+half/2], a[j+half], a[j+3half/2])` within a
+/// `2 * half` block. `s1` is the first pass's stride `n / (2 * half)`; the second's is
+/// twice that, and `hh` is `half / 2`.
+#[inline]
+fn quad_dif(
+    y0: &mut [Fr],
+    y1: &mut [Fr],
+    y2: &mut [Fr],
+    y3: &mut [Fr],
+    twiddles: &[Fr],
+    s1: usize,
+    hh: usize,
+    j0: usize,
+) {
+    for k in 0..y0.len() {
+        let j = j0 + k;
+        let a0 = y0[k] + y2[k];
+        let a2 = (y0[k] - y2[k]) * twiddles[j * s1];
+        let a1 = y1[k] + y3[k];
+        let a3 = (y1[k] - y3[k]) * twiddles[(j + hh) * s1];
+        let w2 = twiddles[2 * j * s1];
+        y0[k] = a0 + a1;
+        y1[k] = (a0 - a1) * w2;
+        y2[k] = a2 + a3;
+        y3[k] = (a2 - a3) * w2;
+    }
+}
+
 fn serial_pass<const DIF: bool>(a: &mut [Fr], half: usize, twiddles: &[Fr], stride: usize) {
     for block in a.chunks_mut(2 * half) {
         let (lo, hi) = block.split_at_mut(half);
@@ -514,6 +600,77 @@ fn parallel_pass<const DIF: bool>(
                 .zip(hi.par_chunks_mut(chunk))
                 .enumerate()
                 .for_each(|(c, (l, h))| butterflies::<DIF>(l, h, twiddles, stride, c * chunk));
+        });
+    }
+}
+
+/// Splits one `4 * half`-sized quad block into its four strips.
+fn quad_strips(block: &mut [Fr], half: usize) -> (&mut [Fr], &mut [Fr], &mut [Fr], &mut [Fr]) {
+    let (lo, hi) = block.split_at_mut(2 * half);
+    let (x0, x1) = lo.split_at_mut(half);
+    let (x2, x3) = hi.split_at_mut(half);
+    (x0, x1, x2, x3)
+}
+
+/// [`parallel_pass`] for a fused DIT pass pair. Only the outer passes come here, so a
+/// block is at least `4 * CACHE_BLOCK` elements and needs no grouping; the split branch
+/// mirrors the radix-2 one for the late passes where blocks are fewer than tasks.
+fn parallel_quad_pass_dit(a: &mut [Fr], half: usize, twiddles: &[Fr], tasks: usize) {
+    let n = a.len();
+    let s2 = n / (4 * half);
+    let block_len = 4 * half;
+    let blocks = n / block_len;
+    if blocks >= tasks {
+        a.par_chunks_mut(block_len).for_each(|block| {
+            let (x0, x1, x2, x3) = quad_strips(block, half);
+            quad_dit(x0, x1, x2, x3, twiddles, s2, half, 0);
+        });
+    } else {
+        let chunk = half
+            .div_ceil(tasks.div_ceil(blocks))
+            .max(MIN_BUTTERFLIES_PER_TASK)
+            .min(half);
+        a.par_chunks_mut(block_len).for_each(|block| {
+            let (x0, x1, x2, x3) = quad_strips(block, half);
+            x0.par_chunks_mut(chunk)
+                .zip(x1.par_chunks_mut(chunk))
+                .zip(x2.par_chunks_mut(chunk))
+                .zip(x3.par_chunks_mut(chunk))
+                .enumerate()
+                .for_each(|(c, (((p0, p1), p2), p3))| {
+                    quad_dit(p0, p1, p2, p3, twiddles, s2, half, c * chunk)
+                });
+        });
+    }
+}
+
+/// The DIF twin: blocks are `2 * half` and the strips are `half / 2` long.
+fn parallel_quad_pass_dif(a: &mut [Fr], half: usize, twiddles: &[Fr], tasks: usize) {
+    let n = a.len();
+    let s1 = n / (2 * half);
+    let hh = half / 2;
+    let block_len = 2 * half;
+    let blocks = n / block_len;
+    if blocks >= tasks {
+        a.par_chunks_mut(block_len).for_each(|block| {
+            let (y0, y1, y2, y3) = quad_strips(block, hh);
+            quad_dif(y0, y1, y2, y3, twiddles, s1, hh, 0);
+        });
+    } else {
+        let chunk = hh
+            .div_ceil(tasks.div_ceil(blocks))
+            .max(MIN_BUTTERFLIES_PER_TASK)
+            .min(hh);
+        a.par_chunks_mut(block_len).for_each(|block| {
+            let (y0, y1, y2, y3) = quad_strips(block, hh);
+            y0.par_chunks_mut(chunk)
+                .zip(y1.par_chunks_mut(chunk))
+                .zip(y2.par_chunks_mut(chunk))
+                .zip(y3.par_chunks_mut(chunk))
+                .enumerate()
+                .for_each(|(c, (((p0, p1), p2), p3))| {
+                    quad_dif(p0, p1, p2, p3, twiddles, s1, hh, c * chunk)
+                });
         });
     }
 }
@@ -717,7 +874,7 @@ mod tests {
         // so the two must agree to the bit, not approximately. Sizes straddle
         // PARALLEL_THRESHOLD so both path choices inside each method are covered.
         let ntt = CpuNtt::new();
-        for log in [2u32, 6, 10, 12, 14] {
+        for log in [2u32, 6, 10, 12, 14, 15] {
             let n = 1usize << log;
             let d = domain(n);
             // The shift the real caller uses: the 2n-th root whose square is the
@@ -745,7 +902,7 @@ mod tests {
         // fused middle are both exercised, plus the fused path at more than one depth
         // of outer passes.
         let ntt = CpuNtt::new();
-        for log in [4u32, 10, 11, 12, 14] {
+        for log in [4u32, 10, 11, 12, 14, 15] {
             let n = 1usize << log;
             let d = domain(n);
             let shift = domain(2 * n).group_gen;
