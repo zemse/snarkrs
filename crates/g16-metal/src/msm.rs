@@ -320,14 +320,22 @@ impl PackedXyzzG2 {
 /// A base vector, repacked and resident on the device. Built once per key in
 /// `prepare`; the whole point of the `Backend` contract's stage grouping is that this
 /// never happens per proof.
+///
+/// `inf` remembers which bases are the point at infinity. A zkey is full of them: the B
+/// queries of the csp keys are 61% infinity, because a wire that appears in no B
+/// constraint still owns a slot. An infinity base contributes nothing whatever its
+/// scalar, so the ones gather (see [`Outputs::alloc`]) drops those indices on the host
+/// instead of paying a device load and a dead branch per point per proof.
 pub struct G1Bases {
     buf: Buffer,
     len: usize,
+    inf: Vec<bool>,
 }
 
 pub struct G2Bases {
     buf: Buffer,
     len: usize,
+    inf: Vec<bool>,
 }
 
 impl G1Bases {
@@ -360,6 +368,11 @@ pub struct ScalarBuf {
     buf: Buffer,
     len: usize,
     general_prefix: Option<Vec<u32>>,
+    /// Ascending indices of the scalars that are exactly 1, from the same
+    /// classification pass. Host-only: what reaches the device is the per-job gather
+    /// list [`Outputs::alloc`] filters from it, since which of these indices matter
+    /// also depends on the job's bases. `None` when the buffer was never classified.
+    ones_idx: Option<Vec<u32>>,
 }
 
 impl ScalarBuf {
@@ -452,6 +465,8 @@ struct Pipelines {
     reduce_g2: ComputePipelineState,
     ones_g1: ComputePipelineState,
     ones_g2: ComputePipelineState,
+    ones_idx_g1: ComputePipelineState,
+    ones_idx_g2: ComputePipelineState,
 }
 
 /// Scratch buffers, kept between calls.
@@ -562,6 +577,8 @@ impl MetalMsm {
             reduce_g2: pso("msm_reduce_g2")?,
             ones_g1: pso("msm_ones_g1")?,
             ones_g2: pso("msm_ones_g2")?,
+            ones_idx_g1: pso("msm_ones_idx_g1")?,
+            ones_idx_g2: pso("msm_ones_idx_g2")?,
         };
 
         let queue = device.new_command_queue();
@@ -603,6 +620,7 @@ impl MetalMsm {
         G1Bases {
             buf: self.shared_buffer(&packed),
             len: bases.len(),
+            inf: bases.iter().map(|b| b.infinity).collect(),
         }
     }
 
@@ -611,6 +629,7 @@ impl MetalMsm {
         G2Bases {
             buf: self.shared_buffer(&packed),
             len: bases.len(),
+            inf: bases.iter().map(|b| b.infinity).collect(),
         }
     }
 
@@ -635,41 +654,49 @@ impl MetalMsm {
             .device
             .new_buffer(bytes, MTLResourceOptions::StorageModeShared);
         let mut prefix = vec![0u32; n + 1];
+        let mut ones_idx = Vec::new();
         if n > 0 {
             // SAFETY: the buffer was just allocated with room for `n` packed scalars
             // and nothing has been encoded against it, so no dispatch can be reading it.
             let slots: &mut [PackedScalar] =
                 unsafe { core::slice::from_raw_parts_mut(buf.contents().cast(), n) };
-            let totals: Vec<u32> = slots
+            let parts: Vec<(u32, Vec<u32>)> = slots
                 .par_chunks_mut(CHUNK)
                 .zip_eq(scalars.par_chunks(CHUNK))
                 .zip_eq(prefix[1..].par_chunks_mut(CHUNK))
-                .map(|((dst, src), pre)| {
+                .enumerate()
+                .map(|(ci, ((dst, src), pre))| {
                     let mut general = 0u32;
-                    for ((d, s), p) in dst.iter_mut().zip(src).zip(pre.iter_mut()) {
-                        if !(s.is_zero() || s.is_one()) {
+                    let mut ones = Vec::new();
+                    for (i, ((d, s), p)) in dst.iter_mut().zip(src).zip(pre.iter_mut()).enumerate()
+                    {
+                        if s.is_one() {
+                            ones.push((ci * CHUNK + i) as u32);
+                        } else if !s.is_zero() {
                             general += 1;
                         }
                         *p = general;
                         *d = PackedScalar::from_fr(s);
                     }
-                    general
+                    (general, ones)
                 })
                 .collect();
             let mut off = 0u32;
-            for (chunk, total) in prefix[1..].chunks_mut(CHUNK).zip(&totals) {
+            for (chunk, (total, ones)) in prefix[1..].chunks_mut(CHUNK).zip(&parts) {
                 if off > 0 {
                     for p in chunk {
                         *p += off;
                     }
                 }
                 off += total;
+                ones_idx.extend_from_slice(ones);
             }
         }
         ScalarBuf {
             buf,
             len: n,
             general_prefix: Some(prefix),
+            ones_idx: Some(ones_idx),
         }
     }
 
@@ -704,6 +731,7 @@ impl MetalMsm {
             buf: out,
             len,
             general_prefix: None,
+            ones_idx: None,
         })
     }
 
@@ -729,6 +757,7 @@ impl MetalMsm {
             buf: std.clone(),
             len,
             general_prefix: None,
+            ones_idx: None,
         }
     }
 
@@ -1106,6 +1135,11 @@ struct Outputs {
     window_sums: Buffer,
     ones: Buffer,
     ones_groups: usize,
+    /// Base indices of the live one-scalar contributions, when the host classified the
+    /// scalars: `msm_ones_idx_*` gathers exactly these. `None` falls back to the
+    /// `msm_ones_*` scan over all `n` scalars, which is the only option for a
+    /// device-resident buffer.
+    ones_idx: Option<(Buffer, usize)>,
     base_off: usize,
     is_g2: bool,
 }
@@ -1132,11 +1166,57 @@ fn ones_groups_for(n: usize) -> usize {
 
 impl Outputs {
     fn alloc(pool: &Pool, keep: &mut Vec<Buffer>, job: &Job<'_>, plan: &Plan<'_>) -> Self {
-        let (is_g2, base_off, point_bytes) = match job {
-            Job::G1(j) => (false, j.base_off, core::mem::size_of::<PackedXyzzG1>()),
-            Job::G2(j) => (true, j.base_off, core::mem::size_of::<PackedXyzzG2>()),
+        let (is_g2, base_off, point_bytes, scalar_off, sbuf, inf) = match job {
+            Job::G1(j) => (
+                false,
+                j.base_off,
+                core::mem::size_of::<PackedXyzzG1>(),
+                j.scalar_off,
+                j.scalars,
+                &j.bases.inf,
+            ),
+            Job::G2(j) => (
+                true,
+                j.base_off,
+                core::mem::size_of::<PackedXyzzG2>(),
+                j.scalar_off,
+                j.scalars,
+                &j.bases.inf,
+            ),
         };
-        let ones_groups = ones_groups_for(plan.n);
+
+        // A classified scalar buffer turns the ones scan into a gather. The buffer's
+        // one-indices are sorted, so the job's range is a subrange; mapping each index
+        // to its base and dropping the bases at infinity happens here, once per proof,
+        // because it is exactly what the kernel would otherwise discover point by
+        // point. On the csp B queries, 61% of the bases are infinity, and this is
+        // where their scalars stop costing anything.
+        let ones_idx = sbuf.ones_idx.as_ref().map(|idx| {
+            let lo = idx.partition_point(|&e| (e as usize) < scalar_off);
+            let hi = idx.partition_point(|&e| (e as usize) < scalar_off + plan.n);
+            let gather: Vec<u32> = idx[lo..hi]
+                .iter()
+                .map(|&e| (base_off + (e as usize - scalar_off)) as u32)
+                .filter(|&b| !inf[b as usize])
+                .collect();
+            let buf = pool.take(gather.len() * 4);
+            if !gather.is_empty() {
+                // SAFETY: the pooled buffer holds at least `gather.len()` u32s and the
+                // batch that could read it has not been committed yet.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        gather.as_ptr(),
+                        buf.contents().cast::<u32>(),
+                        gather.len(),
+                    );
+                }
+            }
+            (buf, gather.len())
+        });
+        let ones_groups = match &ones_idx {
+            Some((_, count)) => ones_groups_for(*count),
+            None => ones_groups_for(plan.n),
+        };
         let buckets = pool.take(plan.n_windows * plan.n_buckets * point_bytes);
         // Two spill slots per slice: at most one run of a slice continues backwards and
         // at most one continues forwards.
@@ -1150,6 +1230,9 @@ impl Outputs {
         keep.push(spill_rows.clone());
         keep.push(window_sums.clone());
         keep.push(ones.clone());
+        if let Some((buf, _)) = &ones_idx {
+            keep.push(buf.clone());
+        }
         Self {
             buckets,
             spill_pts,
@@ -1157,6 +1240,7 @@ impl Outputs {
             window_sums,
             ones,
             ones_groups,
+            ones_idx,
             base_off,
             is_g2,
         }
@@ -1309,8 +1393,10 @@ impl Outputs {
         );
     }
 
-    /// The scalar-of-1 half: one `msm_ones_*` dispatch. Independent of the digit
-    /// pipeline and of every bucket stage; it reads only the scalars and the bases.
+    /// The scalar-of-1 half: one dispatch. Independent of the digit pipeline and of
+    /// every bucket stage. With a gather list it is `msm_ones_idx_*` over exactly the
+    /// live contributions; without one it is the `msm_ones_*` scan over all `n`
+    /// scalars.
     fn encode_ones(
         &self,
         msm: &MetalMsm,
@@ -1318,7 +1404,27 @@ impl Outputs {
         job: &Job<'_>,
         plan: &Plan<'_>,
     ) {
-        let p = self.params_for(plan);
+        let mut p = self.params_for(plan);
+        if let Some((idx, count)) = &self.ones_idx {
+            let (pso, bases) = match job {
+                Job::G1(j) => (&msm.pipelines.ones_idx_g1, &j.bases.buf),
+                Job::G2(j) => (&msm.pipelines.ones_idx_g2, &j.bases.buf),
+            };
+            // The gather kernel reads its length from `n`; the plan's other counts do
+            // not apply to it.
+            p.n = *count as u32;
+            enc.set_compute_pipeline_state(pso);
+            enc.set_buffer(0, Some(idx), 0);
+            enc.set_buffer(1, Some(bases), 0);
+            enc.set_buffer(2, Some(&self.ones), 0);
+            set_params(enc, 3, &p);
+            let tg = REDUCE_TG.min(pso.max_total_threads_per_threadgroup() as usize);
+            enc.dispatch_thread_groups(
+                MTLSize::new(self.ones_groups as u64, 1, 1),
+                MTLSize::new(tg as u64, 1, 1),
+            );
+            return;
+        }
         let (ones_pso, bases) = match job {
             Job::G1(j) => (&msm.pipelines.ones_g1, &j.bases.buf),
             Job::G2(j) => (&msm.pipelines.ones_g2, &j.bases.buf),

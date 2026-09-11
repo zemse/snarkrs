@@ -1286,4 +1286,59 @@ kernel void msm_ones_g2(device const uint* scalars [[buffer(0)]],
     msm_ones_impl<Fq2>(scalars, bases, out, p, shared, g, tid, tcount);
 }
 
+// The gather form of the ones path, used when the host classified the scalars: `idx`
+// holds the base index of every live one-scalar contribution, with the bases at
+// infinity already dropped, and `p.n` is its length. The scan form above pays a
+// 32-byte scalar load and a dead branch for every zero and every infinity base; here
+// every iteration is a real mixed addition, so the dependent per-thread chain is as
+// short as the work allows.
+template <typename F>
+inline void msm_ones_idx_impl(device const uint* idx,
+                              device const Aff<F>* bases,
+                              device Xyzz<F>* out,
+                              constant MsmParams& p,
+                              threadgroup Xyzz<F>* shared,
+                              uint g,
+                              uint tid,
+                              uint tcount) {
+    uint stride = p.ones_groups * tcount;
+    Xyzz<F> acc = pt_zero<F>();
+    for (uint i = g * tcount + tid; i < p.n; i += stride) {
+        acc = pt_madd(acc, bases[idx[i]]);
+    }
+    shared[tid] = acc;
+    for (uint s = 1; s < tcount; s <<= 1) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if ((tid & ((s << 1) - 1u)) == 0u && tid + s < tcount) {
+            shared[tid] = pt_add(shared[tid], shared[tid + s]);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+        out[g] = shared[0];
+    }
+}
+
+kernel void msm_ones_idx_g1(device const uint* idx [[buffer(0)]],
+                            device const AffG1* bases [[buffer(1)]],
+                            device PtG1* out [[buffer(2)]],
+                            constant MsmParams& p [[buffer(3)]],
+                            uint g [[threadgroup_position_in_grid]],
+                            uint tid [[thread_position_in_threadgroup]],
+                            uint tcount [[threads_per_threadgroup]]) {
+    threadgroup PtG1 shared[REDUCE_TG];
+    msm_ones_idx_impl<Fq>(idx, bases, out, p, shared, g, tid, tcount);
+}
+
+kernel void msm_ones_idx_g2(device const uint* idx [[buffer(0)]],
+                            device const AffG2* bases [[buffer(1)]],
+                            device PtG2* out [[buffer(2)]],
+                            constant MsmParams& p [[buffer(3)]],
+                            uint g [[threadgroup_position_in_grid]],
+                            uint tid [[thread_position_in_threadgroup]],
+                            uint tcount [[threads_per_threadgroup]]) {
+    threadgroup PtG2 shared[REDUCE_TG];
+    msm_ones_idx_impl<Fq2>(idx, bases, out, p, shared, g, tid, tcount);
+}
+
 #endif // G16_MSM_METAL
