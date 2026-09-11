@@ -77,18 +77,42 @@ kernel void g16_gather_abc(
         return;
     }
 
+    // Most witness values on the profiled circuits are bits: an audit of sha256_128
+    // found only 27,776 of matrix A's 2,102,656 SIMD loop slots touch a witness value
+    // that is neither 0 nor 1 (17,472 of 781,600 for B). Skipping the multiply for the
+    // trivial ones is the same trade the CPU gather makes, but here it only pays
+    // because the branch is coherent: neighbouring rows reference the same kind of
+    // signal, so whole SIMD groups skip together and the multiply issues on about 1% of
+    // group iterations. Exact either way: adding zero and multiplying by one are both
+    // bit-identical to the slow path.
     Fr a = fr_zero();
     uint lo = row_ptr_a[gid];
     uint hi = row_ptr_a[gid + 1u];
     for (uint k = lo; k < hi; k++) {
-        a = fr_add(a, fr_mul(value_a[k], witness[signal_a[k]]));
+        Fr w = witness[signal_a[k]];
+        if (fr_is_zero(w)) {
+            continue;
+        }
+        if (fr_eq(w, fr_one())) {
+            a = fr_add(a, value_a[k]);
+        } else {
+            a = fr_add(a, fr_mul(value_a[k], w));
+        }
     }
 
     Fr b = fr_zero();
     lo = row_ptr_b[gid];
     hi = row_ptr_b[gid + 1u];
     for (uint k = lo; k < hi; k++) {
-        b = fr_add(b, fr_mul(value_b[k], witness[signal_b[k]]));
+        Fr w = witness[signal_b[k]];
+        if (fr_is_zero(w)) {
+            continue;
+        }
+        if (fr_eq(w, fr_one())) {
+            b = fr_add(b, value_b[k]);
+        } else {
+            b = fr_add(b, fr_mul(value_b[k], w));
+        }
     }
 
     out_a[gid] = a;
