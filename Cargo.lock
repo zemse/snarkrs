@@ -785,6 +785,7 @@ dependencies = [
  "ark-serialize",
  "blake2",
  "byteorder",
+ "g16-cuda",
  "g16-field",
  "g16-metal",
  "g16-msm",

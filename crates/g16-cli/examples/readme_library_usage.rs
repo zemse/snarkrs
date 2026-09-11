@@ -17,7 +17,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let w = Witness::load(std::path::Path::new("circuit.wtns"))?.0;
     let mut t = StageTimings::default();
-    let proof = prove(circuit.as_ref(), &w, &mut ark_std::rand::thread_rng(), &mut t)?;
+    let proof = prove(
+        circuit.as_ref(),
+        &w,
+        &mut ark_std::rand::thread_rng(),
+        &mut t,
+    )?;
 
     // The public signals are the witness prefix, which is what snarkjs publishes.
     let public = &w[1..=n_public];

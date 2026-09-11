@@ -348,7 +348,7 @@ fn fft_backend(kind: BackendKind) -> Result<Box<dyn GroupFft>> {
         BackendKind::Cpu => Ok(Box::new(CpuGroupFft)),
         BackendKind::Wgpu => Err(no_wgpu()),
         BackendKind::Metal => metal_fft(),
-        BackendKind::Cuda => Err(no_cuda()),
+        BackendKind::Cuda => cuda_fft(),
     }
 }
 
@@ -400,6 +400,18 @@ fn metal_key() -> Result<Box<dyn KeyScale>> {
 
 /// The feature is off, or it is on and the target is not macOS. Two different fixes, so
 /// two different messages, as in `make_backend`.
+#[cfg(feature = "cuda")]
+fn cuda_fft() -> Result<Box<dyn GroupFft>> {
+    Ok(Box::new(g16_cuda::CudaGroupFft::new().map_err(|e| {
+        anyhow::anyhow!("backend `cuda` is unavailable: {e}")
+    })?))
+}
+
+#[cfg(not(feature = "cuda"))]
+fn cuda_fft() -> Result<Box<dyn GroupFft>> {
+    Err(no_cuda())
+}
+
 #[cfg(not(all(feature = "metal", target_os = "macos")))]
 fn no_metal() -> anyhow::Error {
     if cfg!(feature = "metal") {
@@ -415,14 +427,16 @@ fn no_metal() -> anyhow::Error {
     }
 }
 
-/// CUDA has kernels for the prover and none for the ceremony. Saying "not built in" when
-/// the feature *is* on would send someone to rebuild a binary that already has everything
-/// it is going to get.
+/// CUDA has kernels for the prover and for `ptau prepare`'s group FFT, and none for the
+/// two ceremony seams this message now covers. Saying "not built in" when the feature
+/// *is* on would send someone to rebuild a binary that already has everything it is
+/// going to get.
 fn no_cuda() -> anyhow::Error {
     if cfg!(feature = "cuda") {
         anyhow::anyhow!(
-            "backend `cuda` is unavailable for the ceremony: g16-cuda implements the prover, \
-             not the ceremony seams, so there is nothing to select yet"
+            "backend `cuda` is unavailable for this ceremony command: g16-cuda implements \
+             the prover and the `ptau prepare` group FFT; the ceremony MSM and apply-key \
+             have no CUDA kernels yet"
         )
     } else {
         anyhow::anyhow!(

@@ -31,6 +31,11 @@ memmap2.workspace = true
 # g16-metal dev-depends on this crate for the same reason; a dev-dependency in both
 # directions is not a cycle, because neither library depends on the other.
 g16-metal.workspace = true
+# The CUDA GroupFft, for tests/prepare_cuda.rs. `features = ["cuda"]` because the crate
+# compiles to an empty shell without it; cudarc's dynamic-loading keeps this buildable
+# on machines with no CUDA installed, so unlike the backend crates it need not be
+# optional here.
+g16-cuda = { workspace = true, features = ["cuda"] }
 
 [features]
 default = []
@@ -38,3 +43,5 @@ default = []
 # need a Metal device, and a machine without one would report a failure where it should
 # report nothing.
 metal = []
+# Same for the cpu-against-cuda comparisons; these skip loudly with no NVIDIA device.
+cuda = []
