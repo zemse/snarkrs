@@ -897,10 +897,7 @@ impl MetalMsm {
                     &mut |enc| out.encode_buckets(self, enc, job, p),
                 )?;
                 run(
-                    format!(
-                        "ones    job{i} {kind} n={} groups={}",
-                        p.n, out.ones_groups
-                    ),
+                    format!("ones    job{i} {kind} n={} groups={}", p.n, out.ones_groups),
                     &mut |enc| out.encode_ones(self, enc, job, p),
                 )?;
             }
@@ -1085,7 +1082,11 @@ impl<'a> Plan<'a> {
     fn encode_zero(&self, msm: &MetalMsm, enc: &ComputeCommandEncoderRef) {
         let rows = self.n_windows * self.n_buckets;
         enc.set_compute_pipeline_state(&msm.pipelines.zero_u32);
-        enc.set_buffer(0, Some(self.counts.as_ref().expect("plan not allocated")), 0);
+        enc.set_buffer(
+            0,
+            Some(self.counts.as_ref().expect("plan not allocated")),
+            0,
+        );
         let len = rows as u32;
         enc.set_bytes(1, 4, (&len as *const u32).cast());
         dispatch_1d(enc, &msm.pipelines.zero_u32, rows, 256);
@@ -1095,7 +1096,11 @@ impl<'a> Plan<'a> {
         let p = self.params();
         enc.set_compute_pipeline_state(&msm.pipelines.count);
         enc.set_buffer(0, Some(self.scalars), 0);
-        enc.set_buffer(1, Some(self.counts.as_ref().expect("plan not allocated")), 0);
+        enc.set_buffer(
+            1,
+            Some(self.counts.as_ref().expect("plan not allocated")),
+            0,
+        );
         set_params(enc, 2, &p);
         dispatch_1d(enc, &msm.pipelines.count, self.n, 64);
     }
@@ -1103,8 +1108,16 @@ impl<'a> Plan<'a> {
     fn encode_scan(&self, msm: &MetalMsm, enc: &ComputeCommandEncoderRef) {
         let p = self.params();
         enc.set_compute_pipeline_state(&msm.pipelines.scan);
-        enc.set_buffer(0, Some(self.counts.as_ref().expect("plan not allocated")), 0);
-        enc.set_buffer(1, Some(self.cursor.as_ref().expect("plan not allocated")), 0);
+        enc.set_buffer(
+            0,
+            Some(self.counts.as_ref().expect("plan not allocated")),
+            0,
+        );
+        enc.set_buffer(
+            1,
+            Some(self.cursor.as_ref().expect("plan not allocated")),
+            0,
+        );
         set_params(enc, 2, &p);
         let scan_tg = SCAN_TG.min(msm.pipelines.scan.max_total_threads_per_threadgroup() as usize);
         enc.dispatch_thread_groups(
@@ -1117,8 +1130,16 @@ impl<'a> Plan<'a> {
         let p = self.params();
         enc.set_compute_pipeline_state(&msm.pipelines.scatter);
         enc.set_buffer(0, Some(self.scalars), 0);
-        enc.set_buffer(1, Some(self.cursor.as_ref().expect("plan not allocated")), 0);
-        enc.set_buffer(2, Some(self.entries.as_ref().expect("plan not allocated")), 0);
+        enc.set_buffer(
+            1,
+            Some(self.cursor.as_ref().expect("plan not allocated")),
+            0,
+        );
+        enc.set_buffer(
+            2,
+            Some(self.entries.as_ref().expect("plan not allocated")),
+            0,
+        );
         set_params(enc, 3, &p);
         dispatch_1d(enc, &msm.pipelines.scatter, self.n, 64);
     }
