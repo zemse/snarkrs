@@ -757,6 +757,7 @@ struct MsmParams {
     uint ones_groups; // threadgroups in msm_ones_*
     uint slice_len;   // entries per thread in the segmented accumulation
     uint slices;      // ceil(cap / slice_len), threads per window there
+    uint reduce_groups; // threadgroups per window in msm_reduce_*
 };
 
 // ---------------------------------------------------------------------------
@@ -1160,9 +1161,15 @@ kernel void msm_merge_g2(device PtG2* buckets [[buffer(0)]],
 // The window sum is sum_j (j+1) B_j. Split the buckets into one segment per thread, at
 // [lo, hi). Inside a segment the reverse running sum gives
 // P = sum_j (j - lo + 1) B_j and Q = sum_j B_j in two additions per bucket, and the
-// segment contributes P + lo * Q. The per-thread results are then tree-reduced in
-// threadgroup memory, so the host reads back one point per window and does nothing but
-// the Horner combination.
+// segment contributes P + lo * Q, with `lo` the window-global bucket index, so the
+// identity holds no matter how the segments are carved up.
+//
+// That freedom is what `reduce_groups` uses. One threadgroup per window is 20
+// threadgroups at c=13, on a device with more cores than that, and it measured 3.96 ms
+// flat in n: pure latency, not work. Each window is therefore split across
+// `reduce_groups` threadgroups, each owning a contiguous chunk of its buckets and
+// writing one partial to `window_sums[w * reduce_groups + g]`; the host adds the
+// partials per window before its Horner combination, a few dozen cheap additions.
 //
 // REDUCE_TG is the threadgroup array size. 64 rather than 128 is a deliberate occupancy
 // choice: at 64 the G2 array is 64 * 256 = 16 KB, half of this device's 32 KB
@@ -1175,12 +1182,17 @@ inline void msm_reduce_impl(device const Xyzz<F>* buckets,
                             device Xyzz<F>* window_sums,
                             constant MsmParams& p,
                             threadgroup Xyzz<F>* shared,
-                            uint w,
+                            uint tg,
                             uint tid,
                             uint tcount) {
-    uint seg_len = (p.n_buckets + tcount - 1u) / tcount;
-    uint lo = tid * seg_len;
-    uint hi = min(lo + seg_len, p.n_buckets);
+    uint w = tg / p.reduce_groups;
+    uint g = tg - w * p.reduce_groups;
+    uint chunk = (p.n_buckets + p.reduce_groups - 1u) / p.reduce_groups;
+    uint tg_lo = g * chunk;
+    uint tg_hi = min(tg_lo + chunk, p.n_buckets);
+    uint seg_len = (chunk + tcount - 1u) / tcount;
+    uint lo = tg_lo + tid * seg_len;
+    uint hi = min(lo + seg_len, tg_hi);
 
     Xyzz<F> mine = pt_zero<F>();
     if (lo < hi) {
@@ -1202,28 +1214,28 @@ inline void msm_reduce_impl(device const Xyzz<F>* buckets,
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0u) {
-        window_sums[w] = shared[0];
+        window_sums[tg] = shared[0];
     }
 }
 
 kernel void msm_reduce_g1(device const PtG1* buckets [[buffer(0)]],
                           device PtG1* window_sums [[buffer(1)]],
                           constant MsmParams& p [[buffer(2)]],
-                          uint w [[threadgroup_position_in_grid]],
+                          uint tg [[threadgroup_position_in_grid]],
                           uint tid [[thread_position_in_threadgroup]],
                           uint tcount [[threads_per_threadgroup]]) {
     threadgroup PtG1 shared[REDUCE_TG];
-    msm_reduce_impl<Fq>(buckets, window_sums, p, shared, w, tid, tcount);
+    msm_reduce_impl<Fq>(buckets, window_sums, p, shared, tg, tid, tcount);
 }
 
 kernel void msm_reduce_g2(device const PtG2* buckets [[buffer(0)]],
                           device PtG2* window_sums [[buffer(1)]],
                           constant MsmParams& p [[buffer(2)]],
-                          uint w [[threadgroup_position_in_grid]],
+                          uint tg [[threadgroup_position_in_grid]],
                           uint tid [[thread_position_in_threadgroup]],
                           uint tcount [[threads_per_threadgroup]]) {
     threadgroup PtG2 shared[REDUCE_TG];
-    msm_reduce_impl<Fq2>(buckets, window_sums, p, shared, w, tid, tcount);
+    msm_reduce_impl<Fq2>(buckets, window_sums, p, shared, tg, tid, tcount);
 }
 
 // The scalar-of-1 path: sum the bases whose scalar is exactly 1, one mixed addition

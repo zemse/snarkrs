@@ -146,6 +146,39 @@ fn slice_len_for(n_windows: usize, cap: usize) -> usize {
     l
 }
 
+/// Threadgroups per window in the reduce, chosen the same way [`slice_len_for`] chooses
+/// its slice length: by occupancy, not by work.
+///
+/// One threadgroup per window was fine at c=8, where 32 windows of 128 buckets keep the
+/// segments short. At c=13 it is 20 threadgroups of [`REDUCE_TG`] threads on a device
+/// with more cores than threadgroups, each thread a dependent chain of 128 full
+/// additions, and it measured 3.96 ms *flat between 2^16 and 2^17*: cost that does not
+/// scale with the input is latency, not work. Splitting each window across groups costs
+/// one `pt_mul_small` per thread (the segment identity already carries the window-global
+/// bucket offset) plus `reduce_groups - 1` host-side additions per window, both noise.
+/// Groups double until the dispatch reaches [`REDUCE_TARGET_THREADS`], floored so every
+/// thread keeps at least [`REDUCE_TG`] buckets per group. The target is higher than the
+/// accumulation's because a reduce thread pays a fixed `pt_mul_small` on top of its
+/// segment, so past the sweet spot more threads mean more of that tax: at c=13 on the
+/// csp artifacts the sweep read 2.52 ms at 4 groups, 2.06 at 8, 2.48 at 16, 3.68 at 32.
+/// Override with `G16_METAL_MSM_RG` to sweep it.
+const REDUCE_TARGET_THREADS: usize = 8192;
+
+fn reduce_groups_for(n_windows: usize, n_buckets: usize) -> usize {
+    let forced = std::env::var("G16_METAL_MSM_RG")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0);
+    if let Some(g) = forced {
+        return g.min(n_buckets.max(1));
+    }
+    let mut g = 1;
+    while n_buckets / (2 * g) >= REDUCE_TG && n_windows * g * REDUCE_TG < REDUCE_TARGET_THREADS {
+        g *= 2;
+    }
+    g
+}
+
 /// `G16_METAL_MSM_LEGACY_ACC=1` swaps the segmented accumulation for the simple
 /// one-thread-per-bucket kernel. Kept only so the load-imbalance claim in
 /// `shaders/msm.metal` can be reproduced rather than taken on trust.
@@ -246,6 +279,7 @@ struct MsmParams {
     ones_groups: u32,
     slice_len: u32,
     slices: u32,
+    reduce_groups: u32,
 }
 
 /// A G1 point in extended Jacobian coordinates, as the kernels write it: 128 bytes,
@@ -270,7 +304,7 @@ pub struct PackedXyzzG2 {
 }
 
 const _: () = {
-    assert!(core::mem::size_of::<MsmParams>() == 40);
+    assert!(core::mem::size_of::<MsmParams>() == 44);
     assert!(core::mem::size_of::<PackedXyzzG1>() == 128);
     assert!(core::mem::size_of::<PackedXyzzG2>() == 256);
 };
@@ -889,13 +923,35 @@ impl MetalMsm {
                     &mut |enc| p.encode(self, enc),
                 )?;
             }
+            // `G16_METAL_MSM_PHASES=2` goes one level finer and times the four bucket
+            // stages one command buffer each. Same caveat, four more submission floors.
+            let fine = std::env::var("G16_METAL_MSM_PHASES").as_deref() == Ok("2");
             for (i, (job, out)) in jobs.iter().zip(&outs).enumerate() {
                 let p = &plans[job_plan[i]];
                 let kind = if out.is_g2 { "g2" } else { "g1" };
-                run(
-                    format!("buckets job{i} {kind} n={} cap={} c={}", p.n, p.cap, p.c),
-                    &mut |enc| out.encode_buckets(self, enc, job, p),
-                )?;
+                if fine {
+                    run(
+                        format!("clear   job{i} {kind} rows={}", p.n_windows * p.n_buckets),
+                        &mut |enc| out.encode_clear(self, enc, job, p),
+                    )?;
+                    run(
+                        format!("accum   job{i} {kind} slices={}", p.n_windows * p.slices),
+                        &mut |enc| out.encode_accumulate(self, enc, job, p),
+                    )?;
+                    run(
+                        format!("merge   job{i} {kind} rows={}", p.n_windows * p.n_buckets),
+                        &mut |enc| out.encode_merge(self, enc, job, p),
+                    )?;
+                    run(
+                        format!("reduce  job{i} {kind} w={}", p.n_windows),
+                        &mut |enc| out.encode_reduce(self, enc, job, p),
+                    )?;
+                } else {
+                    run(
+                        format!("buckets job{i} {kind} n={} cap={} c={}", p.n, p.cap, p.c),
+                        &mut |enc| out.encode_buckets(self, enc, job, p),
+                    )?;
+                }
                 run(
                     format!("ones    job{i} {kind} n={} groups={}", p.n, out.ones_groups),
                     &mut |enc| out.encode_ones(self, enc, job, p),
@@ -1005,6 +1061,7 @@ struct Plan<'a> {
     cap: usize,
     slice_len: usize,
     slices: usize,
+    reduce_groups: usize,
     scalars: &'a Buffer,
     counts: Option<Buffer>,
     cursor: Option<Buffer>,
@@ -1032,6 +1089,7 @@ impl<'a> Plan<'a> {
             cap,
             slice_len,
             slices: cap.div_ceil(slice_len).max(1),
+            reduce_groups: reduce_groups_for(n_windows, n_buckets),
             scalars: &scalars.buf,
             counts: None,
             cursor: None,
@@ -1051,6 +1109,7 @@ impl<'a> Plan<'a> {
             ones_groups: 0,
             slice_len: self.slice_len as u32,
             slices: self.slices as u32,
+            reduce_groups: self.reduce_groups as u32,
         }
     }
 
@@ -1244,7 +1303,7 @@ impl Outputs {
         let spill_slots = 2 * plan.n_windows * plan.slices;
         let spill_pts = pool.take(spill_slots * point_bytes);
         let spill_rows = pool.take(spill_slots * 4);
-        let window_sums = pool.take(plan.n_windows * point_bytes);
+        let window_sums = pool.take(plan.n_windows * plan.reduce_groups * point_bytes);
         let ones = pool.take(ones_groups * point_bytes);
         keep.push(buckets.clone());
         keep.push(spill_pts.clone());
@@ -1409,7 +1468,7 @@ impl Outputs {
         set_params(enc, 2, &p);
         let tg = REDUCE_TG.min(red_pso.max_total_threads_per_threadgroup() as usize);
         enc.dispatch_thread_groups(
-            MTLSize::new(plan.n_windows as u64, 1, 1),
+            MTLSize::new((plan.n_windows * plan.reduce_groups) as u64, 1, 1),
             MTLSize::new(tg as u64, 1, 1),
         );
     }
@@ -1463,32 +1522,48 @@ impl Outputs {
     }
 
     fn combine(&self, plan: &Plan<'_>) -> MsmResult {
+        let rg = plan.reduce_groups;
         if self.is_g2 {
-            let w: &[PackedXyzzG2] = unsafe { read_back(&self.window_sums, plan.n_windows) };
+            let w: &[PackedXyzzG2] = unsafe { read_back(&self.window_sums, plan.n_windows * rg) };
             let o: &[PackedXyzzG2] = unsafe { read_back(&self.ones, self.ones_groups) };
-            let mut acc = w[plan.n_windows - 1].to_projective();
+            // Each window's `reduce_groups` partials fold first, then the Horner.
+            let sum_w = |k: usize| {
+                let mut s = w[k * rg].to_projective();
+                for x in &w[k * rg + 1..(k + 1) * rg] {
+                    s += x.to_projective();
+                }
+                s
+            };
+            let mut acc = sum_w(plan.n_windows - 1);
             for k in (0..plan.n_windows - 1).rev() {
                 for _ in 0..plan.c {
                     acc.double_in_place();
                 }
-                acc += w[k].to_projective();
+                acc += sum_w(k);
             }
             for x in o {
                 acc += x.to_projective();
             }
             MsmResult::G2(acc)
         } else {
-            let w: &[PackedXyzzG1] = unsafe { read_back(&self.window_sums, plan.n_windows) };
+            let w: &[PackedXyzzG1] = unsafe { read_back(&self.window_sums, plan.n_windows * rg) };
             let o: &[PackedXyzzG1] = unsafe { read_back(&self.ones, self.ones_groups) };
-            // Horner over the windows, high to low, `c` doublings between each. Same
-            // order as the CPU backend, so the two agree bit for bit and not just up to
-            // the group law.
-            let mut acc = w[plan.n_windows - 1].to_projective();
+            // Horner over the windows, high to low, `c` doublings between each, each
+            // window's `reduce_groups` partials folded first. Same order as the CPU
+            // backend, so the two agree in the group and the audit can compare affine.
+            let sum_w = |k: usize| {
+                let mut s = w[k * rg].to_projective();
+                for x in &w[k * rg + 1..(k + 1) * rg] {
+                    s += x.to_projective();
+                }
+                s
+            };
+            let mut acc = sum_w(plan.n_windows - 1);
             for k in (0..plan.n_windows - 1).rev() {
                 for _ in 0..plan.c {
                     acc.double_in_place();
                 }
-                acc += w[k].to_projective();
+                acc += sum_w(k);
             }
             for x in o {
                 acc += x.to_projective();
