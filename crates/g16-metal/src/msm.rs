@@ -100,6 +100,10 @@ const REDUCE_TG: usize = 64;
 /// Threadgroup array size of the prefix-sum kernel. Same contract as [`REDUCE_TG`].
 const SCAN_TG: usize = 256;
 
+/// The spill slot sentinel. Must equal `MSM_NO_ROW` in `msm.metal`: a slot holding it
+/// spilled nothing, and the host-tail combine skips it the way `msm_merge_*` does.
+const MSM_NO_ROW: u32 = u32::MAX;
+
 /// Entries one thread of the segmented accumulation owns.
 ///
 /// Accumulation costs `SLICE_LEN` mixed additions per thread and the merge costs
@@ -179,13 +183,37 @@ fn reduce_groups_for(n_windows: usize, n_buckets: usize) -> usize {
         return g.min(n_buckets.max(1));
     }
     let mut g = 1;
-    while n_buckets / (2 * g) >= 2 * REDUCE_TG
-        && n_windows * g * REDUCE_TG < REDUCE_TARGET_THREADS
+    while n_buckets / (2 * g) >= 2 * REDUCE_TG && n_windows * g * REDUCE_TG < REDUCE_TARGET_THREADS
     {
         g *= 2;
     }
     g
 }
+
+/// Buckets at or below which a one-window plan skips the GPU merge and reduce and
+/// finishes in [`Outputs::combine`] instead.
+///
+/// A one-window witness plan on the csp keccak circuits has 256 buckets holding a few
+/// hundred entries, and its reduce dispatches `reduce_groups * REDUCE_TG` threads, 128
+/// on a device with 4,864 ALUs, each a dependent chain of point additions capped by a
+/// `pt_mul_small` and a six-level threadgroup tree. That is latency, not work: the G2
+/// reduce measured 2.96 ms against a 0.014 ms arithmetic floor, and sweeping
+/// `G16_METAL_MSM_RG` moved it only to 2.20, because no group count fixes a dispatch
+/// two threadgroups wide. The host does the same 2 * 256 additions plus the spill fold
+/// in well under half a millisecond inside the rayon combine, where the module already
+/// sums the per-threadgroup partials and runs the Horner. 256 is the largest shape
+/// measured; a one-window plan can in principle carry up to 2^15 buckets, and 2 * 2^15
+/// host additions would cost more than the dispatch it replaces.
+///
+/// Measured in production at keccak_128: the witness batch's device time drops from
+/// 8.33 ms to 2.58 on the driver clock, and the warm minima move by -0.3 there, -0.1
+/// at keccak_256 and -0.5 at keccak_512, with sha256 and the whole ladder flat. The
+/// wall win is a tenth of the device win because the removed dispatches were latency,
+/// not throughput: the second queue's arbitration was already filling their idle lanes
+/// with transform and H work, so most of what they cost was borne off the critical
+/// path. What the change buys beyond the milliseconds is headroom: those 5.7 ms stop
+/// competing with the transforms the moment anything else on the device gets faster.
+const HOST_TAIL_MAX_BUCKETS: usize = 256;
 
 /// `G16_METAL_MSM_LEGACY_ACC=1` swaps the segmented accumulation for the simple
 /// one-thread-per-bucket kernel. Kept only so the load-imbalance claim in
@@ -337,6 +365,9 @@ const _: () = {
 
 unsafe impl Packed for PackedXyzzG1 {}
 unsafe impl Packed for PackedXyzzG2 {}
+// A bare `u32` meets the contract trivially: the host-tail combine reads the spill row
+// indices back through the same [`read_back`] the points go through.
+unsafe impl Packed for u32 {}
 
 /// XYZZ to arkworks' Jacobian, with no field inversion.
 ///
@@ -1127,6 +1158,7 @@ struct Plan<'a> {
     slice_len: usize,
     slices: usize,
     reduce_groups: usize,
+    host_tail: bool,
     scalars: &'a Buffer,
     counts: Option<Buffer>,
     cursor: Option<Buffer>,
@@ -1161,6 +1193,7 @@ impl<'a> Plan<'a> {
             slice_len,
             slices: cap.div_ceil(slice_len).max(1),
             reduce_groups: reduce_groups_for(n_windows, n_buckets),
+            host_tail: n_windows == 1 && n_buckets <= HOST_TAIL_MAX_BUCKETS,
             scalars: &scalars.buf,
             counts: None,
             cursor: None,
@@ -1492,7 +1525,7 @@ impl Outputs {
         job: &Job<'_>,
         plan: &Plan<'_>,
     ) {
-        if legacy_accumulate() {
+        if legacy_accumulate() || plan.host_tail {
             return;
         }
         let p = self.params_for(plan);
@@ -1517,6 +1550,9 @@ impl Outputs {
         job: &Job<'_>,
         plan: &Plan<'_>,
     ) {
+        if plan.host_tail {
+            return;
+        }
         let p = self.params_for(plan);
         let red_pso = match job {
             Job::G1(_) => &msm.pipelines.reduce_g1,
@@ -1584,8 +1620,37 @@ impl Outputs {
     fn combine(&self, plan: &Plan<'_>) -> MsmResult {
         let rg = plan.reduce_groups;
         if self.is_g2 {
-            let w: &[PackedXyzzG2] = unsafe { read_back(&self.window_sums, plan.n_windows * rg) };
             let o: &[PackedXyzzG2] = unsafe { read_back(&self.ones, self.ones_groups) };
+            if plan.host_tail {
+                // The GPU stopped after the accumulation; see [`HOST_TAIL_MAX_BUCKETS`].
+                // Fold the spilled runs into the buckets, then the reverse running sum
+                // gives sum_j (j+1) B_j, the whole window in a one-window plan.
+                let b: &[PackedXyzzG2] = unsafe { read_back(&self.buckets, plan.n_buckets) };
+                let mut buckets: Vec<G2Projective> = b.iter().map(|x| x.to_projective()).collect();
+                if !legacy_accumulate() {
+                    let slots = 2 * plan.slices;
+                    let rows: &[u32] = unsafe { read_back(&self.spill_rows, slots) };
+                    let pts: &[PackedXyzzG2] = unsafe { read_back(&self.spill_pts, slots) };
+                    for (r, pt) in rows.iter().zip(pts) {
+                        if *r != MSM_NO_ROW {
+                            buckets[*r as usize] += pt.to_projective();
+                        }
+                    }
+                }
+                let mut run = G2Projective::zero();
+                let mut acc = G2Projective::zero();
+                for b in buckets.iter().rev() {
+                    run += b;
+                    if !run.is_zero() {
+                        acc += &run;
+                    }
+                }
+                for x in o {
+                    acc += x.to_projective();
+                }
+                return MsmResult::G2(acc);
+            }
+            let w: &[PackedXyzzG2] = unsafe { read_back(&self.window_sums, plan.n_windows * rg) };
             // Each window's `reduce_groups` partials fold first, then the Horner.
             let sum_w = |k: usize| {
                 let mut s = w[k * rg].to_projective();
@@ -1606,8 +1671,35 @@ impl Outputs {
             }
             MsmResult::G2(acc)
         } else {
-            let w: &[PackedXyzzG1] = unsafe { read_back(&self.window_sums, plan.n_windows * rg) };
             let o: &[PackedXyzzG1] = unsafe { read_back(&self.ones, self.ones_groups) };
+            if plan.host_tail {
+                // Same shape as the G2 arm above.
+                let b: &[PackedXyzzG1] = unsafe { read_back(&self.buckets, plan.n_buckets) };
+                let mut buckets: Vec<G1Projective> = b.iter().map(|x| x.to_projective()).collect();
+                if !legacy_accumulate() {
+                    let slots = 2 * plan.slices;
+                    let rows: &[u32] = unsafe { read_back(&self.spill_rows, slots) };
+                    let pts: &[PackedXyzzG1] = unsafe { read_back(&self.spill_pts, slots) };
+                    for (r, pt) in rows.iter().zip(pts) {
+                        if *r != MSM_NO_ROW {
+                            buckets[*r as usize] += pt.to_projective();
+                        }
+                    }
+                }
+                let mut run = G1Projective::zero();
+                let mut acc = G1Projective::zero();
+                for b in buckets.iter().rev() {
+                    run += b;
+                    if !run.is_zero() {
+                        acc += &run;
+                    }
+                }
+                for x in o {
+                    acc += x.to_projective();
+                }
+                return MsmResult::G1(acc);
+            }
+            let w: &[PackedXyzzG1] = unsafe { read_back(&self.window_sums, plan.n_windows * rg) };
             // Horner over the windows, high to low, `c` doublings between each, each
             // window's `reduce_groups` partials folded first. Same order as the CPU
             // backend, so the two agree in the group and the audit can compare affine.
@@ -1713,6 +1805,19 @@ mod tests {
                  of bounds and the MSM answers are silently wrong."
             );
         }
+    }
+
+    /// The spill sentinel lives in two languages too. If the MSL value moved, the
+    /// host-tail combine would fold garbage slots or drop real ones, silently.
+    #[test]
+    fn msl_declares_the_same_spill_sentinel() {
+        assert!(
+            MSM_MSL.contains("constant uint MSM_NO_ROW = 0xffffffffu;"),
+            "shaders/msm.metal no longer defines MSM_NO_ROW as 0xffffffff; \
+             `Outputs::combine`'s host-tail spill fold tests against the same value \
+             and must be changed with it."
+        );
+        assert_eq!(MSM_NO_ROW, u32::MAX);
     }
 
     /// The drift guard, same shape as `layout::tests::msl_declares_the_same_constants`:
