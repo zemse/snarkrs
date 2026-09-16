@@ -760,6 +760,7 @@ struct MsmParams {
     uint reduce_groups; // threadgroups per window in msm_reduce_*
     uint merge_wide_base; // first row msm_merge_wide_* owns instead of msm_merge_*
     uint merge_wide_rows; // rows it owns; 0 leaves everything to msm_merge_*
+    uint separate_ones; // 1 routes scalar 1 to a gather or scan; 0 recodes it normally
 };
 
 // ---------------------------------------------------------------------------
@@ -798,9 +799,9 @@ kernel void msm_count(device const uint* scalars [[buffer(0)]],
     for (uint i = 0; i < 8u; i++) {
         s[i] = scalars[base + i];
     }
-    // The two cheap classes leave here. A zero has cost one 8-limb read and nothing
-    // else; a one is handled by msm_ones_* in a single mixed addition.
-    if (sc_is_zero(s) || sc_is_one(s)) {
+    // A classified one has its own gather. Unclassified inputs recode it normally:
+    // digit 1 in the low window, zero above, with capacity bounded by p.n.
+    if (sc_is_zero(s) || (p.separate_ones != 0u && sc_is_one(s))) {
         return;
     }
     for (uint w = 0; w < p.n_windows; w++) {
@@ -875,7 +876,7 @@ kernel void msm_scatter(device const uint* scalars [[buffer(0)]],
     for (uint i = 0; i < 8u; i++) {
         s[i] = scalars[base + i];
     }
-    if (sc_is_zero(s) || sc_is_one(s)) {
+    if (sc_is_zero(s) || (p.separate_ones != 0u && sc_is_one(s))) {
         return;
     }
     for (uint w = 0; w < p.n_windows; w++) {
@@ -1373,7 +1374,8 @@ inline void msm_reduce_scan_impl(device const Xyzz<F>* buckets,
                                  uint tid,
                                  uint tcount,
                                  uint lane,
-                                 uint sg) {
+                                 uint sg,
+                                 uint width) {
     uint w = tg / p.reduce_groups;
     uint g = tg - w * p.reduce_groups;
     uint chunk = (p.n_buckets + p.reduce_groups - 1u) / p.reduce_groups;
@@ -1395,9 +1397,9 @@ inline void msm_reduce_scan_impl(device const Xyzz<F>* buckets,
     // Suffix scan of the segment sums across the simdgroup. The boundary guard makes
     // Kogge-Stone correct for any active lane count, and a lane past the segment range
     // scans the identity.
-    uint active = min(32u, tcount - sg * 32u);
+    uint active = min(width, tcount - sg * width);
     Xyzz<F> suff = run;
-    for (uint d = 1u; d < 32u; d <<= 1) {
+    for (uint d = 1u; d < width; d <<= 1) {
         Xyzz<F> other = pt_shuffle_down(suff, d);
         if (lane + d < active) {
             suff = pt_add(suff, other);
@@ -1411,14 +1413,14 @@ inline void msm_reduce_scan_impl(device const Xyzz<F>* buckets,
         v = pt_add(v, pt_mul_small(suff, seg_len));
     }
     Xyzz<F> q = suff;
-    for (uint d = 1u; d < 32u; d <<= 1) {
+    for (uint d = 1u; d < width; d <<= 1) {
         Xyzz<F> other = pt_shuffle_down(v, d);
         if (lane + d < active) {
             v = pt_add(v, other);
         }
     }
     if (lane == 0u) {
-        uint sgs = (tcount + 31u) / 32u;
+        uint sgs = (tcount + width - 1u) / width;
         uint slot = 2u * (tg * sgs + sg);
         window_sums[slot] = v;
         window_sums[slot + 1u] = q;
@@ -1432,8 +1434,9 @@ kernel void msm_reduce_g1(device const PtG1* buckets [[buffer(0)]],
                           uint tid [[thread_position_in_threadgroup]],
                           uint tcount [[threads_per_threadgroup]],
                           uint lane [[thread_index_in_simdgroup]],
-                          uint sg [[simdgroup_index_in_threadgroup]]) {
-    msm_reduce_scan_impl<Fq>(buckets, window_sums, p, tg, tid, tcount, lane, sg);
+                          uint sg [[simdgroup_index_in_threadgroup]],
+                          uint width [[threads_per_simdgroup]]) {
+    msm_reduce_scan_impl<Fq>(buckets, window_sums, p, tg, tid, tcount, lane, sg, width);
 }
 
 kernel void msm_reduce_g2(device const PtG2* buckets [[buffer(0)]],

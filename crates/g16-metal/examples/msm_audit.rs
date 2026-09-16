@@ -37,10 +37,12 @@ mod audit {
     fn plan<A: AffineRepr<ScalarField = Fr>>(
         name: &str,
         bases: &[A],
-        scalars: &[Fr],
+        all_scalars: &[Fr],
+        scalar_off: usize,
         device_scalars: bool,
     ) {
-        assert_eq!(bases.len(), scalars.len());
+        let end = scalar_off + bases.len();
+        let scalars = &all_scalars[scalar_off..end];
         let general = scalars
             .iter()
             .filter(|s| !s.is_zero() && !s.is_one())
@@ -56,7 +58,13 @@ mod audit {
         let recode_bits = if device_scalars {
             255
         } else {
-            scalars
+            // ScalarBuf::bits_in rounds the range to CLASSIFY_CHUNK boundaries.
+            // Looking only at L's subrange understated tiny_mul's bound (5 vs 8)
+            // and reported a different window from the one production dispatched.
+            const CLASSIFY_CHUNK: usize = 4096;
+            let lo = scalar_off / CLASSIFY_CHUNK * CLASSIFY_CHUNK;
+            let hi = (end.div_ceil(CLASSIFY_CHUNK) * CLASSIFY_CHUNK).min(all_scalars.len());
+            all_scalars[lo..hi]
                 .iter()
                 .map(|s| s.into_bigint().num_bits() as usize + 1)
                 .max()
@@ -82,7 +90,11 @@ mod audit {
             if s.is_one() {
                 ones += 1;
                 live_ones += usize::from(!base.is_zero());
-                continue;
+                if !device_scalars
+                    || std::env::var("G16_METAL_MSM_ROUTE_ONES").as_deref() == Ok("0")
+                {
+                    continue;
+                }
             }
             let limbs = s.into_bigint();
             let mut reconstructed = Fr::zero();
@@ -165,16 +177,16 @@ mod audit {
             let pk = ProvingKey::load(&dir.join("circuit.zkey")).unwrap();
             let witness = Witness::load(&dir.join("circuit.wtns")).unwrap().0;
             gather(&pk, &witness);
-            plan("A_g1", &pk.a_query, &witness, false);
-            plan("B_g2", &pk.b_g2_query, &witness, false);
-            plan("B_g1", &pk.b_g1_query, &witness, false);
-            plan("L_g1", &pk.l_query, &witness[pk.n_public + 1..], false);
+            plan("A_g1", &pk.a_query, &witness, 0, false);
+            plan("B_g2", &pk.b_g2_query, &witness, 0, false);
+            plan("B_g1", &pk.b_g1_query, &witness, 0, false);
+            plan("L_g1", &pk.l_query, &witness, pk.n_public + 1, false);
             let h_bases = pk.h_query.clone();
             let cpu = CpuBackend::new().prepare(pk).unwrap();
             let h = cpu
                 .compute_h(&witness, &mut StageTimings::default())
                 .unwrap();
-            plan("H_g1", &h_bases, &h.to_host().unwrap(), true);
+            plan("H_g1", &h_bases, &h.to_host().unwrap(), 0, true);
         }
     }
 }

@@ -389,6 +389,7 @@ struct MsmParams {
     reduce_groups: u32,
     merge_wide_base: u32,
     merge_wide_rows: u32,
+    separate_ones: u32,
 }
 
 /// A G1 point in extended Jacobian coordinates, as the kernels write it: 128 bytes,
@@ -413,7 +414,7 @@ pub struct PackedXyzzG2 {
 }
 
 const _: () = {
-    assert!(core::mem::size_of::<MsmParams>() == 52);
+    assert!(core::mem::size_of::<MsmParams>() == 56);
     assert!(core::mem::size_of::<PackedXyzzG1>() == 128);
     assert!(core::mem::size_of::<PackedXyzzG2>() == 256);
 };
@@ -789,6 +790,15 @@ impl MetalMsm {
             .max(1)
     }
 
+    fn reduce_layout(&self, plan: &Plan<'_>) -> ReduceLayout {
+        ReduceLayout::new(
+            plan.n_buckets,
+            plan.reduce_groups,
+            self.reduce_tg(false),
+            self.pipelines.reduce_g1.thread_execution_width() as usize,
+        )
+    }
+
     pub fn device(&self) -> &Device {
         &self.device
     }
@@ -1051,7 +1061,7 @@ impl MetalMsm {
         let mut outs: Vec<Outputs> = Vec::with_capacity(jobs.len());
         for job in jobs {
             let plan = &plans[job_plan[outs.len()]];
-            outs.push(Outputs::alloc(&self.pool, &mut scratch, job, plan));
+            outs.push(Outputs::alloc(self, &mut scratch, job, plan));
         }
 
         // ---- encode, once ----
@@ -1061,6 +1071,10 @@ impl MetalMsm {
         // stderr. Strictly a measurement aid: it adds one ~0.15 ms submission floor per
         // piece, so the sum reads slightly worse than the production path it explains.
         if std::env::var_os("G16_METAL_MSM_PHASES").is_some() {
+            let detail = std::env::var("G16_METAL_MSM_PHASES")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(1);
             let run = |label: String,
                        f: &mut dyn FnMut(&ComputeCommandEncoderRef)|
              -> Result<(), ProveError> {
@@ -1083,17 +1097,32 @@ impl MetalMsm {
                 Ok(())
             };
             for (pi, p) in plans.iter().enumerate() {
-                run(
-                    format!(
-                        "digits plan{pi} n={} cap={} c={} w={}",
-                        p.n, p.cap, p.c, p.n_windows
-                    ),
-                    &mut |enc| p.encode(self, enc),
-                )?;
+                let shape = format!(
+                    "plan{pi} n={} cap={} c={} w={}",
+                    p.n, p.cap, p.c, p.n_windows
+                );
+                if detail >= 3 {
+                    // Separate the contended atomics from the prefix scan's serial
+                    // barrier chain. Every line pays its own submission floor.
+                    run(format!("zero    {shape}"), &mut |enc| {
+                        p.encode_zero(self, enc)
+                    })?;
+                    run(format!("count   {shape}"), &mut |enc| {
+                        p.encode_count(self, enc)
+                    })?;
+                    run(format!("scan    {shape}"), &mut |enc| {
+                        p.encode_scan(self, enc)
+                    })?;
+                    run(format!("scatter {shape}"), &mut |enc| {
+                        p.encode_scatter(self, enc)
+                    })?;
+                } else {
+                    run(format!("digits {shape}"), &mut |enc| p.encode(self, enc))?;
+                }
             }
             // `G16_METAL_MSM_PHASES=2` goes one level finer and times the four bucket
             // stages one command buffer each. Same caveat, four more submission floors.
-            let fine = std::env::var("G16_METAL_MSM_PHASES").as_deref() == Ok("2");
+            let fine = detail >= 2;
             for (i, (job, out)) in jobs.iter().zip(&outs).enumerate() {
                 let p = &plans[job_plan[i]];
                 let kind = if out.is_g2 { "g2" } else { "g1" };
@@ -1233,6 +1262,9 @@ struct Plan<'a> {
     /// Top-window rows the wide merge owns; 0 keeps everything on `msm_merge_*`.
     merge_wide_rows: usize,
     host_tail: bool,
+    /// Classified inputs have an exact ones gather. Unclassified inputs instead
+    /// recode 1 into bucket zero, so an H plan needs no separate full-buffer scan.
+    separate_ones: bool,
     scalars: &'a Buffer,
     counts: Option<Buffer>,
     cursor: Option<Buffer>,
@@ -1271,15 +1303,17 @@ impl<'a> Plan<'a> {
             c,
             n_windows,
             n_buckets,
-            // Only general scalars emit entries, and each emits at most one per window,
-            // so this bounds the scatter exactly. `max(1)` because a zero-length Metal
-            // buffer is not a thing.
+            // Classified inputs emit only general scalars. Unclassified inputs use n
+            // as their bound, including any ones they recode into buckets. Each emits
+            // at most one entry per window. `max(1)` avoids a zero-length Metal buffer.
             cap,
             slice_len,
             slices: cap.div_ceil(slice_len).max(1),
             reduce_groups: reduce_groups_for(n_windows, n_buckets),
             merge_wide_rows,
             host_tail: n_windows == 1 && n_buckets <= HOST_TAIL_MAX_BUCKETS,
+            separate_ones: scalars.ones_idx.is_some()
+                || std::env::var("G16_METAL_MSM_ROUTE_ONES").as_deref() == Ok("0"),
             scalars: &scalars.buf,
             counts: None,
             cursor: None,
@@ -1302,6 +1336,7 @@ impl<'a> Plan<'a> {
             reduce_groups: self.reduce_groups as u32,
             merge_wide_base: ((self.n_windows - 1) * self.n_buckets) as u32,
             merge_wide_rows: self.merge_wide_rows as u32,
+            separate_ones: self.separate_ones as u32,
         }
     }
 
@@ -1437,7 +1472,8 @@ fn ones_groups_for(n: usize) -> usize {
 }
 
 impl Outputs {
-    fn alloc(pool: &Pool, keep: &mut Vec<Buffer>, job: &Job<'_>, plan: &Plan<'_>) -> Self {
+    fn alloc(msm: &MetalMsm, keep: &mut Vec<Buffer>, job: &Job<'_>, plan: &Plan<'_>) -> Self {
+        let pool = &msm.pool;
         let (is_g2, base_off, point_bytes, scalar_off, sbuf, inf) = match job {
             Job::G1(j) => (
                 false,
@@ -1487,7 +1523,8 @@ impl Outputs {
         });
         let ones_groups = match &ones_idx {
             Some((_, count)) => ones_groups_for(*count),
-            None => ones_groups_for(plan.n),
+            None if plan.separate_ones => ones_groups_for(plan.n),
+            None => 0,
         };
         let buckets = pool.take(plan.n_windows * plan.n_buckets * point_bytes);
         // Two spill slots per slice: at most one run of a slice continues backwards and
@@ -1495,9 +1532,13 @@ impl Outputs {
         let spill_slots = 2 * plan.n_windows * plan.slices;
         let spill_pts = pool.take(spill_slots * point_bytes);
         let spill_rows = pool.take(spill_slots * 4);
-        // The G1 reduce writes a (partial, weight) pair per simdgroup rather than one
-        // point per threadgroup; four is the worst case, two simdgroups of two points.
-        let sums_per_group = if is_g2 { 1 } else { 4 };
+        // The G1 reduce writes a pair per simdgroup. Query this pipeline's width:
+        // at width 16 a 64-thread group writes eight points, not four.
+        let sums_per_group = if is_g2 {
+            1
+        } else {
+            2 * msm.reduce_layout(plan).simdgroups
+        };
         let window_sums =
             pool.take(plan.n_windows * plan.reduce_groups * sums_per_group * point_bytes);
         let ones = pool.take(ones_groups * point_bytes);
@@ -1684,8 +1725,8 @@ impl Outputs {
 
     /// The scalar-of-1 half: one dispatch. Independent of the digit pipeline and of
     /// every bucket stage. With a gather list it is `msm_ones_idx_*` over exactly the
-    /// live contributions; without one it is the `msm_ones_*` scan over all `n`
-    /// scalars.
+    /// live contributions. Unclassified scalars normally route ones into the buckets;
+    /// the measurement override restores the `msm_ones_*` scan over all n scalars.
     fn encode_ones(
         &self,
         msm: &MetalMsm,
@@ -1693,6 +1734,13 @@ impl Outputs {
         job: &Job<'_>,
         plan: &Plan<'_>,
     ) {
+        // H's empty ones scan measured 0.23/0.22/0.27 ms at 2^17/2^18/2^19,
+        // including the isolated submission floor. Recode ones into the buckets
+        // when there is no host classification; the entry capacity already bounds n.
+        // G16_METAL_MSM_ROUTE_ONES=0 restores the scan for an end-to-end comparison.
+        if !plan.separate_ones {
+            return;
+        }
         let mut p = self.params_for(plan);
         if let Some((idx, count)) = &self.ones_idx {
             let (pso, bases) = match job {
@@ -1815,46 +1863,18 @@ impl Outputs {
             // The G1 reduce hands back a (partial, weight) PAIR per simdgroup; slot s
             // of a window carries the buckets based at `(s/sgs)*chunk + (s%sgs)*stride`
             // (see msm_reduce_scan_impl). The bases step uniformly whenever the chunk
-            // splits evenly over the threadgroup, which every unforced shape does, and
+            // splits evenly over the threadgroup, as the large unforced shapes do, and
             // then the weighted term folds to suffix additions plus one small multiple
-            // per window; a forced override that breaks the stride pays one multiple
-            // per slot instead. The fold tripled in additions against the old
+            // per window. Small chunks and overrides that break the stride pay one
+            // multiple per slot instead. The fold tripled in additions against the old
             // one-point-per-group readback, so the windows fold on the thread pool
             // before the serial Horner, which keeps the same window order as the CPU
             // backend so the audit can compare affine.
-            let tcount = msm.reduce_tg(false);
-            let sgs = tcount.div_ceil(32);
-            let slots = rg * sgs;
+            let layout = msm.reduce_layout(plan);
+            let slots = layout.slots;
             let w: &[PackedXyzzG1] =
                 unsafe { read_back(&self.window_sums, plan.n_windows * slots * 2) };
-            let chunk = plan.n_buckets.div_ceil(rg);
-            let seg_len = chunk.div_ceil(tcount);
-            let stride = 32 * seg_len;
-            let uniform = chunk == sgs * stride;
-            let sum_w = |k: usize| {
-                let p = &w[k * slots * 2..(k + 1) * slots * 2];
-                if uniform {
-                    let mut c = G1Projective::zero();
-                    let mut suff = G1Projective::zero();
-                    let mut t = G1Projective::zero();
-                    for s in (0..slots).rev() {
-                        c += p[2 * s].to_projective();
-                        suff += p[2 * s + 1].to_projective();
-                        if s >= 1 {
-                            t += &suff;
-                        }
-                    }
-                    c + mul_u64(t, stride as u64)
-                } else {
-                    let mut c = G1Projective::zero();
-                    for s in 0..slots {
-                        let base = (s / sgs) * chunk + (s % sgs) * stride;
-                        c += p[2 * s].to_projective();
-                        c += mul_u64(p[2 * s + 1].to_projective(), base as u64);
-                    }
-                    c
-                }
-            };
+            let sum_w = |k: usize| layout.fold(&w[k * slots * 2..(k + 1) * slots * 2]);
             let sums: Vec<G1Projective> = {
                 use rayon::prelude::*;
                 (0..plan.n_windows).into_par_iter().map(sum_w).collect()
@@ -1877,6 +1897,53 @@ impl Outputs {
 // ---------------------------------------------------------------------------
 // Encoding helpers
 // ---------------------------------------------------------------------------
+
+/// The G1 shader and readback must use the same SIMD width, including partial groups.
+/// Kept independent of the device so the weighting identity can be checked on the CPU.
+struct ReduceLayout {
+    simdgroups: usize,
+    slots: usize,
+    chunk: usize,
+    stride: usize,
+}
+
+impl ReduceLayout {
+    fn new(buckets: usize, groups: usize, threads: usize, width: usize) -> Self {
+        let simdgroups = threads.div_ceil(width);
+        let chunk = buckets.div_ceil(groups);
+        Self {
+            simdgroups,
+            slots: groups * simdgroups,
+            chunk,
+            stride: width * chunk.div_ceil(threads),
+        }
+    }
+
+    fn fold(&self, pairs: &[PackedXyzzG1]) -> G1Projective {
+        assert_eq!(pairs.len(), 2 * self.slots);
+        if self.chunk == self.simdgroups * self.stride {
+            let mut c = G1Projective::zero();
+            let mut suff = G1Projective::zero();
+            let mut t = G1Projective::zero();
+            for s in (0..self.slots).rev() {
+                c += pairs[2 * s].to_projective();
+                suff += pairs[2 * s + 1].to_projective();
+                if s >= 1 {
+                    t += &suff;
+                }
+            }
+            c + mul_u64(t, self.stride as u64)
+        } else {
+            let mut c = G1Projective::zero();
+            for s in 0..self.slots {
+                let base = (s / self.simdgroups) * self.chunk + (s % self.simdgroups) * self.stride;
+                c += pairs[2 * s].to_projective();
+                c += mul_u64(pairs[2 * s + 1].to_projective(), base as u64);
+            }
+            c
+        }
+    }
+}
 
 /// `k * p` by MSB-first double-and-add. `k` is a bucket base, a few thousand at most,
 /// and this runs a handful of times per window inside the combine.
@@ -1929,6 +1996,14 @@ fn dispatch_1d(
 unsafe fn read_back<T: Packed>(buf: &Buffer, len: usize) -> &[T] {
     core::slice::from_raw_parts(buf.contents().cast::<T>(), len)
 }
+
+#[cfg(test)]
+#[path = "msm_cpu_tests.rs"]
+mod cpu_tests;
+
+#[cfg(test)]
+#[path = "msm_gpu_probes.rs"]
+mod gpu_probes;
 
 #[cfg(test)]
 mod tests {
@@ -2107,6 +2182,50 @@ mod tests {
         let ds = m.upload_scalars(&scalars);
         let got = m.msm_g2(&db, &ds).unwrap();
         assert_eq!(got.into_affine(), want.into_affine());
+    }
+
+    /// The device entry point cannot assume H never contains a one. Exercise both
+    /// groups and reuse the scratch across zero, one, and mixed scalar vectors.
+    #[test]
+    fn unclassified_ones_and_zeros_match_both_cpu_groups() {
+        use g16_field::PrimeGroup;
+        let m = MetalMsm::new().expect("Metal device");
+        let n = 65;
+        let g1: Vec<_> = (0..n)
+            .map(|i| (G1Projective::generator() * Fr::from((i + 1) as u64)).into_affine())
+            .collect();
+        let g2: Vec<_> = (0..n)
+            .map(|i| (G2Projective::generator() * Fr::from((i + 1) as u64)).into_affine())
+            .collect();
+        let b1 = m.upload_g1_bases(&g1);
+        let b2 = m.upload_g2_bases(&g2);
+        for kind in [0, 1, 2, 0] {
+            let scalars: Vec<_> = (0..n)
+                .map(|i| match kind {
+                    0 => Fr::zero(),
+                    1 => Fr::one(),
+                    _ => Fr::from((i % 5) as u64),
+                })
+                .collect();
+            let uploaded = m.upload_scalars(&scalars);
+            let device = m.scalars_from_device_std(&uploaded.buf, n);
+            let want1 = g1
+                .iter()
+                .zip(&scalars)
+                .fold(G1Projective::zero(), |a, (b, s)| a + *b * s);
+            let want2 = g2
+                .iter()
+                .zip(&scalars)
+                .fold(G2Projective::zero(), |a, (b, s)| a + *b * s);
+            assert_eq!(
+                m.msm_g1(&b1, &device).unwrap().into_affine(),
+                want1.into_affine()
+            );
+            assert_eq!(
+                m.msm_g2(&b2, &device).unwrap().into_affine(),
+                want2.into_affine()
+            );
+        }
     }
 
     /// The path stage 9 will actually take once the NTT keeps `H` on the device: a
