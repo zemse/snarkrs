@@ -242,6 +242,31 @@ fn merge_wide_min_span() -> usize {
         .unwrap_or(MERGE_WIDE_MIN_SPAN)
 }
 
+/// Bucket rows at or above which the scatter's windows split into two serial
+/// dispatches.
+///
+/// Every scatter store lands on the cache line holding its bucket run's tail, so the
+/// kernel keeps one line per row live: 128 bytes times the row count. The c=13 H plans
+/// hold 81,920 rows, 10.5 MB, and their scattered stores cost 0.07 ms over 2.6 M
+/// entries; the c=15 plan holds 278,528 rows, 35.6 MB against a cache shared with the
+/// scalar stream, and pays 0.58 ms over 8.9 M entries, 2.4x more per entry. Halving
+/// the live set by dispatching the windows in two serial halves measured 0.88 to
+/// 0.62 ms at that shape (three halves tied, four lost), while the c=13 shapes lost
+/// 0.01 ms to the second scalar read, so the split starts where they end. Override
+/// with `G16_METAL_MSM_SCATTER_SPLIT`; 0 keeps every plan in one dispatch.
+const SCATTER_SPLIT_ROWS: usize = 131072;
+
+fn scatter_split_rows() -> usize {
+    match std::env::var("G16_METAL_MSM_SCATTER_SPLIT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        Some(0) => usize::MAX,
+        Some(rows) => rows,
+        None => SCATTER_SPLIT_ROWS,
+    }
+}
+
 /// `G16_METAL_MSM_LEGACY_ACC=1` swaps the segmented accumulation for the simple
 /// one-thread-per-bucket kernel. Kept only so the load-imbalance claim in
 /// `shaders/msm.metal` can be reproduced rather than taken on trust.
@@ -1198,8 +1223,17 @@ impl MetalMsm {
                 p.encode_scan(self, enc);
             }
             barrier(enc);
+            // A split plan's second part must not overlap its first inside this
+            // concurrent encoder, so it goes behind a barrier of its own. The witness
+            // plans never split and ride entirely in the first wave.
             for p in &plans {
-                p.encode_scatter(self, enc);
+                p.encode_scatter_part(self, enc, 0);
+            }
+            if plans.iter().any(|p| p.scatter_parts > 1) {
+                barrier(enc);
+                for p in &plans {
+                    p.encode_scatter_part(self, enc, 1);
+                }
             }
             barrier(enc);
             for (i, (job, out)) in jobs.iter().zip(&outs).enumerate() {
@@ -1261,6 +1295,9 @@ struct Plan<'a> {
     reduce_groups: usize,
     /// Top-window rows the wide merge owns; 0 keeps everything on `msm_merge_*`.
     merge_wide_rows: usize,
+    /// Serial window-range dispatches of the scatter; 2 caps the live tail-line set
+    /// on row-heavy plans (see [`SCATTER_SPLIT_ROWS`]), 1 everywhere else.
+    scatter_parts: usize,
     host_tail: bool,
     /// Classified inputs have an exact ones gather. Unclassified inputs instead
     /// recode 1 into bucket zero, so an H plan needs no separate full-buffer scan.
@@ -1311,6 +1348,11 @@ impl<'a> Plan<'a> {
             slices: cap.div_ceil(slice_len).max(1),
             reduce_groups: reduce_groups_for(n_windows, n_buckets),
             merge_wide_rows,
+            scatter_parts: if n_windows > 1 && n_windows * n_buckets >= scatter_split_rows() {
+                2
+            } else {
+                1
+            },
             host_tail: n_windows == 1 && n_buckets <= HOST_TAIL_MAX_BUCKETS,
             separate_ones: scalars.ones_idx.is_some()
                 || std::env::var("G16_METAL_MSM_ROUTE_ONES").as_deref() == Ok("0"),
@@ -1412,7 +1454,16 @@ impl<'a> Plan<'a> {
         );
     }
 
-    fn encode_scatter(&self, msm: &MetalMsm, enc: &ComputeCommandEncoderRef) {
+    /// The scatter, or the `part`-th of its window-range dispatches. The parts write
+    /// disjoint rows, so no barrier is *required* between them; the caller inserts one
+    /// anyway, because running them serially is the entire point of the split.
+    fn encode_scatter_part(&self, msm: &MetalMsm, enc: &ComputeCommandEncoderRef, part: usize) {
+        if part >= self.scatter_parts {
+            return;
+        }
+        let step = self.n_windows.div_ceil(self.scatter_parts);
+        let lo = part * step;
+        let hi = (lo + step).min(self.n_windows);
         let p = self.params();
         enc.set_compute_pipeline_state(&msm.pipelines.scatter);
         enc.set_buffer(0, Some(self.scalars), 0);
@@ -1427,7 +1478,15 @@ impl<'a> Plan<'a> {
             0,
         );
         set_params(enc, 3, &p);
+        let span = [lo as u32, hi as u32];
+        enc.set_bytes(4, 8, span.as_ptr().cast());
         dispatch_1d(enc, &msm.pipelines.scatter, self.n, 64);
+    }
+
+    fn encode_scatter(&self, msm: &MetalMsm, enc: &ComputeCommandEncoderRef) {
+        for part in 0..self.scatter_parts {
+            self.encode_scatter_part(msm, enc, part);
+        }
     }
 }
 

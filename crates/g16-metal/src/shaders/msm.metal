@@ -821,6 +821,15 @@ kernel void msm_count(device const uint* scalars [[buffer(0)]],
 // SCAN_TG is the array size, not the dispatch size: the host passes
 // min(SCAN_TG, pipeline max) threads and the kernel reads the real count from
 // [[threads_per_threadgroup]], so a pipeline that reports fewer than 256 still works.
+//
+// A Hillis-Steele scan over 256-counter chunks sat here before, at 18 barriers per
+// chunk: 1,152 barriers per window at c=15, on a dispatch of only n_windows
+// threadgroups. Scanning per-thread block totals instead needs two barriers total.
+// Each thread sums a contiguous block of counters serially, thread 0 prefix-sums the
+// block totals (at most SCAN_TG of them, integer adds, not worth a tree), and each
+// thread replays its block against its offset. MEASURED at the keccak_512 H shape
+// (c=15, 16,384 buckets, 17 windows), driver clock, phases split: 0.125 ms before,
+// 0.07 ms after; the c=13 shapes are flat at 0.03 ms, their 288 barriers were cheap.
 #define SCAN_TG 256
 
 kernel void msm_scan(device const uint* counts [[buffer(0)]],
@@ -829,28 +838,29 @@ kernel void msm_scan(device const uint* counts [[buffer(0)]],
                      uint w [[threadgroup_position_in_grid]],
                      uint tid [[thread_position_in_threadgroup]],
                      uint tcount [[threads_per_threadgroup]]) {
-    threadgroup uint tmp[SCAN_TG];
-    uint running = w * p.cap;
-    uint chunks = (p.n_buckets + tcount - 1u) / tcount;
-    for (uint ch = 0; ch < chunks; ch++) {
-        uint idx = ch * tcount + tid;
-        uint v = (idx < p.n_buckets) ? counts[w * p.n_buckets + idx] : 0u;
-        tmp[tid] = v;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        // Hillis-Steele inclusive scan. The read is separated from the write by a
-        // barrier on both sides, which is what makes the in-place update safe.
-        for (uint d = 1; d < tcount; d <<= 1) {
-            uint x = (tid >= d) ? tmp[tid - d] : 0u;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            tmp[tid] += x;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup uint totals[SCAN_TG];
+    uint block = (p.n_buckets + tcount - 1u) / tcount;
+    uint lo = tid * block;
+    uint hi = min(lo + block, p.n_buckets);
+    uint sum = 0u;
+    for (uint i = lo; i < hi; i++) {
+        sum += counts[w * p.n_buckets + i];
+    }
+    totals[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+        uint running = w * p.cap;
+        for (uint t = 0; t < tcount; t++) {
+            uint v = totals[t];
+            totals[t] = running;
+            running += v;
         }
-        if (idx < p.n_buckets) {
-            cursor[w * p.n_buckets + idx] = running + tmp[tid] - v;
-        }
-        uint total = tmp[tcount - 1u];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        running += total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint running = totals[tid];
+    for (uint i = lo; i < hi; i++) {
+        cursor[w * p.n_buckets + i] = running;
+        running += counts[w * p.n_buckets + i];
     }
 }
 
@@ -863,10 +873,21 @@ kernel void msm_scan(device const uint* counts [[buffer(0)]],
 // row is stored rather than recomputed because the segmented accumulation below walks a
 // fixed-length slice of the entry array and has to discover where one bucket's run ends,
 // which it cannot do from the point index alone.
+//
+// `span` is the half-open window range this dispatch owns; the host usually passes the
+// whole plan. Every store lands on the cache line holding its bucket run's tail, so the
+// kernel's active line set is one line per row it is filling. At c=13 that is 10.5 MB
+// and the stores are nearly free (measured 0.07 ms over 2.6 M entries), but the c=15 H
+// plan's 278,528 rows are 35.6 MB of tail lines against a cache shared with the scalar
+// stream, and the same stores cost 0.58 ms over 8.9 M entries, 2.4x more per entry.
+// Serially dispatching two window halves halves the active set: 0.88 to 0.62 ms
+// measured at that shape, while the c=13 shapes lose 0.01 to the second scalar read,
+// which is why the split is gated on row count (see `scatter_parts` in msm.rs).
 kernel void msm_scatter(device const uint* scalars [[buffer(0)]],
                         device atomic_uint* cursor [[buffer(1)]],
                         device uint2* entries [[buffer(2)]],
                         constant MsmParams& p [[buffer(3)]],
+                        constant uint2& span [[buffer(4)]],
                         uint gid [[thread_position_in_grid]]) {
     if (gid >= p.n) {
         return;
@@ -879,7 +900,7 @@ kernel void msm_scatter(device const uint* scalars [[buffer(0)]],
     if (sc_is_zero(s) || (p.separate_ones != 0u && sc_is_one(s))) {
         return;
     }
-    for (uint w = 0; w < p.n_windows; w++) {
+    for (uint w = span.x; w < span.y; w++) {
         uint mag;
         bool neg;
         sc_signed_digit(s, w, p.c, mag, neg);
