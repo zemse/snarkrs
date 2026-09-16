@@ -100,6 +100,9 @@ const REDUCE_TG: usize = 64;
 /// Threadgroup array size of the prefix-sum kernel. Same contract as [`REDUCE_TG`].
 const SCAN_TG: usize = 256;
 
+/// Threads per threadgroup in the wide merge. Same contract as [`REDUCE_TG`].
+const MERGE_TG: usize = 64;
+
 /// The spill slot sentinel. Must equal `MSM_NO_ROW` in `msm.metal`: a slot holding it
 /// spilled nothing, and the host-tail combine skips it the way `msm_merge_*` does.
 const MSM_NO_ROW: u32 = u32::MAX;
@@ -214,6 +217,30 @@ fn reduce_groups_for(n_windows: usize, n_buckets: usize) -> usize {
 /// path. What the change buys beyond the milliseconds is headroom: those 5.7 ms stop
 /// competing with the transforms the moment anything else on the device gets faster.
 const HOST_TAIL_MAX_BUCKETS: usize = 256;
+
+/// Expected slice span of a top-window bucket at or above which its merge moves to
+/// `msm_merge_wide_*`, one threadgroup per bucket instead of one thread.
+///
+/// `msm_merge_*` walks a bucket's slice range serially, so a top-window bucket whose
+/// run spans dozens of slices holds the whole merge dispatch open in a single lane.
+/// The wide kernel strides the range across [`MERGE_TG`] threads and folds a tree.
+/// Below the threshold the serial walk is already two or three dependent additions and
+/// a threadgroup would only add barriers.
+///
+/// Measured on the csp keccak circuits with overlap off, driver clock: the H merge
+/// phase drops from 0.85 to 0.65 ms at 2^17 (span 16) and from 1.57 to 0.78 ms at 2^18
+/// (span 32); at 2^19 the top window is full (c=15 spends all 15 top bits), the span
+/// estimate is below one and the wide path stays off. Warm medians move by the same
+/// amounts, -0.35 and -0.85 ms, because the H MSM is the critical path. Override with
+/// `G16_METAL_MSM_WIDE` to sweep it; 0 disables the wide path.
+const MERGE_WIDE_MIN_SPAN: usize = 4;
+
+fn merge_wide_min_span() -> usize {
+    std::env::var("G16_METAL_MSM_WIDE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(MERGE_WIDE_MIN_SPAN)
+}
 
 /// `G16_METAL_MSM_LEGACY_ACC=1` swaps the segmented accumulation for the simple
 /// one-thread-per-bucket kernel. Kept only so the load-imbalance claim in
@@ -334,6 +361,8 @@ struct MsmParams {
     slice_len: u32,
     slices: u32,
     reduce_groups: u32,
+    merge_wide_base: u32,
+    merge_wide_rows: u32,
 }
 
 /// A G1 point in extended Jacobian coordinates, as the kernels write it: 128 bytes,
@@ -358,7 +387,7 @@ pub struct PackedXyzzG2 {
 }
 
 const _: () = {
-    assert!(core::mem::size_of::<MsmParams>() == 44);
+    assert!(core::mem::size_of::<MsmParams>() == 52);
     assert!(core::mem::size_of::<PackedXyzzG1>() == 128);
     assert!(core::mem::size_of::<PackedXyzzG2>() == 256);
 };
@@ -585,6 +614,8 @@ struct Pipelines {
     segmented_g2: ComputePipelineState,
     merge_g1: ComputePipelineState,
     merge_g2: ComputePipelineState,
+    merge_wide_g1: ComputePipelineState,
+    merge_wide_g2: ComputePipelineState,
     reduce_g1: ComputePipelineState,
     reduce_g2: ComputePipelineState,
     ones_g1: ComputePipelineState,
@@ -697,6 +728,8 @@ impl MetalMsm {
             segmented_g2: pso("msm_segmented_g2")?,
             merge_g1: pso("msm_merge_g1")?,
             merge_g2: pso("msm_merge_g2")?,
+            merge_wide_g1: pso("msm_merge_wide_g1")?,
+            merge_wide_g2: pso("msm_merge_wide_g2")?,
             reduce_g1: pso("msm_reduce_g1")?,
             reduce_g2: pso("msm_reduce_g2")?,
             ones_g1: pso("msm_ones_g1")?,
@@ -1158,6 +1191,8 @@ struct Plan<'a> {
     slice_len: usize,
     slices: usize,
     reduce_groups: usize,
+    /// Top-window rows the wide merge owns; 0 keeps everything on `msm_merge_*`.
+    merge_wide_rows: usize,
     host_tail: bool,
     scalars: &'a Buffer,
     counts: Option<Buffer>,
@@ -1180,6 +1215,17 @@ impl<'a> Plan<'a> {
         let n_buckets = 1usize << (c - 1);
         let cap = general.max(1);
         let slice_len = slice_len_for(n_windows, cap);
+        // Live buckets of the top window, whose short bit range concentrates the
+        // digits. When their expected run span clears the wide threshold, their merge
+        // moves to `msm_merge_wide_*` and `msm_merge_*` skips them.
+        let top_bits = recode_bits - (n_windows - 1) * c as usize;
+        let top_buckets = 1usize << (top_bits.min(c as usize) - 1);
+        let wide_span = merge_wide_min_span();
+        let merge_wide_rows = if wide_span > 0 && general / top_buckets / slice_len >= wide_span {
+            top_buckets
+        } else {
+            0
+        };
         Self {
             n,
             scalar_off,
@@ -1193,6 +1239,7 @@ impl<'a> Plan<'a> {
             slice_len,
             slices: cap.div_ceil(slice_len).max(1),
             reduce_groups: reduce_groups_for(n_windows, n_buckets),
+            merge_wide_rows,
             host_tail: n_windows == 1 && n_buckets <= HOST_TAIL_MAX_BUCKETS,
             scalars: &scalars.buf,
             counts: None,
@@ -1214,6 +1261,8 @@ impl<'a> Plan<'a> {
             slice_len: self.slice_len as u32,
             slices: self.slices as u32,
             reduce_groups: self.reduce_groups as u32,
+            merge_wide_base: ((self.n_windows - 1) * self.n_buckets) as u32,
+            merge_wide_rows: self.merge_wide_rows as u32,
         }
     }
 
@@ -1541,6 +1590,27 @@ impl Outputs {
         enc.set_buffer(4, Some(plan.cursor.as_ref().unwrap()), 0);
         set_params(enc, 5, &p);
         dispatch_1d(enc, merge_pso, plan.n_windows * plan.n_buckets, 64);
+
+        // The top window's fat buckets, one threadgroup each. Disjoint rows from the
+        // dispatch above and the same read-only inputs, so the two share a phase.
+        if plan.merge_wide_rows > 0 {
+            let wide_pso = match job {
+                Job::G1(_) => &msm.pipelines.merge_wide_g1,
+                Job::G2(_) => &msm.pipelines.merge_wide_g2,
+            };
+            enc.set_compute_pipeline_state(wide_pso);
+            enc.set_buffer(0, Some(&self.buckets), 0);
+            enc.set_buffer(1, Some(&self.spill_pts), 0);
+            enc.set_buffer(2, Some(&self.spill_rows), 0);
+            enc.set_buffer(3, Some(plan.counts.as_ref().unwrap()), 0);
+            enc.set_buffer(4, Some(plan.cursor.as_ref().unwrap()), 0);
+            set_params(enc, 5, &p);
+            let tg = MERGE_TG.min(wide_pso.max_total_threads_per_threadgroup() as usize);
+            enc.dispatch_thread_groups(
+                MTLSize::new(plan.merge_wide_rows as u64, 1, 1),
+                MTLSize::new(tg as u64, 1, 1),
+            );
+        }
     }
 
     fn encode_reduce(
@@ -1795,7 +1865,11 @@ mod tests {
     /// MSM outputs wrong, so the proof stops verifying with nothing to point at.
     #[test]
     fn msl_declares_the_same_threadgroup_sizes() {
-        for (name, want) in [("REDUCE_TG", REDUCE_TG), ("SCAN_TG", SCAN_TG)] {
+        for (name, want) in [
+            ("REDUCE_TG", REDUCE_TG),
+            ("SCAN_TG", SCAN_TG),
+            ("MERGE_TG", MERGE_TG),
+        ] {
             let line = format!("#define {name} {want}");
             assert!(
                 MSM_MSL.contains(&line),

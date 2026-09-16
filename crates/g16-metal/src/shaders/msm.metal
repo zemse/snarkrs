@@ -758,6 +758,8 @@ struct MsmParams {
     uint slice_len;   // entries per thread in the segmented accumulation
     uint slices;      // ceil(cap / slice_len), threads per window there
     uint reduce_groups; // threadgroups per window in msm_reduce_*
+    uint merge_wide_base; // first row msm_merge_wide_* owns instead of msm_merge_*
+    uint merge_wide_rows; // rows it owns; 0 leaves everything to msm_merge_*
 };
 
 // ---------------------------------------------------------------------------
@@ -1112,6 +1114,9 @@ inline void msm_merge_impl(device Xyzz<F>* buckets,
     if (row >= p.n_windows * p.n_buckets) {
         return;
     }
+    if (row >= p.merge_wide_base && row < p.merge_wide_base + p.merge_wide_rows) {
+        return;
+    }
     uint cnt = counts[row];
     if (cnt == 0u) {
         return;
@@ -1154,6 +1159,92 @@ kernel void msm_merge_g2(device PtG2* buckets [[buffer(0)]],
                          constant MsmParams& p [[buffer(5)]],
                          uint row [[thread_position_in_grid]]) {
     msm_merge_impl<Fq2>(buckets, spill_pts, spill_rows, counts, cursor, p, row);
+}
+
+// The wide merge, for buckets whose runs span many slices. `msm_merge_*` walks a
+// bucket's whole slice range in one thread, which is fine at typical occupancy (a run
+// crosses one slice boundary, the walk is two iterations) and pathological in the top
+// window, where the recoding leaves only `recode_bits - (W-1)*c` live bits and a
+// bucket's run can span dozens of slices. Here one THREADGROUP owns one bucket: the
+// threads stride the slice range in parallel and a tree folds their partials, so the
+// fattest bucket costs `ceil(span / MERGE_TG)` additions plus a log2(MERGE_TG) tree
+// instead of `span` dependent iterations in a single lane. The host points
+// `merge_wide_base`/`merge_wide_rows` at the top window's live buckets when their
+// expected span clears the threshold in msm.rs, and `msm_merge_*` skips those rows.
+#define MERGE_TG 64
+
+template <typename F>
+inline void msm_merge_wide_impl(device Xyzz<F>* buckets,
+                                device const Xyzz<F>* spill_pts,
+                                device const uint* spill_rows,
+                                device const uint* counts,
+                                device const uint* cursor,
+                                constant MsmParams& p,
+                                threadgroup Xyzz<F>* shared,
+                                uint tg,
+                                uint tid,
+                                uint tcount) {
+    uint row = p.merge_wide_base + tg;
+    uint cnt = counts[row];
+    // Uniform across the threadgroup, so returning before the barriers is safe.
+    if (cnt == 0u) {
+        return;
+    }
+    uint w = row / p.n_buckets;
+    uint base = w * p.cap;
+    uint start = cursor[row] - cnt - base;
+    uint end = cursor[row] - base;
+    uint k_lo = start / p.slice_len;
+    uint k_hi = (end - 1u) / p.slice_len;
+
+    Xyzz<F> acc = pt_zero<F>();
+    for (uint k = k_lo + tid; k <= k_hi; k += tcount) {
+        uint slot = 2u * (w * p.slices + k);
+        if (spill_rows[slot] == row) {
+            acc = pt_add(acc, spill_pts[slot]);
+        }
+        if (spill_rows[slot + 1u] == row) {
+            acc = pt_add(acc, spill_pts[slot + 1u]);
+        }
+    }
+    shared[tid] = acc;
+
+    for (uint s = 1; s < tcount; s <<= 1) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if ((tid & ((s << 1) - 1u)) == 0u && tid + s < tcount) {
+            shared[tid] = pt_add(shared[tid], shared[tid + s]);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+        buckets[row] = pt_add(buckets[row], shared[0]);
+    }
+}
+
+kernel void msm_merge_wide_g1(device PtG1* buckets [[buffer(0)]],
+                              device const PtG1* spill_pts [[buffer(1)]],
+                              device const uint* spill_rows [[buffer(2)]],
+                              device const uint* counts [[buffer(3)]],
+                              device const uint* cursor [[buffer(4)]],
+                              constant MsmParams& p [[buffer(5)]],
+                              uint tg [[threadgroup_position_in_grid]],
+                              uint tid [[thread_position_in_threadgroup]],
+                              uint tcount [[threads_per_threadgroup]]) {
+    threadgroup PtG1 shared[MERGE_TG];
+    msm_merge_wide_impl<Fq>(buckets, spill_pts, spill_rows, counts, cursor, p, shared, tg, tid, tcount);
+}
+
+kernel void msm_merge_wide_g2(device PtG2* buckets [[buffer(0)]],
+                              device const PtG2* spill_pts [[buffer(1)]],
+                              device const uint* spill_rows [[buffer(2)]],
+                              device const uint* counts [[buffer(3)]],
+                              device const uint* cursor [[buffer(4)]],
+                              constant MsmParams& p [[buffer(5)]],
+                              uint tg [[threadgroup_position_in_grid]],
+                              uint tid [[thread_position_in_threadgroup]],
+                              uint tcount [[threads_per_threadgroup]]) {
+    threadgroup PtG2 shared[MERGE_TG];
+    msm_merge_wide_impl<Fq2>(buckets, spill_pts, spill_rows, counts, cursor, p, shared, tg, tid, tcount);
 }
 
 // Stage 5: collapse one window's 2^(c-1) buckets to one point.
