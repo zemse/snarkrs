@@ -56,8 +56,23 @@ pub fn prove_with_blinders(
     // One call for stages 0-9 rather than `compute_h` then `msms`: only stage 9 needs
     // `H`, and a backend may overlap stages 5-8 with 0-4. The trait's default is the
     // old sequence, so nothing changes for a backend that has not opted in.
-    let m = circuit.h_and_msms(witness, timings)?;
-    Ok(assemble(circuit.key(), &m, r, s, timings))
+    //
+    // The blinder terms ride alongside: they need only the key and `(r, s)`, so nothing
+    // in them waits on the witness, on `H` or on an MSM output, and on a GPU backend
+    // stages 0-9 leave every host core idle. That moves about 0.4 ms of stage 11's 0.55
+    // ms of scalar multiplication off the critical path.
+    //
+    // A plain thread, not `rayon::join`. Called from outside the pool, `join` injects
+    // both closures and parks the caller, so stages 0-9 would run *on* a rayon worker
+    // and hold it for the whole GPU wait. Eight concurrent proofs then own eight workers
+    // that are all blocked on a device, and the five MSMs inside each one have nowhere
+    // left to schedule: `audit_metal_vs_cpu` deadlocked for two days at 0% CPU. The
+    // caller's own thread is the only safe place for a blocking wait.
+    let (m, terms) = spawn_terms(circuit.key(), r, s, || {
+        circuit.h_and_msms(witness, timings)
+    });
+    let m = m?;
+    Ok(assemble_from_terms(circuit.key(), &m, &terms, timings))
 }
 
 /// A full proof plus every intermediate value that two machines must agree on.
@@ -96,6 +111,70 @@ pub fn prove_trace(
     ))
 }
 
+/// Run `stages` on this thread and [`BlinderTerms::new`] beside it, returning both.
+///
+/// The two are independent, and `stages` is the one that blocks, so it keeps the caller's
+/// thread and the cheap half goes to a thread of its own. See [`prove_with_blinders`] for
+/// why a rayon worker is the wrong place for the blocking half.
+#[cfg(not(target_family = "wasm"))]
+fn spawn_terms<T: Send>(
+    pk: &ProvingKey,
+    r: Fr,
+    s: Fr,
+    stages: impl FnOnce() -> T,
+) -> (T, BlinderTerms) {
+    std::thread::scope(|sc| {
+        let terms = sc.spawn(|| BlinderTerms::new(pk, r, s));
+        let out = stages();
+        (
+            out,
+            terms
+                .join()
+                .unwrap_or_else(|e| std::panic::resume_unwind(e)),
+        )
+    })
+}
+
+/// wasm32 has no threads to spawn, so the terms cost what they always cost, in the order
+/// they were always computed. The browser prover does not reach this function at all: it
+/// drives the stages itself and calls [`assemble`].
+#[cfg(target_family = "wasm")]
+fn spawn_terms<T>(pk: &ProvingKey, r: Fr, s: Fr, stages: impl FnOnce() -> T) -> (T, BlinderTerms) {
+    let out = stages();
+    (out, BlinderTerms::new(pk, r, s))
+}
+
+/// The four stage 11 products that need only the key and the blinders.
+///
+/// Split out of [`assemble_from_terms`] so [`prove_with_blinders`] can compute them while
+/// stages 0 to 9 are still running: nothing here touches the witness or an MSM output, and
+/// these four are about 70% of stage 11's scalar arithmetic. `r` and `s` travel with the
+/// products so the combination cannot be handed terms built from different blinders than
+/// the ones it goes on to multiply by.
+struct BlinderTerms {
+    r: Fr,
+    s: Fr,
+    delta_g1_r: G1Projective,
+    delta_g1_s: G1Projective,
+    delta_g1_rs: G1Projective,
+    delta_g2_s: G2Projective,
+}
+
+impl BlinderTerms {
+    fn new(pk: &ProvingKey, r: Fr, s: Fr) -> Self {
+        stage!("s11 blind terms (4 scalar multiplications)", {
+            Self {
+                r,
+                s,
+                delta_g1_r: pk.delta_g1 * r,
+                delta_g1_s: pk.delta_g1 * s,
+                delta_g1_rs: pk.delta_g1 * (r * s),
+                delta_g2_s: pk.delta_g2 * s,
+            }
+        })
+    }
+}
+
 /// Stage 11 alone: blind the five MSM outputs into `(A, B, C)`.
 ///
 /// Split out of [`prove_with_blinders`] because the browser prover cannot go through
@@ -112,6 +191,22 @@ pub fn assemble(
     timings: &mut StageTimings,
 ) -> Proof {
     let start = Instant::now();
+    let terms = BlinderTerms::new(pk, r, s);
+    timings.assemble_us += start.elapsed().as_micros() as u64;
+    assemble_from_terms(pk, m, &terms, timings)
+}
+
+/// The combination half of stage 11. This is the one copy of the algebra: [`assemble`] and
+/// [`prove_with_blinders`] differ only in when [`BlinderTerms`] gets computed, never in
+/// what is combined.
+fn assemble_from_terms(
+    pk: &ProvingKey,
+    m: &MsmOutputs,
+    terms: &BlinderTerms,
+    timings: &mut StageTimings,
+) -> Proof {
+    let start = Instant::now();
+    let (r, s) = (terms.r, terms.s);
 
     // Stage 11, in snarkjs' order (groth16_prove.js). Deriving it from the article's
     // equation gives the same thing: A = alpha + sum(a_i w_i) + r*delta lives in G1,
@@ -119,11 +214,13 @@ pub fn assemble(
     // r*B1 with the double-counted r*s*delta subtracted back off. The one place a
     // transcription can go wrong is `s * pi_a`: that is the *blinded* A, not the raw
     // MSM, because the s*A term has to carry the alpha and r*delta pieces too.
-    let (pi_a, pi_b, pi_c) = stage!("s11 blind (6 scalar multiplications)", {
-        let pi_a = m.a_g1 + pk.alpha_g1 + pk.delta_g1 * r;
-        let pi_b = m.b_g2 + pk.beta_g2 + pk.delta_g2 * s;
-        let pib1 = m.b_g1 + pk.beta_g1 + pk.delta_g1 * s;
-        let pi_c = m.l_g1 + m.h_g1 + pi_a * s + pib1 * r - pk.delta_g1 * (r * s);
+    let (pi_a, pi_b, pi_c) = stage!("s11 blind (2 scalar multiplications)", {
+        let pi_a = m.a_g1 + pk.alpha_g1 + terms.delta_g1_r;
+        let pi_b = m.b_g2 + pk.beta_g2 + terms.delta_g2_s;
+        let pib1 = m.b_g1 + pk.beta_g1 + terms.delta_g1_s;
+        // These two wait on the MSM outputs but not on each other.
+        let (a_s, b1_r) = rayon::join(|| pi_a * s, || pib1 * r);
+        let pi_c = m.l_g1 + m.h_g1 + a_s + b1_r - terms.delta_g1_rs;
         (pi_a, pi_b, pi_c)
     });
 
