@@ -1247,6 +1247,39 @@ kernel void msm_merge_wide_g2(device PtG2* buckets [[buffer(0)]],
     msm_merge_wide_impl<Fq2>(buckets, spill_pts, spill_rows, counts, cursor, p, shared, tg, tid, tcount);
 }
 
+// Lane-to-lane point movement for the reduce's simd reduction. A shuffle moves 32-bit
+// registers, so a point is 32 (G1) or 64 (G2) shuffles; lanes past the simdgroup's edge
+// receive undefined values, which is safe in a down-reduction because no lane below the
+// edge ever reads a lane that has absorbed one.
+
+inline Fq fq_shuffle_down(Fq a, uint delta) {
+    Fq r;
+    for (uint i = 0; i < FQ_LIMBS; i++) {
+        r.v[i] = simd_shuffle_down(a.v[i], delta);
+    }
+    return r;
+}
+
+inline Fq2 fq2_shuffle_down(Fq2 a, uint delta) {
+    Fq2 r;
+    r.c0 = fq_shuffle_down(a.c0, delta);
+    r.c1 = fq_shuffle_down(a.c1, delta);
+    return r;
+}
+
+inline Fq  f_shuffle_down(Fq a, uint delta)  { return fq_shuffle_down(a, delta); }
+inline Fq2 f_shuffle_down(Fq2 a, uint delta) { return fq2_shuffle_down(a, delta); }
+
+template <typename F>
+inline Xyzz<F> pt_shuffle_down(Xyzz<F> p, uint delta) {
+    Xyzz<F> r;
+    r.x = f_shuffle_down(p.x, delta);
+    r.y = f_shuffle_down(p.y, delta);
+    r.zz = f_shuffle_down(p.zz, delta);
+    r.zzz = f_shuffle_down(p.zzz, delta);
+    return r;
+}
+
 // Stage 5: collapse one window's 2^(c-1) buckets to one point.
 //
 // The window sum is sum_j (j+1) B_j. Split the buckets into one segment per thread, at
@@ -1265,7 +1298,8 @@ kernel void msm_merge_wide_g2(device PtG2* buckets [[buffer(0)]],
 // REDUCE_TG is the threadgroup array size. 64 rather than 128 is a deliberate occupancy
 // choice: at 64 the G2 array is 64 * 256 = 16 KB, half of this device's 32 KB
 // threadgroup budget, so two threadgroups still fit per core. At 128 it would be the
-// whole budget and only one would.
+// whole budget and only one would. The G1 reduce below uses no threadgroup memory at
+// all; this constant still sizes the G2 reduce and both ones kernels.
 #define REDUCE_TG 64
 
 template <typename F>
@@ -1309,14 +1343,97 @@ inline void msm_reduce_impl(device const Xyzz<F>* buckets,
     }
 }
 
+// The G1 reduce, with the segment scaling taken off every thread's chain.
+//
+// In `msm_reduce_impl` each thread ends its segment with `pt_mul_small(run, lo)`, a
+// dependent double-and-add of up to 14 bits, and because SIMD lanes retire together
+// that multiply sits on every simdgroup's serial path whether one lane pays it or all
+// do. Deleting it (wrongly) measured the H reduce at 0.95 ms against 1.64 at 2^17, so
+// it was worth restating the identity to avoid it. Within a simdgroup the thread
+// offsets are uniform: thread t's segment starts at `base + t * seg_len`, so
+//
+//   sum_t (P_t + (base + t*seg_len) Q_t)
+//     = sum_t P_t + seg_len * sum_{t>=1} S_t + base * Q
+//
+// with S_t the suffix sums of the Q_t, which a Kogge-Stone shuffle scan computes in
+// five additions, and Q = S_0. The `seg_len` scaling is a few doublings, and the
+// `base` term leaves the kernel entirely: each simdgroup writes the PAIR (C, Q) to
+// `window_sums` and the host applies the bases, which fold to suffix additions plus
+// one small multiple per window because the bases step uniformly. No threadgroup
+// memory, no barriers, and the longest dependent chain loses the multiply.
+//
+// The G2 reduce keeps the plain shape: its plans are witness-sized, the reduce is not
+// on their critical path, and the host-side pair fold would price G2 additions into
+// every ladder combine for nothing.
+template <typename F>
+inline void msm_reduce_scan_impl(device const Xyzz<F>* buckets,
+                                 device Xyzz<F>* window_sums,
+                                 constant MsmParams& p,
+                                 uint tg,
+                                 uint tid,
+                                 uint tcount,
+                                 uint lane,
+                                 uint sg) {
+    uint w = tg / p.reduce_groups;
+    uint g = tg - w * p.reduce_groups;
+    uint chunk = (p.n_buckets + p.reduce_groups - 1u) / p.reduce_groups;
+    uint tg_lo = g * chunk;
+    uint tg_hi = min(tg_lo + chunk, p.n_buckets);
+    uint seg_len = (chunk + tcount - 1u) / tcount;
+    uint lo = tg_lo + tid * seg_len;
+    uint hi = min(lo + seg_len, tg_hi);
+
+    Xyzz<F> run = pt_zero<F>();
+    Xyzz<F> tot = pt_zero<F>();
+    if (lo < hi) {
+        for (uint j = hi; j > lo; j--) {
+            run = pt_add(run, buckets[w * p.n_buckets + (j - 1u)]);
+            tot = pt_add(tot, run);
+        }
+    }
+
+    // Suffix scan of the segment sums across the simdgroup. The boundary guard makes
+    // Kogge-Stone correct for any active lane count, and a lane past the segment range
+    // scans the identity.
+    uint active = min(32u, tcount - sg * 32u);
+    Xyzz<F> suff = run;
+    for (uint d = 1u; d < 32u; d <<= 1) {
+        Xyzz<F> other = pt_shuffle_down(suff, d);
+        if (lane + d < active) {
+            suff = pt_add(suff, other);
+        }
+    }
+
+    // V_t = P_t + seg_len * S_t, except lane 0, whose in-simdgroup offset is zero.
+    // Then the same guarded scan sums the V_t, and lane 0 holds the total.
+    Xyzz<F> v = tot;
+    if (lane != 0u) {
+        v = pt_add(v, pt_mul_small(suff, seg_len));
+    }
+    Xyzz<F> q = suff;
+    for (uint d = 1u; d < 32u; d <<= 1) {
+        Xyzz<F> other = pt_shuffle_down(v, d);
+        if (lane + d < active) {
+            v = pt_add(v, other);
+        }
+    }
+    if (lane == 0u) {
+        uint sgs = (tcount + 31u) / 32u;
+        uint slot = 2u * (tg * sgs + sg);
+        window_sums[slot] = v;
+        window_sums[slot + 1u] = q;
+    }
+}
+
 kernel void msm_reduce_g1(device const PtG1* buckets [[buffer(0)]],
                           device PtG1* window_sums [[buffer(1)]],
                           constant MsmParams& p [[buffer(2)]],
                           uint tg [[threadgroup_position_in_grid]],
                           uint tid [[thread_position_in_threadgroup]],
-                          uint tcount [[threads_per_threadgroup]]) {
-    threadgroup PtG1 shared[REDUCE_TG];
-    msm_reduce_impl<Fq>(buckets, window_sums, p, shared, tg, tid, tcount);
+                          uint tcount [[threads_per_threadgroup]],
+                          uint lane [[thread_index_in_simdgroup]],
+                          uint sg [[simdgroup_index_in_threadgroup]]) {
+    msm_reduce_scan_impl<Fq>(buckets, window_sums, p, tg, tid, tcount, lane, sg);
 }
 
 kernel void msm_reduce_g2(device const PtG2* buckets [[buffer(0)]],

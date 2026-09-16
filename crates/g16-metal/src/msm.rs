@@ -750,6 +750,19 @@ impl MetalMsm {
         })
     }
 
+    /// Threads per threadgroup the reduce actually dispatches with. [`Outputs::combine`]
+    /// recomputes the G1 kernel's simdgroup slots from it, so the two must agree.
+    fn reduce_tg(&self, is_g2: bool) -> usize {
+        let pso = if is_g2 {
+            &self.pipelines.reduce_g2
+        } else {
+            &self.pipelines.reduce_g1
+        };
+        REDUCE_TG
+            .min(pso.max_total_threads_per_threadgroup() as usize)
+            .max(1)
+    }
+
     pub fn device(&self) -> &Device {
         &self.device
     }
@@ -1163,7 +1176,7 @@ impl MetalMsm {
             use rayon::prelude::*;
             outs.par_iter()
                 .enumerate()
-                .map(|(i, out)| out.combine(&plans[job_plan[i]]))
+                .map(|(i, out)| out.combine(self, &plans[job_plan[i]]))
                 .collect()
         };
 
@@ -1456,7 +1469,11 @@ impl Outputs {
         let spill_slots = 2 * plan.n_windows * plan.slices;
         let spill_pts = pool.take(spill_slots * point_bytes);
         let spill_rows = pool.take(spill_slots * 4);
-        let window_sums = pool.take(plan.n_windows * plan.reduce_groups * point_bytes);
+        // The G1 reduce writes a (partial, weight) pair per simdgroup rather than one
+        // point per threadgroup; four is the worst case, two simdgroups of two points.
+        let sums_per_group = if is_g2 { 1 } else { 4 };
+        let window_sums =
+            pool.take(plan.n_windows * plan.reduce_groups * sums_per_group * point_bytes);
         let ones = pool.take(ones_groups * point_bytes);
         keep.push(buckets.clone());
         keep.push(spill_pts.clone());
@@ -1632,7 +1649,7 @@ impl Outputs {
         enc.set_buffer(0, Some(&self.buckets), 0);
         enc.set_buffer(1, Some(&self.window_sums), 0);
         set_params(enc, 2, &p);
-        let tg = REDUCE_TG.min(red_pso.max_total_threads_per_threadgroup() as usize);
+        let tg = msm.reduce_tg(self.is_g2);
         enc.dispatch_thread_groups(
             MTLSize::new((plan.n_windows * plan.reduce_groups) as u64, 1, 1),
             MTLSize::new(tg as u64, 1, 1),
@@ -1687,7 +1704,7 @@ impl Outputs {
         );
     }
 
-    fn combine(&self, plan: &Plan<'_>) -> MsmResult {
+    fn combine(&self, msm: &MetalMsm, plan: &Plan<'_>) -> MsmResult {
         let rg = plan.reduce_groups;
         if self.is_g2 {
             let o: &[PackedXyzzG2] = unsafe { read_back(&self.ones, self.ones_groups) };
@@ -1769,23 +1786,59 @@ impl Outputs {
                 }
                 return MsmResult::G1(acc);
             }
-            let w: &[PackedXyzzG1] = unsafe { read_back(&self.window_sums, plan.n_windows * rg) };
-            // Horner over the windows, high to low, `c` doublings between each, each
-            // window's `reduce_groups` partials folded first. Same order as the CPU
-            // backend, so the two agree in the group and the audit can compare affine.
+            // The G1 reduce hands back a (partial, weight) PAIR per simdgroup; slot s
+            // of a window carries the buckets based at `(s/sgs)*chunk + (s%sgs)*stride`
+            // (see msm_reduce_scan_impl). The bases step uniformly whenever the chunk
+            // splits evenly over the threadgroup, which every unforced shape does, and
+            // then the weighted term folds to suffix additions plus one small multiple
+            // per window; a forced override that breaks the stride pays one multiple
+            // per slot instead. The fold tripled in additions against the old
+            // one-point-per-group readback, so the windows fold on the thread pool
+            // before the serial Horner, which keeps the same window order as the CPU
+            // backend so the audit can compare affine.
+            let tcount = msm.reduce_tg(false);
+            let sgs = tcount.div_ceil(32);
+            let slots = rg * sgs;
+            let w: &[PackedXyzzG1] =
+                unsafe { read_back(&self.window_sums, plan.n_windows * slots * 2) };
+            let chunk = plan.n_buckets.div_ceil(rg);
+            let seg_len = chunk.div_ceil(tcount);
+            let stride = 32 * seg_len;
+            let uniform = chunk == sgs * stride;
             let sum_w = |k: usize| {
-                let mut s = w[k * rg].to_projective();
-                for x in &w[k * rg + 1..(k + 1) * rg] {
-                    s += x.to_projective();
+                let p = &w[k * slots * 2..(k + 1) * slots * 2];
+                if uniform {
+                    let mut c = G1Projective::zero();
+                    let mut suff = G1Projective::zero();
+                    let mut t = G1Projective::zero();
+                    for s in (0..slots).rev() {
+                        c += p[2 * s].to_projective();
+                        suff += p[2 * s + 1].to_projective();
+                        if s >= 1 {
+                            t += &suff;
+                        }
+                    }
+                    c + mul_u64(t, stride as u64)
+                } else {
+                    let mut c = G1Projective::zero();
+                    for s in 0..slots {
+                        let base = (s / sgs) * chunk + (s % sgs) * stride;
+                        c += p[2 * s].to_projective();
+                        c += mul_u64(p[2 * s + 1].to_projective(), base as u64);
+                    }
+                    c
                 }
-                s
             };
-            let mut acc = sum_w(plan.n_windows - 1);
+            let sums: Vec<G1Projective> = {
+                use rayon::prelude::*;
+                (0..plan.n_windows).into_par_iter().map(sum_w).collect()
+            };
+            let mut acc = sums[plan.n_windows - 1];
             for k in (0..plan.n_windows - 1).rev() {
                 for _ in 0..plan.c {
                     acc.double_in_place();
                 }
-                acc += sum_w(k);
+                acc += sums[k];
             }
             for x in o {
                 acc += x.to_projective();
@@ -1798,6 +1851,22 @@ impl Outputs {
 // ---------------------------------------------------------------------------
 // Encoding helpers
 // ---------------------------------------------------------------------------
+
+/// `k * p` by MSB-first double-and-add. `k` is a bucket base, a few thousand at most,
+/// and this runs a handful of times per window inside the combine.
+fn mul_u64(p: G1Projective, k: u64) -> G1Projective {
+    let mut acc = G1Projective::zero();
+    if k == 0 || p.is_zero() {
+        return acc;
+    }
+    for i in (0..64 - k.leading_zeros()).rev() {
+        acc.double_in_place();
+        if (k >> i) & 1 == 1 {
+            acc += &p;
+        }
+    }
+    acc
+}
 
 fn set_params(enc: &ComputeCommandEncoderRef, index: u64, p: &MsmParams) {
     enc.set_bytes(
