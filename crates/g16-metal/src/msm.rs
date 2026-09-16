@@ -315,9 +315,29 @@ pub fn window_size_for(m: usize, recode_bits: usize) -> u32 {
     /// One mixed addition in the segmented accumulation, microseconds.
     const MADD_US: f64 = 0.00324;
     /// One bucket's share of the clear, merge and reduction kernels, microseconds.
-    const ROW_US: f64 = 0.025;
+    ///
+    /// Refit from 0.025 after the wide merge and the scan reduce cut what a row
+    /// costs, against production warm medians rather than isolated phases: the
+    /// anchors are c=10 winning tornado's plans at m about 33k (24.5 ms against 26.4
+    /// at the old c=8 and 30.2 at c=13), c=12 winning sha256's H at m=65,536 (its
+    /// minima read 9.9-10.0 against 10.2 at c=13, and c=10 loses at 10.4-10.7),
+    /// c=12 winning js_8x8_d32's witness plans at m about 69k by 2.5 ms, and c=13
+    /// and c=15 keeping the csp H jobs at 2^17/2^18 and 2^19. 0.022 holds every one
+    /// of those with at least 70 us of modelled margin; 0.025 tips the 65k H to
+    /// c=10, which is measured slower there.
+    const ROW_US: f64 = 0.022;
     /// One iteration of the merge loop on the busiest bucket, microseconds. Serial.
     const MERGE_US: f64 = 27.0;
+    /// The wide merge's floor, microseconds: its dispatch plus one threadgroup's
+    /// stride-and-tree. Bracketed rather than fitted: subtracting the spill half of
+    /// the measured merge phase leaves 60 to 160 us across the two csp sizes that
+    /// engage it, and no ranking above or below flips anywhere in that range. With
+    /// the wide path priced, forcing the once-pathological widths confirms the
+    /// model: at 2^17 c=12/13/14 measure 10.0/9.1/10.0 ms on the H job (they read
+    /// 27.5/11.2/27.8 before the wide merge), and at 2^19 c=15 keeps winning at
+    /// 27.3 against 29.5/29.8, so the blow-ups the serial term guarded against are
+    /// gone rather than merely repriced.
+    const WIDE_US: f64 = 100.0;
 
     let slice = slice_len() as f64;
     let mut best = 3;
@@ -330,9 +350,15 @@ pub fn window_size_for(m: usize, recode_bits: usize) -> u32 {
         let top_buckets = (1u64 << (top_bits.min(cu) - 1)) as f64;
         let fattest = m as f64 / top_buckets;
 
-        let cost = MADD_US * (w * m) as f64
-            + ROW_US * (w << (cu - 1)) as f64
-            + MERGE_US * (fattest / slice);
+        // The serial walk only prices spans the wide merge leaves alone; past the
+        // threshold the fattest bucket costs one threadgroup's strided pass instead.
+        let span = fattest / slice;
+        let fat = if span >= MERGE_WIDE_MIN_SPAN as f64 {
+            WIDE_US + MERGE_US * span / MERGE_TG as f64
+        } else {
+            MERGE_US * span
+        };
+        let cost = MADD_US * (w * m) as f64 + ROW_US * (w << (cu - 1)) as f64 + fat;
         if cost < best_cost {
             best_cost = cost;
             best = c;
