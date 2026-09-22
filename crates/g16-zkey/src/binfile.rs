@@ -178,7 +178,7 @@ impl BinFile {
         scan: Scan,
     ) -> Result<Self, ZkeyError> {
         if data.len() < 12 {
-            return Err(ZkeyError::BadMagic([0; 4]));
+            return Err(ZkeyError::TooShort(data.len()));
         }
         let got: [u8; 4] = data[0..4].try_into().expect("slice is 4 bytes");
         if &got != magic {
@@ -445,7 +445,13 @@ pub fn g2(b: &[u8]) -> G2Affine {
 /// Checks a section holds exactly `n` records of `stride` bytes. Getting this wrong is
 /// how an off-by-one in one section quietly shifts every later one.
 pub fn expect_records(data: &[u8], n: usize, stride: usize, section: u32) -> Result<(), ZkeyError> {
-    let want = n * stride;
+    // `n` is a header field, so the product is attacker-controlled. A 64-bit `usize`
+    // cannot overflow it, but this crate is also built for wasm32, where a wrapped `want`
+    // of 0 would make the one length gate every section goes through pass vacuously.
+    let want = n.checked_mul(stride).ok_or_else(|| ZkeyError::Malformed {
+        section,
+        reason: format!("{n} records of {stride} bytes overflows usize"),
+    })?;
     if data.len() != want {
         return Err(ZkeyError::Malformed {
             section,

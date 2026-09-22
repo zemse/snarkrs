@@ -77,6 +77,8 @@ pub enum ZkeyError {
     Io(#[from] std::io::Error),
     #[error("not a zkey file (bad magic {0:?})")]
     BadMagic([u8; 4]),
+    #[error("file is {0} bytes, too short for a binfile header")]
+    TooShort(usize),
     #[error("unsupported protocol id {0} (only groth16 = 1)")]
     UnsupportedProtocol(u32),
     #[error("unsupported curve: expected BN254")]
@@ -179,21 +181,33 @@ impl ProvingKey {
         //    `domain_size` G1 points, so its length refutes a lying header for the cost of
         //    a slice lookup, with nothing allocated yet.
         expect_records(file.unique_section(9)?, domain_size, G1_BYTES, 9)?;
+        // `n_public` is attacker-supplied and `+ 1` is not free. On a 32-bit `usize` - and
+        // this crate is built for wasm32 - `u32::MAX + 1` wraps to 0 in release, where
+        // overflow checks are off. Section 3 is then read as an empty IC, the guard below
+        // becomes `n_vars < 0` and never fires, and `n_vars - n_ic` wraps back to `n_vars`.
+        // That is the same empty-`ic` key `want_ic` on the JSON path exists to refuse,
+        // reached through the other door.
+        let n_ic = n_public
+            .checked_add(1)
+            .ok_or_else(|| ZkeyError::Malformed {
+                section: 2,
+                reason: format!("n_public {n_public} is impossibly large"),
+            })?;
         // The L query covers the private wires only, so an n_vars that does not leave
         // room for `1 + n_public` would underflow the section 8 length below.
-        if n_vars < n_public + 1 {
+        if n_vars < n_ic {
             return Err(ZkeyError::Malformed {
                 section: 2,
                 reason: format!("n_vars {n_vars} does not cover 1 + n_public {n_public}"),
             });
         }
 
-        let ic = read_g1_section(&file, 3, n_public + 1)?;
+        let ic = read_g1_section(&file, 3, n_ic)?;
         let coeffs = read_coefficients(file.unique_section(4)?, n_vars, domain_size)?;
         let a_query = read_g1_section(&file, 5, n_vars)?;
         let b_g1_query = read_g1_section(&file, 6, n_vars)?;
         let b_g2_query = read_g2_section(&file, 7, n_vars)?;
-        let l_query = read_g1_section(&file, 8, n_vars - n_public - 1)?;
+        let l_query = read_g1_section(&file, 8, n_vars - n_ic)?;
         let h_query = read_g1_section(&file, 9, domain_size)?;
 
         // Only the O(1) points are validated on load. The query sections are millions of

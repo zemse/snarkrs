@@ -68,6 +68,19 @@ fn zero_coordinates_decode_to_the_identity() {
     assert!(!G1Affine::new_unchecked(Fq::zero(), Fq::zero()).is_on_curve());
 }
 
+/// `n * stride` used to be a plain multiply. `n` comes straight out of the header, so on a
+/// 32-bit `usize` - and this crate is built for wasm32 - a record count of 2^30 against the
+/// 44-byte coefficient stride wraps to zero, and the one length gate every section goes
+/// through then accepts an empty payload. The check is target-independent, so this is.
+#[test]
+fn a_record_count_that_overflows_usize_is_refused() {
+    let n = usize::MAX / COEF_RECORD + 1;
+    assert!(matches!(
+        binfile::expect_records(&[], n, COEF_RECORD, 4),
+        Err(ZkeyError::Malformed { section: 4, .. })
+    ));
+}
+
 /// Encodes `v` the way snarkjs writes a section-4 coefficient: the limbs of `v * R^2`.
 fn encode_coef(v: u64) -> [u8; 32] {
     let r = r_inv().inverse().unwrap();
@@ -416,6 +429,7 @@ fn snarkjs_reference_proof_verifies_under_the_parsed_key() {
 /// Layout, in order: `n8q`, `q`, `n8r`, `r`, `nVars`, `nPublic`, `domainSize`, then
 /// `alpha1` (G1), `beta1` (G1), `beta2` (G2), `gamma2` (G2), `delta1` (G1), `delta2` (G2).
 struct Header2 {
+    n_public_at: usize,
     domain_size_at: usize,
     beta_g1_at: usize,
     delta_g1_at: usize,
@@ -442,6 +456,7 @@ fn locate(bytes: &[u8]) -> Header2 {
     let p = p + 4 + n8r + 8; // skip nVars, nPublic
     let alpha1 = p + 4;
     Header2 {
+        n_public_at: p - 4,
         domain_size_at: p,
         beta_g1_at: alpha1 + 64,
         delta_g1_at: alpha1 + 64 + 64 + 128 + 128,
@@ -497,6 +512,32 @@ fn a_zeroed_toxic_waste_point_is_rejected() {
                 a.name
             );
         }
+    });
+}
+
+/// The same `nPublic + 1` the JSON path above guards, out of a file that is just as
+/// attacker-controlled. On a 32-bit `usize` the add wraps: section 3 is read as an empty
+/// IC, the `n_vars < n_ic` guard becomes `n_vars < 0` and never fires, and `n_vars - n_ic`
+/// wraps back to `n_vars`, which is the empty-`ic` key the JSON regression exists to
+/// prevent. On 64-bit the u32 cannot overflow the add and the guard is what refuses it.
+/// Either way the file must not load, so the test does not care which one fired.
+#[test]
+fn a_zkey_claiming_an_impossible_npublic_is_refused() {
+    for_each_artifact("a_zkey_claiming_an_impossible_npublic_is_refused", |a| {
+        let err = load_mutated("npublic", &a.dir, |b| {
+            let at = locate(b).n_public_at;
+            b[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        })
+        .expect_err(&format!(
+            "{}: nPublic = u32::MAX must be refused, not parsed into an empty ic",
+            a.name
+        ));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("n_public"),
+            "{}: unhelpful error: {msg}",
+            a.name
+        );
     });
 }
 
@@ -674,10 +715,11 @@ fn the_byte_path_and_the_mmap_path_parse_identically() {
 /// leaves the byte path, which is the one the browser uses, without them.
 #[test]
 fn the_byte_path_rejects_what_the_mmap_path_rejects() {
-    // Shorter than the 12-byte magic + version + nSections header.
+    // Shorter than the 12-byte magic + version + nSections header. These four bytes are
+    // the right magic, so the error must not claim otherwise.
     assert!(matches!(
         ProvingKey::from_bytes(b"zkey".to_vec()),
-        Err(ZkeyError::BadMagic(_))
+        Err(ZkeyError::TooShort(4))
     ));
     // Right length, wrong magic.
     assert!(matches!(
