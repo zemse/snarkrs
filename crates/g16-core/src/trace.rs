@@ -106,7 +106,10 @@ impl Trace {
         m: &MsmOutputs,
         proof: &Proof,
     ) -> Self {
-        let public = &witness[1..(n_public + 1).min(witness.len())];
+        // `.min` alone still panics on an empty witness: the range becomes `1..0`, and a
+        // slice range whose start runs past its end is not empty, it is out of bounds.
+        let end = (n_public + 1).min(witness.len());
+        let public = witness.get(1..end).unwrap_or(&[]);
         let (r, s) = blinders();
 
         let shape = vec![
