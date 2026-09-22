@@ -179,7 +179,16 @@ __device__ __forceinline__ void g16_ntt_batch(Fr* sh,
                                               u32 log_n, u32 s0, u32 k, u32 low,
                                               u32 tid, u32 tgsz)
 {
-    u32 halves = 1u << (k - 1u); // butterflies per pass; k >= 1 whenever this is called
+    // A zero-width batch has no butterflies and `1u << (k - 1u)` would shift by
+    // 0xFFFFFFFF, which is undefined and lets ptxas hand back any `halves` it likes,
+    // including one that walks the slice off the end. k comes from NttParams, so the
+    // branch is uniform across the block and none of the __syncthreads() below is
+    // reached by only some of its threads.
+    if (k == 0u) {
+        return;
+    }
+
+    u32 halves = 1u << (k - 1u); // butterflies per pass
     for (u32 t = 0u; t < k; t++) {
         u32 hl = 1u << t;
         u32 twshift = log_n - s0 - t - 1u;
@@ -254,9 +263,7 @@ extern "C" __global__ void g16_ntt_head(
     }
     __syncthreads();
 
-    if (p.k > 0u) {
-        g16_ntt_batch(sh, tw, p.log_n, 0u, p.k, 0u, tid, tgsz);
-    }
+    g16_ntt_batch(sh, tw, p.log_n, 0u, p.k, 0u, tid, tgsz);
 
     for (u32 m = tid; m < blk; m += tgsz) {
         u32 i = base + m;
@@ -276,9 +283,9 @@ extern "C" __global__ void g16_ntt_head(
 // the batch, so the blocks partition the domain with no overlap and no gap.
 //
 // LAUNCH: identical geometry to the head, grid_dim.x = max(1, n >> k) blocks,
-// shared_mem_bytes = (1 << k) * 32. This kernel is never launched with k = 0, because a
-// zero-width batch only ever appears as the single batch of a size-1 domain and that one
-// is served by the head.
+// shared_mem_bytes = (1 << k) * 32. This kernel is not launched with k = 0 today, because
+// a zero-width batch only ever appears as the single batch of a size-1 domain and that
+// one is served by the head; g16_ntt_batch returns early on k = 0 regardless.
 extern "C" __global__ void g16_ntt_tail(
     Fr*             a,
     const Fr*       tw,
