@@ -2092,6 +2092,8 @@ mod tests {
     use g16_zkey::{wtns::Witness, ProvingKey};
     use std::path::PathBuf;
 
+    /// `name` is relative to `bench/artifacts`, so the grouped sets are reached as
+    /// `csp/keccak_128` rather than being unreachable from a flat name.
     fn artifact(name: &str) -> Option<PathBuf> {
         let d = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../bench/artifacts")
@@ -2261,6 +2263,59 @@ mod tests {
         let ds = m.upload_scalars(&scalars).expect("upload scalars");
         let got = m.msm_g2(&db, &ds).unwrap();
         assert_eq!(got.into_affine(), want.into_affine());
+    }
+
+    /// The host tail, which nothing else in the default suite reaches.
+    ///
+    /// Past [`HOST_TAIL_MAX_BUCKETS`] a one-window plan stops after the accumulation and
+    /// [`Outputs::combine`] folds the spilled runs into the buckets itself, then walks a
+    /// reverse running sum. That is a different final answer, not a different schedule,
+    /// and it needs scalars short enough to recode in a single window, which none of the
+    /// js artifacts produce. The plan shape is asserted as well as the answer, because a
+    /// refit of the window model that moved `c` off 9 here would otherwise leave this
+    /// quietly testing the GPU reduce instead.
+    #[test]
+    fn a_one_window_plan_finishes_on_the_host_and_matches_a_naive_sum() {
+        use g16_field::PrimeGroup;
+        let m = MetalMsm::new().expect("Metal device");
+        let n = 1000usize;
+        let mut g1 = Vec::with_capacity(n);
+        let mut g2 = Vec::with_capacity(n);
+        let mut scalars = Vec::with_capacity(n);
+        let mut c1 = G1Projective::generator();
+        let mut c2 = G2Projective::generator();
+        for i in 0..n {
+            c1 += G1Projective::generator();
+            c2 += G2Projective::generator();
+            g1.push(c1.into_affine());
+            g2.push(c2.into_affine());
+            // Under 2^8, so the plan lays the recoding over nine bits and spends them in
+            // one window. The cycle also carries zeros and ones, which keeps the ones
+            // gather and the spill fold on the path together.
+            scalars.push(Fr::from((i % 200) as u64));
+        }
+        let ds = m.upload_scalars(&scalars).expect("upload scalars");
+        let plan = Plan::new(&ds, 0, n);
+        assert!(
+            plan.host_tail,
+            "c = {} over {} windows of {} buckets is not the host-tail shape",
+            plan.c, plan.n_windows, plan.n_buckets
+        );
+
+        let b1 = m.upload_g1_bases(&g1).expect("upload bases");
+        let b2 = m.upload_g2_bases(&g2).expect("upload bases");
+        let want1 = g1
+            .iter()
+            .zip(&scalars)
+            .fold(G1Projective::zero(), |a, (b, s)| a + *b * s);
+        let want2 = g2
+            .iter()
+            .zip(&scalars)
+            .fold(G2Projective::zero(), |a, (b, s)| a + *b * s);
+        let got1 = m.msm_g1(&b1, &ds).unwrap();
+        let got2 = m.msm_g2(&b2, &ds).unwrap();
+        assert_eq!(got1.into_affine(), want1.into_affine());
+        assert_eq!(got2.into_affine(), want2.into_affine());
     }
 
     /// The device entry point cannot assume H never contains a one. Exercise both
@@ -2749,7 +2804,20 @@ mod tests {
     #[test]
     #[ignore = "minutes on the CPU oracle side"]
     fn five_msms_match_cpu_on_every_artifact() {
-        for name in ["js_2x2_d16", "js_2x2_d32", "js_8x8_d32", "js_16x16_d32"] {
+        for name in [
+            "js_2x2_d16",
+            "js_2x2_d32",
+            "js_8x8_d32",
+            "js_16x16_d32",
+            // The csp set, a level down and therefore missed by every flat name. It is
+            // where the witness plans are one window wide and the H plans reach c = 15,
+            // so it is the only set that covers the host tail and the split scatter.
+            "csp/sha256_128",
+            "csp/sha256_256",
+            "csp/keccak_128",
+            "csp/keccak_256",
+            "csp/keccak_512",
+        ] {
             five_msms_against_cpu(name);
         }
     }

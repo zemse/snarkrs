@@ -16,18 +16,33 @@ use g16_metal::stages::{HHandle, TAG};
 use g16_metal::MetalBackend;
 use g16_zkey::{wtns::Witness, ProvingKey, VerifyingKey};
 
+/// Every artifact under `bench/artifacts`, named by its path relative to that root.
+///
+/// Two levels, not one: the csp set is grouped under `csp/`, and a flat walk skipped it
+/// entirely while `assert!(!found.is_empty())` stayed green on the `js_*` set. Those are
+/// the circuits the one-window host tail, the wide merge and c = 15 were tuned on, so
+/// they are exactly the ones that must not go unaudited.
 fn artifacts() -> Vec<(String, PathBuf)> {
+    fn walk(dir: &Path, prefix: &str, depth: usize, out: &mut Vec<(String, PathBuf)>) {
+        for d in std::fs::read_dir(dir).expect("read_dir").flatten() {
+            let d = d.path();
+            if !d.is_dir() {
+                continue;
+            }
+            let name = format!("{prefix}{}", d.file_name().unwrap().to_string_lossy());
+            if d.join("circuit.zkey").is_file() && d.join("circuit.wtns").is_file() {
+                out.push((name, d));
+            } else if depth > 0 {
+                walk(&d, &format!("{name}/"), depth - 1, out);
+            }
+        }
+    }
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../bench/artifacts")
         .canonicalize()
         .expect("bench/artifacts");
-    let mut out: Vec<(String, PathBuf)> = std::fs::read_dir(&root)
-        .expect("read_dir")
-        .flatten()
-        .map(|e| e.path())
-        .filter(|d| d.join("circuit.zkey").is_file() && d.join("circuit.wtns").is_file())
-        .map(|d| (d.file_name().unwrap().to_string_lossy().into_owned(), d))
-        .collect();
+    let mut out = Vec::new();
+    walk(&root, "", 1, &mut out);
     out.sort();
     out
 }
