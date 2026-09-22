@@ -125,7 +125,7 @@ struct MsmParams {
     u32 c;           // window width in bits
     u32 n_windows;   // ceil(255 / c)
     u32 n_buckets;   // 2^(c-1)
-    u32 cap;         // entries reserved per window, == n
+    u32 cap;         // entries reserved per window, == the general-scalar count
     u32 scalar_off;  // element offset into the scalar buffer
     u32 base_off;    // element offset into the base buffer
     u32 ones_groups; // blocks in msm_ones_*
