@@ -16,7 +16,8 @@
 //!   g16 ptau beacon     --ptau p_0001.ptau --out p_final.ptau
 //!                       --beacon-hash HEX --num-iterations-exp N [--name S]
 //!                       [--backend cpu|metal]
-//!   g16 ptau prepare    --ptau p_final.ptau --out prepared.ptau [--backend cpu|metal]
+//!   g16 ptau prepare    --ptau p_final.ptau --out prepared.ptau
+//!                       [--backend cpu|metal|cuda]
 //!   g16 ptau verify     --ptau p.ptau
 //!
 //!   g16 zkey contribute               --zkey c_0000.zkey --out c_0001.zkey
@@ -212,8 +213,8 @@ enum PtauCmd {
         ptau: PathBuf,
         #[arg(long, value_name = "FILE")]
         out: PathBuf,
-        /// cpu or metal. Both must write byte-identical output; that equivalence is what
-        /// carries the snarkjs one.
+        /// cpu, metal or cuda. All must write byte-identical output; that equivalence is
+        /// what carries the snarkjs one.
         #[arg(long, value_enum, default_value_t = BackendKind::Cpu)]
         backend: BackendKind,
     },
@@ -402,8 +403,6 @@ fn metal_key() -> Result<Box<dyn KeyScale>> {
     Err(no_metal())
 }
 
-/// The feature is off, or it is on and the target is not macOS. Two different fixes, so
-/// two different messages, as in `make_backend`.
 #[cfg(feature = "cuda")]
 fn cuda_fft() -> Result<Box<dyn GroupFft>> {
     Ok(Box::new(g16_cuda::CudaGroupFft::new().map_err(|e| {
@@ -416,6 +415,8 @@ fn cuda_fft() -> Result<Box<dyn GroupFft>> {
     Err(no_cuda())
 }
 
+/// The feature is off, or it is on and the target is not macOS. Two different fixes, so
+/// two different messages, as in `make_backend`.
 #[cfg(not(all(feature = "metal", target_os = "macos")))]
 fn no_metal() -> anyhow::Error {
     if cfg!(feature = "metal") {
