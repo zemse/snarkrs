@@ -77,6 +77,17 @@ fn adc(a: u64, b: u64, carry: u64) -> (u64, u64) {
     (t as u64, (t >> 64) as u64)
 }
 
+/// `t < m`, the `[0, p)` invariant the whole module is written against. Only the
+/// `debug_assert!`s on the conversion entry points call this; nothing on a hot path does.
+fn is_reduced(t: &[u64; 4], m: &[u64; 4]) -> bool {
+    for i in (0..4).rev() {
+        if t[i] != m[i] {
+            return t[i] < m[i];
+        }
+    }
+    false
+}
+
 /// `if t >= m { t - m } else { t }`, branch-free: both candidates are computed and
 /// blended by a mask. LLVM emits csel/cmov for the blend.
 #[inline(always)]
@@ -188,13 +199,24 @@ impl RawFq {
 
     #[inline(always)]
     pub fn from_fq(x: &Fq) -> Self {
-        // arkworks stores exactly these limbs (Montgomery form, little-endian).
+        // arkworks stores exactly these limbs (Montgomery form, little-endian). Reading
+        // the hidden field is the one place here that has no public equivalent: every
+        // public accessor goes out through `into_bigint`, i.e. a Montgomery round-trip,
+        // which is exactly the cost this type exists to avoid.
+        //
+        // This is also the boundary the `[0, p)` invariant is only ever crossed at. It is
+        // not free-standing hygiene: `mont_mul`'s fused shape drops the carry out of limb
+        // 3 because reduced inputs cannot produce one, so an unreduced element entering
+        // here comes back out of the next multiply as a wrong field element. The GPU
+        // unpack path is the live risk — `PackedFq::to_fq` is `new_unchecked` over raw
+        // device words, range-checked by nothing but the kernels' closing `cond_sub`.
+        debug_assert!(is_reduced(&x.0 .0, &FQ_MOD), "RawFq from an unreduced Fq");
         RawFq(x.0 .0)
     }
 
     #[inline(always)]
     pub fn to_fq(self) -> Fq {
-        ark_ff::Fp(ark_ff::BigInt(self.0), core::marker::PhantomData)
+        Fq::new_unchecked(ark_ff::BigInt::new(self.0))
     }
 
     #[inline(always)]
@@ -410,12 +432,13 @@ impl RawFr {
 
     #[inline(always)]
     pub fn from_fr(x: &Fr) -> Self {
+        debug_assert!(is_reduced(&x.0 .0, &FR_MOD), "RawFr from an unreduced Fr");
         RawFr(x.0 .0)
     }
 
     #[inline(always)]
     pub fn to_fr(self) -> Fr {
-        ark_ff::Fp(ark_ff::BigInt(self.0), core::marker::PhantomData)
+        Fr::new_unchecked(ark_ff::BigInt::new(self.0))
     }
 
     #[inline(always)]
