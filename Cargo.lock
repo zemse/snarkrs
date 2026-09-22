@@ -969,16 +969,12 @@ dependencies = [
 name = "g16-zkey"
 version = "0.1.0"
 dependencies = [
- "ark-bn254",
  "ark-ec",
  "ark-ff",
- "ark-serialize",
- "byteorder",
  "g16-field",
  "memmap2",
  "num-bigint",
  "rayon",
- "serde",
  "serde_json",
  "thiserror 2.0.19",
 ]
