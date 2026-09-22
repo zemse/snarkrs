@@ -17,12 +17,12 @@ pub enum Direction {
     Inverse,
 }
 
-/// The transform primitives a backend must provide. Deliberately slice-shaped: the CPU
-/// backend operates in place on host memory, and the Metal backend implements this trait
-/// only for testing kernels in isolation. The *production* GPU path does not go through
-/// this trait, because round-tripping every transform across the boundary would defeat
-/// the point; it implements [`g16_core::PreparedCircuit::compute_h`] directly and keeps
-/// the three vectors device-resident across all six transforms.
+/// The transform primitives a backend must provide. Deliberately slice-shaped: [`CpuNtt`]
+/// is the only implementation, and it operates in place on host memory. The GPU backends
+/// do not implement this trait at all, because round-tripping every transform across the
+/// boundary would defeat the point; each implements
+/// [`g16_core::PreparedCircuit::compute_h`] directly and keeps the three vectors
+/// device-resident across all six transforms.
 pub trait NttBackend: Send + Sync {
     fn name(&self) -> &'static str;
     /// In-place radix-2 NTT. `a.len()` must equal `domain.size`.
@@ -43,8 +43,9 @@ pub trait NttBackend: Send + Sync {
 /// work of 2^12 in less wall time because only one of them took the parallel path.
 ///
 /// Benchmark numbers taken under load are worse than no numbers, because they look like
-/// measurements.
-const PARALLEL_THRESHOLD: usize = 1 << 10;
+/// measurements. Public so the probes that sweep across this boundary can label their
+/// rows from the constant rather than from a literal that drifts the next time it moves.
+pub const PARALLEL_THRESHOLD: usize = 1 << 10;
 
 /// Rayon tasks per pass, as a multiple of the thread count. Slight oversubscription lets
 /// work stealing even out threads that lose time to cache misses; going much higher just
@@ -453,6 +454,14 @@ fn chunk_len(n: usize, tasks: usize) -> usize {
 /// of decimation in time into a flat in-place loop.
 fn bit_reverse_permute(a: &mut [Fr], log_n: u32) {
     let n = a.len();
+    // The loop bound comes from the slice and the shift from `log_n`, so a caller that
+    // reaches here without `check_domain` having related the two gets a permutation on
+    // the wrong width: in bounds, no panic, silently the wrong table.
+    debug_assert_eq!(
+        n,
+        1usize << log_n,
+        "bit reversal width must match the slice length"
+    );
     if n <= 2 {
         return;
     }
@@ -696,6 +705,21 @@ mod tests {
             .collect()
     }
 
+    /// `[root^(j*k)]_k`: the transform of the impulse `e_j`, and the only reference that
+    /// is O(n) rather than O(n^2). Built as one running product so it shares no indexing
+    /// with the transform under test.
+    fn impulse_transform(root: Fr, j: usize, n: usize) -> Vec<Fr> {
+        let step = root.pow([j as u64]);
+        let mut acc = Fr::ONE;
+        (0..n)
+            .map(|_| {
+                let v = acc;
+                acc *= step;
+                v
+            })
+            .collect()
+    }
+
     fn naive_cyclic_convolution(a: &[Fr], b: &[Fr]) -> Vec<Fr> {
         let n = a.len();
         let mut out = vec![Fr::ZERO; n];
@@ -770,6 +794,49 @@ mod tests {
                 .map(|v| v * d.size_inv)
                 .collect();
             assert_eq!(inv, want, "inverse, n = {n}");
+        }
+    }
+
+    #[test]
+    fn matches_the_impulse_dft_above_the_fused_block() {
+        // `naive_dft` is O(n^2), so `matches_the_naive_dft` stops at n = 16 and no
+        // reference written independently of this file reached CACHE_BLOCK, which is
+        // where the fused per-block passes and the radix-4 kernels start running at all.
+        // The impulse makes the reference O(n), so the sizes the prover actually uses
+        // become affordable to predict.
+        let ntt = CpuNtt::new();
+        for log in [12u32, 14, 16] {
+            let n = 1usize << log;
+            let d = domain(n);
+            // An odd index around n/3, so `j * k` cycles through the whole table and a
+            // wrong permutation or a mis-strided twiddle cannot land back on itself.
+            let j = (n / 3) | 1;
+            let mut x = vec![Fr::ZERO; n];
+            x[j] = Fr::ONE;
+
+            let mut fwd = x.clone();
+            ntt.ntt(&d, &mut fwd, Direction::Forward);
+            assert_eq!(
+                fwd,
+                impulse_transform(d.group_gen, j, n),
+                "forward, n = {n}"
+            );
+
+            let mut inv = x.clone();
+            ntt.ntt(&d, &mut inv, Direction::Inverse);
+            let want: Vec<Fr> = impulse_transform(d.group_gen_inv, j, n)
+                .into_iter()
+                .map(|v| v * d.size_inv)
+                .collect();
+            assert_eq!(inv, want, "inverse, n = {n}");
+
+            // The DIF kernels are reached only through `intt_to_bitrev`, which defers
+            // the 1/n, so its output is the unscaled inverse table permuted.
+            let mut bitrev = x;
+            ntt.intt_to_bitrev(&d, &mut bitrev);
+            let mut want = impulse_transform(d.group_gen_inv, j, n);
+            bit_reverse_permute(&mut want, d.log_size);
+            assert_eq!(bitrev, want, "intt_to_bitrev, n = {n}");
         }
     }
 
