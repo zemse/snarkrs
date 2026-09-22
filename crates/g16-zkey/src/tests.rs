@@ -40,7 +40,7 @@ fn r_constants_are_the_arkworks_montgomery_radix() {
 #[test]
 fn fq_reads_snarkjs_montgomery_limbs() {
     // Stored limbs of `R mod q` are the Montgomery representation of exactly 1.
-    assert_eq!(binfile::fq(&le32(R_MOD_Q)), Fq::ONE);
+    assert_eq!(binfile::fq(&le32(R_MOD_Q)).unwrap(), Fq::ONE);
     // And the naive reading, the one that silently breaks provers, is not 1.
     assert_ne!(Fq::from_le_bytes_mod_order(&le32(R_MOD_Q)), Fq::ONE);
 }
@@ -49,7 +49,7 @@ fn fq_reads_snarkjs_montgomery_limbs() {
 fn section4_values_are_double_montgomery() {
     let inv = r_inv();
     assert_eq!(
-        binfile::fr_double_montgomery(&le32(R2_MOD_R), &inv),
+        binfile::fr_double_montgomery(&le32(R2_MOD_R), &inv).unwrap(),
         Fr::ONE
     );
     // Single-Montgomery reading, the mistake this decoder exists to avoid, gives R.
@@ -61,11 +61,52 @@ fn section4_values_are_double_montgomery() {
 
 #[test]
 fn zero_coordinates_decode_to_the_identity() {
-    assert_eq!(binfile::g1(&[0u8; binfile::G1_BYTES]), G1Affine::identity());
-    assert_eq!(binfile::g2(&[0u8; binfile::G2_BYTES]), G2Affine::identity());
+    assert_eq!(
+        binfile::g1(&[0u8; binfile::G1_BYTES]).unwrap(),
+        G1Affine::identity()
+    );
+    assert_eq!(
+        binfile::g2(&[0u8; binfile::G2_BYTES]).unwrap(),
+        G2Affine::identity()
+    );
     // The literal affine pair (0, 0) is not on the curve, so anything that forwarded it
     // unchanged would be caught here.
     assert!(!G1Affine::new_unchecked(Fq::zero(), Fq::zero()).is_on_curve());
+}
+
+/// arkworks keeps the stored limbs of a field element below the modulus, and
+/// `new_unchecked` is the one door into an element that does not honour it. One
+/// `add_assign` on limbs in `[q, 2^256)` drops the carry out of 256 bits and lands on a
+/// value that is not even congruent mod `q`, so `is_on_curve` - the check meant to refuse
+/// the point - is computed with broken arithmetic. The range test therefore has to happen
+/// at the byte boundary, before anything is constructed.
+#[test]
+fn limbs_at_or_above_the_modulus_are_refused() {
+    let q = Fq::MODULUS.to_bytes_le();
+    let r = Fr::MODULUS.to_bytes_le();
+    assert!(matches!(
+        binfile::fq(&q),
+        Err(ZkeyError::NonCanonical("base field"))
+    ));
+    assert!(binfile::fq(&[0xff; FQ_BYTES]).is_err());
+    assert!(matches!(
+        binfile::fr_double_montgomery(&r, &r_inv()),
+        Err(ZkeyError::NonCanonical("scalar field"))
+    ));
+
+    // And through the point decoders, in a coordinate other than the first, so a check
+    // applied to only one of them would still show up here.
+    let mut p1 = [0u8; G1_BYTES];
+    p1[FQ_BYTES..].copy_from_slice(&q);
+    assert!(binfile::g1(&p1).is_err());
+    let mut p2 = [0u8; G2_BYTES];
+    p2[3 * FQ_BYTES..].copy_from_slice(&q);
+    assert!(binfile::g2(&p2).is_err());
+
+    // `q - 1` is the largest coordinate a real file can carry, and it must still decode.
+    let mut just_below = q.clone();
+    just_below[0] -= 1;
+    assert!(binfile::fq(&just_below).is_ok());
 }
 
 /// `n * stride` used to be a plain multiply. `n` comes straight out of the header, so on a
@@ -360,7 +401,7 @@ fn coefficients_csr_reproduces_the_raw_section() {
                     rd(b),
                     rd(b + 4),
                     rd(b + 8),
-                    binfile::fr_double_montgomery(&raw[b + 12..b + 44], &inv),
+                    binfile::fr_double_montgomery(&raw[b + 12..b + 44], &inv).unwrap(),
                 )
             })
             .collect();
@@ -535,6 +576,30 @@ fn a_zkey_claiming_an_impossible_npublic_is_refused() {
         let msg = err.to_string();
         assert!(
             msg.contains("n_public"),
+            "{}: unhelpful error: {msg}",
+            a.name
+        );
+    });
+}
+
+/// The range check at the byte boundary, reached through the full parse rather than the
+/// decoder alone. `beta_g1`'s x set to `q` is still 256 bits, so nothing but an explicit
+/// compare refuses it, and `check_g1` cannot: it would run `is_on_curve` on the very
+/// element whose limbs break the arithmetic it is computed with.
+#[test]
+fn a_zkey_coordinate_at_the_modulus_is_refused() {
+    for_each_artifact("a_zkey_coordinate_at_the_modulus_is_refused", |a| {
+        let err = load_mutated("noncanonical", &a.dir, |b| {
+            let at = locate(b).beta_g1_at;
+            b[at..at + FQ_BYTES].copy_from_slice(&Fq::MODULUS.to_bytes_le());
+        })
+        .expect_err(&format!(
+            "{}: a coordinate at q must be refused, not installed as Montgomery limbs",
+            a.name
+        ));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not below the modulus"),
             "{}: unhelpful error: {msg}",
             a.name
         );

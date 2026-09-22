@@ -213,7 +213,7 @@ fn coefficients_replay_zkey_section_4() {
                 rd(base),
                 rd(base + 4),
                 rd(base + 8),
-                fr_double_montgomery(&s4[base + 12..base + 12 + FR_BYTES], &r_inv),
+                fr_double_montgomery(&s4[base + 12..base + 12 + FR_BYTES], &r_inv).unwrap(),
             )
         };
 

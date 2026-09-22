@@ -238,7 +238,7 @@ fn typed_writers_are_the_inverse_of_the_binfile_decoders() {
     assert_eq!(body.len(), frs.len() * N8);
     let r_inv = binfile::r_inv();
     for (i, want) in frs.iter().enumerate() {
-        let got = binfile::fr_double_montgomery(&body[i * N8..(i + 1) * N8], &r_inv);
+        let got = binfile::fr_double_montgomery(&body[i * N8..(i + 1) * N8], &r_inv).unwrap();
         assert_eq!(got, *want, "double Montgomery coefficient {i}");
     }
 
@@ -250,7 +250,7 @@ fn typed_writers_are_the_inverse_of_the_binfile_decoders() {
     }
     let off = frs.len() * N8;
     for (i, want) in fqs.iter().enumerate() {
-        let got = binfile::fq(&body[off + i * N8..off + (i + 1) * N8]);
+        let got = binfile::fq(&body[off + i * N8..off + (i + 1) * N8]).unwrap();
         assert_eq!(got, *want, "base field coordinate {i}");
     }
 
@@ -262,24 +262,38 @@ fn typed_writers_are_the_inverse_of_the_binfile_decoders() {
     );
     let mut at = 0;
     for (i, want) in g1s.iter().enumerate() {
-        assert_eq!(binfile::g1(&body[at..at + SG1]), *want, "g1 slice {i}");
+        assert_eq!(
+            binfile::g1(&body[at..at + SG1]).unwrap(),
+            *want,
+            "g1 slice {i}"
+        );
         at += SG1;
     }
     for (i, want) in g2s.iter().enumerate() {
-        assert_eq!(binfile::g2(&body[at..at + SG2]), *want, "g2 slice {i}");
+        assert_eq!(
+            binfile::g2(&body[at..at + SG2]).unwrap(),
+            *want,
+            "g2 slice {i}"
+        );
         at += SG2;
     }
     assert!(
         body[at..at + SG1].iter().all(|&b| b == 0),
         "G1 infinity is all zero bytes"
     );
-    assert_eq!(binfile::g1(&body[at..at + SG1]), G1Affine::identity());
+    assert_eq!(
+        binfile::g1(&body[at..at + SG1]).unwrap(),
+        G1Affine::identity()
+    );
     at += SG1;
     assert!(
         body[at..at + SG2].iter().all(|&b| b == 0),
         "G2 infinity is all zero bytes"
     );
-    assert_eq!(binfile::g2(&body[at..at + SG2]), G2Affine::identity());
+    assert_eq!(
+        binfile::g2(&body[at..at + SG2]).unwrap(),
+        G2Affine::identity()
+    );
     at += SG2;
     assert_eq!(at, body.len());
 
@@ -291,7 +305,7 @@ fn typed_writers_are_the_inverse_of_the_binfile_decoders() {
     );
     for i in [0usize, 1, POINT_BATCH - 1, POINT_BATCH, repeat - 1] {
         assert_eq!(
-            binfile::g1(&body[i * SG1..(i + 1) * SG1]),
+            binfile::g1(&body[i * SG1..(i + 1) * SG1]).unwrap(),
             g1(3),
             "repeat {i}"
         );
@@ -299,7 +313,7 @@ fn typed_writers_are_the_inverse_of_the_binfile_decoders() {
     let off = repeat * SG1;
     for i in 0..5 {
         assert_eq!(
-            binfile::g2(&body[off + i * SG2..off + (i + 1) * SG2]),
+            binfile::g2(&body[off + i * SG2..off + (i + 1) * SG2]).unwrap(),
             g2(4),
             "g2 repeat {i}"
         );
@@ -386,7 +400,7 @@ fn the_encoders_reproduce_snarkjs_bytes_on_a_real_zkey() {
                 "{name}: section {id} is not whole points"
             );
             for (i, chunk) in body.chunks(SG1).enumerate() {
-                let p = binfile::g1(chunk);
+                let p = binfile::g1(chunk).unwrap();
                 assert_eq!(&g1_lem(&p)[..], chunk, "{name}: section {id} point {i}");
             }
             n_g1 += body.len() / SG1;
@@ -394,7 +408,7 @@ fn the_encoders_reproduce_snarkjs_bytes_on_a_real_zkey() {
         let body = f.unique_section(7).unwrap();
         assert_eq!(body.len() % SG2, 0, "{name}: section 7 is not whole points");
         for (i, chunk) in body.chunks(SG2).enumerate() {
-            let p = binfile::g2(chunk);
+            let p = binfile::g2(chunk).unwrap();
             assert_eq!(&g2_lem(&p)[..], chunk, "{name}: section 7 point {i}");
         }
         let n_g2 = body.len() / SG2;
@@ -413,7 +427,7 @@ fn the_encoders_reproduce_snarkjs_bytes_on_a_real_zkey() {
         for i in 0..n_coefs {
             let at = 4 + i * COEF_RECORD + 12;
             let raw = &body[at..at + N8];
-            let v = binfile::fr_double_montgomery(raw, &r_inv);
+            let v = binfile::fr_double_montgomery(raw, &r_inv).unwrap();
             assert_eq!(
                 &fr_double_montgomery(&v)[..],
                 raw,

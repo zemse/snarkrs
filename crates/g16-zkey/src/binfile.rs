@@ -379,6 +379,10 @@ fn u64_at(b: &[u8], off: usize) -> u64 {
 }
 
 /// 32 little-endian bytes as a 4-limb bigint, no reduction and no Montgomery conversion.
+///
+/// # Panics
+///
+/// Panics unless `b` is at least [`FQ_BYTES`] long.
 pub fn bigint(b: &[u8]) -> BigInt<4> {
     let mut limbs = [0u64; 4];
     for (i, limb) in limbs.iter_mut().enumerate() {
@@ -388,8 +392,27 @@ pub fn bigint(b: &[u8]) -> BigInt<4> {
 }
 
 /// A base-field coordinate as snarkjs stores it: the Montgomery limbs verbatim.
-pub fn fq(b: &[u8]) -> Fq {
-    Fq::new_unchecked(bigint(b))
+///
+/// Limbs at or above `q` are rejected rather than installed. arkworks holds the invariant
+/// that an element's stored `BigInt` is below the modulus, and its arithmetic is written
+/// to exploit it: `add_assign` is one `add_with_carry` followed by at most one
+/// `subtract_modulus`, so two limb sets in the range `[q, 2^256)` sum past 256 bits, drop
+/// the carry and land on a value that is not even congruent mod `q`. Installing 32
+/// unchecked bytes therefore corrupts everything downstream including `is_on_curve`, which
+/// is the gate meant to refuse the point in the first place. snarkjs never writes such a
+/// coordinate, so nothing legitimate is lost. The one place in this workspace that must
+/// reproduce wasmcurves' wrapping on out-of-range limbs is `g16-ceremony`'s `noncanonical`
+/// module, which is deliberately not built on this decoder.
+///
+/// # Panics
+///
+/// Panics unless `b` is at least [`FQ_BYTES`] long.
+pub fn fq(b: &[u8]) -> Result<Fq, ZkeyError> {
+    let limbs = bigint(b);
+    if limbs >= Fq::MODULUS {
+        return Err(ZkeyError::NonCanonical("base field"));
+    }
+    Ok(Fq::new_unchecked(limbs))
 }
 
 /// A scalar stored in ordinary (non-Montgomery) form. Rejects a value at or above the
@@ -405,8 +428,20 @@ pub fn fr_normal(b: &[u8], section: u32) -> Result<Fr, ZkeyError> {
 /// A section-4 coefficient: the stored integer is `v * R^2`, so one `new_unchecked`
 /// (which divides by `R` by reinterpreting the limbs) leaves `v * R`, and multiplying by
 /// the element whose value is `R^-1` finishes the job.
-pub fn fr_double_montgomery(b: &[u8], r_inv: &Fr) -> Fr {
-    Fr::new_unchecked(bigint(b)) * r_inv
+///
+/// Range-checked for the same reason as [`fq`]: `new_unchecked` on limbs at or above `r`
+/// breaks the invariant arkworks' arithmetic assumes, and the multiply below is the first
+/// operation to observe it.
+///
+/// # Panics
+///
+/// Panics unless `b` is at least [`FR_BYTES`] long.
+pub fn fr_double_montgomery(b: &[u8], r_inv: &Fr) -> Result<Fr, ZkeyError> {
+    let limbs = bigint(b);
+    if limbs >= Fr::MODULUS {
+        return Err(ZkeyError::NonCanonical("scalar field"));
+    }
+    Ok(Fr::new_unchecked(limbs) * r_inv)
 }
 
 /// The element whose *value* is `R^-1 mod r`: limbs `1` reinterpreted as Montgomery.
@@ -417,29 +452,37 @@ pub fn r_inv() -> Fr {
 /// snarkjs writes the point at infinity as the affine pair `(0, 0)`, which is not on the
 /// curve. Every other decoder in the pipeline would then reject or, worse, silently
 /// mangle it, so the mapping has to happen here.
-pub fn g1(b: &[u8]) -> G1Affine {
-    let x = fq(&b[..FQ_BYTES]);
-    let y = fq(&b[FQ_BYTES..G1_BYTES]);
-    if x.is_zero() && y.is_zero() {
+///
+/// # Panics
+///
+/// Panics unless `b` is at least [`G1_BYTES`] long.
+pub fn g1(b: &[u8]) -> Result<G1Affine, ZkeyError> {
+    let x = fq(&b[..FQ_BYTES])?;
+    let y = fq(&b[FQ_BYTES..G1_BYTES])?;
+    Ok(if x.is_zero() && y.is_zero() {
         G1Affine::identity()
     } else {
         G1Affine::new_unchecked(x, y)
-    }
+    })
 }
 
 /// `Fq2` components are stored `c0` then `c1`, matching the `[[x0, x1], ...]` order in
 /// `verification_key.json`.
-pub fn g2(b: &[u8]) -> G2Affine {
-    let x = Fq2::new(fq(&b[..FQ_BYTES]), fq(&b[FQ_BYTES..2 * FQ_BYTES]));
+///
+/// # Panics
+///
+/// Panics unless `b` is at least [`G2_BYTES`] long.
+pub fn g2(b: &[u8]) -> Result<G2Affine, ZkeyError> {
+    let x = Fq2::new(fq(&b[..FQ_BYTES])?, fq(&b[FQ_BYTES..2 * FQ_BYTES])?);
     let y = Fq2::new(
-        fq(&b[2 * FQ_BYTES..3 * FQ_BYTES]),
-        fq(&b[3 * FQ_BYTES..G2_BYTES]),
+        fq(&b[2 * FQ_BYTES..3 * FQ_BYTES])?,
+        fq(&b[3 * FQ_BYTES..G2_BYTES])?,
     );
-    if x.is_zero() && y.is_zero() {
+    Ok(if x.is_zero() && y.is_zero() {
         G2Affine::identity()
     } else {
         G2Affine::new_unchecked(x, y)
-    }
+    })
 }
 
 /// Checks a section holds exactly `n` records of `stride` bytes. Getting this wrong is

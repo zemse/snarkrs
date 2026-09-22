@@ -50,7 +50,9 @@ use crate::transcript::{
     PERSONALIZATION_BETA, PERSONALIZATION_TAU,
 };
 use crate::write::BinFileWriter;
-use crate::{CeremonyError, ContributionKind, ContributionParams, SCG1, SCG2, SG1, SG2};
+use crate::{
+    CeremonyError, ContainerError, ContributionKind, ContributionParams, SCG1, SCG2, SG1, SG2,
+};
 
 /// `nSections` a fresh file declares (`powersoftau_new.js:75`). A prepared, converted or
 /// truncated file declares 11, which is why the count is not a test for "prepared".
@@ -97,7 +99,7 @@ trait PtauGroup: AffineRepr<ScalarField = Fr> + Send + Sync {
     const SG: usize;
     /// `scG`, bytes compressed.
     const SCG: usize;
-    fn from_lem(bytes: &[u8]) -> Self;
+    fn from_lem(bytes: &[u8]) -> Result<Self, ContainerError>;
     fn write_lem(&self, out: &mut [u8]);
     fn write_compressed(&self, out: &mut [u8]);
     fn write_uncompressed(&self, out: &mut [u8]);
@@ -126,7 +128,7 @@ impl PtauGroup for Affine<g1::Config> {
     const SG: usize = SG1;
     const SCG: usize = SCG1;
 
-    fn from_lem(bytes: &[u8]) -> Self {
+    fn from_lem(bytes: &[u8]) -> Result<Self, ContainerError> {
         binfile::g1(bytes)
     }
 
@@ -169,7 +171,7 @@ impl PtauGroup for Affine<g2::Config> {
     const SG: usize = SG2;
     const SCG: usize = SCG2;
 
-    fn from_lem(bytes: &[u8]) -> Self {
+    fn from_lem(bytes: &[u8]) -> Result<Self, ContainerError> {
         binfile::g2(bytes)
     }
 
@@ -375,7 +377,10 @@ fn process_section<C: PtauGroup>(
     while done < plan.n_points {
         let n = (plan.n_points - done).min(chunk);
         let raw = ptau.section_elements(plan.id, C::SG, done, n)?;
-        let mut points: Vec<C> = raw.par_chunks_exact(C::SG).map(C::from_lem).collect();
+        let mut points: Vec<C> = raw
+            .par_chunks_exact(C::SG)
+            .map(C::from_lem)
+            .collect::<Result<_, _>>()?;
         C::apply_key(scale, &mut points, t, plan.inc)?;
 
         let lem_out = &mut lem[..n * C::SG];
@@ -430,7 +435,10 @@ fn hash_section_u<C: PtauGroup>(
         lem[..n * C::SG]
             .par_chunks_exact(C::SG)
             .zip(u[..n * C::SG].par_chunks_exact_mut(C::SG))
-            .for_each(|(src, dst)| C::from_lem(src).write_uncompressed(dst));
+            .try_for_each(|(src, dst)| -> Result<(), ContainerError> {
+                C::from_lem(src)?.write_uncompressed(dst);
+                Ok(())
+            })?;
         hasher.update(&u[..n * C::SG]);
         done += n;
     }

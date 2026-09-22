@@ -322,12 +322,12 @@ impl Groth16Header {
         let n_vars = cur.u32()?;
         let n_public = cur.u32()?;
         let domain_size = cur.u32()?;
-        let alpha_g1 = g16_zkey::binfile::g1(cur.take(SG1)?);
-        let beta_g1 = g16_zkey::binfile::g1(cur.take(SG1)?);
-        let beta_g2 = g16_zkey::binfile::g2(cur.take(SG2)?);
-        let gamma_g2 = g16_zkey::binfile::g2(cur.take(SG2)?);
-        let delta_g1 = g16_zkey::binfile::g1(cur.take(SG1)?);
-        let delta_g2 = g16_zkey::binfile::g2(cur.take(SG2)?);
+        let alpha_g1 = g16_zkey::binfile::g1(cur.take(SG1)?)?;
+        let beta_g1 = g16_zkey::binfile::g1(cur.take(SG1)?)?;
+        let beta_g2 = g16_zkey::binfile::g2(cur.take(SG2)?)?;
+        let gamma_g2 = g16_zkey::binfile::g2(cur.take(SG2)?)?;
+        let delta_g1 = g16_zkey::binfile::g1(cur.take(SG1)?)?;
+        let delta_g2 = g16_zkey::binfile::g2(cur.take(SG2)?)?;
         if cur.remaining() != 0 {
             return Err(CeremonyError::malformed(
                 2,

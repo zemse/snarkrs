@@ -87,6 +87,11 @@ pub enum ZkeyError {
     MissingSection(u32),
     #[error("malformed section {section}: {reason}")]
     Malformed { section: u32, reason: String },
+    /// A stored field element whose limbs are at or above the modulus. Separate from
+    /// [`ZkeyError::Malformed`] because the decoders that raise it are handed a bare slice
+    /// and do not know which section it came from.
+    #[error("{0} element is not below the modulus")]
+    NonCanonical(&'static str),
     #[error("verification key json: {0}")]
     BadJson(String),
 }
@@ -135,12 +140,12 @@ impl ProvingKey {
         let domain_size = s2.u32()? as usize;
         // Order here is alpha1, beta1, beta2, gamma2, delta1, delta2. Section 2 is one
         // packed blob, so a single swapped pair shifts every later point.
-        let alpha_g1 = g1(s2.take(G1_BYTES)?);
-        let beta_g1 = g1(s2.take(G1_BYTES)?);
-        let beta_g2 = g2(s2.take(G2_BYTES)?);
-        let gamma_g2 = g2(s2.take(G2_BYTES)?);
-        let delta_g1 = g1(s2.take(G1_BYTES)?);
-        let delta_g2 = g2(s2.take(G2_BYTES)?);
+        let alpha_g1 = g1(s2.take(G1_BYTES)?)?;
+        let beta_g1 = g1(s2.take(G1_BYTES)?)?;
+        let beta_g2 = g2(s2.take(G2_BYTES)?)?;
+        let gamma_g2 = g2(s2.take(G2_BYTES)?)?;
+        let delta_g1 = g1(s2.take(G1_BYTES)?)?;
+        let delta_g2 = g2(s2.take(G2_BYTES)?)?;
         if s2.remaining() != 0 {
             return Err(ZkeyError::Malformed {
                 section: 2,
@@ -338,13 +343,13 @@ fn read_g1_section(file: &BinFile, id: u32, n: usize) -> Result<Vec<G1Affine>, Z
     expect_records(data, n, G1_BYTES, id)?;
     // One pass over the mapped bytes straight into the output vector: the section is
     // never materialised as an intermediate buffer.
-    Ok(data.par_chunks_exact(G1_BYTES).map(g1).collect())
+    data.par_chunks_exact(G1_BYTES).map(g1).collect()
 }
 
 fn read_g2_section(file: &BinFile, id: u32, n: usize) -> Result<Vec<G2Affine>, ZkeyError> {
     let data = file.unique_section(id)?;
     expect_records(data, n, G2_BYTES, id)?;
-    Ok(data.par_chunks_exact(G2_BYTES).map(g2).collect())
+    data.par_chunks_exact(G2_BYTES).map(g2).collect()
 }
 
 fn check_g1(p: &G1Affine, section: u32, what: &str) -> Result<(), ZkeyError> {
@@ -422,7 +427,7 @@ fn read_coefficients(
         let slot = cursor[m][constraint] as usize;
         cursor[m][constraint] += 1;
         signal[m][slot] = sig as u32;
-        value[m][slot] = fr_double_montgomery(&data[off..off + FR_BYTES], &r_inv);
+        value[m][slot] = fr_double_montgomery(&data[off..off + FR_BYTES], &r_inv)?;
     }
 
     Ok(Coefficients {

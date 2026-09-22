@@ -37,7 +37,9 @@ use crate::transcript::{
     self, create_delta_key, hash_to_g2, same_ratio, CeremonyRng, Digest, Transcript,
 };
 use crate::write::BinFileWriter;
-use crate::{CeremonyError, ContributionKind, ContributionParams, Groth16Header, SG1, SG2};
+use crate::{
+    CeremonyError, ContainerError, ContributionKind, ContributionParams, Groth16Header, SG1, SG2,
+};
 
 use g16_zkey::binfile::{self, BinFile, Cursor};
 
@@ -89,10 +91,10 @@ impl MpcParams {
         // makes a short section an error here instead of a panic.
         let mut contributions = Vec::with_capacity(n.min(1024));
         for _ in 0..n {
-            let delta_after = binfile::g1(cur.take(SG1)?);
-            let g1_s = binfile::g1(cur.take(SG1)?);
-            let g1_sx = binfile::g1(cur.take(SG1)?);
-            let g2_spx = binfile::g2(cur.take(SG2)?);
+            let delta_after = binfile::g1(cur.take(SG1)?)?;
+            let g1_s = binfile::g1(cur.take(SG1)?)?;
+            let g1_sx = binfile::g1(cur.take(SG1)?)?;
+            let g2_spx = binfile::g2(cur.take(SG2)?)?;
             let mut t = [0u8; 64];
             t.copy_from_slice(cur.take(64)?);
             let kind = ContributionKind::from_u32(cur.u32()?)?;
@@ -369,7 +371,10 @@ fn apply_key_to_section(
     }
     w.start_section(id)?;
     for chunk in body.chunks(CHUNK_POINTS * SG1) {
-        let mut points: Vec<G1Affine> = chunk.par_chunks_exact(SG1).map(binfile::g1).collect();
+        let mut points: Vec<G1Affine> = chunk
+            .par_chunks_exact(SG1)
+            .map(binfile::g1)
+            .collect::<Result<_, _>>()?;
         key.apply_key_g1(&mut points, k, Fr::ONE)?;
         w.write_g1_slice(&points)?;
     }
@@ -605,8 +610,8 @@ fn check_l_section(
     // to survive a random combination, and 32 bits of soundness per check is snarkjs'
     // choice, not something the port gets to tighten without diverging.
     let scalars: Vec<Fr> = (0..n).map(|_| Fr::from(rng.next_u32())).collect();
-    let r1 = msm.msm_g1(&decode_g1(init_body), &scalars);
-    let r2 = msm.msm_g1(&decode_g1(final_body), &scalars);
+    let r1 = msm.msm_g1(&decode_g1(init_body)?, &scalars);
+    let r2 = msm.msm_g1(&decode_g1(final_body)?, &scalars);
     if !same_ratio(
         &r1.into_affine(),
         &r2.into_affine(),
@@ -688,7 +693,7 @@ fn check_h_section(
     let ntt = CpuNtt::new();
     ntt.ntt(&domain, &mut shifted, Direction::Forward);
 
-    let r2 = msm.msm_g1(&decode_g1(h_body), &shifted);
+    let r2 = msm.msm_g1(&decode_g1(h_body)?, &shifted);
     if !same_ratio(
         &r1.into_affine(),
         &r2.into_affine(),
@@ -700,6 +705,6 @@ fn check_h_section(
     Ok(())
 }
 
-fn decode_g1(body: &[u8]) -> Vec<G1Affine> {
+fn decode_g1(body: &[u8]) -> Result<Vec<G1Affine>, ContainerError> {
     body.par_chunks_exact(SG1).map(binfile::g1).collect()
 }

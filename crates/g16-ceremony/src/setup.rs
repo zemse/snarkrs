@@ -685,7 +685,7 @@ pub fn write_hs(ptau: &Ptau, domain_size: usize) -> Result<Vec<G1Affine>, Ceremo
             .skip(1)
             .step_by(2)
             .map(binfile::g1)
-            .collect())
+            .collect::<Result<_, _>>()?)
     } else if cir_power == Fr::TWO_ADICITY {
         // At the two-adicity there is no `2*domainSize`-th root of unity, so
         // `lagrangeEvaluations` took its coset branch and wrote the even and odd halves
@@ -783,7 +783,11 @@ fn h_difference(hi: &[u8], lo: &[u8]) -> G1Projective {
         .iter()
         .all(|b| noncanonical::in_range(&noncanonical::load(b)));
     if canonical {
-        return G1Projective::from(binfile::g1(hi)) - binfile::g1(lo);
+        // `in_range` above is the same compare `binfile::g1` makes, so neither decode
+        // can fail on this branch.
+        let hi = binfile::g1(hi).expect("coordinates checked in range");
+        let lo = binfile::g1(lo).expect("coordinates checked in range");
+        return G1Projective::from(hi) - lo;
     }
     let (x, y, z) = noncanonical::sub_affine(hi, lo);
     if noncanonical::is_zero(&z) {

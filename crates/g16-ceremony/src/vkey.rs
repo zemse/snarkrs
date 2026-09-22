@@ -99,8 +99,8 @@ fn fields(zkey: &Path) -> Result<Vec<(&'static str, Value)>, CeremonyError> {
     g16_zkey::binfile::expect_records(ic_bytes, n_ic, SG1, S_IC)?;
     let ic: Vec<Value> = ic_bytes
         .chunks_exact(SG1)
-        .map(|b| g1_json(&g16_zkey::binfile::g1(b)))
-        .collect();
+        .map(|b| Ok(g1_json(&g16_zkey::binfile::g1(b)?)))
+        .collect::<Result<_, CeremonyError>>()?;
 
     // `e(alpha_1, beta_2)` in F12, nested 2 x 3 x 2 by the tower Fq12 = Fq2(Fq6(Fq2)).
     // Redundant, and only ever a precomputation a verifier may skip the pairing with.

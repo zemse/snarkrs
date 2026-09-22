@@ -193,11 +193,11 @@ impl PtauContribution {
     pub fn read(data: &mut &[u8], prev_challenge: &Digest) -> Result<Self, CeremonyError> {
         let head = take(data, CONTRIBUTION_PREFIX_BYTES)?;
         let mut cur = Cursor::new(head, S_CONTRIBUTIONS);
-        let tau_g1 = binfile::g1(cur.take(SG1)?);
-        let tau_g2 = binfile::g2(cur.take(SG2)?);
-        let alpha_g1 = binfile::g1(cur.take(SG1)?);
-        let beta_g1 = binfile::g1(cur.take(SG1)?);
-        let beta_g2 = binfile::g2(cur.take(SG2)?);
+        let tau_g1 = binfile::g1(cur.take(SG1)?)?;
+        let tau_g2 = binfile::g2(cur.take(SG2)?)?;
+        let alpha_g1 = binfile::g1(cur.take(SG1)?)?;
+        let beta_g1 = binfile::g1(cur.take(SG1)?)?;
+        let beta_g2 = binfile::g2(cur.take(SG2)?)?;
         let pubkeys = read_ptau_pubkey(cur.take(PTAU_PUBKEY_BYTES)?, prev_challenge)?;
         let mut partial_hash = [0u8; PARTIAL_HASH_BYTES];
         partial_hash.copy_from_slice(cur.take(PARTIAL_HASH_BYTES)?);
@@ -456,7 +456,10 @@ impl Ptau {
         n: usize,
     ) -> Result<Vec<G1Affine>, CeremonyError> {
         let data = self.section_elements(id, SG1, offset, n)?;
-        Ok(data.par_chunks_exact(SG1).map(binfile::g1).collect())
+        Ok(data
+            .par_chunks_exact(SG1)
+            .map(binfile::g1)
+            .collect::<Result<_, _>>()?)
     }
 
     /// `n` G2 points from element `offset` of section `id`.
@@ -467,7 +470,10 @@ impl Ptau {
         n: usize,
     ) -> Result<Vec<G2Affine>, CeremonyError> {
         let data = self.section_elements(id, SG2, offset, n)?;
-        Ok(data.par_chunks_exact(SG2).map(binfile::g2).collect())
+        Ok(data
+            .par_chunks_exact(SG2)
+            .map(binfile::g2)
+            .collect::<Result<_, _>>()?)
     }
 
     /// The `domain_size`-point Lagrange block of section `id`, which starts at element

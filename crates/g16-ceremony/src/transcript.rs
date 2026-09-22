@@ -773,9 +773,9 @@ pub fn read_ptau_pubkey(bytes: &[u8], challenge: &Digest) -> Result<PtauPubKeys,
         g2_spx,
     };
     Ok(PtauPubKeys {
-        tau: key(g1(0), g1(1), g2(0), PERSONALIZATION_TAU),
-        alpha: key(g1(2), g1(3), g2(1), PERSONALIZATION_ALPHA),
-        beta: key(g1(4), g1(5), g2(2), PERSONALIZATION_BETA),
+        tau: key(g1(0)?, g1(1)?, g2(0)?, PERSONALIZATION_TAU),
+        alpha: key(g1(2)?, g1(3)?, g2(1)?, PERSONALIZATION_ALPHA),
+        beta: key(g1(4)?, g1(5)?, g2(2)?, PERSONALIZATION_BETA),
     })
 }
 
