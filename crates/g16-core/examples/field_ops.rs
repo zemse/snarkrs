@@ -20,8 +20,8 @@
 use std::time::Instant;
 
 use g16_field::{
-    CurveGroup, Fq, Fq2, Fr, G1Affine, G1Projective, G2Affine, G2Projective,
-    PrimeField, UniformRand,
+    CurveGroup, Fq, Fq2, Fr, G1Affine, G1Projective, G2Affine, G2Projective, PrimeField,
+    UniformRand,
 };
 
 /// Nanoseconds per operation, best of `reps` passes of `iters` operations.

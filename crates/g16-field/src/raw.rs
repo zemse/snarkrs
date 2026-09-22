@@ -67,7 +67,9 @@ pub const FR_N0: u64 = 0xc2e1f593efffffff;
 fn sbb(a: u64, b: u64, borrow: u64) -> (u64, u64) {
     // 128-bit subtract keeps the borrow as data rather than as a flag the compiler is
     // tempted to branch on.
-    let t = (a as u128).wrapping_sub(b as u128).wrapping_sub(borrow as u128);
+    let t = (a as u128)
+        .wrapping_sub(b as u128)
+        .wrapping_sub(borrow as u128);
     (t as u64, (t >> 127) as u64)
 }
 

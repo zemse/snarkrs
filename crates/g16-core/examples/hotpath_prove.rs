@@ -63,8 +63,7 @@ fn main() {
     );
     for _ in 0..reps {
         let mut t = StageTimings::default();
-        let proof =
-            prove_with_blinders(circuit.as_ref(), &witness, r, s, &mut t).expect("prove");
+        let proof = prove_with_blinders(circuit.as_ref(), &witness, r, s, &mut t).expect("prove");
         std::hint::black_box(&proof);
     }
 }

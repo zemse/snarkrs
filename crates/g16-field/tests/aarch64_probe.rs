@@ -159,10 +159,22 @@ fn probe() {
         } else {
             Fr::rand(&mut rng)
         };
-        let b = if i < 4 { -Fr::from(1u64) } else { Fr::rand(&mut rng) };
+        let b = if i < 4 {
+            -Fr::from(1u64)
+        } else {
+            Fr::rand(&mut rng)
+        };
         let want = a * b;
-        assert_eq!(from_limbs(mont_mul_u128(limbs(&a), limbs(&b))), want, "u128 wrong at {i}");
-        assert_eq!(from_limbs(mont_mul_asm(limbs(&a), limbs(&b))), want, "asm wrong at {i}");
+        assert_eq!(
+            from_limbs(mont_mul_u128(limbs(&a), limbs(&b))),
+            want,
+            "u128 wrong at {i}"
+        );
+        assert_eq!(
+            from_limbs(mont_mul_asm(limbs(&a), limbs(&b))),
+            want,
+            "asm wrong at {i}"
+        );
     }
 
     let x0 = Fr::rand(&mut rng);

@@ -95,7 +95,9 @@ fn main() {
 
         let fwd = best(reps, &mut || ntt.ntt(&domain, &mut v, Direction::Forward));
         let inv = best(reps, &mut || ntt.ntt(&domain, &mut v, Direction::Inverse));
-        let shift = best(reps, &mut || ntt.distribute_powers(&mut v, domain.group_gen));
+        let shift = best(reps, &mut || {
+            ntt.distribute_powers(&mut v, domain.group_gen)
+        });
         let bitrev = best(reps, &mut || bit_reverse_permute(&mut v, log_n));
 
         // A transform is one permutation plus log_n butterfly passes, so the permutation's
@@ -157,7 +159,11 @@ fn scaling() {
     let bases = G1Projective::normalize_batch(&proj);
     drop(proj);
     let scalars: Vec<Fr> = (0..n).map(|_| Fr::rand(&mut rng)).collect();
-    assert_eq!(bases.len(), scalars.len(), "MSM truncates a mismatch in release");
+    assert_eq!(
+        bases.len(),
+        scalars.len(),
+        "MSM truncates a mismatch in release"
+    );
 
     let mut base_ntt = 0.0;
     let mut base_msm = 0.0;
@@ -172,9 +178,8 @@ fn scaling() {
         let mut v = sample(n);
         pool.install(|| ntt.ntt(&domain, &mut v, Direction::Forward));
 
-        let t_ntt = pool.install(|| {
-            best(reps, &mut || ntt.ntt(&domain, &mut v, Direction::Forward))
-        });
+        let t_ntt =
+            pool.install(|| best(reps, &mut || ntt.ntt(&domain, &mut v, Direction::Forward)));
         let t_msm = pool.install(|| {
             best(3, &mut || {
                 let _ = std::hint::black_box(msm.msm_g1(&bases, &scalars));

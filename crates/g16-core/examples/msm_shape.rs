@@ -159,7 +159,17 @@ fn main() {
 
         println!(
             "{:<8} {:>9} {:>8} {:>7} {:>9} {:>7} {:>8} {:>9} {:>10} {:>3} {:>9}",
-            "msm", "len", "zeros", "ones", "general", "0/1 %", "|s|<=8", "inf bases", "inf %", "c", "ms"
+            "msm",
+            "len",
+            "zeros",
+            "ones",
+            "general",
+            "0/1 %",
+            "|s|<=8",
+            "inf bases",
+            "inf %",
+            "c",
+            "ms"
         );
         let mut serial_total = 0.0;
         let mut rows: Vec<(&str, Shape, f64)> = Vec::new();
@@ -248,7 +258,10 @@ fn main() {
         // Share of the serial sum, which is the right denominator for "which MSM should I
         // optimise": it is the work, independent of how well the pool happens to overlap.
         for (label, _, ms) in &rows {
-            println!("  {label:<6} {:>5.1}% of serial MSM work", 100.0 * ms / serial_total);
+            println!(
+                "  {label:<6} {:>5.1}% of serial MSM work",
+                100.0 * ms / serial_total
+            );
         }
     }
 }

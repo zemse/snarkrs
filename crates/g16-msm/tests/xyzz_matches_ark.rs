@@ -12,8 +12,10 @@ use ark_std::UniformRand;
 use g16_field::{G1Projective, G2Projective};
 use g16_msm::xyzz::{to_projective, RawCurve, Xyzz};
 
-fn check_group<P: RawCurve>(label: &str, rand_proj: impl Fn(&mut ark_std::rand::rngs::StdRng) -> Projective<P>)
-where
+fn check_group<P: RawCurve>(
+    label: &str,
+    rand_proj: impl Fn(&mut ark_std::rand::rngs::StdRng) -> Projective<P>,
+) where
     Projective<P>: std::fmt::Debug,
 {
     use ark_std::rand::SeedableRng;
@@ -31,7 +33,11 @@ where
         let (x, y) = P::raw_xy(p);
         acc.madd(x, y);
         want += p;
-        assert_eq!(to_projective(&acc), want, "{label}: madd chain diverged at {i}");
+        assert_eq!(
+            to_projective(&acc),
+            want,
+            "{label}: madd chain diverged at {i}"
+        );
     }
 
     // The corners.
@@ -47,7 +53,11 @@ where
     let mut d = Xyzz::<P::RF>::ZERO;
     d.madd(px, py);
     d.madd(px, py);
-    assert_eq!(to_projective(&d), p.into_group() + p, "{label}: p + p doubles");
+    assert_eq!(
+        to_projective(&d),
+        p.into_group() + p,
+        "{label}: p + p doubles"
+    );
 
     // p += -p, the cancellation branch
     let neg = (-p.into_group()).into_affine();
@@ -56,7 +66,11 @@ where
     z.madd(px, py);
     z.madd(nx, ny);
     assert!(z.is_zero(), "{label}: p + (-p) must cancel to the identity");
-    assert_eq!(to_projective(&z), Projective::<P>::from(p) - p, "{label}: cancel value");
+    assert_eq!(
+        to_projective(&z),
+        Projective::<P>::from(p) - p,
+        "{label}: cancel value"
+    );
 
     // full add: both identity cases, doubling, cancellation, and randoms
     let q = pts[1];
@@ -72,15 +86,27 @@ where
 
     let mut s = xa;
     s.add_assign(&Xyzz::<P::RF>::ZERO);
-    assert_eq!(to_projective(&s), p.into_group(), "{label}: add identity rhs");
+    assert_eq!(
+        to_projective(&s),
+        p.into_group(),
+        "{label}: add identity rhs"
+    );
 
     let mut s = Xyzz::<P::RF>::ZERO;
     s.add_assign(&xa);
-    assert_eq!(to_projective(&s), p.into_group(), "{label}: add identity lhs");
+    assert_eq!(
+        to_projective(&s),
+        p.into_group(),
+        "{label}: add identity lhs"
+    );
 
     let mut s = xa;
     s.add_assign(&xa);
-    assert_eq!(to_projective(&s), p.into_group() + p, "{label}: add self doubles");
+    assert_eq!(
+        to_projective(&s),
+        p.into_group() + p,
+        "{label}: add self doubles"
+    );
 
     let mut xneg = Xyzz::<P::RF>::ZERO;
     xneg.madd(nx, ny);
