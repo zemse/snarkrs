@@ -50,6 +50,7 @@ use std::fmt::Write as _;
 use g16_gpu_layout::LIMBS;
 
 use crate::gen::field::Variant;
+use crate::gen::FLOOR_INVOCATIONS;
 
 /// Threads per workgroup, emitted as a literal so the shader and the host dispatch count
 /// cannot disagree.
@@ -141,8 +142,8 @@ pub fn h_join_module_at(v: Variant, workgroup: u32) -> String {
         v.limbs()
     );
     assert!(
-        workgroup > 0 && workgroup <= 256,
-        "workgroup size {workgroup} is outside 1..=256, the floor's \
+        workgroup > 0 && workgroup <= FLOOR_INVOCATIONS,
+        "workgroup size {workgroup} is outside 1..={FLOOR_INVOCATIONS}, the floor's \
          maxComputeInvocationsPerWorkgroup"
     );
 

@@ -87,6 +87,7 @@ use std::fmt::Write as _;
 use g16_gpu_layout::LIMBS;
 
 use crate::gen::field::Variant;
+use crate::gen::{FLOOR_INVOCATIONS, FLOOR_WORKGROUP_BYTES};
 
 /// Threads per workgroup for an entry point at tile size `k`: `2^(k-1)` clamped to
 /// `32..=128`.
@@ -319,8 +320,8 @@ pub fn ntt_module_at(v: Variant, ks: &[u32], workgroup: Option<u32>) -> String {
     );
     if let Some(w) = workgroup {
         assert!(
-            w > 0 && w <= 256,
-            "workgroup size {w} is outside 1..=256, the floor's \
+            w > 0 && w <= FLOOR_INVOCATIONS,
+            "workgroup size {w} is outside 1..={FLOOR_INVOCATIONS}, the floor's \
              maxComputeInvocationsPerWorkgroup"
         );
     }
@@ -352,9 +353,10 @@ pub fn ntt_module_at(v: Variant, ks: &[u32], workgroup: Option<u32>) -> String {
         );
         let bytes = workgroup_bytes(k, v);
         assert!(
-            bytes <= 16384,
+            bytes <= FLOOR_WORKGROUP_BYTES,
             "tile size k = {k} needs {bytes} bytes of workgroup storage, over the floor's \
-             16384; maxComputeWorkgroupStorageSize never rises in a browser's default tier"
+             {FLOOR_WORKGROUP_BYTES}; maxComputeWorkgroupStorageSize never rises in a \
+             browser's default tier"
         );
         if seen.contains(&k) {
             continue;

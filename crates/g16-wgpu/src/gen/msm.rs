@@ -89,6 +89,7 @@ use std::fmt::Write as _;
 use g16_gpu_layout::LIMBS;
 
 use crate::gen::field::Variant;
+use crate::gen::FLOOR_INVOCATIONS;
 
 // ---------------------------------------------------------------------------
 // Entry point names and bindings
@@ -399,8 +400,8 @@ fn header(pick: LimbPick, wg: Workgroups) -> String {
 fn check_sizes(sizes: &[(&str, u32)]) {
     for &(name, n) in sizes {
         assert!(
-            n > 0 && n <= 256,
-            "{name} workgroup size {n} is outside 1..=256, the floor's \
+            n > 0 && n <= FLOOR_INVOCATIONS,
+            "{name} workgroup size {n} is outside 1..={FLOOR_INVOCATIONS}, the floor's \
              maxComputeInvocationsPerWorkgroup"
         );
     }

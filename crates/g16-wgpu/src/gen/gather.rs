@@ -68,6 +68,7 @@ use std::fmt::Write as _;
 use g16_gpu_layout::LIMBS;
 
 use crate::gen::field::{field_module, Variant};
+use crate::gen::FLOOR_INVOCATIONS;
 
 /// Threads per workgroup, and the divisor the host's dispatch count is computed from.
 /// Emitted into the WGSL as a literal, so the shader and the dispatch math cannot disagree.
@@ -162,11 +163,11 @@ pub fn entry_point() -> String {
 
 /// Just the entry point, at a chosen workgroup size.
 pub fn entry_point_at(workgroup: u32) -> String {
-    // 256 is `maxComputeInvocationsPerWorkgroup` at the Floor. This adapter allows 1024 and
-    // the browser does not, so the check is against the Floor and not against the device.
+    // Against the Floor and not against the device: this adapter allows 1024 and the browser
+    // does not.
     assert!(
-        workgroup > 0 && workgroup <= 256,
-        "workgroup size {workgroup} is outside 1..=256"
+        workgroup > 0 && workgroup <= FLOOR_INVOCATIONS,
+        "workgroup size {workgroup} is outside 1..={FLOOR_INVOCATIONS}"
     );
     let mut s = String::new();
     writeln!(

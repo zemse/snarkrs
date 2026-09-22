@@ -635,7 +635,7 @@ fn split_regs(c: Curve) -> bool {
 fn split_reg_file(c: Curve, n: usize, body: &str) -> String {
     let decl = format!("var R: array<{}, {n}>;", c.fty);
     let split = format!("var R0: array<Fq, {n}>;\n    var R1: array<Fq, {n}>;");
-    debug_assert!(body.contains(&decl), "register file declaration moved");
+    assert!(body.contains(&decl), "register file declaration moved");
     rewrite_regs(&body.replace(&decl, &split))
 }
 
@@ -1253,7 +1253,6 @@ fn entry_merge(c: Curve, wg: u32) -> String {
     // it just denies the compiler the second inlined copy. `MERGE_BODY` keeps every variant
     // above reachable, because a workaround for a compiler nobody can inspect should not
     // also be the only record of what was tried.
-    let level = MERGE_BODY.load(std::sync::atomic::Ordering::Relaxed);
     let spill_loop = match level {
         // Loop kept, every point operation dropped.
         2 => "    for (var k = k_lo; k <= k_hi; k = k + 1u) {
