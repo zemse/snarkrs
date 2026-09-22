@@ -411,8 +411,10 @@ impl MsmBatch {
         for (gi, g) in groups.iter().enumerate() {
             let general = match &g.scalars {
                 Source::Device { general, .. } => *general,
-                // The packer walked every scalar to build the limbs, so the count is free
-                // here and there is no reason to fall back to `n`.
+                // Not available at plan time: this loop runs before the upload below, so
+                // `pack_scalars` has not walked these scalars yet. `None` means `n`, which
+                // is the overestimate `Source::Device`'s `general` documents as the safe
+                // direction.
                 Source::Host(_) => None,
             };
             let dplan = DigitPlan::new(g.n.max(1), g.scalar_off, general)?;
@@ -420,11 +422,15 @@ impl MsmBatch {
                 if g.n == 0 {
                     continue;
                 }
-                if job.base_len() < (job.base_off() + g.n) as usize {
+                // Widened before the add, like the scalar bound below. `base_off` is a
+                // public field of a public `Job`, so it is caller-supplied: a `u32` sum near
+                // the top of the range wraps in release, the comparison passes, and the point
+                // kernels index past the base vector, which WebGPU drops in silence.
+                let end = (job.base_off() as u64) + (g.n as u64);
+                if (job.base_len() as u64) < end {
                     return Err(bad(format!(
-                        "group {gi} job {ji} reads bases {}..{} of a {} point vector",
+                        "group {gi} job {ji} reads bases {}..{end} of a {} point vector",
                         job.base_off(),
-                        job.base_off() + g.n,
                         job.base_len()
                     )));
                 }
