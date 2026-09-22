@@ -23,9 +23,18 @@
 //! [`crate::device::WgpuBackend::exclusive`] argues that `pushErrorScope`/`popErrorScope`
 //! cannot be used to attribute a proof's errors, because the scope stack is device-wide and
 //! two concurrent proofs would nest each other's scopes. That argument is about concurrency,
-//! not about error scopes. This function is `&mut`-shaped in practice: it takes the same
-//! exclusive guard the prover does, so nothing else on the device is pushing scopes while it
-//! runs, and each scope is pushed and popped inside one check.
+//! not about error scopes, and [`run`] answers it by being the thing that holds the device:
+//! natively it takes the same exclusive guard the prover does, so nothing else is pushing
+//! scopes or filling the device-wide error slot while it runs, and each scope is pushed and
+//! popped inside one check. That second half matters as much as the scopes do, because
+//! `Kernel::go` finishes on `take_error()`, and an unguarded battery running beside a proof
+//! would consume the proof's error and report it as a failed check while the proof returned
+//! `Ok` over dispatches that never ran.
+//!
+//! On wasm it does not take that guard, and must not: the guard is a `std::sync::Mutex` and
+//! the battery would hold it across every `.await` below, so on a browser's one thread a
+//! second caller would deadlock the worker rather than queue. There is one thread and one
+//! device there, and [`crate::wasm`] serialises its entry points on `busy` instead.
 
 use g16_field::Fr;
 use g16_gpu_layout::{PackedFr, LIMBS};
@@ -104,6 +113,11 @@ pub enum Battery {
 
 /// The battery, in the order that makes a failure diagnostic.
 pub async fn run(backend: &WgpuBackend, battery: Battery) -> Vec<Check> {
+    // The guard the module docs rest on, taken here and not in [`guard`] or [`run_json`]:
+    // both reach the device through this function, and `exclusive` is a plain
+    // `std::sync::Mutex` that a second take on the same thread would deadlock on.
+    #[cfg(not(target_arch = "wasm32"))]
+    let _gpu = backend.exclusive();
     let mut out = Vec::new();
     // First, because if a dispatch cannot write a buffer at all then nothing below means
     // anything and no kernel is at fault.
@@ -942,4 +956,38 @@ pub fn first_failure(checks: &[Check]) -> Option<String> {
 /// A `wgpu`-only convenience so the caller does not have to name `bad`.
 pub fn as_error(checks: &[Check]) -> Option<g16_core::ProveError> {
     first_failure(checks).map(bad)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compare;
+
+    /// The half of the battery a GPU cannot pin: that a `want` which no longer matches is
+    /// reported at all, and reported with enough to tell the two failures apart.
+    ///
+    /// `tests/selftest.rs` runs every check against a device known to be right, which catches
+    /// an expectation that has drifted away from a correct kernel. It cannot catch an
+    /// expectation that has stopped being able to disagree with anything, and this is where
+    /// that would show.
+    #[test]
+    fn a_want_that_no_longer_matches_is_a_failure_and_names_the_first_word() {
+        let got: Vec<u32> = (0..8u32).map(|i| i * 2 + 1).collect();
+        assert!(compare(&got, &got).is_ok());
+
+        let mut want = got.clone();
+        want[5] = 0xdead_beef;
+        let e = compare(&got, &want).unwrap_err();
+        assert!(e.contains("word 5"), "{e}");
+        assert!(e.contains("0xdeadbeef"), "{e}");
+
+        // The case the whole file exists for: on a browser where every pipeline is invalid
+        // and every dispatch a no-op, the readback is the zeroed buffer. That is one word
+        // wrong like any other and the message has to say which shape it is.
+        let e = compare(&vec![0u32; 8], &got).unwrap_err();
+        assert!(e.contains("8 of 8 words are zero"), "{e}");
+
+        // A short read is its own message rather than an index panic in library code.
+        let e = compare(&got[..4], &got).unwrap_err();
+        assert!(e.contains("read 4 words, expected 8"), "{e}");
+    }
 }
