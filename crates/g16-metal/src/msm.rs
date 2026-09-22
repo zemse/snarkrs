@@ -331,12 +331,18 @@ pub fn window_size(m: usize) -> u32 {
 /// windows over the bits it will actually dispatch, so the `windows * m` term stops
 /// charging for digit rows that hold nothing: at sha256_128 the four witness plans use
 /// 8 of the 51 windows a full-width layout would emit at c = 5.
+///
+/// A layout is at least one bit wide; 0 is read as 1.
 pub fn window_size_for(m: usize, recode_bits: usize) -> u32 {
     if let Ok(v) = std::env::var("G16_METAL_MSM_C") {
         if let Ok(c) = v.parse::<u32>() {
             return c.clamp(2, MAX_WINDOW);
         }
     }
+    // `w - 1` in the loop below underflows at zero bits. `Plan::new` cannot get there,
+    // since it prices `bits_in + 1`, but this is public and its callers pick their own
+    // width.
+    let recode_bits = recode_bits.max(1);
     /// One mixed addition in the segmented accumulation, microseconds.
     const MADD_US: f64 = 0.00324;
     /// One bucket's share of the clear, merge and reduction kernels, microseconds.
@@ -1837,15 +1843,24 @@ impl Outputs {
     fn combine(&self, msm: &MetalMsm, plan: &Plan<'_>) -> MsmResult {
         let rg = plan.reduce_groups;
         if self.is_g2 {
+            // SAFETY: `alloc` sized `ones` at `ones_groups` points and the ones scan
+            // wrote one per group. Every read in this function is off the batch
+            // `msm_batch` has already waited on, so the writes have landed.
             let o: &[PackedXyzzG2] = unsafe { read_back(&self.ones, self.ones_groups) };
             if plan.host_tail {
                 // The GPU stopped after the accumulation; see [`HOST_TAIL_MAX_BUCKETS`].
                 // Fold the spilled runs into the buckets, then the reverse running sum
                 // gives sum_j (j+1) B_j, the whole window in a one-window plan.
+                //
+                // SAFETY: the bucket array holds `n_windows * n_buckets` points, and
+                // `host_tail` implies a single window, so `n_buckets` is all of it.
                 let b: &[PackedXyzzG2] = unsafe { read_back(&self.buckets, plan.n_buckets) };
                 let mut buckets: Vec<G2Projective> = b.iter().map(|x| x.to_projective()).collect();
                 if !legacy_accumulate() {
                     let slots = 2 * plan.slices;
+                    // SAFETY: both spill arrays hold `2 * n_windows * slices` slots and
+                    // the single window again makes `slots` the whole of each. The
+                    // accumulation writes every slot, sentinel row included.
                     let rows: &[u32] = unsafe { read_back(&self.spill_rows, slots) };
                     let pts: &[PackedXyzzG2] = unsafe { read_back(&self.spill_pts, slots) };
                     for (r, pt) in rows.iter().zip(pts) {
@@ -1867,6 +1882,8 @@ impl Outputs {
                 }
                 return MsmResult::G2(acc);
             }
+            // SAFETY: the G2 reduce writes one point per (window, group), which is the
+            // `sums_per_group = 1` `alloc` sized `window_sums` with.
             let w: &[PackedXyzzG2] = unsafe { read_back(&self.window_sums, plan.n_windows * rg) };
             // Each window's `reduce_groups` partials fold first, then the Horner.
             let sum_w = |k: usize| {
@@ -1888,13 +1905,18 @@ impl Outputs {
             }
             MsmResult::G2(acc)
         } else {
+            // SAFETY: as in the G2 arm — `ones_groups` points, written by the completed
+            // batch.
             let o: &[PackedXyzzG1] = unsafe { read_back(&self.ones, self.ones_groups) };
             if plan.host_tail {
-                // Same shape as the G2 arm above.
+                // Same shape as the G2 arm above, and the same lengths hold for the same
+                // reason: `host_tail` implies one window.
+                // SAFETY: `n_buckets` is the whole one-window bucket array.
                 let b: &[PackedXyzzG1] = unsafe { read_back(&self.buckets, plan.n_buckets) };
                 let mut buckets: Vec<G1Projective> = b.iter().map(|x| x.to_projective()).collect();
                 if !legacy_accumulate() {
                     let slots = 2 * plan.slices;
+                    // SAFETY: `slots` is the whole of each one-window spill array.
                     let rows: &[u32] = unsafe { read_back(&self.spill_rows, slots) };
                     let pts: &[PackedXyzzG1] = unsafe { read_back(&self.spill_pts, slots) };
                     for (r, pt) in rows.iter().zip(pts) {
@@ -1928,6 +1950,10 @@ impl Outputs {
             // backend so the audit can compare affine.
             let layout = msm.reduce_layout(plan);
             let slots = layout.slots;
+            // SAFETY: `alloc` sized `window_sums` at `n_windows * reduce_groups *
+            // sums_per_group` points with `sums_per_group = 2 * simdgroups`, from this
+            // same `ReduceLayout`; `slots` is `reduce_groups * simdgroups`, so
+            // `n_windows * slots * 2` is exactly what it allocated and the reduce wrote.
             let w: &[PackedXyzzG1] =
                 unsafe { read_back(&self.window_sums, plan.n_windows * slots * 2) };
             let sum_w = |k: usize| layout.fold(&w[k * slots * 2..(k + 1) * slots * 2]);
