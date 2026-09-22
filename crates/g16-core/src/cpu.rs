@@ -103,6 +103,30 @@ impl CpuCircuit {
                     domain.size
                 )));
             }
+            // A decreasing pair makes `lo..hi` in `gather` an empty range, so that row
+            // would accumulate `Fr::zero()` with no panic and no error, and the proof that
+            // came out would fail `snarkjs groth16 verify` with nothing in any log. The
+            // three GPU backends already refuse such a key (`CsrTables::build` and its
+            // Metal and CUDA counterparts), and this backend is the oracle they are diffed
+            // against, so it must not be the one copy that proves garbage quietly.
+            for c in 1..row_ptr.len() {
+                if row_ptr[c] < row_ptr[c - 1] {
+                    return Err(bad(format!(
+                        "matrix {name} row_ptr is not monotone at row {}: {} then {}",
+                        c - 1,
+                        row_ptr[c - 1],
+                        row_ptr[c]
+                    )));
+                }
+            }
+            let total = row_ptr[row_ptr.len() - 1] as usize;
+            if total != pk.coeffs.signal[m].len() || total != pk.coeffs.value[m].len() {
+                return Err(bad(format!(
+                    "matrix {name} row_ptr ends at {total} but has {} signals and {} values",
+                    pk.coeffs.signal[m].len(),
+                    pk.coeffs.value[m].len()
+                )));
+            }
             // Paid once per key, not per proof, and it turns a would-be panic deep inside
             // the parallel gather into an error at load time.
             if pk.coeffs.signal[m].iter().any(|&s| s as usize >= pk.n_vars) {
@@ -111,6 +135,18 @@ impl CpuCircuit {
                     pk.n_vars
                 )));
             }
+        }
+
+        // `msms` slices the private witness as `witness[n_public + 1..]`, which past
+        // `n_vars` is a panic and not an error, and the workspace release profile's
+        // `panic = "abort"` turns that into a SIGABRT that takes every other in-flight
+        // proof with it. The three GPU backends refuse such a key in their own `new`;
+        // so does this one.
+        if pk.n_vars.checked_sub(pk.n_public + 1).is_none() {
+            return Err(bad(format!(
+                "n_public {} exceeds n_vars {}",
+                pk.n_public, pk.n_vars
+            )));
         }
 
         Ok(Self {
@@ -297,6 +333,36 @@ impl PreparedCircuit for CpuCircuit {
             });
         }
 
+        // The base vectors are checked here and not in `new` the way the GPU backends do
+        // it, because this circuit is also the stage 0-4 oracle those backends are diffed
+        // against and the tests that use it that way carry keys with no bases at all (see
+        // `synthetic_key` in g16-wgpu's stages test). Four length compares per proof is
+        // nothing, and without them a short query reaches `g16-msm`'s deliberate hard
+        // `assert_eq!`, which under `panic = "abort"` is a SIGABRT rather than the
+        // `ProveError::Backend` every other backend returns.
+        for (name, got) in [
+            ("a_query", self.pk.a_query.len()),
+            ("b_g1_query", self.pk.b_g1_query.len()),
+            ("b_g2_query", self.pk.b_g2_query.len()),
+        ] {
+            if got != self.pk.n_vars {
+                return Err(ProveError::Backend {
+                    backend: "cpu",
+                    reason: format!("{name} has {got} bases, n_vars is {}", self.pk.n_vars),
+                });
+            }
+        }
+        if self.pk.h_query.len() != self.domain.size {
+            return Err(ProveError::Backend {
+                backend: "cpu",
+                reason: format!(
+                    "h_query has {} bases, domain size is {}",
+                    self.pk.h_query.len(),
+                    self.domain.size
+                ),
+            });
+        }
+
         // Section 8 covers the private wires only: witness[0] is the constant 1 and
         // witness[1..=n_public] are the public inputs, both of which the verifier folds
         // into L_bar through IC instead.
@@ -404,6 +470,39 @@ mod tests {
             };
             assert!(err.to_string().contains("not a power of two"), "{err}");
         }
+    }
+
+    /// `gather` reads a decreasing pair as an empty range, so this key would have produced
+    /// a silently zeroed row rather than any kind of failure. Every GPU backend rejects it,
+    /// and the reference must not be quieter than the things it is the reference for.
+    #[test]
+    fn rejects_a_non_monotone_row_ptr() {
+        let Some(mut pk) = tiny_key() else { return };
+        let rp = &mut pk.coeffs.row_ptr[0];
+        // Lift the start of a nonempty row above its end. Touching a row start rather than
+        // a row end leaves the last entry alone, so this fails the monotonicity check and
+        // not the nonzero-count one.
+        let c = (1..rp.len())
+            .find(|&c| rp[c] > rp[c - 1])
+            .expect("matrix A has no nonzeros");
+        rp[c - 1] = rp[c] + 1;
+        let Err(err) = CpuCircuit::new(pk) else {
+            panic!("accepted a non-monotone row_ptr");
+        };
+        assert!(err.to_string().contains("not monotone"), "{err}");
+    }
+
+    /// The private witness is `witness[n_public + 1..]`, and under the release profile's
+    /// `panic = "abort"` a key that makes that slice out of range kills the process
+    /// instead of returning.
+    #[test]
+    fn rejects_a_key_with_more_public_inputs_than_wires() {
+        let Some(mut pk) = tiny_key() else { return };
+        pk.n_public = pk.n_vars;
+        let Err(err) = CpuCircuit::new(pk) else {
+            panic!("accepted n_public == n_vars");
+        };
+        assert!(err.to_string().contains("exceeds n_vars"), "{err}");
     }
 
     #[test]
