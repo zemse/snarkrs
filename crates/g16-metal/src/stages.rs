@@ -62,12 +62,12 @@ pub const TAG: &str = "metal";
 /// 896 was measured for a bare multiply kernel on this machine and 512 for a kernel doing
 /// point arithmetic. Metal rejects a threadgroup larger than the pipeline's limit, so the
 /// preference is always `min`ed against `max_total_threads_per_threadgroup`.
+const PREFERRED_THREADS: u64 = 256;
+
 /// A, B and C: the three witness-evaluation vectors that go round the transform pipeline
 /// together. Named rather than written as a bare 3 because it is also the number of
 /// command buffers `compute_h` splits the transforms across, and the two must agree.
 const N_DOMAIN_VECTORS: usize = 3;
-
-const PREFERRED_THREADS: u64 = 256;
 
 /// Hard cap on passes fused into one dispatch, independent of the memory budget.
 ///
@@ -133,13 +133,6 @@ pub struct HStages {
     /// threadgroup memory limit rather than hardcoded.
     max_fused: u32,
 }
-
-// SAFETY: `MTLDevice`, `MTLCommandQueue`, `MTLLibrary` and `MTLComputePipelineState` are
-// documented as safe to use from multiple threads concurrently. The types that are *not*
-// thread safe, `MTLCommandBuffer` and `MTLComputeCommandEncoder`, are created inside
-// `compute_h` on the calling thread and never escape it.
-unsafe impl Send for HStages {}
-unsafe impl Sync for HStages {}
 
 impl HStages {
     /// The MSL for stages 0 to 4, in dependency order.
@@ -335,12 +328,6 @@ struct Scratch {
     h_std: Buffer,
 }
 
-// SAFETY: `MTLBuffer` is thread safe; a `Scratch` is owned by exactly one in-flight proof
-// at a time by construction (it is removed from the pool while in use and returned only
-// when the `HHandle` that owns it is dropped).
-unsafe impl Send for Scratch {}
-unsafe impl Sync for Scratch {}
-
 type Pool = Arc<Mutex<Vec<Scratch>>>;
 
 /// Everything uploaded once per key.
@@ -362,11 +349,6 @@ pub struct HResident {
 
     pool: Pool,
 }
-
-// SAFETY: as for `Scratch`. Every field is either plain data or an `MTLBuffer`, which is
-// only read by kernels after this point, never mutated.
-unsafe impl Send for HResident {}
-unsafe impl Sync for HResident {}
 
 impl HResident {
     fn new(st: &HStages, pk: &ProvingKey) -> Result<Self, ProveError> {
@@ -822,11 +804,6 @@ pub struct HHandle {
     len: usize,
 }
 
-// SAFETY: `MTLBuffer` is thread safe, and the scratch inside is owned exclusively by this
-// handle from the moment `compute_h` returns until this handle is dropped.
-unsafe impl Send for HHandle {}
-unsafe impl Sync for HHandle {}
-
 impl HHandle {
     pub fn len(&self) -> usize {
         self.len
@@ -885,6 +862,26 @@ impl Drop for HHandle {
         }
     }
 }
+
+/// Everything a `PreparedCircuit` carries from this module has to be `Send + Sync`, and
+/// all four of these are, by derivation rather than by assertion: `metal-rs` declares
+/// every handle it defines `Sync + Send`, and MTLDevice, MTLCommandQueue, MTLLibrary,
+/// MTLComputePipelineState and MTLBuffer are documented thread-safe. The two Metal types
+/// that are *not*, `MTLCommandBuffer` and `MTLComputeCommandEncoder`, are created inside
+/// `compute_h` on the calling thread and never stored.
+///
+/// Checked here rather than asserted with a hand-written `unsafe impl`, which these four
+/// used to carry. An `unsafe impl` overrides the auto-trait analysis instead of relying
+/// on it, so a `Cell` or an `Rc` added to any of them later would have compiled, and the
+/// guard in `backend.rs` that exists to catch exactly that would have passed anyway.
+/// Same mechanism and same reasoning as `msm::thread_safety`.
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<HStages>();
+    assert_send_sync::<Scratch>();
+    assert_send_sync::<HResident>();
+    assert_send_sync::<HHandle>();
+};
 
 #[cfg(test)]
 mod tests {
