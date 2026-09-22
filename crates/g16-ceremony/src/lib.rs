@@ -322,6 +322,31 @@ impl Groth16Header {
         let n_vars = cur.u32()?;
         let n_public = cur.u32()?;
         let domain_size = cur.u32()?;
+        // The three counts are the only header fields anything computes with, and both
+        // expressions `zkey verify` builds from them underflow on a hostile file:
+        // `SG1 * (n_vars - n_public - 1)` for the L section length, and
+        // `coeffs[domain_size - 1] = 0` in the H check. Debug panics on the subtraction and
+        // release wraps to `usize::MAX` and panics on the index, so a verifier - the one
+        // component that owes its caller an `Err` on hostile input - aborts in both
+        // profiles. Checked here so every reader of section 2 gets it, `vkey`'s
+        // `n_public + 1` included.
+        let n_ic = n_public.checked_add(1).ok_or_else(|| {
+            CeremonyError::malformed(2, format!("n_public {n_public} is impossibly large"))
+        })?;
+        if n_vars < n_ic {
+            return Err(CeremonyError::malformed(
+                2,
+                format!("n_vars {n_vars} does not cover 1 + n_public {n_public}"),
+            ));
+        }
+        // `zkey_new.js:199` only ever writes `1 << cirPower`, and the H check evaluates on
+        // a domain of exactly this size. Zero is not a power of two, so it is this test.
+        if !domain_size.is_power_of_two() {
+            return Err(CeremonyError::malformed(
+                2,
+                format!("domain size {domain_size} is not a power of two"),
+            ));
+        }
         let alpha_g1 = g16_zkey::binfile::g1(cur.take(SG1)?)?;
         let beta_g1 = g16_zkey::binfile::g1(cur.take(SG1)?)?;
         let beta_g2 = g16_zkey::binfile::g2(cur.take(SG2)?)?;

@@ -537,6 +537,18 @@ fn fail(what: impl Into<String>) -> CeremonyError {
 /// the beacon hash and the iteration count it stores, so both points are recomputed rather
 /// than trusted (`zkey_verify_frominit.js:75-88`).
 fn verify_chain(mpc: &MpcParams, header: &Groth16Header) -> Result<Vec<Digest>, CeremonyError> {
+    // snarkjs has no guard here (`ys` in the bundle), so `zkey verify` on an untouched init
+    // key reports success: the loop below leaves `cur_delta` at the generator, which is
+    // what `header.delta_g1` still is, `same_ratio` on the two generators passes, the byte
+    // comparisons against the init file are trivial when it is the same file, and both
+    // rescale checks pass because `invDelta == 1`. That is a clean verification for a key
+    // whose delta is 1, under which anyone can forge a proof. Phase 1 already makes the
+    // opposite choice (`phase1::verify`), and no key carrying a contribution can trip this.
+    if mpc.contributions.is_empty() {
+        return Err(fail(
+            "this key has no contribution, it cannot be used in production",
+        ));
+    }
     let mut accumulated = Transcript::new();
     accumulated.update(&mpc.cs_hash);
     let mut cur_delta = G1Affine::generator();

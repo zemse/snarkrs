@@ -19,7 +19,7 @@ use std::process::Command;
 
 use g16_ceremony::contribute::{self, MpcParams};
 use g16_ceremony::vkey;
-use g16_ceremony::{CpuKeyScale, Groth16Header};
+use g16_ceremony::{CeremonyError, CpuKeyScale, Groth16Header};
 use g16_msm::CpuMsm;
 
 fn artifacts() -> Vec<(String, PathBuf)> {
@@ -501,4 +501,60 @@ fn a_checked_in_contribution_hashes_to_what_snarkjs_printed() {
         JS_1X1_D8_CONTRIBUTION_HASH.replace(' ', "")
     );
     assert_eq!(mpc.contributions[0].params.name.as_deref(), Some("bench"));
+}
+
+/// `verify_from_init` computes `SG1 * (n_vars - n_public - 1)` for the L section length
+/// and `coeffs[domain_size - 1]` in the H check, on three fields that arrive straight out
+/// of a file. Debug panics on the subtraction and release wraps to `usize::MAX` and panics
+/// on the index, so an unvalidated header aborts the one command that owes its caller an
+/// `Err` on hostile input, in both profiles.
+#[test]
+fn a_header_whose_counts_cannot_be_computed_with_is_refused() {
+    let zkey =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/artifacts/tiny_mul/circuit.zkey");
+    if !zkey.is_file() {
+        eprintln!("SKIPPED a_header_whose_counts_...: no tiny_mul");
+        return;
+    }
+    let file = g16_zkey::binfile::BinFile::open(&zkey, b"zkey", 2).unwrap();
+    let body = file.unique_section(2).unwrap().to_vec();
+    Groth16Header::read(&body).expect("the unedited header still parses");
+    // Two primes of `u32 n8` and 32 bytes come first, so `nVars` is at 72, `nPublic` at 76
+    // and `domainSize` at 80.
+    for (at, value) in [(72usize, 0u32), (76, u32::MAX), (80, 0), (80, 3)] {
+        let mut edited = body.clone();
+        edited[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        assert!(
+            matches!(
+                Groth16Header::read(&edited),
+                Err(CeremonyError::Malformed { section: 2, .. })
+            ),
+            "byte {at} set to {value} was accepted"
+        );
+    }
+}
+
+/// A key with an empty chain is a key whose delta is 1, and anyone can forge a proof under
+/// one. snarkjs reports it as verified; phase 1 already refuses the analogue, and this is
+/// the only place the two phases disagreed about it.
+#[test]
+fn an_uncontributed_key_does_not_verify_against_itself() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench");
+    let (r1cs, ptau) = (
+        dir.join("artifacts/tiny_mul/circuit.r1cs"),
+        dir.join("ptau/local_13.ptau"),
+    );
+    if !r1cs.is_file() || !ptau.is_file() {
+        eprintln!("SKIPPED an_uncontributed_key_...: no tiny_mul or local_13");
+        return;
+    }
+    let msm = CpuMsm::new();
+    let init = tmp_dir("uncontributed").join("init.zkey");
+    g16_ceremony::setup::setup(&r1cs, &ptau, &init, &msm).unwrap();
+    let err = contribute::verify_from_init(&init, &ptau, &init, &msm)
+        .expect_err("an init key verified as a finished one");
+    assert!(
+        matches!(&err, CeremonyError::Verification(s) if s.contains("no contribution")),
+        "{err}"
+    );
 }
