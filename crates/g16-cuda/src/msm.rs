@@ -150,16 +150,16 @@ fn legacy_accumulate() -> bool {
     std::env::var("G16_CUDA_MSM_LEGACY_ACC").as_deref() == Ok("1")
 }
 
+/// The widest window the T4 sweep found worth using. Distinct from `MAX_WINDOW`, which
+/// is what the kernels can physically address: this is what is fast, and it is smaller.
+const MEASURED_MAX_WINDOW: u32 = 8;
+
 /// Meaningful bits of the top window at width `c`.
 ///
 /// The digits are laid out over [`RECODE_BITS`] bits in `W = ceil(255 / c)` windows, and
 /// `W * c` overshoots 255 by up to `c - 1`, so the top window has only
 /// `255 - (W - 1) * c` meaningful bits and its digits crowd into `2^(top_bits - 1)` buckets
 /// instead of `2^(c-1)`.
-/// The widest window the T4 sweep found worth using. Distinct from `MAX_WINDOW`, which
-/// is what the kernels can physically address: this is what is fast, and it is smaller.
-const MEASURED_MAX_WINDOW: u32 = 8;
-
 fn top_bits(c: u32) -> u32 {
     let w = RECODE_BITS.div_ceil(c as usize);
     (RECODE_BITS - (w - 1) * c as usize).min(c as usize) as u32
@@ -247,9 +247,23 @@ pub fn window_size(m: usize) -> u32 {
 }
 
 /// Blocks in the ones kernel. Enough that a 2^18-long witness gives each thread about sixty
-/// scalars to scan, few enough that the host adds a few dozen points. Same formula as the
-/// Metal twin: it trades device parallelism against a serial host tail, and changing it
-/// changes what the two backends are comparing.
+/// scalars to scan, few enough that the host adds a few dozen points. It trades device
+/// parallelism against a serial host tail.
+///
+/// **This is no longer the Metal formula, and this is the half that is stale.** The twin
+/// (`g16-metal/src/msm.rs`) now hands each thread 8 scalars rather than 64 and clamps to
+/// 256 groups rather than 64, because measuring it showed the scan is a *dependent* chain:
+/// a thread waits on its own previous mixed addition, so 64 scalars per thread regardless
+/// of `n` was 832 threads at 2^16 and the four witness MSMs' ones scans came out flat in
+/// `n`, latency-bound at about a sixth of occupancy. `msm_ones_impl` in `msm.cu` has the
+/// same shape, and at 2^18 this launches 64 blocks of 64 threads where Metal launches
+/// 16,384 threads — on a T4's 40 SMs that is one or two blocks per SM, two warps each.
+///
+/// The formula is left alone anyway, because the Metal number is an M2 Max number and
+/// nothing here has run on a card. Whoever next has a T4 should sweep the scalars-per-
+/// thread the way `G16_METAL_MSM_ONES_SPT` sweeps it there (4 and 8 tie, 16 and up climb
+/// back) and take the measured answer. Metal has also since grown an `ones_idx` gather
+/// path that this backend has no kernel for.
 fn ones_groups_for(n: usize) -> usize {
     n.div_ceil(REDUCE_TG as usize * 64).clamp(1, 64)
 }
@@ -1744,10 +1758,11 @@ mod tests {
     // of this workspace is developed on an M2 Max; a silent pass is not something a
     // correctness suite for a proof system should be able to do.
     //
-    // They are `#[ignore]` as well as guarded, because `Cuda::new` does not merely return an
-    // error on a machine with no `libcuda`: `cudarc`'s dynamic loader panics inside it, so
-    // the guard below cannot catch that case and a plain `cargo test` on the development Mac
-    // would go red for a reason that has nothing to do with this code.
+    // They are `#[ignore]` as well as guarded because the guard is only cheap where there is
+    // no card: on the GPU box it is the compile below that costs, and a plain `cargo test`
+    // should not pay it. The skip itself is safe on the development Mac, where `cudarc`'s
+    // dynamic loader would panic rather than error; `context::libcuda_loadable` is what turns
+    // that back into the `Err` the guard reads.
     //
     // Each of these compiles the MSM unit, which is minutes of ptxas on a T4. Run them on
     // the GPU box with
