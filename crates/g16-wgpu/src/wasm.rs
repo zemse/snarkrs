@@ -154,12 +154,25 @@ pub fn wasm_memory() -> JsValue {
 // The streaming byte path.
 // ---------------------------------------------------------------------------------------
 
+/// Zeroed bytes for the page to stream into, or a null pointer if they could not be reserved.
+///
+/// Fallible on purpose. `vec![0u8; len]` on a memory wasm cannot grow calls
+/// `handle_alloc_error`, which aborts, and `console_error_panic_hook` covers panics and not
+/// the allocation error handler: the worker dies with a bare `RuntimeError: unreachable`, no
+/// message and no stack, which is indistinguishable from the device-loss and miscompilation
+/// deaths U13 spent its time narrowing down. Running out of memory is a *normal* condition on
+/// the target this crate is built for, since the 94.4 MB `js_16x16_d32` key plus 62 MB of
+/// resident bases on a phone is the headline case, so it is reported and not fatal.
 fn alloc(len: usize) -> *mut u8 {
-    // `vec![0; len].into_boxed_slice()` and not `Vec::with_capacity`: the capacity has to be
-    // exactly `len` when the box is reconstituted, and `with_capacity` is allowed to give
-    // more. The zeroing pass is about 10 ms on the 94 MB key and buys a `Vec` that is sound
-    // to rebuild.
-    let b = vec![0u8; len].into_boxed_slice();
+    // `try_reserve_exact` and not `try_reserve`: the capacity has to be exactly `len` when
+    // the box is reconstituted, and the inexact form is allowed to give more. The zeroing
+    // pass is about 10 ms on the 94 MB key and buys a `Vec` that is sound to rebuild.
+    let mut v: Vec<u8> = Vec::new();
+    if v.try_reserve_exact(len).is_err() {
+        return std::ptr::null_mut();
+    }
+    v.resize(len, 0);
+    let b = v.into_boxed_slice();
     let ptr = Box::into_raw(b) as *mut u8;
     ALLOCS.with(|a| a.borrow_mut().push((ptr as usize, len)));
     ptr
@@ -198,6 +211,9 @@ fn take(ptr: *mut u8, len: usize) -> Result<Vec<u8>, JsError> {
 ///
 /// The page writes the `fetch` stream into `new Uint8Array(memory.buffer, ptr, len)` and must
 /// re-derive that view after every chunk. See the module docs.
+///
+/// **Returns 0 when the bytes could not be reserved**, and the page has to check it. See
+/// [`alloc`] for why that is a returned value here and not an abort.
 #[wasm_bindgen]
 pub fn zkey_alloc(len: usize) -> *mut u8 {
     alloc(len)
@@ -957,7 +973,17 @@ async fn prove_cold_inner(device: Arc<WgpuBackend>, msm: Arc<MsmBatch>) -> Resul
     let (pk, witness, mut extra) = reparse()?;
 
     let t0 = Instant::now();
-    let circuit = WgpuCircuit::new(device, msm, pk).map_err(js)?;
+    // The same scope discipline as `prepare`, and for the same reason: this builds the
+    // gather, NTT and h_join modules, and on Safari a pipeline the browser rejects is
+    // reported through no other channel, which is how a 3 ms cold row that snarkjs rejects
+    // gets published as a measurement. `scoped` wants the device held exclusively for the
+    // whole of `f`, which the `busy` handshake in `prove_cold` above is.
+    let circuit = device
+        .scoped("building the stage 0 to 4 shader modules", || {
+            WgpuCircuit::new(Arc::clone(&device), Arc::clone(&msm), pk)
+        })
+        .await
+        .map_err(js)?;
     extra.push_str(&format!(
         r#","prepare_us":{}"#,
         t0.elapsed().as_micros() as u64

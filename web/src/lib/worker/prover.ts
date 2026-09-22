@@ -107,6 +107,12 @@ async function streamInto(
   }
 
   const ptr = alloc(len);
+  // 0 is `zkey_alloc`/`wtns_alloc` saying it could not reserve the bytes. It is a returned
+  // value and not an abort because the alternative on a phone that is out of memory is the
+  // worker dying with a bare `RuntimeError: unreachable`; see `alloc` in wasm.rs.
+  if (!ptr) {
+    throw new Error(`${url}: could not reserve ${len} bytes of wasm memory to stream it into`);
+  }
   try {
     const reader = r.body!.getReader();
     let off = 0;

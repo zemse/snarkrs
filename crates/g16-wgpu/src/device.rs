@@ -578,9 +578,10 @@ impl WgpuBackend {
     /// That method argues error scopes cannot attribute a *proof's* errors, because the scope
     /// stack is device-wide and two proofs in flight would nest each other's. That argument
     /// stands and this does not contradict it: **the caller must hold the device exclusively
-    /// for the whole of `f`**, which is why the only callers are the two build paths
-    /// (`create_prover` and `prepare`), each of which runs before any proof exists on this
-    /// device. Do not reach for this inside `compute_h` or `msms`.
+    /// for the whole of `f`**, which is why every caller is a build path (`create_prover`,
+    /// `prepare`, and the circuit build inside `prove_cold`), each of which either runs
+    /// before any proof exists on this device or holds the worker's `busy` claim for its
+    /// whole length. Do not reach for this inside `compute_h` or `msms`.
     ///
     /// Not used natively for anything, and harmless there: wgpu implements scopes on every
     /// backend, and a native validation error is reported through both channels.
