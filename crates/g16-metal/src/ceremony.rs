@@ -1335,6 +1335,61 @@ mod tests {
         }
     }
 
+    /// The host fallback against the implementation it was hand-copied from.
+    ///
+    /// [`apply_key_on_host`] takes every call under [`KEY_MIN_POINTS`], which is a live
+    /// path: a power-8 `.ptau` has 511 points in its largest section. The end-to-end
+    /// version of this comparison is `the_identity_survives_both_of_the_metal_paths` in
+    /// `g16-ceremony/tests/contribute_metal.rs`, which forces the fallback with
+    /// `with_min_points(usize::MAX)`. That one needs a device and the `metal` feature;
+    /// this one needs neither, so an edit to the arithmetic fails in the crate that owns
+    /// it rather than only in the crate that calls it.
+    #[test]
+    fn apply_key_on_host_matches_the_cpu() {
+        let mut rng = Lcg(0x5eed_0007);
+        let first = rng.fr();
+        let inc = rng.fr();
+
+        // Under the crossover, which is the whole point, with identities planted because
+        // ptau section 12's Lagrange padding carries them.
+        let mut g1: Vec<G1Affine> = Vec::new();
+        let mut g2: Vec<G2Affine> = Vec::new();
+        for i in 0..100 {
+            if i % 11 == 0 {
+                g1.push(G1Affine::identity());
+                g2.push(G2Affine::identity());
+            } else {
+                g1.push((G1Affine::generator() * rng.fr()).into_affine());
+                g2.push((G2Affine::generator() * rng.fr()).into_affine());
+            }
+        }
+        assert!(g1.len() < KEY_MIN_POINTS);
+
+        for (first, inc, what) in [
+            (first, inc, "geometric"),
+            (first, Fr::ONE, "constant"),
+            (Fr::ONE, Fr::ONE, "identity key"),
+            (Fr::from(0u64), inc, "zero key"),
+            (Fr::from(0u64) - Fr::ONE, inc, "maximal first"),
+        ] {
+            let mut want1 = g1.clone();
+            let mut got1 = g1.clone();
+            CpuKeyScale
+                .apply_key_g1(&mut want1, first, inc)
+                .expect("cpu apply_key_g1");
+            apply_key_on_host(&mut got1, first, inc);
+            assert_eq!(got1, want1, "G1 host apply_key disagrees, {what}");
+
+            let mut want2 = g2.clone();
+            let mut got2 = g2.clone();
+            CpuKeyScale
+                .apply_key_g2(&mut want2, first, inc)
+                .expect("cpu apply_key_g2");
+            apply_key_on_host(&mut got2, first, inc);
+            assert_eq!(got2, want2, "G2 host apply_key disagrees, {what}");
+        }
+    }
+
     /// The ladder over a vector long enough to cross the chunk boundary, with the corner
     /// scalars deliberately placed in the second and third chunks rather than the first.
     #[test]
