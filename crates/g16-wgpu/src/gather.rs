@@ -360,10 +360,21 @@ pub(crate) fn storage_u32(
     data: &[u32],
 ) -> Result<wgpu::Buffer, ProveError> {
     let bytes = (data.len().max(1) as u64) * 4;
-    if bytes > backend.granted_limits().max_buffer_size {
+    let limits = backend.granted_limits();
+    if bytes > limits.max_buffer_size {
         return Err(bad(format!(
             "{label} wants {bytes} bytes, over the {} byte buffer limit",
-            backend.granted_limits().max_buffer_size
+            limits.max_buffer_size
+        )));
+    }
+    // Every buffer from here is bound as `array<u32>` or `array<Fr>`, so the binding limit is
+    // the one that actually bites: 128 MiB against 256 MiB at the Floor. Without this a 2^23
+    // `coset_pows` allocates cleanly and then fails inside `create_bind_group` with wgpu's own
+    // message about an anonymous buffer.
+    if bytes > limits.max_storage_buffer_binding_size {
+        return Err(bad(format!(
+            "{label} wants {bytes} bytes, over the {} byte storage binding limit",
+            limits.max_storage_buffer_binding_size
         )));
     }
     let buf = backend.device().create_buffer(&wgpu::BufferDescriptor {
