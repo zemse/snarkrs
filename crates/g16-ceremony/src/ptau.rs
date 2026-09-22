@@ -50,6 +50,7 @@ use g16_zkey::binfile::{self, BinFile, Cursor, Scan};
 use g16_zkey::ZkeyError;
 use rayon::prelude::*;
 
+use crate::phase1::{POWER_MAX, POWER_MIN};
 use crate::transcript::{
     read_ptau_pubkey, write_ptau_pubkey, Digest, PtauPubKeys, Transcript, PARTIAL_HASH_BYTES,
     PTAU_PUBKEY_BYTES,
@@ -669,6 +670,29 @@ fn read_header(file: &BinFile) -> Result<PtauHeader, CeremonyError> {
     check_modulus(&mut cur, &q_le())?;
     let power = cur.u32()?;
     let ceremony_power = cur.u32()?;
+    // Both are raw u32 out of a file someone downloaded, and every `1 << power` in this
+    // crate reads one of them. `contributions` is the sharpest case: it seeds from
+    // `first_challenge_hash(ceremony_power)`, which hashes the generator `2^(p+1) - 1`
+    // times, so an unbounded field turns `ptau verify` into a run that never returns
+    // before any check it performs has started. Bounded once here rather than at the
+    // dozen use sites, to the range `powersoftau new` itself enforces (`cli.js:701`).
+    for (value, what) in [(power, "power"), (ceremony_power, "ceremony power")] {
+        if !(POWER_MIN..=POWER_MAX).contains(&value) {
+            return Err(CeremonyError::malformed(
+                S_HEADER,
+                format!("{what} must be between {POWER_MIN} and {POWER_MAX}, got {value}"),
+            ));
+        }
+    }
+    // Only `powersoftau truncate` makes the two differ, and it only ever lowers `power`
+    // (`powersoftau_truncate.js:46-58`). The other direction would leave every section
+    // short of what `power` claims.
+    if power > ceremony_power {
+        return Err(CeremonyError::malformed(
+            S_HEADER,
+            format!("power {power} is above the ceremony power {ceremony_power}"),
+        ));
+    }
     if cur.remaining() != 0 {
         return Err(CeremonyError::malformed(
             S_HEADER,

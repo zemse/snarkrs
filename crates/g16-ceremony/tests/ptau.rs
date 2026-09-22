@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 
 use g16_ceremony::ptau::*;
 use g16_ceremony::transcript::same_ratio;
+use g16_ceremony::{phase1, CeremonyError};
 use g16_field::{AffineRepr, G1Affine, G2Affine};
 
 /// power, ceremony power, contributions, and the byte total the formulas have to land on.
@@ -439,6 +440,45 @@ fn recomputed_g2_sp_matches_the_stored_pubkey() {
         saw_truncated,
         "the truncated case is the one that regressed"
     );
+}
+
+/// `power` and `ceremonyPower` are raw u32 out of a downloaded file, and every `1 <<
+/// power` in the crate reads one of them. `contributions` is the sharpest: it seeds from
+/// `first_challenge_hash(ceremony_power)`, so `ceremonyPower = 45` starts `ptau verify`
+/// on 2^46 repeated hashes of the generator before any check it performs has run, and 64
+/// is an overflowing shift instead. Four flipped bits in a multi-GB download reach both.
+#[test]
+fn a_header_power_outside_the_ceremony_range_is_refused() {
+    let dir = tmp_dir("header-power");
+    let good = dir.join("good.ptau");
+    phase1::ptau_new(2, &good).unwrap();
+    let bytes = std::fs::read(&good).unwrap();
+    // 12 bytes of preamble and 12 of section framing, then `n8` and `q`, puts `power` at
+    // 60 and `ceremonyPower` at 64.
+    assert_eq!(&bytes[60..68], [2, 0, 0, 0, 2, 0, 0, 0]);
+    Ptau::open(&good).expect("the unedited file still opens");
+
+    // Both fields at both ends of the range, then the one ordering `truncate` can never
+    // produce: it only ever lowers `power` (`powersoftau_truncate.js:46-58`).
+    for (at, value) in [(60usize, 0u32), (60, 29), (64, 45), (64, 64), (64, 1)] {
+        let mut edited = bytes.clone();
+        edited[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        let path = dir.join(format!("bad_{at}_{value}.ptau"));
+        std::fs::write(&path, &edited).unwrap();
+        for opened in [Ptau::open(&path), Ptau::open_lenient(&path)] {
+            assert!(
+                matches!(opened, Err(CeremonyError::Malformed { section: 1, .. })),
+                "byte {at} set to {value} was accepted"
+            );
+        }
+    }
+}
+
+fn tmp_dir(test: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("g16-ceremony-ptau-{test}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
 }
 
 fn hex(bytes: &[u8]) -> String {
