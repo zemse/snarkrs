@@ -23,7 +23,7 @@
 
 use std::time::Instant;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use g16_ceremony::CpuGroupFft;
 use g16_cuda::fft::FftKernels;
 use g16_cuda::Cuda;
@@ -31,6 +31,13 @@ use g16_field::raw::{RawFq, RawFq2};
 use g16_field::{CurveGroup, G1Projective, G2Projective, PrimeGroup};
 use g16_msm::xyzz::{to_projective, Xyzz};
 use g16_msm::GroupFft;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum Group {
+    G1,
+    G2,
+    Both,
+}
 
 #[derive(clap::Args, Debug)]
 pub struct Args {
@@ -46,8 +53,8 @@ pub struct Args {
     #[arg(long, value_delimiter = ',', default_value = "128")]
     pub blocks: Vec<u32>,
     /// g1, g2 or both.
-    #[arg(long, default_value = "both")]
-    pub group: String,
+    #[arg(long, value_enum, default_value_t = Group::Both)]
+    pub group: Group,
     /// Timed repetitions per row. The first row of a fresh process is also the warmup;
     /// discard iter 0 of the very first row when reading the table.
     #[arg(long, default_value_t = 3)]
@@ -176,6 +183,12 @@ pub fn run(args: Args) -> Result<()> {
             args.power
         );
     }
+    // Zero of either makes the CPU comparison vacuous rather than failing: `ifft_many`
+    // over no blocks launches nothing and returns Ok, `all` over no copies is true, and
+    // the `iter == 0` arm never runs. Every row would print `ok` having compared nothing.
+    if args.copies == 0 || args.iters == 0 {
+        bail!("--copies and --iters must be at least 1");
+    }
     // The gated variants exist in the unit only when the define is in the source
     // (kernels.rs reads this env at compile time). Anything beyond the shipped `c5`
     // needs it, so default it on; an explicit value, e.g. `0` to sweep only the cheap
@@ -186,7 +199,10 @@ pub fn run(args: Args) -> Result<()> {
     }
 
     let ordinal = match std::env::var("G16_CUDA_DEVICE") {
-        Ok(v) => v.trim().parse::<usize>()?,
+        Ok(v) => v
+            .trim()
+            .parse::<usize>()
+            .with_context(|| format!("G16_CUDA_DEVICE={v:?} is not a device ordinal"))?,
         Err(_) => 0,
     };
     let t = Instant::now();
@@ -237,9 +253,6 @@ pub fn run(args: Args) -> Result<()> {
     );
     println!("group variant block   iter    wall_s      Ml/s  check");
 
-    if !["g1", "g2", "both"].contains(&args.group.as_str()) {
-        bail!("--group must be g1, g2 or both");
-    }
     // The closure keeps the module type (a cudarc handle) inside g16-cuda's API; every
     // instance it makes shares the one compiled module, so a row costs a function bind
     // and nothing else.
@@ -253,10 +266,10 @@ pub fn run(args: Args) -> Result<()> {
             .with_timing(args.time))
     };
     let mut mismatches = 0usize;
-    if args.group == "g1" || args.group == "both" {
+    if matches!(args.group, Group::G1 | Group::Both) {
         mismatches += run_group::<G1, _>(&args, &mk, &selected)?;
     }
-    if args.group == "g2" || args.group == "both" {
+    if matches!(args.group, Group::G2 | Group::Both) {
         mismatches += run_group::<G2, _>(&args, &mk, &selected)?;
     }
     // A wrong variant fails the command, but only after every row ran: the compile this
