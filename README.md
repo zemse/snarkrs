@@ -17,8 +17,8 @@
 
 **proving (warm)**:
 
-| program         | constraints | g16 cpu | g16 metal | g16 cuda | rapidsnark | snarkjs |
-| --------------- | ----------: | ------: | --------: | -------: | ---------: | ------: |
+| program         | constraints | g16 cpu (ms) | g16 metal (ms) | g16 cuda (ms) | rapidsnark (ms) | snarkjs (ms) |
+| --------------- | ----------: | -----------: | -------------: | ------------: | --------------: | -----------: |
 | `railgun-01x01` |      20,135 |    65.4 |      29.1 |          |       72.0 |         |
 | `tornado`       |      28,275 |   102.9 |      40.2 |          |      117.5 |         |
 | `sha256`        |      59,281 |    57.3 |      21.0 |          |       72.0 |         |
@@ -27,12 +27,12 @@
 | `keccak256`     |     239,176 |   216.1 |      38.8 |          |      289.0 |         |
 | `anon-aadhaar`  |   1,115,080 |  1764.5 |     263.2 |          |     2120.0 |         |
 
-**trusted setup** (seconds, not milliseconds; faster of cpu/metal in bold):
+**trusted setup** (faster of cpu/metal in bold):
 
 phase 1, powers of tau, run once for every circuit that follows:
 
-| command            | input    | g16 cpu | g16 metal | snarkjs |
-| ------------------ | -------- | ------: | --------: | ------: |
+| command            | input    | g16 cpu (s) | g16 metal (s) | snarkjs (s) |
+| ------------------ | -------- | ----------: | ------------: | ----------: |
 | `ptau new`         | power 14 |**0.01** |         — |     0.5 |
 | `ptau contribute`  | power 19 |    36.3 |  **5.2**  |   162.3 |
 | `ptau beacon`      | power 19 |    36.2 |  **5.2**  |   162.0 |
@@ -41,8 +41,8 @@ phase 1, powers of tau, run once for every circuit that follows:
 
 phase 2, the proving key, run once per circuit:
 
-| command                | domain | g16 cpu  | g16 metal | snarkjs |
-| ---------------------- | ------ | -------: | --------: | ------: |
+| command                | domain | g16 cpu (s) | g16 metal (s) | snarkjs (s) |
+| ---------------------- | ------ | ----------: | ------------: | ----------: |
 | `setup` circom         | 2^20   |     17.4 | **17.1**  |    86.4 |
 | `zkey contribute`      | 2^20   |     16.4 |  **1.8**  |    72.6 |
 | `zkey beacon`          | 2^20   |     16.3 |  **1.8**  |    73.6 |
@@ -51,8 +51,8 @@ phase 2, the proving key, run once per circuit:
 
 **warm**:
 
-| program         | constraints | g16 cpu | g16 metal | g16 cuda | rapidsnark | snarkjs |
-| --------------- | ----------: | ------: | --------: | -------: | ---------: | ------: |
+| program         | constraints | g16 cpu (ms) | g16 metal (ms) | g16 cuda (ms) | rapidsnark (ms) | snarkjs (ms) |
+| --------------- | ----------: | -----------: | -------------: | ------------: | --------------: | -----------: |
 | `railgun-01x01` |      20,135 |   231.0 |           |     23.7 |      170.0 |         |
 | `tornado`       |      28,275 |   396.1 |           |     32.0 |      300.0 |         |
 | `sha256`        |      59,281 |   193.6 |           |     18.0 |      175.0 |         |
