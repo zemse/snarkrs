@@ -43,6 +43,7 @@ use std::time::Instant;
 use g16_core::{HPoly, ProveError, StageTimings};
 use g16_field::{Domain, Field, Fr};
 use g16_zkey::ProvingKey;
+use metal::objc::rc::autoreleasepool;
 use metal::{
     Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, Library,
     MTLResourceOptions, MTLSize,
@@ -501,9 +502,19 @@ impl HResident {
         let pack_us = start.elapsed().as_micros() as u64;
 
         let profile = std::env::var_os("G16_METAL_PROFILE").is_some();
-        if profile {
-            self.run_profiled(st, &sc, n, t, pack_us)?;
-        } else {
+        // One autorelease pool per proof, around every submission below.
+        //
+        // `commandBuffer` and `computeCommandEncoder` are both `+0` autoreleased, and
+        // metal-rs hands back a borrowed `&CommandBufferRef` that neither retains nor
+        // releases. A Rust binary has no ambient pool and no run loop, so with none here
+        // the objc runtime installs a page nothing ever drains and every submission leaks
+        // its command buffer and its encoder for the life of the process;
+        // `OBJC_DEBUG_MISSING_POOLS=YES` names both classes. The pool closes after the
+        // waits rather than after each commit, because the refs the waits read are its.
+        autoreleasepool(|| -> Result<(), ProveError> {
+            if profile {
+                return self.run_profiled(st, &sc, n, t, pack_us);
+            }
             t.gather_us += pack_us;
             let start = Instant::now();
 
@@ -550,7 +561,8 @@ impl HResident {
                 crate::cb::wait_ok(cb, context)?;
             }
             t.ntt_us += start.elapsed().as_micros() as u64;
-        }
+            Ok(())
+        })?;
 
         Ok(HPoly::Device {
             tag: TAG,

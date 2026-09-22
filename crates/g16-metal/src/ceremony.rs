@@ -18,6 +18,7 @@ use g16_field::{
 };
 use g16_msm::xyzz::Xyzz;
 use g16_msm::{AccelError, GroupFft, KeyScale, MsmBackend};
+use metal::objc::rc::autoreleasepool;
 use metal::{
     Buffer, CommandQueue, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device,
     MTLResourceOptions, MTLSize,
@@ -739,32 +740,39 @@ impl CeremonyKernels {
         let mut out = Vec::with_capacity(points.len());
 
         for (pts, scs) in points.chunks(self.chunk).zip(scalars.chunks(self.chunk)) {
-            let n = pts.len();
-            let packed: Vec<G::PackedPoint> = pts.iter().map(G::pack_point).collect();
-            let in_buf = self.buffer(&packed);
-            let sc_buf = self.buffer(&PackedScalar::pack_slice(scs));
-            let out_buf = self.scratch::<G::PackedPoint>(n);
-            let p = CerParams {
-                n: n as u32,
-                ..Default::default()
-            };
+            // One pool per chunk. Command buffers and encoders are autoreleased and a
+            // Rust binary drains nothing on its own; see the longer note in
+            // `stages::HResident::compute_h`. A `ptau prepare` submits one of these per
+            // chunk of a multi-gigabyte section, so the leak is not a rounding error.
+            autoreleasepool(|| -> Result<(), ProveError> {
+                let n = pts.len();
+                let packed: Vec<G::PackedPoint> = pts.iter().map(G::pack_point).collect();
+                let in_buf = self.buffer(&packed);
+                let sc_buf = self.buffer(&PackedScalar::pack_slice(scs));
+                let out_buf = self.scratch::<G::PackedPoint>(n);
+                let p = CerParams {
+                    n: n as u32,
+                    ..Default::default()
+                };
 
-            let cb = self.queue.new_command_buffer();
-            let enc = cb.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(pso);
-            enc.set_buffer(0, Some(&in_buf), 0);
-            enc.set_buffer(1, Some(&sc_buf), 0);
-            enc.set_buffer(2, Some(&out_buf), 0);
-            set_params(enc, 3, &p);
-            dispatch_1d(enc, pso, n, 64);
-            enc.end_encoding();
-            cb.commit();
-            crate::cb::wait_ok(cb, "ceremony point scalar multiplication")?;
+                let cb = self.queue.new_command_buffer();
+                let enc = cb.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(pso);
+                enc.set_buffer(0, Some(&in_buf), 0);
+                enc.set_buffer(1, Some(&sc_buf), 0);
+                enc.set_buffer(2, Some(&out_buf), 0);
+                set_params(enc, 3, &p);
+                dispatch_1d(enc, pso, n, 64);
+                enc.end_encoding();
+                cb.commit();
+                crate::cb::wait_ok(cb, "ceremony point scalar multiplication")?;
 
-            // SAFETY: the command buffer completed, and `n` points of this type is
-            // exactly what the kernel wrote.
-            let got: &[G::PackedPoint] = unsafe { cer_read_back(&out_buf, n) };
-            out.extend(got.iter().map(G::unpack_point));
+                // SAFETY: the command buffer completed, and `n` points of this type is
+                // exactly what the kernel wrote.
+                let got: &[G::PackedPoint] = unsafe { cer_read_back(&out_buf, n) };
+                out.extend(got.iter().map(G::unpack_point));
+                Ok(())
+            })?;
         }
         Ok(out)
     }
@@ -775,15 +783,20 @@ impl CeremonyKernels {
     ) -> Result<Vec<G::Affine>, ProveError> {
         let mut out = Vec::with_capacity(points.len());
         for pts in points.chunks(self.chunk) {
-            let n = pts.len();
-            let packed: Vec<G::PackedPoint> = pts.iter().map(G::pack_point).collect();
-            let in_buf = self.buffer(&packed);
-            let aff = self.scratch::<G::PackedAffine>(n);
-            self.affine_from_device::<G>(&in_buf, &aff, n, None)?;
-            // SAFETY: as above, and `PackedAffine` is `Packed`, so every bit pattern is
-            // a valid value.
-            let got: &[G::PackedAffine] = unsafe { cer_read_back(&aff, n) };
-            out.extend(got.iter().map(G::unpack_affine));
+            // As in `point_mul`: the pool has to wrap both of `affine_from_device`'s
+            // submissions, so it sits outside the call rather than inside it.
+            autoreleasepool(|| -> Result<(), ProveError> {
+                let n = pts.len();
+                let packed: Vec<G::PackedPoint> = pts.iter().map(G::pack_point).collect();
+                let in_buf = self.buffer(&packed);
+                let aff = self.scratch::<G::PackedAffine>(n);
+                self.affine_from_device::<G>(&in_buf, &aff, n, None)?;
+                // SAFETY: as above, and `PackedAffine` is `Packed`, so every bit pattern
+                // is a valid value.
+                let got: &[G::PackedAffine] = unsafe { cer_read_back(&aff, n) };
+                out.extend(got.iter().map(G::unpack_affine));
+                Ok(())
+            })?;
         }
         Ok(out)
     }
@@ -799,39 +812,43 @@ impl CeremonyKernels {
         let chunk = self.chunk;
 
         for (ci, block) in points.chunks_mut(chunk).enumerate() {
-            let n = block.len();
-            let packed: Vec<G::PackedAffine> = block.iter().map(G::pack_affine).collect();
-            let in_buf = self.buffer(&packed);
-            let xyzz = self.scratch::<G::PackedPoint>(n);
-            let aff = self.scratch::<G::PackedAffine>(n);
-            let p = CerParams {
-                n: n as u32,
-                index_off: (ci * chunk) as u32,
-                has_inc: u32::from(inc != Fr::ONE),
-                first: PackedFr::from_fr(&first),
-                inc: PackedFr::from_fr(&inc),
-                ..Default::default()
-            };
+            // As in `point_mul`, and outside `affine_from_device` for the same reason.
+            autoreleasepool(|| -> Result<(), ProveError> {
+                let n = block.len();
+                let packed: Vec<G::PackedAffine> = block.iter().map(G::pack_affine).collect();
+                let in_buf = self.buffer(&packed);
+                let xyzz = self.scratch::<G::PackedPoint>(n);
+                let aff = self.scratch::<G::PackedAffine>(n);
+                let p = CerParams {
+                    n: n as u32,
+                    index_off: (ci * chunk) as u32,
+                    has_inc: u32::from(inc != Fr::ONE),
+                    first: PackedFr::from_fr(&first),
+                    inc: PackedFr::from_fr(&inc),
+                    ..Default::default()
+                };
 
-            // The ladder and the first batch-to-affine pass go into one command buffer:
-            // dispatches inside a serial compute encoder are ordered and coherent, so the
-            // prefix pass reads what the ladder wrote with no barrier and no second
-            // submission.
-            let ladder = |enc: &ComputeCommandEncoderRef| {
-                enc.set_compute_pipeline_state(pso);
-                enc.set_buffer(0, Some(&in_buf), 0);
-                enc.set_buffer(1, Some(&xyzz), 0);
-                set_params(enc, 2, &p);
-                dispatch_1d(enc, pso, n, 64);
-            };
-            self.affine_from_device::<G>(&xyzz, &aff, n, Some(&ladder))?;
+                // The ladder and the first batch-to-affine pass go into one command
+                // buffer: dispatches inside a serial compute encoder are ordered and
+                // coherent, so the prefix pass reads what the ladder wrote with no
+                // barrier and no second submission.
+                let ladder = |enc: &ComputeCommandEncoderRef| {
+                    enc.set_compute_pipeline_state(pso);
+                    enc.set_buffer(0, Some(&in_buf), 0);
+                    enc.set_buffer(1, Some(&xyzz), 0);
+                    set_params(enc, 2, &p);
+                    dispatch_1d(enc, pso, n, 64);
+                };
+                self.affine_from_device::<G>(&xyzz, &aff, n, Some(&ladder))?;
 
-            // SAFETY: the command buffer completed and `n` affine points is what the
-            // finish pass wrote.
-            let got: &[G::PackedAffine] = unsafe { cer_read_back(&aff, n) };
-            for (dst, src) in block.iter_mut().zip(got) {
-                *dst = G::unpack_affine(src);
-            }
+                // SAFETY: the command buffer completed and `n` affine points is what the
+                // finish pass wrote.
+                let got: &[G::PackedAffine] = unsafe { cer_read_back(&aff, n) };
+                for (dst, src) in block.iter_mut().zip(got) {
+                    *dst = G::unpack_affine(src);
+                }
+                Ok(())
+            })?;
         }
         Ok(())
     }
