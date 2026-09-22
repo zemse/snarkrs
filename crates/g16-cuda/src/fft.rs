@@ -172,6 +172,28 @@ struct Block {
     stream: Arc<CudaStream>,
 }
 
+/// Blocks the host until every stream of a multi-stream round has drained, however the
+/// round ends.
+///
+/// The happy path does not need this: each block's `download` synchronizes its own stream
+/// before anything is freed. The error paths do. `ifft_many` has `?` exits after launches
+/// have been issued, and one of the buffers those launches read is the shared `tw`, which
+/// lives on `self.stream` rather than on any pool stream. cudarc frees a `CudaSlice` with
+/// `cuMemFreeAsync` on the stream it was allocated against, and that only orders against
+/// work already queued on *that* stream, so an early return would free the twiddle table
+/// out from under mix passes still queued elsewhere. A device-side use-after-free reads as
+/// corrupt points or as an illegal address that takes the context down, either of which is
+/// worse than the error being reported.
+struct DrainOnExit<'a>(&'a [Arc<CudaStream>]);
+
+impl Drop for DrainOnExit<'_> {
+    fn drop(&mut self) {
+        for s in self.0 {
+            let _ = s.synchronize();
+        }
+    }
+}
+
 /// The two kernels for one group of one variant.
 struct FftPair {
     mix: Kernel,
@@ -479,7 +501,8 @@ impl FftKernels {
         // other. No cross-stream ordering is needed: blocks are independent transforms
         // and each one's uploads, passes and download stay on its own stream, while the
         // shared `tw` upload below completes (host-blocking) before any launch is
-        // issued anywhere.
+        // issued anywhere. When `tw` is *freed* is a separate question, and the one this
+        // reasoning used to skip; [`DrainOnExit`] answers it.
         let pool: Vec<Arc<CudaStream>> = if self.streams > 1 {
             (0..self.streams.min(blocks.len().max(1)))
                 .map(|_| {
@@ -550,6 +573,10 @@ impl FftKernels {
             &self.stream,
             as_words(&twiddle_table::<G::Cfg>(max_bits, Fr::ONE)),
         )?;
+        // Declared after `tw` so it drops before it: locals drop in reverse order, so
+        // every launch below is finished before the buffers those launches read go away.
+        // See [`DrainOnExit`].
+        let _drain = DrainOnExit(&pool);
 
         let mut times: Vec<PassTime> = Vec::new();
         for exp in 1..=max_bits {
