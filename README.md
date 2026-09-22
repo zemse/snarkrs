@@ -17,15 +17,24 @@
 
 **proving (warm)**:
 
-| program         | constraints | g16 cpu (ms) | g16 metal (ms) | g16 cuda (ms) | rapidsnark (ms) | snarkjs (ms) |
-| --------------- | ----------: | -----------: | -------------: | ------------: | --------------: | -----------: |
-| `railgun-01x01` |      20,135 |    65.4 |      29.1 |          |       72.0 |         |
-| `tornado`       |      28,275 |   102.9 |      40.2 |          |      117.5 |         |
-| `sha256`        |      59,281 |    57.3 |      21.0 |          |       72.0 |         |
-| `railgun-13x01` |     141,276 |   390.3 |     125.2 |          |      421.0 |         |
-| `rsa2048`       |     190,945 |   225.4 |      56.8 |          |      344.5 |         |
-| `keccak256`     |     239,176 |   216.1 |      38.8 |          |      289.0 |         |
-| `anon-aadhaar`  |   1,115,080 |  1764.5 |     263.2 |          |     2120.0 |         |
+<table>
+<thead>
+<tr><th rowspan="2">program</th><th rowspan="2" align="right">constraints</th><th>GPU</th><th colspan="3">CPU</th></tr>
+<tr><th align="right">g16 metal (ms)</th><th align="right">g16 cpu (ms)</th><th align="right">rapidsnark (ms)</th><th align="right">snarkjs (ms)</th></tr>
+</thead>
+<tbody>
+<tr><td><code>railgun-01x01</code></td><td align="right">20,135</td><td align="right">29.1</td><td align="right">65.4</td><td align="right">72.0</td><td align="right"></td></tr>
+<tr><td><code>tornado</code></td><td align="right">28,275</td><td align="right">40.2</td><td align="right">102.9</td><td align="right">117.5</td><td align="right"></td></tr>
+<tr><td><code>sha256</code></td><td align="right">59,281</td><td align="right">21.0</td><td align="right">57.3</td><td align="right">72.0</td><td align="right"></td></tr>
+<tr><td><code>railgun-13x01</code></td><td align="right">141,276</td><td align="right">125.2</td><td align="right">390.3</td><td align="right">421.0</td><td align="right"></td></tr>
+<tr><td><code>rsa2048</code></td><td align="right">190,945</td><td align="right">56.8</td><td align="right">225.4</td><td align="right">344.5</td><td align="right"></td></tr>
+<tr><td><code>keccak256</code></td><td align="right">239,176</td><td align="right">38.8</td><td align="right">216.1</td><td align="right">289.0</td><td align="right"></td></tr>
+<tr><td><code>anon-aadhaar</code></td><td align="right">1,115,080</td><td align="right">263.2</td><td align="right">1764.5</td><td align="right">2120.0</td><td align="right"></td></tr>
+</tbody>
+</table>
+
+> blank = not measurable on this box: snarkjs has no warm mode, its CLI starts a fresh
+> process per proof. Its cold numbers are in `bench/results/machines/`.
 
 **trusted setup** (faster of cpu/metal in bold):
 
@@ -51,15 +60,24 @@ phase 2, the proving key, run once per circuit:
 
 **warm**:
 
-| program         | constraints | g16 cpu (ms) | g16 metal (ms) | g16 cuda (ms) | rapidsnark (ms) | snarkjs (ms) |
-| --------------- | ----------: | -----------: | -------------: | ------------: | --------------: | -----------: |
-| `railgun-01x01` |      20,135 |   231.0 |           |     23.7 |      170.0 |         |
-| `tornado`       |      28,275 |   396.1 |           |     32.0 |      300.0 |         |
-| `sha256`        |      59,281 |   193.6 |           |     18.0 |      175.0 |         |
-| `railgun-13x01` |     141,276 |  1447.7 |           |    135.3 |     1191.5 |         |
-| `rsa2048`       |     190,945 |   776.9 |           |     64.7 |      790.5 |         |
-| `keccak256`     |     239,176 |   758.1 |           |     51.4 |      682.0 |         |
-| `anon-aadhaar`  |   1,115,080 |  5925.0 |           |    406.5 |     5774.0 |         |
+<table>
+<thead>
+<tr><th rowspan="2">program</th><th rowspan="2" align="right">constraints</th><th>GPU</th><th colspan="3">CPU</th></tr>
+<tr><th align="right">g16 cuda (ms)</th><th align="right">g16 cpu (ms)</th><th align="right">rapidsnark (ms)</th><th align="right">snarkjs (ms)</th></tr>
+</thead>
+<tbody>
+<tr><td><code>railgun-01x01</code></td><td align="right">20,135</td><td align="right">23.7</td><td align="right">231.0</td><td align="right">170.0</td><td align="right"></td></tr>
+<tr><td><code>tornado</code></td><td align="right">28,275</td><td align="right">32.0</td><td align="right">396.1</td><td align="right">300.0</td><td align="right"></td></tr>
+<tr><td><code>sha256</code></td><td align="right">59,281</td><td align="right">18.0</td><td align="right">193.6</td><td align="right">175.0</td><td align="right"></td></tr>
+<tr><td><code>railgun-13x01</code></td><td align="right">141,276</td><td align="right">135.3</td><td align="right">1447.7</td><td align="right">1191.5</td><td align="right"></td></tr>
+<tr><td><code>rsa2048</code></td><td align="right">190,945</td><td align="right">64.7</td><td align="right">776.9</td><td align="right">790.5</td><td align="right"></td></tr>
+<tr><td><code>keccak256</code></td><td align="right">239,176</td><td align="right">51.4</td><td align="right">758.1</td><td align="right">682.0</td><td align="right"></td></tr>
+<tr><td><code>anon-aadhaar</code></td><td align="right">1,115,080</td><td align="right">406.5</td><td align="right">5925.0</td><td align="right">5774.0</td><td align="right"></td></tr>
+</tbody>
+</table>
+
+> blank = not measurable on this box: snarkjs has no warm mode, its CLI starts a fresh
+> process per proof. Its cold numbers are in `bench/results/machines/`.
 
 > note: constraint count is a poor predictor of proving time. e.g. `railgun-13x01` has fewer constraints than `keccak256` but takes more to prove.
 
