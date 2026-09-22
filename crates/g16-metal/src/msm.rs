@@ -446,9 +446,6 @@ const _: () = {
 
 unsafe impl Packed for PackedXyzzG1 {}
 unsafe impl Packed for PackedXyzzG2 {}
-// A bare `u32` meets the contract trivially: the host-tail combine reads the spill row
-// indices back through the same [`read_back`] the points go through.
-unsafe impl Packed for u32 {}
 
 /// XYZZ to arkworks' Jacobian, with no field inversion.
 ///

@@ -450,6 +450,10 @@ unsafe impl Packed for PackedFq {}
 unsafe impl Packed for PackedFq2 {}
 unsafe impl Packed for PackedG1Affine {}
 unsafe impl Packed for PackedG2Affine {}
+// A bare `u32` meets the contract trivially, and each backend's MSM has a word buffer
+// that goes through the same reader its points do (the host-tail combine's spill row
+// indices).
+unsafe impl Packed for u32 {}
 
 /// Byte view of a packed slice, for `MTLDevice::newBuffer*`.
 pub fn as_bytes<T: Packed>(items: &[T]) -> &[u8] {
