@@ -44,10 +44,7 @@ use g16_core::{HPoly, ProveError, StageTimings};
 use g16_field::{Domain, Field, Fr};
 use g16_zkey::ProvingKey;
 use metal::objc::rc::autoreleasepool;
-use metal::{
-    Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, Library,
-    MTLResourceOptions, MTLSize,
-};
+use metal::{Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, Library, MTLSize};
 
 use crate::kernels::{FR_MSL, GATHER_MSL, NTT_MSL, POINTWISE_MSL};
 use crate::layout::{as_bytes, PackedFr, PackedScalar};
@@ -225,42 +222,30 @@ impl HStages {
         HResident::new(self, pk)
     }
 
-    fn buf<T: crate::layout::Packed>(&self, data: &[T]) -> Buffer {
+    fn buf<T: crate::layout::Packed>(&self, data: &[T]) -> Result<Buffer, ProveError> {
         // A zero-length MTLBuffer is not a valid allocation, and an empty CSR matrix or a
         // size-1 domain's empty twiddle table both reach here. One padding element keeps
         // the binding legal; no kernel reads it, because every loop that could is bounded
         // by a row pointer or a domain size that is zero.
         if data.is_empty() {
-            return self.device.new_buffer(
-                core::mem::size_of::<T>() as u64,
-                MTLResourceOptions::StorageModeShared,
-            );
+            return crate::alloc::shared(&self.device, core::mem::size_of::<T>());
         }
         let bytes = as_bytes(data);
-        self.device.new_buffer_with_data(
-            bytes.as_ptr() as *const c_void,
-            bytes.len() as u64,
-            MTLResourceOptions::StorageModeShared,
-        )
+        crate::alloc::shared_with_data(&self.device, bytes.as_ptr() as *const c_void, bytes.len())
     }
 
-    fn buf_u32(&self, data: &[u32]) -> Buffer {
+    fn buf_u32(&self, data: &[u32]) -> Result<Buffer, ProveError> {
         if data.is_empty() {
-            return self
-                .device
-                .new_buffer(4, MTLResourceOptions::StorageModeShared);
+            return crate::alloc::shared(&self.device, 4);
         }
-        self.device.new_buffer_with_data(
-            data.as_ptr() as *const c_void,
-            (data.len() * 4) as u64,
-            MTLResourceOptions::StorageModeShared,
-        )
+        crate::alloc::shared_with_data(&self.device, data.as_ptr() as *const c_void, data.len() * 4)
     }
 
-    fn empty(&self, elems: usize) -> Buffer {
-        let bytes = (elems.max(1) * core::mem::size_of::<PackedFr>()) as u64;
-        self.device
-            .new_buffer(bytes, MTLResourceOptions::StorageModeShared)
+    fn empty(&self, elems: usize) -> Result<Buffer, ProveError> {
+        crate::alloc::shared(
+            &self.device,
+            elems.max(1) * core::mem::size_of::<PackedFr>(),
+        )
     }
 
     /// Threadgroup width for a pipeline: the preference, clamped by what the pipeline
@@ -407,20 +392,20 @@ impl HResident {
             n_vars: pk.n_vars,
             batches: split_passes(domain.log_size, st.max_fused),
             row_ptr: [
-                st.buf_u32(&pk.coeffs.row_ptr[0]),
-                st.buf_u32(&pk.coeffs.row_ptr[1]),
+                st.buf_u32(&pk.coeffs.row_ptr[0])?,
+                st.buf_u32(&pk.coeffs.row_ptr[1])?,
             ],
             signal: [
-                st.buf_u32(&pk.coeffs.signal[0]),
-                st.buf_u32(&pk.coeffs.signal[1]),
+                st.buf_u32(&pk.coeffs.signal[0])?,
+                st.buf_u32(&pk.coeffs.signal[1])?,
             ],
             value: [
-                st.buf(&PackedFr::pack_slice(&pk.coeffs.value[0])),
-                st.buf(&PackedFr::pack_slice(&pk.coeffs.value[1])),
+                st.buf(&PackedFr::pack_slice(&pk.coeffs.value[0]))?,
+                st.buf(&PackedFr::pack_slice(&pk.coeffs.value[1]))?,
             ],
-            tw_fwd: st.buf(&PackedFr::pack_slice(&domain.twiddles())),
-            tw_inv: st.buf(&PackedFr::pack_slice(&domain.twiddles_inv())),
-            coset_pows: st.buf(&PackedFr::pack_slice(&pows)),
+            tw_fwd: st.buf(&PackedFr::pack_slice(&domain.twiddles()))?,
+            tw_inv: st.buf(&PackedFr::pack_slice(&domain.twiddles_inv()))?,
+            coset_pows: st.buf(&PackedFr::pack_slice(&pows))?,
             coset_shift,
             domain,
             pool: Arc::new(Mutex::new(Vec::new())),
@@ -445,20 +430,20 @@ impl HResident {
         self.batches.iter().map(|b| (b.s0, b.k)).collect()
     }
 
-    fn take_scratch(&self, st: &HStages) -> Scratch {
+    fn take_scratch(&self, st: &HStages) -> Result<Scratch, ProveError> {
         if let Some(s) = self.pool.lock().unwrap_or_else(|e| e.into_inner()).pop() {
-            return s;
+            return Ok(s);
         }
         let n = self.domain.size;
-        Scratch {
-            witness: st.empty(self.n_vars),
-            a: st.empty(n),
-            b: st.empty(n),
-            c: st.empty(n),
-            t: st.empty(n),
-            h_mont: st.empty(n),
-            h_std: st.empty(n),
-        }
+        Ok(Scratch {
+            witness: st.empty(self.n_vars)?,
+            a: st.empty(n)?,
+            b: st.empty(n)?,
+            c: st.empty(n)?,
+            t: st.empty(n)?,
+            h_mont: st.empty(n)?,
+            h_std: st.empty(n)?,
+        })
     }
 
     /// Stages 0 to 4. Returns `H` on the coset, length `domain_size`, still on the device.
@@ -485,7 +470,7 @@ impl HResident {
             });
         }
         let n = self.domain.size;
-        let sc = self.take_scratch(st);
+        let sc = self.take_scratch(st)?;
 
         // The pack writes straight into the buffer's contents pointer. On unified memory
         // that write is the upload; there is no staging copy and no blit.

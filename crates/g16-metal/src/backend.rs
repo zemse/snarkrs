@@ -187,11 +187,11 @@ impl MetalCircuit {
         // arkworks and `G2Affine` is 136, neither is `repr(C)`, and both carry an
         // infinity flag that the packed layout encodes as all-zero coordinates instead.
         let t1 = Instant::now();
-        let a_bases = msm.upload_g1_bases(&pk.a_query);
-        let b_g1_bases = msm.upload_g1_bases(&pk.b_g1_query);
-        let b_g2_bases = msm.upload_g2_bases(&pk.b_g2_query);
-        let l_bases = msm.upload_g1_bases(&pk.l_query);
-        let h_bases = msm.upload_g1_bases(&pk.h_query);
+        let a_bases = msm.upload_g1_bases(&pk.a_query)?;
+        let b_g1_bases = msm.upload_g1_bases(&pk.b_g1_query)?;
+        let b_g2_bases = msm.upload_g2_bases(&pk.b_g2_query)?;
+        let l_bases = msm.upload_g1_bases(&pk.l_query)?;
+        let h_bases = msm.upload_g1_bases(&pk.h_query)?;
         let bases_us = t1.elapsed().as_micros() as u64;
 
         let cost = PrepareCost {
@@ -306,7 +306,7 @@ impl MetalCircuit {
                 let host = h.to_host().ok_or_else(|| {
                     bad("compute_h output is neither a metal handle nor a host vector")
                 })?;
-                Ok(self.msm.upload_scalars(host))
+                self.msm.upload_scalars(host)
             }
         }
     }
@@ -396,7 +396,7 @@ impl PreparedCircuit for MetalCircuit {
 
         let start = Instant::now();
 
-        let w = self.msm.upload_scalars(witness);
+        let w = self.msm.upload_scalars(witness)?;
         let h_scalars = self.h_scalars(h)?;
 
         // One command buffer for all five. Order matches the stage numbering, and
@@ -455,7 +455,7 @@ impl PreparedCircuit for MetalCircuit {
         let mut compute_h_us = 0u64;
         let (h_out, wit_out) = std::thread::scope(|s| {
             let wit = s.spawn(|| {
-                let w = self.msm.upload_scalars(witness);
+                let w = self.msm.upload_scalars(witness)?;
                 self.msm.msm_batch(&self.witness_jobs(&w))
             });
             let h_out = (|| {

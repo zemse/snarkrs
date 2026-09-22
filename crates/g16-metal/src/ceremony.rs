@@ -21,7 +21,7 @@ use g16_msm::{AccelError, GroupFft, KeyScale, MsmBackend};
 use metal::objc::rc::autoreleasepool;
 use metal::{
     Buffer, CommandQueue, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device,
-    MTLResourceOptions, MTLSize,
+    MTLSize,
 };
 
 use crate::fft::FftKernels;
@@ -84,16 +84,28 @@ impl MsmBackend for MetalMsmBackend {
     }
 
     fn msm_g1(&self, bases: &[G1Affine], scalars: &[Fr]) -> G1Projective {
-        let bases = self.msm.upload_g1_bases(bases);
-        let scalars = self.msm.upload_scalars(scalars);
+        let bases = self
+            .msm
+            .upload_g1_bases(bases)
+            .unwrap_or_else(|e| panic!("metal msm_g1 failed, no zkey was written: {e}"));
+        let scalars = self
+            .msm
+            .upload_scalars(scalars)
+            .unwrap_or_else(|e| panic!("metal msm_g1 failed, no zkey was written: {e}"));
         self.msm
             .msm_g1(&bases, &scalars)
             .unwrap_or_else(|e| panic!("metal msm_g1 failed, no zkey was written: {e}"))
     }
 
     fn msm_g2(&self, bases: &[G2Affine], scalars: &[Fr]) -> G2Projective {
-        let bases = self.msm.upload_g2_bases(bases);
-        let scalars = self.msm.upload_scalars(scalars);
+        let bases = self
+            .msm
+            .upload_g2_bases(bases)
+            .unwrap_or_else(|e| panic!("metal msm_g2 failed, no zkey was written: {e}"));
+        let scalars = self
+            .msm
+            .upload_scalars(scalars)
+            .unwrap_or_else(|e| panic!("metal msm_g2 failed, no zkey was written: {e}"));
         self.msm
             .msm_g2(&bases, &scalars)
             .unwrap_or_else(|e| panic!("metal msm_g2 failed, no zkey was written: {e}"))
@@ -702,24 +714,16 @@ impl CeremonyKernels {
 
     // -- the shared submission code --
 
-    fn buffer<T: Packed>(&self, items: &[T]) -> Buffer {
+    fn buffer<T: Packed>(&self, items: &[T]) -> Result<Buffer, ProveError> {
         let bytes = as_bytes(items);
         if bytes.is_empty() {
-            return self
-                .device
-                .new_buffer(4, MTLResourceOptions::StorageModeShared);
+            return crate::alloc::shared(&self.device, 4);
         }
-        self.device.new_buffer_with_data(
-            bytes.as_ptr().cast(),
-            bytes.len() as u64,
-            MTLResourceOptions::StorageModeShared,
-        )
+        crate::alloc::shared_with_data(&self.device, bytes.as_ptr().cast(), bytes.len())
     }
 
-    fn scratch<T>(&self, len: usize) -> Buffer {
-        let bytes = (len.max(1) * core::mem::size_of::<T>()) as u64;
-        self.device
-            .new_buffer(bytes, MTLResourceOptions::StorageModeShared)
+    fn scratch<T>(&self, len: usize) -> Result<Buffer, ProveError> {
+        crate::alloc::shared(&self.device, len.max(1) * core::mem::size_of::<T>())
     }
 
     fn point_mul<G: CerGroup>(
@@ -747,9 +751,9 @@ impl CeremonyKernels {
             autoreleasepool(|| -> Result<(), ProveError> {
                 let n = pts.len();
                 let packed: Vec<G::PackedPoint> = pts.iter().map(G::pack_point).collect();
-                let in_buf = self.buffer(&packed);
-                let sc_buf = self.buffer(&PackedScalar::pack_slice(scs));
-                let out_buf = self.scratch::<G::PackedPoint>(n);
+                let in_buf = self.buffer(&packed)?;
+                let sc_buf = self.buffer(&PackedScalar::pack_slice(scs))?;
+                let out_buf = self.scratch::<G::PackedPoint>(n)?;
                 let p = CerParams {
                     n: n as u32,
                     ..Default::default()
@@ -788,8 +792,8 @@ impl CeremonyKernels {
             autoreleasepool(|| -> Result<(), ProveError> {
                 let n = pts.len();
                 let packed: Vec<G::PackedPoint> = pts.iter().map(G::pack_point).collect();
-                let in_buf = self.buffer(&packed);
-                let aff = self.scratch::<G::PackedAffine>(n);
+                let in_buf = self.buffer(&packed)?;
+                let aff = self.scratch::<G::PackedAffine>(n)?;
                 self.affine_from_device::<G>(&in_buf, &aff, n, None)?;
                 // SAFETY: as above, and `PackedAffine` is `Packed`, so every bit pattern
                 // is a valid value.
@@ -816,9 +820,9 @@ impl CeremonyKernels {
             autoreleasepool(|| -> Result<(), ProveError> {
                 let n = block.len();
                 let packed: Vec<G::PackedAffine> = block.iter().map(G::pack_affine).collect();
-                let in_buf = self.buffer(&packed);
-                let xyzz = self.scratch::<G::PackedPoint>(n);
-                let aff = self.scratch::<G::PackedAffine>(n);
+                let in_buf = self.buffer(&packed)?;
+                let xyzz = self.scratch::<G::PackedPoint>(n)?;
+                let aff = self.scratch::<G::PackedAffine>(n)?;
                 let p = CerParams {
                     n: n as u32,
                     index_off: (ci * chunk) as u32,
@@ -870,8 +874,8 @@ impl CeremonyKernels {
         }
         let pipelines = G::pipelines(self);
         let segments = n.div_ceil(SEG_LEN);
-        let prefix = self.scratch::<G::PackedField>(n);
-        let segprod = self.scratch::<G::PackedField>(segments);
+        let prefix = self.scratch::<G::PackedField>(n)?;
+        let segprod = self.scratch::<G::PackedField>(segments)?;
         let p = CerParams {
             n: n as u32,
             seg_len: SEG_LEN as u32,
@@ -897,7 +901,7 @@ impl CeremonyKernels {
         // SAFETY: the command buffer completed and the prefix pass wrote one field
         // element per segment.
         let got: &[G::PackedField] = unsafe { cer_read_back(&segprod, segments) };
-        let seeds = self.buffer(&build_seeds::<G>(got)?);
+        let seeds = self.buffer(&build_seeds::<G>(got)?)?;
 
         let cb = self.queue.new_command_buffer();
         let enc = cb.new_compute_command_encoder();

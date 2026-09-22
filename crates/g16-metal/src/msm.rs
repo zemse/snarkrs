@@ -63,7 +63,7 @@ use ark_ff::{AdditiveGroup, One, Zero};
 use metal::objc::{msg_send, sel, sel_impl};
 use metal::{
     Buffer, CommandQueue, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device,
-    MTLDispatchType, MTLResourceOptions, MTLSize,
+    MTLDispatchType, MTLSize,
 };
 
 use g16_core::ProveError;
@@ -692,7 +692,7 @@ struct Pool {
 }
 
 impl Pool {
-    fn take(&self, bytes: usize) -> Buffer {
+    fn take(&self, bytes: usize) -> Result<Buffer, ProveError> {
         let bytes = bytes.max(4);
         let mut free = self.free.lock().expect("scratch pool poisoned");
         // Smallest buffer that fits, so a single huge allocation cannot be handed out
@@ -707,11 +707,10 @@ impl Pool {
             }
         }
         if let Some(i) = best {
-            return free.swap_remove(i);
+            return Ok(free.swap_remove(i));
         }
         drop(free);
-        self.device
-            .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared)
+        crate::alloc::shared(&self.device, bytes)
     }
 
     fn give(&self, bufs: Vec<Buffer>) {
@@ -831,40 +830,34 @@ impl MetalMsm {
         &self.device
     }
 
-    fn shared_buffer<T: Packed>(&self, items: &[T]) -> Buffer {
+    fn shared_buffer<T: Packed>(&self, items: &[T]) -> Result<Buffer, ProveError> {
         let bytes = as_bytes(items);
         if bytes.is_empty() {
-            return self
-                .device
-                .new_buffer(4, MTLResourceOptions::StorageModeShared);
+            return crate::alloc::shared(&self.device, 4);
         }
-        self.device.new_buffer_with_data(
-            bytes.as_ptr().cast(),
-            bytes.len() as u64,
-            MTLResourceOptions::StorageModeShared,
-        )
+        crate::alloc::shared_with_data(&self.device, bytes.as_ptr().cast(), bytes.len())
     }
 
     /// Repacks and uploads a G1 base vector. `ark_ec::G1Affine` is 72 bytes on this
     /// arkworks and carries an infinity flag, so a byte cast would hand the GPU a 72-byte
     /// stride where the shader reads 64. [`PackedG1Affine::from_affine`] reads the flag
     /// and maps infinity onto the all-zero encoding the kernels test for.
-    pub fn upload_g1_bases(&self, bases: &[G1Affine]) -> G1Bases {
+    pub fn upload_g1_bases(&self, bases: &[G1Affine]) -> Result<G1Bases, ProveError> {
         let packed = PackedG1Affine::pack_slice(bases);
-        G1Bases {
-            buf: self.shared_buffer(&packed),
+        Ok(G1Bases {
+            buf: self.shared_buffer(&packed)?,
             len: bases.len(),
             inf: bases.iter().map(|b| b.infinity).collect(),
-        }
+        })
     }
 
-    pub fn upload_g2_bases(&self, bases: &[G2Affine]) -> G2Bases {
+    pub fn upload_g2_bases(&self, bases: &[G2Affine]) -> Result<G2Bases, ProveError> {
         let packed = PackedG2Affine::pack_slice(bases);
-        G2Bases {
-            buf: self.shared_buffer(&packed),
+        Ok(G2Bases {
+            buf: self.shared_buffer(&packed)?,
             len: bases.len(),
             inf: bases.iter().map(|b| b.infinity).collect(),
-        }
+        })
     }
 
     /// Packs scalars into standard form and uploads them, classifying as it goes.
@@ -878,14 +871,12 @@ impl MetalMsm {
     /// Each chunk counts its own generals and builds its stretch of the prefix locally;
     /// a serial fix-up then shifts every stretch by the chunks before it, which is one
     /// add per scalar against the reduction the parallel pass just paid.
-    pub fn upload_scalars(&self, scalars: &[Fr]) -> ScalarBuf {
+    pub fn upload_scalars(&self, scalars: &[Fr]) -> Result<ScalarBuf, ProveError> {
         use rayon::prelude::*;
 
         let n = scalars.len();
-        let bytes = (n.max(1) * core::mem::size_of::<PackedScalar>()) as u64;
-        let buf = self
-            .device
-            .new_buffer(bytes, MTLResourceOptions::StorageModeShared);
+        let bytes = n.max(1) * core::mem::size_of::<PackedScalar>();
+        let buf = crate::alloc::shared(&self.device, bytes)?;
         let mut prefix = vec![0u32; n + 1];
         let mut ones_idx = Vec::new();
         let mut chunk_bits = Vec::new();
@@ -929,13 +920,13 @@ impl MetalMsm {
                 chunk_bits.push(*bits);
             }
         }
-        ScalarBuf {
+        Ok(ScalarBuf {
             buf,
             len: n,
             general_prefix: Some(prefix),
             ones_idx: Some(ones_idx),
             chunk_bits: Some(chunk_bits),
-        }
+        })
     }
 
     /// Converts a device-resident Montgomery `Fr` buffer (what the NTT leaves behind for
@@ -950,10 +941,7 @@ impl MetalMsm {
         mont: &Buffer,
         len: usize,
     ) -> Result<ScalarBuf, ProveError> {
-        let out = self.device.new_buffer(
-            (len.max(1) * 32) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+        let out = crate::alloc::shared(&self.device, len.max(1) * 32)?;
         let cb = self.queue.new_command_buffer();
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&self.pipelines.mont_to_std);
@@ -1084,12 +1072,12 @@ impl MetalMsm {
         // ---- allocate ----
         let mut scratch: Vec<Buffer> = Vec::new();
         for p in &mut plans {
-            p.alloc(&self.pool, &mut scratch);
+            p.alloc(&self.pool, &mut scratch)?;
         }
         let mut outs: Vec<Outputs> = Vec::with_capacity(jobs.len());
         for job in jobs {
             let plan = &plans[job_plan[outs.len()]];
-            outs.push(Outputs::alloc(self, &mut scratch, job, plan));
+            outs.push(Outputs::alloc(self, &mut scratch, job, plan)?);
         }
 
         // ---- encode, once ----
@@ -1385,19 +1373,20 @@ impl<'a> Plan<'a> {
         }
     }
 
-    fn alloc(&mut self, pool: &Pool, keep: &mut Vec<Buffer>) {
+    fn alloc(&mut self, pool: &Pool, keep: &mut Vec<Buffer>) -> Result<(), ProveError> {
         let rows = self.n_windows * self.n_buckets;
-        let counts = pool.take(rows * 4);
-        let cursor = pool.take(rows * 4);
+        let counts = pool.take(rows * 4)?;
+        let cursor = pool.take(rows * 4)?;
         // 8 bytes an entry: the bucket row travels with the point index so the
         // segmented accumulation can find run boundaries without recomputing digits.
-        let entries = pool.take(self.n_windows * self.cap * 8);
+        let entries = pool.take(self.n_windows * self.cap * 8)?;
         keep.push(counts.clone());
         keep.push(cursor.clone());
         keep.push(entries.clone());
         self.counts = Some(counts);
         self.cursor = Some(cursor);
         self.entries = Some(entries);
+        Ok(())
     }
 
     fn encode(&self, msm: &MetalMsm, enc: &ComputeCommandEncoderRef) {
@@ -1534,7 +1523,12 @@ fn ones_groups_for(n: usize) -> usize {
 }
 
 impl Outputs {
-    fn alloc(msm: &MetalMsm, keep: &mut Vec<Buffer>, job: &Job<'_>, plan: &Plan<'_>) -> Self {
+    fn alloc(
+        msm: &MetalMsm,
+        keep: &mut Vec<Buffer>,
+        job: &Job<'_>,
+        plan: &Plan<'_>,
+    ) -> Result<Self, ProveError> {
         let pool = &msm.pool;
         let (is_g2, base_off, point_bytes, scalar_off, sbuf, inf) = match job {
             Job::G1(j) => (
@@ -1561,39 +1555,42 @@ impl Outputs {
         // because it is exactly what the kernel would otherwise discover point by
         // point. On the csp B queries, 61% of the bases are infinity, and this is
         // where their scalars stop costing anything.
-        let ones_idx = sbuf.ones_idx.as_ref().map(|idx| {
-            let lo = idx.partition_point(|&e| (e as usize) < scalar_off);
-            let hi = idx.partition_point(|&e| (e as usize) < scalar_off + plan.n);
-            let gather: Vec<u32> = idx[lo..hi]
-                .iter()
-                .map(|&e| (base_off + (e as usize - scalar_off)) as u32)
-                .filter(|&b| !inf[b as usize])
-                .collect();
-            let buf = pool.take(gather.len() * 4);
-            if !gather.is_empty() {
-                // SAFETY: the pooled buffer holds at least `gather.len()` u32s and the
-                // batch that could read it has not been committed yet.
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        gather.as_ptr(),
-                        buf.contents().cast::<u32>(),
-                        gather.len(),
-                    );
+        let ones_idx = match sbuf.ones_idx.as_ref() {
+            Some(idx) => {
+                let lo = idx.partition_point(|&e| (e as usize) < scalar_off);
+                let hi = idx.partition_point(|&e| (e as usize) < scalar_off + plan.n);
+                let gather: Vec<u32> = idx[lo..hi]
+                    .iter()
+                    .map(|&e| (base_off + (e as usize - scalar_off)) as u32)
+                    .filter(|&b| !inf[b as usize])
+                    .collect();
+                let buf = pool.take(gather.len() * 4)?;
+                if !gather.is_empty() {
+                    // SAFETY: the pooled buffer holds at least `gather.len()` u32s and
+                    // the batch that could read it has not been committed yet.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            gather.as_ptr(),
+                            buf.contents().cast::<u32>(),
+                            gather.len(),
+                        );
+                    }
                 }
+                Some((buf, gather.len()))
             }
-            (buf, gather.len())
-        });
+            None => None,
+        };
         let ones_groups = match &ones_idx {
             Some((_, count)) => ones_groups_for(*count),
             None if plan.separate_ones => ones_groups_for(plan.n),
             None => 0,
         };
-        let buckets = pool.take(plan.n_windows * plan.n_buckets * point_bytes);
+        let buckets = pool.take(plan.n_windows * plan.n_buckets * point_bytes)?;
         // Two spill slots per slice: at most one run of a slice continues backwards and
         // at most one continues forwards.
         let spill_slots = 2 * plan.n_windows * plan.slices;
-        let spill_pts = pool.take(spill_slots * point_bytes);
-        let spill_rows = pool.take(spill_slots * 4);
+        let spill_pts = pool.take(spill_slots * point_bytes)?;
+        let spill_rows = pool.take(spill_slots * 4)?;
         // The G1 reduce writes a pair per simdgroup. Query this pipeline's width:
         // at width 16 a 64-thread group writes eight points, not four.
         let sums_per_group = if is_g2 {
@@ -1602,8 +1599,8 @@ impl Outputs {
             2 * msm.reduce_layout(plan).simdgroups
         };
         let window_sums =
-            pool.take(plan.n_windows * plan.reduce_groups * sums_per_group * point_bytes);
-        let ones = pool.take(ones_groups * point_bytes);
+            pool.take(plan.n_windows * plan.reduce_groups * sums_per_group * point_bytes)?;
+        let ones = pool.take(ones_groups * point_bytes)?;
         keep.push(buckets.clone());
         keep.push(spill_pts.clone());
         keep.push(spill_rows.clone());
@@ -1612,7 +1609,7 @@ impl Outputs {
         if let Some((buf, _)) = &ones_idx {
             keep.push(buf.clone());
         }
-        Self {
+        Ok(Self {
             buckets,
             spill_pts,
             spill_rows,
@@ -1622,7 +1619,7 @@ impl Outputs {
             ones_idx,
             base_off,
             is_g2,
-        }
+        })
     }
 
     /// The Pippenger half: clear, segmented accumulation, merge, reduce. Split from
@@ -2234,8 +2231,8 @@ mod tests {
                 .iter()
                 .zip(&scalars)
                 .fold(G1Projective::zero(), |a, (b, s)| a + *b * s);
-            let db = m.upload_g1_bases(&bases);
-            let ds = m.upload_scalars(&scalars);
+            let db = m.upload_g1_bases(&bases).expect("upload bases");
+            let ds = m.upload_scalars(&scalars).expect("upload scalars");
             let got = m.msm_g1(&db, &ds).unwrap();
             assert_eq!(got.into_affine(), want.into_affine(), "n = {n}");
         }
@@ -2260,8 +2257,8 @@ mod tests {
             .iter()
             .zip(&scalars)
             .fold(G2Projective::zero(), |a, (b, s)| a + *b * s);
-        let db = m.upload_g2_bases(&bases);
-        let ds = m.upload_scalars(&scalars);
+        let db = m.upload_g2_bases(&bases).expect("upload bases");
+        let ds = m.upload_scalars(&scalars).expect("upload scalars");
         let got = m.msm_g2(&db, &ds).unwrap();
         assert_eq!(got.into_affine(), want.into_affine());
     }
@@ -2279,8 +2276,8 @@ mod tests {
         let g2: Vec<_> = (0..n)
             .map(|i| (G2Projective::generator() * Fr::from((i + 1) as u64)).into_affine())
             .collect();
-        let b1 = m.upload_g1_bases(&g1);
-        let b2 = m.upload_g2_bases(&g2);
+        let b1 = m.upload_g1_bases(&g1).expect("upload bases");
+        let b2 = m.upload_g2_bases(&g2).expect("upload bases");
         for kind in [0, 1, 2, 0] {
             let scalars: Vec<_> = (0..n)
                 .map(|i| match kind {
@@ -2289,7 +2286,7 @@ mod tests {
                     _ => Fr::from((i % 5) as u64),
                 })
                 .collect();
-            let uploaded = m.upload_scalars(&scalars);
+            let uploaded = m.upload_scalars(&scalars).expect("upload scalars");
             let device = m.scalars_from_device_std(&uploaded.buf, n);
             let want1 = g1
                 .iter()
@@ -2330,14 +2327,13 @@ mod tests {
         }
         let packed = crate::layout::PackedFr::pack_slice(&scalars);
         let bytes = as_bytes(&packed);
-        let mont = m.device.new_buffer_with_data(
-            bytes.as_ptr().cast(),
-            bytes.len() as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+        let mont =
+            crate::alloc::shared_with_data(&m.device, bytes.as_ptr().cast(), bytes.len()).unwrap();
 
-        let db = m.upload_g1_bases(&bases);
-        let from_host = m.msm_g1(&db, &m.upload_scalars(&scalars)).unwrap();
+        let db = m.upload_g1_bases(&bases).expect("upload bases");
+        let from_host = m
+            .msm_g1(&db, &m.upload_scalars(&scalars).expect("upload scalars"))
+            .unwrap();
         let from_device = m
             .msm_g1(&db, &m.scalars_from_device_mont(&mont, n).unwrap())
             .unwrap();
@@ -2368,13 +2364,13 @@ mod tests {
         let n_public = circuit.n_public();
 
         let m = MetalMsm::new().expect("Metal device");
-        let a_bases = m.upload_g1_bases(&pk.a_query);
-        let b1_bases = m.upload_g1_bases(&pk.b_g1_query);
-        let b2_bases = m.upload_g2_bases(&pk.b_g2_query);
-        let l_bases = m.upload_g1_bases(&pk.l_query);
-        let h_bases = m.upload_g1_bases(&pk.h_query);
-        let w_scalars = m.upload_scalars(&witness);
-        let h_dev = m.upload_scalars(h_scalars);
+        let a_bases = m.upload_g1_bases(&pk.a_query).expect("upload bases");
+        let b1_bases = m.upload_g1_bases(&pk.b_g1_query).expect("upload bases");
+        let b2_bases = m.upload_g2_bases(&pk.b_g2_query).expect("upload bases");
+        let l_bases = m.upload_g1_bases(&pk.l_query).expect("upload bases");
+        let h_bases = m.upload_g1_bases(&pk.h_query).expect("upload bases");
+        let w_scalars = m.upload_scalars(&witness).expect("upload scalars");
+        let h_dev = m.upload_scalars(h_scalars).expect("upload scalars");
 
         let n = witness.len();
         let l_off = n_public + 1;
@@ -2504,15 +2500,15 @@ mod tests {
             let l_off = circuit.n_public() + 1;
 
             let t0 = Instant::now();
-            let a_bases = m.upload_g1_bases(&pk.a_query);
-            let b1_bases = m.upload_g1_bases(&pk.b_g1_query);
-            let b2_bases = m.upload_g2_bases(&pk.b_g2_query);
-            let l_bases = m.upload_g1_bases(&pk.l_query);
-            let h_bases = m.upload_g1_bases(&pk.h_query);
+            let a_bases = m.upload_g1_bases(&pk.a_query).expect("upload bases");
+            let b1_bases = m.upload_g1_bases(&pk.b_g1_query).expect("upload bases");
+            let b2_bases = m.upload_g2_bases(&pk.b_g2_query).expect("upload bases");
+            let l_bases = m.upload_g1_bases(&pk.l_query).expect("upload bases");
+            let h_bases = m.upload_g1_bases(&pk.h_query).expect("upload bases");
             let upload_ms = t0.elapsed().as_secs_f64() * 1e3;
 
             let general = {
-                let s = m.upload_scalars(&witness);
+                let s = m.upload_scalars(&witness).expect("upload scalars");
                 s.general_in(&(0..n))
             };
 
@@ -2526,8 +2522,8 @@ mod tests {
                 let cpu_ms = t0.elapsed().as_secs_f64() * 1e3;
 
                 let t0 = Instant::now();
-                let w_scalars = m.upload_scalars(&witness);
-                let h_dev = m.upload_scalars(&h_scalars);
+                let w_scalars = m.upload_scalars(&witness).expect("upload scalars");
+                let h_dev = m.upload_scalars(&h_scalars).expect("upload scalars");
                 let pack_ms = t0.elapsed().as_secs_f64() * 1e3;
                 let t1 = Instant::now();
                 let jobs = vec![
@@ -2622,12 +2618,12 @@ mod tests {
             let n = witness.len();
             let l_off = circuit.n_public() + 1;
 
-            let a_bases = m.upload_g1_bases(&pk.a_query);
-            let b2_bases = m.upload_g2_bases(&pk.b_g2_query);
-            let l_bases = m.upload_g1_bases(&pk.l_query);
-            let h_bases = m.upload_g1_bases(&pk.h_query);
-            let w_scalars = m.upload_scalars(&witness);
-            let h_dev = m.upload_scalars(&h_scalars);
+            let a_bases = m.upload_g1_bases(&pk.a_query).expect("upload bases");
+            let b2_bases = m.upload_g2_bases(&pk.b_g2_query).expect("upload bases");
+            let l_bases = m.upload_g1_bases(&pk.l_query).expect("upload bases");
+            let h_bases = m.upload_g1_bases(&pk.h_query).expect("upload bases");
+            let w_scalars = m.upload_scalars(&witness).expect("upload scalars");
+            let h_dev = m.upload_scalars(&h_scalars).expect("upload scalars");
 
             println!("--- {name}");
             for (label, scalars_slice, job) in [

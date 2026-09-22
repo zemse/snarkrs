@@ -272,11 +272,11 @@ fn where_the_msm_time_actually_goes() {
     for (name, dir) in artifacts() {
         let pk = ProvingKey::load(&dir.join("circuit.zkey")).unwrap();
         let witness = Witness::load(&dir.join("circuit.wtns")).unwrap().0;
-        let a = msm.upload_g1_bases(&pk.a_query);
-        let b1 = msm.upload_g1_bases(&pk.b_g1_query);
-        let b2 = msm.upload_g2_bases(&pk.b_g2_query);
-        let l = msm.upload_g1_bases(&pk.l_query);
-        let hq = msm.upload_g1_bases(&pk.h_query);
+        let a = msm.upload_g1_bases(&pk.a_query).expect("upload bases");
+        let b1 = msm.upload_g1_bases(&pk.b_g1_query).expect("upload bases");
+        let b2 = msm.upload_g2_bases(&pk.b_g2_query).expect("upload bases");
+        let l = msm.upload_g1_bases(&pk.l_query).expect("upload bases");
+        let hq = msm.upload_g1_bases(&pk.h_query).expect("upload bases");
 
         let cpu = CpuBackend::new().prepare(pk).unwrap();
         let mut t = StageTimings::default();
@@ -291,8 +291,8 @@ fn where_the_msm_time_actually_goes() {
         let mut batch_ms = Vec::new();
         for rep in 0..9 {
             let s = Instant::now();
-            let w = msm.upload_scalars(&witness);
-            let hs = msm.upload_scalars(&h_host);
+            let w = msm.upload_scalars(&witness).expect("upload scalars");
+            let hs = msm.upload_scalars(&h_host).expect("upload scalars");
             let p = s.elapsed().as_secs_f64() * 1e3;
 
             let s = Instant::now();
@@ -481,7 +481,7 @@ fn adversarial_scalars_agree_with_arkworks() {
 
     let n = 4096usize;
     let bases: Vec<g16_field::G1Affine> = pk.a_query[..n].to_vec();
-    let gb = msm.upload_g1_bases(&bases);
+    let gb = msm.upload_g1_bases(&bases).expect("upload bases");
 
     // A tiny deterministic xorshift; no rand dependency in this crate.
     let mut st = 0x243F6A8885A308D3u64;
@@ -564,7 +564,7 @@ fn adversarial_scalars_agree_with_arkworks() {
     for (label, scalars) in &cases {
         let m = scalars.len();
         let want = g16_field::G1Projective::msm(&bases[..m], scalars).unwrap();
-        let sb = msm.upload_scalars(scalars);
+        let sb = msm.upload_scalars(scalars).expect("upload scalars");
         let got = msm
             .msm_g1(&gb, &sb)
             .unwrap_or_else(|e| panic!("{label}: {e}"));

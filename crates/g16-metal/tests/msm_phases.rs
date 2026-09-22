@@ -42,12 +42,12 @@ fn msm_stage_intercept() {
         let g2: Vec<_> = (0..n)
             .map(|i| (g16_field::G2Affine::generator() * Fr::from((i as u64) + 5)).into_affine())
             .collect();
-        let b1 = msm.upload_g1_bases(&g1);
-        let b2 = msm.upload_g2_bases(&g2);
+        let b1 = msm.upload_g1_bases(&g1).expect("upload bases");
+        let b2 = msm.upload_g2_bases(&g2).expect("upload bases");
 
         // warm
         for _ in 0..5 {
-            let s = msm.upload_scalars(&scalars);
+            let s = msm.upload_scalars(&scalars).expect("upload scalars");
             let _ = msm
                 .msm_batch(&[Job::G1(JobG1 {
                     bases: &b1,
@@ -64,7 +64,7 @@ fn msm_stage_intercept() {
         let mut b1t = Vec::new();
         for _ in 0..30 {
             let t = Instant::now();
-            let s = msm.upload_scalars(&scalars);
+            let s = msm.upload_scalars(&scalars).expect("upload scalars");
             up.push(ms(t));
 
             let t = Instant::now();

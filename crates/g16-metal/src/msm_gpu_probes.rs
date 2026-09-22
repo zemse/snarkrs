@@ -61,8 +61,8 @@ fn review_plan_shape() {
     let want = g16_msm::CpuMsm::new()
         .msm_g1(&bases, &scalars)
         .into_affine();
-    let b = m.upload_g1_bases(&bases);
-    let s = m.upload_scalars(&scalars);
+    let b = m.upload_g1_bases(&bases).expect("upload bases");
+    let s = m.upload_scalars(&scalars).expect("upload scalars");
     let plan = Plan::new(&s, 0, n);
     println!(
         "shape n={n} bits={bits} c={} w={} slice={} wide_rows={} host_tail={}",
@@ -171,14 +171,9 @@ fn review_reduce_body() {
             })
             .collect();
         let packed: Vec<_> = points.iter().map(|k| table[*k as usize - 1]).collect();
-        let input = m.device.new_buffer_with_data(
-            packed.as_ptr().cast(),
-            (rows * 128) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
-        let output = m
-            .device
-            .new_buffer((count * 128) as u64, MTLResourceOptions::StorageModeShared);
+        let input =
+            crate::alloc::shared_with_data(&m.device, packed.as_ptr().cast(), rows * 128).unwrap();
+        let output = crate::alloc::shared(&m.device, count * 128).unwrap();
         let shape = [buckets as u32, groups as u32, windows as u32, 0];
         let mut samples = [Vec::new(), Vec::new(), Vec::new()];
         for rep in 0..8 {
@@ -281,13 +276,9 @@ fn lane_first_cb_cost() {
         .new_compute_pipeline_state_with_function(&f)
         .unwrap();
     let n: usize = 131072;
-    let bytes = (n * 32) as u64;
-    let out = m
-        .device
-        .new_buffer((n * 4) as u64, MTLResourceOptions::StorageModeShared);
-    let reused = m
-        .device
-        .new_buffer(bytes, MTLResourceOptions::StorageModeShared);
+    let bytes = n * 32;
+    let out = crate::alloc::shared(&m.device, n * 4).unwrap();
+    let reused = crate::alloc::shared(&m.device, bytes).unwrap();
     let run = |buf: &Buffer| -> (f64, f64) {
         let cb = m.queue.new_command_buffer();
         let enc = cb.new_compute_command_encoder();
@@ -314,7 +305,7 @@ fn lane_first_cb_cost() {
         let t = Instant::now();
         // SAFETY: shared-mode buffer of `bytes` bytes, no dispatch in flight.
         unsafe {
-            core::ptr::write_bytes(buf.contents().cast::<u8>(), 0x5a, bytes as usize);
+            core::ptr::write_bytes(buf.contents().cast::<u8>(), 0x5a, bytes);
         }
         t.elapsed().as_secs_f64() * 1e3
     };
@@ -332,9 +323,7 @@ fn lane_first_cb_cost() {
             let buf = match *kind {
                 "reused+write" | "reused" => &reused,
                 _ => {
-                    fresh = m
-                        .device
-                        .new_buffer(bytes, MTLResourceOptions::StorageModeShared);
+                    fresh = crate::alloc::shared(&m.device, bytes).unwrap();
                     &fresh
                 }
             };
@@ -488,10 +477,10 @@ fn lane_scatter_body() {
                 Fr::from_le_bytes_mod_order(&bytes)
             })
             .collect();
-        let s = m.upload_scalars(&scalars);
+        let s = m.upload_scalars(&scalars).expect("upload scalars");
         let mut plan = Plan::new(&s, 0, n);
         let mut keep = Vec::new();
-        plan.alloc(&m.pool, &mut keep);
+        plan.alloc(&m.pool, &mut keep).expect("plan scratch");
         println!(
             "scatter_body n={n} c={} w={} buckets={} cap={}",
             plan.c, plan.n_windows, plan.n_buckets, plan.cap

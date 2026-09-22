@@ -88,11 +88,11 @@ mod probe {
         let witness = Witness::load(&dir.join("circuit.wtns")).unwrap().0;
         let resident: HResident = stages.prepare(&pk).unwrap();
         let bases = Bases {
-            a: msm.upload_g1_bases(&pk.a_query),
-            b_g2: msm.upload_g2_bases(&pk.b_g2_query),
-            b_g1: msm.upload_g1_bases(&pk.b_g1_query),
-            l: msm.upload_g1_bases(&pk.l_query),
-            h: msm.upload_g1_bases(&pk.h_query),
+            a: msm.upload_g1_bases(&pk.a_query).expect("upload bases"),
+            b_g2: msm.upload_g2_bases(&pk.b_g2_query).expect("upload bases"),
+            b_g1: msm.upload_g1_bases(&pk.b_g1_query).expect("upload bases"),
+            l: msm.upload_g1_bases(&pk.l_query).expect("upload bases"),
+            h: msm.upload_g1_bases(&pk.h_query).expect("upload bases"),
         };
         println!(
             "{} (domain 2^{})",
@@ -115,7 +115,7 @@ mod probe {
             let handle = h
                 .device_handle::<g16_metal::stages::HHandle>(g16_metal::stages::TAG)
                 .unwrap();
-            let w = msm.upload_scalars(&witness);
+            let w = msm.upload_scalars(&witness).expect("upload scalars");
             let h_scalars = msm.scalars_from_device_std(handle.h_std(), handle.len());
             let [j0, j1, j2, j3] = witness_jobs(&pk, &bases, &w);
             let jobs = [
@@ -139,7 +139,7 @@ mod probe {
             let start = Instant::now();
             let (h_out, wit_out) = std::thread::scope(|s| {
                 let wit = s.spawn(|| {
-                    let w = msm.upload_scalars(&witness);
+                    let w = msm.upload_scalars(&witness).expect("upload scalars");
                     let jobs = witness_jobs(&pk, &bases, &w);
                     msm.msm_batch(&jobs).unwrap()
                 });

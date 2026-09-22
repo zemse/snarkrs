@@ -27,7 +27,7 @@ use g16_gpu_layout::glv::twiddle_table;
 use g16_msm::xyzz::Xyzz;
 use metal::{
     Buffer, CommandQueue, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device,
-    MTLDispatchType, MTLResourceOptions,
+    MTLDispatchType,
 };
 use rayon::prelude::*;
 
@@ -485,8 +485,8 @@ impl FftKernels {
                 continue;
             }
             let bits = n.trailing_zeros();
-            let src = self.scratch(n * G::SCRATCH);
-            let dst = self.scratch(n * G::SCRATCH);
+            let src = self.scratch(n * G::SCRATCH)?;
+            let dst = self.scratch(n * G::SCRATCH)?;
 
             // The input goes straight into the buffer rather than into a `Vec` that is
             // then copied in. Metal buffers here are `StorageModeShared` (msm.rs:460), so
@@ -517,7 +517,7 @@ impl FftKernels {
             // needs. `s` differs per block, so unlike `tw` this table cannot be shared
             // across a round; it costs 16 bytes a point next to the ping-pong pair's
             // 256 or 512.
-            let stw = self.buffer(&twiddle_table::<G::Cfg>(bits, size_inv));
+            let stw = self.buffer(&twiddle_table::<G::Cfg>(bits, size_inv))?;
             live.push(Block {
                 idx: bi,
                 n,
@@ -537,7 +537,7 @@ impl FftKernels {
         // `tw_shift = max_bits - exp` reads the deepest block's table at the right
         // stride for all of them and no block carries its own. Only the fused final
         // passes read their per-block `stw` instead.
-        let tw = self.buffer(&twiddle_table::<G::Cfg>(max_bits, Fr::ONE));
+        let tw = self.buffer(&twiddle_table::<G::Cfg>(max_bits, Fr::ONE))?;
 
         for exp in 1..=max_bits {
             let round: Vec<Pass> = live
@@ -727,23 +727,16 @@ impl FftKernels {
         Err(err.expect("RETRIES is at least 1"))
     }
 
-    fn scratch(&self, bytes: usize) -> Buffer {
-        self.device
-            .new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared)
+    fn scratch(&self, bytes: usize) -> Result<Buffer, ProveError> {
+        crate::alloc::shared(&self.device, bytes.max(1))
     }
 
-    fn buffer<T: Packed>(&self, items: &[T]) -> Buffer {
+    fn buffer<T: Packed>(&self, items: &[T]) -> Result<Buffer, ProveError> {
         let bytes = as_bytes(items);
         if bytes.is_empty() {
-            return self
-                .device
-                .new_buffer(4, MTLResourceOptions::StorageModeShared);
+            return crate::alloc::shared(&self.device, 4);
         }
-        self.device.new_buffer_with_data(
-            bytes.as_ptr().cast(),
-            bytes.len() as u64,
-            MTLResourceOptions::StorageModeShared,
-        )
+        crate::alloc::shared_with_data(&self.device, bytes.as_ptr().cast(), bytes.len())
     }
 }
 
