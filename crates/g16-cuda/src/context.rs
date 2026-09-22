@@ -7,7 +7,7 @@
 //! way `cargo build --features cuda` works on a laptop with no CUDA at all, and the binary
 //! runs on whatever card it finds.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream};
 
@@ -38,41 +38,13 @@ pub struct Cuda {
 impl Cuda {
     /// Opens a context on `ordinal`, or says why it could not.
     ///
-    /// # This returns `Err` where `cudarc` panics
-    ///
-    /// With the `dynamic-loading` feature, `cudarc` resolves `libcuda` lazily on first use
-    /// and **unwraps** the `dlopen`. On a machine with no NVIDIA driver at all, which is
-    /// every macOS host in this workspace, `CudaContext::new` therefore aborts the process
-    /// instead of returning the error its signature promises. That defeats the whole
-    /// skip-if-no-device pattern the test suites are written around, so the unwind is
-    /// caught here and turned back into a [`CudaError`].
-    ///
-    /// Only the context creation is wrapped. Everything after it has a real driver behind
-    /// it and a real error channel, and swallowing panics from arbitrary later code would
-    /// hide genuine bugs.
+    /// The one reason this can fail without the driver having said so is a missing
+    /// `libcuda`, which `cudarc` reports by panicking; see [`libcuda_loadable`]. Once that
+    /// has answered, everything here has a real driver behind it and a real error channel.
     pub fn new(ordinal: usize) -> Result<Self, CudaError> {
-        // The default hook prints a panic message and a backtrace for something that is
-        // not a crash. Silenced for the duration of this one call and restored straight
-        // after, so a panic anywhere else still prints normally.
         let t_open = std::time::Instant::now();
-        let hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let opened = std::panic::catch_unwind(|| CudaContext::new(ordinal));
-        std::panic::set_hook(hook);
-
-        let ctx = match opened {
-            Ok(r) => r.map_err(|e| CudaError::NoDevice(e.to_string()))?,
-            Err(payload) => {
-                let what = payload
-                    .downcast_ref::<&str>()
-                    .map(|s| (*s).to_string())
-                    .or_else(|| payload.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "panic with a non-string payload".to_string());
-                return Err(CudaError::NoDevice(format!(
-                    "the CUDA driver library could not be loaded: {what}"
-                )));
-            }
-        };
+        libcuda_loadable()?;
+        let ctx = CudaContext::new(ordinal).map_err(|e| CudaError::NoDevice(e.to_string()))?;
         let stream = ctx.default_stream();
         let cc = ctx.compute_capability()?;
         let arch = arch_flag(cc)?;
@@ -215,8 +187,9 @@ impl Cuda {
 
         let opts = cudarc::nvrtc::CompileOptions {
             arch: Some(self.arch),
-            // Treat warnings as the signal they are. NVRTC is quiet on clean code, so
-            // anything it prints is worth reading rather than scrolling past.
+            // C++17 for the `if constexpr` ladder choice in `fft.cu`. Nothing else: no
+            // warning flag would be visible anyway, because `compile_ptx_with_opts`
+            // discards the program log on a successful compile.
             options: vec!["--std=c++17".into()],
             ..Default::default()
         };
@@ -224,7 +197,7 @@ impl Cuda {
         let ptx =
             cudarc::nvrtc::compile_ptx_with_opts(src, opts).map_err(|e| CudaError::Compile {
                 unit,
-                log: e.to_string(),
+                log: compile_log(e),
             })?;
         let nvrtc_ms = t_nvrtc.elapsed().as_secs_f64() * 1e3;
 
@@ -269,6 +242,67 @@ impl Cuda {
             .iter()
             .map(|n| module.load_function(n).map_err(CudaError::from))
             .collect()
+    }
+}
+
+/// The NVRTC diagnostic with its line breaks intact.
+///
+/// `CompileError`'s `Display` is `write!(f, "{self:?}")` and the log inside it is a
+/// `CString`, so `to_string` escapes every newline and a multi-line diagnostic arrives as
+/// one long `\n`-separated line. Given what a compile costs to reach on a real card, the
+/// one error worth reading should not have to be unescaped by hand first.
+fn compile_log(e: cudarc::nvrtc::CompileError) -> String {
+    match e {
+        cudarc::nvrtc::CompileError::CompileError { log, .. } => log.to_string_lossy().into_owned(),
+        other => other.to_string(),
+    }
+}
+
+/// Whether `libcuda` can be loaded at all, probed once for the whole process.
+///
+/// # This returns `Err` where `cudarc` panics
+///
+/// With the `dynamic-loading` feature, `cudarc` resolves `libcuda` lazily on first use and
+/// **unwraps** the `dlopen`. On a machine with no NVIDIA driver at all, which is every
+/// macOS host in this workspace, the first driver call therefore aborts the process instead
+/// of returning the error its signature promises. That defeats the whole skip-if-no-device
+/// pattern the test suites are written around, so the unwind is caught here and turned back
+/// into a [`CudaError`]. The default hook would also print a panic message and a backtrace
+/// for something that is not a crash, so it is silenced across the probe.
+///
+/// # Why once, and not around each open
+///
+/// The panic hook is a single process-global slot with no lock of its own, so a take/set
+/// pair is only safe if no other thread is in one at the same time. Two threads that
+/// interleave can each restore the *other's* no-op and leave the process silent for good,
+/// and this crate has the threads to do it: `backend`'s two open tests both reach here and
+/// libtest runs them concurrently. `OnceLock::get_or_init` blocks the second caller and
+/// runs the swap exactly once, and every later open reads the stored answer.
+///
+/// [`CudaContext::device_count`] is the cheapest call that goes through the loader: `cuInit`
+/// and `cuDeviceGetCount`, no context and no device bring-up. Whether it then reports a
+/// driver error is not this function's business, because the library loaded and answered;
+/// `CudaContext::new` surfaces whatever is actually wrong through its own error channel.
+fn libcuda_loadable() -> Result<(), CudaError> {
+    static PROBE: OnceLock<Option<String>> = OnceLock::new();
+    let failure = PROBE.get_or_init(|| {
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let probed = std::panic::catch_unwind(CudaContext::device_count);
+        std::panic::set_hook(hook);
+        probed.err().map(|payload| {
+            payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "panic with a non-string payload".to_string())
+        })
+    });
+    match failure {
+        None => Ok(()),
+        Some(what) => Err(CudaError::NoDevice(format!(
+            "the CUDA driver library could not be loaded: {what}"
+        ))),
     }
 }
 
