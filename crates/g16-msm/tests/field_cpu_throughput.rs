@@ -14,8 +14,10 @@
 //!   multiply drags 96 bytes through the memory system. This is what an NTT butterfly or
 //!   an MSM bucket update actually looks like, and it is the regime a real prover lives in.
 //!
-//! Run with `cargo test -p g16-msm --release --test field_cpu_throughput -- --nocapture`.
-//! Release matters: a debug build of `ark-ff` reports roughly a fiftieth of this.
+//! Run with
+//! `cargo test -p g16-msm --release --test field_cpu_throughput -- --ignored --nocapture`.
+//! Release matters: a debug build of `ark-ff` reports roughly a fiftieth of this, which is
+//! why the test is `#[ignore]`d rather than left to burn a core on every `cargo test`.
 
 use ark_bn254::Fr;
 use ark_ff::UniformRand;
@@ -84,6 +86,7 @@ fn median(mut v: Vec<f64>) -> f64 {
 }
 
 #[test]
+#[ignore = "benchmark, meaningless in a debug build"]
 fn cpu_field_multiply_throughput() {
     let mut rng = SplitMix64(0x5EED_0003);
     let threads = rayon::current_num_threads();
