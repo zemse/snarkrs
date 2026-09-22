@@ -468,8 +468,8 @@ impl HResident {
     /// make, because there is exactly one submission: `gather_us` carries the host-side
     /// witness pack, `ntt_us` carries the whole GPU wall time for stages 0 to 4, and
     /// `pointwise_us` is zero. Splitting it further would mean inventing a number.
-    /// Setting `G16_METAL_PROFILE=1` instead submits three command buffers, so each field
-    /// gets a real measurement, at the cost of two extra 0.15 ms round trips and of
+    /// Setting `G16_METAL_PROFILE=1` instead waits on each stage group separately, so each
+    /// field gets a real measurement, at the cost of two extra 0.15 ms round trips and of
     /// disabling the stage 4 fusion. That is exactly why it is opt in.
     pub fn compute_h(
         &self,
@@ -563,8 +563,12 @@ impl HResident {
         })
     }
 
-    /// Three command buffers so the three stage groups get honest separate numbers. Costs
-    /// two extra round trips and gives up the stage 4 fusion, hence opt in.
+    /// A wait per stage group, so the three get honest separate numbers. Costs two extra
+    /// round trips and gives up the stage 4 fusion, hence opt in.
+    ///
+    /// Five command buffers, not three: the transforms are split per domain vector here
+    /// exactly as they are on the fast path, because the preemption fault that split is
+    /// for does not care which path encoded the work.
     fn run_profiled(
         &self,
         st: &HStages,
@@ -582,13 +586,23 @@ impl HResident {
         crate::cb::wait_ok(cb, "stage 0-1 gather (profiled)")?;
         t.gather_us += pack_us + start.elapsed().as_micros() as u64;
 
+        // Split per domain vector here too, and for the reason `compute_h` gives: all six
+        // transforms in one encoder is the preemption fault, and a diagnostic path that
+        // dies on the domains worth profiling diagnoses nothing. `ntt_us` is the wall time
+        // around the whole group, the same number the fast path reports.
         let start = Instant::now();
-        let cb = st.queue.new_command_buffer();
-        let enc = cb.new_compute_command_encoder();
-        self.encode_transforms(st, enc, sc, n, false);
-        enc.end_encoding();
-        cb.commit();
-        crate::cb::wait_ok(cb, "stages 2-3 transforms (profiled)")?;
+        let mut cbs = Vec::with_capacity(N_DOMAIN_VECTORS);
+        for vi in 0..N_DOMAIN_VECTORS {
+            let cb = st.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            self.encode_transforms_vector(st, enc, sc, n, vi, false);
+            enc.end_encoding();
+            cb.commit();
+            cbs.push(cb);
+        }
+        for cb in cbs {
+            crate::cb::wait_ok(cb, "stages 2-3 transforms (profiled)")?;
+        }
         t.ntt_us += start.elapsed().as_micros() as u64;
 
         let start = Instant::now();
@@ -635,27 +649,13 @@ impl HResident {
         enc.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(tg, 1, 1));
     }
 
-    /// The six transforms. `fuse_h` folds stage 4 into the store epilogue of the last
-    /// batch of C's forward transform, which is legal because A and B are already fully
-    /// transformed by then and their coset evaluations are exactly what `H = A*B - C`
-    /// needs. It saves a whole write of C and a whole read of A, B and C.
-    fn encode_transforms(
-        &self,
-        st: &HStages,
-        enc: &metal::ComputeCommandEncoderRef,
-        sc: &Scratch,
-        n: usize,
-        fuse_h: bool,
-    ) {
-        for vi in 0..N_DOMAIN_VECTORS {
-            self.encode_transforms_vector(st, enc, sc, n, vi, fuse_h);
-        }
-    }
-
-    /// The iNTT, the coset shift and the forward NTT for one of the three domain vectors.
+    /// The iNTT, the coset shift and the forward NTT for one of the three domain vectors,
+    /// one vector per command buffer. See the comment in `compute_h` for why that matters.
     ///
-    /// Split out of `encode_transforms` so each vector can be given its own command
-    /// buffer. See the comment in `compute_h` for why that matters.
+    /// `fuse_h` folds stage 4 into the store epilogue of the last batch of C's forward
+    /// transform, which is legal because A and B are already fully transformed by then and
+    /// their coset evaluations are exactly what `H = A*B - C` needs. It saves a whole write
+    /// of C and a whole read of A, B and C.
     fn encode_transforms_vector(
         &self,
         st: &HStages,

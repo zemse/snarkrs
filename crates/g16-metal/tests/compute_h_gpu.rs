@@ -115,7 +115,7 @@ fn gpu_compute_h_matches_the_cpu_backend() {
             "  CSR rows  A mean {ma:.2} empty {ea} longest {la}   B mean {mb:.2} empty {eb} longest {lb}"
         );
 
-        // The production path: one command buffer, stage 4 fused into the last NTT store.
+        // The production path: four command buffers, stage 4 fused into the last NTT store.
         let mut tg = StageTimings::default();
         let h = res.compute_h(&stages, &w, &mut tg).unwrap();
         assert_eq!(h.len(), res.domain_size());
@@ -124,8 +124,8 @@ fn gpu_compute_h_matches_the_cpu_backend() {
         let m2 = compare(&name, "fused/standard", &std_form, &want);
         drop(h);
 
-        // The unfused path, which runs the standalone stage 4 kernel and three separate
-        // command buffers. Same answer or the fusion is wrong.
+        // The unfused path, which runs the standalone stage 4 kernel and waits on each
+        // stage group separately. Same answer or the fusion is wrong.
         std::env::set_var("G16_METAL_PROFILE", "1");
         let mut tp = StageTimings::default();
         let h = res.compute_h(&stages, &w, &mut tp).unwrap();
@@ -240,7 +240,7 @@ fn gpu_compute_h_timing() {
 /// Does fusing stage 4 into the last NTT store actually pay?
 ///
 /// The fused path saves one dispatch, one write of C and one read of A, B and C, but the
-/// unfused path is also two extra command buffers, so the two effects have to be
+/// unfused path is also two extra round trips, so the two effects have to be
 /// separated by measurement rather than argued. Reps alternate so a thermal drift over
 /// the run cannot be mistaken for a difference between the paths.
 #[test]
@@ -277,7 +277,7 @@ fn stage_four_fusion_ab() {
         let f = fused[fused.len() / 2];
         let u = unfused[unfused.len() / 2];
         println!(
-            "FUSION A/B  {name:<14} fused {f:.3} ms (p10 {:.3} p90 {:.3})  unfused+3cb {u:.3} ms  ratio {:.2}x",
+            "FUSION A/B  {name:<14} fused {f:.3} ms (p10 {:.3} p90 {:.3})  unfused {u:.3} ms  ratio {:.2}x",
             fused[fused.len() / 10],
             fused[fused.len() * 9 / 10],
             u / f
