@@ -105,6 +105,35 @@ mod tests {
         );
     }
 
+    /// The one branch the verifier's soundness argument actually leans on: `verify`
+    /// validates nothing itself and says so, on the grounds that this reader already did.
+    /// BN254's G2 has a large cofactor, so a point can sit on the curve and outside the
+    /// prime-order subgroup, and such a `pi_b` would otherwise reach the Miller loop. G1
+    /// has cofactor 1 and so has no equivalent case to test.
+    #[test]
+    fn rejects_a_g2_point_outside_the_prime_order_subgroup() {
+        // Solve the curve equation for a small x and skip the cofactor clearing that
+        // `G2Affine::generator() * k` would do for us.
+        let off = (1u64..64)
+            .find_map(|i| {
+                let x = Fq2::new(Fq::from(i), Fq::zero());
+                let p = G2Affine::get_point_from_x_unchecked(x, true)?;
+                (!p.is_in_correct_subgroup_assuming_on_curve()).then_some(p)
+            })
+            .expect("no on-curve off-subgroup point among the first 63 x values");
+        let fq2 = |p: &Fq2| format!("[\"{}\",\"{}\"]", dec(p.c0), dec(p.c1));
+        let triple = |p: &G2Affine| value(&format!("[{},{},[\"1\",\"0\"]]", fq2(&p.x), fq2(&p.y)));
+
+        let err = read_g2(&triple(&off), "pi_b").unwrap_err();
+        assert!(err.to_string().contains("prime-order subgroup"), "{err}");
+        // The generator still gets through, otherwise this would pass just as well against
+        // a reader that rejects every G2 point.
+        assert_eq!(
+            read_g2(&triple(&G2Affine::generator()), "pi_b").unwrap(),
+            G2Affine::generator()
+        );
+    }
+
     #[test]
     fn rejects_the_wrong_shape() {
         assert!(read_g1(&value(r#"["1","2"]"#), "pi_a").is_err());

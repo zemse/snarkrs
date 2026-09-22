@@ -68,9 +68,7 @@ pub fn prove_with_blinders(
     // that are all blocked on a device, and the five MSMs inside each one have nowhere
     // left to schedule: `audit_metal_vs_cpu` deadlocked for two days at 0% CPU. The
     // caller's own thread is the only safe place for a blocking wait.
-    let (m, terms) = spawn_terms(circuit.key(), r, s, || {
-        circuit.h_and_msms(witness, timings)
-    });
+    let (m, terms) = spawn_terms(circuit.key(), r, s, || circuit.h_and_msms(witness, timings));
     let m = m?;
     Ok(assemble_from_terms(circuit.key(), &m, &terms, timings))
 }
@@ -299,11 +297,6 @@ mod tests {
         serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
     }
 
-    fn dec_fq(v: &serde_json::Value) -> Fq {
-        let n: num_bigint::BigUint = v.as_str().unwrap().parse().unwrap();
-        Fq::from_le_bytes_mod_order(&n.to_bytes_le())
-    }
-
     fn public_inputs(dir: &Path) -> Vec<Fr> {
         json(&dir.join("public.json"))
             .as_array()
@@ -316,35 +309,17 @@ mod tests {
             .collect()
     }
 
-    /// snarkjs writes proof points as projective triples of decimal strings, the same
-    /// encoding `vkey.json` uses. Parsed here rather than through `g16-zkey`'s private
-    /// helpers so this crate's tests do not depend on that crate widening its API.
+    /// snarkjs' own `proof.json`, read through the shipping reader.
+    ///
+    /// It used to be decoded here by hand, which put a second copy of the `c0`/`c1`
+    /// ordering and the projective `z` convention in the crate — and the copy was wrong:
+    /// it divided by `z` where ffjavascript's arithmetic is Jacobian and `crate::json`
+    /// divides by `z^2` and `z^3`. Invisible only because snarkjs normalises to `z = 1`
+    /// first, where both formulas agree. Going through `json::proof_from_str` also means
+    /// the oracle below exercises the on-curve and subgroup checks a real caller gets.
     fn reference_proof(dir: &Path) -> Proof {
-        let v = json(&dir.join("proof.json"));
-        let g1 = |k: &str| {
-            let p = &v[k];
-            let z = dec_fq(&p[2]);
-            if z.is_zero() {
-                G1Affine::identity()
-            } else {
-                let zi = z.inverse().unwrap();
-                G1Affine::new(dec_fq(&p[0]) * zi, dec_fq(&p[1]) * zi)
-            }
-        };
-        let fq2 = |p: &serde_json::Value| Fq2::new(dec_fq(&p[0]), dec_fq(&p[1]));
-        let p = &v["pi_b"];
-        let z = fq2(&p[2]);
-        let b = if z.is_zero() {
-            G2Affine::identity()
-        } else {
-            let zi = z.inverse().unwrap();
-            G2Affine::new(fq2(&p[0]) * zi, fq2(&p[1]) * zi)
-        };
-        Proof {
-            a: g1("pi_a"),
-            b,
-            c: g1("pi_c"),
-        }
+        let text = std::fs::read_to_string(dir.join("proof.json")).unwrap();
+        crate::json::proof_from_str(&text).unwrap()
     }
 
     fn prepared(dir: &Path) -> (Box<dyn PreparedCircuit>, Vec<Fr>) {
