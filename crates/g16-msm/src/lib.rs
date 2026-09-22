@@ -32,6 +32,16 @@ use xyzz::{to_projective, RawCurve, Xyzz};
 
 pub use accel::{AccelError, GroupFft, KeyScale};
 
+/// A backend for the five MSMs the proof is made of.
+///
+/// `bases` and `scalars` must be the same length, and a backend has to treat a mismatch as
+/// a malformed key rather than as a short input: reducing to the shorter prefix returns a
+/// valid-looking group element for a proof that is wrong. The CPU path asserts on it (see
+/// [`pippenger`]) and every other backend is expected to be just as loud.
+///
+/// An empty input is the identity. A base at infinity contributes nothing whatever its
+/// scalar, which is a live path and not a defensive one: 34% of the B query bases are the
+/// point at infinity.
 pub trait MsmBackend: Send + Sync {
     fn name(&self) -> &'static str;
     fn msm_g1(&self, bases: &[G1Affine], scalars: &[Fr]) -> G1Projective;
@@ -46,9 +56,10 @@ const SCALAR_BITS: usize = Fr::MODULUS_BIT_SIZE as usize;
 /// final carry rather than just hiding it.
 const RECODE_BITS: usize = SCALAR_BITS + 1;
 
-/// Caps the bucket array at 2^15 + 1 points, about 3 MB of Jacobian G1 (6 MB of G2) per
-/// in-flight task. Past this the cost model's gain is under 5% and the memset starts to
-/// hurt.
+/// Caps the bucket array at 2^15 XYZZ points, 4 MiB of G1 (8 MiB of G2) per in-flight
+/// task. A window this wide takes the batch-affine fill instead, which holds 2 MiB of
+/// affine G1 plus a 4 MiB XYZZ side array it only allocates once a bucket contends. Past
+/// this the cost model's gain is under 5% and the memset starts to hurt.
 const MAX_WINDOW: u32 = 16;
 
 /// Prescan granularity. Small enough to balance, large enough that the two output vectors
@@ -314,8 +325,9 @@ fn window_chunk<P: RawCurve>(
     c: u32,
     n_buckets: usize,
 ) -> Projective<P> {
-    // 2^(c-1) buckets for |d| in [1, 2^(c-1)], plus one for the digit that the
-    // carry-free recoding pushes to exactly 2^(c-1).
+    // `d` lands in [-2^(c-1), 2^(c-1)], so the bucket index |d| - 1 is in
+    // [0, 2^(c-1) - 1] and 2^(c-1) buckets is tight. The caller sizes them, and the
+    // comment there says what the extra bucket an earlier version allocated cost.
     let mut buckets = vec![Xyzz::<P::RF>::ZERO; n_buckets];
     for k in range {
         let d = signed_digit(scan.bigints[k].as_ref(), window, c);
@@ -868,11 +880,12 @@ mod tests {
                 _ => Fr::rand(rng),
             })
             .collect();
+        // r - 1 is the largest scalar there is, and the one that stresses the top window.
         s[0] = -Fr::one();
         s[1] = Fr::from(2u64);
         s[2] = Fr::zero();
         s[3] = Fr::one();
-        // r - 1 is the largest scalar there is, and the one that stresses the top window.
+        // Fits in one limb, so every window above the lowest handful is zero.
         s[4] = Fr::from(u64::MAX);
         s
     }
