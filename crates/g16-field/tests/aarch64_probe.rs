@@ -24,7 +24,7 @@ fn limbs(x: &Fr) -> [u64; 4] {
 }
 #[inline(always)]
 fn from_limbs(l: [u64; 4]) -> Fr {
-    ark_ff::Fp(ark_ff::BigInt(l), core::marker::PhantomData)
+    Fr::new_unchecked(ark_ff::BigInt::new(l))
 }
 
 #[inline(always)]
@@ -81,6 +81,17 @@ fn mont_mul_asm(a: [u64; 4], b: [u64; 4]) -> [u64; 4] {
     let mut t2: u64 = 0;
     let mut t3: u64 = 0;
     for &bi in b.iter() {
+        // SAFETY: four conditions, none of them obvious, all of them load-bearing.
+        // - The block touches only registers, so `nomem`/`nostack` hold; its outputs are
+        //   a function of its inputs alone, so `pure` does too.
+        // - The adds/adcs/adc chains clobber NZCV. That is fine only because aarch64
+        //   inline asm assumes the flags are clobbered unless `preserves_flags` is given.
+        //   Adding `preserves_flags` here would be immediate UB.
+        // - `a4` is `out(reg) _` scratch and is written by `adc {a4}, xzr, xzr` before its
+        //   first read, which is required: `out` registers start undefined.
+        // - Every scratch is `out`, never `lateout`. The carry chains read the `a*`/`q*`
+        //   inputs after writing scratch, so a `lateout` (which may share a register with
+        //   an input) would silently corrupt the product.
         unsafe {
             core::arch::asm!(
                 // multiply pass: t += a * bi, lo then hi chain; a4 is the carry word
