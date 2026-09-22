@@ -67,9 +67,11 @@ pub fn variants(root: impl AsRef<Path>) -> Vec<Variant> {
 
 /// `variants`, filtered to `wanted` (all of them when `wanted` is empty). Naming a
 /// variant that does not exist is an error: silently benchmarking nothing is how a
-/// typo'd `--variant` turns into an empty CSV nobody notices.
+/// typo'd `--variant` turns into an empty CSV nobody notices. Naming one twice is the
+/// same hazard pointing the other way: `bench` would emit two blocks of rows carrying the
+/// same variant, backend, mode and rep indices, and nothing in the CSV tells them apart.
 pub fn selected(root: impl AsRef<Path>, wanted: &[String]) -> anyhow::Result<Vec<Variant>> {
-    let found = variants(root.as_ref());
+    let mut found = variants(root.as_ref());
     if wanted.is_empty() {
         if found.is_empty() {
             anyhow::bail!(
@@ -80,29 +82,25 @@ pub fn selected(root: impl AsRef<Path>, wanted: &[String]) -> anyhow::Result<Vec
         }
         return Ok(found);
     }
-    let mut out = Vec::new();
+    // Taken before the loop, which moves each pick out of `found` as it goes: the list
+    // this names is what the directory holds, not what is left to pick from.
+    let have = found
+        .iter()
+        .map(|v| v.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut out: Vec<Variant> = Vec::new();
     for name in wanted {
+        if out.iter().any(|v| &v.name == name) {
+            anyhow::bail!("variant {name:?} given more than once");
+        }
         match found.iter().position(|v| &v.name == name) {
-            Some(i) => out.push(found[i].dir.clone()),
+            Some(i) => out.push(found.swap_remove(i)),
             None => anyhow::bail!(
-                "variant {name:?} not found under {} (have: {})",
+                "variant {name:?} not found under {} (have: {have})",
                 root.as_ref().display(),
-                found
-                    .iter()
-                    .map(|v| v.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
             ),
         }
     }
-    Ok(out
-        .into_iter()
-        .map(|dir| Variant {
-            name: dir
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            dir,
-        })
-        .collect())
+    Ok(out)
 }
