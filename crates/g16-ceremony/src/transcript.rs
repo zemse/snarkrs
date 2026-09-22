@@ -914,7 +914,7 @@ pub fn g2_from_uncompressed(bytes: &[u8]) -> Result<G2Affine, CeremonyError> {
         fq_from_be(&bytes[..N8], "uncompressed G2 x.c1")?,
     );
     let y = Fq2::new(
-        fq_from_be(&bytes[3 * N8..], "uncompressed G2 y.c0")?,
+        fq_from_be(&bytes[3 * N8..SG2], "uncompressed G2 y.c0")?,
         fq_from_be(&bytes[2 * N8..3 * N8], "uncompressed G2 y.c1")?,
     );
     if x.is_zero() && y.is_zero() {
@@ -1002,7 +1002,7 @@ pub fn g2_from_compressed(bytes: &[u8]) -> Result<G2Affine, CeremonyError> {
     c1_be.copy_from_slice(&bytes[..N8]);
     c1_be[0] &= 0x3f;
     let x = Fq2::new(
-        fq_from_be(&bytes[N8..], "compressed G2 x.c0")?,
+        fq_from_be(&bytes[N8..SCG2], "compressed G2 x.c0")?,
         fq_from_be(&c1_be, "compressed G2 x.c1")?,
     );
     let root = (x * x * x + g2::Config::COEFF_B)

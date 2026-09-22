@@ -427,6 +427,35 @@ fn point_codecs_round_trip_on_random_points() {
     }
 }
 
+/// All four decoders guard with `<`, so a slice longer than the point is documented to be
+/// fine. The two G2 ones then sliced their last coordinate open-ended, and `fq_from_be`
+/// copies into a `[u8; 32]`, so one extra byte panicked where the guard promised a decode.
+#[test]
+fn a_longer_slice_decodes_the_point_at_its_front() {
+    let mut seed = CeremonyRng::from_seed_words([7, 7, 7, 7, 7, 7, 7, 7]);
+    let p1 = g1_from_rng(&mut seed);
+    let p2 = g2_from_rng(&mut seed);
+    for pad in [1usize, 33] {
+        let padded = |b: &[u8]| [b, &vec![0xabu8; pad][..]].concat();
+        assert_eq!(
+            g1_from_uncompressed(&padded(&g1_uncompressed(&p1))).unwrap(),
+            p1
+        );
+        assert_eq!(
+            g2_from_uncompressed(&padded(&g2_uncompressed(&p2))).unwrap(),
+            p2
+        );
+        assert_eq!(
+            g1_from_compressed(&padded(&g1_compressed(&p1))).unwrap(),
+            p1
+        );
+        assert_eq!(
+            g2_from_compressed(&padded(&g2_compressed(&p2))).unwrap(),
+            p2
+        );
+    }
+}
+
 #[test]
 fn a_coordinate_at_or_above_the_modulus_is_rejected() {
     let mut bytes = [0xffu8; 64];
