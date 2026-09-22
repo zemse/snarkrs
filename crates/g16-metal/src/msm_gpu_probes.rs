@@ -321,15 +321,11 @@ fn lane_first_cb_cost() {
     for _ in 0..3 {
         run(&reused);
     }
-    let mut rows: Vec<(&str, Vec<f64>, Vec<f64>, Vec<f64>)> = [
-        "fresh+write",
-        "reused+write",
-        "reused",
-        "fresh",
-    ]
-    .into_iter()
-    .map(|k| (k, Vec::new(), Vec::new(), Vec::new()))
-    .collect();
+    let mut rows: Vec<(&str, Vec<f64>, Vec<f64>, Vec<f64>)> =
+        ["fresh+write", "reused+write", "reused", "fresh"]
+            .into_iter()
+            .map(|k| (k, Vec::new(), Vec::new(), Vec::new()))
+            .collect();
     for _ in 0..10 {
         for (kind, walls, gpus, writes) in rows.iter_mut() {
             let fresh;
@@ -363,7 +359,6 @@ fn lane_first_cb_cost() {
         );
     }
 }
-
 
 // The scatter's cost, split by suspect. Every mode reads and recodes the scalars the
 // way the production kernel does; they differ only in what happens per digit. Mode 0
@@ -593,15 +588,15 @@ fn lane_scatter_body() {
                 }
             }
         }
-        println!(
-            "  prep(zero+count+scan) gpu_ms={:.4}",
-            median(prep_samples)
-        );
+        println!("  prep(zero+count+scan) gpu_ms={:.4}", median(prep_samples));
         for (label, values) in labels.iter().zip(samples) {
             println!("  {label:24} gpu_ms={:.4}", median(values));
         }
         for (parts, values) in span_parts.iter().zip(span_samples) {
-            println!("  span parts={parts}            gpu_ms={:.4}", median(values));
+            println!(
+                "  span parts={parts}            gpu_ms={:.4}",
+                median(values)
+            );
         }
         m.pool.give(keep);
     }
