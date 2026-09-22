@@ -761,10 +761,28 @@ pub fn read_ptau_pubkey(bytes: &[u8], challenge: &Digest) -> Result<PtauPubKeys,
             ),
         ));
     }
-    let g1 = |i: usize| g16_zkey::binfile::g1(&bytes[i * SG1..(i + 1) * SG1]);
+    // The nine stored points go straight into `same_ratio`, so they are checked where they
+    // are decoded rather than at each of the three call sites below. Stored order is the
+    // six G1 in tau, alpha, beta order and then the three G2 in the same order.
+    const G1_NAMES: [&str; 6] = [
+        "tau g1_s",
+        "tau g1_sx",
+        "alpha g1_s",
+        "alpha g1_sx",
+        "beta g1_s",
+        "beta g1_sx",
+    ];
+    const G2_NAMES: [&str; 3] = ["tau g2_spx", "alpha g2_spx", "beta g2_spx"];
+    let g1 = |i: usize| {
+        let p = g16_zkey::binfile::g1(&bytes[i * SG1..(i + 1) * SG1])?;
+        crate::check_g1(&p, 7, G1_NAMES[i])?;
+        Ok::<_, CeremonyError>(p)
+    };
     let g2 = |i: usize| {
         let at = 6 * SG1 + i * SG2;
-        g16_zkey::binfile::g2(&bytes[at..at + SG2])
+        let p = g16_zkey::binfile::g2(&bytes[at..at + SG2])?;
+        crate::check_g2(&p, 7, G2_NAMES[i])?;
+        Ok::<_, CeremonyError>(p)
     };
     let key = |g1_s: G1Affine, g1_sx: G1Affine, g2_spx: G2Affine, personalization: u8| PtauPubKey {
         g1_s,

@@ -95,6 +95,14 @@ impl MpcParams {
             let g1_s = binfile::g1(cur.take(SG1)?)?;
             let g1_sx = binfile::g1(cur.take(SG1)?)?;
             let g2_spx = binfile::g2(cur.take(SG2)?)?;
+            for (p, what) in [
+                (&delta_after, "delta_after"),
+                (&g1_s, "g1_s"),
+                (&g1_sx, "g1_sx"),
+            ] {
+                crate::check_g1(p, S_MPC_PARAMS, what)?;
+            }
+            crate::check_g2(&g2_spx, S_MPC_PARAMS, "g2_spx")?;
             let mut t = [0u8; 64];
             t.copy_from_slice(cur.take(64)?);
             let kind = ContributionKind::from_u32(cur.u32()?)?;

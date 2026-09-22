@@ -199,6 +199,15 @@ impl PtauContribution {
         let alpha_g1 = binfile::g1(cur.take(SG1)?)?;
         let beta_g1 = binfile::g1(cur.take(SG1)?)?;
         let beta_g2 = binfile::g2(cur.take(SG2)?)?;
+        for (p, what) in [
+            (&tau_g1, "tau_g1"),
+            (&alpha_g1, "alpha_g1"),
+            (&beta_g1, "beta_g1"),
+        ] {
+            crate::check_g1(p, S_CONTRIBUTIONS, what)?;
+        }
+        crate::check_g2(&tau_g2, S_CONTRIBUTIONS, "tau_g2")?;
+        crate::check_g2(&beta_g2, S_CONTRIBUTIONS, "beta_g2")?;
         let pubkeys = read_ptau_pubkey(cur.take(PTAU_PUBKEY_BYTES)?, prev_challenge)?;
         let mut partial_hash = [0u8; PARTIAL_HASH_BYTES];
         partial_hash.copy_from_slice(cur.take(PARTIAL_HASH_BYTES)?);

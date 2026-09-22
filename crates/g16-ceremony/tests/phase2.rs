@@ -19,7 +19,9 @@ use std::process::Command;
 
 use g16_ceremony::contribute::{self, MpcParams};
 use g16_ceremony::vkey;
+use g16_ceremony::write::g2_lem;
 use g16_ceremony::{CeremonyError, CpuKeyScale, Groth16Header};
+use g16_field::G2Affine;
 use g16_msm::CpuMsm;
 
 fn artifacts() -> Vec<(String, PathBuf)> {
@@ -557,4 +559,68 @@ fn an_uncontributed_key_does_not_verify_against_itself() {
         matches!(&err, CeremonyError::Verification(s) if s.contains("no contribution")),
         "{err}"
     );
+}
+
+/// A point that is off the curve, or on it but outside the prime-order subgroup, still
+/// decodes: `binfile` builds every point with `new_unchecked`. Arkworks documents
+/// arithmetic on one of those as meaningless, and each of these six goes straight into a
+/// `same_ratio` pairing, so a `verify` that never looks makes no statement about any curve
+/// point. snarkjs never writes such a header, so the gate costs nothing real.
+#[test]
+fn a_header_point_off_the_curve_or_off_the_subgroup_is_refused() {
+    let zkey =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/artifacts/tiny_mul/circuit.zkey");
+    if !zkey.is_file() {
+        eprintln!("SKIPPED a_header_point_off_...: no tiny_mul");
+        return;
+    }
+    let file = g16_zkey::binfile::BinFile::open(&zkey, b"zkey", 2).unwrap();
+    let body = file.unique_section(2).unwrap().to_vec();
+
+    // `alpha_1` is the first point of the header, at 84. One flipped bit in its `x` moves
+    // it off the curve without moving the limbs out of range.
+    let mut edited = body.clone();
+    edited[84] ^= 1;
+    assert!(
+        !g16_zkey::binfile::g1(&edited[84..84 + 64])
+            .unwrap()
+            .is_on_curve(),
+        "the edit has to move alpha_1 off the curve for this to test anything"
+    );
+    assert!(
+        matches!(
+            Groth16Header::read(&edited),
+            Err(CeremonyError::Malformed { section: 2, .. })
+        ),
+        "an off-curve alpha_1 was accepted"
+    );
+
+    // `gamma_2` is at 340: 84 plus two G1 and one G2. G1 has cofactor 1 on BN254, so the
+    // subgroup half of the check only ever does work on a G2 point.
+    let mut edited = body.clone();
+    edited[340..340 + 128].copy_from_slice(&g2_lem(&off_subgroup_g2()));
+    assert!(
+        matches!(
+            Groth16Header::read(&edited),
+            Err(CeremonyError::Malformed { section: 2, .. })
+        ),
+        "an off-subgroup gamma_2 was accepted"
+    );
+}
+
+/// A point of `E'(Fq2)` outside the order-`r` subgroup, found by taking the smallest `x`
+/// whose curve equation has a root. The compressed decoder is the shortest way to solve
+/// for `y`, and like every decoder here it does not check what it returns.
+fn off_subgroup_g2() -> G2Affine {
+    for i in 1u64..256 {
+        let mut x = [0u8; 64];
+        x[56..].copy_from_slice(&i.to_be_bytes());
+        let Ok(p) = g16_ceremony::transcript::g2_from_compressed(&x) else {
+            continue;
+        };
+        if p.is_on_curve() && !p.is_in_correct_subgroup_assuming_on_curve() {
+            return p;
+        }
+    }
+    panic!("no off-subgroup G2 point under x = 256");
 }

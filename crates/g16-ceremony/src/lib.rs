@@ -353,6 +353,20 @@ impl Groth16Header {
         let gamma_g2 = g16_zkey::binfile::g2(cur.take(SG2)?)?;
         let delta_g1 = g16_zkey::binfile::g1(cur.take(SG1)?)?;
         let delta_g2 = g16_zkey::binfile::g2(cur.take(SG2)?)?;
+        for (p, what) in [
+            (&alpha_g1, "alpha_g1"),
+            (&beta_g1, "beta_g1"),
+            (&delta_g1, "delta_g1"),
+        ] {
+            check_g1(p, 2, what)?;
+        }
+        for (p, what) in [
+            (&beta_g2, "beta_g2"),
+            (&gamma_g2, "gamma_g2"),
+            (&delta_g2, "delta_g2"),
+        ] {
+            check_g2(p, 2, what)?;
+        }
         if cur.remaining() != 0 {
             return Err(CeremonyError::malformed(
                 2,
@@ -386,6 +400,41 @@ impl Groth16Header {
         w.write_g1(&self.delta_g1)?;
         w.write_g2(&self.delta_g2)
     }
+}
+
+/// Reject a point that is not on the curve or lies outside the prime-order subgroup.
+///
+/// Every `same_ratio` in both phases hands `Bn254::multi_pairing` points that came off
+/// disk through `new_unchecked`, and arkworks documents arithmetic on one of those as
+/// meaningless rather than merely slow, so what `verify` reports about such a file is not
+/// a statement about any curve point. snarkjs checks neither, but the sets this is applied
+/// to are the O(1) ones - a header's six points, a contribution record's four or five, a
+/// phase-1 pubkey's nine - so the cost is invisible and no file snarkjs would accept is
+/// refused.
+///
+/// The identity passes both tests in arkworks, which is what keeps snarkjs' all-zero
+/// encoding of infinity readable here. Whether infinity is *allowed* at a given position
+/// is a separate question, and `same_ratio` already answers it for the ones that matter.
+pub(crate) fn check_g1(p: &G1Affine, section: u32, what: &str) -> Result<(), CeremonyError> {
+    if !p.is_on_curve() || !p.is_in_correct_subgroup_assuming_on_curve() {
+        return Err(CeremonyError::malformed(
+            section,
+            format!("{what} is not a valid G1 point"),
+        ));
+    }
+    Ok(())
+}
+
+/// [`check_g1`] for G2, where the subgroup half is the one that does work: `E'(Fq2)` has a
+/// cofactor, so an off-subgroup point is representable in a way a G1 one is not.
+pub(crate) fn check_g2(p: &G2Affine, section: u32, what: &str) -> Result<(), CeremonyError> {
+    if !p.is_on_curve() || !p.is_in_correct_subgroup_assuming_on_curve() {
+        return Err(CeremonyError::malformed(
+            section,
+            format!("{what} is not a valid G2 point"),
+        ));
+    }
+    Ok(())
 }
 
 /// `u32 n8` then the modulus as a plain little-endian integer, the shape both the ptau
