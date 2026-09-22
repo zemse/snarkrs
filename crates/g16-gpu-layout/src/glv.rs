@@ -21,13 +21,16 @@ use ark_ff::{BigInteger, PrimeField};
 use g16_field::{FftField, Field, Fr};
 use rayon::prelude::*;
 
-use crate::{Packed, LIMBS};
+use crate::Packed;
 
 /// A scalar already through the GLV lattice: `k == +-k1 + lambda * (+-k2)`, 36 bytes,
 /// both magnitudes **standard form** and under `2^127`.
 ///
 /// `k[0..4]` is `|k1|` and `k[4..8]` is `|k2|`, four 32-bit limbs each rather than eight,
-/// which is the whole point: a half-width magnitude is half the ladder. `sign` carries
+/// which is the whole point: a half-width magnitude is half the ladder. The eight is
+/// written out rather than taken from [`crate::LIMBS`], because this is two half-width
+/// magnitudes and not a field element: `LIMBS` is a revisitable decision about the CIOS
+/// multiply, and this is a wire format that must not move with it. `sign` carries
 /// bit 0 for `k1 < 0` and bit 1 for `k2 < 0`, and a signed ladder spends nothing on
 /// either, since negating a point is negating one coordinate.
 ///
@@ -38,7 +41,7 @@ use crate::{Packed, LIMBS};
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct PackedGlv {
-    pub k: [u32; LIMBS],
+    pub k: [u32; 8],
     pub sign: u32,
 }
 
@@ -77,6 +80,13 @@ unsafe impl Packed for PackedGlv {}
 /// this M2 Max against the multiply's tens of nanoseconds. A power-15 command decomposes
 /// 237,568 twiddles, so serially that is a quarter of a second with the device idle for
 /// all of it; measured on the pool it is 52 ms.
+///
+/// `bits` must be in `1..=Fr::TWO_ADICITY`, and that is asserted rather than assumed.
+/// Past the two-adicity the squaring loop below runs zero times, so `root` stays the
+/// `2^28`-th root and the function returns a correctly sized, entirely wrong table with
+/// nothing to see; the FFT that reads it then produces a proof that verifies against
+/// nothing. Both backend drivers reject such a block before they get here, but this crate
+/// exists to be called by backends that may not both remember to.
 pub fn twiddle_table<C: GLVConfig<ScalarField = Fr>>(bits: u32, first: Fr) -> Vec<PackedGlv> {
     /// Entries a rayon task walks, and small on purpose. A section builds these tables
     /// while a worker thread is already running the sub-crossover blocks on the same pool,
@@ -88,6 +98,12 @@ pub fn twiddle_table<C: GLVConfig<ScalarField = Fr>>(bits: u32, first: Fr) -> Ve
     /// begins with is about 30 `Fr` operations against 256 decompositions, and going lower
     /// starts paying for that.
     const CHUNK: usize = 256;
+
+    assert!(
+        (1..=Fr::TWO_ADICITY).contains(&bits),
+        "twiddle table over 2^{bits}, outside the {}-bit two-adic subgroup",
+        Fr::TWO_ADICITY
+    );
 
     let half = 1usize << (bits - 1);
     let mut root = Fr::TWO_ADIC_ROOT_OF_UNITY;
@@ -181,6 +197,43 @@ mod tests {
         let mut e2 = p2;
         e2.x *= beta2;
         assert_eq!(e2, (p2 * l2).into_affine(), "phi is not [lambda^2] on G2");
+    }
+
+    /// [`twiddle_table`]'s chunked walk against the serial recurrence it stands in for.
+    /// A chunk reseeds with `root^(ci * CHUNK)` instead of carrying `w` across the
+    /// boundary, so the one thing that can be wrong is that exponent, and the shape of
+    /// that bug is that entry 0 of every chunk after the first is off while the other 255
+    /// are right: a spot check or a small-`n` eyeball passes. `bits = 11` is 1,024 entries,
+    /// four chunks, and both values of `first` the drivers pass.
+    #[test]
+    fn the_chunked_twiddle_walk_is_the_serial_one() {
+        fn check<C: GLVConfig<ScalarField = Fr>>(name: &str, bits: u32, first: Fr) {
+            let mut root = Fr::TWO_ADIC_ROOT_OF_UNITY;
+            for _ in bits..Fr::TWO_ADICITY {
+                root.square_in_place();
+            }
+            let got = twiddle_table::<C>(bits, first);
+            assert_eq!(
+                got.len(),
+                1usize << (bits - 1),
+                "{name}: the 2^{bits} table is not half the block"
+            );
+            let mut w = first;
+            for (i, slot) in got.iter().enumerate() {
+                assert_eq!(*slot, decompose::<C>(&w), "{name}: 2^{bits} twiddle {i}");
+                w *= root;
+            }
+        }
+
+        for bits in [1u32, 2, 5, 11] {
+            let inv_n = Fr::from(1u64 << bits)
+                .inverse()
+                .expect("a power of two is a unit mod r");
+            check::<g16_field::g1::Config>("G1", bits, Fr::ONE);
+            check::<g16_field::g1::Config>("G1", bits, inv_n);
+            check::<g16_field::g2::Config>("G2", bits, Fr::ONE);
+            check::<g16_field::g2::Config>("G2", bits, inv_n);
+        }
     }
 
     /// [`decompose`]'s output means what the kernels read it as, over the scalars most
