@@ -1,10 +1,15 @@
 //! The parallel NTT path against an external oracle.
 //!
 //! `g16-ntt`'s own `serial_and_parallel_transforms_agree` compares our two paths to each
-//! other, and `matches_the_naive_dft` only runs at n = 8 and 16, both far below
-//! `PARALLEL_THRESHOLD = 2^13`. Nothing checked the path the prover actually takes at
-//! prover sizes against an implementation written by someone else. These vectors come
-//! from ffjavascript's `Fr.fft`, the transform snarkjs itself uses, at 2^13, 2^14, 2^16.
+//! other, and its independent oracles are ones we wrote: `matches_the_naive_dft` at
+//! n <= 16 and `matches_the_impulse_dft_above_the_fused_block` at prover sizes. Nothing
+//! checked the path the prover actually takes against an implementation written by
+//! someone else. These vectors come from ffjavascript's `Fr.fft`, the transform snarkjs
+//! itself uses, at 2^13, 2^14, 2^16.
+//!
+//! `bench/fft-vectors/` is gitignored, so a fresh clone has nothing to compare against and
+//! this test skips. Set `G16_REQUIRE_VECTORS` to make a missing vector fail instead: a
+//! test that reports `ok` having asserted nothing is worse than one that is absent.
 //!
 //! Lives in g16-core rather than g16-ntt only because this crate already has the JSON and
 //! bigint dev dependencies the vectors need.
@@ -21,6 +26,11 @@ fn vector_dir() -> Option<PathBuf> {
     d.is_dir().then_some(d)
 }
 
+/// Whether the fixtures are mandatory on this run rather than a bonus.
+fn vectors_required() -> bool {
+    std::env::var_os("G16_REQUIRE_VECTORS").is_some()
+}
+
 fn fr(s: &str) -> Fr {
     let n: num_bigint::BigUint = s.parse().unwrap();
     Fr::from(n)
@@ -28,7 +38,12 @@ fn fr(s: &str) -> Fr {
 
 #[test]
 fn forward_transform_matches_ffjavascript() {
+    let required = vectors_required();
     let Some(dir) = vector_dir() else {
+        assert!(
+            !required,
+            "G16_REQUIRE_VECTORS is set but bench/fft-vectors is missing"
+        );
         eprintln!("SKIPPED: no bench/fft-vectors directory");
         return;
     };
@@ -37,6 +52,11 @@ fn forward_transform_matches_ffjavascript() {
     for log in [13u32, 14, 16] {
         let path = dir.join(format!("fft_{log}.json"));
         if !path.is_file() {
+            assert!(
+                !required,
+                "G16_REQUIRE_VECTORS is set but {} is missing",
+                path.display()
+            );
             continue;
         }
         let v: serde_json::Value =

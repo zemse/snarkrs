@@ -15,7 +15,7 @@ use ark_ec::{CurveGroup, VariableBaseMSM};
 use ark_std::{rand::Rng, test_rng, UniformRand};
 use g16_field::*;
 use g16_msm::{window_size, CpuMsm, MsmBackend};
-use g16_ntt::{CpuNtt, Direction, NttBackend};
+use g16_ntt::{CpuNtt, Direction, NttBackend, PARALLEL_THRESHOLD};
 
 /// Best of `reps` runs, in milliseconds.
 fn best_ms(reps: usize, mut f: impl FnMut()) -> f64 {
@@ -626,24 +626,29 @@ fn scaling_curve_small_pools() {
     }
 }
 
-/// The NTT switches from the serial to the parallel path at `PARALLEL_THRESHOLD = 2^13`.
-/// A fine sweep across that boundary shows whether the constant is in the right place: if
-/// ns/point drops sharply *at* 2^13, everything below it was being left on one core for
-/// no reason. `js_1x1_d8` runs at domain 2^12, i.e. entirely on the serial side.
+/// The NTT switches from the serial to the parallel path at `PARALLEL_THRESHOLD`, now
+/// 2^10. A fine sweep across that boundary shows whether the constant is in the right
+/// place: if ns/point drops sharply *at* the threshold, everything below it was being
+/// left on one core for no reason. `js_1x1_d8` runs at domain 2^12, so even the smallest
+/// artifact is on the parallel side. The sweep and the path column both read the constant
+/// rather than a literal, because the last time it moved this probe kept printing the old
+/// boundary and labelled three parallel rows serial.
 #[test]
 #[ignore = "probe"]
 fn ntt_around_the_parallel_threshold() {
     let mut rng = test_rng();
     let ntt = CpuNtt::new();
     println!(
-        "\n== NTT across PARALLEL_THRESHOLD (2^13), rayon threads = {} ==",
+        "\n== NTT across PARALLEL_THRESHOLD (2^{}), rayon threads = {} ==",
+        PARALLEL_THRESHOLD.trailing_zeros(),
         threads()
     );
     println!(
         "{:>5} {:>10} {:>12} {:>10}",
         "log n", "ms", "ns/point", "path"
     );
-    for log in [10u32, 11, 12, 13, 14, 15] {
+    let crossover = PARALLEL_THRESHOLD.trailing_zeros();
+    for log in crossover - 3..=crossover + 5 {
         let n = 1usize << log;
         let domain = Domain::new(n).unwrap();
         let mut a = rand_scalars(n, &mut rng);
@@ -654,7 +659,11 @@ fn ntt_around_the_parallel_threshold() {
             log,
             ms,
             ms * 1e6 / n as f64,
-            if n >= (1 << 13) { "parallel" } else { "serial" }
+            if n >= PARALLEL_THRESHOLD {
+                "parallel"
+            } else {
+                "serial"
+            }
         );
     }
 }

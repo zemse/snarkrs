@@ -5,6 +5,10 @@
 //! scalars as decimal strings. If our H agrees with that vector at every index then the
 //! coset shift, the transform ordering, the iNTT normalisation and the "no Z division"
 //! convention are all right; a pairing check alone cannot separate those.
+//!
+//! `bench/artifacts/` is gitignored, so a fresh clone has nothing to replay and this test
+//! skips. Set `G16_REQUIRE_VECTORS` to make that a failure instead: a test that reports
+//! `ok` having asserted nothing is worse than one that is absent.
 
 use g16_core::{cpu::CpuBackend, Backend, StageTimings};
 use g16_field::Fr;
@@ -33,6 +37,10 @@ fn artifacts() -> Vec<(String, PathBuf)> {
 fn h_matches_snarkjs_element_by_element() {
     let found = artifacts();
     if found.is_empty() {
+        assert!(
+            std::env::var_os("G16_REQUIRE_VECTORS").is_none(),
+            "G16_REQUIRE_VECTORS is set but no artifact carries h_expected.json"
+        );
         eprintln!("SKIPPED: no artifact carries h_expected.json");
         return;
     }
