@@ -72,8 +72,8 @@ impl R1csHeader {
     }
 
     /// `floor(log2(nConstraints + nPublic)) + 1`, the domain exponent setup will use
-    /// (`zkey_new.js:59`). One copy of the formula lives in [`crate::setup`]; this is the
-    /// spelling every other command reaches for, since it is a property of the circuit.
+    /// (`zkey_new.js:59`). The formula is [`crate::setup::circuit_power`]; this is the
+    /// spelling `setup` reaches for, since the power is a property of the circuit.
     pub fn cir_power(&self) -> u32 {
         crate::setup::circuit_power(self.n_constraints as usize, self.n_public())
     }

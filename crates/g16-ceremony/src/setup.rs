@@ -161,8 +161,8 @@ pub fn setup(
     let n_vars = r1cs.header().n_vars as usize;
     let n_public = r1cs.header().n_public();
     let n_constraints = r1cs.header().n_constraints as usize;
-    let cir_power = circuit_power(n_constraints, n_public);
-    let domain_size = 1usize << cir_power;
+    let cir_power = r1cs.header().cir_power();
+    let domain_size = r1cs.header().domain_size();
 
     // Order matters only for the message a caller sees: snarkjs tests the power first
     // (`zkey_new.js:61`) and only then section 12 (`:66`).
