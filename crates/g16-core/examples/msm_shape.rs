@@ -4,11 +4,12 @@
 //! and not enough to say anything else. Two questions this answers that the aggregate
 //! cannot:
 //!
-//!   * **The 0/1 claim.** `g16-msm`'s module docs assert "in bit-decomposition-heavy
-//!     circuits over 99% of witness scalars are 0 or 1" and build the whole prescan fast
-//!     path on it. That is measurable per circuit, and the answer decides whether the
-//!     bucket loop is a sparse problem or a dense one.
-//!   * **Where the MSM time sits.** Four MSMs take the witness (sparse); one takes H
+//!   * **The 0/1 share.** `g16-msm`'s module docs built the prescan fast path on "in
+//!     bit-decomposition-heavy circuits over 99% of witness scalars are 0 or 1", and then
+//!     retracted it: measured on the benchmark ladder the share is 1.80% on the two
+//!     largest circuits and 4.12% at the sparsest point. This reports it per MSM per
+//!     circuit, which is what says whether one key's bucket loop is sparse or dense.
+//!   * **Where the MSM time sits.** Four MSMs take the witness; one takes H
 //!     (dense, `domain_size` general scalars). If H is most of it, work on the dense
 //!     bucket path; if the witness MSMs are, work on the prescan.
 //!

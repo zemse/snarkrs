@@ -51,8 +51,11 @@ fn rand_scalars(n: usize, rng: &mut impl Rng) -> Vec<Fr> {
     (0..n).map(|_| Fr::rand(rng)).collect()
 }
 
-/// The scalar mix the four witness MSMs actually see: mostly 0 and 1.
-fn witness_scalars(n: usize, rng: &mut impl Rng) -> Vec<Fr> {
+/// A 0/1-dominated mix. Not what the witness MSMs see: measured on the benchmark ladder,
+/// 0/1 scalars are 1.80% of the witness on the two largest circuits and 4.12% at the
+/// sparsest point (`g16-msm`'s module docs). Kept as the upper bound on what the prescan
+/// fast path can pay back.
+fn bit_heavy_scalars(n: usize, rng: &mut impl Rng) -> Vec<Fr> {
     (0..n)
         .map(|i| match i % 8 {
             0..=4 => Fr::zero(),
@@ -110,8 +113,8 @@ fn msm_vs_arkworks() {
     }
 }
 
-/// The scalar mix matters more than the length: four of the five Groth16 MSMs are fed the
-/// witness, which is overwhelmingly 0 and 1.
+/// What the scalar mix is worth: the dense row is the regime the ladder's witness MSMs
+/// are actually in, and the 0/1-heavy row is the ceiling on what the prescan can remove.
 #[test]
 #[ignore = "probe"]
 fn msm_scalar_mix() {
@@ -125,15 +128,15 @@ fn msm_scalar_mix() {
         let n = 1usize << log;
         let bases: Vec<G1Affine> = walk_points(n, &mut rng);
         let dense = rand_scalars(n, &mut rng);
-        let sparse = witness_scalars(n, &mut rng);
+        let bit_heavy = bit_heavy_scalars(n, &mut rng);
         let reps = if log >= 18 { 3 } else { 5 };
         let d = best_ms(reps, || {
             let _ = std::hint::black_box(msm.msm_g1(&bases, &dense));
         });
         let s = best_ms(reps, || {
-            let _ = std::hint::black_box(msm.msm_g1(&bases, &sparse));
+            let _ = std::hint::black_box(msm.msm_g1(&bases, &bit_heavy));
         });
-        println!("2^{log}  dense {d:8.2} ms   witness-like (62% zero, 25% one) {s:8.2} ms");
+        println!("2^{log}  dense {d:8.2} ms   bit-heavy (62% zero, 25% one) {s:8.2} ms");
     }
 }
 
@@ -184,7 +187,8 @@ fn distribute_powers_sweep() {
 }
 
 /// What a 2^20 proof would cost, composed from stages measured at 2^20 rather than
-/// extrapolated. The H MSM is dense; the four witness MSMs are witness-like.
+/// extrapolated. The H MSM is dense; the four witness MSMs are fed the 0/1-heavy mix, so
+/// their rows are a lower bound on what the ladder's witness costs.
 ///
 /// Every stage is timed once per round and the rounds are interleaved, so a load spike
 /// lands on all five stages instead of inflating whichever one happened to be running.
@@ -203,7 +207,7 @@ fn composed_stage_split_at_2_20() {
     let shift = Fr::from(7u64);
     let bases: Vec<G1Affine> = walk_points(n, &mut rng);
     let dense = rand_scalars(n, &mut rng);
-    let sparse = witness_scalars(n, &mut rng);
+    let bit_heavy = bit_heavy_scalars(n, &mut rng);
     let g2: Vec<G2Affine> = walk_points(n, &mut rng);
 
     // Warm up: first-touch page faults on ~250 MB and the 16 MB twiddle table must not
@@ -211,8 +215,8 @@ fn composed_stage_split_at_2_20() {
     ntt.ntt(&domain, &mut v, Direction::Forward);
     ntt.distribute_powers(&mut v, shift);
     let _ = std::hint::black_box(msm.msm_g1(&bases, &dense));
-    let _ = std::hint::black_box(msm.msm_g1(&bases, &sparse));
-    let _ = std::hint::black_box(msm.msm_g2(&g2, &sparse));
+    let _ = std::hint::black_box(msm.msm_g1(&bases, &bit_heavy));
+    let _ = std::hint::black_box(msm.msm_g2(&g2, &bit_heavy));
 
     let (mut ntt_one, mut dist_one) = (f64::MAX, f64::MAX);
     let (mut h_msm, mut w_msm_g1, mut w_msm_g2) = (f64::MAX, f64::MAX, f64::MAX);
@@ -230,10 +234,10 @@ fn composed_stage_split_at_2_20() {
         let _ = std::hint::black_box(msm.msm_g1(&bases, &dense));
         lap(&mut h_msm, t);
         let t = Instant::now();
-        let _ = std::hint::black_box(msm.msm_g1(&bases, &sparse));
+        let _ = std::hint::black_box(msm.msm_g1(&bases, &bit_heavy));
         lap(&mut w_msm_g1, t);
         let t = Instant::now();
-        let _ = std::hint::black_box(msm.msm_g2(&g2, &sparse));
+        let _ = std::hint::black_box(msm.msm_g2(&g2, &bit_heavy));
         lap(&mut w_msm_g2, t);
     }
 
