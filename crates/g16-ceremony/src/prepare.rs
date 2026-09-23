@@ -426,7 +426,7 @@ fn lagrange_split<F: RawField>(a: &mut [Xyzz<F>]) {
     let shift_to_m = shift().pow([m as u64]);
     let s_const = (Fr::one() - shift_to_m)
         .inverse()
-        .expect("shift has order q-1, so shift^m is never 1 for m below it");
+        .expect("shift^m is not 1 at m = 2^k for k <= TWO_ADICITY");
     let shift_inv = shift().inverse().expect("shift is nonzero");
 
     let (t0, t1) = a.split_at_mut(m);
@@ -655,10 +655,10 @@ fn block_input<P: PrepareCurve>(
 ///
 /// One block per power, ascending, and one extra block for section 2. Blocks above
 /// [`COSCHEDULE_MAX`] are transformed and written one at a time so the resident set is
-/// the largest block rather than the whole section: at power 28 the difference is 32 GB
-/// against 1 TB. Blocks at or below it are co-submitted, which costs nothing there (they
-/// sum to at most twice the cap) and is what lets a device fill itself from passes too
-/// small to fill it alone.
+/// the largest block rather than the whole section: at power 28 that is 2^29 points of
+/// section 12's `4n - 1`. Blocks at or below it are co-submitted, which costs nothing
+/// there (they sum to at most twice the cap) and is what lets a device fill itself from
+/// passes too small to fill it alone.
 ///
 /// Blocks below the backend's crossover are a different schedule. Each of them would run
 /// on the CPU through `ifft_block` anyway, and run in the gaps between device blocks they

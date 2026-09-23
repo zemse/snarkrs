@@ -80,6 +80,7 @@ pub enum CeremonyError {
     /// [`g16_msm::AccelError`].
     #[error(transparent)]
     Accel(#[from] g16_msm::AccelError),
+    /// `section: 0` means the value did not come from a numbered section.
     #[error("malformed section {section}: {reason}")]
     Malformed { section: u32, reason: String },
     #[error("missing section {0}")]

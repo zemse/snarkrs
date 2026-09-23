@@ -538,8 +538,9 @@ fn write_points_g2(
     Ok(())
 }
 
-/// One output point per accumulator slot: identity for an empty slot, a single scalar
-/// multiplication for a slot with one term, a multiexp otherwise.
+/// One output point per accumulator slot: identity for an empty slot, and otherwise the
+/// slot's terms summed, through a multiexp only once the slot reaches
+/// `MULTIEXP_MIN_TERMS`.
 pub fn compose_points_g1(
     slots: &[Vec<PointTerm>],
     bases: &LagrangeBlocks,
