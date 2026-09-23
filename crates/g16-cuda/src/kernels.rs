@@ -1,10 +1,10 @@
 //! Kernel sources, compiled at run time by NVRTC.
 //!
-//! The sources and the include graph live in `g16-gpu-kernels`, because hipRTC compiles the
-//! same six files and a second copy of the CIOS Montgomery multiply would be two
-//! implementations of one algorithm that only a failing proof could tell apart. What is left
-//! here is the one NVIDIA-only knob: the preprocessor prelude each translation unit is
-//! prefixed with.
+//! The sources and the include graph live in `g16-gpu-kernels` so a second runtime compiler
+//! (hipRTC is the intended one; nothing implements it yet) can be handed the same eight
+//! files rather than a second copy of the CIOS Montgomery multiply, which only a failing
+//! proof could tell apart from the first. What is left here is the one NVIDIA-only knob: the
+//! preprocessor prelude each translation unit is prefixed with.
 
 pub use g16_gpu_kernels::{
     CURVE_CUH, FFT_CU, FIELD_PROBE_CU, FR_CUH, GATHER_CU, MSM_CU, NTT_CU, POINTWISE_CU,
@@ -16,8 +16,9 @@ pub use g16_gpu_kernels::{
 /// CIOS Montgomery multiply for the inline-PTX carry-chain version in `bn254_fr.cuh` /
 /// `msm.cu`. OFF by default: the PTX path has been validated against a host simulation
 /// of its exact chain shape but has never executed on an NVIDIA card. First run on real
-/// hardware: check `fr_probe` passes with the flag on, then compare `bench_chain` with
-/// the flag off/on; only then is it a candidate for the default.
+/// hardware: check `fr_probe` passes with the flag on, then compare `g16 ptau fft-bench`
+/// with the flag off/on; it prints which way the flag was set. Only then is it a candidate
+/// for the default.
 ///
 /// `G16_CUDA_FFT_VARIANTS=1` defines `G16_FFT_VARIANTS`, which instantiates the FFT
 /// experiment entry points (`kernels/fft.cu`, bottom) alongside the shipped pair. One

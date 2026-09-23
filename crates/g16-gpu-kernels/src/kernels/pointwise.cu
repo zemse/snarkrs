@@ -93,6 +93,9 @@ extern "C" __global__ void g16_h_join(
 // the MSM stage never packs or uploads the witness a second time (that used to be a
 // second full PCIe transfer plus a host-side Montgomery reduction per element, per
 // proof). One thread per element, no sharing, tail-guarded like everything else.
+// Byte-identical twin of fr_mont_to_std in msm.cu, and the duplication is forced by the unit
+// split: unit_stages does not carry msm.cu. A change to fr_from_mont's callers is made in
+// both.
 extern "C" __global__ void g16_mont_to_std(
     const Fr* in,
     Fr*       out,

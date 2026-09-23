@@ -6,11 +6,13 @@
 //! is checked by the compiler rather than by a preprocessor search path that only exists on
 //! the machine that happened to build it.
 //!
-//! Both vendors compile these same six files. The arithmetic is not vendor-specific: the
-//! CIOS Montgomery multiply, the NTT butterflies and the Pippenger buckets are the same
-//! code on NVIDIA and on AMD, and a second copy of them under a `hip/` directory would be
-//! two implementations of one algorithm that only a proof-verification failure could tell
-//! apart. One copy, one place to fix a carry.
+//! These eight files are meant to serve both vendors, and today only `g16-cuda` consumes
+//! them: hipRTC is the intended second consumer and nothing implements it yet. The
+//! arithmetic is not vendor-specific, which is what makes that possible: the CIOS Montgomery
+//! multiply, the NTT butterflies and the Pippenger buckets are the same code on NVIDIA and
+//! on AMD, and a second copy of them under a `hip/` directory would be two implementations
+//! of one algorithm that only a proof-verification failure could tell apart. One copy, one
+//! place to fix a carry.
 //!
 //! What differs per backend is the preprocessor prelude, and that stays the caller's
 //! business: [`unit_stages`] and its two twins take it as a string and paste it at the top.

@@ -171,6 +171,9 @@ extern "C" __global__ void zero_u32(u32* buf, u32 len) {
 
 // Montgomery limbs (layout::PackedFr) to standard limbs (layout::PackedScalar).
 // The NTT leaves H in Montgomery form on the device; Pippenger needs the integer.
+// Byte-identical twin of g16_mont_to_std in pointwise.cu, and the duplication is forced by
+// the unit split: unit_msm does not carry pointwise.cu. A change to fr_from_mont's callers
+// is made in both.
 extern "C" __global__ void fr_mont_to_std(const Fr* in, Fr* out, u32 len) {
     u32 gid = blockIdx.x * blockDim.x + threadIdx.x;
     if (gid < len) {
