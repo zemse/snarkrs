@@ -992,8 +992,18 @@ impl MetalMsm {
     /// One MSM on its own command buffer. Convenience for tests; the proving path should
     /// call [`Self::msm_batch`], because five separate command buffers cost five times
     /// the 0.16 ms submission floor.
+    ///
+    /// A length mismatch is an error, not a shorter MSM: `g16_msm::MsmBackend` requires a
+    /// backend to treat it as a malformed key, because the prefix is a valid-looking point
+    /// for the wrong proof.
     pub fn msm_g1(&self, bases: &G1Bases, scalars: &ScalarBuf) -> Result<G1Projective, ProveError> {
-        let n = bases.len.min(scalars.len);
+        if bases.len != scalars.len {
+            return Err(err(format!(
+                "msm over G1: {} bases against {} scalars",
+                bases.len, scalars.len
+            )));
+        }
+        let n = bases.len;
         let out = self.msm_batch(&[Job::G1(JobG1 {
             bases,
             base_off: 0,
@@ -1005,7 +1015,13 @@ impl MetalMsm {
     }
 
     pub fn msm_g2(&self, bases: &G2Bases, scalars: &ScalarBuf) -> Result<G2Projective, ProveError> {
-        let n = bases.len.min(scalars.len);
+        if bases.len != scalars.len {
+            return Err(err(format!(
+                "msm over G2: {} bases against {} scalars",
+                bases.len, scalars.len
+            )));
+        }
+        let n = bases.len;
         let out = self.msm_batch(&[Job::G2(JobG2 {
             bases,
             base_off: 0,
@@ -2238,6 +2254,39 @@ mod tests {
             let got = m.msm_g1(&db, &ds).unwrap();
             assert_eq!(got.into_affine(), want.into_affine(), "n = {n}");
         }
+    }
+
+    /// `g16_msm::MsmBackend` forbids reducing to the shorter side: the prefix sum is a
+    /// valid group element for a key that is wrong, and this is the `setup` path that
+    /// writes `.zkey` files. `MetalMsmBackend` panics through this error.
+    #[test]
+    fn a_length_mismatch_is_an_error_not_a_shorter_msm() {
+        use g16_field::PrimeGroup;
+        let m = MetalMsm::new().expect("Metal device");
+        let bases: Vec<G1Affine> = (0..8)
+            .map(|i| (G1Projective::generator() * Fr::from(i as u64 + 1)).into_affine())
+            .collect();
+        let scalars: Vec<Fr> = (0..5).map(|i| Fr::from(i as u64 + 1)).collect();
+        let db = m.upload_g1_bases(&bases).expect("upload bases");
+        let ds = m.upload_scalars(&scalars).expect("upload scalars");
+        let e = m.msm_g1(&db, &ds).expect_err("8 bases against 5 scalars");
+        let text = e.to_string();
+        assert!(text.contains('8') && text.contains('5'), "{text}");
+    }
+
+    #[test]
+    fn a_length_mismatch_is_an_error_not_a_shorter_msm_g2() {
+        use g16_field::PrimeGroup;
+        let m = MetalMsm::new().expect("Metal device");
+        let bases: Vec<G2Affine> = (0..4)
+            .map(|i| (G2Projective::generator() * Fr::from(i as u64 + 1)).into_affine())
+            .collect();
+        let scalars: Vec<Fr> = (0..9).map(|i| Fr::from(i as u64 + 1)).collect();
+        let db = m.upload_g2_bases(&bases).expect("upload bases");
+        let ds = m.upload_scalars(&scalars).expect("upload scalars");
+        let e = m.msm_g2(&db, &ds).expect_err("4 bases against 9 scalars");
+        let text = e.to_string();
+        assert!(text.contains('4') && text.contains('9'), "{text}");
     }
 
     #[test]

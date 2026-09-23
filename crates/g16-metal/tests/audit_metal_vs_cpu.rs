@@ -580,10 +580,18 @@ fn adversarial_scalars_agree_with_arkworks() {
         let m = scalars.len();
         let want = g16_field::G1Projective::msm(&bases[..m], scalars).unwrap();
         let sb = msm.upload_scalars(scalars).expect("upload scalars");
+        // `msm_g1` refuses a length mismatch, so the short cases upload their own prefix
+        // rather than leaning on the full-length buffer.
+        let short;
+        let gb = if m == n {
+            &gb
+        } else {
+            short = msm.upload_g1_bases(&bases[..m]).expect("upload bases");
+            &short
+        };
         let got = msm
-            .msm_g1(&gb, &sb)
+            .msm_g1(gb, &sb)
             .unwrap_or_else(|e| panic!("{label}: {e}"));
-        // msm_g1 uses min(bases, scalars) so the short cases work.
         assert_eq!(
             got.into_affine(),
             want.into_affine(),
