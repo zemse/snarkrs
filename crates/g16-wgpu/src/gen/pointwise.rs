@@ -89,7 +89,7 @@ use crate::gen::FLOOR_INVOCATIONS;
 /// widely: `tests/gather.rs` and `tests/ntt.rs` use the same differencing harness, and their
 /// published tables were taken in debug. The NTT's numbers are milliseconds and the effect is
 /// small there, but stage 0's smallest cells are around 1 ms and could move. Filed in
-/// `TASKS.md`.
+/// `TASKS.local.md`.
 ///
 /// **The honest headline is still that none of this matters.** The whole kernel is 0.21 ms at
 /// 2^18 and the entire spread across four workgroup sizes is 38 microseconds, against about

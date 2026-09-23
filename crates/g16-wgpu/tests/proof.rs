@@ -63,7 +63,7 @@ mod gpulock;
 ///
 /// Nothing this crate ships opens two devices, so the product is not affected: a
 /// `WgpuProver` owns one, and every proof through it holds the guard. It is written up in
-/// `TASKS.md` because it is worth reporting upstream and because the next person to reach
+/// `TASKS.local.md` because it is worth reporting upstream and because the next person to reach
 /// for a private device in a test needs to know. Here, the answer is one device and this
 /// lock.
 fn exclusive() -> std::sync::MutexGuard<'static, ()> {
@@ -806,7 +806,7 @@ fn a_whole_proof_is_two_submits_and_the_readback_is_bounded() {
 /// against the 38.3 ms `tests/msm_g1.rs::what_one_g1_msm_costs_against_the_cpu` measured for
 /// **one** G1 MSM at n = 4096 standing alone. The two agree to the last figure. Whatever is
 /// wrong is not in this file: batching five MSMs is free, and each of the five costs exactly
-/// what U9 measured it costing on its own. The fix is the occupancy item in `TASKS.md`.
+/// what U9 measured it costing on its own. The fix is the occupancy item in `TASKS.local.md`.
 #[test]
 fn where_the_msm_time_goes() {
     let _one_at_a_time = exclusive();

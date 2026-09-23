@@ -780,7 +780,7 @@ fn compare_modes(stages: &HStages, w: &[Fr], reps: usize) -> [(u64, u64); 2] {
 ///
 /// **`g16-metal` has the same shape and, as far as this repo records, has never measured
 /// it**: its 2^18 split is 9 + 9, so its joined batch also runs at `s0 = 9`. Filed in
-/// `TASKS.md`.
+/// `TASKS.local.md`.
 #[test]
 fn the_fusion_is_measured_and_not_assumed() {
     // Timing. Takes the cross-process lock, because cargo runs the test binaries in

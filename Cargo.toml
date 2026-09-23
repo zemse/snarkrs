@@ -36,7 +36,7 @@ ark-bn254    = { version = "0.5", default-features = false, features = ["curve"]
 # arithmetic so high on the Mac. And ark-ff 0.5 also requires `target_feature = "bmi2"`
 # and `"adx"` (montgomery_backend.rs:157-160), neither of which is in the baseline
 # x86-64 target, and this repo sets no `target-cpu`, so the EC2 boxes were not running
-# the assembly either. See the entry in TASKS.md before quoting any x86 CPU row.
+# the assembly either. See the entry in TASKS.local.md before quoting any x86 CPU row.
 ark-ff       = { version = "0.5", default-features = false }
 ark-ec       = { version = "0.5", default-features = false }
 ark-serialize = { version = "0.5", default-features = false }

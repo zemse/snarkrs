@@ -19,7 +19,7 @@ license.workspace = true
 #
 # U13's browser entry point needs `cdylib` plus wasm-bindgen, js-sys and web-sys, none of
 # which belong in the native dependency tree. It gets its own thin wrapper crate, which is
-# where wasm-pack should have been pointed anyway. See TASKS.md.
+# where wasm-pack should have been pointed anyway. See TASKS.local.md.
 crate-type = ["rlib"]
 
 [dependencies]
