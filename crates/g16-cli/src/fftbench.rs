@@ -3,10 +3,10 @@
 //! The economics this command exists for: any edit to `kernels/fft.cu` costs a full
 //! NVRTC + ptxas rebuild on the measuring machine, minutes of billed GPU time, because
 //! the PTX cache keys on the source. So the candidate kernels are all instantiated in
-//! one translation unit (`G16_CUDA_FFT_VARIANTS=1`, see `g16-cuda/src/fft.rs`
-//! `VARIANTS`) and this command pays one compile, one context, and one input
-//! generation for the whole table. Every row after the first costs only its own
-//! kernel time.
+//! one translation unit (`G16_CUDA_FFT_VARIANTS=1`, which `g16-cuda/src/kernels.rs`
+//! turns into the `#define`; `g16-cuda/src/fft.rs` `VARIANTS` is the table of names) and
+//! this command pays one compile, one context, and one input generation for the whole
+//! table. Every row after the first costs only its own kernel time.
 //!
 //! What a row measures: the wall clock of one `ifft_many` call over `--copies`
 //! independent blocks of `2^power` synthetic points, which includes the host pack,
@@ -48,10 +48,10 @@ pub struct Args {
     /// unit carries (all of them, since this command compiles the experiment set).
     #[arg(long, value_delimiter = ',')]
     pub variants: Vec<String>,
-    /// Threads-per-block values to sweep. Launches clamp to a variant's own
-    /// `__launch_bounds__` maximum.
+    /// CUDA threads-per-block values to sweep, unrelated to the data blocks `--copies`
+    /// counts. Launches clamp to a variant's own `__launch_bounds__` maximum.
     #[arg(long, value_delimiter = ',', default_value = "128")]
-    pub blocks: Vec<u32>,
+    pub block_size: Vec<u32>,
     /// g1, g2 or both.
     #[arg(long, value_enum, default_value_t = Group::Both)]
     pub group: Group,
@@ -189,10 +189,11 @@ pub fn run(args: Args) -> Result<()> {
     if args.copies == 0 || args.iters == 0 {
         bail!("--copies and --iters must be at least 1");
     }
-    // The gated variants exist in the unit only when the define is in the source
-    // (kernels.rs reads this env at compile time). Anything beyond the shipped `c5`
-    // needs it, so default it on; an explicit value, e.g. `0` to sweep only the cheap
-    // shipped unit, is respected.
+    // The gated variants exist in the unit only when the define is in the source, and
+    // `kernels::defines` reads this env when it assembles the NVRTC source, so setting it
+    // here, before `FftKernels::compile`, is what puts the define in the unit. Anything
+    // beyond the shipped `c5` needs it, so default it on; an explicit value, e.g. `0` to
+    // sweep only the cheap shipped unit, is respected.
     let wants_gated = args.variants.is_empty() || args.variants.iter().any(|v| v != "c5");
     if wants_gated && std::env::var_os("G16_CUDA_FFT_VARIANTS").is_none() {
         std::env::set_var("G16_CUDA_FFT_VARIANTS", "1");
@@ -251,7 +252,7 @@ pub fn run(args: Args) -> Result<()> {
         args.streams,
         args.iters
     );
-    println!("group variant block   iter    wall_s      Ml/s  check");
+    println!("group variant bsize   iter    wall_s      Ml/s  check");
 
     // The closure keeps the module type (a cudarc handle) inside g16-cuda's API; every
     // instance it makes shares the one compiled module, so a row costs a function bind
@@ -313,7 +314,7 @@ fn run_group<G: BenchGroup, F: Fn(&str, u32) -> Result<FftKernels>>(
     let total_ladders = ladders(args.power) * args.copies as u64;
     let mut mismatches = 0usize;
     for variant in selected {
-        for &block in &args.blocks {
+        for &block in &args.block_size {
             let k = mk(variant, block)?;
             for iter in 0..args.iters {
                 let mut copies: Vec<Vec<Xyzz<G::Raw>>> = vec![base.clone(); args.copies];
