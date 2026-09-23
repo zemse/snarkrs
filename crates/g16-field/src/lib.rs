@@ -16,11 +16,9 @@ pub use ark_ff::{BigInteger, FftField, Field, One, PrimeField, UniformRand, Zero
 /// iNTT. It does NOT get a coset generator from here, on purpose: the snarkjs-compatible
 /// H coset is the odd half of the `2*size`-th roots of unity, so each backend derives its
 /// shift as a primitive `2*size`-th root whose square is `group_gen` (see
-/// `CpuCircuit::new` in g16-core for the full argument). An earlier version of this type
-/// exposed `coset_gen = Fr::GENERATOR` and `vanishing_on_coset()`, which describe a
-/// mathematically valid but snarkjs-INCOMPATIBLE coset: nothing on the proving path used
-/// them, and pairing them with section-9 H bases would produce proofs that fail to
-/// verify, so the footgun was removed rather than documented around.
+/// `CpuCircuit::new` in g16-core for the full argument). A shift built from
+/// `Fr::GENERATOR` is a mathematically valid coset that snarkjs rejects: paired with the
+/// section-9 H bases it produces proofs that fail to verify.
 #[derive(Clone, Debug)]
 pub struct Domain {
     pub size: usize,

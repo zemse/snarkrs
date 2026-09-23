@@ -423,9 +423,8 @@ impl RawField for RawFq2 {
 // RawFr
 // ---------------------------------------------------------------------------
 
-/// BN254 scalar field element as raw Montgomery limbs. Same design as [`RawFq`]; exists
-/// for `Fr`-heavy loops (NTT butterflies, coset shifts) that want the branch-free
-/// reduction there too.
+/// BN254 scalar field element as raw Montgomery limbs. Not yet used by any hot loop; see
+/// REV-02 in the backlog.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RawFr(pub [u64; 4]);
 
