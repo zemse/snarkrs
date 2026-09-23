@@ -1952,11 +1952,10 @@ mod tests {
             len: 8,
             data: std::sync::Arc::new(()),
         };
-        // `MsmOutputs` has no `Debug`, so this cannot use `expect_err`.
-        let msg = match m.msms(&[], &h, &mut StageTimings::default()) {
-            Ok(_) => panic!("a foreign device handle must be refused, not read"),
-            Err(e) => e.to_string(),
-        };
+        let msg = m
+            .msms(&[], &h, &mut StageTimings::default())
+            .expect_err("a foreign device handle must be refused, not read")
+            .to_string();
         assert!(msg.contains("metal"), "unhelpful message: {msg}");
     }
 }
