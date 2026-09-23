@@ -49,12 +49,16 @@ pub trait MsmBackend: Send + Sync {
 }
 
 /// Bits in the scalar field modulus: 254 for BN254's Fr.
-const SCALAR_BITS: usize = Fr::MODULUS_BIT_SIZE as usize;
+pub const SCALAR_BITS: usize = Fr::MODULUS_BIT_SIZE as usize;
 
 /// Signed recoding carries one bit past the top of the scalar, so the digit array is
-/// laid out over `SCALAR_BITS + 1` bits. See [`signed_digit`] for why that kills the
+/// laid out over `SCALAR_BITS + 1` bits. See `signed_digit` for why that kills the
 /// final carry rather than just hiding it.
-const RECODE_BITS: usize = SCALAR_BITS + 1;
+///
+/// Public because every GPU backend retypes it in its own shader language and asserts
+/// against this one; a copy one below it is wrong only for scalars above `2^((nw-1)*c)`,
+/// which a random test with small scalars never reaches.
+pub const RECODE_BITS: usize = SCALAR_BITS + 1;
 
 /// Caps the bucket array at 2^15 XYZZ points, 4 MiB of G1 (8 MiB of G2) per in-flight
 /// task. A window this wide takes the batch-affine fill instead, which holds 2 MiB of

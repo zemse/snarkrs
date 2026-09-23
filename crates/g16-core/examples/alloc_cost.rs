@@ -19,9 +19,7 @@
 use std::time::Instant;
 
 use g16_field::{Fr, G1Projective, G2Projective, PrimeField, UniformRand, Zero};
-use g16_msm::window_size;
-
-const RECODE_BITS: usize = 255;
+use g16_msm::{window_size, RECODE_BITS};
 
 fn best(reps: usize, f: &mut dyn FnMut()) -> f64 {
     (0..reps)
