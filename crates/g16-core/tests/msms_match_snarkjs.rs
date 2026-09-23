@@ -5,6 +5,10 @@
 //! that isolates an l_query offset error or an h_query length error: both still produce
 //! a proof, and both are invisible to any check that only looks at the final pairing when
 //! the pairing itself is wrong for a second reason.
+//!
+//! `bench/artifacts/` is gitignored, so a fresh clone has nothing to replay and this test
+//! skips. Set `G16_REQUIRE_VECTORS` to make that a failure instead: a test that reports
+//! `ok` having asserted nothing is worse than one that is absent.
 
 use g16_core::{cpu::CpuBackend, Backend, StageTimings};
 use g16_field::*;
@@ -65,6 +69,10 @@ fn g2(v: &serde_json::Value) -> G2Affine {
 fn five_msms_match_snarkjs() {
     let found = artifacts();
     if found.is_empty() {
+        assert!(
+            std::env::var_os("G16_REQUIRE_VECTORS").is_none(),
+            "G16_REQUIRE_VECTORS is set but no artifact carries msm_expected.json"
+        );
         eprintln!("SKIPPED: no artifact carries msm_expected.json");
         return;
     }
