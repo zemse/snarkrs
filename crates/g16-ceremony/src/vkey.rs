@@ -68,11 +68,16 @@ fn fq2_json(x: &Fq2) -> Value {
     Value::Array(vec![dec(x.c0), dec(x.c1)])
 }
 
+/// [`g1_json`] over Fq2, so the identity is `[[0,0], [1,0], [0,0]]`: ffjavascript's
+/// `toObject` returns `[F.zero, F.one, F.zero]` for the zero point
+/// (`wasm_curve.js:338-345`) and `F.one` over Fq2 is `[1, 0]`. Unreachable from a
+/// well-formed header, where none of `vk_beta_2`, `vk_gamma_2` and `vk_delta_2` is ever
+/// the identity.
 fn g2_json(p: &G2Affine) -> Value {
     if p.infinity {
         Value::Array(vec![
             fq2_json(&Fq2::new(Fq::from(0u64), Fq::from(0u64))),
-            fq2_json(&Fq2::new(Fq::from(0u64), Fq::from(0u64))),
+            fq2_json(&Fq2::new(Fq::from(1u64), Fq::from(0u64))),
             fq2_json(&Fq2::new(Fq::from(0u64), Fq::from(0u64))),
         ])
     } else {
@@ -178,5 +183,26 @@ fn render(v: &Value, depth: usize, out: &mut String) {
             out.push(']');
         }
         other => out.push_str(&other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The identity is the one point whose encoding no artifact pins, because no
+    /// well-formed key carries one. Both spellings are ffjavascript's `toObject`
+    /// (`wasm_curve.js:338-345`), which is what `zkey export verificationkey` writes
+    /// through.
+    #[test]
+    fn the_identity_is_the_projective_zero_in_both_groups() {
+        assert_eq!(
+            g1_json(&G1Affine::identity()),
+            serde_json::json!(["0", "1", "0"])
+        );
+        assert_eq!(
+            g2_json(&G2Affine::identity()),
+            serde_json::json!([["0", "0"], ["1", "0"], ["0", "0"]])
+        );
     }
 }
