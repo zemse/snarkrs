@@ -50,6 +50,7 @@ use rand_chacha::rand_core::{RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use sha2::Sha256;
 
+use crate::phase1::{BEACON_ITERATIONS_MAX, BEACON_ITERATIONS_MIN};
 use crate::{CeremonyError, N8, SCG1, SCG2, SG1, SG2};
 
 /// A 64-byte BLAKE2b-512 digest. Every challenge, response, transcript and `csHash` is
@@ -419,18 +420,45 @@ pub fn rng_from_entropy_with(os_bytes: &[u8; 64], entropy: &str) -> CeremonyRng 
     CeremonyRng::from_digest(&h.finalize())
 }
 
+/// A `numIterationsExp` inside snarkjs' `10..=63`, which is the only form
+/// [`rng_from_beacon_params`] accepts: the exponent reaches phase 2 as a raw byte off
+/// disk, and `2^exp` rounds of SHA-256 is a command that never returns long before the
+/// shift itself runs out of width.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BeaconIterations(u8);
+
+impl BeaconIterations {
+    /// The exponent half of `phase1::check_beacon`, and the one place the bound is
+    /// enforced.
+    pub fn new(num_iterations_exp: u8) -> Result<Self, CeremonyError> {
+        if !(BEACON_ITERATIONS_MIN..=BEACON_ITERATIONS_MAX).contains(&num_iterations_exp) {
+            return Err(CeremonyError::BadParams(format!(
+                "invalid numIterationsExp: must be between {BEACON_ITERATIONS_MIN} and {BEACON_ITERATIONS_MAX}, got {num_iterations_exp}"
+            )));
+        }
+        Ok(Self(num_iterations_exp))
+    }
+
+    /// The raw exponent, as a contribution record stores it.
+    pub fn exp(self) -> u8 {
+        self.0
+    }
+}
+
 /// `rngFromBeaconParams` (`misc.js:201-228`): SHA-256 iterated exactly
 /// `2^num_iterations_exp` times, the first over `beacon_hash` itself and every later one
 /// over the previous 32-byte digest, then eight big-endian words of that digest.
 ///
 /// This is the deterministic half of the ceremony and where byte-comparison against
-/// snarkjs belongs. Callers bound `num_iterations_exp` to `10..=63`.
-pub fn rng_from_beacon_params(beacon_hash: &[u8], num_iterations_exp: u8) -> CeremonyRng {
+/// snarkjs belongs.
+pub fn rng_from_beacon_params(
+    beacon_hash: &[u8],
+    num_iterations_exp: BeaconIterations,
+) -> CeremonyRng {
     // snarkjs splits the count into an inner and an outer loop only to keep each bound
-    // inside a 32-bit int (`misc.js:205-211`); the product is 2^num_iterations_exp.
-    let iterations = 1u128
-        .checked_shl(num_iterations_exp.into())
-        .expect("numIterationsExp is bounded to 10..=63 by parse_beacon_args");
+    // inside a 32-bit int (`misc.js:205-211`); the product is 2^num_iterations_exp, and
+    // the bound on the exponent is what keeps that inside a u128.
+    let iterations = 1u128 << num_iterations_exp.exp();
     let mut cur: Vec<u8> = beacon_hash.to_vec();
     for _ in 0..iterations {
         cur = Sha256::digest(&cur).to_vec();

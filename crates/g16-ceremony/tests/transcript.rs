@@ -560,14 +560,20 @@ fn g1_and_g2_from_rng_match_ffjavascript() {
 /// 1024 times (`misc.js:201-228`), then the first three draws are `zkey_beacon.js:56-58`.
 #[test]
 fn beacon_rng_matches_snarkjs() {
-    let mut rng = rng_from_beacon_params(&[0x0a, 0x0b, 0x0c, 0x0d], 10);
+    let mut rng = rng_from_beacon_params(
+        &[0x0a, 0x0b, 0x0c, 0x0d],
+        BeaconIterations::new(10).unwrap(),
+    );
     let expected_seed = unhex("38a809c6c8540db7555f3dcfeceac2a11d126cfc7d98a8f0f7fc53967cb9ecac");
     let mut reference = CeremonyRng::from_digest(&expected_seed);
     for _ in 0..4 {
         assert_eq!(rng.next_u32(), reference.next_u32());
     }
 
-    let mut rng = rng_from_beacon_params(&[0x0a, 0x0b, 0x0c, 0x0d], 10);
+    let mut rng = rng_from_beacon_params(
+        &[0x0a, 0x0b, 0x0c, 0x0d],
+        BeaconIterations::new(10).unwrap(),
+    );
     let prv = fr_from_rng(&mut rng);
     assert_eq!(
         fr_raw(&prv),
@@ -682,7 +688,10 @@ fn get_g2_sp_matches_snarkjs() {
 /// pubkey serialisations at once; a single reordered draw changes every byte after it.
 #[test]
 fn create_ptau_key_matches_snarkjs() {
-    let mut rng = rng_from_beacon_params(&[0x0a, 0x0b, 0x0c, 0x0d], 10);
+    let mut rng = rng_from_beacon_params(
+        &[0x0a, 0x0b, 0x0c, 0x0d],
+        BeaconIterations::new(10).unwrap(),
+    );
     let challenge = blake2b512(b"");
     let key = create_ptau_key(&mut rng, &challenge);
 
@@ -729,7 +738,10 @@ fn create_ptau_key_matches_snarkjs() {
 /// way, so a divergence here is caught by snarkjs' own verifier.
 #[test]
 fn create_delta_key_closes_the_transcript_it_names() {
-    let mut rng = rng_from_beacon_params(&[0x0a, 0x0b, 0x0c, 0x0d], 10);
+    let mut rng = rng_from_beacon_params(
+        &[0x0a, 0x0b, 0x0c, 0x0d],
+        BeaconIterations::new(10).unwrap(),
+    );
     let mut prior = Transcript::new();
     prior.update(&blake2b512(b"cs"));
     let (delta, transcript) = create_delta_key(&mut rng, prior.clone());

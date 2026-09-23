@@ -649,9 +649,9 @@ fn a_beacon_exponent_outside_the_bounds_is_refused_before_the_file_is_opened() {
 }
 
 /// `numIterationsExp` reaches the verifier as a raw byte off disk, and
-/// `rng_from_beacon_params` turns it into `2^exp` SHA-256 rounds. Unbounded, 100 is a
-/// `zkey verify` that never returns and 128 is a panic, on the one command whose whole job
-/// is to survive a file someone else wrote.
+/// `rng_from_beacon_params` turns it into `2^exp` SHA-256 rounds. Unchecked, 100 is a
+/// `zkey verify` that never returns, on the one command whose whole job is to survive a
+/// file someone else wrote.
 #[test]
 fn a_beacon_record_with_an_unbounded_exponent_is_refused_by_the_verifier() {
     let bench = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench");

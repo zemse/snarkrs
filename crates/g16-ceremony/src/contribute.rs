@@ -257,8 +257,8 @@ pub fn beacon(
     num_iterations_exp: u8,
     key: &dyn KeyScale,
 ) -> Result<ContributionReport, CeremonyError> {
-    check_beacon(beacon_hash, num_iterations_exp)?;
-    let mut rng = transcript::rng_from_beacon_params(beacon_hash, num_iterations_exp);
+    let iterations = check_beacon(beacon_hash, num_iterations_exp)?;
+    let mut rng = transcript::rng_from_beacon_params(beacon_hash, iterations);
     let params = ContributionParams {
         name: name.map(str::to_owned),
         num_iterations_exp: Some(num_iterations_exp),
@@ -587,8 +587,9 @@ fn verify_chain(mpc: &MpcParams, header: &Groth16Header) -> Result<Vec<Digest>, 
                     )))
                 }
             };
-            check_beacon(hash, exp).map_err(|e| fail(format!("INVALID({i}): {e}")))?;
-            let mut rng = transcript::rng_from_beacon_params(hash, exp);
+            let iterations =
+                check_beacon(hash, exp).map_err(|e| fail(format!("INVALID({i}): {e}")))?;
+            let mut rng = transcript::rng_from_beacon_params(hash, iterations);
             let prv_key = transcript::fr_from_rng(&mut rng);
             let g1_s = transcript::g1_from_rng(&mut rng);
             if g1_s != c.g1_s || (g1_s * prv_key).into_affine() != c.g1_sx {

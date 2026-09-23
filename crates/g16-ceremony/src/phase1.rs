@@ -45,9 +45,9 @@ use rayon::prelude::*;
 use crate::ptau::{self, Ptau, PtauContribution, PtauHeader};
 use crate::transcript::{
     g1_compressed, g1_uncompressed, g2_compressed, g2_uncompressed, get_g2_sp,
-    rng_from_beacon_params, rng_from_entropy, same_ratio, write_ptau_pubkey, CeremonyRng, Digest,
-    PtauKey, PtauPubKey, Transcript, PARTIAL_HASH_BYTES, PERSONALIZATION_ALPHA,
-    PERSONALIZATION_BETA, PERSONALIZATION_TAU,
+    rng_from_beacon_params, rng_from_entropy, same_ratio, write_ptau_pubkey, BeaconIterations,
+    CeremonyRng, Digest, PtauKey, PtauPubKey, Transcript, PARTIAL_HASH_BYTES,
+    PERSONALIZATION_ALPHA, PERSONALIZATION_BETA, PERSONALIZATION_TAU,
 };
 use crate::write::BinFileWriter;
 use crate::{
@@ -658,13 +658,13 @@ pub fn beacon(
     num_iterations_exp: u8,
     key: &dyn KeyScale,
 ) -> Result<Phase1Report, CeremonyError> {
-    check_beacon(beacon_hash, num_iterations_exp)?;
+    let iterations = check_beacon(beacon_hash, num_iterations_exp)?;
     let params = ContributionParams {
         name: name.map(str::to_owned),
         num_iterations_exp: Some(num_iterations_exp),
         beacon_hash: Some(beacon_hash.to_vec()),
     };
-    let mut rng = rng_from_beacon_params(beacon_hash, num_iterations_exp);
+    let mut rng = rng_from_beacon_params(beacon_hash, iterations);
     apply_contribution(
         ptau_in,
         ptau_out,
@@ -760,8 +760,8 @@ fn verify_contribution(
             .beacon_hash
             .as_deref()
             .ok_or_else(|| failed(named("beacon record has no beaconHash")))?;
-        check_beacon(hash, exp)?;
-        let mut rng = rng_from_beacon_params(hash, exp);
+        let iterations = check_beacon(hash, exp)?;
+        let mut rng = rng_from_beacon_params(hash, iterations);
         let expected = crate::transcript::create_ptau_key(&mut rng, &prev.next_challenge);
         for (name, got, want) in [
             ("tau", cur.pubkeys.tau, expected.tau.pubkey),
@@ -1164,11 +1164,12 @@ pub fn verify(ptau: &Path) -> Result<PtauVerifyReport, CeremonyError> {
 ///
 /// Both phases call this, and phase 2 has to: it reads `numIterationsExp` as a raw byte
 /// out of section 10, and [`crate::transcript::rng_from_beacon_params`] turns it into
-/// `2^exp` SHA-256 rounds with nothing else between them.
+/// `2^exp` SHA-256 rounds with nothing else between them. The checked exponent comes back
+/// as the [`BeaconIterations`] that function takes.
 pub(crate) fn check_beacon(
     beacon_hash: &[u8],
     num_iterations_exp: u8,
-) -> Result<(), CeremonyError> {
+) -> Result<BeaconIterations, CeremonyError> {
     if beacon_hash.is_empty() {
         return Err(CeremonyError::BadParams(
             "invalid beacon hash: it must be a valid hexadecimal sequence".into(),
@@ -1180,12 +1181,7 @@ pub(crate) fn check_beacon(
             beacon_hash.len()
         )));
     }
-    if !(BEACON_ITERATIONS_MIN..=BEACON_ITERATIONS_MAX).contains(&num_iterations_exp) {
-        return Err(CeremonyError::BadParams(format!(
-            "invalid numIterationsExp: must be between {BEACON_ITERATIONS_MIN} and {BEACON_ITERATIONS_MAX}, got {num_iterations_exp}"
-        )));
-    }
-    Ok(())
+    BeaconIterations::new(num_iterations_exp)
 }
 
 /// Parse and bounds-check the two beacon arguments the way snarkjs does before it touches
