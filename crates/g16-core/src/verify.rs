@@ -25,9 +25,9 @@ pub enum VerifyError {
 /// The points in `proof` are taken as given. This function does no on-curve, subgroup or
 /// canonical-encoding validation, because `Proof`'s fields are public and a `Proof` that
 /// reached here through this crate's own deserializer has already been validated by it:
-/// `g16-cli`'s `json.rs` checks on-curve and prime-order-subgroup membership for `pi_b`,
-/// which is the one that matters (BN254 G1 has cofactor 1, so on-curve implies in-subgroup
-/// there; G2 does not).
+/// [`crate::json`] runs an on-curve and a prime-order-subgroup check on all three points.
+/// The subgroup check only does work on `pi_b` (BN254 G1 has cofactor 1, so on-curve
+/// implies in-subgroup there; G2 does not).
 ///
 /// A caller that constructs a `Proof` by hand, over FFI, or with `ark-serialize` and
 /// `Validate::No` gets no such guarantee and must validate before calling. Feeding an
