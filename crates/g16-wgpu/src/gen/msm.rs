@@ -350,7 +350,7 @@ pub fn mont_module_at(v: Variant, workgroup: u32) -> String {
 /// All five entry points behind one copy of the `Fr` prelude.
 ///
 /// The alternative to shipping two modules, kept so the choice is a measurement rather than
-/// an assumption. `tests/msm_digits.rs::the_digit_modules_are_split_for_a_measured_reason`
+/// an assumption. `tests/msm_digits.rs::the_digit_modules_are_fused_for_a_measured_reason`
 /// builds this and the two-module form and prints both costs; the answer and the numbers are
 /// on [`crate::msm::MsmDigits`].
 pub fn fused_module_at(v: Variant, wg: Workgroups, pick: LimbPick) -> String {

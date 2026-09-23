@@ -289,7 +289,7 @@ impl Field {
         }
         // One conditional subtraction at the end of a Montgomery multiply is only enough
         // because the CIOS intermediate is below 2m, and that in turn needs m < 2^255 so the
-        // ninth accumulator word is provably zero. Both BN254 moduli have top limb 0x3064e472.
+        // ninth accumulator word is provably zero. Both BN254 moduli have top limb 0x30644e72.
         assert!(
             self.modulus[LIMBS - 1] < 0x8000_0000,
             "modulus is at least 2^255; the single conditional subtraction below is not enough"
