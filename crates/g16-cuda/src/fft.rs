@@ -300,7 +300,8 @@ impl FftGroup for FftG2 {
     }
 }
 
-/// The four FFT kernels, compiled once.
+/// The shipped variant's four kernels, plus the gated experiment set when the unit carries
+/// it, compiled once.
 ///
 /// Compiling the unit is the expensive call (NVRTC plus the driver's ptxas on a miss of
 /// both caches; see `context.rs` for the measured cliff) and it belongs once at the top
@@ -321,7 +322,8 @@ pub struct FftKernels {
 }
 
 impl FftKernels {
-    /// Compiles `kernels::unit_fft()` and binds the four kernel handles.
+    /// Compiles `kernels::unit_fft()` and binds the shipped variant's four kernel handles,
+    /// plus the gated experiment set when the unit carries it.
     pub fn new(cuda: &Cuda) -> Result<Self, ProveError> {
         let module = Self::compile(cuda)?;
         Self::from_module(cuda, module)

@@ -29,7 +29,7 @@
 //! PCIe. Both are process-lifetime costs by design, so they are paid once here in a
 //! `OnceLock` and shared by every test. Building a backend per test would not be a slower
 //! test suite, it would be a test suite that never finishes, and the eight tests below
-//! would each be paying for the same eight kernels.
+//! would each be paying for the same kernels.
 //!
 //! The first run on a fresh box therefore takes about five minutes before the first
 //! assertion. That is the CUDA installation warming up, not a hang.

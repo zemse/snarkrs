@@ -182,9 +182,6 @@ fn world() -> Option<&'static World> {
 /// bucket array would read as a backend bug when it is an out-of-memory.
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// One test at a time on the device, same reason as the pipeline suite: several proofs'
-/// worth of bucket arrays live at once on a 15 GB card reads as a backend bug when it is
-/// an out-of-memory.
 fn for_each(test: &str, f: impl Fn(&World, &Fixture)) {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(w) = world() else {
