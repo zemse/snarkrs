@@ -86,8 +86,9 @@ fn err(reason: impl Into<String>) -> ProveError {
 // ---------------------------------------------------------------------------
 
 /// Bits the signed recoding is laid out over: 254 for BN254's `Fr`, plus one so the
-/// carry out of the top window is provably zero. Must match `g16_msm::RECODE_BITS`.
+/// carry out of the top window is provably zero.
 const RECODE_BITS: usize = 255;
+const _: () = assert!(RECODE_BITS == g16_msm::RECODE_BITS);
 
 /// Caps the bucket array at 2^15 points per window.
 const MAX_WINDOW: u32 = 16;
