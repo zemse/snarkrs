@@ -399,16 +399,23 @@ impl CeremonyRng {
 ///
 /// The 64 bytes come from `/dev/urandom` rather than a crate: `rand_core::OsRng` needs
 /// its `getrandom` feature, which nothing in this crate's dependency graph turns on and
-/// which we would then be relying on a sibling crate to keep turning on. Panicking is the
-/// right failure here, because a ceremony that silently proceeds on degraded entropy is
-/// worse than one that stops.
-pub fn rng_from_entropy(entropy: &str) -> CeremonyRng {
+/// which we would then be relying on a sibling crate to keep turning on. A read that
+/// fails is an error and never a fallback, because a ceremony that proceeds on degraded
+/// entropy is worse than one that stops, and the two verify commands owe their caller an
+/// `Err` rather than a panic.
+///
+/// `entropy` is domain separation and nothing else: the unpredictability is all in the 64
+/// bytes. The contribute commands pass the user's string, and the two verify commands,
+/// which draw only local challenge scalars, pass their own command name.
+pub fn rng_from_entropy(entropy: &str) -> Result<CeremonyRng, CeremonyError> {
     use std::io::Read;
     let mut os_bytes = [0u8; 64];
     std::fs::File::open("/dev/urandom")
         .and_then(|mut f| f.read_exact(&mut os_bytes))
-        .expect("/dev/urandom: no operating system entropy for the contribution");
-    rng_from_entropy_with(&os_bytes, entropy)
+        .map_err(|e| {
+            std::io::Error::new(e.kind(), format!("/dev/urandom: no system entropy: {e}"))
+        })?;
+    Ok(rng_from_entropy_with(&os_bytes, entropy))
 }
 
 /// [`rng_from_entropy`] with the 64 OS-random bytes injected, so a run can be compared

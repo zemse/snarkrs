@@ -197,7 +197,7 @@ pub fn contribute(
     entropy: &str,
     key: &dyn KeyScale,
 ) -> Result<ContributionReport, CeremonyError> {
-    let mut rng = transcript::rng_from_entropy(entropy);
+    let mut rng = transcript::rng_from_entropy(entropy)?;
     let params = ContributionParams {
         name: name.map(str::to_owned),
         num_iterations_exp: None,
@@ -486,7 +486,7 @@ pub fn verify_from_init(
         }
     }
 
-    let mut rng = transcript::rng_from_entropy("");
+    let mut rng = transcript::rng_from_entropy("g16 zkey verify")?;
     check_l_section(
         init.unique_section(S_C)?,
         l_bytes,

@@ -625,7 +625,7 @@ pub fn contribute(
         name: name.map(str::to_owned),
         ..Default::default()
     };
-    contribute_with(ptau_in, ptau_out, params, rng_from_entropy(entropy), key)
+    contribute_with(ptau_in, ptau_out, params, rng_from_entropy(entropy)?, key)
 }
 
 /// [`contribute`] with the RNG supplied, so a run can be held against snarkjs' bytes.
@@ -999,7 +999,7 @@ pub fn verify(ptau: &Path) -> Result<PtauVerifyReport, CeremonyError> {
     let cur = &contributions[last];
     let mut hasher = Transcript::new();
     hasher.update(&cur.response_hash()?);
-    let mut rng = rng_from_entropy("g16 ptau verify");
+    let mut rng = rng_from_entropy("g16 ptau verify")?;
 
     let tau1 = verify_powers::<G1Affine>(
         &file,
