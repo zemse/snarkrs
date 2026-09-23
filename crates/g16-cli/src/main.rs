@@ -684,6 +684,13 @@ fn run_prove(
     let w = Witness::load(witness)
         .with_context(|| format!("loading {}", witness.display()))?
         .0;
+    // Checked here, not at the slice below, so a witness that does not match the key costs
+    // the load and nothing else. On a large circuit the proof is tens of seconds.
+    anyhow::ensure!(
+        w.len() > n_public,
+        "witness has {} entries, too short for {n_public} public signals",
+        w.len()
+    );
     let circuit = make_backend(backend)?.prepare(pk)?;
 
     // Stage 10's blinders come from the OS CSPRNG. Nothing on this command offers a seed
@@ -698,11 +705,7 @@ fn run_prove(
     // The public signals are the witness prefix, which is what snarkjs publishes. Taken
     // from the witness rather than copied from an existing public.json so that `prove`
     // needs nothing but the zkey and the witness.
-    anyhow::ensure!(
-        w.len() > n_public,
-        "witness has {} entries, too short for {n_public} public signals",
-        w.len()
-    );
+    //
     // Verify before writing, not after, so a bad proof never reaches the filesystem where
     // something downstream might pick it up. `bench` has verified every timed rep since it
     // was written, on the grounds that timing a broken prover is worse than not timing one;

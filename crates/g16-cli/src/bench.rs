@@ -174,6 +174,9 @@ fn cold(v: &Variant, constraints: i64, args: &Args) -> Result<Vec<Row>> {
         let witness = Witness::load(&v.wtns())
             .with_context(|| format!("{}: loading circuit.wtns", v.name))?
             .0;
+        // Before the prepare, so a witness too short for the key fails here rather than
+        // after a full proof. The copy is `n_public` field elements.
+        let public = public_of(&witness, n_public)?;
         let circuit = crate::make_backend(args.backend)?.prepare(pk)?;
         let prepare_ms = ms(start);
 
@@ -182,7 +185,7 @@ fn cold(v: &Variant, constraints: i64, args: &Args) -> Result<Vec<Row>> {
 
         // Verification is outside the timed region but before the row is recorded: a
         // benchmark that times a broken prover is worse than no benchmark.
-        verify(&vk, &public_of(&witness, n_public)?, &proof).with_context(|| {
+        verify(&vk, &public, &proof).with_context(|| {
             format!(
                 "{} cold rep {rep}: our own verifier rejected the proof",
                 v.name
