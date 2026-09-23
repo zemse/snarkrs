@@ -4,13 +4,15 @@
 //!
 //! What this gives that the other two instruments do not:
 //!
-//!   * `StageTimings` reports five stage groups. It cannot separate the three iNTTs from
-//!     the three forward NTTs, because both are `ntt_us`.
+//!   * `StageTimings` reports five stage groups. It cannot say which of the three domain
+//!     vectors stages 1-3 spent their time on, because all three are `ntt_us`.
 //!   * A sampling profile reports which function the CPU is in. It cannot separate the
-//!     six transforms either, because they are the same code on the same shape of data.
+//!     three either, because they are the same code on the same shape of data.
 //!
 //! The annotations sit at region boundaries in `g16-core` only, so what they measure is
-//! the composition of the pipeline, which is exactly the thing `g16-core` owns.
+//! the composition of the pipeline, which is exactly the thing `g16-core` owns. That is
+//! also their floor: `intt_coset_ntt` fuses iNTT, coset shift and NTT per cache block, so
+//! stages 1-3 are one region per vector and the six transforms are not separable here.
 //!
 //! Read the report with two caveats. Regions inside `rayon::join` overlap, so the five
 //! MSM lines are concurrent windows and sum to more than the enclosing region. And the

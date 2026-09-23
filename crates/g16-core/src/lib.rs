@@ -29,10 +29,14 @@
 /// unchanged when the `hotpath` feature is off.
 ///
 /// `StageTimings` already reports the five stage groups, and a sampling profile already
-/// reports which functions the CPU is in. Neither can answer "of the six transforms in
-/// `compute_h`, which one", because all six are the same function on the same data and a
-/// sampler folds them into one line. That is what these annotations are for, and it is why
-/// they sit at region boundaries rather than on functions.
+/// reports which functions the CPU is in. Neither can answer "of the three domain vectors,
+/// which one", because all three go through the same function on the same shape of data
+/// and a sampler folds them into one line. That is what these annotations are for, and it
+/// is why they sit at region boundaries rather than on functions.
+///
+/// They cannot go finer than that. The three stage-1-3 regions separate the three vectors
+/// from each other and from stages 0 and 4; the six transforms cannot be split here at
+/// all, because `intt_coset_ntt` fuses them per cache block.
 ///
 /// Two things to keep in mind when reading the report they produce:
 ///
