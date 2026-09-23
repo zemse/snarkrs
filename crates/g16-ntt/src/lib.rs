@@ -452,7 +452,7 @@ fn chunk_len(n: usize, tasks: usize) -> usize {
 
 /// Moves element `i` to `bit_reverse(i)`, which is what turns the recursive even/odd split
 /// of decimation in time into a flat in-place loop.
-fn bit_reverse_permute(a: &mut [Fr], log_n: u32) {
+pub fn bit_reverse_permute(a: &mut [Fr], log_n: u32) {
     let n = a.len();
     // The loop bound comes from the slice and the shift from `log_n`, so a caller that
     // reaches here without `check_domain` having related the two gets a permutation on

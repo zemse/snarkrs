@@ -15,7 +15,7 @@ use ark_ec::{CurveGroup, VariableBaseMSM};
 use ark_std::{rand::Rng, test_rng, UniformRand};
 use g16_field::*;
 use g16_msm::{window_size, CpuMsm, MsmBackend};
-use g16_ntt::{CpuNtt, Direction, NttBackend, PARALLEL_THRESHOLD};
+use g16_ntt::{bit_reverse_permute, CpuNtt, Direction, NttBackend, PARALLEL_THRESHOLD};
 
 /// Best of `reps` runs, in milliseconds.
 fn best_ms(reps: usize, mut f: impl FnMut()) -> f64 {
@@ -261,25 +261,9 @@ fn composed_stage_split_at_2_20() {
     println!("  (gather and pointwise excluded: they need a real key)");
 }
 
-/// Exact replica of `g16_ntt`'s private `bit_reverse_permute`, so its cost can be
-/// separated from the butterfly passes. It is serial in the library, and at 2^20 it is a
-/// random-access pass over 32 MB of `Fr`.
-fn bit_reverse_permute_replica(a: &mut [Fr], log_n: u32) {
-    let n = a.len();
-    if n <= 2 {
-        return;
-    }
-    let shift = usize::BITS - log_n;
-    for i in 0..n {
-        let j = i.reverse_bits() >> shift;
-        if i < j {
-            a.swap(i, j);
-        }
-    }
-}
-
 /// How much of one NTT is the serial bit-reversal? This is the Amdahl ceiling on the
-/// whole transform.
+/// whole transform. The permutation is serial in the library, and at 2^20 it is a
+/// random-access pass over 32 MB of `Fr`.
 #[test]
 #[ignore = "probe"]
 fn bit_reversal_share_of_the_ntt() {
@@ -298,7 +282,7 @@ fn bit_reversal_share_of_the_ntt() {
         let domain = Domain::new(n).unwrap();
         let mut a = rand_scalars(n, &mut rng);
         let reps = if log >= 20 { 3 } else { 5 };
-        let br = best_ms(reps, || bit_reverse_permute_replica(&mut a, log));
+        let br = best_ms(reps, || bit_reverse_permute(&mut a, log));
         let full = best_ms(reps, || ntt.ntt(&domain, &mut a, Direction::Forward));
         println!(
             "{:>5} {:>12.2} {:>12.2} {:>9.1}%",
