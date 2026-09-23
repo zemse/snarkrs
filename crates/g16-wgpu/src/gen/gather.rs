@@ -151,16 +151,6 @@ pub fn gather_module_at(v: Variant, workgroup: u32) -> String {
     s
 }
 
-/// Just the entry point at [`WORKGROUP`], assuming the field prelude is already in scope.
-///
-/// Separate from [`gather_module`] so U7 can concatenate stage 0 and the NTT into one
-/// module over a single copy of the prelude if the compile cost ever argues for it. It does
-/// not today: `tests/gather.rs` reports the whole stage 0 module at 5.4 ms of module plus
-/// pipeline creation, against the 5 s bar `tests/device.rs` tracks.
-pub fn entry_point() -> String {
-    entry_point_at(WORKGROUP)
-}
-
 /// Just the entry point, at a chosen workgroup size.
 pub fn entry_point_at(workgroup: u32) -> String {
     // Against the Floor and not against the device: this adapter allows 1024 and the browser

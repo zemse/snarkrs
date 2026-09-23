@@ -239,19 +239,6 @@ impl Default for Workgroups {
     }
 }
 
-impl Workgroups {
-    /// Every size the same, for the sweep in `tests/msm_digits.rs`.
-    pub fn uniform(n: u32) -> Self {
-        Self {
-            zero: n,
-            mont: n,
-            count: n,
-            scan: n,
-            scatter: n,
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // How a scalar limb is selected
 // ---------------------------------------------------------------------------
