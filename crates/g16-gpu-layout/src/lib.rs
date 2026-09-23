@@ -1,18 +1,21 @@
 //! The packed layouts that cross the Rust/GPU boundary, defined once for every backend.
 //!
-//! # One definition, three languages
+//! # One definition, four languages
 //!
-//! Every `#[repr(C)]` type below has a byte-for-byte twin in each GPU backend's kernel
-//! source: `g16-metal/src/shaders/bn254_fr.metal` in MSL and
-//! `g16-gpu-kernels/src/kernels/bn254_fr.cuh` in CUDA C. Each kernel side carries a
-//! `static_assert` on `sizeof`, this side carries a `const` assertion on `size_of`, and
-//! each backend keeps a test that greps its own kernel source for the exact constant
-//! lines so the copies cannot drift silently. If you change a struct here you are
-//! changing a wire format shared by two GPUs; change all three in the same commit.
+//! Rust here, MSL in `g16-metal/src/shaders/bn254_fr.metal`, CUDA C in
+//! `g16-gpu-kernels/src/kernels/bn254_fr.cuh`, and the WGSL that `g16-wgpu/src/gen`
+//! emits. Every `#[repr(C)]` type below has a byte-for-byte twin on each of those sides.
+//! Metal and CUDA retype the constants as kernel text, so each kernel side carries a
+//! `static_assert` on `sizeof` and each of those two backends keeps a test that greps its
+//! own source for the exact constant lines; this side carries a `const` assertion on
+//! `size_of`. `g16-wgpu` reads the constants out of this crate at run time and generates
+//! its WGSL from them, so it has no copy that can drift, but it does depend on the struct
+//! strides and on the infinity sentinel. If you change a struct here you are changing a
+//! wire format three backends read; change the MSL and the CUDA header in the same commit.
 //!
-//! This crate exists so that Metal and CUDA cannot disagree about what a point is. The
-//! two backends run on different hardware with different compilers, and a benchmark that
-//! compares them is only meaningful if they are fed bit-identical inputs.
+//! This crate exists so that the three backends cannot disagree about what a point is.
+//! They run on different hardware with different compilers, and a benchmark that compares
+//! them is only meaningful if they are fed bit-identical inputs.
 //!
 //! # Why repacking is not optional
 //!
@@ -158,8 +161,9 @@ pub struct PackedFq2 {
 ///
 /// * The stride stays a power of two, 64 bytes, so a base vector is naturally aligned and
 ///   a thread's load of one point is two 32-byte segments rather than a straddle.
-/// * A freshly allocated Metal buffer is already zero-filled, so an accumulator array
-///   starts at infinity with no memset kernel and no host staging buffer.
+/// * A freshly allocated device buffer is zero-filled on all three backends, so an
+///   accumulator array starts at infinity with no memset kernel and no host staging
+///   buffer.
 /// * The test is `x | y == 0` over 16 words, which is branch-free.
 ///
 /// This matters in practice and is not a theoretical case: snarkjs zkeys really do
@@ -245,9 +249,9 @@ impl PackedFr {
         xs.iter().map(Self::from_fr).collect()
     }
 
-    /// Packs directly into caller memory, which on this platform is meant to be the
-    /// pointer from `MTLBuffer::contents()`. Unified memory means there is no second copy
-    /// after this, so this is the whole upload.
+    /// Packs directly into caller memory. On Metal that pointer is `MTLBuffer::contents()`
+    /// and unified memory makes this the whole upload; on CUDA and WebGPU a transfer still
+    /// follows.
     ///
     /// Panics if the destination is not exactly as long as the source, because a short
     /// destination would leave the tail of a device buffer holding whatever was there
@@ -287,6 +291,9 @@ impl PackedScalar {
         xs.iter().map(Self::from_fr).collect()
     }
 
+    /// Panics if the destination is not exactly as long as the source, because a short
+    /// destination would leave the tail of a device buffer holding whatever was there
+    /// before, and a proof built on it would fail verification with no other symptom.
     pub fn pack_into(xs: &[Fr], out: &mut [Self]) {
         assert_eq!(xs.len(), out.len(), "packed destination length mismatch");
         for (dst, src) in out.iter_mut().zip(xs) {
@@ -340,7 +347,7 @@ impl PackedFq2 {
 }
 
 impl PackedG1Affine {
-    /// The point at infinity, and also what a zeroed Metal buffer already contains.
+    /// The point at infinity, and also what a zeroed device buffer already contains.
     pub const INFINITY: Self = Self {
         x: PackedFq::ZERO,
         y: PackedFq::ZERO,
@@ -382,6 +389,9 @@ impl PackedG1Affine {
         ps.iter().map(Self::from_affine).collect()
     }
 
+    /// Panics if the destination is not exactly as long as the source, because a short
+    /// destination would leave the tail of a device buffer holding whatever was there
+    /// before, and a proof built on it would fail verification with no other symptom.
     pub fn pack_into(ps: &[G1Affine], out: &mut [Self]) {
         assert_eq!(ps.len(), out.len(), "packed destination length mismatch");
         for (dst, src) in out.iter_mut().zip(ps) {
@@ -426,6 +436,9 @@ impl PackedG2Affine {
         ps.iter().map(Self::from_affine).collect()
     }
 
+    /// Panics if the destination is not exactly as long as the source, because a short
+    /// destination would leave the tail of a device buffer holding whatever was there
+    /// before, and a proof built on it would fail verification with no other symptom.
     pub fn pack_into(ps: &[G2Affine], out: &mut [Self]) {
         assert_eq!(ps.len(), out.len(), "packed destination length mismatch");
         for (dst, src) in out.iter_mut().zip(ps) {
@@ -455,7 +468,7 @@ unsafe impl Packed for PackedG2Affine {}
 // indices).
 unsafe impl Packed for u32 {}
 
-/// Byte view of a packed slice, for `MTLDevice::newBuffer*`.
+/// Byte view of a packed slice, for a device upload.
 pub fn as_bytes<T: Packed>(items: &[T]) -> &[u8] {
     // SAFETY: `Packed` promises no padding and no invalid bit patterns, so every byte of
     // the slice is initialised and readable. The result borrows `items`, so the lifetime

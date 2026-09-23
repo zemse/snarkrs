@@ -1,7 +1,7 @@
 //! The Metal end of the packed layouts that cross the Rust/GPU boundary.
 //!
 //! The types themselves are [`g16_gpu_layout`]'s and are re-exported here rather than
-//! declared again, because the CUDA backend reads the identical bytes: two Rust
+//! declared again, because the CUDA and WebGPU backends read the identical bytes: two Rust
 //! definitions that merely happen to agree would let a fix to one of them silently
 //! invalidate the Metal-vs-CUDA comparison this project exists to make. What stays here
 //! is the part that is Metal's: the import path this crate's drivers use, and the drift
@@ -16,8 +16,8 @@
 //! `static_assert` on each `sizeof`, `g16-gpu-layout` carries a `const` assertion on each
 //! `size_of`, and [`tests::msl_declares_the_same_constants`] greps the shader source for
 //! the exact constant lines so the two cannot drift silently. If you change a struct in
-//! `g16-gpu-layout` you are changing a wire format two GPUs read; go change this shader
-//! and the CUDA header in the same commit.
+//! `g16-gpu-layout` you are changing a wire format three backends read; go change this
+//! shader and the CUDA header in the same commit.
 
 pub use g16_gpu_layout::{
     as_bytes, as_bytes_mut, Packed, PackedFq, PackedFq2, PackedFr, PackedG1Affine, PackedG2Affine,
