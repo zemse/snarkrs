@@ -395,7 +395,16 @@ struct BatchFill<P: RawCurve> {
     side: Option<Vec<Xyzz<P::RF>>>,
     dens: Vec<P::RF>,
     prefix: Vec<P::RF>,
-    ops: Vec<u8>,
+    ops: Vec<Op>,
+}
+
+/// What one pending entry turned out to be, decided before the shared inversion and
+/// replayed after it.
+#[derive(Clone, Copy)]
+enum Op {
+    Add,
+    Dbl,
+    Cancel,
 }
 
 impl<P: RawCurve> BatchFill<P> {
@@ -471,9 +480,6 @@ impl<P: RawCurve> BatchFill<P> {
     /// and the doubling denominator `2y` is nonzero because the odd-order BN254 groups
     /// have no 2-torsion.
     fn flush(&mut self) {
-        const ADD: u8 = 0;
-        const DBL: u8 = 1;
-        const CANCEL: u8 = 2;
         if self.pending.is_empty() {
             return;
         }
@@ -485,12 +491,12 @@ impl<P: RawCurve> BatchFill<P> {
             let b = b as usize;
             let dx = px.sub(self.bx[b]);
             let (op, den) = if !dx.is_zero() {
-                (ADD, dx)
+                (Op::Add, dx)
             } else if py == self.by[b] {
-                (DBL, self.by[b].double())
+                (Op::Dbl, self.by[b].double())
             } else {
                 // Same x, different y: the negative. The bucket empties.
-                (CANCEL, P::RF::ONE)
+                (Op::Cancel, P::RF::ONE)
             };
             self.ops.push(op);
             self.dens.push(den);
@@ -504,20 +510,20 @@ impl<P: RawCurve> BatchFill<P> {
             let d_inv = inv.mul(self.prefix[i]);
             inv = inv.mul(self.dens[i]);
             match self.ops[i] {
-                ADD => {
+                Op::Add => {
                     let lambda = py.sub(self.by[b]).mul(d_inv);
                     let x3 = lambda.sqr().sub(self.bx[b]).sub(px);
                     self.by[b] = lambda.mul(self.bx[b].sub(x3)).sub(self.by[b]);
                     self.bx[b] = x3;
                 }
-                DBL => {
+                Op::Dbl => {
                     let xx = self.bx[b].sqr();
                     let lambda = xx.double().add(xx).mul(d_inv);
                     let x3 = lambda.sqr().sub(self.bx[b].double());
                     self.by[b] = lambda.mul(self.bx[b].sub(x3)).sub(self.by[b]);
                     self.bx[b] = x3;
                 }
-                _ => self.occupied[b] = false,
+                Op::Cancel => self.occupied[b] = false,
             }
             self.busy[b] = false;
         }
