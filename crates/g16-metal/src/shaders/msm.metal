@@ -25,12 +25,18 @@
 //    a sort because the keys are already dense small integers: count how many points
 //    land in every bucket (32-bit `atomic_fetch_add`, on plain counters, never on a
 //    field element), prefix-sum the counts into row offsets, scatter each point index
-//    into its bucket's run (again a 32-bit `atomic_fetch_add`, this time on a cursor),
-//    and then give one thread exclusive ownership of one bucket. That is a counting
-//    sort by bucket index, O(n) rather than O(n log n), and after the scatter every
-//    bucket is written by exactly one thread, so the accumulation needs no
-//    synchronisation of any kind. Order within a bucket is not preserved, which does not
-//    matter because bucket accumulation is commutative.
+//    into its bucket's run (again a 32-bit `atomic_fetch_add`, this time on a cursor).
+//    That is a counting sort by bucket index, O(n) rather than O(n log n). Order within
+//    a bucket is not preserved, which does not matter because bucket accumulation is
+//    commutative.
+//
+//    What accumulates over that layout is `msm_segmented_*`, where a thread owns a
+//    fixed-length slice of the entry array rather than a bucket, so per-thread work is
+//    uniform whatever the digit distribution does. A run that touches neither end of its
+//    slice cannot continue into another, so it is written straight to its bucket with no
+//    synchronisation; a run at either end goes to one of the slice's two spill slots and
+//    `msm_merge_*` folds it in. One thread per bucket is `msm_accumulate_*`, kept behind
+//    `G16_METAL_MSM_LEGACY_ACC=1` as the baseline the imbalance is measured against.
 //
 // 2. THE SCALARS 0 AND 1 NEVER REACH A BUCKET.
 //    Four of the five MSMs take the witness as scalars, and in a bit-heavy circuit over
@@ -65,13 +71,17 @@
 //    that it loses.
 //
 //    Identity is ZZ == 0, which is what a freshly allocated Metal buffer already
-//    contains, so a bucket array needs no memset kernel.
+//    contains. Bucket arrays are pooled rather than freshly allocated, so
+//    `msm_clear_*` zeroes ZZ across the array before every segmented accumulation.
 //
 // 4. THE WINDOW REDUCTION ENDS ON THE HOST.
-//    `msm_reduce_*` collapses each window's 2^(c-1) buckets to a single point through a
-//    per-thread segment plus a threadgroup tree, so the host reads back `n_windows`
-//    points per MSM and does only the Horner combination. The serial tail stays where
-//    serial tails belong.
+//    `msm_reduce_g2` collapses each window's 2^(c-1) buckets through a per-thread
+//    segment plus a threadgroup tree, one partial per threadgroup. `msm_reduce_g1` takes
+//    the scan form and writes a (C, Q) pair per simdgroup, so the host reads back
+//    `n_windows * reduce_groups * simdgroups * 2` points and runs `ReduceLayout::fold`
+//    over them before the Horner combination. The ones partials, and on a `host_tail`
+//    plan the spill slots, are folded in there too. The serial tail stays where serial
+//    tails belong.
 
 #ifndef G16_MSM_METAL
 #define G16_MSM_METAL
@@ -749,9 +759,11 @@ inline bool sc_is_one(thread const uint* v) {
 struct MsmParams {
     uint n;           // scalars in this MSM
     uint c;           // window width in bits
-    uint n_windows;   // ceil(255 / c)
+    uint n_windows;   // ceil(recode_bits / c); recode_bits is the range's own width,
+                      // not always 255 (see `window_size_for` in msm.rs)
     uint n_buckets;   // 2^(c-1)
-    uint cap;         // entries reserved per window, == the general-scalar count
+    uint cap;         // entries reserved per window: the general-scalar count, or n when
+                      // the scalars were never classified
     uint scalar_off;  // element offset into the scalar buffer
     uint base_off;    // element offset into the base buffer
     uint ones_groups; // threadgroups in msm_ones_*
@@ -1315,7 +1327,9 @@ inline Xyzz<F> pt_shuffle_down(Xyzz<F> p, uint delta) {
 // flat in n: pure latency, not work. Each window is therefore split across
 // `reduce_groups` threadgroups, each owning a contiguous chunk of its buckets and
 // writing one partial to `window_sums[w * reduce_groups + g]`; the host adds the
-// partials per window before its Horner combination, a few dozen cheap additions.
+// partials per window before its Horner combination, a few dozen cheap additions. That
+// is G2's layout: G1 goes through `msm_reduce_scan_impl` below, which writes a pair per
+// simdgroup instead.
 //
 // REDUCE_TG is the threadgroup array size. 64 rather than 128 is a deliberate occupancy
 // choice: at 64 the G2 array is 64 * 256 = 16 KB, half of this device's 32 KB
