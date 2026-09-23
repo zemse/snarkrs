@@ -15,8 +15,11 @@
 //! costs 2 to 3 us. That is a factor of about 60. Both Metal MSM implementations we read
 //! submit one command buffer per stage, four or more per MSM; at this prover's domain
 //! sizes that alone would cost more than the arithmetic. [`MetalMsm::msm_batch`]
-//! therefore encodes all five MSMs, 37 dispatches, into ONE command buffer with ONE
-//! `wait_until_completed`, and reads back a few hundred points at the end.
+//! therefore encodes every job it is handed into ONE command buffer with ONE
+//! `wait_until_completed`, and reads back a few hundred points at the end. The proving
+//! path hands it all five MSMs below a 2^17 domain; at and above it `MetalCircuit`
+//! splits them into two batches so the witness four can run while `compute_h` is still
+//! on the other queue (see `backend::overlap_pays`).
 //!
 //! # What is on the GPU and what is not
 //!
@@ -1040,9 +1043,11 @@ impl MetalMsm {
     ///
     /// Jobs that share a scalar buffer, offset and length share their digit pipeline:
     /// the A, B-in-G2 and B-in-G1 MSMs all run over the whole witness, so the counting
-    /// sort runs once for the three of them and only the point stages are repeated. That
-    /// removes six of the fifteen digit dispatches and, more to the point, two thirds of
-    /// the scatter's memory traffic.
+    /// sort runs once for the three of them and only the point stages are repeated. A
+    /// plan costs four dispatches (`zero`, `count`, `scan`, `scatter`), so collapsing the
+    /// five proving jobs to three plans removes eight of the twenty and, more to the
+    /// point, two thirds of the scatter's memory traffic. A bucket array past
+    /// [`SCATTER_SPLIT_ROWS`] splits the scatter in two, which scales both counts.
     pub fn msm_batch<'a>(&self, jobs: &[Job<'a>]) -> Result<Vec<MsmResult>, ProveError> {
         if jobs.is_empty() {
             return Ok(Vec::new());
@@ -2703,12 +2708,14 @@ mod tests {
         }
     }
 
-    /// Per-MSM wall clock plus the bucket-occupancy histogram that explains it.
+    /// Per-MSM wall clock plus the bucket-occupancy histogram behind the kernel choice.
     ///
-    /// One thread owns one bucket, so the accumulate dispatch finishes when the fattest
-    /// bucket does. This test prints that number next to the average, because a ratio
-    /// far from 1 is the difference between a dispatch that uses the machine and one
-    /// that is a single serial loop with a quarter of a million idle threads beside it.
+    /// The shipped accumulation hands every thread a fixed-length slice of the sorted
+    /// entries, so per-thread work is uniform whatever the histogram says, and the spill
+    /// slots plus `msm_merge_*` exist to stitch back together the runs a fat bucket
+    /// spreads over several slices. The max-to-average ratio printed here is what that
+    /// machinery is paid for: `G16_METAL_MSM_LEGACY_ACC=1` gives one thread one bucket
+    /// instead, and then the dispatch finishes when the fattest bucket does.
     #[test]
     #[ignore = "measurement, not a check"]
     fn measure_per_msm() {

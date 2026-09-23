@@ -19,12 +19,14 @@
 //! hundred times less. 128 trivial dispatches took 0.29 ms batched into one command
 //! buffer against 14.6 ms as 128 separate commit/wait pairs.
 //!
-//! So the whole of stages 0 to 4 is one command buffer. At the 2^18 domain of the largest
-//! artifact that is fourteen dispatches: one gather, then two per transform for six
-//! transforms, with stage 4 fused into the last one. The reference Metal implementations
-//! do the opposite (zkonduit commits and blocks four times per MSM, zkmopro uses one
-//! command buffer per dispatch) and at our domain sizes that alone would decide the
-//! result before any arithmetic ran.
+//! So stages 0 to 4 are encoded as few command buffers as the display will tolerate:
+//! four, one for the gather and one per domain vector, committed back to back and waited
+//! on once. See the note in [`HResident::compute_h`] for why it is four and not one. At
+//! the 2^18 domain of the largest artifact that is thirteen dispatches: one gather, then
+//! two per transform for six transforms, with stage 4 fused into the last one. The
+//! reference Metal implementations do the opposite (zkonduit commits and blocks four
+//! times per MSM, zkmopro uses one command buffer per dispatch) and at our domain sizes
+//! that alone would decide the result before any arithmetic ran.
 //!
 //! # Where the host still does work per proof
 //!
