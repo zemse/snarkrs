@@ -3,20 +3,18 @@
 //! ark's generic Rust CIOS. This probe cross-checks two local reimplementations against
 //! ark-ff on a couple hundred thousand operands and then times three regimes.
 //!
+//! Answered: no meaningful headroom in the multiply itself. The win found later was the
+//! reduction, not the product (see `g16_field::raw`), and both local arms below keep
+//! ark's *branching* conditional subtraction on purpose, so these timings do not bound
+//! what `raw.rs` buys.
+//!
 //! Run with `cargo test --release -p g16-field --test aarch64_probe -- --nocapture`.
 #![cfg(target_arch = "aarch64")]
 
+use g16_field::raw::{FR_MOD, FR_N0};
 use g16_field::{Fr, UniformRand};
 use std::hint::black_box;
 use std::time::Instant;
-
-const N: [u64; 4] = [
-    0x43e1f593f0000001,
-    0x2833e84879b97091,
-    0xb85045b68181585d,
-    0x30644e72e131a029,
-];
-const N0: u64 = 0xc2e1f593efffffff; // -r^{-1} mod 2^64
 
 #[inline(always)]
 fn limbs(x: &Fr) -> [u64; 4] {
@@ -29,10 +27,10 @@ fn from_limbs(l: [u64; 4]) -> Fr {
 
 #[inline(always)]
 fn cond_sub(t: [u64; 4]) -> [u64; 4] {
-    let (r0, br) = t[0].overflowing_sub(N[0]);
-    let (r1, br) = borrowing_sub(t[1], N[1], br);
-    let (r2, br) = borrowing_sub(t[2], N[2], br);
-    let (r3, br) = borrowing_sub(t[3], N[3], br);
+    let (r0, br) = t[0].overflowing_sub(FR_MOD[0]);
+    let (r1, br) = borrowing_sub(t[1], FR_MOD[1], br);
+    let (r2, br) = borrowing_sub(t[2], FR_MOD[2], br);
+    let (r3, br) = borrowing_sub(t[3], FR_MOD[3], br);
     if br {
         t
     } else {
@@ -56,13 +54,13 @@ fn mont_mul_u128(a: [u64; 4], b: [u64; 4]) -> [u64; 4] {
         let mut aa = t[0] as u128 + a[0] as u128 * bi;
         let t0 = aa as u64;
         aa >>= 64;
-        let m = t0.wrapping_mul(N0);
-        let mut c = (t0 as u128 + (m as u128) * (N[0] as u128)) >> 64;
+        let m = t0.wrapping_mul(FR_N0);
+        let mut c = (t0 as u128 + (m as u128) * (FR_MOD[0] as u128)) >> 64;
         for j in 1..4 {
             aa = t[j] as u128 + a[j] as u128 * bi + aa;
             let tj = aa as u64;
             aa >>= 64;
-            c = tj as u128 + (m as u128) * (N[j] as u128) + c;
+            c = tj as u128 + (m as u128) * (FR_MOD[j] as u128) + c;
             t[j - 1] = c as u64;
             c >>= 64;
         }
@@ -137,9 +135,9 @@ fn mont_mul_asm(a: [u64; 4], b: [u64; 4]) -> [u64; 4] {
                 t2 = inout(reg) t2, t3 = inout(reg) t3,
                 a0 = in(reg) a[0], a1 = in(reg) a[1],
                 a2 = in(reg) a[2], a3 = in(reg) a[3],
-                bi = in(reg) bi, n0 = in(reg) N0,
-                q0 = in(reg) N[0], q1 = in(reg) N[1],
-                q2 = in(reg) N[2], q3 = in(reg) N[3],
+                bi = in(reg) bi, n0 = in(reg) FR_N0,
+                q0 = in(reg) FR_MOD[0], q1 = in(reg) FR_MOD[1],
+                q2 = in(reg) FR_MOD[2], q3 = in(reg) FR_MOD[3],
                 l0 = out(reg) _, l1 = out(reg) _, l2 = out(reg) _, l3 = out(reg) _,
                 h0 = out(reg) _, h1 = out(reg) _, h2 = out(reg) _, h3 = out(reg) _,
                 m = out(reg) _, a4 = out(reg) _,
