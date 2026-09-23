@@ -71,14 +71,14 @@ fn main() {
     let out = args
         .next()
         .unwrap_or_else(|| "bench/results/profiling/dhat-heap.json".to_string());
+    // The output directory is made before the profiler starts, so its own setup is not in
+    // the numbers.
     if let Some(parent) = std::path::Path::new(&out).parent() {
         std::fs::create_dir_all(parent).ok();
     }
 
-    // Built before the profiler so the profiler's own setup is not in the numbers, and
-    // dropped at the end of main so the JSON is written even though the release profile
-    // uses `panic = "abort"` (nothing here is expected to unwind, but a panic would lose
-    // the file, which is worth knowing rather than being surprised by).
+    // The guard writes the JSON when it drops at the end of `main`. The release profile is
+    // `panic = "abort"`, so a panic loses the file rather than flushing it.
     let _profiler = dhat::Profiler::builder().file_name(&out).build();
 
     let start = Snap::now();

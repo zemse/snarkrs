@@ -98,12 +98,12 @@ cargo build --release --features cuda      # + NVIDIA CUDA
 ```sh
 g16 prove  --zkey circuit.zkey --witness circuit.wtns \
            --proof proof.json --public public.json \
-           [--backend cpu|metal|cuda] [--stage-timings] [--self-verify true|false]
+           [--backend cpu|wgpu|metal|cuda] [--stage-timings] [--self-verify true|false]
 
 g16 verify --vkey verification_key.json --proof proof.json --public public.json
 
 g16 bench  --artifacts <DIR> [--variant NAME]... [--reps N] \
-           [--backend cpu|metal|cuda] [--mode cold|warm|both] [--csv FILE]
+           [--backend cpu|wgpu|metal|cuda] [--mode cold|warm|both] [--csv FILE]
 ```
 
 The output is what snarkjs expects, so the two are interchangeable in either direction:

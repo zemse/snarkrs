@@ -2,6 +2,7 @@
 //!
 //!   g16 prove  --zkey c.zkey --witness c.wtns --proof p.json --public pub.json
 //!              [--backend cpu|wgpu|metal|cuda] [--stage-timings]
+//!              [--self-verify true|false]
 //!   g16 verify --vkey vkey.json --proof p.json --public pub.json
 //!   g16 trace  --zkey c.zkey --witness c.wtns [--backend cpu|wgpu|...] [--out t.txt]
 //!   g16 bench  --artifacts DIR [--variant NAME]... [--reps 15] [--backend cpu|wgpu|...]
@@ -19,6 +20,7 @@
 //!   g16 ptau prepare    --ptau p_final.ptau --out prepared.ptau
 //!                       [--backend cpu|metal|cuda]
 //!   g16 ptau verify     --ptau p.ptau
+//!   g16 ptau fft-bench  --power N [--variants NAME,...] [--block-size N,...]   (cuda only)
 //!
 //!   g16 zkey contribute               --zkey c_0000.zkey --out c_0001.zkey
 //!                                     --entropy STRING [--name S] [--backend cpu|metal]
