@@ -681,7 +681,217 @@ fn every_barrier_sits_in_uniform_control_flow() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. The uniform parameter structs, which nothing on either side validates
+// 4. The inlined point-operation budget, which three workarounds rest on and
+//    nothing else checks
+// ---------------------------------------------------------------------------
+
+/// `maxima` the reduce bisection in `gen::points::entry_reduce` measured on an iPhone 15 Pro:
+/// two inlined G2 point-operation call sites in one entry point are bit-exact, three return
+/// every window as the identity, four or more corrupt the windows, and one of the four-site
+/// spellings loses the device outright.
+const MAX_SITES_PER_ENTRY: usize = 2;
+/// What the merge bisection in `gen::points::entry_merge` measured on the same phone: the
+/// threshold sits between one and two inlined `pt_add` over a 256-byte struct loaded from
+/// storage inside a dynamically bounded loop. One survives, two lose the device every time,
+/// with no error, no crash and nothing in the system log.
+const MAX_SITES_PER_LOOP: usize = 1;
+
+/// Every `name(` in `body`, as the byte offset of the name and the name.
+///
+/// The generated source is ASCII, so byte offsets and character offsets agree and the
+/// brace walk below can consume these in order.
+fn call_sites(body: &str) -> Vec<(usize, String)> {
+    let b = body.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        if !(b[i].is_ascii_alphabetic() || b[i] == b'_') {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+            i += 1;
+        }
+        let mut j = i;
+        while j < b.len() && b[j] == b' ' {
+            j += 1;
+        }
+        if j < b.len() && b[j] == b'(' {
+            out.push((start, body[start..i].to_string()));
+        }
+    }
+    out
+}
+
+/// How many point-operation call sites a call to `name` inlines: one for a point operation
+/// itself, and for anything else the sum over its own body.
+///
+/// Counted through the call graph rather than by grepping an entry point, so moving a second
+/// `pt_add` into a helper and calling that instead does not hide it from this test.
+fn inlined_sites(
+    m: &Module,
+    name: &str,
+    ops: &[String],
+    memo: &mut std::collections::HashMap<String, usize>,
+) -> usize {
+    if ops.iter().any(|o| o == name) {
+        return 1;
+    }
+    if let Some(&n) = memo.get(name) {
+        return n;
+    }
+    let Some(f) = m.fns.iter().find(|f| f.name == name) else {
+        return 0;
+    };
+    // WGSL forbids recursion, so this is only here to keep a malformed module from hanging
+    // the test rather than failing it.
+    memo.insert(name.to_string(), 0);
+    let mut total = 0usize;
+    for (_, callee) in call_sites(&f.body) {
+        if callee != name {
+            total += inlined_sites(m, &callee, ops, memo);
+        }
+    }
+    memo.insert(name.to_string(), total);
+    total
+}
+
+/// The most point-operation call sites any one loop in `body` encloses, counting a call to a
+/// helper as everything that helper inlines.
+fn worst_loop(body: &str, weight: &dyn Fn(&str) -> usize) -> usize {
+    let sites = call_sites(body);
+    let b = body.as_bytes();
+    // Per open block: whether it is a loop, and the sites seen inside it so far. A site adds
+    // to every enclosing entry at once, so a site nested in an `if` still counts against the
+    // loop around it.
+    let mut stack: Vec<(bool, usize)> = vec![(false, 0)];
+    let mut worst = 0usize;
+    let mut stmt = 0usize;
+    let mut paren = 0usize;
+    let mut next = 0usize;
+    for i in 0..b.len() {
+        while next < sites.len() && sites[next].0 == i {
+            let w = weight(&sites[next].1);
+            for e in stack.iter_mut() {
+                e.1 += w;
+            }
+            next += 1;
+        }
+        match b[i] {
+            b'(' => paren += 1,
+            b')' => paren = paren.saturating_sub(1),
+            b'{' => {
+                let head = body[stmt..i].trim();
+                let is_loop = head.starts_with("for")
+                    || head.starts_with("while")
+                    || head.starts_with("loop");
+                stack.push((is_loop, 0));
+                stmt = i + 1;
+            }
+            b'}' => {
+                if let Some((is_loop, w)) = stack.pop() {
+                    if is_loop {
+                        worst = worst.max(w);
+                    }
+                }
+                stmt = i + 1;
+            }
+            // A `for` head carries two semicolons inside its parentheses, as in
+            // [`barrier_contexts`].
+            b';' if paren == 0 => stmt = i + 1,
+            _ => {}
+        }
+    }
+    worst
+}
+
+/// `MERGE_BODY`, `REDUCE_BODY` and `MUL_SMALL_BODY` all exist because of one textual property
+/// of the generated WGSL: how many times a point operation over a 128 or 256 byte struct is
+/// inlined into one entry point, and whether a second one sits inside a dynamically bounded
+/// loop. Three device-loss workarounds rest on that count and nothing else checks it.
+///
+/// # Why a text check and not a device test
+///
+/// Because the device this runs on cannot fail. Every one of the bisections behind the two
+/// constants above was run by holding an iPhone 15 Pro (iOS 26.6, Safari 26.6) to a laptop;
+/// on an M2 Max the same shaders are correct at every count tried. The compile-time half is
+/// the same story elsewhere: `gen::points::POINT_BODY` records a Mali-G715 going 259 ms at
+/// one inlined `fq_mul` copy to 18979 ms at sixteen, then losing the device, against an M4
+/// through ANGLE Metal flat at about 200 ms from 1 copy to 28. So re-inlining a second
+/// `pt_add_g2` into the merge loop passes every test in this repo and loses a phone's device
+/// in the field, exactly as the array-constructor guard above shipped a proof snarkjs
+/// rejected.
+///
+/// The budget this asserts is today's output, derived here rather than retyped from the
+/// comments: `msm_merge_*` two sites (one in the loop nest, one after), `msm_reduce_*` two
+/// (one in the state machine, one in the barrier tree), `msm_ones_*` two (the same shape),
+/// `msm_segmented_*` one, `msm_clear_*` none. Both limits are at the recorded boundary, so
+/// this is a ratchet: if a change needs more, the phone is what says whether it may have it.
+#[test]
+fn no_entry_point_inlines_more_point_operations_than_the_device_survives() {
+    let v = Variant::default();
+    let mut checked = 0usize;
+    for c in pointsgen::CURVES {
+        let mut tgs = vec![c.wg.tg, c.max_tg()];
+        tgs.dedup();
+        for tg in tgs {
+            let label = format!("points {} tg={tg}", c.suffix);
+            let m = parse(&label, &pointsgen::points_module_at(v, c, c.with_tg(tg)));
+            let ops = [
+                format!("pt_add_{}", c.suffix),
+                format!("pt_madd_{}", c.suffix),
+            ];
+            let mut memo = std::collections::HashMap::new();
+            for f in &m.fns {
+                inlined_sites(&m, &f.name, &ops, &mut memo);
+            }
+            let weight = |n: &str| {
+                if ops.iter().any(|o| o == n) {
+                    1
+                } else {
+                    memo.get(n).copied().unwrap_or(0)
+                }
+            };
+            for e in m.entry_points() {
+                let total = weight(&e.name);
+                assert!(
+                    total <= MAX_SITES_PER_ENTRY,
+                    "{label}: {} inlines {total} point-operation call sites, over the {} the \
+                     reduce bisection measured. Three return every window as the identity on \
+                     an iPhone 15 Pro. Fold them onto one site the way gen::points does, or \
+                     re-run the bisection on the phone and move this constant with it.",
+                    e.name,
+                    MAX_SITES_PER_ENTRY
+                );
+                for f in m.reachable(&e.name) {
+                    let worst = worst_loop(&f.body, &weight);
+                    assert!(
+                        worst <= MAX_SITES_PER_LOOP,
+                        "{label}: {} reaches {}, which has a loop enclosing {worst} \
+                         point-operation call sites, over the {}. That is the shape that \
+                         loses an iPhone 15 Pro's device every time; see \
+                         gen::points::MERGE_BODY level 5, which keeps it reachable on \
+                         purpose.",
+                        e.name,
+                        f.name,
+                        MAX_SITES_PER_LOOP
+                    );
+                }
+                checked += 1;
+            }
+        }
+    }
+    assert!(
+        checked >= 10,
+        "only {checked} entry points checked; both curves emit five each at two widths, so \
+         the reader is not seeing them"
+    );
+    println!("{checked} entry points within the inlined point-operation budget");
+}
+
+// ---------------------------------------------------------------------------
+// 5. The uniform parameter structs, which nothing on either side validates
 // ---------------------------------------------------------------------------
 
 /// `struct NAME { a: u32, b: u32, ... }` -> the field names in declaration order.
@@ -814,7 +1024,7 @@ fn every_uniform_parameter_struct_matches_its_host_mirror() {
 }
 
 // ---------------------------------------------------------------------------
-// 5. The recoding width, which three crates retype
+// 6. The recoding width, which three crates retype
 // ---------------------------------------------------------------------------
 
 /// `crate::msm::RECODE_BITS` must match `g16_msm::RECODE_BITS` and
