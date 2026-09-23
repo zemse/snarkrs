@@ -61,8 +61,8 @@ pub struct Args {
 
 pub const CSV_HEADER: &str = "host,os,arch,cores,variant,constraints,prover,backend,mode,rep,ms,prepare_ms,gather_us,ntt_us,pointwise_us,msm_us,assemble_us,verified";
 
-/// One proof: what it cost and whether it was accepted. `prepare_ms` is setup only, and
-/// for a cold rep it is the part of `ms` spent before `prove()` was entered.
+/// One proof and what it cost. `prepare_ms` is setup only, and for a cold rep it is the
+/// part of `ms` spent before `prove()` was entered.
 pub struct Row {
     pub variant: String,
     pub constraints: i64,
@@ -72,14 +72,16 @@ pub struct Row {
     pub ms: f64,
     pub prepare_ms: f64,
     pub timings: StageTimings,
-    pub verified: bool,
 }
 
 impl Row {
+    /// The `verified` column is always `yes`: a rep whose proof the verifier rejects
+    /// leaves through `?` and is never recorded, and `bench/scripts/bench_external.py`
+    /// refuses the same way. The column is schema parity with that writer.
     fn to_csv(&self, host: &HostInfo) -> String {
         let t = self.timings;
         format!(
-            "{},{},{},{},{},{},ours,{},{},{},{:.3},{:.3},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},ours,{},{},{},{:.3},{:.3},{},{},{},{},{},yes",
             host.host,
             host.os,
             host.arch,
@@ -96,7 +98,6 @@ impl Row {
             t.pointwise_us,
             t.msm_us,
             t.assemble_us,
-            if self.verified { "yes" } else { "no" },
         )
     }
 }
@@ -197,7 +198,6 @@ fn cold(v: &Variant, constraints: i64, args: &Args) -> Result<Vec<Row>> {
             ms: total_ms,
             prepare_ms,
             timings: t,
-            verified: true,
         });
         // Explicit, because the whole meaning of "cold" is that nothing survives a rep.
         drop(circuit);
@@ -244,7 +244,6 @@ fn warm(v: &Variant, constraints: i64, args: &Args) -> Result<Vec<Row>> {
             ms: prove_ms,
             prepare_ms,
             timings: t,
-            verified: true,
         });
     }
     Ok(rows)
@@ -333,7 +332,6 @@ mod tests {
                 msm_us: 4,
                 assemble_us: 5,
             },
-            verified: true,
         };
         let line = row.to_csv(&host);
         assert_eq!(
