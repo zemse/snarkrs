@@ -1,21 +1,18 @@
-//! What the six transforms in `compute_h` are made of, and what the bit-reversal costs.
+//! What the six transforms in `compute_h` are made of, and what the permutation costs.
 //!
-//! The standing review claims the radix-2 NTT "pays six full bit-reversal passes per
-//! proof" and rates the fix a medium win with a plausible 1.2x-1.8x NTT-only gain. Two
-//! numbers turn that from a guess into a decision, and neither needs `g16-ntt` to change:
+//! The question this was built to answer is settled: the review claimed the radix-2 NTT
+//! "pays six full bit-reversal passes per proof", and the prover pays none. Stages 1-3
+//! run through `intt_coset_ntt`, which is DIF in and DIT out with both permutations
+//! cancelled, so the permutation survives only in the `NttBackend::ntt` entry point and
+//! once per key inside the coset table. What is left to measure is the fused pipeline
+//! against the three-call composition it replaced, and what fraction of the proof the
+//! transforms are at all, which caps any NTT prize.
 //!
-//!   1. What fraction of a transform the permutation actually is. `bit_reverse_permute`
-//!      is a self-contained pass over the array, so the identical loop is reproduced here
-//!      and timed on its own. It is reproduced rather than called because it is private,
-//!      and a test asserts the reproduction permutes identically, so this cannot silently
-//!      drift from the code it stands in for.
-//!   2. What fraction of the proof the transforms are at all, which caps the prize
-//!      whatever the NTT gain turns out to be.
-//!
-//! One structural point the timings make on their own: `bit_reverse_permute` is a plain
-//! serial `for` loop inside a transform whose butterfly passes are all parallel. On a
-//! 12-core machine its share of *wall clock* is therefore about twelve times its share of
-//! CPU, which is not what a CPU profile shows and is exactly what Amdahl charges for.
+//! The permutation is still timed on its own, because it is what that entry point spends
+//! over the fused path: a plain serial `for` loop inside a transform whose butterfly
+//! passes are all parallel. On a 12-core machine its share of *wall clock* is therefore
+//! about twelve times its share of CPU, which is not what a CPU profile shows and is
+//! exactly what Amdahl charges for.
 //!
 //! `cargo run --release -p g16-core --example ntt_shape -- [LOG_N]`
 
@@ -23,23 +20,7 @@ use std::time::Instant;
 
 use g16_field::{CurveGroup, Domain, Fr, G1Projective, UniformRand};
 use g16_msm::{CpuMsm, MsmBackend};
-use g16_ntt::{CpuNtt, Direction, NttBackend};
-
-/// Byte-for-byte the permutation `g16_ntt::bit_reverse_permute` performs. Kept in step
-/// with it by `same_permutation_as_the_ntt_uses` below.
-fn bit_reverse_permute(a: &mut [Fr], log_n: u32) {
-    let n = a.len();
-    if n <= 2 {
-        return;
-    }
-    let shift = usize::BITS - log_n;
-    for i in 0..n {
-        let j = i.reverse_bits() >> shift;
-        if i < j {
-            a.swap(i, j);
-        }
-    }
-}
+use g16_ntt::{bit_reverse_permute, CpuNtt, Direction, NttBackend};
 
 fn best(reps: usize, f: &mut dyn FnMut()) -> f64 {
     (0..reps)
@@ -100,8 +81,8 @@ fn main() {
         });
         let bitrev = best(reps, &mut || bit_reverse_permute(&mut v, log_n));
 
-        // A transform is one permutation plus log_n butterfly passes, so the permutation's
-        // share of the transform is what a mixed-radix or Stockham rewrite could remove.
+        // A transform through `ntt` is one permutation plus log_n butterfly passes, so
+        // this share is what the fused path stops paying.
         let per_transform = (fwd + inv) / 2.0;
         println!(
             "{log_n:>6} {n:>10} {inv:>11.3} {fwd:>11.3} {shift:>11.3} {bitrev:>11.3} \
@@ -109,13 +90,26 @@ fn main() {
             100.0 * bitrev / per_transform
         );
 
+        // The prover's own shift: the 2n-th root whose square is the domain's generator.
+        let coset_shift = Domain::new(2 * n).unwrap().group_gen;
+        // Warm the coset table, which is built once per (size, shift) and kept for the
+        // life of the circuit.
+        ntt.intt_coset_ntt(&domain, &mut v, coset_shift);
+        let fused = 3.0
+            * best(reps, &mut || {
+                ntt.intt_coset_ntt(&domain, &mut v, coset_shift)
+            });
+
         // One proof's stages 1-3 at this domain: three vectors, each iNTT -> shift -> NTT.
-        let stages_1_3 = 3.0 * (inv + shift + fwd);
+        // The composition is what the prover ran before the fusion; `intt_coset_ntt` is
+        // what it runs now, over the same three stages.
+        let composed = 3.0 * (inv + shift + fwd);
         println!(
-            "       one proof's stages 1-3 at this size: {stages_1_3:.2} ms, of which \
-             6 bit-reversal passes are {:.2} ms ({:.1}%)",
-            6.0 * bitrev,
-            100.0 * 6.0 * bitrev / stages_1_3
+            "       one proof's stages 1-3 at this size: composed {composed:.2} ms, \
+             fused {fused:.2} ms ({:.2}x); the composition's 6 bit-reversal passes are \
+             {:.2} ms",
+            composed / fused,
+            6.0 * bitrev
         );
     }
 
@@ -130,9 +124,10 @@ fn main() {
 /// roughly a quarter of the machine while the rest of the pool waits. Running each stage
 /// in a fixed-size pool settles it directly.
 ///
-/// A transform is `log n` sequential passes with a fork/join barrier between each, plus a
-/// serial bit-reversal, so it has a hard ceiling that an MSM (whose windows are entirely
-/// independent) does not.
+/// A transform is `log n` sequential passes with a fork/join barrier between each, so it
+/// has a hard ceiling that an MSM (whose windows are entirely independent) does not. The
+/// `ntt` entry point timed here also pays the serial permutation; `intt_coset_ntt`, which
+/// is what the prover runs, does not.
 fn scaling() {
     let log_n = 18u32;
     let n = 1usize << log_n;
@@ -194,42 +189,5 @@ fn scaling() {
             base_ntt / t_ntt,
             base_msm / t_msm
         );
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The permutation above must be the one the NTT performs, or every number this
-    /// example prints is about a different program.
-    #[test]
-    fn same_permutation_as_the_ntt_uses() {
-        for log_n in 1..12u32 {
-            let n = 1usize << log_n;
-            let domain = Domain::new(n).unwrap();
-            let ntt = CpuNtt::new();
-
-            // A transform is permute-then-butterflies, and on the all-ones input every
-            // butterfly pass is a pure sum, so the permutation is not observable that way.
-            // Instead: permuting twice is the identity, so permute the input, run the
-            // NTT, and check it equals the NTT of the unpermuted input permuted... which
-            // is circular. Use the direct property instead: the permutation is an
-            // involution built from `reverse_bits`, so compare against an independent
-            // construction by index.
-            let mut a = sample(n);
-            let want: Vec<Fr> = (0..n)
-                .map(|i| a[i.reverse_bits() >> (usize::BITS - log_n)])
-                .collect();
-            bit_reverse_permute(&mut a, log_n);
-            assert_eq!(a, want, "log_n {log_n}");
-
-            // And it really is an involution, which is what makes the in-place swap loop
-            // correct in the first place.
-            bit_reverse_permute(&mut a, log_n);
-            let _ = domain;
-            let _ = ntt;
-            assert_eq!(a, sample(n), "log_n {log_n} not an involution");
-        }
     }
 }
