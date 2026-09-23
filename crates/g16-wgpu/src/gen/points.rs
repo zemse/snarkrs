@@ -593,7 +593,17 @@ struct {pt} {{ x: {fty}, y: {fty}, zz: {fty}, zzz: {fty} }}
 /// future compiler whether either cliff is still there.
 pub static POINT_BODY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(2);
 
-fn microcoded() -> bool {
+/// [`POINT_BODY`]'s level, seeding it from `G16_WGPU_POINT_BODY` on the first call.
+///
+/// The seed is a call and not a side effect of generating, so a caller that wants its own
+/// level runs this first and stores afterwards. It used to run inside `pt_madd` on the way
+/// through, which put it after anything a caller stored: `dump_points_wgsl` took a level from
+/// its command line, stored it, and had the environment overwrite it with no message.
+///
+/// # Panics
+///
+/// On a level above 2, which used to mean "microcoded, not split" and so read as accepted.
+pub fn point_body() -> u32 {
     // `G16_WGPU_POINT_BODY=0` or `=1` runs the whole native suite against another spelling without
     // a second copy of any test, the same way `G16_WGPU_LIMITS` does for the limits profile.
     // A browser has no environment and sets the atomic directly.
@@ -609,7 +619,16 @@ fn microcoded() -> bool {
             }
         });
     }
-    POINT_BODY.load(std::sync::atomic::Ordering::Relaxed) != 0
+    let level = POINT_BODY.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        level <= 2,
+        "POINT_BODY is {level}; the spellings are 0, 1 and 2"
+    );
+    level
+}
+
+fn microcoded() -> bool {
+    point_body() != 0
 }
 
 /// Whether the microcoded register file is spelled as one `array<Fq, N>` per Fq2 component
@@ -624,7 +643,7 @@ fn microcoded() -> bool {
 ///
 /// G1 emits identical text either way, so this only ever changes the curve that is broken.
 fn split_regs(c: Curve) -> bool {
-    c.needs_fq2 && POINT_BODY.load(std::sync::atomic::Ordering::Relaxed) == 2
+    c.needs_fq2 && point_body() == 2
 }
 
 /// Rewrite a microcoded body's register file from one `array<Fq2, N>` into two `array<Fq, N>`.
