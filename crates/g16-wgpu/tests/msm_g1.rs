@@ -882,7 +882,11 @@ fn the_g1_module_carries_no_fq2_it_never_calls() {
     );
     assert!(!g1.contains("struct Fq2"), "the G1 module declares Fq2");
     assert!(g2.contains("fn fq2_mul("), "the G2 module lost fq2_mul");
-    // And every routine the G1 kernels do call is there under the right prefix.
+    // And every point routine is there under the right prefix. The last three are not
+    // reachable at the shipped knobs: `pt_dbl_affine_g1` and `pt_dbl_g1` are the straight-line
+    // spellings `gen::points::POINT_BODY` 0 calls, and `pt_mul_small_g1` is called only from
+    // `REDUCE_BODY` 1. They are emitted unconditionally, which REV-11 owns; what is pinned
+    // here is the naming, not the reachability.
     for f in [
         "fn fq_mul(",
         "fn fq_sqr(",
