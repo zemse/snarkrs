@@ -333,9 +333,9 @@ fn window_chunk<P: RawCurve>(
     range: core::ops::Range<usize>,
     window: usize,
     c: u32,
-    n_buckets: usize,
 ) -> Projective<P> {
     // `d` is in [-2^(c-1), 2^(c-1)], so `2^(c-1)` buckets is tight.
+    let n_buckets = 1usize << (c - 1);
     let mut buckets = vec![Xyzz::<P::RF>::ZERO; n_buckets];
     for k in range {
         let d = signed_digit(scan.bigints[k].as_ref(), window, c);
@@ -570,8 +570,9 @@ fn window_chunk_batch<P: RawCurve>(
     range: core::ops::Range<usize>,
     window: usize,
     c: u32,
-    n_buckets: usize,
 ) -> Projective<P> {
+    // `d` is in [-2^(c-1), 2^(c-1)], so `2^(c-1)` buckets is tight.
+    let n_buckets = 1usize << (c - 1);
     let mut fill = BatchFill::<P>::new(n_buckets);
     for k in range {
         let d = signed_digit(scan.bigints[k].as_ref(), window, c);
@@ -653,9 +654,9 @@ where
                     // narrow ones stay on the XYZZ fill, which has no round overhead
                     // to amortise.
                     if n_buckets >= BATCH_MIN_BUCKETS {
-                        window_chunk_batch(bases, &scan, lo..hi, w, c, n_buckets)
+                        window_chunk_batch(bases, &scan, lo..hi, w, c)
                     } else {
-                        window_chunk(bases, &scan, lo..hi, w, c, n_buckets)
+                        window_chunk(bases, &scan, lo..hi, w, c)
                     }
                 })
                 .reduce(Projective::zero, |a, b| a + b)
@@ -946,11 +947,10 @@ mod tests {
             ones_sum: Projective::zero(),
         };
         for c in [5u32, 8] {
-            let n_buckets = 1usize << (c - 1);
             for w in 0..RECODE_BITS.div_ceil(c as usize) {
                 assert_eq!(
-                    window_chunk_batch(bases, &scan, 0..bases.len(), w, c, n_buckets),
-                    window_chunk(bases, &scan, 0..bases.len(), w, c, n_buckets),
+                    window_chunk_batch(bases, &scan, 0..bases.len(), w, c),
+                    window_chunk(bases, &scan, 0..bases.len(), w, c),
                     "window {w} at c = {c}"
                 );
             }
