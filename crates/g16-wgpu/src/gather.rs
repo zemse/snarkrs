@@ -19,7 +19,7 @@
 //!
 //! An out-of-range index in WGSL is not a fault. naga and every browser bounds-check storage
 //! access, so `WITNESS[signal]` with a signal past the end of the witness quietly returns
-//! zero and the proof comes out wrong with nothing in any log. [`CsrTables::build`] therefore
+//! zero and the proof comes out wrong with nothing in any log. [`CsrHost::build`] therefore
 //! walks the CSR once at key load and rejects a non-monotone `row_ptr`, a `row_ptr` of the
 //! wrong length, a nonzero count that disagrees with the arrays, and a signal at or past
 //! `n_vars`. `g16_core::cpu::CpuCircuit::prepare` already checks two of those four, but this

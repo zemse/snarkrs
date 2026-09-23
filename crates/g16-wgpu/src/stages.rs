@@ -209,7 +209,7 @@ type Pool = Arc<Mutex<Vec<Scratch>>>;
 /// `HStages` is.
 ///
 /// Nothing here is mutated by a proof. The pool is behind a mutex and hands out an exclusive
-/// [`Scratch`] per in-flight proof, so two concurrent `compute_h` calls against one
+/// `Scratch` per in-flight proof, so two concurrent `compute_h` calls against one
 /// `HStages` touch no common mutable state.
 pub struct HStages {
     gather: GatherAbc,

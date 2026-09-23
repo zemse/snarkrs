@@ -18,8 +18,8 @@
 //! So: one [`wgpu::CommandEncoder`], one compute pass, every dispatch of every MSM in it,
 //! then five `copy_buffer_to_buffer` calls into five windows of a **single** staging buffer,
 //! then one submit and one map. Design §3 caps the whole per-proof readback at 64 KiB and
-//! [`MsmBatch::readback_bytes`] reports what a given proof actually asks for, so the claim is
-//! checkable rather than asserted.
+//! [`MsmBatch::last_readback_bytes`] reports what a given proof actually asks for, so the
+//! claim is checkable rather than asserted.
 //!
 //! # Why the caller groups the jobs instead of this file deducing the grouping
 //!
