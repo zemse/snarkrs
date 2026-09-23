@@ -22,11 +22,11 @@
 //! So stages 0 to 4 are encoded as few command buffers as the display will tolerate:
 //! four, one for the gather and one per domain vector, committed back to back and waited
 //! on once. See the note in [`HResident::compute_h`] for why it is four and not one. At
-//! the 2^18 domain of the largest artifact that is thirteen dispatches: one gather, then
-//! two per transform for six transforms, with stage 4 fused into the last one. The
-//! reference Metal implementations do the opposite (zkonduit commits and blocks four
-//! times per MSM, zkmopro uses one command buffer per dispatch) and at our domain sizes
-//! that alone would decide the result before any arithmetic ran.
+//! the 2^18 domain of the largest `js_*` artifact that is thirteen dispatches: one
+//! gather, then two per transform for six transforms, with stage 4 fused into the last
+//! one. The reference Metal implementations do the opposite (zkonduit commits and blocks
+//! four times per MSM, zkmopro uses one command buffer per dispatch) and at our domain
+//! sizes that alone would decide the result before any arithmetic ran.
 //!
 //! # Where the host still does work per proof
 //!
@@ -118,7 +118,7 @@ const STORE_JOIN: u32 = 1;
 ///
 /// Built once and shared. Compiling this MSL through `newLibraryWithSource` was measured
 /// at about 54 ms for the field prelude alone, which is a tenth of the CPU backend's
-/// whole 596 ms proof for the largest artifact, so it must never sit inside a timed
+/// whole 596 ms proof for the largest `js_*` artifact, so it must never sit inside a timed
 /// region or a per-proof path.
 pub struct HStages {
     device: Device,

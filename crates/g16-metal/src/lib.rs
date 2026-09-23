@@ -42,7 +42,8 @@ pub mod kernels;
 #[cfg(target_os = "macos")]
 pub mod msm;
 /// Stages 0 to 4 on the GPU: the CSR gather, the six NTTs, the coset shift and
-/// `H = A*B - C`, all in one command buffer with the domain vectors kept resident.
+/// `H = A*B - C`, thirteen dispatches across four command buffers with the domain
+/// vectors kept resident.
 #[cfg(target_os = "macos")]
 pub mod stages;
 
