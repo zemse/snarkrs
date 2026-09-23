@@ -814,19 +814,18 @@ fn every_uniform_parameter_struct_matches_its_host_mirror() {
 }
 
 // ---------------------------------------------------------------------------
-// 5. The recoding width, which a doc comment says must match a private constant
+// 5. The recoding width, which three crates retype
 // ---------------------------------------------------------------------------
 
-/// `crate::msm::RECODE_BITS` says it "must match `g16_msm::RECODE_BITS` and
-/// `g16_metal::msm::RECODE_BITS`", and it cannot be compared to either: both are private
-/// `const`s in crates this one does not depend on, so the requirement is unenforced and a
-/// drift would show up as an MSM that disagrees with the CPU one by `2^(W*c)` on some
-/// scalars and not others.
+/// `crate::msm::RECODE_BITS` must match `g16_msm::RECODE_BITS` and
+/// `g16_metal::msm::RECODE_BITS`, and a drift would show up as an MSM that disagrees with
+/// the CPU one by `2^(W*c)` on some scalars and not others.
 ///
-/// What can be checked is the thing all three are derived from, which is the field: the
-/// recoding carries one bit past the top of the scalar, so it is `MODULUS_BIT_SIZE + 1`.
-/// `g16-msm` spells exactly that (`SCALAR_BITS + 1`), so pinning it here pins the pair
-/// without a dependency.
+/// `g16-msm` is a dev-dependency of this crate, so the pair is compared directly in
+/// `tests/msm_digits.rs`'s `const _: () = assert!(..)`; it cannot live in `src/msm.rs`,
+/// which does not have `g16-msm` in scope. What that comparison cannot reach is `g16-metal`,
+/// so this pins the thing all three are derived from instead: the recoding carries one bit
+/// past the top of the scalar, so it is `MODULUS_BIT_SIZE + 1`.
 #[test]
 fn the_recoding_width_is_the_modulus_bit_size_plus_one() {
     use g16_field::{Fr, PrimeField};
@@ -834,7 +833,7 @@ fn the_recoding_width_is_the_modulus_bit_size_plus_one() {
         g16_wgpu::msm::RECODE_BITS,
         Fr::MODULUS_BIT_SIZE + 1,
         "RECODE_BITS is not MODULUS_BIT_SIZE + 1, so the top window's carry is no longer \
-         provably zero and g16-msm's private copy has drifted away from this one"
+         provably zero and g16-metal's copy has drifted away from this one"
     );
     // And the top window really does sit above the modulus, which is the property the carry
     // argument rests on: r < 2^254 and the digits are laid out over 255 bits.
