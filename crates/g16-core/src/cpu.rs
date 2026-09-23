@@ -379,24 +379,13 @@ impl PreparedCircuit for CpuCircuit {
         }
 
         let start = Instant::now();
-        // The five MSMs overlap through nested joins. Keep the nesting, but not for the
-        // reason this comment used to give: it claimed four of the MSMs were cheap
-        // because their scalars are mostly 0 or 1, leaving the dense H MSM running alone.
-        // Both halves are false, and bench/results/profiling/ has the numbers.
-        //
-        // Only 1.80% of witness scalars are 0 or 1 on the two largest circuits, 4.12% at
-        // the sparsest point on the ladder. So no witness MSM is cheap and none of them
-        // drains early. The nesting itself is worth 1.01x at 140,261 constraints, not the
-        // structural win implied here. It earns its keep at the bottom of the ladder
-        // instead, 1.77x at 2 constraints, and by lifting occupancy on a pool that
-        // otherwise idles: a proof measures 9.41 busy cores out of 12.
-        //
-        // It therefore stays because it raises occupancy and costs nothing, which is a
-        // much weaker claim than the one it replaces.
-        // The five annotations below overlap: these MSMs run at the same time. Their
-        // durations are wall-clock windows, not disjoint costs, and they will sum to more
-        // than the enclosing region. `examples/msm_shape.rs` measures them one at a time
-        // when the disjoint cost is what is wanted.
+        // The five MSMs overlap through nested joins. Not because four of them are cheap:
+        // only 1.80% of witness scalars are 0 or 1 on the two largest circuits, 4.12% at
+        // the sparsest point on the ladder, so none of them drains early
+        // (bench/results/profiling/). The nesting is worth 1.01x at 140,261 constraints
+        // and 1.77x at 2, and it lifts occupancy on a pool that otherwise idles: a proof
+        // measures 9.41 busy cores out of 12. `examples/msm_shape.rs` times them one at a
+        // time.
         let ((a_g1, b_g2), ((b_g1, l_g1), h_g1)) = rayon::join(
             || {
                 rayon::join(
