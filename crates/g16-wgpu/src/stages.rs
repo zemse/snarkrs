@@ -705,7 +705,12 @@ impl WgpuHandle {
             });
         rb.copy_from(&mut enc, buf, 0, bytes)?;
         let raw = rb.submit_and_read(backend, enc, bytes).await?;
-        Ok(bytemuck::cast_slice::<u8, u32>(&raw).to_vec())
+        // Not `bytemuck::cast_slice`: a `Vec<u8>` is 4-aligned only by the allocator's
+        // choice, and `cast_slice` panics if it ever is not. Same allocation either way.
+        Ok(raw
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().expect("chunks_exact(4)")))
+            .collect())
     }
 }
 
