@@ -375,7 +375,7 @@ impl FftKernels {
         &self.device
     }
 
-    /// Shortest block this instance will run on the device. See [`MIN_BLOCK`].
+    /// Shortest block this instance will run on the device. See `MIN_BLOCK`.
     pub fn min_block(&self) -> usize {
         self.min_block
     }
@@ -390,10 +390,10 @@ impl FftKernels {
         self
     }
 
-    /// Overrides [`FftGroup::BUDGET`], the ladders one command buffer may hold.
+    /// Overrides `FftGroup::BUDGET`, the ladders one command buffer may hold.
     ///
     /// Both groups at once, which is what a test wants and a sweep does not; a sweep uses
-    /// the two [`env_budget`] variables. The tests set it small because the shipped budget
+    /// the two `env_budget` variables. The tests set it small because the shipped budget
     /// is 2^18 ladders on G1, so a block big enough to split a pass across command buffers
     /// on its own is a block too big to put in a unit test, and the `gid_off` arithmetic
     /// would go untested at every size the suite can afford to run.
@@ -403,7 +403,7 @@ impl FftKernels {
         self
     }
 
-    /// The ladder window this instance uses for G1. See [`FFT_WINDOW_G1`].
+    /// The ladder window this instance uses for G1. See `FFT_WINDOW_G1`.
     pub fn window_g1(&self) -> u32 {
         self.window_g1
     }

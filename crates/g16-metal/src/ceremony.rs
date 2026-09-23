@@ -1,5 +1,5 @@
-//! The Metal side of the three ceremony seams: [`MsmBackend`], [`GroupFft`] and
-//! [`KeyScale`].
+//! The Metal side of the three ceremony seams: [`g16_msm::MsmBackend`],
+//! [`g16_msm::GroupFft`] and [`g16_msm::KeyScale`].
 //!
 //! Separate from [`crate::backend`], which implements `g16_core::Backend`, the whole
 //! prover. A ceremony command wants one primitive at a time and holds no proving key, so
@@ -261,7 +261,7 @@ impl MetalKeyScale {
         &self.kernels
     }
 
-    /// The crossover this instance uses. See [`KEY_MIN_POINTS`].
+    /// The crossover this instance uses. See `KEY_MIN_POINTS`.
     pub fn min_points(&self) -> usize {
         self.min_points
     }
@@ -648,7 +648,7 @@ impl CeremonyKernels {
         &self.device
     }
 
-    /// The ladder window this instance uses for G1. See [`WINDOW_G1`] for the measurement.
+    /// The ladder window this instance uses for G1. See `WINDOW_G1` for the measurement.
     pub fn window_g1(&self) -> u32 {
         self.window_g1
     }
