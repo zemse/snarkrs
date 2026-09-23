@@ -515,8 +515,12 @@ impl CudaStages {
     }
 
     /// Kernel launches issued by one call to [`Self::compute_h`], for reporting.
+    ///
+    /// The fused path: the witness mont-to-std, the gather, and one launch per batch for
+    /// each of the six transforms. `G16_CUDA_UNFUSED` adds the standalone `g16_h_join`, and
+    /// that is read from the environment inside `compute_h` rather than here.
     pub fn launch_count(&self) -> usize {
-        1 + 6 * self.batches.len()
+        2 + 6 * self.batches.len()
     }
 
     /// The `(s0, k)` pass split, for reporting.
