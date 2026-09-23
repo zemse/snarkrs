@@ -391,11 +391,34 @@ impl CudaStages {
         .group_gen;
 
         for (m, name) in [(0usize, "A"), (1usize, "B")] {
-            if pk.coeffs.row_ptr[m].len() != domain.size + 1 {
+            let row_ptr = &pk.coeffs.row_ptr[m];
+            if row_ptr.len() != domain.size + 1 {
                 return Err(bad(format!(
                     "matrix {name} has {} rows, domain size is {}",
-                    pk.coeffs.row_ptr[m].len().saturating_sub(1),
+                    row_ptr.len().saturating_sub(1),
                     domain.size
+                )));
+            }
+            // `g16_gather_abc` walks `row_ptr[gid]..row_ptr[gid + 1]`, so a decreasing pair
+            // is a silently empty row and a final entry past the arrays is an out-of-bounds
+            // device read. The same two loops run in `CpuBackend::prepare`, which is the
+            // oracle this backend is diffed against.
+            for c in 1..row_ptr.len() {
+                if row_ptr[c] < row_ptr[c - 1] {
+                    return Err(bad(format!(
+                        "matrix {name} row_ptr is not monotone at row {}: {} then {}",
+                        c - 1,
+                        row_ptr[c - 1],
+                        row_ptr[c]
+                    )));
+                }
+            }
+            let total = row_ptr[row_ptr.len() - 1] as usize;
+            if total != pk.coeffs.signal[m].len() || total != pk.coeffs.value[m].len() {
+                return Err(bad(format!(
+                    "matrix {name} row_ptr ends at {total} but has {} signals and {} values",
+                    pk.coeffs.signal[m].len(),
+                    pk.coeffs.value[m].len()
                 )));
             }
             // Checked once per key rather than per proof. On the GPU an out-of-range signal
