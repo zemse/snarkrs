@@ -359,11 +359,33 @@ impl HResident {
         .group_gen;
 
         for (m, name) in [(0usize, "A"), (1usize, "B")] {
-            if pk.coeffs.row_ptr[m].len() != domain.size + 1 {
+            let row_ptr = &pk.coeffs.row_ptr[m];
+            if row_ptr.len() != domain.size + 1 {
                 return Err(bad(format!(
                     "matrix {name} has {} rows, domain size is {}",
-                    pk.coeffs.row_ptr[m].len().saturating_sub(1),
+                    row_ptr.len().saturating_sub(1),
                     domain.size
+                )));
+            }
+            // `gather.metal` walks `for (k = lo; k < hi; k++)`, so a decreasing pair is a
+            // row that silently accumulates zero and a total past the signal array is an
+            // out-of-bounds device read. Same two loops as `g16_core::cpu`, the oracle.
+            for c in 1..row_ptr.len() {
+                if row_ptr[c] < row_ptr[c - 1] {
+                    return Err(bad(format!(
+                        "matrix {name} row_ptr is not monotone at row {}: {} then {}",
+                        c - 1,
+                        row_ptr[c - 1],
+                        row_ptr[c]
+                    )));
+                }
+            }
+            let total = row_ptr[row_ptr.len() - 1] as usize;
+            if total != pk.coeffs.signal[m].len() || total != pk.coeffs.value[m].len() {
+                return Err(bad(format!(
+                    "matrix {name} row_ptr ends at {total} but has {} signals and {} values",
+                    pk.coeffs.signal[m].len(),
+                    pk.coeffs.value[m].len()
                 )));
             }
             // Checked once per key rather than per proof. On the GPU an out-of-range
@@ -911,6 +933,48 @@ mod tests {
                 assert!(hi - lo <= 1, "log_n {log_n}: uneven split {bs:?}");
             }
         }
+    }
+
+    fn tiny_key() -> Option<ProvingKey> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../bench/artifacts/tiny_mul/circuit.zkey");
+        if !path.is_file() {
+            eprintln!("SKIPPED: no tiny_mul artifact");
+            return None;
+        }
+        Some(ProvingKey::load(&path).unwrap())
+    }
+
+    /// `gather.metal` reads a decreasing pair as an empty range, so without this check the
+    /// key would have produced a silently zeroed row. Mirrors `g16_core::cpu`'s test.
+    #[test]
+    fn prepare_rejects_a_non_monotone_row_ptr() {
+        let Some(mut pk) = tiny_key() else { return };
+        let rp = &mut pk.coeffs.row_ptr[0];
+        // Lift the start of a nonempty row above its end, which leaves the last entry
+        // alone so this fails the monotonicity check and not the nonzero-count one.
+        let c = (1..rp.len())
+            .find(|&c| rp[c] > rp[c - 1])
+            .expect("matrix A has no nonzeros");
+        rp[c - 1] = rp[c] + 1;
+        let st = HStages::new().expect("Metal device");
+        let Err(err) = st.prepare(&pk) else {
+            panic!("accepted a non-monotone row_ptr");
+        };
+        assert!(err.to_string().contains("not monotone"), "{err}");
+    }
+
+    /// Past the end of the signal array `gather.metal` reads whatever follows the buffer.
+    #[test]
+    fn prepare_rejects_a_row_ptr_past_the_signal_total() {
+        let Some(mut pk) = tiny_key() else { return };
+        let rp = &mut pk.coeffs.row_ptr[0];
+        *rp.last_mut().expect("row_ptr is nonempty") += 1;
+        let st = HStages::new().expect("Metal device");
+        let Err(err) = st.prepare(&pk) else {
+            panic!("accepted a row_ptr past the signal total");
+        };
+        assert!(err.to_string().contains("row_ptr ends at"), "{err}");
     }
 
     /// The shapes the artifacts actually use, spelled out so a change to the splitting
