@@ -139,7 +139,7 @@ impl HStages {
         format!("{FR_MSL}\n{GATHER_MSL}\n{POINTWISE_MSL}\n{NTT_MSL}\n")
     }
 
-    /// Picks the system default device and compiles [`Self::source`].
+    /// Picks the system default device and compiles the MSL for stages 0 to 4.
     pub fn new() -> Result<Self, ProveError> {
         let device = Device::system_default().ok_or_else(|| bad("no Metal device"))?;
         Self::with_device(device)

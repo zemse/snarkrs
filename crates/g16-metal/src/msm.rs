@@ -1047,7 +1047,7 @@ impl MetalMsm {
     /// plan costs four dispatches (`zero`, `count`, `scan`, `scatter`), so collapsing the
     /// five proving jobs to three plans removes eight of the twenty and, more to the
     /// point, two thirds of the scatter's memory traffic. A bucket array past
-    /// [`SCATTER_SPLIT_ROWS`] splits the scatter in two, which scales both counts.
+    /// `SCATTER_SPLIT_ROWS` splits the scatter in two, which scales both counts.
     pub fn msm_batch<'a>(&self, jobs: &[Job<'a>]) -> Result<Vec<MsmResult>, ProveError> {
         if jobs.is_empty() {
             return Ok(Vec::new());
