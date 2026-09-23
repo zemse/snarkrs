@@ -16,9 +16,10 @@
 //! extra dispatch in an already open encoder at 2 to 3 microseconds, a factor of 50 to 100.
 //! An empty submit plus its fence re-measures here at **22 to 24 microseconds in release**
 //! and about 70 in debug, so the design's figure is pessimistic by 4x and the ratio it rests
-//! on is intact. At the largest artifact (2^18) this encodes **20 dispatches**: one gather,
-//! three per transform for six transforms, and one `h_join`. Twenty separate submits would
-//! be 0.5 ms of pure fence latency against about 0.05 ms of extra encoding.
+//! on is intact. At the 2^18 domain of the largest `js_*` artifact this encodes **20
+//! dispatches**: one gather, three per transform for six transforms, and one `h_join`.
+//! Twenty separate submits would be 0.5 ms of pure fence latency against about 0.05 ms of
+//! extra encoding.
 //! `tests/stages.rs` asserts the submit count is exactly one, counted through
 //! [`crate::device::WgpuBackend::submit`] rather than asserted in a comment.
 //!
