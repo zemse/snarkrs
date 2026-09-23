@@ -193,7 +193,7 @@ fn top_bits(c: u32) -> u32 {
 /// It changes the pick for every `m` above ~10k, and of those only 70,357 and 140,261 were
 /// measured; 10,153 and 17,929 move from 10 to 8 on inference, not evidence. The mechanism
 /// below argues the shape is architectural rather than Turing-specific, but that is an
-/// argument and the table is a measurement. See TASKS.md.
+/// argument and the table is a measurement. See TASKS.local.md.
 ///
 /// The Metal twin picks `c` from a three-term cost model whose coefficients (`MADD_US`,
 /// `ROW_US`, `MERGE_US`) were fitted to an M2 Max by forcing five window widths on two
@@ -201,26 +201,21 @@ fn top_bits(c: u32) -> u32 {
 /// of them are copied here. What is used instead is the textbook Pippenger heuristic,
 /// `c ~ log2(m) - 3`, clamped, with one structural correction described below.
 ///
-/// **Whoever first runs this on a real card should sweep `G16_CUDA_MSM_C` over 8..=16 on
-/// each of the five MSMs and replace this function with the measured answer.** Do not
-/// assume the optimum is shallow. On the M2 Max at 140k constraints the sweep gave c=8
-/// 139.5 ms, c=10 152.4, c=12 272.4, c=13 127.6, c=14 308.7, c=16 336.1: a 2.4x cliff one
-/// step either side of the optimum. Whatever the constants turn out to be on NVIDIA, the
-/// shape of that curve is a property of the algorithm and will still be there.
-///
 /// # The one correction, which is structural rather than fitted
 ///
-/// Those cliffs are not noise and they are not Apple specific. At c=12 and c=14 the top
-/// window has three meaningful bits, so its digits crowd into four live buckets instead of
-/// 2048 or 8192 and each of the four holds a quarter of the scalars. On the CPU that costs
-/// nothing, because a serial bucket loop only cares about the total. On either GPU it is
-/// the critical path: such a bucket's run spans thousands of slices, and `msm_merge_*`
-/// walks a bucket's slice range in ONE thread while the rest of the machine waits.
+/// The cliffs in that table are not noise. At c=12 and c=14 the top window has three
+/// meaningful bits, so its digits crowd into four live buckets instead of 2048 or 8192 and
+/// each of the four holds a quarter of the scalars. On the CPU that costs nothing, because
+/// a serial bucket loop only cares about the total. On either GPU it is the critical path:
+/// such a bucket's run spans thousands of slices, and `msm_merge_*` walks a bucket's slice
+/// range in ONE thread while the rest of the machine waits.
 ///
 /// So the heuristic's pick is stepped *down* (never up, which would only inflate the bucket
-/// array) by at most three, until the top window keeps at least half its bits. At 140k
-/// general scalars that turns 14 into 13, which is where the M2 Max sweep puts the optimum.
-/// That agreement is a sanity check, not a measurement.
+/// array) by at most three, until the top window keeps at least half its bits. Under
+/// [`MEASURED_MAX_WINDOW`] that fires at one width and one only: `base == 7`, which is `m`
+/// in 1024..=2047, where `top_bits(7) = 3` fails the guard and 6 is taken instead. Every
+/// other width in 3..=8 passes on the first iteration. The 12/13/14 widths are history of
+/// the uncapped heuristic, and they are why the guard is here at all.
 ///
 /// Override with `G16_CUDA_MSM_C` to sweep it.
 pub fn window_size(m: usize) -> u32 {
@@ -1706,11 +1701,16 @@ mod tests {
     /// [`window_size`], so this test pins behaviour, not optimality.
     #[test]
     fn the_default_window_sizes_are_what_we_think_they_are() {
-        // The degenerate top windows the correction is there to avoid.
+        // These pin `top_bits` itself, not a live branch of `window_size`: the cap keeps
+        // the pick at 8 or below, so 12 and 14 are unreachable widths now.
         assert_eq!(top_bits(12), 3);
         assert_eq!(top_bits(14), 3);
         assert_eq!(top_bits(13), 8);
         assert_eq!(top_bits(15), 15);
+
+        // The one width the correction still fires at: base 7 fails `2 * top_bits >= c`
+        // and steps down to 6. Reachable only between 1024 and 2047 general scalars.
+        assert_eq!(window_size(1500), 6);
 
         // A 140k witness with about 140k general scalars: the heuristic says 14, and
         // [`MEASURED_MAX_WINDOW`] caps it at the swept 8 (1.09x over 13 there).
