@@ -283,9 +283,9 @@ impl HStages {
 
     /// Dispatches one [`Self::compute_h`] encodes at `mode`.
     ///
-    /// The gather is one dispatch below a 2^23 domain and the standalone join one below
-    /// 2^23, but both are computed rather than assumed so the number stays right when a
-    /// bigger artifact arrives.
+    /// The gather is one dispatch below a 2^23 domain and the standalone join one below a
+    /// 2^24 one (128 threads against 256), but both are computed rather than assumed so the
+    /// number stays right when a bigger artifact arrives.
     pub fn dispatches(&self, mode: Stage4) -> u32 {
         let n = self.domain.size as u32;
         let joins = match mode {

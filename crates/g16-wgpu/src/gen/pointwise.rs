@@ -41,9 +41,10 @@
 //! # The element range is in the uniform block for the same reason stage 0's is
 //!
 //! `maxComputeWorkgroupsPerDimension` is 65535 at every tier of every browser, so at
-//! [`WORKGROUP`] threads a single dispatch covers 16,776,960 elements and a 2^25 domain does
-//! not fit. The kernel takes `[lo, hi)` and the host emits as many dispatches as it needs;
-//! below 2^24 that is one dispatch and the parameter costs one add.
+//! [`WORKGROUP`] threads a single dispatch covers 16,776,960 elements. A 2^24 domain is
+//! 16,777,216 elements, **256 over**, which is exactly one workgroup. The kernel takes
+//! `[lo, hi)` and the host emits as many dispatches as it needs; below 2^24 that is one
+//! dispatch and the parameter costs one add.
 
 use std::fmt::Write as _;
 
