@@ -3,7 +3,7 @@
 //!
 //! Everything here is wiring. Stages 0 to 4 are [`crate::stages`], stages 5 to 9 are
 //! [`crate::batch`], and what happens in this file is the split between witness-independent
-//! work, which must all be hoisted into [`WgpuProver::prepare`], and per-proof work, which
+//! work, which must all be hoisted into `WgpuProver::prepare`, and per-proof work, which
 //! must touch nothing shared and mutable.
 //!
 //! # One circuit, two ways of waiting for it
@@ -18,7 +18,7 @@
 //! So the *async* half of this file compiles on both targets and the blocking half does not.
 //! [`WgpuCircuit::compute_h_async`] and [`WgpuCircuit::msms_async`] are the real
 //! implementations; the `PreparedCircuit` impl is four `pollster::block_on` calls over them
-//! and is `cfg`-gated off wasm32, and [`crate::wasm`] awaits the same two functions from the
+//! and is `cfg`-gated off wasm32, and `crate::wasm` awaits the same two functions from the
 //! browser's dedicated Web Worker. U13 did it this way after starting to copy the file: the
 //! only thing that differs between a native proof and a browser proof is who waits, and
 //! duplicating 200 lines of job wiring to express that is how the two backends drift.
@@ -40,7 +40,7 @@
 //! # There is no CPU fallback, and no size gate
 //!
 //! Every stage runs on the device and every one is checked against the CPU backend element by
-//! element, so [`WgpuCircuit::backend_name`] can honestly say "wgpu" for the whole proof.
+//! element, so `WgpuCircuit::backend_name` can honestly say "wgpu" for the whole proof.
 //! There is deliberately no "small circuits go to the CPU" gate either, for the reason
 //! `g16-metal` gives: a gate that quietly ran the other backend would make
 //! `g16 prove --backend wgpu` report a number that belongs to somebody else. The crossover is
@@ -114,7 +114,7 @@ impl WgpuProver {
     }
 
     /// Native only: opening a device is async and blocking a browser's only thread on it
-    /// hangs the tab. The browser opens the device with `.await` in [`crate::wasm`].
+    /// hangs the tab. The browser opens the device with `.await` in `crate::wasm`.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn with_profile(profile: LimitsProfile) -> Result<Self, ProveError> {
         let device = pollster::block_on(WgpuBackend::with_profile(profile))?;
@@ -157,7 +157,7 @@ impl WgpuProver {
 }
 
 /// Native only, because `prepare` hands back a `Box<dyn PreparedCircuit>` and that trait is
-/// synchronous. The browser builds a [`WgpuCircuit`] directly; see [`crate::wasm`].
+/// synchronous. The browser builds a [`WgpuCircuit`] directly; see `crate::wasm`.
 #[cfg(not(target_arch = "wasm32"))]
 impl Backend for WgpuProver {
     fn name(&self) -> &'static str {
@@ -199,7 +199,7 @@ pub struct WgpuCircuit {
 }
 
 impl WgpuCircuit {
-    /// Uploads everything witness independent. `pub` because [`crate::wasm`] builds a circuit
+    /// Uploads everything witness independent. `pub` because `crate::wasm` builds a circuit
     /// without going through [`Backend::prepare`], whose return type is a boxed
     /// `PreparedCircuit` and therefore native only.
     pub fn new(
@@ -349,7 +349,7 @@ impl WgpuCircuit {
     /// comment requires it to be held at the synchronous boundary rather than inside an
     /// `async fn`, so that no `MutexGuard` is live across an `.await` and these futures stay
     /// `Send`. The `PreparedCircuit` impl below takes it; the browser worker in
-    /// [`crate::wasm`] runs one proof at a time by protocol and refuses a second instead.
+    /// `crate::wasm` runs one proof at a time by protocol and refuses a second instead.
     pub async fn compute_h_async(
         &self,
         witness: &[Fr],

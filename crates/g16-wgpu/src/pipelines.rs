@@ -25,8 +25,8 @@
 //! `createShaderModule` reports errors through `getCompilationInfo()`, and Dawn compiles
 //! lazily behind `createComputePipeline`. The sweep measured
 //! 0.9 to 4.6 ms in Chrome for the same 29 KiB module that costs 155 to 174 ms natively,
-//! roughly 40x, and that ratio is too good to believe as a compiler comparison. Read the
-//! browser figure as a lower bound until U13 takes it again through
+//! roughly 40x, and that ratio is too good to believe as a compiler comparison. The browser
+//! figure is a lower bound: nothing here has yet taken it again through
 //! `createComputePipelineAsync`, which is the call that actually waits.
 
 use std::collections::HashMap;
@@ -69,10 +69,13 @@ impl PrepareCost {
 
 /// One WGSL module and every compute pipeline built from it.
 ///
-/// Deliberately one module per group of kernels rather than one for the whole backend: the
-/// 129 s figure in the module docs was a single fused module, and the mitigation the design
-/// commits to is many small ones. Splitting also means a change to the NTT does not
-/// re-trigger the compile over the G2 curve arithmetic.
+/// Deliberately one module per group of kernels rather than one for the whole backend: a
+/// change to the NTT does not then re-trigger the compile over the G2 curve arithmetic.
+///
+/// That is a rebuild-scope argument and not a cold-cost one. The design's "many small
+/// modules" mitigation measured backwards inside a group: Metal compiles a pipeline per entry
+/// point and dead-strips the module around it, so splitting one group costs about 21 ms of
+/// per-entry-point pipeline creation and saves only naga time. See [`crate::msm::ModuleShape`].
 pub struct Kernels {
     label: String,
     source_len: usize,

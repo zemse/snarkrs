@@ -17,6 +17,12 @@
 //! [`LimitsProfile::Raised`] is opt-in through `G16_WGPU_LIMITS=raised` and buys throughput
 //! only, never correctness.
 //!
+//! There is a third. [`LimitsProfile::Auto`] is the floor with `max_buffer_size` and
+//! `max_storage_buffer_binding_size` alone raised to what the adapter grants, and it is what
+//! the browser asks for. Capacity is a bound every kernel already checks; the geometry
+//! limits, which are the ones a kernel can be shaped around, stay at the floor. So `Auto`
+//! runs the identical kernels over more data, and only `Raised` changes their shape.
+//!
 //! # Three limits that are physics
 //!
 //! `maxComputeWorkgroupsPerDimension` is 65535, `maxBindGroups` is 4 and
@@ -110,8 +116,8 @@ pub enum LimitsProfile {
     ///
     /// That distinction is what makes this safe to turn on by default. A device that grants
     /// more capacity runs the identical kernels over more data. See
-    /// [`Self::limits_table`] for the measured gap, and prior art for heliax shipping the
-    /// other choice twice.
+    /// [`WgpuBackend::limits_table`] for the measured gap, and prior art for heliax shipping
+    /// the other choice twice.
     Auto,
 }
 
@@ -120,8 +126,8 @@ impl LimitsProfile {
     ///
     /// `std::env::var` is not a `cfg` hazard here: on `wasm32-unknown-unknown` std compiles
     /// it against an empty environment and it returns `NotPresent`, so the browser build
-    /// gets `Floor` and never has to be special-cased. A browser that wants `Raised` will
-    /// get an explicit constructor at U13, not an environment variable it cannot set.
+    /// gets `Floor` and never has to be special-cased. A browser names its profile through
+    /// the wasm bindings instead, which is how it reaches [`Self::Auto`].
     pub fn from_env() -> Result<Self, ProveError> {
         match std::env::var("G16_WGPU_LIMITS") {
             Ok(v) => Self::parse(&v),
@@ -184,11 +190,12 @@ impl LimitsProfile {
 /// One adapter, one device, one queue, and the running total of what compiling cost.
 ///
 /// Built once per process. There is no `Clone`: what makes it expensive is the pipeline
-/// compiles hanging off it, and U11 will share those by handing every circuit an `Arc` of
-/// the same [`crate::pipelines::Kernels`] rather than by duplicating anything.
+/// compiles hanging off it, and `WgpuProver::prepare` shares those by handing every circuit
+/// an `Arc` of the same [`crate::pipelines::Kernels`] rather than by duplicating anything.
 ///
-/// This is not yet a `g16_core::Backend`. Stages 0 to 9 do not exist, so an implementation
-/// would have to either lie or panic; U11 adds it once there is something to run.
+/// This is the device, not the prover. [`crate::backend::WgpuProver`] and
+/// [`crate::backend::WgpuCircuit`] are what implement `g16_core::Backend` and
+/// `g16_core::PreparedCircuit` over it.
 pub struct WgpuBackend {
     // Held because dropping the instance while a device is alive is not something wgpu
     // promises anything about, and on wasm it owns the `GPU` handle.
@@ -329,8 +336,9 @@ impl WgpuBackend {
         // raised when the API refuses something; a lost device is what happens when work that
         // was accepted does not complete, and the buffers it was going to write keep whatever
         // they held. `wait_for_submitted_work` returns normally in that case and the proof
-        // comes out wrong with nothing else to go on, which is exactly the failure `TASKS.md`
-        // records against `g16-metal` for never checking command buffer status.
+        // comes out wrong with nothing else to go on, which is exactly the failure
+        // `TASKS.local.md` records against `g16-metal` for never checking command buffer
+        // status.
         let sink = error.clone();
         device.set_device_lost_callback(move |reason, msg| {
             eprintln!("wgpu device lost: {reason:?}: {msg}");
@@ -401,7 +409,7 @@ impl WgpuBackend {
     /// therefore passed its own validation and then panicked inside the generator, where a
     /// `ProveError` was the documented behaviour. One ceiling, read by both sides, is the
     /// fix; the floor is the side to keep, because the generated source is what has to run
-    /// in Chrome. Filed against U11 in `TASKS.md` by U9's verification pass.
+    /// in Chrome. Filed against U11 in `TASKS.local.md` by U9's verification pass.
     pub fn ceiling_invocations(&self) -> u32 {
         self.granted_limits()
             .max_compute_invocations_per_workgroup
@@ -459,7 +467,7 @@ impl WgpuBackend {
     ///    another proof's GPU time and the benchmark would report a number nobody can
     ///    attribute.
     ///
-    /// Both were filed against U11 in `TASKS.md`. The honest options were a lock from submit
+    /// Both were filed against U11 in `TASKS.local.md`. The honest options were a lock from submit
     /// to poll or one device per in-flight proof, and a second device means a second copy of
     /// every base vector, 62 MB at `js_16x16_d32`, plus a second set of pipeline compiles.
     /// So: a lock, held across the whole of `compute_h` and the whole of `msms`.

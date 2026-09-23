@@ -293,7 +293,7 @@ pub struct Transform<'a> {
     /// read values a different workgroup had already overwritten. Nothing here can check it:
     /// wgpu offers no buffer identity comparison and WebGPU is happy to bind one buffer
     /// twice. `g16-metal`'s `stages.rs` keeps a separate `t` buffer for exactly this reason,
-    /// and so must U7.
+    /// and so does [`crate::stages`].
     pub src: &'a wgpu::Buffer,
     /// The head's output, and every later batch's in-place buffer.
     pub dst: &'a wgpu::Buffer,
@@ -543,12 +543,8 @@ impl Ntt {
 
     /// Builds the bind groups and pushes the parameter blocks for one whole transform.
     ///
-    /// `src` and `dst` must be different buffers. The head reads `SRC[reverse(i)]` and writes
-    /// `DST[i]`, and the reversed index of one workgroup's slice lands in another's, so an
-    /// in-place head would read values a different workgroup had already overwritten. Nothing
-    /// here can check it: wgpu offers no buffer identity comparison, and WebGPU is happy to
-    /// bind one buffer twice. Metal's `stages.rs` keeps a separate `t` buffer for exactly
-    /// this reason and so must U7.
+    /// `src` and `dst` must be different buffers; see [`Transform::src`] for why nothing
+    /// here can check it.
     ///
     /// Separate from [`Self::encode`] because design §3 writes every parameter block for the
     /// whole proof in one `write_buffer` before encoding starts, so the pushes have to happen

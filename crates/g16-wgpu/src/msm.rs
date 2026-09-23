@@ -3,8 +3,8 @@
 //!
 //! [`crate::gen::msm`] explains the algorithm and every decision behind it. This file is the
 //! other half: the window width, the parameter block, the five pipelines, the three scratch
-//! buffers and the four dispatches that fill them. U9 adds the G1 point stages that read
-//! what this produces, U10 adds G2, U11 puts all 38 dispatches in one submit.
+//! buffers and the four dispatches that fill them. [`crate::points`] is the other end of it,
+//! and [`crate::batch`] puts a whole proof's dispatches in one submit.
 //!
 //! # What a digit pipeline is, and why there are three of them per proof rather than five
 //!
@@ -60,15 +60,25 @@ pub const RECODE_BITS: u32 = 255;
 /// WGSL leaves indeterminate.
 pub const MAX_WINDOW: u32 = 16;
 
+/// Forces the window width, or 0 to compute it. The browser's counterpart to
+/// `G16_WGPU_MSM_C`, which cannot work there: `std::env::var` on wasm always fails, so a
+/// page has no way to reach the environment variable at all. Set through `set_msm_c` in the
+/// wasm bindings, and read by [`window_size`] below.
+pub static WINDOW_OVERRIDE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// Window width for `m` scalars that actually reach the buckets.
 ///
-/// # This model is provisional and the backend has to say so
+/// # This model is a fit, and the backend has to say so
 ///
-/// The three constants below are `g16-metal`'s, fitted to MSL kernels on this M2 Max, with
+/// The four constants below are `g16-metal`'s, fitted to MSL kernels on this M2 Max, with
 /// `MADD_US` scaled by 2.3 for the measured WGSL-to-MSL field ratio (1.964 against 4.51
-/// G mul/s). **Nothing in this crate has measured them.** A later unit owns the refit,
-/// once a whole MSM is runnable; until then this picks a plausible `c` and no more than
-/// that. `G16_WGPU_MSM_C` forces one.
+/// G mul/s). None of them has been refitted here. What has been measured here is the
+/// *output*: `tests/msm_verify.rs::the_window_width_the_cost_model_picks_is_within_ten_
+/// percent_of_the_measured_best` sweeps every width over a whole G1 MSM and holds this
+/// function to within ten percent of the winner. It is failing at m = 65536 today, where the
+/// model picks c = 13 and the sweep wants c = 8; see REV-12. So the width is held to a
+/// measurement, not to a green gate, and it is still a fit and not a derivation.
+/// `G16_WGPU_MSM_C` forces one.
 ///
 /// # Why this is not the CPU's cost model
 ///
@@ -83,12 +93,6 @@ pub const MAX_WINDOW: u32 = 16;
 /// `2^(top_bits - 1)` buckets instead of `2^(c-1)`. At c=11 that is two buckets holding half
 /// the scalars each. On the CPU a serial bucket loop only cares about the total; on the GPU
 /// those runs span thousands of slices and the merge walks one in a single lane.
-/// Forces the window width, or 0 to compute it. The browser's counterpart to
-/// `G16_WGPU_MSM_C`, which cannot work there: `std::env::var` on wasm always fails, so a
-/// page has no way to reach the environment variable at all. Set through `set_msm_c` in the
-/// wasm bindings, and read by [`window_size`] below.
-pub static WINDOW_OVERRIDE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-
 pub fn window_size(m: usize) -> u32 {
     let forced = WINDOW_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
     if forced > 0 {
@@ -432,7 +436,7 @@ pub(crate) fn storage_buffer(
 /// each. That is a per-entry-point floor, not a function of module size, and it is most of
 /// what a cold `prepare` pays.
 ///
-/// Second, and this settles a `TASKS.md` item U7 filed: Metal compiles a pipeline per entry
+/// Second, and this settles a `TASKS.local.md` item U7 filed: Metal compiles a pipeline per entry
 /// point and dead-strips the module around it, so **carrying a prelude a kernel never calls
 /// costs naga time and no pipeline time**. U7's note that stage 0's module carries 30 KiB of
 /// `Fq` and `Fq2` it never calls, with an "unmeasured saving", has now been measured
@@ -1106,9 +1110,6 @@ impl MsmDigits {
 
     // ---- reporting ----
 
-    /// Parameter ring slots the whole counting sort consumes for `plan`, which is also its
-    /// dispatch count because every dispatch takes its own block. Four at every shape any
-    /// artifact reaches.
     /// Ring slots `fr_mont_to_std` over `n` elements consumes, which is also its dispatch
     /// count. One at every domain any artifact reaches, because a single dispatch covers
     /// `128 * 65535` elements.
@@ -1119,6 +1120,9 @@ impl MsmDigits {
         self.dispatches(n, self.wg.mont)
     }
 
+    /// Parameter ring slots the whole counting sort consumes for `plan`, which is also its
+    /// dispatch count because every dispatch takes its own block. Four at every shape any
+    /// artifact reaches.
     pub fn sort_slots(&self, plan: &DigitPlan) -> u32 {
         self.dispatches(plan.rows(), self.wg.zero)
             + self.dispatches(plan.n, self.wg.count)

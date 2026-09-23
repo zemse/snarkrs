@@ -17,18 +17,24 @@
 //!
 //! On the device: bucket accumulation over fixed-length slices, the spill merge, the
 //! per-window reduction and the sum of the bases whose scalar is 1. On the host: the Horner
-//! combination of `n_windows` points and the sum of at most 64 `ones` partials. That is at
-//! most 84 curve additions per MSM against tens of millions on the device, and it is where
-//! ZPrize, heliax and `g16-metal` all independently left the window tail, for the same
-//! reason: compiling a shader containing `add_points` at the tail costs more than the
-//! readback plus the additions.
+//! combination of `n_windows` points and the sum of at most 64 `ones` partials, so
+//! `n_windows - 1 + ones_groups` additions, at most 148 against tens of millions on the
+//! device. It is where ZPrize, heliax and `g16-metal` all independently left the window tail,
+//! for the same reason: compiling a shader containing `add_points` at the tail costs more
+//! than the readback plus the additions.
 //!
 //! # One readback, and G2's 256-byte point makes it free
 //!
 //! `msm_reduce_*` writes `n_windows` points and `msm_ones_*` writes `ones_groups` points, and
 //! both go into **one** buffer, so the whole result of an MSM is one `copy_buffer_to_buffer`
-//! and one `mapAsync`. Design §3 puts the per-proof readback ceiling at 64 KiB across all
-//! five MSMs and this is 20 + 8 points here, 7 KiB over G2 and 3.5 KiB over G1.
+//! and one `mapAsync`. One MSM is therefore `n_windows + ones_groups` points: `n_windows` is
+//! `ceil(RECODE_BITS / c)` and so at most 85 at the narrowest `c`
+//! [`crate::msm::window_size`] searches, and `ones_groups_for` clamps at 64. Over four G1
+//! jobs and one G2 that is 112 KiB, against the 64 KiB per-proof ceiling design §3 puts on
+//! the readback. Measured, every artifact in the repo is well inside 64 KiB except
+//! `keccak256` at 86 KiB and `tiny_mul` at 65.5 KiB;
+//! `tests/proof.rs::a_whole_proof_is_two_submits_and_the_readback_is_bounded` prints the
+//! table and asserts the derived ceiling rather than the design's constant.
 //!
 //! The two bindings are windows into that one buffer at different offsets, and a storage
 //! binding offset must be a multiple of `minStorageBufferOffsetAlignment`, which is **256** in
@@ -1222,8 +1228,9 @@ fn limb_at(raw: &[u8], j: usize) -> PackedFq {
 ///
 /// XYZZ carries the invariant `ZZ^3 = ZZZ^2`, so setting the Jacobian `Z = ZZZ` gives
 /// `Z^2 = ZZ^3` and the point `(X * ZZ^2, Y * ZZ^3, ZZZ)` has `x = X*ZZ^2 / ZZ^3 = X/ZZ` and
-/// `y = Y*ZZ^3 / ZZZ^3 = Y/ZZZ`, which is exactly the XYZZ point. Three multiplications
-/// against two inversions through affine, and there are up to 84 of these per MSM.
+/// `y = Y*ZZ^3 / ZZZ^3 = Y/ZZZ`, which is exactly the XYZZ point. Four multiplications
+/// against two inversions through affine, and there are `n_windows + ones_groups` of these
+/// per MSM, at most 149.
 ///
 /// `new_unchecked` is deliberate. These come back from a kernel that was handed on-curve
 /// inputs, and re-checking the curve equation on every window sum would cost a subgroup check

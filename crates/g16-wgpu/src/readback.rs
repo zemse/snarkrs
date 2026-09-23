@@ -41,14 +41,15 @@
 //! # Cost, and the size ceiling that keeps it irrelevant
 //!
 //! One `mapAsync` round trip is about 0.3 ms. Design §3 caps the whole per-proof readback at
-//! 64 KiB (20 window sums plus up to 64 `ones_groups` partials per MSM, four G1 and one G2),
-//! so this is paid once per proof and nothing is chunked through it.
+//! 64 KiB; the bound the code actually gives is `n_windows + ones_groups` points per MSM, at
+//! most 85 + 64 over four G1 jobs and one G2, which is 112 KiB. Either way it is paid once
+//! per proof and nothing is chunked through it.
 //!
 //! That ceiling is load-bearing on wasm. `get_mapped_range` there copies the entire mapped
 //! `ArrayBuffer` into linear memory, measured at
-//! **33.8 ms for 64 MiB** against 2.6 ms for the GPU copy that produced it. At 64 KiB that is
-//! three orders of magnitude clear. If a readback ever grows past a megabyte, this function is
-//! the wrong tool and `as_uint8array()` is the right one.
+//! **33.8 ms for 64 MiB** against 2.6 ms for the GPU copy that produced it. At the hundred
+//! KiB or so this reads, that is several hundred times clear. If a readback ever grows past
+//! a megabyte, this function is the wrong tool and `as_uint8array()` is the right one.
 
 use g16_core::ProveError;
 

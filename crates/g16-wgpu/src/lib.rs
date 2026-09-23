@@ -1,6 +1,6 @@
 //! A WebGPU backend for the BN254 Groth16 prover, through `wgpu`, on native and in a browser.
 //!
-//! # State: stages 0 to 4, and the front half of the MSM
+//! # State: the whole prover, stages 0 to 9
 //!
 //! [`gen::field`] emits the whole BN254
 //! field prelude (`Fr`, `Fq`, `Fq2`) as WGSL text. [`device`], [`pipelines`], [`params`] and
@@ -10,22 +10,25 @@
 //! stage 0, the CSR gather, restructured onto 7 storage buffers because the Metal original
 //! binds 10 and the browser floor allows 8. [`ntt`] and [`gen::ntt`] are stages 1 to 3, the
 //! six transforms with the bit-reverse, the `1/n` normalisation and the coset shift fused
-//! into their loads. [`stages`] is U7: it drives all of stages 0 to 4 into **one submit**
+//! into their loads. [`stages`] drives all of stages 0 to 4 into **one submit**
 //! and hands back [`g16_core::HPoly::Device`] carrying a [`stages::WgpuHandle`], so `H`
 //! never touches the host. [`pointwise`] and [`gen::pointwise`] are stage 4, and they are
 //! what the prover dispatches: the fused NTT epilogue the design specifies is implemented
 //! and tested here too, and it measured slower. See [`stages::Stage4`]. [`msm`] and
-//! [`gen::msm`] are U8, the front half of stages 5 to 9: the signed-digit recoding, the 0/1
+//! [`gen::msm`] are the front half of stages 5 to 9: the signed-digit recoding, the 0/1
 //! classification and the counting sort that makes one thread own one bucket by construction,
 //! so no 64-bit atomic is ever needed. It touches no curve arithmetic.
 //!
-//! [`points`] and [`gen::points`] are the back half, U10 and U9: the XYZZ curve arithmetic
+//! [`points`] and [`gen::points`] are the back half: the XYZZ curve arithmetic
 //! and the five point kernels, emitted once per curve and instantiated for both BN254 groups.
 //! [`MsmPointsG1`] is four of a proof's five MSMs (A, B-G1, L, H) and [`MsmPointsG2`] is the
 //! fifth.
 //!
-//! There is still no `Backend` implementation and no proof. U11 is where the two halves of
-//! an MSM become one.
+//! [`batch`] joins the two halves: it shares one set of MSM modules across every circuit and
+//! runs all five jobs of a proof in one submit. [`backend`] is the `g16_core::Backend` and
+//! `g16_core::PreparedCircuit` implementation over the lot, and `wasm` is the same two async
+//! entry points exported to a browser's Web Worker. There is no CPU fallback at any stage and
+//! no size gate, so a `wgpu` number belongs to `wgpu`.
 //!
 //! # Why a fourth backend exists at all
 //!
