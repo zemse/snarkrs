@@ -53,6 +53,11 @@ use num_traits::{One as _, Zero as _};
 #[path = "gpulock/mod.rs"]
 mod gpulock;
 
+// The digit recoding only agrees with the CPU oracle these tests are written against while
+// both lay the scalar out over the same number of bits. `g16-msm` is a dev-dependency of this
+// crate, so the check lives here and not next to the constant.
+const _: () = assert!(g16_wgpu::msm::RECODE_BITS as usize == g16_msm::RECODE_BITS);
+
 // ---------------------------------------------------------------------------
 // Device, built once for the whole binary
 // ---------------------------------------------------------------------------

@@ -48,6 +48,9 @@ pub const ENTRY_BYTES: u64 = 8;
 /// Bits the signed recoding is laid out over: 254 for BN254's `Fr`, plus one so the carry out
 /// of the top window is provably zero. Must match `g16_msm::RECODE_BITS` and
 /// `g16_metal::msm::RECODE_BITS`, and [`crate::gen::msm`]'s module docs carry the proof.
+///
+/// `g16-msm` is a dev-dependency here and not a runtime one, so the comparison against it is
+/// a `const _` in `tests/msm_digits.rs` rather than in this file.
 pub const RECODE_BITS: u32 = 255;
 
 /// Caps the bucket array at 2^15 rows per window.
