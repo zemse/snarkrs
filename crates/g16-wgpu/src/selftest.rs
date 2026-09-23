@@ -34,7 +34,7 @@
 //! On wasm it does not take that guard, and must not: the guard is a `std::sync::Mutex` and
 //! the battery would hold it across every `.await` below, so on a browser's one thread a
 //! second caller would deadlock the worker rather than queue. There is one thread and one
-//! device there, and [`crate::wasm`] serialises its entry points on `busy` instead.
+//! device there, and `crate::wasm` serialises its entry points on `busy` instead.
 
 use g16_field::Fr;
 use g16_gpu_layout::{PackedFr, LIMBS};
@@ -61,12 +61,15 @@ impl Check {
             self.name,
             self.ok,
             self.us,
-            json_str(&self.detail)
+            json_string(&self.detail)
         )
     }
 }
 
-fn json_str(s: &str) -> String {
+/// Minimal JSON string escaping, for check details and for the adapter strings
+/// `crate::wasm` reads off a driver. Here rather than there because this file is the
+/// target-independent one.
+pub(crate) fn json_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {
@@ -103,7 +106,7 @@ pub enum Battery {
     /// The two checks that stand between this prover and a silently wrong proof, and nothing
     /// else. Measured at about 350 ms on Safari 26.6 and 40 ms on Chrome 152, both dominated
     /// by the first shader compile of the process. Run unconditionally when the device is
-    /// opened; see [`crate::wasm::create_prover`].
+    /// opened; see `crate::wasm::create_prover`.
     Guard,
     /// Everything. Adds the fence timing, `mul64` on its own, atomics, workgroup memory and
     /// dynamic uniform offsets: the checks that turn "the GPU is wrong" into "*this* is
@@ -931,9 +934,9 @@ pub async fn module_diagnostics(kernels: &[&crate::pipelines::Kernels]) -> Strin
             .collect();
         rows.push(format!(
             r#"{{"module":{},"messages":[{}]}}"#,
-            json_str(k.label()),
+            json_string(k.label()),
             msgs.iter()
-                .map(|m| json_str(m))
+                .map(|m| json_string(m))
                 .collect::<Vec<_>>()
                 .join(",")
         ));

@@ -61,6 +61,7 @@ use web_time::Instant;
 use crate::backend::WgpuCircuit;
 use crate::batch::MsmBatch;
 use crate::device::{LimitsProfile, WgpuBackend};
+use crate::selftest::json_string;
 
 /// Everything one worker holds. There is exactly one, in a `thread_local`, because there is
 /// exactly one device and wasm32 without `+atomics` has exactly one thread.
@@ -180,7 +181,7 @@ fn alloc(len: usize) -> *mut u8 {
 
 /// Reclaims an allocation, checking it against the ones actually handed out.
 ///
-/// # Safety
+/// # The invariant, and why it is checked rather than trusted
 ///
 /// `ptr` must be one [`alloc`] returned and not yet taken. That is checked against `ALLOCS`
 /// rather than trusted, because the caller is a JavaScript file and the alternative is
@@ -481,25 +482,6 @@ pub async fn shader_diagnostics() -> Result<String, JsError> {
     Ok(crate::selftest::module_diagnostics(&mods).await)
 }
 
-/// Minimal JSON string escaping, for adapter strings that come from a driver.
-fn json_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
 /// Uploads everything witness independent: the CSR, both twiddle tables, the coset powers and
 /// all five base vectors. This is the "warm" half of every number this repo publishes.
 ///
@@ -741,7 +723,7 @@ fn claim(what: &str) -> Result<(Rc<WgpuCircuit>, Rc<Vec<Fr>>), JsError> {
 /// Forces the MSM reduction width, or 0 to use each curve's measured one.
 ///
 /// Must be called before `create_prover`, because that is when the pipelines are compiled.
-/// See [`g16_wgpu::points::REDUCE_TG_OVERRIDE`] for why this is a knob: the shipped widths
+/// See [`crate::points::REDUCE_TG_OVERRIDE`] for why this is a knob: the shipped widths
 /// are a measurement from one class of GPU, and the G2 one lands exactly on the workgroup
 /// storage an iPhone grants.
 #[wasm_bindgen]
@@ -749,17 +731,21 @@ pub fn set_reduce_tg(tg: u32) {
     crate::points::REDUCE_TG_OVERRIDE.store(tg, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Replaces the merge kernel's body, or 0 to keep it. 1 makes it return immediately, so
-/// the dispatch still happens and none of the code runs. A bisection gate; the result is
-/// wrong on purpose. Must be called before `create_prover`, because the shader text is
+/// Replaces the merge kernel's body, or 0 to keep it. A bisection gate; every level but 0
+/// is wrong on purpose. Must be called before `create_prover`, because the shader text is
 /// generated when the pipelines are built.
+///
+/// 1 returns immediately, so the dispatch still happens and none of the code runs. 2 keeps
+/// the loop and drops every point operation, 3 keeps the point operation and drops the loop,
+/// and 5 is the two-call-site shape that loses an iPhone 15 Pro's device. There is no 4. See
+/// [`crate::gen::points::MERGE_BODY`].
 #[wasm_bindgen]
 pub fn set_merge_body(level: u32) {
     crate::gen::points::MERGE_BODY.store(level, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Restores the reduce kernel's pre-fix per-thread body at level 1, or 0 for the one that
-/// ships. See [`g16_wgpu::gen::points::REDUCE_BODY`]: the pre-fix spelling computes the same
+/// ships. See [`crate::gen::points::REDUCE_BODY`]: the pre-fix spelling computes the same
 /// window sum and gets it wrong on an iPhone, so this is how to ask a future Safari whether
 /// that is still true. Before `create_prover`, like `set_merge_body`.
 #[wasm_bindgen]
@@ -768,7 +754,7 @@ pub fn set_reduce_body(level: u32) {
 }
 
 /// Restores the two-call-site `pt_mul_small_*`, or 0 for the folded spelling that ships.
-/// See [`g16_wgpu::gen::points::MUL_SMALL_BODY`]. Before `create_prover`, like
+/// See [`crate::gen::points::MUL_SMALL_BODY`]. Before `create_prover`, like
 /// `set_merge_body`.
 #[wasm_bindgen]
 pub fn set_mul_small_body(level: u32) {
