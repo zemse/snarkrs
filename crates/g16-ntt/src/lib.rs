@@ -450,6 +450,15 @@ fn chunk_len(n: usize, tasks: usize) -> usize {
         .min(n.max(1))
 }
 
+/// Butterflies per task when a pass has fewer blocks than tasks, so the only parallelism
+/// left is inside a block and the strip itself has to be split.
+fn strip_chunk(strip: usize, blocks: usize, tasks: usize) -> usize {
+    strip
+        .div_ceil(tasks.div_ceil(blocks))
+        .max(MIN_BUTTERFLIES_PER_TASK)
+        .min(strip)
+}
+
 /// Moves element `i` to `bit_reverse(i)`, which is what turns the recursive even/odd split
 /// of decimation in time into a flat in-place loop.
 pub fn bit_reverse_permute(a: &mut [Fr], log_n: u32) {
@@ -573,19 +582,11 @@ fn parallel_pass<const DIF: bool>(
         let per_task = blocks
             .div_ceil(tasks)
             .max(MIN_BUTTERFLIES_PER_TASK.div_ceil(half));
-        a.par_chunks_mut(per_task * block_len).for_each(|group| {
-            for block in group.chunks_mut(block_len) {
-                let (lo, hi) = block.split_at_mut(half);
-                butterflies::<DIF>(lo, hi, twiddles, stride, 0);
-            }
-        });
+        a.par_chunks_mut(per_task * block_len)
+            .for_each(|group| serial_pass::<DIF>(group, half, twiddles, stride));
     } else {
-        // Late passes: few blocks, and the last one covers the whole array. The only
-        // parallelism left is inside a block, so split the butterfly range itself.
-        let chunk = half
-            .div_ceil(tasks.div_ceil(blocks))
-            .max(MIN_BUTTERFLIES_PER_TASK)
-            .min(half);
+        // Late passes: few blocks, and the last one covers the whole array.
+        let chunk = strip_chunk(half, blocks, tasks);
         a.par_chunks_mut(block_len).for_each(|block| {
             let (lo, hi) = block.split_at_mut(half);
             lo.par_chunks_mut(chunk)
@@ -617,10 +618,7 @@ fn parallel_quad_pass_dit(a: &mut [Fr], half: usize, twiddles: &[Fr], tasks: usi
             quad_dit(quad_strips(block, half), twiddles, s2, half, 0);
         });
     } else {
-        let chunk = half
-            .div_ceil(tasks.div_ceil(blocks))
-            .max(MIN_BUTTERFLIES_PER_TASK)
-            .min(half);
+        let chunk = strip_chunk(half, blocks, tasks);
         a.par_chunks_mut(block_len).for_each(|block| {
             let [x0, x1, x2, x3] = quad_strips(block, half);
             x0.par_chunks_mut(chunk)
@@ -647,10 +645,7 @@ fn parallel_quad_pass_dif(a: &mut [Fr], half: usize, twiddles: &[Fr], tasks: usi
             quad_dif(quad_strips(block, hh), twiddles, s1, hh, 0);
         });
     } else {
-        let chunk = hh
-            .div_ceil(tasks.div_ceil(blocks))
-            .max(MIN_BUTTERFLIES_PER_TASK)
-            .min(hh);
+        let chunk = strip_chunk(hh, blocks, tasks);
         a.par_chunks_mut(block_len).for_each(|block| {
             let [y0, y1, y2, y3] = quad_strips(block, hh);
             y0.par_chunks_mut(chunk)
