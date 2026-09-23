@@ -66,11 +66,6 @@ pub struct ZkeyContribution {
     pub params: ContributionParams,
 }
 
-impl ZkeyContribution {
-    /// Fixed bytes before the params: `3*sG1 + sG2 + 64 + 4 + 4`.
-    pub const PREFIX_BYTES: usize = 3 * crate::SG1 + crate::SG2 + 72;
-}
-
 /// zkey section 10.
 ///
 /// A freshly generated zkey has exactly 68 bytes here: the 64-byte `csHash` then a u32

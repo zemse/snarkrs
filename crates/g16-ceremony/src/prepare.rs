@@ -56,8 +56,8 @@ use std::path::Path;
 use ark_ec::short_weierstrass::{Affine, Projective};
 use g16_field::raw::{RawFq, RawFq2};
 use g16_field::{
-    raw::RawField, BigInteger, FftField, Field, Fq, Fq2, Fr, G1Affine, G1Projective, G2Affine,
-    G2Projective, One, PrimeField, Zero,
+    raw::RawField, BigInteger, FftField, Field, Fq, Fq2, Fr, G1Affine, G1Projective, G2Affine, One,
+    PrimeField, Zero,
 };
 use g16_msm::xyzz::{to_projective, RawCurve, Xyzz};
 use g16_msm::{AccelError, GroupFft};
@@ -540,11 +540,6 @@ pub fn lagrange_evaluations_g2(
 /// to affine once, not `2^p` times.
 pub fn group_ifft_g1(a: &mut [G1Projective], fft: &dyn GroupFft) -> Result<(), CeremonyError> {
     group_ifft::<g16_field::g1::Config>(a, fft)
-}
-
-/// [`group_ifft_g1`] over G2.
-pub fn group_ifft_g2(a: &mut [G2Projective], fft: &dyn GroupFft) -> Result<(), CeremonyError> {
-    group_ifft::<g16_field::g2::Config>(a, fft)
 }
 
 fn group_ifft<P: PrepareCurve>(

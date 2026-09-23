@@ -207,13 +207,6 @@ impl R1cs {
         &self.file
     }
 
-    /// Whether sections 4 and 5 are both present, which is r1csfile's whole definition of
-    /// `useCustomGates` (`r1csfile.js:54-55`). Groth16 setup ignores it.
-    pub fn has_custom_gates(&self) -> bool {
-        let has = |id: u32| self.file.sections().iter().any(|s| s.id == id);
-        has(S_CUSTOM_GATES_LIST) && has(S_CUSTOM_GATES_USES)
-    }
-
     /// The whole of section 2, unparsed. Every [`Term::coef_ptr`] is an offset into this
     /// slice.
     pub fn constraint_bytes(&self) -> Result<&[u8], CeremonyError> {
