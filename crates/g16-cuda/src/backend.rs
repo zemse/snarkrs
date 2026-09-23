@@ -63,7 +63,7 @@ use g16_zkey::ProvingKey;
 
 use crate::context::Cuda;
 use crate::msm::CudaMsm;
-use crate::stages::CudaStages;
+use crate::stages::{CudaStages, HHandle, TAG};
 
 fn bad(reason: impl Into<String>) -> ProveError {
     ProveError::Backend {
@@ -375,6 +375,19 @@ impl PreparedCircuit for CudaCircuit {
             )));
         }
         self.msm.msms(witness, h, t)
+    }
+
+    /// The debugging seam only: a device `H` costs a full PCIe readback of the whole
+    /// domain, which is the round trip [`HPoly`] exists to avoid.
+    ///
+    /// `None` only for another backend's device handle. A host `HPoly` is copied straight
+    /// out, as the trait default does, because [`Self::msms`] accepts one and so it reaches
+    /// here whenever stages 0 to 4 ran elsewhere.
+    fn h_to_host(&self, h: &HPoly) -> Option<Vec<Fr>> {
+        if let Some(v) = h.to_host() {
+            return Some(v.to_vec());
+        }
+        h.device_handle::<HHandle>(TAG)?.to_host().ok()
     }
 }
 
