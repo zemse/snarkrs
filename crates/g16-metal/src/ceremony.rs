@@ -1019,10 +1019,10 @@ mod tests {
     use g16_ceremony::prepare::{batch_to_affine, point_times_fr};
     use g16_ceremony::CpuKeyScale;
 
-    /// Bits the recoding covers. Same value and same reason as `msm::RECODE_BITS`, which
-    /// is private to that module: `g16_msm::RECODE_BITS` is private to its crate too, so
-    /// the number lives in three places and every one of them is guarded by a test.
+    /// Bits the recoding covers. A local copy because `msm::RECODE_BITS` is private to
+    /// that module.
     const RECODE_BITS: usize = 255;
+    const _: () = assert!(RECODE_BITS == g16_msm::RECODE_BITS);
 
     /// The ladder decomposes a scalar with `sc_signed_digit` from `msm.metal`, whose digit
     /// count comes from this constant. If the shader's copy drifts below the CPU's the top
