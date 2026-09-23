@@ -87,7 +87,7 @@ const MIN_BLOCK: usize = 1 << 12;
 /// chain per thread, so occupancy comes from the grid, not the group.
 const THREADGROUP: usize = 64;
 
-/// Attempts at one command buffer before giving up. See
+/// Attempts at one command buffer before giving up, counting the first submission. See
 /// [`FftKernels::dispatch_with_retry`]: a macOS interactivity kill is a scheduling event,
 /// not an arithmetic one, and a power-20 `ptau prepare` is seventeen minutes of work to
 /// throw away over one.
@@ -262,7 +262,7 @@ impl FftGroup for FftG2 {
     // produce the same buffer; see `FftG1::BUDGET`. 2^17 was 350 ms median and 390 ms at
     // the top at power 19, and that is the size macOS objects to: at power 17 on a machine
     // also driving a display it lost 5 of 6 runs to `ImpactingInteractivity` after all four
-    // retries, where every budget at or below 2^16 finished 24 of 24 in the same window.
+    // attempts, where every budget at or below 2^16 finished 24 of 24 in the same window.
     // 2^16 is 179 ms median, 210 ms at the top, for +3.7% of G2's GPU-busy time. Those are
     // the pre-GLV ladder's too; on this one 2^16 measured 129 ms median and 141 ms at the
     // top over the 33 G2 buffers of a power-17 run, and the 3.5x ratio that sets the pair
@@ -380,10 +380,11 @@ impl FftKernels {
         self.min_block
     }
 
-    /// Moves the crossover. A test passes 1 so that a power-10 file, whose largest block
-    /// is 2^11, reaches the device at all; a measurement passes a sweep. Consuming rather
-    /// than a setter because the pipelines are already built and nothing else about the
-    /// instance changes.
+    /// Moves the crossover. `g16-ceremony/tests/prepare_metal.rs` passes 1 so that a
+    /// power-10 file, whose largest block is 2^11, reaches the device at all, and
+    /// `usize::MAX` to hold the same file to the host fallback; a measurement passes a
+    /// sweep. Consuming rather than a setter because the pipelines are already built and
+    /// nothing else about the instance changes.
     pub fn with_min_block(mut self, n: usize) -> Self {
         self.min_block = n;
         self
@@ -747,9 +748,9 @@ fn bit_reverse_index(i: usize, bits: u32) -> usize {
     ((i as u32).reverse_bits() >> (u32::BITS - bits)) as usize
 }
 
-/// `G16_METAL_FFT_MIN_BLOCK` overrides [`MIN_BLOCK`]. Only the tests set it, and they set
-/// it to 0 so that a block small enough to run in a second still takes the device path;
-/// with the default in force a power-13 file would be compared against itself.
+/// `G16_METAL_FFT_MIN_BLOCK` overrides [`MIN_BLOCK`] for a sweep from the CLI. Nothing in
+/// the workspace sets it: the tests move the crossover through
+/// [`FftKernels::with_min_block`] instead.
 fn env_min_block() -> usize {
     env_usize("G16_METAL_FFT_MIN_BLOCK").unwrap_or(MIN_BLOCK)
 }

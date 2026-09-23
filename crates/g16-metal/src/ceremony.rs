@@ -114,8 +114,8 @@ impl MsmBackend for MetalMsmBackend {
 
 /// The group inverse FFT behind `ptau prepare`, the slowest command in the project.
 ///
-/// A wrapper over [`FftKernels`], which owns the kernels, the twiddle table and the
-/// single-command-buffer submission. What the trait adds on top is the error mapping and
+/// A wrapper over [`FftKernels`], which owns the kernels, the twiddle tables and the
+/// budgeted, retried submission. What the trait adds on top is the error mapping and
 /// the crossover: `min_block` is the backend's own number, so `prepare::ifft_block`
 /// (prepare.rs:352) carries no backend-shaped branch and the threshold can move without
 /// touching the ceremony crate.
@@ -423,9 +423,9 @@ struct GroupPipelines {
     affine_finish: ComputePipelineState,
 }
 
-/// Position of `c` in [`CER_WINDOWS`], clamped to the compiled range rather than
-/// rejected: an out-of-range width can only come from the env override, and a sweep that
-/// silently ran the wrong width would be reported as a measurement.
+/// Position of `c` in [`CER_WINDOWS`]. [`env_window`] has already filtered to a compiled
+/// width and the tests pick theirs out of `CER_WINDOWS`, so the fallback is unreachable;
+/// it is there to keep the function total.
 pub(crate) fn window_index(c: u32) -> usize {
     CER_WINDOWS
         .iter()
