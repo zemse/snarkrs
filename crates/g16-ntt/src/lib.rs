@@ -733,23 +733,34 @@ mod tests {
 
     #[test]
     fn round_trips_for_every_size_up_to_2_12() {
+        // The threshold falls inside this range, so `ntt` takes both of its path choices
+        // here. Each path is also driven directly, because `ntt` alone would leave the
+        // serial one covering nothing but the bottom of the loop.
+        assert!(2 < PARALLEL_THRESHOLD && PARALLEL_THRESHOLD <= 1usize << 12);
         let ntt = CpuNtt::new();
         for log in 1..=12u32 {
             let n = 1usize << log;
             let d = domain(n);
             let original = sample(n, 0xC0FFEE + log as u64);
+            for parallel in [false, true] {
+                let mut a = original.clone();
+                ntt.transform(&d, &mut a, Direction::Forward, parallel);
+                assert_ne!(a, original, "forward was a no-op at n = {n}, {parallel}");
+                ntt.transform(&d, &mut a, Direction::Inverse, parallel);
+                assert_eq!(a, original, "round trip failed at n = {n}, {parallel}");
+            }
             let mut a = original.clone();
             ntt.ntt(&d, &mut a, Direction::Forward);
-            assert_ne!(a, original, "forward transform was a no-op at n = {n}");
             ntt.ntt(&d, &mut a, Direction::Inverse);
-            assert_eq!(a, original, "round trip failed at n = {n}");
+            assert_eq!(a, original, "round trip through `ntt` failed at n = {n}");
         }
     }
 
     #[test]
     fn round_trips_through_the_parallel_path() {
-        // The loop above stays under PARALLEL_THRESHOLD, so these are the sizes that
-        // exercise `ntt` as the prover will actually hit it.
+        // 2^13 is the smallest size whose outer passes go through the radix-4 quad pair,
+        // and 2^14 adds the radix-2 pass that mops up an odd count after it. The loop
+        // above stops one size short of both.
         let ntt = CpuNtt::new();
         for log in [13u32, 14] {
             let n = 1usize << log;
