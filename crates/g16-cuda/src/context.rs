@@ -127,17 +127,19 @@ impl Cuda {
     ///
     /// **So what does this cache buy, honestly.** It covers the NVRTC stage only. With
     /// `~/.nv` warm it saves nothing measurable: 0.30 s either way, verified by running
-    /// with `G16_CUDA_NO_CACHE=1`. With `~/.nv` cold it removes 113 s of the 283, and the
-    /// remaining 175 s of driver JIT is not something a process can cache for itself
-    /// through this API. That is a real but partial win, and it is the reason to keep it
-    /// rather than a reason to have built it: the driver's cache is a fixed-size LRU shared
-    /// by every CUDA process on the machine (`CUDA_CACHE_MAXSIZE`, one gigabyte by
-    /// default), a 30 MB entry in it is evictable by unrelated work, and an entry that
-    /// survives here is one that cannot be evicted by someone else's job.
+    /// with `G16_CUDA_NO_CACHE=1`. With `~/.nv` cold it removes 113 s of the 283 and leaves
+    /// the 175 s of driver JIT on the table. That half is cacheable too and this does not do
+    /// it yet: `cuLinkCreate_v2` / `cuLinkAddData_v2(CU_JIT_INPUT_PTX)` / `cuLinkComplete`
+    /// hand back the assembled cubin in host memory, and `Ptx::from_binary` plus
+    /// `load_module` already take one. What it costs is the key, because a cubin is not
+    /// forward compatible the way PTX is: the key would have to grow the exact SM and the
+    /// driver version. Filed as OPT-24.
     ///
-    /// An earlier version of this comment claimed the cache meant "compile once ever, then
-    /// pay 120 ms of driver JIT". The 120 ms was a warm-`~/.nv` measurement quoted as if it
-    /// held on a cold machine, which it does not. Corrected above.
+    /// So this is a real but partial win, and it is the reason to keep it rather than a
+    /// reason to have built it: the driver's cache is a fixed-size LRU shared by every CUDA
+    /// process on the machine (`CUDA_CACHE_MAXSIZE`, one gigabyte by default), a 30 MB entry
+    /// in it is evictable by unrelated work, and an entry that survives here is one that
+    /// cannot be evicted by someone else's job.
     ///
     /// Two ways to shrink the generated code were measured and neither is worth taking:
     ///
