@@ -133,8 +133,7 @@ impl CpuNtt {
         check_domain(domain, a.len());
         let n = a.len();
         // Size 1 has an empty twiddle table and `size_inv == 1`, so both directions are
-        // the identity. Bailing here also keeps the `usize::BITS - log_size` shift below
-        // from being a shift by the full word width.
+        // the identity.
         if n <= 1 {
             return;
         }
