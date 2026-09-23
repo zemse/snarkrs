@@ -106,8 +106,8 @@ impl CpuCircuit {
             // A decreasing pair makes `lo..hi` in `gather` an empty range, so that row
             // would accumulate `Fr::zero()` with no panic and no error, and the proof that
             // came out would fail `snarkjs groth16 verify` with nothing in any log. The
-            // three GPU backends already refuse such a key (`CsrTables::build` and its
-            // Metal and CUDA counterparts), and this backend is the oracle they are diffed
+            // same two loops belong in every backend's prepare path (`CsrHost::build` is
+            // g16-wgpu's copy), and this backend is the oracle the other three are diffed
             // against, so it must not be the one copy that proves garbage quietly.
             for c in 1..row_ptr.len() {
                 if row_ptr[c] < row_ptr[c - 1] {
