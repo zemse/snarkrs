@@ -265,7 +265,6 @@ impl PreparedCircuit for CpuCircuit {
         // The three windows below overlap, like the MSM annotations. `ntt_us` takes the
         // whole wall-clock window, coset shift included, so from here `pointwise_us`
         // covers stage 4 only.
-        let mut pointwise_us = 0u64;
         let start = Instant::now();
         let pipeline = |v: &mut [Fr]| self.ntt.intt_coset_ntt(&self.domain, v, self.coset_shift);
         rayon::join(
@@ -295,8 +294,7 @@ impl PreparedCircuit for CpuCircuit {
                 .zip(c.par_iter())
                 .for_each(|((x, y), z)| *x = *x * y - z)
         );
-        pointwise_us += start.elapsed().as_micros() as u64;
-        t.pointwise_us += pointwise_us;
+        t.pointwise_us += start.elapsed().as_micros() as u64;
 
         Ok(HPoly::Host(a))
     }
