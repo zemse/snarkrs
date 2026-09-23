@@ -428,6 +428,16 @@ impl PreparedCircuit for MetalCircuit {
         })
     }
 
+    /// Without this the trait default reports "no H" for every device handle, so
+    /// `g16 trace` on this backend would print the H rows empty. Debugging seam only: it
+    /// costs a full-domain readback, which is the round trip [`HPoly`] exists to avoid.
+    fn h_to_host(&self, h: &HPoly) -> Option<Vec<Fr>> {
+        match h.device_handle::<HHandle>(crate::stages::TAG) {
+            Some(handle) => Some(handle.to_host()),
+            None => h.to_host().map(<[Fr]>::to_vec),
+        }
+    }
+
     /// Stages 0-9, with stages 5-8 started before `H` exists.
     ///
     /// Only stage 9 reads the buffer stage 4 writes; the other four MSMs read the
@@ -589,6 +599,31 @@ mod tests {
             verify(&vk, &public, &proof).unwrap_or_else(|e| panic!("{name}: {e}"));
             // A backend that reported nothing would make `bench` print a free prover.
             assert!(t.msm_us > 0, "{name}: msms reported no time");
+        });
+    }
+
+    /// `g16_core::trace` is the only caller and it takes the trait default unless a
+    /// backend overrides it; the default cannot see through a device handle, so without
+    /// the override every Metal trace recorded "no H".
+    #[test]
+    fn h_to_host_reads_the_device_handle_back() {
+        for_each("h_to_host_reads_the_device_handle_back", |name, dir| {
+            let (circuit, witness, _) = load(dir);
+            let mut t = StageTimings::default();
+            let h = circuit.compute_h(&witness, &mut t).unwrap();
+            assert!(
+                h.to_host().is_none(),
+                "{name}: H did not stay on the device"
+            );
+            let host = circuit
+                .h_to_host(&h)
+                .unwrap_or_else(|| panic!("{name}: no H"));
+            assert_eq!(host.len(), circuit.domain_size(), "{name}");
+            let cpu = g16_core::cpu::CpuBackend::new()
+                .prepare(ProvingKey::load(&dir.join("circuit.zkey")).unwrap())
+                .unwrap();
+            let want = cpu.compute_h(&witness, &mut t).unwrap();
+            assert_eq!(host.as_slice(), want.to_host().expect("cpu h"), "{name}");
         });
     }
 
