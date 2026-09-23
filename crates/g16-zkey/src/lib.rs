@@ -361,8 +361,16 @@ fn read_g2_section(file: &BinFile, id: u32, n: usize) -> Result<Vec<G2Affine>, Z
     data.par_chunks_exact(G2_BYTES).map(g2).collect()
 }
 
+fn valid_g1(p: &G1Affine) -> bool {
+    p.is_on_curve() && p.is_in_correct_subgroup_assuming_on_curve()
+}
+
+fn valid_g2(p: &G2Affine) -> bool {
+    p.is_on_curve() && p.is_in_correct_subgroup_assuming_on_curve()
+}
+
 fn check_g1(p: &G1Affine, section: u32, what: &str) -> Result<(), ZkeyError> {
-    if !p.is_on_curve() || !p.is_in_correct_subgroup_assuming_on_curve() {
+    if !valid_g1(p) {
         return Err(ZkeyError::Malformed {
             section,
             reason: format!("{what} is not a valid G1 point"),
@@ -372,7 +380,7 @@ fn check_g1(p: &G1Affine, section: u32, what: &str) -> Result<(), ZkeyError> {
 }
 
 fn check_g2(p: &G2Affine, section: u32, what: &str) -> Result<(), ZkeyError> {
-    if !p.is_on_curve() || !p.is_in_correct_subgroup_assuming_on_curve() {
+    if !valid_g2(p) {
         return Err(ZkeyError::Malformed {
             section,
             reason: format!("{what} is not a valid G2 point"),
@@ -551,14 +559,10 @@ fn json_fq(v: &serde_json::Value, what: &str) -> Result<Fq, ZkeyError> {
     let n: num_bigint::BigUint = s
         .parse()
         .map_err(|_| ZkeyError::BadJson(format!("{what} is not a decimal integer: {s:?}")))?;
-    let bytes = n.to_bytes_le();
-    let bi = ark_ff::BigInt::<4>::try_from(n.clone())
+    let bi = ark_ff::BigInt::<4>::try_from(n)
         .map_err(|_| ZkeyError::BadJson(format!("{what} does not fit in 256 bits")))?;
     Fq::from_bigint(bi).ok_or_else(|| {
-        ZkeyError::BadJson(format!(
-            "{what} is not below the base field modulus ({} bytes)",
-            bytes.len()
-        ))
+        ZkeyError::BadJson(format!("{what} is not below the base field modulus: {s}"))
     })
 }
 
@@ -582,7 +586,11 @@ fn json_g1(v: &serde_json::Value, what: &str) -> Result<G1Affine, ZkeyError> {
         )));
     }
     let p = G1Affine::new_unchecked(x, y);
-    check_g1(&p, 0, what).map_err(|e| ZkeyError::BadJson(e.to_string()))?;
+    if !valid_g1(&p) {
+        return Err(ZkeyError::BadJson(format!(
+            "{what} is not a valid G1 point"
+        )));
+    }
     Ok(p)
 }
 
@@ -611,7 +619,11 @@ fn json_g2(v: &serde_json::Value, what: &str) -> Result<G2Affine, ZkeyError> {
         )));
     }
     let p = G2Affine::new_unchecked(x, y);
-    check_g2(&p, 0, what).map_err(|e| ZkeyError::BadJson(e.to_string()))?;
+    if !valid_g2(&p) {
+        return Err(ZkeyError::BadJson(format!(
+            "{what} is not a valid G2 point"
+        )));
+    }
     Ok(p)
 }
 
