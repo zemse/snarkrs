@@ -38,15 +38,10 @@ pub const FR_BYTES: usize = 32;
 /// Where a binfile's bytes live. Both variants deref to `&[u8]`, so nothing below this
 /// type, and no decoder in `lib.rs` or `wtns.rs`, knows which one it got.
 ///
-/// The split exists because the browser has no filesystem to map. `wasm32-unknown-unknown`
-/// has no `open(2)`: a zkey arrives over `fetch` and is written into linear memory, so an
-/// owned `Vec<u8>` is the only backing that can exist there.
-///
-/// This is not a build fix, and it would be dishonest to sell it as one. Checked before
-/// the change: memmap2 0.9.11 compiles for wasm32 and `cargo build --target
-/// wasm32-unknown-unknown -p g16-zkey` already succeeded. What it fixes is an API that
-/// links and then cannot work, because `File::open` on that target fails at runtime for
-/// every path there is.
+/// The split exists because the browser has no filesystem to map.
+/// `wasm32-unknown-unknown` has no `open(2)`, so `File::open` there fails at runtime for
+/// every path there is: a zkey arrives over `fetch` and is written into linear memory,
+/// and an owned `Vec<u8>` is the only backing that can exist on that target.
 ///
 /// `Mapped` stays the native default and is not a micro-optimisation: `js_16x16_d32`'s
 /// zkey is 94.4 MB (`bench/artifacts/manifest.csv`) and mmap keeps it out of the process
@@ -349,13 +344,6 @@ impl<'a> Cursor<'a> {
 
     pub fn remaining(&self) -> usize {
         self.data.len() - self.pos
-    }
-
-    /// Bytes consumed so far. The ceremony readers need it because both param blobs
-    /// self-check by requiring the cursor to land exactly on the section end
-    /// (`powersoftau_utils.js:239`, `zkey_utils.js:481-483`).
-    pub fn pos(&self) -> usize {
-        self.pos
     }
 
     fn short(&self, want: usize) -> ZkeyError {
