@@ -540,12 +540,11 @@ fn apply_contribution(
     write_header(&mut w, power, power)?;
 
     // Payload offsets in the file being written, so the uncompressed pass can seek to
-    // them. Every length up to section 6 is fixed by `power`, and 12 bytes of entry header
-    // precede each payload (`binfileutils.js:53-58`).
-    let mut at = 12 + 12 + PtauHeader::BYTES as u64;
+    // them. Every length up to section 6 is fixed by `power` (`binfileutils.js:53-58`).
+    let mut at = ptau::PREAMBLE_BYTES + ptau::SECTION_FRAMING + PtauHeader::BYTES as u64;
     let mut starts = [0u64; 5];
     for (i, plan) in plans.iter().enumerate() {
-        at += 12;
+        at += ptau::SECTION_FRAMING;
         starts[i] = at;
         at += plan.n_points as u64
             * if plan.id == ptau::S_TAU_G2 || plan.id == ptau::S_BETA_G2 {

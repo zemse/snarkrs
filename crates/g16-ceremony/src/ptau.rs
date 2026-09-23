@@ -134,8 +134,8 @@ const DIGEST_BYTES: usize = 64;
 /// The 12 bytes of framing every section costs: `u32 id`, `u64 length`
 /// (`binfileutils.js:23-32`). The file preamble is the same width by coincidence: 4 magic
 /// bytes, `u32 version`, `u32 nSections`.
-const SECTION_FRAMING: u64 = 12;
-const PREAMBLE_BYTES: u64 = 12;
+pub(crate) const SECTION_FRAMING: u64 = 12;
+pub(crate) const PREAMBLE_BYTES: u64 = 12;
 
 /// Section 1. `n8` and `q` are checked against BN254 at open, so they are not kept: the
 /// curve is identified by `q` alone and there is no curve-name field anywhere in the
