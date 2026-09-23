@@ -58,7 +58,6 @@ use g16_zkey::ProvingKey;
 
 use crate::batch::{G1Bases, G2Bases, Group, Job, MontConvert, MsmBatch, Source};
 use crate::device::{bad, WgpuBackend};
-use crate::pipelines::PrepareCost;
 use crate::stages::{HStages, WgpuHandle};
 
 // `Backend` and `PreparedCircuit` are the synchronous traits, `Stage4` is only reachable
@@ -95,7 +94,6 @@ pub struct CircuitCost {
 pub struct WgpuProver {
     device: Arc<WgpuBackend>,
     msm: Arc<MsmBatch>,
-    cost: PrepareCost,
 }
 
 impl WgpuProver {
@@ -143,17 +141,11 @@ impl WgpuProver {
         Ok(Self {
             device,
             msm: Arc::new(msm),
-            cost,
         })
     }
 
     pub fn device(&self) -> &Arc<WgpuBackend> {
         &self.device
-    }
-
-    /// What the three MSM modules cost to compile, which is paid once per process.
-    pub fn msm_compile_cost(&self) -> PrepareCost {
-        self.cost
     }
 
     /// The shared MSM pipelines, for a report. `tests/proof.rs` reads

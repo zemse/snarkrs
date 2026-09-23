@@ -518,11 +518,6 @@ impl Ntt {
         self.max_fused
     }
 
-    /// The forced flat workgroup size, or `None` when each tile got its own.
-    pub fn forced_workgroup(&self) -> Option<u32> {
-        self.workgroup
-    }
-
     /// Threads per workgroup the entry points at tile size `k` were generated at.
     pub fn workgroup_for(&self, k: u32) -> u32 {
         self.workgroup.unwrap_or_else(|| wgsl::workgroup_for(k))
