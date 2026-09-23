@@ -476,7 +476,7 @@ mod tests {
             let mut t = StageTimings::default();
             let p1 = prove_with_blinders(circuit.as_ref(), &witness, r, s, &mut t).unwrap();
             let p2 = prove_with_blinders(circuit.as_ref(), &witness, r, s, &mut t).unwrap();
-            assert_eq!((p1.a, p1.b, p1.c), (p2.a, p2.b, p2.c));
+            assert_eq!(p1, p2);
 
             let vk = VerifyingKey::from_json(&a.dir.join("vkey.json")).unwrap();
             verify(&vk, &public_inputs(&a.dir), &p1).unwrap();

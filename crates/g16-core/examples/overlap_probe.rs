@@ -19,33 +19,13 @@ use std::path::Path;
 use std::time::Instant;
 
 use g16_core::{cpu::CpuBackend, Backend, MsmOutputs, StageTimings};
-use g16_field::{Fr, G1Projective, G2Projective};
+use g16_field::{Fr, G1Projective};
 use g16_msm::{CpuMsm, MsmBackend};
 use g16_zkey::{wtns::Witness, ProvingKey};
 
 const ROUNDS: usize = 9;
 
-struct Outs {
-    a_g1: G1Projective,
-    b_g2: G2Projective,
-    b_g1: G1Projective,
-    l_g1: G1Projective,
-    h_g1: G1Projective,
-}
-
-impl From<MsmOutputs> for Outs {
-    fn from(m: MsmOutputs) -> Self {
-        Outs {
-            a_g1: m.a_g1,
-            b_g2: m.b_g2,
-            b_g1: m.b_g1,
-            l_g1: m.l_g1,
-            h_g1: m.h_g1,
-        }
-    }
-}
-
-fn witness_msms(msm: &CpuMsm, pk: &g16_zkey::ProvingKey, witness: &[Fr]) -> Outs {
+fn witness_msms(msm: &CpuMsm, pk: &g16_zkey::ProvingKey, witness: &[Fr]) -> MsmOutputs {
     let l_scalars = &witness[pk.n_public + 1..];
     // Same nesting as the prover's, minus the H job.
     let ((a_g1, b_g2), (b_g1, l_g1)) = rayon::join(
@@ -62,21 +42,13 @@ fn witness_msms(msm: &CpuMsm, pk: &g16_zkey::ProvingKey, witness: &[Fr]) -> Outs
             )
         },
     );
-    Outs {
+    MsmOutputs {
         a_g1,
         b_g2,
         b_g1,
         l_g1,
         h_g1: G1Projective::default(),
     }
-}
-
-fn check(name: &str, a: &Outs, b: &Outs) {
-    assert_eq!(a.a_g1, b.a_g1, "{name}: a_g1");
-    assert_eq!(a.b_g2, b.b_g2, "{name}: b_g2");
-    assert_eq!(a.b_g1, b.b_g1, "{name}: b_g1");
-    assert_eq!(a.l_g1, b.l_g1, "{name}: l_g1");
-    assert_eq!(a.h_g1, b.h_g1, "{name}: h_g1");
 }
 
 fn stats(label: &str, ms: &mut [f64]) {
@@ -114,7 +86,7 @@ fn run(dir: &Path) {
         let mut t = StageTimings::default();
         let start = Instant::now();
         let h = circuit.compute_h(&witness, &mut t).unwrap();
-        let ma: Outs = circuit.msms(&witness, &h, &mut t).unwrap().into();
+        let ma = circuit.msms(&witness, &h, &mut t).unwrap();
         ta.push(start.elapsed().as_secs_f64() * 1e3);
 
         // B: witness MSMs beside compute_h, H MSM after both.
@@ -142,8 +114,8 @@ fn run(dir: &Path) {
         mc.h_g1 = h_g1;
         tc.push(start.elapsed().as_secs_f64() * 1e3);
 
-        check("B", &ma, &mb);
-        check("C", &ma, &mc);
+        assert_eq!(ma, mb, "B");
+        assert_eq!(ma, mc, "C");
     }
     stats("A sequential      ", &mut ta);
     stats("B join, then H    ", &mut tb);

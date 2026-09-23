@@ -131,7 +131,7 @@ impl core::fmt::Debug for ProveError {
 /// This is pinned by a regression test rather than left as folklore, because it is the sort
 /// of property that reads as a bug and gets "fixed" by someone adding a uniqueness check
 /// that does not work.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Proof {
     pub a: G1Affine,
     pub b: G2Affine,
@@ -198,6 +198,7 @@ impl HPoly {
 }
 
 /// The five MSM results, stages 5-9.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MsmOutputs {
     pub a_g1: G1Projective,
     pub b_g2: G2Projective,
