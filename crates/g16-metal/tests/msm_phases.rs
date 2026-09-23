@@ -1,4 +1,4 @@
-//! Splits the Metal MSM stage into its three submissions, to find the size-independent
+//! Splits the Metal MSM stage into its two submissions, to find the size-independent
 //! intercept that makes the GPU lose below the crossover.
 //!
 //! `msms()` does two things: one `upload_scalars` (host pack + memcpy) and one
