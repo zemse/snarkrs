@@ -42,9 +42,10 @@ fn refuse_if_unoptimized() -> Result<(), ProveError> {
     Ok(())
 }
 
-/// Deterministic variant with caller-supplied `r`, `s`. Used only by tests, so a proof
-/// can be compared against a reference implementation bit for bit. Never use in
-/// production: reusing `r`/`s` across proofs of different witnesses leaks the witness.
+/// Deterministic variant with caller-supplied `r`, `s`: for tests that compare a proof
+/// against a reference implementation bit for bit, and for the profiling examples, which
+/// need their reps comparable. Never use in production: reusing `r`/`s` across proofs of
+/// different witnesses leaks the witness.
 pub fn prove_with_blinders(
     circuit: &dyn PreparedCircuit,
     witness: &[Fr],
