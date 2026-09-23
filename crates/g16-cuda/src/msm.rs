@@ -108,6 +108,7 @@ pub(crate) fn drv(what: &str, e: impl std::fmt::Display) -> ProveError {
 /// out of the top window is provably zero. Must match `g16_msm::RECODE_BITS` and the
 /// arithmetic in `sc_signed_digit`.
 const RECODE_BITS: usize = 255;
+const _: () = assert!(RECODE_BITS == g16_msm::RECODE_BITS);
 
 /// Caps the bucket array at 2^15 points per window.
 const MAX_WINDOW: u32 = 16;
