@@ -296,8 +296,9 @@ impl CudaStages {
     /// Compiles `kernels::unit_stages()` and uploads everything witness independent.
     ///
     /// The compile is the expensive half: NVRTC over the gather plus NTT plus pointwise
-    /// unit is tens of milliseconds, comparable to a whole proof at the small domains. It
-    /// belongs here and nowhere else.
+    /// unit is 1.3 s on a T4 ([`crate::context::Cuda::compile`] has the measured table),
+    /// hundreds of times a whole proof at the small domains. It belongs here and nowhere
+    /// else.
     pub fn new(cuda: &Cuda, pk: &ProvingKey) -> Result<Self, ProveError> {
         Self::from_module(cuda, Self::compile(cuda)?, pk)
     }
@@ -342,8 +343,9 @@ impl CudaStages {
         // from Volta up gives a block for free; the second is the 64 KB (Turing) to 163 KB
         // (A100) ceiling that needs a per-function cudaFuncSetAttribute opt in. Taking that
         // opt in would buy one extra fused pass, which at 2^18 turns an 18 = 9 + 9 split
-        // into 18 = 9 + 9, in exchange for an architecture-dependent limit the host would
-        // have to get right on every card. 48 KB holds 1536 Fr, and the largest power of
+        // into 18 = 9 + 9 again (two batches either way), so it changes nothing at the sizes
+        // this prover actually runs, in exchange for an architecture-dependent limit the
+        // host would have to get right on every card. 48 KB holds 1536 Fr, and the largest power of
         // two at or below that is 1024, so k <= 10. Querying beats hardcoding 49152, which
         // is a device property written down as a constant.
         let budget = ctx
@@ -988,14 +990,8 @@ fn elapsed_us(start: &CudaEvent, end: &CudaEvent) -> Result<u64, ProveError> {
 // The device-resident result
 // ---------------------------------------------------------------------------
 
-/// What [`g16_core::HPoly::Device`] carries out of stage 4, under the tag [`TAG`].
-///
-/// Recover it with `h.device_handle::<HHandle>(g16_cuda::stages::TAG)`. It owns the whole
-/// scratch set for the proof, which is what makes the buffers safe to read until the caller
-/// drops the `HPoly`: the scratch goes back into the pool at that point and not before, so a
-/// second concurrent proof cannot be handed buffers stage 9 is still reading.
-///
-/// General-scalar prefix counts plus an order-dependent fold of the raw limbs.
+/// The general-scalar prefix counts and an order-dependent fold of the raw limbs, in that
+/// order.
 ///
 /// The fold is an integrity tag, not a cryptographic hash: it exists to catch the caller
 /// handing `msms` a different witness than the one `compute_h` converted (an API misuse
@@ -1020,6 +1016,13 @@ fn classify_witness(witness: &[g16_field::Fr]) -> (Vec<u32>, u64) {
     (prefix, fold)
 }
 
+/// What [`g16_core::HPoly::Device`] carries out of stage 4, under the tag [`TAG`].
+///
+/// Recover it with `h.device_handle::<HHandle>(g16_cuda::stages::TAG)`. It owns the whole
+/// scratch set for the proof, which is what makes the buffers safe to read until the caller
+/// drops the `HPoly`: the scratch goes back into the pool at that point and not before, so a
+/// second concurrent proof cannot be handed buffers stage 9 is still reading.
+///
 /// The work that produced these buffers was synchronized before `compute_h` returned, so a
 /// consumer on any stream may read them with no further ordering.
 pub struct HHandle {
