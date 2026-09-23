@@ -267,7 +267,8 @@ impl CsrTables {
         let value_bytes = host.value.len() as u64 * 4;
         // The first thing that breaks at scale, so it is named rather than left to a wgpu
         // validation message about an anonymous buffer. 128 MiB at the Floor is 4.19 million
-        // nonzeros, which is a 2^22 domain at the measured 1.13 to 1.69 nonzeros per row.
+        // nonzeros, and this buffer holds A's and B's together, so at the measured 1.13 + 1.69
+        // per row that is about 1.5 million rows and a 2^21 domain is already over.
         if value_bytes > limits.max_storage_buffer_binding_size {
             return Err(bad(format!(
                 "the concatenated coefficient values are {value_bytes} bytes ({} nonzeros at \
