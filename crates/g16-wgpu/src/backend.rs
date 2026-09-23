@@ -632,9 +632,13 @@ impl WgpuCircuit {
     /// [`g16_core::PreparedCircuit::h_to_host`], whose native impl is `block_on` over this,
     /// and which the browser cannot use because every readback here is asynchronous.
     ///
-    /// `None` for an `HPoly` this backend did not write, rather than a guess at how to read
-    /// somebody else's handle.
+    /// `None` only for another backend's device handle, rather than a guess at how to read
+    /// somebody else's pointer. A host `HPoly` is copied straight out: [`Self::msms_async`]
+    /// accepts one, so it reaches here whenever stages 0 to 4 ran elsewhere.
     pub async fn h_to_host_async(&self, h: &HPoly) -> Option<Vec<Fr>> {
+        if let Some(v) = h.to_host() {
+            return Some(v.to_vec());
+        }
         let handle = h.device_handle::<WgpuHandle>(crate::stages::TAG)?;
         handle.to_host(&self.device).await.ok()
     }
