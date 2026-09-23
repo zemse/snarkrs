@@ -519,11 +519,14 @@ struct {pt} {{ x: {fty}, y: {fty}, zz: {fty}, zzz: {fty} }}
     )
 }
 
-/// Which spelling of the two heavy point routines to emit. **1, the step table, ships.**
+/// Which spelling of the two heavy point routines to emit. **2, the split register file,
+/// ships.**
 ///
 /// 0 is the straight-line formula, ten to fourteen inlined `{f}_mul` in one function. 1
 /// drives the same multiplies in the same order from a table, so the whole routine carries
-/// **one**.
+/// **one**, over one `array<{fty}, N>` register file. 2 is 1 with that array split into one
+/// `array<Fq, N>` per Fq2 component, which changes nothing on G1 and is the only spelling
+/// Adreno survives on G2.
 ///
 /// # Why it changed
 ///
@@ -1009,14 +1012,15 @@ fn pt_dbl_{sfx}(p: {pt}) -> {pt} {{
     //
     // The obvious spelling doubles and then conditionally adds, two inlined point operations
     // in one loop, which is the exact shape 29b5940 removed from the merge kernel after it
-    // lost an iPhone 15 Pro's WebGPU device every time. Inlined here it does it again: the
-    // `REDUCE_BODY` ladder's rung 7 is nothing but the correct serial reduction plus one
-    // call of this function, and with the two-site spelling it loses that phone's device on
-    // both of two runs, while rung 3 without it is bit-exact. So the doubling is expressed
-    // through `pt_add` too, which is unified (a == b falls through to `pt_dbl` inside it,
-    // and either argument may be the identity): even steps of `i` double, odd steps fold in
-    // the bit's addend, and the compiler sees a single inlined copy. Twice the loop trips of
-    // the obvious spelling, on a path that is not the reduce kernel's cost. `MUL_SMALL_BODY`
+    // lost an iPhone 15 Pro's WebGPU device every time. Inlined here it does it again:
+    // `REDUCE_BODY` 1 is the correct serial reduction plus one call of this function, and
+    // with `MUL_SMALL_BODY` 1 under it that pair loses the phone's device on both of two
+    // runs, while the same reduction over `MUL_SMALL_BODY` 0 is bit-exact. So the doubling
+    // is expressed through `pt_add` too, which is unified (a == b falls through to `pt_dbl`
+    // inside it, and either argument may be the identity): odd steps of `i` double, even
+    // steps fold in the bit's addend, and the compiler sees a single inlined copy. Twice the
+    // loop trips of the obvious spelling, on a path that is not the reduce kernel's cost.
+    // `MUL_SMALL_BODY`
     // keeps the failing spelling reachable, because a workaround for a compiler nobody can
     // inspect should not also be the only record of what was tried.
     if MUL_SMALL_BODY.load(std::sync::atomic::Ordering::Relaxed) == 1 {
@@ -1074,7 +1078,7 @@ pub static MUL_SMALL_BODY: std::sync::atomic::AtomicU32 = std::sync::atomic::Ato
 /// gets a pipeline layout declaring only what it reads. A pipeline layout is allowed to
 /// declare bindings the shader ignores, so this costs nothing.
 ///
-/// `SPILL_PTS` and `SPILL_ROWS` are `read_write` even though `msm_merge_g2` only reads them,
+/// `SPILL_PTS` and `SPILL_ROWS` are `read_write` even though `msm_merge_*` only reads them,
 /// because one declaration serves both entry points and WGSL has no way to vary the access
 /// mode per entry point. The bind group layouts follow, so merge declares them writable and
 /// writes nothing.
@@ -1225,9 +1229,17 @@ fn {entry}(@builtin(global_invocation_id) gid: vec3<u32>) {{
 
 /// Replaces the merge kernel's body at generation time, for bisecting a device loss.
 ///
-/// 0 is the real kernel. 1 returns immediately, so the dispatch still happens, the bindings
-/// are still set and none of the code runs. If a device dies with 1, the fault is not in
-/// this kernel's body at all.
+/// The levels are the bisection listed inside `entry_merge`, one per step of it:
+///
+/// * 0 ships: the loop, with both spill slots folded onto one `pt_add` call site.
+/// * 1 returns immediately, so the dispatch still happens, the bindings are still set and
+///   none of the code runs. If a device dies with 1, the fault is not in this kernel's body.
+/// * 2 keeps the loop and drops every point operation.
+/// * 3 keeps the point operation and drops the loop.
+/// * 5 is the two-call-site shape that loses an iPhone 15 Pro's device, kept reachable so
+///   the failure can be shown again.
+///
+/// There is no 4. Every other level falls through to 0.
 ///
 /// At generation time rather than behind a uniform, because the question is what Metal is
 /// asked to compile, and a branch the compiler can see is a different experiment from code
@@ -1404,7 +1416,9 @@ fn entry_reduce(c: Curve, tg: u32) -> String {
             "    // One pt_add call site for everything this thread computes: even steps of
     // phase A fold a bucket into run (pts[0]), odd steps fold run into tot (pts[1]);
     // phase B is pt_mul_small's double-and-add on pts[2] with run as the addend; the
-    // last step joins pts[2] into tot. See REDUCE_BODY rung 12 for what this dodges.
+    // last step joins pts[2] into tot. What this dodges is REDUCE_BODY 1: three or more
+    // inlined G2 point operations in one entry point, which corrupt every window sum on an
+    // iPhone 15 Pro.
     var pts: array<{pt}, 3>;
     pts[0] = pt_zero_{sfx}();
     pts[1] = pt_zero_{sfx}();
