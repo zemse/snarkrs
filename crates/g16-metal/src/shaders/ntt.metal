@@ -51,11 +51,13 @@
 // two-element tail kernel that profiling of bellperson caught at 2^26. 18 = 9 + 9 instead,
 // which is 512 elements and 16 KB per group, leaving room for two resident groups per core.
 //
-// At the 2^18 domain of the largest artifact that is TWO dispatches per transform, twelve
-// for the six transforms of a proof, and the whole of stages 0 to 4 is fourteen dispatches
-// inside one command buffer with one wait. The measured cost of an extra dispatch in an
-// already open command buffer is a couple of microseconds; the cost of a separate command
-// buffer is 0.15 ms, which is why this is not encoded as fourteen command buffers.
+// At the 2^18 domain of the largest `js_*` artifact that is TWO dispatches per transform,
+// twelve for the six transforms of a proof, and thirteen for the whole of stages 0 to 4
+// once the gather is counted. The measured cost of an extra dispatch in an already open
+// command buffer is a couple of microseconds against 0.15 ms for a command buffer of its
+// own, which is why the dispatches are batched. They go into four command buffers, one for
+// the gather and one per domain vector; `compute_h` in `stages.rs` gives the reason for
+// that split.
 //
 // ============================================================================
 // WHAT IS *NOT* DONE HERE
