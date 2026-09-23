@@ -3,7 +3,7 @@
 //! The question this was built to answer is settled: the review claimed the radix-2 NTT
 //! "pays six full bit-reversal passes per proof", and the prover pays none. Stages 1-3
 //! run through `intt_coset_ntt`, which is DIF in and DIT out with both permutations
-//! cancelled, so the permutation survives only in the `NttBackend::ntt` entry point and
+//! cancelled, so the permutation survives only in the `CpuNtt::ntt` entry point and
 //! once per key inside the coset table. What is left to measure is the fused pipeline
 //! against the three-call composition it replaced, and what fraction of the proof the
 //! transforms are at all, which caps any NTT prize.
@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use g16_field::{CurveGroup, Domain, Fr, G1Projective, UniformRand};
 use g16_msm::{CpuMsm, MsmBackend};
-use g16_ntt::{bit_reverse_permute, CpuNtt, Direction, NttBackend};
+use g16_ntt::{bit_reverse_permute, CpuNtt, Direction};
 
 fn best(reps: usize, f: &mut dyn FnMut()) -> f64 {
     (0..reps)

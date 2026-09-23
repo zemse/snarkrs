@@ -34,7 +34,7 @@ use std::sync::OnceLock;
 use g16_field::{Domain, Field as _, Fr};
 use g16_gpu_layout::testrng::SplitMix64;
 use g16_gpu_layout::LIMBS;
-use g16_ntt::{CpuNtt, Direction as CpuDirection, NttBackend as _};
+use g16_ntt::{CpuNtt, Direction as CpuDirection};
 use g16_wgpu::gather::{fr_buffer, fr_words};
 use g16_wgpu::gen::ntt as wgsl;
 use g16_wgpu::gen::ntt::Mode;

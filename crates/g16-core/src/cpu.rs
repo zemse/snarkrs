@@ -256,7 +256,7 @@ impl PreparedCircuit for CpuCircuit {
         // three at once takes stages 1-3 from 12.4 to 10.2 ms at 2^16 and from 23.9 to
         // 20.6 at 2^17 (csp warm medians, same session).
         //
-        // The bit-reversed forms rather than `NttBackend::ntt`: a decimation-in-frequency
+        // The bit-reversed forms rather than `CpuNtt::ntt`: a decimation-in-frequency
         // inverse hands its output to a decimation-in-time forward with both permutations
         // cancelled, and the shift stage between them indexes its cached table in the
         // same order. Only the intermediate order changes; the stage 3 output is

@@ -15,7 +15,7 @@
 //! bigint dev dependencies the vectors need.
 
 use g16_field::{Domain, Fr};
-use g16_ntt::{CpuNtt, Direction, NttBackend};
+use g16_ntt::{CpuNtt, Direction};
 use std::path::{Path, PathBuf};
 
 fn vector_dir() -> Option<PathBuf> {

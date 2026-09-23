@@ -25,7 +25,7 @@ use g16_field::{
     AffineRepr, CurveGroup, Domain, Field, Fr, G1Affine, G1Projective, G2Affine, Zero,
 };
 use g16_msm::{KeyScale, MsmBackend};
-use g16_ntt::{CpuNtt, Direction, NttBackend};
+use g16_ntt::{CpuNtt, Direction};
 use rayon::prelude::*;
 
 use crate::phase1::check_beacon;

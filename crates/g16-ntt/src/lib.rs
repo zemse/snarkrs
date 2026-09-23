@@ -17,20 +17,6 @@ pub enum Direction {
     Inverse,
 }
 
-/// The transform primitives a backend must provide. Deliberately slice-shaped: [`CpuNtt`]
-/// is the only implementation, and it operates in place on host memory. The GPU backends
-/// do not implement this trait at all, because round-tripping every transform across the
-/// boundary would defeat the point; each implements
-/// [`g16_core::PreparedCircuit::compute_h`] directly and keeps the three vectors
-/// device-resident across all six transforms.
-pub trait NttBackend: Send + Sync {
-    fn name(&self) -> &'static str;
-    /// In-place radix-2 NTT. `a.len()` must equal `domain.size`.
-    fn ntt(&self, domain: &Domain, a: &mut [Fr], dir: Direction);
-    /// In-place `a[i] *= shift^i`.
-    fn distribute_powers(&self, a: &mut [Fr], shift: Fr);
-}
-
 /// Below this length the serial path wins. A transform is `log n` sequential passes and
 /// every one pays a full rayon fork/join, so the overhead scales with `log n` while the
 /// work only starts to dominate at `n log n`.
@@ -70,12 +56,15 @@ const CACHE_BLOCK: usize = 1 << 11;
 /// the one `Domain::new` derives for that size.
 type TwiddleCache = RwLock<HashMap<(usize, Fr), Arc<Vec<Fr>>>>;
 
-/// Multi-threaded CPU NTT.
+/// Multi-threaded CPU NTT, and the only slice-shaped transform in the workspace. The GPU
+/// backends do not offer one, because round-tripping every transform across the boundary
+/// would defeat the point: each implements `g16_core::PreparedCircuit::compute_h`
+/// directly and keeps the three vectors device-resident across all six transforms.
 pub struct CpuNtt {
     pub threads: usize,
     /// `Domain::twiddles()` rebuilds the whole table on every call, and the prover runs
     /// six transforms per proof over the same two tables. The cache has to live here:
-    /// `NttBackend::ntt` receives a `&Domain`, not a prepared table.
+    /// [`Self::ntt`] receives a `&Domain`, not a prepared table.
     twiddles: TwiddleCache,
     /// Tables for [`Self::coset_scale_bitrev`], keyed by size, shift and `size_inv`.
     /// The scale is public on `Domain`, so two same-sized domains can differ in it.
@@ -248,6 +237,11 @@ impl CpuNtt {
         }
     }
 
+    /// In-place radix-2 NTT. `a.len()` must equal `domain.size`.
+    pub fn ntt(&self, domain: &Domain, a: &mut [Fr], dir: Direction) {
+        self.transform(domain, a, dir, a.len() >= PARALLEL_THRESHOLD);
+    }
+
     /// Inverse transform, natural input to *bit-reversed* output, and deliberately
     /// without the `1/n` scale: [`Self::coset_scale_bitrev`] folds it into its table, so
     /// applying it here as well would scale twice.
@@ -381,6 +375,11 @@ impl CpuNtt {
         Arc::clone(guard.entry(key).or_insert(built))
     }
 
+    /// In-place `a[i] *= shift^i`.
+    pub fn distribute_powers(&self, a: &mut [Fr], shift: Fr) {
+        self.distribute(a, shift, a.len() >= PARALLEL_THRESHOLD);
+    }
+
     /// `a[i] *= shift^i`, with the path choice exposed for the same reason as
     /// [`Self::transform`].
     fn distribute(&self, a: &mut [Fr], shift: Fr, parallel: bool) {
@@ -410,18 +409,6 @@ impl CpuNtt {
 impl Default for CpuNtt {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-impl NttBackend for CpuNtt {
-    fn name(&self) -> &'static str {
-        "cpu"
-    }
-    fn ntt(&self, domain: &Domain, a: &mut [Fr], dir: Direction) {
-        self.transform(domain, a, dir, a.len() >= PARALLEL_THRESHOLD);
-    }
-    fn distribute_powers(&self, a: &mut [Fr], shift: Fr) {
-        self.distribute(a, shift, a.len() >= PARALLEL_THRESHOLD);
     }
 }
 

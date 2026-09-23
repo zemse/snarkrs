@@ -15,7 +15,7 @@ use ark_ec::{CurveGroup, VariableBaseMSM};
 use ark_std::{rand::Rng, test_rng, UniformRand};
 use g16_field::*;
 use g16_msm::{window_size, CpuMsm, MsmBackend};
-use g16_ntt::{bit_reverse_permute, CpuNtt, Direction, NttBackend, PARALLEL_THRESHOLD};
+use g16_ntt::{bit_reverse_permute, CpuNtt, Direction, PARALLEL_THRESHOLD};
 
 /// Best of `reps` runs, in milliseconds.
 fn best_ms(reps: usize, mut f: impl FnMut()) -> f64 {

@@ -38,7 +38,7 @@ use ark_ec::short_weierstrass::Affine;
 use blake2::{Blake2b512, Digest as _};
 use g16_field::{g1, g2, AffineRepr, CurveGroup, Domain, Field, Fr, G1Affine, G2Affine, Zero};
 use g16_msm::{AccelError, CpuMsm, KeyScale, MsmBackend};
-use g16_ntt::{CpuNtt, Direction, NttBackend};
+use g16_ntt::{CpuNtt, Direction};
 use g16_zkey::binfile;
 use rayon::prelude::*;
 
