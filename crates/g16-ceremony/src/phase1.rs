@@ -1161,8 +1161,15 @@ pub fn verify(ptau: &Path) -> Result<PtauVerifyReport, CeremonyError> {
 }
 
 /// The two bounds snarkjs enforces on a beacon before it opens a file
-/// (`powersoftau_beacon.js:26-42`).
-fn check_beacon(beacon_hash: &[u8], num_iterations_exp: u8) -> Result<(), CeremonyError> {
+/// (`powersoftau_beacon.js:26-42`, `zkey_beacon.js:38-42`).
+///
+/// Both phases call this, and phase 2 has to: it reads `numIterationsExp` as a raw byte
+/// out of section 10, and [`crate::transcript::rng_from_beacon_params`] turns it into
+/// `2^exp` SHA-256 rounds with nothing else between them.
+pub(crate) fn check_beacon(
+    beacon_hash: &[u8],
+    num_iterations_exp: u8,
+) -> Result<(), CeremonyError> {
     if beacon_hash.is_empty() {
         return Err(CeremonyError::BadParams(
             "invalid beacon hash: it must be a valid hexadecimal sequence".into(),

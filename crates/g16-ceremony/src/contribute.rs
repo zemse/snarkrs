@@ -28,6 +28,7 @@ use g16_msm::{KeyScale, MsmBackend};
 use g16_ntt::{CpuNtt, Direction, NttBackend};
 use rayon::prelude::*;
 
+use crate::phase1::check_beacon;
 use crate::ptau::Ptau;
 use crate::setup::{
     S_A, S_B1, S_B2, S_C, S_COEFFS, S_H, S_HEADER, S_IC, S_MPC_PARAMS, S_PROTOCOL, ZKEY_MAGIC,
@@ -249,8 +250,10 @@ pub fn contribute_with(
 /// `zkey beacon`: the same contribution with a reproducible key, derived by iterating
 /// SHA-256 `2^num_iterations_exp` times over `beacon_hash`.
 ///
-/// `beacon_hash` is raw bytes, not hex: the CLI parses the hex and enforces the bounds
-/// snarkjs does (`10 <= num_iterations_exp <= 63`, and a hash of 1 to 255 bytes).
+/// `beacon_hash` is raw bytes, not hex; [`crate::phase1::parse_beacon_args`] is the
+/// parser the CLI hands them through. The bounds snarkjs enforces
+/// (`10 <= num_iterations_exp <= 63`, and a hash of 1 to 255 bytes) are checked here, so
+/// they hold for a caller that is not a command.
 pub fn beacon(
     zkey_in: &Path,
     zkey_out: &Path,
@@ -259,6 +262,7 @@ pub fn beacon(
     num_iterations_exp: u8,
     key: &dyn KeyScale,
 ) -> Result<ContributionReport, CeremonyError> {
+    check_beacon(beacon_hash, num_iterations_exp)?;
     let mut rng = transcript::rng_from_beacon_params(beacon_hash, num_iterations_exp);
     let params = ContributionParams {
         name: name.map(str::to_owned),
@@ -588,6 +592,7 @@ fn verify_chain(mpc: &MpcParams, header: &Groth16Header) -> Result<Vec<Digest>, 
                     )))
                 }
             };
+            check_beacon(hash, exp).map_err(|e| fail(format!("INVALID({i}): {e}")))?;
             let mut rng = transcript::rng_from_beacon_params(hash, exp);
             let prv_key = transcript::fr_from_rng(&mut rng);
             let g1_s = transcript::g1_from_rng(&mut rng);

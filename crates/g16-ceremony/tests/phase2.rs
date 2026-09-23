@@ -624,3 +624,80 @@ fn off_subgroup_g2() -> G2Affine {
     }
     panic!("no off-subgroup G2 point under x = 256");
 }
+
+/// The bound is checked before the input is opened, so a path that does not exist is the
+/// cheapest proof that nothing downstream of it was reached: an accepted exponent fails
+/// with an `Io` error instead.
+#[test]
+fn a_beacon_exponent_outside_the_bounds_is_refused_before_the_file_is_opened() {
+    let dir = tmp_dir("beacon-bounds");
+    for exp in [0u8, 9, 64, 100, 128, 255] {
+        let err = contribute::beacon(
+            &dir.join("no-such-input.zkey"),
+            &dir.join("out.zkey"),
+            None,
+            &beacon_bytes(),
+            exp,
+            &CpuKeyScale,
+        )
+        .expect_err("an exponent outside 10..=63 was accepted");
+        assert!(
+            matches!(&err, CeremonyError::BadParams(s) if s.contains("numIterationsExp")),
+            "{exp}: {err}"
+        );
+    }
+}
+
+/// `numIterationsExp` reaches the verifier as a raw byte off disk, and
+/// `rng_from_beacon_params` turns it into `2^exp` SHA-256 rounds. Unbounded, 100 is a
+/// `zkey verify` that never returns and 128 is a panic, on the one command whose whole job
+/// is to survive a file someone else wrote.
+#[test]
+fn a_beacon_record_with_an_unbounded_exponent_is_refused_by_the_verifier() {
+    let bench = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench");
+    let (r1cs, ptau) = (
+        bench.join("artifacts/tiny_mul/circuit.r1cs"),
+        bench.join("ptau/local_13.ptau"),
+    );
+    if !r1cs.is_file() || !ptau.is_file() {
+        eprintln!("SKIPPED a_beacon_record_with_an_unbounded_exponent_...: no tiny_mul or ptau");
+        return;
+    }
+    let dir = tmp_dir("hostile-beacon");
+    let init = dir.join("init.zkey");
+    g16_ceremony::setup::setup(&r1cs, &ptau, &init, &CpuMsm::new()).unwrap();
+    let beaconed = dir.join("beacon.zkey");
+    contribute::beacon(
+        &init,
+        &beaconed,
+        None,
+        &beacon_bytes(),
+        BEACON_EXP,
+        &CpuKeyScale,
+    )
+    .unwrap();
+    contribute::verify_from_init(&init, &ptau, &beaconed, &CpuMsm::new())
+        .expect("the unedited beacon verifies");
+
+    // The beacon is the only record and carries no name, so its params blob is the last
+    // 36 bytes of section 10: `2, exp, 3, 32`, then the hash.
+    let file = g16_zkey::binfile::BinFile::open(&beaconed, b"zkey", 2).unwrap();
+    let section = file.sections().iter().find(|s| s.id == 10).unwrap();
+    let at = section.start + section.len - 35;
+    drop(file);
+    let mut bytes = std::fs::read(&beaconed).unwrap();
+    assert_eq!(
+        (bytes[at - 1], bytes[at], bytes[at + 1], bytes[at + 2]),
+        (2, BEACON_EXP, 3, 32),
+        "the params blob is not where this test edits"
+    );
+    bytes[at] = 100;
+    std::fs::write(&beaconed, bytes).unwrap();
+
+    let err = contribute::verify_from_init(&init, &ptau, &beaconed, &CpuMsm::new())
+        .expect_err("a numIterationsExp of 100 was accepted");
+    assert!(
+        matches!(&err, CeremonyError::Verification(s) if s.contains("numIterationsExp")),
+        "{err}"
+    );
+}
