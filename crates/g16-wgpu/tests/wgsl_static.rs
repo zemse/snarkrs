@@ -593,8 +593,13 @@ fn barrier_contexts(body: &str) -> Vec<Vec<Block>> {
     let mut i = 0usize;
     // Start of the statement currently being read, so a `{` can be classified from its head.
     let mut stmt = 0usize;
+    // A WGSL `for` head carries two semicolons inside its parentheses. Ending the statement
+    // on those would leave the head as `i = i + 1u)` and classify every loop as `Bare`.
+    let mut paren = 0usize;
     while i < chars.len() {
         match chars[i] {
+            '(' => paren += 1,
+            ')' => paren = paren.saturating_sub(1),
             '{' => {
                 let head: String = chars[stmt..i].iter().collect();
                 let head = head.trim().to_string();
@@ -621,7 +626,7 @@ fn barrier_contexts(body: &str) -> Vec<Vec<Block>> {
                 stack.pop();
                 stmt = i + 1;
             }
-            ';' => stmt = i + 1,
+            ';' if paren == 0 => stmt = i + 1,
             _ => {
                 if chars[i..].starts_with(&needle[..]) {
                     out.push(stack.clone());
