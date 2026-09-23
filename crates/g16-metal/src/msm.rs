@@ -692,9 +692,12 @@ struct Pool {
 }
 
 impl Pool {
+    /// The lock is taken back from a poisoned mutex rather than panicked on, the same as
+    /// `stages::HResident`'s pool: the vector holds plain buffer handles, so a panic
+    /// while it was held leaves nothing half-updated for the next caller to trip over.
     fn take(&self, bytes: usize) -> Result<Buffer, ProveError> {
         let bytes = bytes.max(4);
-        let mut free = self.free.lock().expect("scratch pool poisoned");
+        let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
         // Smallest buffer that fits, so a single huge allocation cannot be handed out
         // for every small request and then be unavailable for the one that needs it.
         let mut best: Option<usize> = None;
@@ -714,7 +717,7 @@ impl Pool {
     }
 
     fn give(&self, bufs: Vec<Buffer>) {
-        let mut free = self.free.lock().expect("scratch pool poisoned");
+        let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
         free.extend(bufs);
         // Unbounded reuse would keep every shape any circuit ever asked for. This is a
         // cache, not an arena.
