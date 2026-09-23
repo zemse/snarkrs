@@ -123,8 +123,6 @@ const STORE_JOIN: u32 = 1;
 pub struct HStages {
     device: Device,
     queue: CommandQueue,
-    #[allow(dead_code)]
-    library: Library,
     gather: ComputePipelineState,
     head: ComputePipelineState,
     tail: ComputePipelineState,
@@ -135,12 +133,9 @@ pub struct HStages {
 }
 
 impl HStages {
-    /// The MSL for stages 0 to 4, in dependency order.
-    ///
-    /// Exposed so a backend that also wants the MSM kernels can compile one library
-    /// instead of two and pay the runtime compile once. `pointwise.metal` must precede
+    /// The MSL for stages 0 to 4, in dependency order. `pointwise.metal` must precede
     /// `ntt.metal`: the fused NTT epilogue calls `g16_store_h`, which is defined there.
-    pub fn source() -> String {
+    pub(crate) fn source() -> String {
         format!("{FR_MSL}\n{GATHER_MSL}\n{POINTWISE_MSL}\n{NTT_MSL}\n")
     }
 
@@ -162,7 +157,7 @@ impl HStages {
 
     /// Builds from an already-compiled library, for a backend that compiles the whole
     /// prover (stages 0 to 4 plus the MSM kernels) as a single translation unit.
-    pub fn new_with_library(
+    pub(crate) fn new_with_library(
         device: Device,
         queue: CommandQueue,
         library: Library,
@@ -196,7 +191,6 @@ impl HStages {
         Ok(Self {
             device,
             queue,
-            library,
             gather,
             head,
             tail,
@@ -207,10 +201,6 @@ impl HStages {
 
     pub fn device(&self) -> &Device {
         &self.device
-    }
-
-    pub fn queue(&self) -> &CommandQueue {
-        &self.queue
     }
 
     /// Passes fused into one dispatch. 10 on this device.
@@ -322,10 +312,6 @@ type Pool = Arc<Mutex<Vec<Scratch>>>;
 pub struct HResident {
     domain: Domain,
     n_vars: usize,
-    /// snarkjs' `inc`, a primitive 2n-th root of unity. Not `Domain::coset_gen`; see
-    /// `g16_core::cpu::CpuCircuit::new` for the argument, which is a contract with the
-    /// section 9 bases in the zkey and not a free choice.
-    coset_shift: Fr,
     batches: Vec<Batch>,
 
     row_ptr: [Buffer; 2],
@@ -430,7 +416,6 @@ impl HResident {
             tw_fwd: st.buf(&PackedFr::pack_slice(&domain.twiddles()))?,
             tw_inv: st.buf(&PackedFr::pack_slice(&domain.twiddles_inv()))?,
             coset_pows: st.buf(&PackedFr::pack_slice(&pows))?,
-            coset_shift,
             domain,
             pool: Arc::new(Mutex::new(Vec::new())),
         })
@@ -438,10 +423,6 @@ impl HResident {
 
     pub fn domain_size(&self) -> usize {
         self.domain.size
-    }
-
-    pub fn coset_shift(&self) -> Fr {
-        self.coset_shift
     }
 
     /// Dispatches encoded for one call to [`Self::compute_h`], for reporting.
