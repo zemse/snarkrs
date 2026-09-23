@@ -45,7 +45,7 @@ use g16_field::{Field as _, Fr};
 use g16_gpu_layout::testrng::SplitMix64;
 use g16_gpu_layout::{PackedFr, PackedScalar, LIMBS};
 use g16_wgpu::gen::msm as wgsl;
-use g16_wgpu::msm::{DigitBuffers, DigitPlan, MsmDigits};
+use g16_wgpu::msm::{DigitBuffers, DigitPlan, ModuleShape, MsmDigits};
 use g16_wgpu::{LimitsProfile, ParamRing, Readback, WgpuBackend};
 use num_bigint::{BigInt, BigUint};
 use num_traits::{One as _, Zero as _};
@@ -1056,6 +1056,64 @@ fn the_counting_sort_survives_being_split_across_dispatches() {
 }
 
 // ---------------------------------------------------------------------------
+// 9b. The other module shape, which no artifact selects
+// ---------------------------------------------------------------------------
+
+/// `ModuleShape::Split` is what the default is measured against in section 10, and that
+/// measurement drives `wgsl::*_module_at` by hand rather than through [`MsmDigits`], so
+/// without this nothing ever builds the two-module arm or the linear search over it.
+/// `fr_mont_to_std` is the case that matters: it is the only entry point that misses the
+/// first module and has to be found in the second.
+#[test]
+fn the_split_module_shape_runs_the_same_sort_and_the_same_conversion() {
+    let b = floor();
+    let d = MsmDigits::with_module_shape(
+        b,
+        wgsl::Workgroups::default(),
+        wgsl::LimbPick::default(),
+        65535,
+        ModuleShape::Split,
+    )
+    .expect("split pipelines");
+    assert_eq!(d.module_shape(), ModuleShape::Split);
+    assert_eq!(d.modules().len(), 2, "Split did not compile two modules");
+
+    let mut rng = SplitMix64(0x5911_7AB1);
+    let all = general(&mut rng, 1300);
+    let n = all.len() as u32;
+    let words: Vec<u32> = all.iter().flat_map(std_words).collect();
+    let c = 9;
+    let plan = DigitPlan::with_c(n, 0, Some(n), c).expect("plan");
+    let run = run_sort(&d, &plan, &words, 2);
+    let r = reference(&all, 0, n as usize, c, plan.cap());
+    let checked = check_against_reference(&run, &r, &plan, 2, "Split");
+    assert!(checked > 0, "the Split sort checked no entries");
+
+    // The second module. `pipeline` walks the digits module first, misses, and finds this
+    // one; under Fused the loop never gets past index 0.
+    let mont: Vec<u32> = all.iter().flat_map(|x| PackedFr::from_fr(x).v).collect();
+    let want: Vec<u32> = all.iter().flat_map(std_words).collect();
+    let src = storage_words(b, "split mont src", &mont);
+    let dst = storage_words(b, "split mont dst", &vec![SENTINEL; want.len()]);
+    let mut ring = ParamRing::new(b, "split mont ring", d.mont_slots(n) + 4).unwrap();
+    let offsets = d.plan_mont(n, &mut ring).unwrap();
+    ring.flush(b);
+    let bind = d.bind_mont(b, &ring, n, &src, &dst).unwrap();
+    let mut enc = b.device().create_command_encoder(&Default::default());
+    {
+        let mut pass = enc.begin_compute_pass(&Default::default());
+        d.encode_mont(&mut pass, &bind, n, &offsets).unwrap();
+    }
+    b.submit([enc.finish()]);
+    b.device()
+        .poll(wgpu::PollType::wait_indefinitely())
+        .unwrap();
+    assert!(b.take_error().is_none(), "device error under Split");
+    assert_eq!(read_words(b, &dst), want, "fr_mont_to_std under Split");
+    println!("Split: {checked} entries sorted and {n} scalars converted across 2 modules");
+}
+
+// ---------------------------------------------------------------------------
 // 10. The measured constants
 // ---------------------------------------------------------------------------
 
@@ -1288,7 +1346,7 @@ fn the_limb_pick_strategy_is_measured() {
 }
 
 #[test]
-fn the_digit_modules_are_split_for_a_measured_reason() {
+fn the_digit_modules_are_fused_for_a_measured_reason() {
     const ENTRIES: [&str; 5] = [
         wgsl::ENTRY_ZERO,
         wgsl::ENTRY_MONT,
@@ -1432,14 +1490,14 @@ fn the_digit_modules_are_split_for_a_measured_reason() {
         row("cold: digits, no prelude", dl as f64 / 1024.0, dn, dp),
         row("cold: fr_mont_to_std, prelude", ml as f64 / 1024.0, mn, mp),
         row(
-            "cold: the two as shipped",
+            "cold: the two as Split",
             (dl + ml) as f64 / 1024.0,
             dn + mn,
             dp + mp
         ),
         row("cold: all five in one module", fl as f64 / 1024.0, fn_, fp),
         row(
-            "warm: the two as shipped",
+            "warm: the two as Split",
             (dl + ml) as f64 / 1024.0,
             wn + wn2,
             wp + wp2

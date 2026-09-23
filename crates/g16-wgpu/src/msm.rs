@@ -408,7 +408,7 @@ pub(crate) fn storage_buffer(
 /// one monolithic WGSL shader. On this platform, for these five kernels, the opposite is
 /// true. Cold means Metal's on-disk function cache misses, which needs a genuinely new MSL
 /// function name and not a nonce comment, because naga strips comments before Metal ever sees
-/// the source; `tests/msm_digits.rs::the_digit_modules_are_split_for_a_measured_reason`
+/// the source; `tests/msm_digits.rs::the_digit_modules_are_fused_for_a_measured_reason`
 /// renames every entry point per run to force that. Three runs, M2 Max, naga to MSL,
 /// milliseconds:
 ///
@@ -435,8 +435,11 @@ pub(crate) fn storage_buffer(
 /// `Fq` and `Fq2` it never calls, with an "unmeasured saving", has now been measured
 /// indirectly here: the saving is about 2 ms of naga per module and nothing else.
 ///
-/// Both shapes ship and both are tested, and the test asserts the default is the faster of
-/// the two rather than pinning today's answer, so if Tint reverses it at U14 it fails loudly.
+/// Both shapes ship. `the_digit_modules_are_fused_for_a_measured_reason` compiles the two
+/// arrangements through [`crate::gen::msm`] and asserts the default is the faster of them
+/// rather than pinning today's answer, so if Tint reverses it at U14 it fails loudly;
+/// `the_split_module_shape_runs_the_same_sort_and_the_same_conversion` is what runs
+/// [`ModuleShape::Split`] through [`MsmDigits`] itself.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ModuleShape {
     /// All five entry points behind one copy of the `Fr` prelude. The default, on the table
