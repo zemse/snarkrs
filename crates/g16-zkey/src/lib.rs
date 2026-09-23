@@ -55,8 +55,17 @@ pub struct ProvingKey {
 /// way at all (there is no 32-byte atomic). Sorting once at key load turns it into a
 /// race-free gather that both backends share. This is a one-time cost paid in `prepare`,
 /// never per proof.
+///
+/// The fields are `pub`, so a hand-built `Coefficients` can hold anything. What
+/// `read_coefficients` upholds, and what a consumer of a parsed key may assume, is:
+/// `row_ptr[m].len() == domain_size + 1`; `row_ptr[m]` is non-decreasing;
+/// `row_ptr[m][domain_size] == signal[m].len() == value[m].len()`; and every
+/// `signal[m][k] < n_vars`. `g16-core` re-checks all four at prepare time because a key
+/// built by hand is still reachable.
 pub struct Coefficients {
-    /// `row_ptr[m][c]..row_ptr[m][c+1]` indexes into `signal`/`value`, for matrix m in {A, B}.
+    /// `row_ptr[m][c]..row_ptr[m][c+1]` indexes into `signal`/`value`, for matrix `m`,
+    /// which is 0 for A and 1 for B. Transposing them is silent and produces a proof
+    /// that does not verify.
     pub row_ptr: [Vec<u32>; 2],
     pub signal: [Vec<u32>; 2],
     pub value: [Vec<Fr>; 2],
