@@ -211,8 +211,8 @@ fn top_bits(c: u32) -> u32 {
 /// range in ONE thread while the rest of the machine waits.
 ///
 /// So the heuristic's pick is stepped *down* (never up, which would only inflate the bucket
-/// array) by at most three, until the top window keeps at least half its bits. Under
-/// [`MEASURED_MAX_WINDOW`] that fires at one width and one only: `base == 7`, which is `m`
+/// array) by at most three, until the top window keeps at least half its bits. Under the
+/// `MEASURED_MAX_WINDOW` cap that fires at one width and one only: `base == 7`, which is `m`
 /// in 1024..=2047, where `top_bits(7) = 3` fails the guard and 6 is taken instead. Every
 /// other width in 3..=8 passes on the first iteration. The 12/13/14 widths are history of
 /// the uncapped heuristic, and they are why the guard is here at all.
@@ -950,9 +950,10 @@ impl CudaMsm {
     ///
     /// Jobs that share a scalar buffer, offset and length share their digit pipeline: the A,
     /// B-in-G2 and B-in-G1 MSMs all run over the whole witness, so the counting sort runs
-    /// once for the three of them and only the point stages repeat. That removes six of the
-    /// fifteen digit launches and, more to the point, two thirds of the scatter's memory
-    /// traffic.
+    /// once for the three of them and only the point stages repeat. `launch_digits`
+    /// issues four launches a plan, so five unshared jobs would be twenty and three plans
+    /// are twelve: that removes eight of the twenty digit launches and, more to the point,
+    /// two thirds of the scatter's memory traffic.
     pub fn msm_batch(&self, jobs: &[Job<'_>]) -> Result<Vec<MsmResult>, ProveError> {
         if jobs.is_empty() {
             return Ok(Vec::new());
@@ -1007,8 +1008,11 @@ impl CudaMsm {
                     boff + n
                 )));
             }
-            // Identity of the device buffer, not of its contents: two jobs share a digit
-            // pipeline exactly when they read the same scalars over the same range.
+            // Identity of the borrowed `CudaSlice` handle, not of its contents and not of
+            // the device allocation underneath it: two `Scalars` borrowing distinct handles
+            // onto one allocation get separate plans, which is a missed share and never a
+            // wrong answer. Two jobs share a plan exactly when they name the same handle
+            // over the same range.
             let key = (scalars.buf as *const CudaSlice<u32> as usize, soff, n);
             let idx = match by_key.get(&key) {
                 Some(&i) => i,
