@@ -478,26 +478,6 @@ pub fn as_bytes<T: Packed>(items: &[T]) -> &[u8] {
     }
 }
 
-/// Mutable byte view, for reading a kernel's output back out of a shared buffer.
-///
-/// # Safety
-///
-/// The caller must not write a value that violates `T`'s invariants. For every type in
-/// this module there are none, so this is safe in practice for all of them; it stays
-/// `unsafe` so that a future `Packed` type with an invariant cannot quietly inherit it.
-pub unsafe fn as_bytes_mut<T: Packed>(items: &mut [T]) -> &mut [u8] {
-    // SAFETY: `Packed` promises no padding and no invalid bit patterns, so every byte of
-    // the slice is initialised and any byte the caller writes still leaves a valid `T`.
-    // The `&mut` borrow of `items` makes the returned slice the only live handle to those
-    // bytes for its lifetime, which is what the mutable direction additionally needs.
-    unsafe {
-        core::slice::from_raw_parts_mut(
-            items.as_mut_ptr().cast::<u8>(),
-            size_of::<T>() * items.len(),
-        )
-    }
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;

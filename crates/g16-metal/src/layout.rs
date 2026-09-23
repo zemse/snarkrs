@@ -20,8 +20,8 @@
 //! shader and the CUDA header in the same commit.
 
 pub use g16_gpu_layout::{
-    as_bytes, as_bytes_mut, Packed, PackedFq, PackedFq2, PackedFr, PackedG1Affine, PackedG2Affine,
-    PackedGlv, PackedScalar, FQ_MODULUS, FQ_N0, FR_MODULUS, FR_N0, LIMBS,
+    as_bytes, Packed, PackedFq, PackedFq2, PackedFr, PackedG1Affine, PackedG2Affine, PackedGlv,
+    PackedScalar, FQ_MODULUS, FQ_N0, FR_MODULUS, FR_N0, LIMBS,
 };
 
 #[cfg(test)]
