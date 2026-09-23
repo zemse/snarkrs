@@ -14,23 +14,15 @@ use g16_ntt::CpuNtt;
 use g16_zkey::ProvingKey;
 use rayon::prelude::*;
 
-pub struct CpuBackend {
-    pub threads: usize,
-}
+/// No pool size of its own: the NTT and MSM crates both size their task counts against
+/// the global rayon pool, so a knob here would describe a pool nobody uses. Set
+/// `RAYON_NUM_THREADS` or build a `ThreadPoolBuilder` instead.
+#[derive(Default)]
+pub struct CpuBackend;
 
 impl CpuBackend {
     pub fn new() -> Self {
-        // The NTT and MSM crates both size their task counts against the global rayon
-        // pool, so reporting anything else here would describe a pool nobody uses.
-        Self {
-            threads: rayon::current_num_threads().max(1),
-        }
-    }
-}
-
-impl Default for CpuBackend {
-    fn default() -> Self {
-        Self::new()
+        Self
     }
 }
 
