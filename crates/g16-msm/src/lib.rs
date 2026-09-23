@@ -16,8 +16,9 @@
 //! about 1.02x, not the 5x once asserted. The paths stay because they are nearly free
 //! and a genuinely bit-heavy circuit still benefits, but on this ladder the MSMs are
 //! dense and the bucket loop is the whole game. What IS a measured, structural win on
-//! every circuit here: 34% of the B query bases are the point at infinity, and the
-//! prescan drops them before they cost a single window visit.
+//! every key measured so far: a large fraction of the B query bases are the point at
+//! infinity, and the prescan drops them before they cost a single window visit. The
+//! figures are on `prescan`.
 
 use ark_ec::short_weierstrass::{Affine, Projective, SWCurveConfig};
 use ark_ff::{AdditiveGroup, One, PrimeField, Zero};
@@ -37,11 +38,11 @@ pub use accel::{AccelError, GroupFft, KeyScale};
 /// `bases` and `scalars` must be the same length, and a backend has to treat a mismatch as
 /// a malformed key rather than as a short input: reducing to the shorter prefix returns a
 /// valid-looking group element for a proof that is wrong. The CPU path asserts on it (see
-/// [`pippenger`]) and every other backend is expected to be just as loud.
+/// `pippenger`) and every other backend is expected to be just as loud.
 ///
 /// An empty input is the identity. A base at infinity contributes nothing whatever its
-/// scalar, which is a live path and not a defensive one: 34% of the B query bases are the
-/// point at infinity.
+/// scalar, which is a live path and not a defensive one: most of a B query can be
+/// infinity. See `prescan` for the measurements.
 pub trait MsmBackend: Send + Sync {
     fn name(&self) -> &'static str;
     fn msm_g1(&self, bases: &[G1Affine], scalars: &[Fr]) -> G1Projective;
@@ -100,7 +101,7 @@ const BATCH_MIN_BUCKETS: usize = 2 * BATCH;
 /// `2^c`, which is worth roughly one extra bit of window. The weight of 3 on the bucket
 /// term is `2 * 1.5`: a full add is about 1.5 mixed adds (add-2007-bl is 11M+5S, the mixed
 /// madd-2007-bl is 7M+4S). The one
-/// extra bucket [`signed_digit`] needs is left out of the model, it moves nothing.
+/// extra bucket `signed_digit` needs is left out of the model, it moves nothing.
 pub fn window_size(n: usize) -> u32 {
     let mut best = 3;
     let mut best_cost = u128::MAX;
@@ -157,8 +158,9 @@ fn read_bits(limbs: &[u64], bit_offset: usize, width: u32) -> u64 {
     }
     let shift = bit_offset % 64;
     let mut buf = limbs[idx] >> shift;
-    // `shift` is provably nonzero here (width < 64), so the `64 - shift` shift is defined.
     if shift + width as usize > 64 && idx + 1 < limbs.len() {
+        // The branch condition forces `shift > 64 - width >= 1`, so the `64 - shift`
+        // shift is in range.
         buf |= limbs[idx + 1] << (64 - shift);
     }
     buf & ((1u64 << width) - 1)
@@ -208,6 +210,8 @@ fn signed_digit(limbs: &[u64], i: usize, c: u32) -> i64 {
 /// multiplies, so the bucket loop walks both vectors in order and hits the bases through
 /// one indirection.
 struct Prescan<P: SWCurveConfig> {
+    /// `u32` to halve the footprint of a witness-length vector; a key with more than
+    /// `2^32` bases is not representable and is asserted against in `prescan`.
     idx: Vec<u32>,
     bigints: Vec<<Fr as PrimeField>::BigInt>,
     ones_sum: Projective<P>,
@@ -247,6 +251,7 @@ fn prescan<P: RawCurve>(bases: &[Affine<P>], scalars: &[Fr], n: usize) -> Presca
 where
     P::BaseField: Send + Sync,
 {
+    debug_assert!(n <= u32::MAX as usize);
     let run = |lo: usize, hi: usize| {
         let mut idx = Vec::new();
         let mut bigints = Vec::new();
@@ -259,10 +264,11 @@ where
             }
             // A base at infinity contributes nothing whatever its scalar. This is not a
             // rare key quirk: 34% of the B query bases are the point at infinity on
-            // every measured circuit (a wire that appears in no B-side linear
-            // combination), and letting them through would cost a madd call per window
-            // each. Filtering here also lets the bucket loop's madd skip its own
-            // infinity test entirely.
+            // every circuit in the benchmark ladder, and 61% on the csp keys (see
+            // `g16-metal::msm`), because a wire that appears in no B-side linear
+            // combination still owns a slot. Letting them through would cost a madd
+            // call per window each. Filtering here also lets the bucket loop's madd
+            // skip its own infinity test entirely.
             if bases[i].infinity {
                 continue;
             }
@@ -329,9 +335,7 @@ fn window_chunk<P: RawCurve>(
     c: u32,
     n_buckets: usize,
 ) -> Projective<P> {
-    // `d` lands in [-2^(c-1), 2^(c-1)], so the bucket index |d| - 1 is in
-    // [0, 2^(c-1) - 1] and 2^(c-1) buckets is tight. The caller sizes them, and the
-    // comment there says what the extra bucket an earlier version allocated cost.
+    // `d` is in [-2^(c-1), 2^(c-1)], so `2^(c-1)` buckets is tight.
     let mut buckets = vec![Xyzz::<P::RF>::ZERO; n_buckets];
     for k in range {
         let d = signed_digit(scan.bigints[k].as_ref(), window, c);
@@ -589,11 +593,8 @@ fn pippenger<P: RawCurve>(bases: &[Affine<P>], scalars: &[Fr], threads: usize) -
 where
     P::BaseField: Send + Sync,
 {
-    // A hard assert, not a debug one. A malformed or hand-built proving key with
-    // mismatched lengths must fail loudly in release too: the previous
-    // `debug_assert!` + `min()` combination silently dropped the tail of the longer
-    // side, which turns a bad key into a wrong-but-plausible MSM instead of a panic
-    // pointing at the key.
+    // A hard assert, not a debug one: a length mismatch is a malformed key and must
+    // fail in release too.
     assert_eq!(
         bases.len(),
         scalars.len(),
@@ -608,8 +609,8 @@ where
 
     let scan = prescan(bases, scalars, n);
     let m = scan.idx.len();
-    // Every scalar was 0 or 1, which is the normal case for a bit-decomposition-heavy
-    // witness. Skip Pippenger entirely rather than allocate W bucket arrays for nothing.
+    // Nothing reached the general path: every scalar was 0 or 1, or its base was
+    // infinity. Skip Pippenger rather than allocate W bucket arrays for nothing.
     if m == 0 {
         return scan.ones_sum;
     }

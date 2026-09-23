@@ -101,7 +101,8 @@ impl<F: RawField> Xyzz<F> {
     /// madd-2008-s: `self += (px, py)`, 8M + 2S. The bucket-loop workhorse.
     ///
     /// The caller guarantees `(px, py)` is NOT the point at infinity; the prescan filters
-    /// those out before anything reaches a bucket (34% of the B query on real keys).
+    /// those out before anything reaches a bucket, and on a real key that is most of a B
+    /// query (see `crate::prescan`).
     #[inline(always)]
     pub fn madd(&mut self, px: F, py: F) {
         if self.is_zero() {
