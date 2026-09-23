@@ -1,4 +1,6 @@
-//! Opt-in measurements for the review. None runs in the correctness suite.
+//! Opt-in GPU measurements of the plan shape, the reduce and scatter kernel bodies, and
+//! what a first command buffer costs. Every one is `#[ignore]`d, so none runs in the
+//! correctness suite.
 
 use super::*;
 use g16_field::{CurveGroup, PrimeField, PrimeGroup};

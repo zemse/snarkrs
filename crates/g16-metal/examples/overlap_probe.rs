@@ -1,4 +1,4 @@
-//! Throwaway probe: what would overlapping stages 0-4 with the witness MSMs buy on Metal?
+//! What overlapping stages 0-4 with the witness MSMs buys on Metal, measured both ways.
 //!
 //! Only stage 9 reads `H`; stages 5-8 read the witness. `HStages` and `MetalMsm` own
 //! separate command queues, so a second thread can submit the four witness MSMs while
@@ -6,8 +6,9 @@
 //! cost of asking is that the batch splits in two: the witness jobs lose their seat in
 //! the concurrent encoder next to H's accumulation, and a second submission is paid.
 //!
-//!   A  sequential, the shape `prove` has today: compute_h, then all five in one batch.
-//!   C  thread 1 runs compute_h then the H MSM alone; thread 2 runs the witness batch.
+//!   A  sequential: compute_h, then all five in one batch. Shipped below the crossover.
+//!   C  split: thread 1 runs compute_h then the H MSM alone, thread 2 runs the witness
+//!      batch. Shipped at 2^17 and up; see `overlap_pays` in `backend.rs`.
 //!
 //! Rounds interleave A/C so thermal drift hits both alike, and outputs are compared
 //! each round. Run with `G16_METAL_CB_TIMES=1` to see whether the driver's GPU windows

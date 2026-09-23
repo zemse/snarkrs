@@ -1,10 +1,12 @@
 //! Splits the Metal MSM stage into its three submissions, to find the size-independent
 //! intercept that makes the GPU lose below the crossover.
 //!
-//! `msms()` does three things: one `upload_scalars` (host pack + memcpy), one
-//! `scalars_from_device_mont` command buffer, and one `msm_batch` command buffer holding
-//! every dispatch for all five MSMs. Three commits at the measured 0.153 ms floor is
-//! 0.46 ms, so if the stage costs ~7 ms on a 100-wire circuit the rest is somewhere else.
+//! `msms()` does two things: one `upload_scalars` (host pack + memcpy) and one
+//! `msm_batch` command buffer holding every dispatch for all five MSMs. H's scalars are
+//! already device-resident and `scalars_from_device_std` dispatches nothing, so the whole
+//! submission floor is one commit at the measured 0.153 ms, and if the stage costs ~7 ms
+//! on a 100-wire circuit the rest is somewhere else. The table times a one-job batch
+//! against a five-job one so the floor separates from the per-window work.
 
 #![cfg(target_os = "macos")]
 
