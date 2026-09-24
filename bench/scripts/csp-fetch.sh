@@ -91,6 +91,12 @@ CIRCOM="$HERE/bin/circom2"
 
 digest() { shasum -a256 "$1" | cut -d' ' -f1; }
 
+# Is the generator for $2 one upstream ships, or one we left behind?
+upstream_ships() {
+  git -C "$VENDOR/circom" ls-files --error-unmatch \
+      "circuits/$1/$2/$2.cpp" "circuits/$1/$2/$2.dat" >/dev/null 2>&1
+}
+
 for name in $VARIANTS; do
   [ -z "$name" ] && continue
   family="${name%_*}"
@@ -102,9 +108,12 @@ for name in $VARIANTS; do
   plain="$(mktemp -d)"
   ( cd "$VENDOR/circom/circuits/$family" && "$CIRCOM" "$name.circom" --c --r1cs --O2 -o "$plain" )
 
-  # Check 1, where upstream gives us something to check against.
+  # Check 1, where upstream gives us something to check against. Tracked in their tree
+  # is the test, not present on disk: `ecdsa_32.cpp` is 57 MB of our own output from an
+  # earlier run sitting next to the `.circom` sources, and comparing a build against
+  # itself would pass while checking nothing.
   faithful=yes
-  if [ -s "$dir/$name.cpp" ]; then
+  if upstream_ships "$family" "$name"; then
     [ "$(digest "$plain/${name}_cpp/$name.cpp")" = "$(digest "$dir/$name.cpp")" ] || faithful=no
     [ "$(digest "$plain/${name}_cpp/$name.dat")" = "$(digest "$dir/$name.dat")" ] || faithful=no
   fi
