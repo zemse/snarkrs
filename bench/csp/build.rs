@@ -135,7 +135,7 @@ fn clone_witnesscalc(dir: &Path) {
     run(&["submodule", "update", "--init", "--recursive"], Some(dir));
 }
 
-/// Give `Fr_mod` and `Fr_idiv` a path that does not go through GMP.
+/// Give `Fr_mod`, `Fr_idiv` and `Fr_pow` a path that does not go through GMP.
 ///
 /// circom routes every witness time `%` and `\\` through these two functions, and the
 /// shipped bodies answer each call with three `mpz_init`/`mpz_clear` pairs and a multi
@@ -152,6 +152,15 @@ fn clone_witnesscalc(dir: &Path) {
 /// result `Fr_SHORT` when it fits in a signed int, leaving `longVal` alone, so these
 /// paths reproduce the shipped representation and not merely the shipped value. All
 /// sixteen reference witnesses are byte identical across the change.
+///
+/// `Fr_pow` is the same story with a different shape. circom emits it for `**`, and
+/// every call these circuits make has a small non-negative base and exponent: sha256
+/// computes `2**j` 194,304 times per witness for the `Num2Bits` sums, and ecdsa computes
+/// `i**j` with both under seven 424,489 times for `BigMultNoCarry`'s polynomial identity.
+/// The shipped body answers each with three `mpz_init`/`mpz_clear` pairs and an
+/// `mpz_powm`, measured at 58.4 ns for the sha256 shape and 167.4 ns for the ecdsa one.
+/// Repeated squaring in `uint64_t` answers them in a few nanoseconds, and only when the
+/// whole result fits in 64 bits, so it is exact and no reduction mod q is involved.
 ///
 /// Set `G16_CSP_STOCK_FR` to build the checkout unpatched, which is how the before
 /// numbers in `bench/results/csp` were measured.
@@ -240,6 +249,39 @@ static inline bool g16_divmod(PFrElement r, PFrElement a, PFrElement b, bool quo
     return false;
 }
 "##;
+    const POW_FAST: &str = r##"
+    // g16: a small non-negative power is a few multiplies, not three mpz_init/clear
+    // pairs and an mpz_powm. sha256 reaches here 194,304 times per witness computing
+    // 2**j for the Num2Bits sums, and ecdsa 424,489 times computing i**j with i and j
+    // both under seven in BigMultNoCarry's polynomial identity.
+    //
+    // Only when the whole result fits in 64 bits, so it is exact and needs no reduction
+    // mod q; the tagging then reproduces Fr_fromMpz exactly, Fr_SHORT when it fits a
+    // signed int and Fr_LONG with the value in the low limb otherwise. Anything that
+    // overflows falls through to GMP.
+    if (!((a->type | b->type) & Fr_LONG) && a->shortVal >= 0 && b->shortVal >= 0) {
+        uint64_t base = (uint64_t)a->shortVal;
+        uint32_t e = (uint32_t)b->shortVal;
+        uint64_t acc = 1;
+        bool ok = true;
+        while (e) {
+            if (e & 1) { if (__builtin_mul_overflow(acc, base, &acc)) { ok = false; break; } }
+            e >>= 1;
+            if (e) { if (__builtin_mul_overflow(base, base, &base)) { ok = false; break; } }
+        }
+        if (ok) {
+            if (acc <= 0x7fffffffull) {
+                r->type = Fr_SHORT;
+                r->shortVal = (int32_t)acc;
+            } else {
+                r->type = Fr_LONG;
+                r->longVal[0] = acc;
+                r->longVal[1] = 0; r->longVal[2] = 0; r->longVal[3] = 0;
+            }
+            return;
+        }
+    }
+"##;
     let fr = witnesscalc.join("build/fr.cpp");
     // Restore before patching rather than checking for a marker. A marker can only say
     // that some version of this patch is present, not that it is this one, and an
@@ -278,6 +320,14 @@ static inline bool g16_divmod(PFrElement r, PFrElement a, PFrElement b, bool quo
         );
         out.insert_str(at + sig.len(), &fast);
     }
+    {
+        const SIG: &str = "void Fr_pow(PFrElement r, PFrElement a, PFrElement b) {";
+        let at = out
+            .find(SIG)
+            .expect("Fr_pow is not declared the way this patch expects");
+        out.insert_str(at + SIG.len(), POW_FAST);
+    }
+
     // Ahead of every caller. Fr_idiv is defined before Fr_mod in this file, so anchoring
     // on either function name puts the helpers after one of them.
     const ANCHOR: &str = "#include \"fr.hpp\"\n";
