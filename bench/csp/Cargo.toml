@@ -56,6 +56,11 @@ path = "src/bin/main.rs"
 name = "g16-csp-mem"
 path = "src/bin/mem.rs"
 
+# Witness generation on its own, so a profile of it is not also a profile of the prover.
+[[bin]]
+name = "g16-csp-wit"
+path = "src/bin/wit.rs"
+
 [profile.release]
 opt-level = 3
 lto = "fat"
