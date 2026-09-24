@@ -16,7 +16,7 @@ import pathlib
 
 HERE = pathlib.Path(__file__).resolve().parents[2]
 PUBLISHED = HERE / "bench/csp/published-circom.json"
-ORDER = {"poseidon": 0, "sha256": 1, "keccak": 2}
+ORDER = {"poseidon": 0, "sha256": 1, "keccak": 2, "ecdsa": 3}
 
 
 def load_ours(metrics_dir):

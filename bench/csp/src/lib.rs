@@ -29,14 +29,14 @@ pub mod mem;
 pub mod metrics;
 pub mod run;
 
-/// A benchmark family. Upstream also has `blake3`, `poseidon2` and `ecdsa`; the first two
-/// have no circom circuit at all and `ecdsa` is tracked separately because its witness
-/// generator has to be compiled from source rather than shipped.
+/// A benchmark family. Upstream also has `blake3` and `poseidon2`, which have no circom
+/// circuit at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum Target {
     Sha256,
     Keccak,
     Poseidon,
+    Ecdsa,
 }
 
 impl Target {
@@ -45,19 +45,28 @@ impl Target {
             Target::Sha256 => "sha256",
             Target::Keccak => "keccak",
             Target::Poseidon => "poseidon",
+            Target::Ecdsa => "ecdsa",
         }
     }
 
     /// The sizes upstream's `BENCH_INPUT_PROFILE=full` iterates. Bytes for the hashes,
-    /// field elements for poseidon, which is why the two lists differ.
+    /// field elements for poseidon, which is why the two lists differ. ECDSA has one
+    /// circuit and no size to vary: the 32 is the digest it signs, and it is in the name
+    /// because a witness generator is addressed as `family_size`.
     pub fn input_sizes(self) -> &'static [usize] {
         match self {
             Target::Sha256 | Target::Keccak => &[128, 256, 512, 1024, 2048],
             Target::Poseidon => &[2, 4, 8, 12, 16],
+            Target::Ecdsa => &[32],
         }
     }
 
-    pub const ALL: [Target; 3] = [Target::Sha256, Target::Keccak, Target::Poseidon];
+    pub const ALL: [Target; 4] = [
+        Target::Sha256,
+        Target::Keccak,
+        Target::Poseidon,
+        Target::Ecdsa,
+    ];
 }
 
 /// One circuit: a target at one input size.

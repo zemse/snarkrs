@@ -73,11 +73,13 @@ the six numbers reported.
 | sha256   | 128 - 2048 bytes          | 53,048 - 595,688   |
 | keccak   | 128 - 2048 bytes          | 93,184 - 1,506,240 |
 | poseidon | 2 - 16 field elements     | 517 - 2,092        |
+| ecdsa    | one secp256k1 signature   | 512,955            |
 
-`ecdsa` is the fourth circom target and is not here yet: its witness generator is 57 MB of
-generated C++ that upstream compiles from source on demand rather than shipping, so it needs
-a circom run before it can be linked. `blake3` and `poseidon2`, the other two upstream
-targets, have no circom circuit at all.
+`ecdsa`'s witness generator is the one upstream does not ship: 57 MB of generated C++,
+because the width-12 comb table is inlined in the circuit. `csp-fetch.sh` compiles it with
+`--O2 --c`, the flags upstream's own build script uses, so that first fetch needs circom
+2.2.3 on PATH. `blake3` and `poseidon2`, the other two upstream targets, have no circom
+circuit at all.
 
 ## Comparing against the published row
 
@@ -91,3 +93,7 @@ comparison and the report prints both:
   `keccak_128` was 163,638 constraints, the one in this directory is 93,184. Comparing by
   input size overstates any speedup by about 1.75x on keccak. The report carries both
   constraint counts and a per-million-constraint rate for that reason.
+
+`ecdsa` has no counterpart in that row at all: the page's `circom` entry does not cover
+it. The report prints dashes on that line, and the per-million-constraint rate beside the
+other targets is the only thing on it that compares to anything.

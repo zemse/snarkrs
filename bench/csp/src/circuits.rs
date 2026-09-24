@@ -23,9 +23,10 @@ witnesscalc_adapter::witness!(poseidon_4);
 witnesscalc_adapter::witness!(poseidon_8);
 witnesscalc_adapter::witness!(poseidon_12);
 witnesscalc_adapter::witness!(poseidon_16);
+witnesscalc_adapter::witness!(ecdsa_32);
 
 /// Stack for the witness thread, copied from upstream. A default 2 MiB thread is enough
-/// for every circuit here, but the ECDSA generator overruns it, and running the small
+/// for every circuit but `ecdsa_32`, whose generator overruns it, and running the small
 /// circuits on a different stack size than the big one is a difference for no reason.
 const WITNESS_STACK: usize = 8 * 1024 * 1024;
 
@@ -48,6 +49,7 @@ fn witness_fn(v: Variant) -> Result<WitnessFn> {
         (Target::Poseidon, 8) => poseidon_8_witness,
         (Target::Poseidon, 12) => poseidon_12_witness,
         (Target::Poseidon, 16) => poseidon_16_witness,
+        (Target::Ecdsa, 32) => ecdsa_32_witness,
         (t, n) => return Err(anyhow!("no {} circuit at input size {n}", t.as_str())),
     };
     Ok(f)

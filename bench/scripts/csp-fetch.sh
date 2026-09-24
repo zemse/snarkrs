@@ -10,6 +10,8 @@
 # Sources:
 #   circuits  github.com/ethereum/csp-benchmarks @ main, sparse (circom/ only)
 #   zkeys     the same repo's `zkeys-v2` release
+#
+# Needs `circom` 2.2.3 on PATH for the one witness generator upstream does not ship.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
@@ -48,6 +50,29 @@ if [ ! -f "$VENDOR/circom/circomlib/circuits/poseidon.circom" ]; then
   git -C "$VENDOR/circom/circomlib" checkout --quiet "$CIRCOMLIB_SHA"
 fi
 
+# `ecdsa_32` is the one witness generator upstream does not keep in its tree: 57 MB of
+# generated C++, because the width-12 comb table is inlined in the circuit. Compile it
+# where `build.rs` expects to read it, with the flags upstream's own build script uses.
+# The includes are relative to the circuit directory, so circom runs from there.
+ecdsa="$VENDOR/circom/circuits/ecdsa"
+if [ ! -s "$ecdsa/ecdsa_32/ecdsa_32.dat" ]; then
+  log "compiling the ecdsa_32 witness generator (a few minutes)"
+  # Pinned to 2.2.3, the version upstream states its constraint counts for. A later
+  # circom compiles the same source to a different R1CS, and a witness from it does not
+  # satisfy the published zkey: the failure surfaces as a proof that will not verify,
+  # a long way from the cause.
+  CIRCOM="$HERE/bin/circom2"
+  [ -x "$CIRCOM" ] || CIRCOM="$(command -v circom || true)"
+  [ -n "$CIRCOM" ] || { echo "circom 2.2.3 is not on PATH and bench/bin/circom2 is missing" >&2; exit 1; }
+  "$CIRCOM" --version 2>&1 | grep -q '2[.]2[.]3' \
+    || { echo "need circom 2.2.3, have: $("$CIRCOM" --version 2>&1)" >&2; exit 1; }
+  staging="$(mktemp -d)"
+  ( cd "$ecdsa" && "$CIRCOM" ecdsa_32.circom --c --O2 -o "$staging" )
+  mkdir -p "$ecdsa/ecdsa_32"
+  cp "$staging/ecdsa_32_cpp/ecdsa_32.cpp" "$staging/ecdsa_32_cpp/ecdsa_32.dat" "$ecdsa/ecdsa_32/"
+  rm -rf "$staging"
+fi
+
 # checksums.sha256 maps a release asset to its path inside the upstream tree. We only
 # want the basename and the digest.
 manifest="$VENDOR/circom/checksums.sha256"
@@ -66,7 +91,6 @@ for name in $VARIANTS; do
   [ -n "$want" ] || { echo "$asset not in checksums.sha256" >&2; exit 1; }
 
   if [ -f "$d/circuit.zkey" ]; then
-    got="$(shasum -a 256 "$d/circuit.zkey" | cut -d' ' -f1)"
     if [ "$got" = "$want" ]; then
       printf 'ok    %-14s zkey already present\n' "$name"
       continue
@@ -77,7 +101,6 @@ for name in $VARIANTS; do
   log "$name: downloading $asset"
   curl --fail --location --retry 3 --retry-delay 5 -C - \
        "$RELEASE/$asset" --output "$d/circuit.zkey.part"
-  got="$(shasum -a 256 "$d/circuit.zkey.part" | cut -d' ' -f1)"
   if [ "$got" != "$want" ]; then
     echo "FAIL  $name: sha256 $got, expected $want" >&2
     exit 1

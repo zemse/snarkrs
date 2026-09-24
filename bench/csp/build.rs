@@ -4,6 +4,10 @@
 //! crate computes is the same witness the `circom` row computes. They are not vendored
 //! into this repo: `bench/scripts/csp-fetch.sh` clones them, and this build reads them
 //! from that checkout.
+//!
+//! `ecdsa_32` is the exception upstream makes too: 57 MB of generated C++ is not in their
+//! tree either, so `csp-fetch.sh` runs circom over `ecdsa_32.circom` to produce it in
+//! place, with the same `--O2 --c` upstream's own build script uses.
 
 use std::path::{Path, PathBuf};
 
@@ -24,6 +28,7 @@ const CIRCUITS: &[&str] = &[
     "poseidon_8",
     "poseidon_12",
     "poseidon_16",
+    "ecdsa_32",
 ];
 
 fn main() {

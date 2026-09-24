@@ -26,6 +26,10 @@ rand = "0.8"
 sha2 = "0.10"
 sha3 = "0.10"
 
+# 0.13 speaks rand_core 0.6, which is the one rand 0.8 implements, so the seeded StdRng
+# goes straight into `SigningKey::random` and the benchmark signature stays reproducible.
+k256 = "0.13"
+
 ark-std = { version = "0.5", default-features = false, features = ["std", "getrandom"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
