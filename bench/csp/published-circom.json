@@ -1,0 +1,172 @@
+{
+  "_source": "https://ethproofs.org/csp-benchmarks, collected_benchmarks_26644954256.json, updated 2026-07-29",
+  "_host": "AWS mac2.metal: Apple M1, 8 cores, 16 GB",
+  "_caveat": "measured against the zkeys-v1 circuits. The zkeys-v2 circuits in bench/artifacts/csp are smaller at every size, so num_constraints is the column to compare on, not input_size.",
+  "rows": [
+    {
+      "name": "circom",
+      "target": "keccak",
+      "input_size": 128,
+      "proof_duration": 655263929,
+      "verify_duration": 66565917,
+      "proof_size": 1013,
+      "preprocessing_size": 84106528,
+      "num_constraints": 163638,
+      "peak_memory": 246602137
+    },
+    {
+      "name": "circom",
+      "target": "keccak",
+      "input_size": 256,
+      "proof_duration": 1272337033,
+      "verify_duration": 128204984,
+      "proof_size": 1013,
+      "preprocessing_size": 167792168,
+      "num_constraints": 327244,
+      "peak_memory": 473191219
+    },
+    {
+      "name": "circom",
+      "target": "keccak",
+      "input_size": 512,
+      "proof_duration": 2513491908,
+      "verify_duration": 250535246,
+      "proof_size": 1009,
+      "preprocessing_size": 335173253,
+      "num_constraints": 654456,
+      "peak_memory": 721990451
+    },
+    {
+      "name": "circom",
+      "target": "keccak",
+      "input_size": 1024,
+      "proof_duration": 5088063504,
+      "verify_duration": 492120692,
+      "proof_size": 1012,
+      "preprocessing_size": 669935499,
+      "num_constraints": 1308880,
+      "peak_memory": 1377869824
+    },
+    {
+      "name": "circom",
+      "target": "keccak",
+      "input_size": 2048,
+      "proof_duration": 10269186996,
+      "verify_duration": 974536196,
+      "proof_size": 1004,
+      "preprocessing_size": 1339459874,
+      "num_constraints": 2617728,
+      "peak_memory": 2679262412
+    },
+    {
+      "name": "circom",
+      "target": "poseidon",
+      "input_size": 2,
+      "proof_duration": 14656445,
+      "verify_duration": 3214850,
+      "proof_size": 920,
+      "preprocessing_size": 6114964,
+      "num_constraints": 517,
+      "peak_memory": 17796300
+    },
+    {
+      "name": "circom",
+      "target": "poseidon",
+      "input_size": 4,
+      "proof_duration": 15335741,
+      "verify_duration": 3283436,
+      "proof_size": 918,
+      "preprocessing_size": 8005630,
+      "num_constraints": 736,
+      "peak_memory": 18885836
+    },
+    {
+      "name": "circom",
+      "target": "poseidon",
+      "input_size": 8,
+      "proof_duration": 20810883,
+      "verify_duration": 3477579,
+      "proof_size": 924,
+      "preprocessing_size": 12159828,
+      "num_constraints": 1171,
+      "peak_memory": 20175257
+    },
+    {
+      "name": "circom",
+      "target": "poseidon",
+      "input_size": 12,
+      "proof_duration": 23097197,
+      "verify_duration": 3597431,
+      "proof_size": 924,
+      "preprocessing_size": 16653787,
+      "num_constraints": 1613,
+      "peak_memory": 21866086
+    },
+    {
+      "name": "circom",
+      "target": "poseidon",
+      "input_size": 16,
+      "proof_duration": 31814425,
+      "verify_duration": 3842094,
+      "proof_size": 921,
+      "preprocessing_size": 22286842,
+      "num_constraints": 2092,
+      "peak_memory": 24671027
+    },
+    {
+      "name": "circom",
+      "target": "sha256",
+      "input_size": 128,
+      "proof_duration": 355711865,
+      "verify_duration": 40167136,
+      "proof_size": 1009,
+      "preprocessing_size": 53497217,
+      "num_constraints": 94976,
+      "peak_memory": 162257305
+    },
+    {
+      "name": "circom",
+      "target": "sha256",
+      "input_size": 256,
+      "proof_duration": 635816429,
+      "verify_duration": 66540925,
+      "proof_size": 1013,
+      "preprocessing_size": 91340739,
+      "num_constraints": 158656,
+      "peak_memory": 249859276
+    },
+    {
+      "name": "circom",
+      "target": "sha256",
+      "input_size": 512,
+      "proof_duration": 1209973050,
+      "verify_duration": 118117771,
+      "proof_size": 1009,
+      "preprocessing_size": 167027783,
+      "num_constraints": 286016,
+      "peak_memory": 452149248
+    },
+    {
+      "name": "circom",
+      "target": "sha256",
+      "input_size": 1024,
+      "proof_duration": 2389189858,
+      "verify_duration": 221216129,
+      "proof_size": 1020,
+      "preprocessing_size": 318401941,
+      "num_constraints": 540736,
+      "peak_memory": 646456934
+    },
+    {
+      "name": "circom",
+      "target": "sha256",
+      "input_size": 2048,
+      "proof_duration": 4809998287,
+      "verify_duration": 422801421,
+      "proof_size": 1014,
+      "preprocessing_size": 621150107,
+      "num_constraints": 1050176,
+      "peak_memory": 1352441856
+    }
+  ]
+}

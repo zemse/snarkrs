@@ -15,6 +15,9 @@ members = [
     "crates/g16-wasm",
     "crates/g16-cli",
 ]
+# Its own workspace: it links a C++ witness generator and pulls rand, sha3 and
+# witnesscalc-adapter, and none of that belongs in a `cargo build` of the prover.
+exclude = ["bench/csp"]
 
 [workspace.package]
 version = "0.1.0"

@@ -1,0 +1,58 @@
+# Outside the workspace on purpose. This crate links a C++ witness generator and pulls
+# rand, sha3 and witnesscalc-adapter, none of which the prover has any business depending
+# on, and its build clones and builds witnesscalc from source. Keeping it out means
+# `cargo build --release` at the repo root is unaffected by any of that.
+[package]
+name = "g16-csp"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+g16-core  = { path = "../../crates/g16-core" }
+g16-zkey  = { path = "../../crates/g16-zkey" }
+g16-field = { path = "../../crates/g16-field" }
+g16-ceremony = { path = "../../crates/g16-ceremony" }
+g16-metal = { path = "../../crates/g16-metal", optional = true }
+g16-cuda  = { path = "../../crates/g16-cuda", optional = true }
+
+witnesscalc-adapter = "0.1"
+
+# rand 0.8, not 0.9, and the pin is load bearing. The benchmark inputs are whatever
+# `StdRng::seed_from_u64(n)` produces, and 0.9 replaced StdRng's ChaCha12 stream plumbing,
+# so a bump here silently changes every message we hash.
+rand = "0.8"
+sha2 = "0.10"
+sha3 = "0.10"
+
+ark-std = { version = "0.5", default-features = false, features = ["std", "getrandom"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+num-bigint = "0.4"
+
+[build-dependencies]
+witnesscalc-adapter = "0.1"
+
+[features]
+default = []
+metal = ["dep:g16-metal"]
+cuda = ["dep:g16-cuda", "g16-cuda/cuda"]
+
+[[bin]]
+name = "g16-csp"
+path = "src/bin/main.rs"
+
+# Separate binary so that a peak-RSS sample is one process that does one proof and exits,
+# which is what `/usr/bin/time -l` can actually measure. Anything the driver does before
+# or after would land in the same maxrss.
+[[bin]]
+name = "g16-csp-mem"
+path = "src/bin/mem.rs"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
