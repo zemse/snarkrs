@@ -61,6 +61,19 @@ fi
 # The flag omits it and takes keccak_2048 from 357 ms to 145. Author-written `assert()`
 # in the circom sources is kept; only the generated constraint checks go.
 #
+# `--no_init` goes with it. circom rewrites `var x[N];` into `x = [0,...,0]`, which the
+# C++ backend emits as one zero array at a high `lvar` index and an `Fr_copyn` from it
+# into every array declared. In `ecdsa_32` that is 90,684 such copies and 35,259 scalar
+# ones, 23% of the generated file and 5.12 GB of `memcpy` for one witness. The flag drops
+# the rewrite and takes ecdsa_32 from 513 ms to 444; the other fifteen circuits do not
+# move, their initialisations being one-time rather than per-block.
+#
+# What it leaves behind is a `var x[N]` holding whatever the stack held, so a circuit that
+# read an element before writing it would witness the stack rather than its input. The
+# R1CS check below covers the constraint system; for the witness itself, all sixteen
+# circuits were compared byte for byte against a build without the flag over twenty
+# seeded inputs, eight of them ecdsa signatures under distinct keys.
+#
 # Two things have to hold before a local build may replace upstream's, and both are
 # checked per circuit rather than assumed:
 #
@@ -127,7 +140,7 @@ for name in $VARIANTS; do
   fi
 
   flagged="$(mktemp -d)"
-  ( cd "$VENDOR/circom/circuits/$family" && "$CIRCOM" "$name.circom" --c --r1cs --O2 --sanity_check 0 -o "$flagged" )
+  ( cd "$VENDOR/circom/circuits/$family" && "$CIRCOM" "$name.circom" --c --r1cs --O2 --sanity_check 0 --no_init -o "$flagged" )
 
   # Check 2. The constraint system is what the published zkey commits to.
   [ "$(digest "$plain/$name.r1cs")" = "$(digest "$flagged/$name.r1cs")" ] || {
