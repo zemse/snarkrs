@@ -103,6 +103,9 @@ pub enum ZkeyError {
     NonCanonical(&'static str),
     #[error("verification key json: {0}")]
     BadJson(String),
+    /// A verifying key that is well formed but lets anyone forge, or accepts everything.
+    #[error("unsafe verifying key: {0}")]
+    UnsafeVerifyingKey(&'static str),
 }
 
 /// snarkjs' groth16 protocol id in section 1.
@@ -111,30 +114,71 @@ const PROTOCOL_GROTH16: u32 = 1;
 /// Section 4 record: three u32 indices then one 32-byte scalar.
 const COEF_RECORD: usize = 12 + FR_BYTES;
 
+/// How much of a key the parser validates. See [`ProvingKey::load`] for what the checked
+/// mode adds and [`ProvingKey::load_unchecked`] for what skipping it gives up.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Check {
+    Full,
+    Unchecked,
+}
+
 impl ProvingKey {
-    /// Parse a `.zkey` by mmap. Must not copy the point sections more than once.
+    /// Parse a `.zkey` by mmap and validate it. Must not copy the point sections more than
+    /// once.
+    ///
+    /// On top of the container, header and point-at-infinity gates that every load runs,
+    /// this checks that every point in sections 5 to 9 is on the curve, and refuses a key
+    /// whose `gamma_g2` equals its `delta_g2`. The curve check costs 7 ms on js_16x16_d32
+    /// and 35 ms on anon-aadhaar, against loads of 80 and 440 ms. The G2 query is not
+    /// subgroup checked here: that is 70 to 90 us a point, 1.2 s and 6.6 s on the same
+    /// two keys, and [`g16_core`'s `prove`] checks the one G2 point that leaves the
+    /// prover instead.
+    ///
+    /// `gamma_g2 == delta_g2` is what a key with no phase-2 contribution looks like: both
+    /// are left at the G2 generator, and anyone can then forge a proof of any statement
+    /// with `A = alpha`, `B = beta`, `C = -L`. It is the key the Foom and Veil verifiers
+    /// were drained through. Development keys look like this, so
+    /// [`ProvingKey::load_unchecked`] still accepts it.
     ///
     /// Native only. There is no filesystem on `wasm32-unknown-unknown`, so the browser
     /// uses [`ProvingKey::from_bytes`] instead.
     #[cfg(not(target_family = "wasm"))]
     pub fn load(path: &std::path::Path) -> Result<Self, ZkeyError> {
-        Self::parse(BinFile::open(path, b"zkey", 2)?)
+        Self::parse(BinFile::open(path, b"zkey", 2)?, Check::Full)
     }
 
-    /// Parse a `.zkey` that is already in memory, for the browser, where the key arrives
-    /// over `fetch` rather than from a path.
+    /// [`ProvingKey::load`] without the per-point curve checks on sections 5 to 9 and
+    /// without the `gamma_g2 != delta_g2` refusal. For a key this process generated or
+    /// otherwise already trusts. The container, header and infinity gates still run: they
+    /// are O(1) and they are what keeps a bad file from allocating or panicking.
+    ///
+    /// An off-curve query point is not caught at load this way. It yields an off-curve
+    /// proof element, which the checked `prove` in `g16-core` still refuses to return.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn load_unchecked(path: &std::path::Path) -> Result<Self, ZkeyError> {
+        Self::parse(BinFile::open(path, b"zkey", 2)?, Check::Unchecked)
+    }
+
+    /// Parse and validate a `.zkey` that is already in memory, for the browser, where the
+    /// key arrives over `fetch` rather than from a path. Validates exactly what
+    /// [`ProvingKey::load`] does.
     ///
     /// By value, not `&[u8]`: at `js_16x16_d32` the key is 94.4 MB, and a borrow would
     /// force the caller to hold a second live owner for as long as the `ProvingKey`
     /// exists. In a 4 GiB wasm32 address space that doubling is worth avoiding on its own,
     /// and the caller has no use for the bytes afterwards anyway.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, ZkeyError> {
-        Self::parse(BinFile::from_bytes(bytes, b"zkey", 2)?)
+        Self::parse(BinFile::from_bytes(bytes, b"zkey", 2)?, Check::Full)
     }
 
-    /// Everything after the container is opened, shared by both constructors so the two
+    /// [`ProvingKey::from_bytes`] with the checks [`ProvingKey::load_unchecked`] skips.
+    pub fn from_bytes_unchecked(bytes: Vec<u8>) -> Result<Self, ZkeyError> {
+        Self::parse(BinFile::from_bytes(bytes, b"zkey", 2)?, Check::Unchecked)
+    }
+
+    /// Everything after the container is opened, shared by all four constructors so the
     /// paths cannot diverge on a single validation.
-    fn parse(file: BinFile) -> Result<Self, ZkeyError> {
+    fn parse(file: BinFile, check: Check) -> Result<Self, ZkeyError> {
         let mut s1 = Cursor::new(file.unique_section(1)?, 1);
         let protocol = s1.u32()?;
         if protocol != PROTOCOL_GROTH16 {
@@ -216,13 +260,15 @@ impl ProvingKey {
             });
         }
 
-        let ic = read_g1_section(&file, 3, n_ic)?;
+        // Unchecked here because every IC point gets the full check further down, in both
+        // modes: there are `n_public + 1` of them and the verifier depends on them.
+        let ic = read_g1_section(&file, 3, n_ic, Check::Unchecked)?;
         let coeffs = read_coefficients(file.unique_section(4)?, n_vars, domain_size)?;
-        let a_query = read_g1_section(&file, 5, n_vars)?;
-        let b_g1_query = read_g1_section(&file, 6, n_vars)?;
-        let b_g2_query = read_g2_section(&file, 7, n_vars)?;
-        let l_query = read_g1_section(&file, 8, n_vars - n_ic)?;
-        let h_query = read_g1_section(&file, 9, domain_size)?;
+        let a_query = read_g1_section(&file, 5, n_vars, check)?;
+        let b_g1_query = read_g1_section(&file, 6, n_vars, check)?;
+        let b_g2_query = read_g2_section(&file, 7, n_vars, check)?;
+        let l_query = read_g1_section(&file, 8, n_vars - n_ic, check)?;
+        let h_query = read_g1_section(&file, 9, domain_size, check)?;
 
         // Only the O(1) points are validated on load. The query sections are millions of
         // points on a real circuit and a subgroup check each would dominate key load, so
@@ -308,6 +354,16 @@ impl ProvingKey {
         for (i, p) in ic.iter().enumerate() {
             check_g1(p, 3, &format!("ic[{i}]"))?;
         }
+        if check == Check::Full && gamma_g2 == delta_g2 {
+            return Err(ZkeyError::Malformed {
+                section: 2,
+                reason: "gamma_g2 equals delta_g2, which is what a key with no phase-2 \
+                         contribution looks like; anyone can forge a proof against it. \
+                         Contribute to phase 2, or load it with `load_unchecked` for \
+                         development"
+                    .into(),
+            });
+        }
 
         Ok(Self {
             n_vars,
@@ -347,18 +403,57 @@ fn check_modulus(c: &mut Cursor<'_>, want: &[u8]) -> Result<(), ZkeyError> {
     Ok(())
 }
 
-fn read_g1_section(file: &BinFile, id: u32, n: usize) -> Result<Vec<G1Affine>, ZkeyError> {
+fn read_g1_section(
+    file: &BinFile,
+    id: u32,
+    n: usize,
+    check: Check,
+) -> Result<Vec<G1Affine>, ZkeyError> {
     let data = file.unique_section(id)?;
     expect_records(data, n, G1_BYTES, id)?;
     // One pass over the mapped bytes straight into the output vector: the section is
-    // never materialised as an intermediate buffer.
-    data.par_chunks_exact(G1_BYTES).map(g1).collect()
+    // never materialised as an intermediate buffer. The curve check rides in the same
+    // pass, while the point is still in cache, which is what makes it close to free.
+    // BN254 G1 has cofactor 1, so on the curve is in the subgroup.
+    data.par_chunks_exact(G1_BYTES)
+        .enumerate()
+        .map(|(i, b)| {
+            let p = g1(b)?;
+            if check == Check::Full && !valid_g1(&p) {
+                return Err(off_curve(id, i));
+            }
+            Ok(p)
+        })
+        .collect()
 }
 
-fn read_g2_section(file: &BinFile, id: u32, n: usize) -> Result<Vec<G2Affine>, ZkeyError> {
+fn read_g2_section(
+    file: &BinFile,
+    id: u32,
+    n: usize,
+    check: Check,
+) -> Result<Vec<G2Affine>, ZkeyError> {
     let data = file.unique_section(id)?;
     expect_records(data, n, G2_BYTES, id)?;
-    data.par_chunks_exact(G2_BYTES).map(g2).collect()
+    // On the curve only. See `ProvingKey::load` for why the subgroup is checked on the
+    // proof rather than on each of these points.
+    data.par_chunks_exact(G2_BYTES)
+        .enumerate()
+        .map(|(i, b)| {
+            let p = g2(b)?;
+            if check == Check::Full && !p.is_on_curve() {
+                return Err(off_curve(id, i));
+            }
+            Ok(p)
+        })
+        .collect()
+}
+
+fn off_curve(section: u32, i: usize) -> ZkeyError {
+    ZkeyError::Malformed {
+        section,
+        reason: format!("point {i} is not on the curve"),
+    }
 }
 
 fn valid_g1(p: &G1Affine) -> bool {
@@ -441,6 +536,16 @@ fn read_coefficients(
                 reason: format!("signal {sig} is outside n_vars {n_vars}"),
             });
         }
+        // Pass 1 checked `constraint`, but on the mmap path this is a second read of a file
+        // someone else may be writing, and a record that changed in between indexed past
+        // the end: SIGABRT on `js_16x16_d32` in 4 of 6 live races. Re-check both indices
+        // so a changed record is an error rather than an abort or a silently wrong CSR.
+        if constraint >= domain_size || cursor[m][constraint] >= row_ptr[m][constraint + 1] {
+            return Err(ZkeyError::Malformed {
+                section: 4,
+                reason: format!("record {i} changed between the two passes over section 4"),
+            });
+        }
         let slot = cursor[m][constraint] as usize;
         cursor[m][constraint] += 1;
         signal[m][slot] = sig as u32;
@@ -473,8 +578,44 @@ fn coef_indices(data: &[u8], i: usize) -> Result<(usize, usize, usize, usize), Z
 }
 
 impl VerifyingKey {
+    /// Refuse a key that no honest setup produces and that breaks soundness. O(1), so the
+    /// checked `verify` in `g16-core` runs it on every call: the fields are `pub`, and a
+    /// key built by hand or over FFI never went through a loader.
+    ///
+    /// * `alpha_g1`, `beta_g2`, `gamma_g2` or `delta_g2` at infinity. With every pair
+    ///   degenerate the pairing product is the empty product, 1, and every proof verifies.
+    /// * `gamma_g2 == delta_g2`: no phase-2 contribution. `A = alpha`, `B = beta`,
+    ///   `C = -L` then verifies for any public input. See [`ProvingKey::load`].
+    /// * An empty `ic`, which has no constant-wire point.
+    pub fn check_structure(&self) -> Result<(), ZkeyError> {
+        let bad = |what| Err(ZkeyError::UnsafeVerifyingKey(what));
+        if self.alpha_g1.infinity {
+            return bad("alpha_g1 is the point at infinity");
+        }
+        if self.beta_g2.infinity {
+            return bad("beta_g2 is the point at infinity");
+        }
+        if self.gamma_g2.infinity {
+            return bad("gamma_g2 is the point at infinity");
+        }
+        if self.delta_g2.infinity {
+            return bad("delta_g2 is the point at infinity");
+        }
+        if self.gamma_g2 == self.delta_g2 {
+            return bad(
+                "gamma_g2 equals delta_g2, so the key had no phase-2 contribution and anyone \
+                 can forge a proof against it",
+            );
+        }
+        if self.ic.is_empty() {
+            return bad("IC is empty; it must carry at least the constant-wire point");
+        }
+        Ok(())
+    }
+
     /// Parse snarkjs' `verification_key.json`, so we can verify against the same key
-    /// snarkjs uses without trusting our own zkey reader.
+    /// snarkjs uses without trusting our own zkey reader. Every point is checked on the
+    /// curve and in the subgroup, and [`VerifyingKey::check_structure`] runs.
     ///
     /// Native only, because there is no filesystem in a browser. The browser path is
     /// [`VerifyingKey::from_json_str`], which this is a thin wrapper over.
@@ -483,11 +624,26 @@ impl VerifyingKey {
         Self::from_json_str(&std::fs::read_to_string(path)?)
     }
 
-    /// Same, on text the caller already has.
+    /// [`VerifyingKey::from_json`] without [`VerifyingKey::check_structure`], for a
+    /// development key that never had a phase-2 contribution. The points are still
+    /// checked: that costs microseconds and an off-subgroup point is never wanted.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn from_json_unchecked(path: &std::path::Path) -> Result<Self, ZkeyError> {
+        Self::from_json_str_unchecked(&std::fs::read_to_string(path)?)
+    }
+
+    /// Same as [`VerifyingKey::from_json`], on text the caller already has.
+    pub fn from_json_str(text: &str) -> Result<Self, ZkeyError> {
+        let vk = Self::from_json_str_unchecked(text)?;
+        vk.check_structure()?;
+        Ok(vk)
+    }
+
+    /// Same as [`VerifyingKey::from_json_unchecked`], on text the caller already has.
     ///
     /// The page in `../webgpu-trial` cross-checks snarkjs' proofs against our own verifier,
     /// and it has `vkey.json` as a string from `fetch`, not as a path.
-    pub fn from_json_str(text: &str) -> Result<Self, ZkeyError> {
+    pub fn from_json_str_unchecked(text: &str) -> Result<Self, ZkeyError> {
         let v: serde_json::Value =
             serde_json::from_str(text).map_err(|e| ZkeyError::BadJson(e.to_string()))?;
 
