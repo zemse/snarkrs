@@ -826,6 +826,16 @@ async fn prove_inner(circuit: &WgpuCircuit, witness: &[Fr]) -> Result<String, Js
     let (r, s) = blinders()?;
     // Stage 11, from `g16-core`, so the browser and the CLI blind identically.
     let proof = g16_core::prove::assemble(circuit.key(), &m, r, s, &mut t);
+    // The check `g16_core::prove::prove` runs, which this path cannot call because every
+    // readback above is asynchronous. It matters more here than anywhere: the key came
+    // over `fetch` from someone else, and WebKit has miscompiled this prover's shaders
+    // into wrong proofs twice. See `prove`'s docs for what it guards.
+    let checked_at = Instant::now();
+    let public = witness
+        .get(1..=circuit.key().n_public)
+        .ok_or_else(|| JsError::new("witness is shorter than the key's public inputs"))?;
+    verify_proof(&circuit.key().vk, public, &proof).map_err(|e| js(ProveError::SelfVerify(e)))?;
+    t.verify_us += checked_at.elapsed().as_micros() as u64;
     let total_us = t0.elapsed().as_micros() as u64;
 
     result_json(circuit.key(), witness, &proof, &t, total_us, "")
@@ -837,10 +847,13 @@ fn blinders() -> Result<(Fr, Fr), JsError> {
         let mut rng = BrowserRng {
             crypto: st.crypto.clone(),
         };
-        Ok((
-            <Fr as ark_std::UniformRand>::rand(&mut rng),
-            <Fr as ark_std::UniformRand>::rand(&mut rng),
-        ))
+        let r = <Fr as ark_std::UniformRand>::rand(&mut rng);
+        let s = <Fr as ark_std::UniformRand>::rand(&mut rng);
+        // Same guard as `g16_core::prove::prove_unchecked`: a zero here is a broken RNG.
+        if ark_std::Zero::is_zero(&r) || ark_std::Zero::is_zero(&s) {
+            return Err(js(ProveError::ZeroBlinder));
+        }
+        Ok((r, s))
     })
 }
 
@@ -865,7 +878,7 @@ fn result_json(
     let public = &witness[1..=n_public];
 
     Ok(format!(
-        r#"{{"proof":{},"publicSignals":{},"timings":{{"gather_us":{},"ntt_us":{},"pointwise_us":{},"msm_us":{},"assemble_us":{},"total_us":{}{}}}}}"#,
+        r#"{{"proof":{},"publicSignals":{},"timings":{{"gather_us":{},"ntt_us":{},"pointwise_us":{},"msm_us":{},"assemble_us":{},"verify_us":{},"total_us":{}{}}}}}"#,
         json::proof_to_string(proof).trim_end(),
         json::public_to_string(public).trim_end(),
         t.gather_us,
@@ -873,6 +886,7 @@ fn result_json(
         t.pointwise_us,
         t.msm_us,
         t.assemble_us,
+        t.verify_us,
         total_us,
         extra,
     ))

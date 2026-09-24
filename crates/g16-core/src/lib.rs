@@ -82,6 +82,18 @@ pub enum ProveError {
         backend: &'static str,
         reason: String,
     },
+    #[error("w[0] is the constant-one wire and must be 1")]
+    ConstantWire,
+    #[error("the RNG produced a zero blinder, which a CSPRNG does with probability 2^-254")]
+    ZeroBlinder,
+    /// Raised by [`prove::prove`] when the proof it just produced does not verify against
+    /// the key it was proved with.
+    #[error(
+        "the proof does not verify against the key it was proved with ({0}). Either the \
+         witness does not satisfy the circuit, the key is not what it claims to be, or the \
+         prover or its accelerator computed something wrong"
+    )]
+    SelfVerify(verify::VerifyError),
     /// Raised by [`prove::prove_with_blinders`] when the crate was built at opt-level 0 or 1.
     ///
     /// Not a safety rail on the arithmetic, a rail on wall clock. `cargo test` defaults to
@@ -216,6 +228,8 @@ pub struct StageTimings {
     pub pointwise_us: u64,
     pub msm_us: u64,
     pub assemble_us: u64,
+    /// The check of the result in [`prove::prove`]. Zero from [`prove::prove_unchecked`].
+    pub verify_us: u64,
 }
 
 /// Creates [`PreparedCircuit`]s. One per accelerator.

@@ -26,7 +26,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
-use g16_core::{prove::prove, verify::verify, StageTimings};
+use g16_core::{prove::prove_unchecked, verify::verify, StageTimings};
 use g16_field::Fr;
 use g16_zkey::{wtns::Witness, ProvingKey, VerifyingKey};
 
@@ -180,11 +180,13 @@ fn cold(v: &Variant, constraints: i64, args: &Args) -> Result<Vec<Row>> {
         let circuit = crate::make_backend(args.backend)?.prepare(pk)?;
         let prepare_ms = ms(start);
 
-        let proof = prove(circuit.as_ref(), &witness, &mut rng, &mut t)?;
+        let proof = prove_unchecked(circuit.as_ref(), &witness, &mut rng, &mut t)?;
         let total_ms = ms(start);
 
         // Verification is outside the timed region but before the row is recorded: a
-        // benchmark that times a broken prover is worse than no benchmark.
+        // benchmark that times a broken prover is worse than no benchmark. That is also why
+        // this is `prove_unchecked`: the same check inside the timed region would bill it
+        // to the prover, and rapidsnark and snarkjs, the columns beside ours, run none.
         verify(&vk, &public, &proof).with_context(|| {
             format!(
                 "{} cold rep {rep}: our own verifier rejected the proof",
@@ -228,7 +230,7 @@ fn warm(v: &Variant, constraints: i64, args: &Args) -> Result<Vec<Row>> {
     for rep in 1..=args.reps {
         let mut t = StageTimings::default();
         let start = Instant::now();
-        let proof = prove(circuit.as_ref(), &witness, &mut rng, &mut t)?;
+        let proof = prove_unchecked(circuit.as_ref(), &witness, &mut rng, &mut t)?;
         let prove_ms = ms(start);
 
         verify(&vk, &public, &proof).with_context(|| {
@@ -334,6 +336,7 @@ mod tests {
                 pointwise_us: 3,
                 msm_us: 4,
                 assemble_us: 5,
+                verify_us: 0,
             },
         };
         let line = row.to_csv(&host);

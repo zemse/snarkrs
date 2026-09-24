@@ -57,7 +57,7 @@ use g16_ceremony::{
 };
 use g16_cli::{bench, json, make_backend, BackendKind};
 use g16_core::{
-    prove::{prove, prove_trace},
+    prove::{prove, prove_trace, prove_unchecked},
     verify::verify,
     StageTimings,
 };
@@ -701,39 +701,31 @@ fn run_prove(
     let mut rng = ark_std::rand::thread_rng();
     let mut t = StageTimings::default();
     let started = std::time::Instant::now();
-    let proof = prove(circuit.as_ref(), &w, &mut rng, &mut t)?;
+    // Verify before writing, not after, so a bad proof never reaches the filesystem where
+    // something downstream might pick it up. `prove` does it, and validates the proof's
+    // points first; see its docs for why that check is also what keeps a hostile key from
+    // reading the witness out of `C`.
+    let proof = if self_verify {
+        prove(circuit.as_ref(), &w, &mut rng, &mut t).map_err(|e| {
+            anyhow::anyhow!("{e}. Nothing has been written. Re-run with --self-verify=false to write it anyway.")
+        })?
+    } else {
+        prove_unchecked(circuit.as_ref(), &w, &mut rng, &mut t)?
+    };
     let elapsed = started.elapsed();
 
     // The public signals are the witness prefix, which is what snarkjs publishes. Taken
     // from the witness rather than copied from an existing public.json so that `prove`
     // needs nothing but the zkey and the witness.
-    //
-    // Verify before writing, not after, so a bad proof never reaches the filesystem where
-    // something downstream might pick it up. `bench` has verified every timed rep since it
-    // was written, on the grounds that timing a broken prover is worse than not timing one;
-    // `prove` is the command people actually ship with and it was the one path that skipped
-    // the check. A dropped GPU kernel error or a stale pooled buffer fails exactly here.
     let public = &w[1..=n_public];
-    if self_verify {
-        let vk = &circuit.key().vk;
-        match verify(vk, public, &proof) {
-            Ok(()) => {}
-            Err(e) => anyhow::bail!(
-                "the proof this run produced does not verify against the key it was proved \
-                 with ({e}). Nothing has been written. This is a bug in the prover or a sign \
-                 of a faulty accelerator, not a bad witness: an inconsistent witness yields a \
-                 proof that fails verification elsewhere, not one that fails against its own \
-                 key. Re-run with --self-verify=false to write it anyway."
-            ),
-        }
-    }
 
     json::write_proof(proof_out, &proof)?;
     json::write_public(public_out, public)?;
 
     if stage_timings {
         let total = elapsed.as_micros() as u64;
-        let known = t.gather_us + t.ntt_us + t.pointwise_us + t.msm_us + t.assemble_us;
+        let known =
+            t.gather_us + t.ntt_us + t.pointwise_us + t.msm_us + t.assemble_us + t.verify_us;
         println!("backend        {}", circuit.backend_name());
         println!("domain size    {}", circuit.domain_size());
         println!("gather      us {:>10}", t.gather_us);
@@ -741,6 +733,7 @@ fn run_prove(
         println!("pointwise   us {:>10}", t.pointwise_us);
         println!("msm         us {:>10}", t.msm_us);
         println!("assemble    us {:>10}", t.assemble_us);
+        println!("verify      us {:>10}", t.verify_us);
         // Attributed and total are printed separately rather than one being derived from
         // the other, so any stage that forgets to report shows up as a gap.
         println!("attributed  us {:>10}", known);

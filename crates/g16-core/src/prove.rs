@@ -9,8 +9,48 @@ use crate::{MsmOutputs, PreparedCircuit, Proof, ProveError, StageTimings};
 use g16_field::*;
 use g16_zkey::ProvingKey;
 
-/// Full proof: stages 0-11. `rng` supplies the zero-knowledge blinders `r` and `s`.
+/// Full proof: stages 0-11, then a check of the result. `rng` supplies the
+/// zero-knowledge blinders `r` and `s`.
+///
+/// The proof is verified against the key it was proved with before it is returned, with
+/// every element validated first (see [`crate::verify::verify`]). About 1 ms, and it is
+/// doing two jobs:
+///
+/// * **Correctness.** A dropped GPU kernel error, a stale pooled buffer or a miscompiled
+///   shader perturbs the proof and not the key, so it fails here instead of reaching
+///   whoever consumes the proof.
+/// * **Zero knowledge against a hostile key.** With `delta_g1` and `delta_g2` nonzero,
+///   which every load checks, `A` and `B` are uniform and independent, and a proof that
+///   verifies under a fixed key has `C` determined by `A`, `B` and the public inputs. So a
+///   proof that passes this check carries nothing about the witness, however the query
+///   sections were built. Without it, a key whose L query is shifted by `e` on one private
+///   wire puts `w * e` into `C` for anyone holding that key's trapdoor to read back. What
+///   is left is one bit per call: whether the check passed. A crafted key can choose which
+///   linear condition on the witness decides that, so a key from someone you do not trust
+///   still needs `g16 zkey verify` (or `snarkjs zkey verify`) against the circuit and the
+///   ptau.
+///
+/// [`prove_unchecked`] skips the check.
 pub fn prove<R: ark_std::rand::RngCore + ark_std::rand::CryptoRng>(
+    circuit: &dyn PreparedCircuit,
+    witness: &[Fr],
+    rng: &mut R,
+    timings: &mut StageTimings,
+) -> Result<Proof, ProveError> {
+    let proof = prove_unchecked(circuit, witness, rng, timings)?;
+    // `prove_unchecked` has refused a witness of the wrong length, so the slice is in range.
+    let public = &witness[1..=circuit.n_public()];
+    let start = Instant::now();
+    let checked = crate::verify::verify(&circuit.key().vk, public, &proof);
+    timings.verify_us += start.elapsed().as_micros() as u64;
+    checked.map_err(ProveError::SelfVerify)?;
+    Ok(proof)
+}
+
+/// [`prove`] without the check of the result. For a benchmark that verifies outside its
+/// timed region, or a caller that verifies the proof itself. A key that is not trusted
+/// should never reach this function: see [`prove`] for what the check is guarding.
+pub fn prove_unchecked<R: ark_std::rand::RngCore + ark_std::rand::CryptoRng>(
     circuit: &dyn PreparedCircuit,
     witness: &[Fr],
     rng: &mut R,
@@ -21,6 +61,12 @@ pub fn prove<R: ark_std::rand::RngCore + ark_std::rand::CryptoRng>(
     // rather than a default argument someone could reach for by accident.
     let r = Fr::rand(rng);
     let s = Fr::rand(rng);
+    // A CSPRNG gives zero with probability 2^-254 a draw. A zero here means the RNG is
+    // broken, most likely a seeded one threaded through for reproducible benchmarks, and
+    // `r = s = 0` is an unblinded proof that still verifies, so no later check sees it.
+    if r.is_zero() || s.is_zero() {
+        return Err(ProveError::ZeroBlinder);
+    }
     prove_with_blinders(circuit, witness, r, s, timings)
 }
 
@@ -54,6 +100,7 @@ pub fn prove_with_blinders(
     timings: &mut StageTimings,
 ) -> Result<Proof, ProveError> {
     refuse_if_unoptimized()?;
+    check_witness_shape(circuit, witness)?;
     // One call for stages 0-9 rather than `compute_h` then `msms`: only stage 9 needs
     // `H`, and a backend may overlap stages 5-8 with 0-4. The trait's default is the
     // old sequence, so nothing changes for a backend that has not opted in.
@@ -108,6 +155,24 @@ pub fn prove_trace(
         &m,
         &proof,
     ))
+}
+
+/// Length and the constant-one wire, before any stage runs. The backends check the length
+/// too, but only once the NTT is under way on some of them, and none checks `w[0]`: every
+/// QAP row is written against `w[0] = 1`, so anything else is a full proof's work for a
+/// proof that cannot verify. `Witness::load` already refuses it, which covers the CLI and
+/// not an in-process or FFI caller.
+fn check_witness_shape(circuit: &dyn PreparedCircuit, witness: &[Fr]) -> Result<(), ProveError> {
+    if witness.len() != circuit.n_vars() {
+        return Err(ProveError::WitnessLength {
+            got: witness.len(),
+            want: circuit.n_vars(),
+        });
+    }
+    if !witness[0].is_one() {
+        return Err(ProveError::ConstantWire);
+    }
+    Ok(())
 }
 
 /// Run `stages` on this thread and [`BlinderTerms::new`] beside it, returning both.
@@ -631,5 +696,74 @@ mod tests {
             assert_eq!(got, want);
             assert!(aggregate_public(&vk, &public[..public.len() - 1]).is_err());
         });
+    }
+
+    /// The zero-knowledge argument in [`prove`]'s docs, run rather than asserted.
+    ///
+    /// A key with one private wire's L base shifted by `E` passes every load check: every
+    /// point is valid and nothing in the header moves. Proved with the same blinders, its
+    /// `C` differs from the honest one by exactly `w * E`, which anyone holding that key's
+    /// trapdoor can compute the honest `C` to subtract. The checked `prove` refuses to hand
+    /// that proof out. The last part pins what remains: on a wire whose value is zero the
+    /// shift cancels and the checked `prove` succeeds, so success or failure is the one bit
+    /// a hostile key still learns.
+    #[test]
+    fn a_shifted_l_query_leaks_through_c_and_only_the_checked_prove_stops_it() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/artifacts/js_1x1_d8");
+        if !dir.join("circuit.zkey").is_file() {
+            eprintln!("SKIPPED shifted_l_query: no js_1x1_d8 under bench/artifacts");
+            return;
+        }
+        let witness = Witness::load(&dir.join("circuit.wtns")).unwrap().0;
+        let n_public = ProvingKey::load(&dir.join("circuit.zkey"))
+            .unwrap()
+            .n_public;
+        // L covers the private wires, which start after the constant and the public inputs.
+        let first_private = n_public + 1;
+        let wire = |pred: &dyn Fn(&Fr) -> bool| {
+            (first_private..witness.len())
+                .find(|&j| pred(&witness[j]))
+                .expect("js_1x1_d8 has both a zero and a nonzero private wire")
+        };
+        let nonzero = wire(&|w| !w.is_zero());
+        let zero = wire(&|w| w.is_zero());
+        let e = G1Projective::generator() * Fr::from(0x5eedu64);
+
+        let hostile = |j: usize| {
+            let mut pk = ProvingKey::load(&dir.join("circuit.zkey")).unwrap();
+            let k = j - first_private;
+            pk.l_query[k] = (pk.l_query[k] + e).into_affine();
+            CpuBackend::new().prepare(pk).unwrap()
+        };
+        let honest = CpuBackend::new()
+            .prepare(ProvingKey::load(&dir.join("circuit.zkey")).unwrap())
+            .unwrap();
+        let (r, s) = (Fr::from(3u64), Fr::from(5u64));
+        let mut t = StageTimings::default();
+
+        // The leak: same blinders, and C moves by exactly w * E.
+        let bad = hostile(nonzero);
+        let p_honest = prove_with_blinders(honest.as_ref(), &witness, r, s, &mut t).unwrap();
+        let p_bad = prove_with_blinders(bad.as_ref(), &witness, r, s, &mut t).unwrap();
+        assert_eq!(p_bad.a, p_honest.a);
+        assert_eq!(p_bad.b, p_honest.b);
+        assert_eq!(
+            p_bad.c.into_group() - p_honest.c.into_group(),
+            e * witness[nonzero],
+            "C does not carry w * E"
+        );
+
+        // The guard: the checked prove refuses to return it.
+        let mut rng = StdRng::from_seed([7u8; 32]);
+        assert!(matches!(
+            super::prove(bad.as_ref(), &witness, &mut rng, &mut t),
+            Err(ProveError::SelfVerify(VerifyError::PairingFailed))
+        ));
+        assert!(prove_unchecked(bad.as_ref(), &witness, &mut rng, &mut t).is_ok());
+
+        // What is left: a zero wire cancels the shift, so the checked prove succeeds, and
+        // whether it succeeds says whether that wire is zero.
+        let quiet = hostile(zero);
+        assert!(super::prove(quiet.as_ref(), &witness, &mut rng, &mut t).is_ok());
     }
 }

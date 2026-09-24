@@ -29,9 +29,9 @@ use ark_serialize::CanonicalSerialize;
 use ark_std::rand::{rngs::StdRng, thread_rng, SeedableRng};
 use g16_cli::artifacts::{variants, Variant};
 use g16_cli::{make_backend, BackendKind};
-use g16_core::prove::{prove, prove_with_blinders};
+use g16_core::prove::{prove, prove_unchecked, prove_with_blinders};
 use g16_core::verify::verify;
-use g16_core::{PreparedCircuit, Proof, StageTimings};
+use g16_core::{PreparedCircuit, Proof, ProveError, StageTimings};
 use g16_field::{Fr, PrimeField, UniformRand};
 use g16_zkey::{wtns::Witness, ProvingKey, VerifyingKey};
 
@@ -272,10 +272,19 @@ fn tiny_mul_rejects_what_it_should() {
         let public = vec![out, a, b];
 
         // Bad witness, honest public inputs. The R1CS is unsatisfied, so H is not
-        // divisible by Z and the pairing check must fail.
+        // divisible by Z and the pairing check must fail. The checked `prove` runs that
+        // check itself and refuses; `prove_unchecked` hands the proof over so the
+        // verifier below gets to reject it too.
         let bogus = vec![Fr::from(1u64), out, a, b, c, t + Fr::from(1u64)];
         let mut timings = StageTimings::default();
-        let proof = prove(l.circuit.as_ref(), &bogus, &mut thread_rng(), &mut timings)
+        assert!(
+            matches!(
+                prove(l.circuit.as_ref(), &bogus, &mut thread_rng(), &mut timings),
+                Err(ProveError::SelfVerify(_))
+            ),
+            "round {i}: the checked prove returned a proof of an unsatisfying witness"
+        );
+        let proof = prove_unchecked(l.circuit.as_ref(), &bogus, &mut thread_rng(), &mut timings)
             .expect("proving an unsatisfying witness should still produce a Proof value");
         assert!(
             verify(&l.vk, &public, &proof).is_err(),
