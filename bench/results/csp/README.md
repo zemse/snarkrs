@@ -23,7 +23,7 @@ wrong.
 | zkeys | the published `zkeys-v2` release, checksum verified, not regenerated locally |
 | witness | witnesscalc, in process, inside the timed region, identical for all three provers |
 | provers | `g16` cpu, `g16` metal, rapidsnark; one loop, only the prover swapped |
-| variants | sha256 and keccak at 128 to 2048 bytes, poseidon at 2 to 16 field elements |
+| variants | sha256 and keccak at 128 to 2048 bytes, poseidon at 2 to 16 field elements, ecdsa at 32 |
 | raw output | `bench/results/csp/metrics/*.json`, untracked, which is why the numbers are in this file |
 
 Every duration below is milliseconds unless the column header says otherwise. Every one is
@@ -242,12 +242,34 @@ snarkjs' and not merely self-consistent. That check is three variants and a manu
 not something the harness runs, and until it is wired in the other twelve rest on our
 verifier alone.
 
+## ecdsa
+
+The fourth circom target was measured after the fifteen above and sits in its own section
+because it has no published row to compare against: the page's `circom` entry covers
+sha256, keccak and poseidon only. secp256k1 signature verification, 512,955 constraints,
+the same three provers.
+
+| prover | witness | zkey read | prepare | prove | total | peak rss |
+| ------ | ------: | --------: | ------: | ----: | ----: | -------: |
+| rapidsnark | 671.9 | n/a | 3.1 | 857.3 | 1,532.3 | not measured |
+| `g16` cpu | 671.9 | 74.3 | 3.3 | 403.8 | 1,153.3 | 860 MB |
+| `g16` metal | 671.1 | 74.6 | 61.3 | **87.5** | **894.5** | 1,151 MB |
+
+This is the clearest case in the file of the point the previous section makes. On the
+proving call alone Metal is 9.8x rapidsnark, the widest margin anywhere here. End to end it
+is 1.71x, because witnesscalc takes 672 ms whoever proves afterwards: 44% of rapidsnark's
+measurement, 58% of the CPU's, 75% of Metal's. No amount of prover work moves that row much
+further. The witness generator is the target.
+
+The zkey read behaves differently here too. At 334 MB for 512,955 constraints the key is
+larger per constraint than any hash circuit, because the width-12 comb table is inlined,
+and `preprocessing_size` is 412,467,641 bytes once the 59.5 MB `.cpp` and 18.6 MB `.dat`
+the page counts are added.
+
 ## What is missing
 
-`ecdsa` is the fourth circom target on the page and there is no row for it here. The fifteen
-variants above are every one that had a measurement when these numbers were taken.
-`blake3` and `poseidon2`, the other two upstream targets, have no circom circuit, so the
-page has no circom row for them either.
+`blake3` and `poseidon2` are the other two upstream targets and have no circom circuit, so
+the page has no circom row for them either. Nothing else on the page is a circom target.
 
-A `mac2.metal` run is also missing. Every ratio against the published row here carries a
+A `mac2.metal` run is missing. Every ratio against the published row here carries a
 hardware term that only running the same harness on the same instance type can remove.
