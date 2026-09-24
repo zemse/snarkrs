@@ -116,46 +116,155 @@ fn clone_witnesscalc(dir: &Path) {
     run(&["submodule", "update", "--init", "--recursive"], Some(dir));
 }
 
-/// Give `Fr_mod` and `Fr_idiv` a fast path for small non-negative operands.
+/// Give `Fr_mod` and `Fr_idiv` a path that does not go through GMP.
 ///
-/// circom compiles witness-time arithmetic on `var`s to these two calls, so a keccak
-/// round's `(x + 1) % 5` and a rotation's `r % 64` arrive here as two small non-negative
-/// integers. The shipped implementation answers them with three `mpz_init`/`mpz_clear`
-/// pairs and a multi-precision division, which measures 53.7 ns for a remainder that fits
-/// in a register and accounts for 38% of keccak_2048's witness generation. `Fr_toMpz`
-/// normalises every element into [0, q) before dividing, so when neither operand is long
-/// and both are non-negative the machine remainder is that same value, and `Fr_fromMpz`
-/// would have tagged the result `Fr_SHORT` because it fits.
+/// circom routes every witness time `%` and `\\` through these two functions, and the
+/// shipped bodies answer each call with three `mpz_init`/`mpz_clear` pairs and a multi
+/// precision division: 53.7 ns for a remainder that often fits in a register, 4,300,800
+/// times for one `keccak_2048` witness and 2.0 million times for one `ecdsa_32` witness.
 ///
-/// A short element with a negative `shortVal` stands for `shortVal + q`, a 254 bit
-/// number, so that case falls through to the general path along with every long operand.
-/// `ecdsa_32`'s bigint helpers divide by 2^64 and stay on the general path throughout.
+/// Three shapes cover almost every call these circuits make. Two small non-negative
+/// shorts is keccak and sha256 index arithmetic, `(x + 1) % 5` and `r % 64`, and measures
+/// 1.18 ns against 53.7. A power of two divisor is what the bigint gadgets divide by all
+/// through `ecdsa_32`, and the answer is a shift and a mask. A single limb divisor with a
+/// single limb dividend is one `udiv`. Anything wider still goes to GMP.
 ///
-/// Set `G16_CSP_STOCK_FR` to build the checkout unpatched, which is how the before number
-/// in `bench/results/csp` was measured.
+/// `Fr_toMpz` normalises an element into [0, q) before dividing and `Fr_fromMpz` tags the
+/// result `Fr_SHORT` when it fits in a signed int, leaving `longVal` alone, so these
+/// paths reproduce the shipped representation and not merely the shipped value. All
+/// sixteen reference witnesses are byte identical across the change.
+///
+/// Set `G16_CSP_STOCK_FR` to build the checkout unpatched, which is how the before
+/// numbers in `bench/results/csp` were measured.
 fn patch_fr(witnesscalc: &Path) {
-    const MARKER: &str = "g16: short-operand fast path";
-    let fr = witnesscalc.join("build/fr.cpp");
-    let src = std::fs::read_to_string(&fr).expect("witnesscalc checkout has no build/fr.cpp");
-    if src.contains(MARKER) {
-        return;
+    const HELPERS: &str = r##"
+// g16: divide without GMP whenever the operands make that possible.
+//
+// circom routes every witness time `%` and `\` through Fr_mod and Fr_idiv, and the
+// shipped bodies answer each one with three mpz_init/mpz_clear pairs and a multi
+// precision division. Three shapes cover almost every call these circuits make:
+// two small non-negative shorts (keccak and sha256 index arithmetic), a divisor that
+// is a power of two (the bigint gadgets divide by 2^64 throughout), and a single limb
+// divisor with a single limb dividend.
+//
+// Fr_toMpz normalises an element into [0, q) before dividing and Fr_fromMpz tags the
+// result Fr_SHORT when it fits in a signed int, leaving longVal alone, so these paths
+// reproduce the shipped representation exactly and not merely the shipped value.
+
+static inline bool g16_limbs(uint64_t out[4], PFrElement e) {
+    FrElement t;
+    Fr_toNormal(&t, e);
+    if (t.type & Fr_LONG) {
+        out[0] = t.longVal[0]; out[1] = t.longVal[1];
+        out[2] = t.longVal[2]; out[3] = t.longVal[3];
+        return true;
     }
+    // A negative short stands for shortVal + q, a 254 bit number. None of the circuits
+    // benchmarked here produce one as a dividend, so it goes to the general path.
+    if (t.shortVal < 0) return false;
+    out[0] = (uint64_t)t.shortVal; out[1] = out[2] = out[3] = 0;
+    return true;
+}
+
+static inline void g16_store(PFrElement r, const uint64_t v[4]) {
+    if (!v[1] && !v[2] && !v[3] && v[0] <= 0x7fffffffull) {
+        r->type = Fr_SHORT;
+        r->shortVal = (int32_t)v[0];
+        return;                      // Fr_fromMpz leaves longVal untouched here
+    }
+    r->type = Fr_LONG;
+    r->longVal[0] = v[0]; r->longVal[1] = v[1];
+    r->longVal[2] = v[2]; r->longVal[3] = v[3];
+}
+
+// The one bit set in b, or -1 when b is not a power of two.
+static inline int g16_log2(const uint64_t b[4]) {
+    int bit = -1;
+    for (int i = 0; i < 4; i++) {
+        if (!b[i]) continue;
+        if (b[i] & (b[i] - 1)) return -1;       // more than one bit in this limb
+        if (bit >= 0) return -1;                // and a bit in an earlier limb
+        bit = i * 64 + __builtin_ctzll(b[i]);
+    }
+    return bit;
+}
+
+static inline bool g16_divmod(PFrElement r, PFrElement a, PFrElement b, bool quotient) {
+    uint64_t av[4], bv[4], out[4] = {0, 0, 0, 0};
+    if (!g16_limbs(av, a) || !g16_limbs(bv, b)) return false;
+    if (!(bv[0] | bv[1] | bv[2] | bv[3])) return false;   // let the general path decide
+
+    int k = g16_log2(bv);
+    if (k >= 0) {
+        if (quotient) {                                    // a >> k
+            int w = k / 64, s = k % 64;
+            for (int i = 0; i + w < 4; i++) {
+                out[i] = av[i + w] >> s;
+                if (s && i + w + 1 < 4) out[i] |= av[i + w + 1] << (64 - s);
+            }
+        } else {                                           // a & ((1 << k) - 1)
+            for (int i = 0; i < 4; i++) {
+                if (k >= (i + 1) * 64) out[i] = av[i];
+                else if (k > i * 64) out[i] = av[i] & ((1ull << (k - i * 64)) - 1);
+            }
+        }
+        g16_store(r, out);
+        return true;
+    }
+    // One limb over one limb is a single udiv; anything wider is left to GMP, which
+    // measurement says is not worth special casing for these circuits.
+    if (!(bv[1] | bv[2] | bv[3]) && !(av[1] | av[2] | av[3])) {
+        out[0] = quotient ? av[0] / bv[0] : av[0] % bv[0];
+        g16_store(r, out);
+        return true;
+    }
+    return false;
+}
+"##;
+    let fr = witnesscalc.join("build/fr.cpp");
+    // Restore before patching rather than checking for a marker. A marker can only say
+    // that some version of this patch is present, not that it is this one, and an
+    // OUT_DIR outlives edits to this file. The checkout is a git clone and the adapter
+    // rebuilds it from scratch on every run, so this costs nothing.
+    let ok = Command::new("git")
+        .args(["checkout", "--", "build/fr.cpp"])
+        .current_dir(witnesscalc)
+        .status()
+        .expect("git is not on PATH")
+        .success();
+    assert!(
+        ok,
+        "could not restore build/fr.cpp in the witnesscalc checkout"
+    );
+    let src = std::fs::read_to_string(&fr).expect("witnesscalc checkout has no build/fr.cpp");
+    assert!(
+        !src.contains("g16"),
+        "git restored a build/fr.cpp that is still patched"
+    );
     let mut out = src;
-    for (name, op) in [("Fr_mod", "%"), ("Fr_idiv", "/")] {
+    for (name, op, quotient) in [("Fr_mod", "%", "false"), ("Fr_idiv", "/", "true")] {
         let sig = format!("void {name}(PFrElement r, PFrElement a, PFrElement b) {{");
         let at = out
             .find(&sig)
             .unwrap_or_else(|| panic!("{name} is not declared the way this patch expects"));
         let fast = format!(
-            "\n    // {MARKER}\n\
+            "\n    // g16: short operands, then the limb paths, then GMP\n\
              \x20   if (!((a->type | b->type) & Fr_LONG) && a->shortVal >= 0 && b->shortVal > 0) {{\n\
              \x20       int32_t v = a->shortVal {op} b->shortVal;\n\
              \x20       r->type = Fr_SHORT;\n\
              \x20       r->shortVal = v;\n\
              \x20       return;\n\
-             \x20   }}\n"
+             \x20   }}\n\
+             \x20   if (g16_divmod(r, a, b, {quotient})) return;\n"
         );
         out.insert_str(at + sig.len(), &fast);
     }
+    // Ahead of every caller. Fr_idiv is defined before Fr_mod in this file, so anchoring
+    // on either function name puts the helpers after one of them.
+    const ANCHOR: &str = "#include \"fr.hpp\"\n";
+    let at = out
+        .find(ANCHOR)
+        .expect("build/fr.cpp does not open by including fr.hpp");
+    out.insert_str(at + ANCHOR.len(), HELPERS);
     std::fs::write(&fr, out).expect("writing the patched build/fr.cpp");
 }

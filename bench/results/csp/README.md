@@ -266,6 +266,158 @@ larger per constraint than any hash circuit, because the width-12 comb table is 
 and `preprocessing_size` is 412,467,641 bytes once the 59.5 MB `.cpp` and 18.6 MB `.dat`
 the page counts are added.
 
+## Witness generation: 1.37x, and where the rest of it is
+
+`bench/csp/build.rs` patches the witnesscalc checkout before it is built. The numbers
+below are that patch, measured by `g16-csp-wit`, which runs witness generation with no
+prover attached so a sampling profile of it is not also a profile of the prover.
+
+`G16_CSP_STOCK_FR=1 CARGO_TARGET_DIR=target-stock cargo build --release --bin g16-csp-wit`
+builds the same crate unpatched. Both binaries were then run alternately, five rounds of
+ten repetitions each, and the minimum of the fifty is reported: a single threaded
+measurement on a laptop competes with whatever else is running, and the minimum is the
+sample that got a performance core to itself. Every repetition compares its `.wtns` bytes
+against the first, and all sixteen witnesses are byte identical to the ones the stock
+build produces.
+
+| variant | stock ms | patched ms | x |
+| ------- | -------: | ---------: | --: |
+| `sha256_128` | 13.10 | 10.24 | 1.28 |
+| `sha256_256` | 22.53 | 16.96 | 1.33 |
+| `sha256_512` | 40.78 | 30.90 | 1.32 |
+| `sha256_1024` | 77.55 | 58.60 | 1.32 |
+| `sha256_2048` | 150.79 | 114.76 | 1.31 |
+| `keccak_128` | 29.51 | 16.03 | 1.84 |
+| `keccak_256` | 65.09 | 39.23 | 1.66 |
+| `keccak_512` | 136.90 | 86.10 | 1.59 |
+| `keccak_1024` | 282.38 | 177.64 | 1.59 |
+| `keccak_2048` | 569.25 | 364.17 | 1.56 |
+| `poseidon_2` | 0.13 | 0.13 | 1.00 |
+| `poseidon_4` | 0.18 | 0.19 | 0.95 |
+| `poseidon_8` | 0.31 | 0.31 | 1.00 |
+| `poseidon_12` | 0.43 | 0.48 | 0.90 |
+| `poseidon_16` | 0.63 | 0.62 | 1.02 |
+| `ecdsa_32` | 680.90 | 590.26 | 1.15 |
+| suite | 2,070.46 | 1,506.62 | **1.37** |
+
+### What was wrong
+
+circom compiles witness time arithmetic on `var`s into `Fr_mod` and `Fr_idiv`. A keccak
+round's `(x + 1) % 5` and a rotation's `r % 64` therefore arrive at the field library as
+two small integers, and the shipped bodies in `build/fr.cpp` answer each one with three
+`mpz_init`/`mpz_clear` pairs and a multi precision division. Counted by a build with
+instrumented call sites, `keccak_2048` makes **4,300,800** such calls per witness and
+`ecdsa_32` makes **2,027,436**. The divisors are `circuitConstants[11] = 5` and
+`circuitConstants[3] = 64`.
+
+Three shapes cover almost all of them. Two small non-negative shorts is the keccak and
+sha256 case; a power of two divisor is what `ecdsa_32`'s bigint gadgets divide by
+throughout, and the answer is a shift and a mask; a single limb divisor with a single limb
+dividend is one `udiv`. Anything wider still goes to GMP. `Fr_toMpz` normalises an element
+into [0, q) before dividing and `Fr_fromMpz` tags the result `Fr_SHORT` when it fits in a
+signed int, leaving `longVal` alone, so these paths reproduce the shipped representation
+and not merely the shipped value.
+
+Measured on this machine, single threaded, best of nine over 262,144 operations:
+
+| operation | ns/op |
+| --------- | ----: |
+| `Fr_mod(short, 5)` as shipped | 53.69 |
+| `Fr_mod(short, 5)` short path | 1.18 |
+| `Fr_idiv(short, 5)` as shipped | 55.12 |
+| `Fr_idiv(short, 5)` short path | 1.18 |
+| `Fr_mod(254 bit, 2^64)` as shipped | 64.61 |
+| `Fr_rawMMul`, the montgomery core | 11.78 |
+| `Fr_mul`, the wrapper | 11.92 |
+| `Fr_add`, two shorts | 1.72 |
+| `Fr_copy` | 1.28 |
+| `Fr_toLongNormal` | 7.10 |
+
+### The profile before and after
+
+`sample` at 1 ms, leaf attribution, converted to ms of the measured call. The point of
+this table is that the patch removed the class it aimed at and left everything else alone.
+
+| class | keccak stock | keccak patched | ecdsa stock | ecdsa patched |
+| ----- | -----------: | -------------: | ----------: | ------------: |
+| Fr raw asm core | 240.6 | 239.2 | 123.3 | 114.7 |
+| malloc/free | 119.8 | **0.1** | 73.5 | 15.2 |
+| gmp bignum | 94.4 | **0.0** | 101.2 | 41.5 |
+| Fr wrappers | 97.9 | 96.9 | 193.6 | 189.4 |
+| circuit code | 6.1 | 11.0 | 97.4 | 104.1 |
+| memory move | 2.5 | 3.5 | 80.6 | 85.2 |
+
+On `keccak_2048` the 214.2 ms of malloc and GMP is gone rather than reduced. On `ecdsa_32`
+118 ms of 174.7 goes and 56.7 ms stays, which is correct: its dividends are genuine multi
+limb values and a 254 bit division is what they need.
+
+### What is left, and what it is worth
+
+The arithmetic floor, from the measured intrinsics and the constraint counts, assuming one
+montgomery multiply per non-linear constraint, three add or sub to form each linear
+combination, and one 40 byte signal store per signal:
+
+| circuit | floor | patched | over floor |
+| ------- | ----: | ------: | ---------: |
+| `keccak_2048` | 34.8 ms | 364.17 ms | 10.5x |
+| `sha256_2048` | 13.5 ms | 114.76 ms | 8.5x |
+| `ecdsa_32` | 53.7 ms | 590.26 ms | 11.0x |
+
+So roughly 10% of what remains is arithmetic the constraints require. The rest is the
+interpreter: `keccak_2048` makes about forty `Fr_*` calls per constraint against a minimum
+of about four, and every one of them branches on the operand's type tag before doing any
+work. That is the `Fr wrappers` row above, 96.9 ms on keccak and 189.4 ms on ecdsa, and it
+cannot be fixed from outside the code generator. Emitting typed calls, where a signal
+produced by a multiply is known to be `Fr_LONGMONTGOMERY` and a loop variable is known to
+be `Fr_SHORT`, is the change that would collect it.
+
+`Fr_rawMMul` is at its floor and is not worth attacking. A four limb CIOS montgomery
+multiply needs 2n^2 + n = 36 products, so 68 multiplier pipe instructions, which is 34
+cycles on two multiply pipes. It measures 11.78 ns, 43 cycles at 3.68 GHz, which is the
+dependent chain latency. The ceiling is 22% and out of order execution already overlaps
+independent multiplies.
+
+`ecdsa_32`'s remaining 190 ms of wrappers and 85 ms of `memmove` are a circuit property,
+not a witnesscalc one. Its 0xPARC bigint gadgets carry each 64 bit limb in a 40 byte field
+element and pass arrays by value across circom function boundaries, which is where
+`long_div`, `short_div` and `long_scalar_mult` spend their time.
+
+### Whether a GPU can take this over
+
+No, on these numbers. Level scheduling the witness DAG is the only shape that parallelises,
+and the arithmetic it would parallelise is about 35 ms of `keccak_2048`, not 364. The
+remainder is type dispatch and per-call overhead that static compilation removes on the CPU
+before a GPU sees the problem.
+
+The sync cost decides it. keccak-f is roughly 200 dependent levels per permutation, so the
+circuit is about 2,000 levels deep at a width near 3,600. Compute per level is around
+0.2 us and traffic around 1.2 us at the 283 GB/s this machine's GPU streams, both
+negligible; 2,000 dependent dispatches at 6 to 8 us each is 15 to 20 ms. That is a ceiling
+of about 2x over a static CPU evaluator that would have to be written anyway to produce the
+DAG.
+
+The published prior art agrees rather than conflicting. ZKPoG (eprint 2025/765) is the only
+work that puts witness generation on a GPU, for Plonky2 rather than circom; it reports
+14.8x on witness generation against 25.7x for the rest of its pipeline, which leaves
+witness generation at 58% of proving, and its fully sequential circuit gets 1.0x. On the
+circom side there is nothing: iden3's `evaluate_parallel` is commented out, and mopro
+measures `circom-witnesscalc`, the flat DAG evaluator a GPU port would start from, as
+slower than witnesscalc on exactly these shapes on Apple silicon (Keccak 69.6 ms against
+63.9 ms, SHA256 32 ms against 22 ms).
+
+Two cheap measurements would settle it if it is ever worth revisiting: time 2,000 trivial
+dependent dispatches in one Metal command buffer, and level sort the `keccak_2048` witness
+DAG for its true depth and width. Nobody has published the second number for a circom
+circuit.
+
+### This helps the published row too
+
+The fix is in `build/fr.cpp`, which is checked into zkmopro/witnesscalc and generated by
+iden3's ffiasm. It is not specific to this prover: the `circom` row on the page uses the
+same witness generator, so adopting it upstream would move their numbers by the same
+factor and narrow the gap measured in the sections above. That is the honest reading and
+it is an argument for sending it, not for sitting on it.
+
 ## What is missing
 
 `blake3` and `poseidon2` are the other two upstream targets and have no circom circuit, so
