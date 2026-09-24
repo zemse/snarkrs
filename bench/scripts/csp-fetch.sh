@@ -148,6 +148,7 @@ for name in $VARIANTS; do
   [ -n "$want" ] || { echo "$asset not in checksums.sha256" >&2; exit 1; }
 
   if [ -f "$d/circuit.zkey" ]; then
+    got="$(digest "$d/circuit.zkey")"
     if [ "$got" = "$want" ]; then
       printf 'ok    %-14s zkey already present\n' "$name"
       continue
