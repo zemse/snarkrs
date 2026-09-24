@@ -49,7 +49,11 @@ fn main() -> Result<()> {
             let t = Instant::now();
             let wtns = circuits::witness(v, input.clone())?;
             times.push(t.elapsed());
-            ensure!(wtns == reference, "{}: witness changed between reps", v.name());
+            ensure!(
+                wtns == reference,
+                "{}: witness changed between reps",
+                v.name()
+            );
         }
         times.sort_unstable();
         let mean = times.iter().sum::<Duration>() / times.len() as u32;
