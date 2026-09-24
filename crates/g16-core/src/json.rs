@@ -140,22 +140,30 @@ fn checked_g2(x: Fq2, y: Fq2, what: &str) -> Result<G2Affine, JsonError> {
     Ok(p)
 }
 
+/// `[x, y, z]` with `z` exactly `"1"`, or exactly `["0","1","0"]` for the point at
+/// infinity, which is what [`proof_to_string`] and snarkjs write.
+///
+/// Every coordinate is parsed before `z` is looked at. The reader used to return the
+/// identity on `z == 0` without reading `x` and `y`, so `[{"lol":1},[1,2,3],"0"]` was an
+/// accepted `pi_a`, and it divided through by any other nonzero `z`, which gave every
+/// proof about 2^254 accepted encodings. Neither is anything snarkjs writes.
 pub fn read_g1(v: &Value, what: &str) -> Result<G1Affine, JsonError> {
     let a = elements(v, 3, what)?;
+    let x: Fq = parse_field(&a[0], what)?;
+    let y: Fq = parse_field(&a[1], what)?;
     let z: Fq = parse_field(&a[2], what)?;
     if z.is_zero() {
-        return Ok(G1Affine::identity());
+        if x.is_zero() && y.is_one() {
+            return Ok(G1Affine::identity());
+        }
+        return err(format!(
+            "{what}: z = 0 but (x, y) is not ffjavascript's (0, 1)"
+        ));
     }
-    // ffjavascript's curve arithmetic is Jacobian, so the affine point is (x/z^2, y/z^3).
-    // snarkjs always writes z = 1, where every convention agrees; this branch only
-    // matters for hand-written input.
-    let zi = z.inverse().expect("z is nonzero here");
-    let zi2 = zi.square();
-    checked_g1(
-        parse_field::<Fq>(&a[0], what)? * zi2,
-        parse_field::<Fq>(&a[1], what)? * zi2 * zi,
-        what,
-    )
+    if !z.is_one() {
+        return err(format!("{what}: z = {}, expected 1", dec(z)));
+    }
+    checked_g1(x, y, what)
 }
 
 fn read_fq2(v: &Value, what: &str) -> Result<Fq2, JsonError> {
@@ -166,19 +174,25 @@ fn read_fq2(v: &Value, what: &str) -> Result<Fq2, JsonError> {
     ))
 }
 
+/// `[x, y, z]` over `Fq2`, with `z` exactly `["1","0"]`, or the whole point exactly
+/// `[["0","0"],["1","0"],["0","0"]]` for infinity. Same rules as [`read_g1`].
 pub fn read_g2(v: &Value, what: &str) -> Result<G2Affine, JsonError> {
     let a = elements(v, 3, what)?;
+    let x = read_fq2(&a[0], what)?;
+    let y = read_fq2(&a[1], what)?;
     let z = read_fq2(&a[2], what)?;
     if z.is_zero() {
-        return Ok(G2Affine::identity());
+        if x.is_zero() && y.is_one() {
+            return Ok(G2Affine::identity());
+        }
+        return err(format!(
+            "{what}: z = 0 but (x, y) is not ffjavascript's (0, 1)"
+        ));
     }
-    let zi = z.inverse().expect("z is nonzero here");
-    let zi2 = zi.square();
-    checked_g2(
-        read_fq2(&a[0], what)? * zi2,
-        read_fq2(&a[1], what)? * zi2 * zi,
-        what,
-    )
+    if !z.is_one() {
+        return err(format!("{what}: z is not [1, 0]"));
+    }
+    checked_g2(x, y, what)
 }
 
 pub fn proof_from_value(v: &Value) -> Result<Proof, JsonError> {

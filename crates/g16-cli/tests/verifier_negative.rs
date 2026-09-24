@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 use g16_cli::json::{proof_from_value, proof_to_string, read_public};
 use g16_core::cpu::CpuBackend;
 use g16_core::prove::prove_with_blinders;
-use g16_core::verify::{verify, VerifyError};
+use g16_core::verify::{verify, verify_unchecked, VerifyError};
 use g16_core::{Backend, PreparedCircuit, Proof, StageTimings};
 use g16_field::*;
 use g16_zkey::{wtns::Witness, ProvingKey, VerifyingKey};
@@ -222,6 +222,28 @@ fn must_reject_with_pairing_failure(fx: &Fixture, public: &[Fr], proof: &Proof, 
     }
 }
 
+/// For a proof element the checked `verify` refuses before the pairing: off the curve,
+/// outside the subgroup, or at infinity. The bare pairing must still fail on it, so
+/// `verify_unchecked` is held to the older, weaker promise.
+fn must_reject_as_invalid(fx: &Fixture, public: &[Fr], proof: &Proof, case: &str) {
+    match verify(&fx.vk, public, proof) {
+        Err(VerifyError::InvalidProof(_)) => {}
+        Err(e) => panic!(
+            "{}: {case} was rejected as {e}, expected an invalid proof element",
+            fx.name
+        ),
+        Ok(()) => panic!("{}: verifier ACCEPTED {case}", fx.name),
+    }
+    match verify_unchecked(&fx.vk, public, proof) {
+        Err(VerifyError::PairingFailed) => {}
+        Err(e) => panic!(
+            "{}: {case} was rejected by verify_unchecked as {e}, expected a pairing failure",
+            fx.name
+        ),
+        Ok(()) => panic!("{}: verify_unchecked ACCEPTED {case}", fx.name),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The matrix
 // ---------------------------------------------------------------------------
@@ -252,7 +274,7 @@ fn single_bit_flips_in_every_coordinate_are_rejected() {
                     "{}: flipping {coord:?} bit {bit} was a no-op",
                     fx.name
                 );
-                must_reject_with_pairing_failure(
+                must_reject_as_invalid(
                     fx,
                     &fx.public,
                     &bad,
@@ -429,7 +451,8 @@ fn cross_proof_splices_of_the_same_statement_are_rejected() {
 
 /// The identity is the one point every pairing implementation special-cases, so it is
 /// the one most likely to short-circuit a check into vacuous truth. `e(0, B) = 1`, which
-/// removes a factor from the product entirely.
+/// removes a factor from the product entirely. The checked `verify` refuses it before the
+/// pairing; `verify_unchecked` must still fail it arithmetically.
 #[test]
 fn the_point_at_infinity_is_rejected_in_every_position() {
     each("point_at_infinity", |fx| {
@@ -458,11 +481,11 @@ fn the_point_at_infinity_is_rejected_in_every_position() {
             ),
         ];
         for (case, bad) in cases {
-            must_reject_with_pairing_failure(fx, &fx.public, &bad, case);
+            must_reject_as_invalid(fx, &fx.public, &bad, case);
         }
         // The all-zero proof is the degenerate one a stub or a zeroed buffer produces,
         // and it must not be mistaken for a proof of anything.
-        must_reject_with_pairing_failure(
+        must_reject_as_invalid(
             fx,
             &fx.public,
             &Proof {

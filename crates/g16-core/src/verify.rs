@@ -16,28 +16,74 @@ pub enum VerifyError {
     EmptyVerifyingKey,
     #[error("pairing check failed")]
     PairingFailed,
+    /// A proof element that no honest prover emits: off the curve, outside the prime-order
+    /// subgroup, or the point at infinity.
+    #[error("proof element {0}")]
+    InvalidProof(&'static str),
+    #[error(transparent)]
+    UnsafeKey(#[from] g16_zkey::ZkeyError),
 }
 
-/// Check a proof against a verifying key and public inputs.
+/// Check a proof against a verifying key and public inputs, validating both first.
 ///
-/// # What this does not check
+/// `A` and `C` must be on the curve, `B` on the curve and in the prime-order subgroup,
+/// and none of the three the point at infinity. The key must pass
+/// [`VerifyingKey::check_structure`]. Together these cost about one G2 subgroup check,
+/// small against the pairing, and they are what make the result a guarantee of this
+/// function rather than of whichever loader the caller happened to use: `Proof`'s and
+/// `VerifyingKey`'s fields are public, so a value built by hand or over FFI would
+/// otherwise reach the Miller loop unchecked. The Groth16 soundness argument stops
+/// applying the moment an off-subgroup element does.
 ///
-/// The points in `proof` are taken as given. This function does no on-curve, subgroup or
-/// canonical-encoding validation, because `Proof`'s fields are public and a `Proof` that
-/// reached here through this crate's own deserializer has already been validated by it:
-/// [`crate::json`] runs an on-curve and a prime-order-subgroup check on all three points.
-/// The subgroup check only does work on `pi_b` (BN254 G1 has cofactor 1, so on-curve
-/// implies in-subgroup there; G2 does not).
-///
-/// A caller that constructs a `Proof` by hand, over FFI, or with `ark-serialize` and
-/// `Validate::No` gets no such guarantee and must validate before calling. Feeding an
-/// off-subgroup `B` here returns `false` today rather than accepting, but that is a
-/// property of BN254 and of arkworks' arithmetic, not something this signature promises:
-/// the Groth16 soundness argument stops applying the moment an off-subgroup element
-/// reaches the Miller loop.
+/// Infinity is refused outright rather than left to the pairing, because arkworks drops a
+/// pair with a zero element from the product, which turns the 4-pair check into a
+/// 3-pair one instead of failing it.
 ///
 /// A proof that verifies is malleable. See [`Proof`] for why that matters to the caller.
 pub fn verify(vk: &VerifyingKey, public: &[Fr], proof: &Proof) -> Result<(), VerifyError> {
+    vk.check_structure()?;
+    check_proof(proof)?;
+    verify_unchecked(vk, public, proof)
+}
+
+/// The three proof elements, checked as [`verify`] documents.
+pub fn check_proof(proof: &Proof) -> Result<(), VerifyError> {
+    let bad = |what| Err(VerifyError::InvalidProof(what));
+    if proof.a.infinity {
+        return bad("A is the point at infinity");
+    }
+    if proof.b.infinity {
+        return bad("B is the point at infinity");
+    }
+    if proof.c.infinity {
+        return bad("C is the point at infinity");
+    }
+    // BN254 G1 has cofactor 1, so on the curve is in the subgroup there. The subgroup call
+    // stays on A and C anyway so the check survives a change of curve.
+    if !(proof.a.is_on_curve() && proof.a.is_in_correct_subgroup_assuming_on_curve()) {
+        return bad("A is not a valid G1 point");
+    }
+    if !(proof.c.is_on_curve() && proof.c.is_in_correct_subgroup_assuming_on_curve()) {
+        return bad("C is not a valid G1 point");
+    }
+    if !(proof.b.is_on_curve() && proof.b.is_in_correct_subgroup_assuming_on_curve()) {
+        return bad("B is not a valid G2 point");
+    }
+    Ok(())
+}
+
+/// [`verify`] without validating the key or the proof: the bare pairing check.
+///
+/// For a caller that has already validated both, for instance through [`crate::json`]
+/// and [`VerifyingKey::from_json`], and wants the microseconds back. Feeding it an
+/// off-subgroup `B` returns `false` today rather than accepting, but that is a property
+/// of BN254 and of arkworks' arithmetic, not something this signature promises. A key
+/// with every pair degenerate makes it accept everything.
+pub fn verify_unchecked(
+    vk: &VerifyingKey,
+    public: &[Fr],
+    proof: &Proof,
+) -> Result<(), VerifyError> {
     let l_bar = aggregate_public(vk, public)?;
 
     // `multi_pairing` runs one Miller loop per pair and a single final exponentiation
