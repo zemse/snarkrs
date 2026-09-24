@@ -6,7 +6,8 @@
 //! not. That script explains both, and which circuits fall on which side. This build
 //! reads the staged pair and nothing else.
 //!
-//! The witnesscalc checkout is patched before it is built; see [`patch_fr`].
+//! The witnesscalc checkout is patched before it is built; see [`patch_fr`] and
+//! [`patch_fr_generic`].
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -79,7 +80,15 @@ fn main() {
     println!("cargo:rerun-if-env-changed=G16_CSP_STOCK_FR");
     if std::env::var_os("G16_CSP_STOCK_FR").is_none() {
         patch_fr(&witnesscalc);
+        patch_fr_generic(&witnesscalc);
     }
+    // `tests/fr_paths.rs` compiles a differential test against the field library this
+    // build produces, and needs to know where it landed.
+    println!(
+        "cargo:rustc-env=G16_CSP_WITNESSCALC={}",
+        witnesscalc.display()
+    );
+
     witnesscalc_adapter::build_and_link(staged.to_str().unwrap());
 
     // `build_and_link` emits `-l dylib=witnesscalc_<circuit>` but no rpath, so without
@@ -277,4 +286,80 @@ static inline bool g16_divmod(PFrElement r, PFrElement a, PFrElement b, bool quo
         .expect("build/fr.cpp does not open by including fr.hpp");
     out.insert_str(at + ANCHOR.len(), HELPERS);
     std::fs::write(&fr, out).expect("writing the patched build/fr.cpp");
+}
+
+/// Stop `mul_s1s2` widening a short product it has already computed.
+///
+/// The shipped body multiplies two shorts, writes the short result, and then overwrites
+/// it with the long form:
+///
+/// ```text
+///     r->shortVal = (int32_t)result;
+///     r->type = Fr_SHORT;
+///     //
+///     Fr_rawCopyS2L(r->longVal, result);          // and throw that away
+///     r->type = Fr_LONG;
+/// ```
+///
+/// The comment above it reads "done the same way as in intel asm implementation", so it
+/// is deliberate bug compatibility with `fr.asm` rather than an accident. It costs most
+/// of keccak: every signal there is a 0 or a 1 and every constant is small, so every
+/// product is short, and widening them sends the additions down the long paths and makes
+/// `Fr_eq` pay a `Fr_toMontgomery`. Keeping the short result takes `keccak_2048` from
+/// 145.5 ms to 88.2 ms. sha256 barely moves, because its working bits are long tagged
+/// before they ever reach a multiply, and ecdsa's operands are genuinely wide.
+///
+/// Only non-negative products may stay short, and that restriction is load bearing. A
+/// negative short subtracted from a long goes through `sub_s1l2n`, which returns an
+/// unreduced representative where the all-long path reduces, and `Fr_toLongNormal` does
+/// not reduce either: the same value mod q, different bytes in the witness. With the
+/// restriction, `tests/fr_paths.rs` agrees with the shipped representation on every one
+/// of its checks; without it, that test fails.
+fn patch_fr_generic(witnesscalc: &Path) {
+    let generic = witnesscalc.join("build/fr_generic.cpp");
+    let ok = Command::new("git")
+        .args(["checkout", "--", "build/fr_generic.cpp"])
+        .current_dir(witnesscalc)
+        .status()
+        .expect("git is not on PATH")
+        .success();
+    assert!(
+        ok,
+        "could not restore build/fr_generic.cpp in the witnesscalc checkout"
+    );
+    let src = std::fs::read_to_string(&generic)
+        .expect("witnesscalc checkout has no build/fr_generic.cpp");
+    assert!(
+        !src.contains("g16"),
+        "git restored a build/fr_generic.cpp that is still patched"
+    );
+
+    const SHIPPED: &str = "        // done the same way as in intel asm implementation\n\
+                           \x20       r->shortVal = (int32_t)result;\n\
+                           \x20       r->type = Fr_SHORT;\n\
+                           \x20       //\n\n\
+                           \x20       Fr_rawCopyS2L(r->longVal, result);\n\
+                           \x20       r->type = Fr_LONG;\n\
+                           \x20       r->shortVal = 0;\n";
+    const PATCHED: &str = "        // g16: a non-negative product that fits stays short, the way add_s1s2 does.\n\
+                           \x20       //\n\
+                           \x20       // A negative one must not. It would reach sub_s1l2n, which returns an\n\
+                           \x20       // unreduced representative where the all-long path reduces, and\n\
+                           \x20       // Fr_toLongNormal does not reduce either: same value mod q, different\n\
+                           \x20       // bytes in the witness.\n\
+                           \x20       if (result >= 0) {\n\
+                           \x20           r->shortVal = (int32_t)result;\n\
+                           \x20           r->type = Fr_SHORT;\n\
+                           \x20           return;\n\
+                           \x20       }\n\n\
+                           \x20       Fr_rawCopyS2L(r->longVal, result);\n\
+                           \x20       r->type = Fr_LONG;\n\
+                           \x20       r->shortVal = 0;\n";
+    assert_eq!(
+        src.matches(SHIPPED).count(),
+        1,
+        "mul_s1s2 is not written the way this patch expects"
+    );
+    std::fs::write(&generic, src.replace(SHIPPED, PATCHED))
+        .expect("writing the patched build/fr_generic.cpp");
 }
