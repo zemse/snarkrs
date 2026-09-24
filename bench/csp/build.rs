@@ -1,13 +1,10 @@
 //! Compile and link the circom witness generators.
 //!
-//! The `.cpp`/`.dat` pairs are the ones the upstream benchmark ships, so the witness this
-//! crate computes is the same witness the `circom` row computes. They are not vendored
-//! into this repo: `bench/scripts/csp-fetch.sh` clones them, and this build reads them
-//! from that checkout.
-//!
-//! `ecdsa_32` is the exception upstream makes too: 57 MB of generated C++ is not in their
-//! tree either, so `csp-fetch.sh` runs circom over `ecdsa_32.circom` to produce it in
-//! place, with the same `--O2 --c` upstream's own build script uses.
+//! Which generator each circuit is built from is decided by `bench/scripts/csp-fetch.sh`
+//! and recorded there as `<name>.staged.cpp`/`.staged.dat`: a local `--sanity_check 0`
+//! build where that provably reproduces upstream's, and upstream's own where it does
+//! not. That script explains both, and which circuits fall on which side. This build
+//! reads the staged pair and nothing else.
 //!
 //! The witnesscalc checkout is patched before it is built; see [`patch_fr`].
 
@@ -45,15 +42,29 @@ fn main() {
     std::fs::create_dir_all(&staged).unwrap();
     for name in CIRCUITS {
         let family = name.rsplit_once('_').expect("name is family_size").0;
-        for ext in ["cpp", "dat"] {
-            let from = src.join(family).join(name).join(format!("{name}.{ext}"));
+        let dir = src.join(family).join(name);
+        // `csp-fetch.sh` decides, per circuit, whether the staged generator is a local
+        // `--sanity_check 0` build or upstream's own, and writes the answer here. Read
+        // only that pair: a `.cpp` and a `.dat` from different builds do not describe the
+        // same circuit, and requiring the staged names rather than falling back to
+        // upstream's means a stale checkout fails here instead of silently mixing them.
+        for (from, to) in [
+            (
+                dir.join(format!("{name}.staged.cpp")),
+                format!("{name}.cpp"),
+            ),
+            (
+                dir.join(format!("{name}.staged.dat")),
+                format!("{name}.dat"),
+            ),
+        ] {
             if !from.is_file() {
                 panic!(
                     "missing {}\nrun bench/scripts/csp-fetch.sh first",
                     from.display()
                 );
             }
-            link(&from, &staged.join(format!("{name}.{ext}")));
+            link(&from, &staged.join(to));
         }
     }
     println!("cargo:rerun-if-changed={}", src.display());
@@ -69,7 +80,6 @@ fn main() {
     if std::env::var_os("G16_CSP_STOCK_FR").is_none() {
         patch_fr(&witnesscalc);
     }
-
     witnesscalc_adapter::build_and_link(staged.to_str().unwrap());
 
     // `build_and_link` emits `-l dylib=witnesscalc_<circuit>` but no rpath, so without

@@ -11,7 +11,7 @@
 #   circuits  github.com/ethereum/csp-benchmarks @ main, sparse (circom/ only)
 #   zkeys     the same repo's `zkeys-v2` release
 #
-# Needs `circom` 2.2.3 on PATH for the one witness generator upstream does not ship.
+# Needs `circom` 2.2.3 on PATH: every witness generator is compiled here, see below.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
@@ -50,28 +50,85 @@ if [ ! -f "$VENDOR/circom/circomlib/circuits/poseidon.circom" ]; then
   git -C "$VENDOR/circom/circomlib" checkout --quiet "$CIRCOMLIB_SHA"
 fi
 
-# `ecdsa_32` is the one witness generator upstream does not keep in its tree: 57 MB of
-# generated C++, because the width-12 comb table is inlined in the circuit. Compile it
-# where `build.rs` expects to read it, with the flags upstream's own build script uses.
-# The includes are relative to the circuit directory, so circom runs from there.
-ecdsa="$VENDOR/circom/circuits/ecdsa"
-if [ ! -s "$ecdsa/ecdsa_32/ecdsa_32.dat" ]; then
-  log "compiling the ecdsa_32 witness generator (a few minutes)"
-  # Pinned to 2.2.3, the version upstream states its constraint counts for. A later
-  # circom compiles the same source to a different R1CS, and a witness from it does not
-  # satisfy the published zkey: the failure surfaces as a proof that will not verify,
-  # a long way from the cause.
-  CIRCOM="$HERE/bin/circom2"
-  [ -x "$CIRCOM" ] || CIRCOM="$(command -v circom || true)"
-  [ -n "$CIRCOM" ] || { echo "circom 2.2.3 is not on PATH and bench/bin/circom2 is missing" >&2; exit 1; }
-  "$CIRCOM" --version 2>&1 | grep -q '2[.]2[.]3' \
-    || { echo "need circom 2.2.3, have: $("$CIRCOM" --version 2>&1)" >&2; exit 1; }
-  staging="$(mktemp -d)"
-  ( cd "$ecdsa" && "$CIRCOM" ecdsa_32.circom --c --O2 -o "$staging" )
-  mkdir -p "$ecdsa/ecdsa_32"
-  cp "$staging/ecdsa_32_cpp/ecdsa_32.cpp" "$staging/ecdsa_32_cpp/ecdsa_32.dat" "$ecdsa/ecdsa_32/"
-  rm -rf "$staging"
-fi
+# The witness generator each circuit is built from, as `<name>.staged.cpp`/`.staged.dat`.
+# `build.rs` reads only those two, so the choice made here is the whole of it.
+#
+# Where we can, the staged generator is a local `--sanity_check 0` build. circom's C++
+# backend emits, for each `===` constraint, code that re-evaluates the constraint
+# polynomial in field arithmetic and compares it. That is the proof system's job, not the
+# witness generator's, and it is most of the work: one `Xor3Bits` bit costs two `Fr_bxor`
+# and a copy to compute, and six muls, five adds, two subs and an `Fr_eq` to re-check.
+# The flag omits it and takes keccak_2048 from 357 ms to 145. Author-written `assert()`
+# in the circom sources is kept; only the generated constraint checks go.
+#
+# Two things have to hold before a local build may replace upstream's, and both are
+# checked per circuit rather than assumed:
+#
+#   1. Compiling WITHOUT the flag must reproduce upstream's shipped `.cpp` and `.dat` byte
+#      for byte. That is what makes the flag the only difference between their generator
+#      and ours, and it is a property of this machine's circom and this circomlib, not
+#      something that can be taken on faith. sha256 and keccak pass. **All five poseidon
+#      circuits fail it**: upstream's shipped poseidon generators do not come from circom
+#      2.2.3 over circomlib $CIRCOMLIB_SHA, so we keep theirs and forgo the flag there.
+#      Poseidon is a fraction of a percent of witness time and gains nothing from it
+#      anyway, every variant measuring 1.00x.
+#
+#   2. The R1CS must be identical with and without the flag, so the published zkey stays
+#      valid and `num_constraints` does not move.
+#
+# A generator built from sources that do not match the one the published zkey was
+# generated for produces a witness that does not satisfy it, and that surfaces as a proof
+# which will not verify, a long way from the cause. Hence the checks, and hence circom is
+# pinned to 2.2.3, the version upstream states its constraint counts for.
+#
+# `ecdsa_32` has no upstream generator to compare against: 57 MB of generated C++ is not
+# in their tree, so check 1 does not apply and we build it as we always have.
+CIRCOM="$HERE/bin/circom2"
+[ -x "$CIRCOM" ] || CIRCOM="$(command -v circom || true)"
+[ -n "$CIRCOM" ] || { echo "circom 2.2.3 is not on PATH and bench/bin/circom2 is missing" >&2; exit 1; }
+"$CIRCOM" --version 2>&1 | grep -q '2[.]2[.]3' \
+  || { echo "need circom 2.2.3, have: $("$CIRCOM" --version 2>&1)" >&2; exit 1; }
+
+digest() { shasum -a256 "$1" | cut -d' ' -f1; }
+
+for name in $VARIANTS; do
+  [ -z "$name" ] && continue
+  family="${name%_*}"
+  dir="$VENDOR/circom/circuits/$family/$name"
+  [ -s "$dir/$name.staged.cpp" ] && continue
+  mkdir -p "$dir"
+
+  log "building the $name witness generator"
+  plain="$(mktemp -d)"
+  ( cd "$VENDOR/circom/circuits/$family" && "$CIRCOM" "$name.circom" --c --r1cs --O2 -o "$plain" )
+
+  # Check 1, where upstream gives us something to check against.
+  faithful=yes
+  if [ -s "$dir/$name.cpp" ]; then
+    [ "$(digest "$plain/${name}_cpp/$name.cpp")" = "$(digest "$dir/$name.cpp")" ] || faithful=no
+    [ "$(digest "$plain/${name}_cpp/$name.dat")" = "$(digest "$dir/$name.dat")" ] || faithful=no
+  fi
+
+  if [ "$faithful" = no ]; then
+    echo "      our circom does not reproduce upstream's $name generator; keeping theirs" >&2
+    cp "$dir/$name.cpp" "$dir/$name.staged.cpp"
+    cp "$dir/$name.dat" "$dir/$name.staged.dat"
+    rm -rf "$plain"
+    continue
+  fi
+
+  flagged="$(mktemp -d)"
+  ( cd "$VENDOR/circom/circuits/$family" && "$CIRCOM" "$name.circom" --c --r1cs --O2 --sanity_check 0 -o "$flagged" )
+
+  # Check 2. The constraint system is what the published zkey commits to.
+  [ "$(digest "$plain/$name.r1cs")" = "$(digest "$flagged/$name.r1cs")" ] || {
+    echo "$name: --sanity_check 0 changed the R1CS, which would invalidate the zkey" >&2
+    exit 1; }
+
+  cp "$flagged/${name}_cpp/$name.cpp" "$dir/$name.staged.cpp"
+  cp "$flagged/${name}_cpp/$name.dat" "$dir/$name.staged.dat"
+  rm -rf "$plain" "$flagged"
+done
 
 # checksums.sha256 maps a release asset to its path inside the upstream tree. We only
 # want the basename and the digest.
