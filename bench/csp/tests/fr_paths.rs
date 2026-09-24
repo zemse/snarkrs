@@ -49,6 +49,15 @@ fn run(bin: &Path) -> (bool, String) {
     )
 }
 
+/// The probe prints a line per mismatch and its verdict last, so the verdict is the final
+/// non-empty line, not the first one.
+fn verdict(out: &str) -> &str {
+    out.lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+}
+
 #[test]
 fn short_and_long_forms_agree_on_every_consumer() {
     let Some(w) = witnesscalc() else { return };
@@ -59,7 +68,7 @@ fn short_and_long_forms_agree_on_every_consumer() {
     assert!(compile(&w, &bin, false), "compiling tests/fr_paths.cpp");
     let (ok, out) = run(&bin);
     assert!(ok, "{out}");
-    assert!(out.starts_with("PASS"), "{out}");
+    assert!(verdict(&out).starts_with("PASS"), "{out}");
 }
 
 /// The negative half of the same comparison, which is why the patch excludes it. If this
@@ -75,7 +84,7 @@ fn negative_shorts_do_not_agree_and_that_is_why_they_are_excluded() {
     assert!(compile(&w, &bin, true), "compiling tests/fr_paths.cpp");
     let (ok, out) = run(&bin);
     assert!(
-        !ok && out.starts_with("FAIL"),
+        !ok && verdict(&out).starts_with("FAIL"),
         "negative shorts agreed with the long form, which the patch assumes they do not:\n{out}"
     );
 }
