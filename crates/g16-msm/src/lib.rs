@@ -392,10 +392,47 @@ struct BatchFill<P: RawCurve> {
     /// Conflicts waiting for the next flush.
     retry: Vec<(u32, P::RF, P::RF)>,
     /// XYZZ escape hatch for buckets too contended for the round machinery.
-    side: Option<Vec<Xyzz<P::RF>>>,
+    side: Option<SideBuckets<P::RF>>,
     dens: Vec<P::RF>,
     prefix: Vec<P::RF>,
     ops: Vec<Op>,
+}
+
+/// The XYZZ buckets [`BatchFill`] falls back to, stored only for the buckets that needed
+/// one. A dense array of every bucket was allocated per window chunk the first time any
+/// bucket contended, which on the benchmark ladder is nearly every chunk: 2 MiB of G1 or
+/// 4 MiB of G2 each, 84 MiB of churn per `js_16x16_d32` proof and 21 MiB at its peak, for
+/// a handful of buckets. The slot map is 4 bytes a bucket.
+struct SideBuckets<F> {
+    /// Index into `points` per bucket; 0 is the shared zero, so an untouched bucket
+    /// reads as the identity without a branch.
+    slot: Vec<u32>,
+    points: Vec<Xyzz<F>>,
+}
+
+impl<F: RawField> SideBuckets<F> {
+    fn new(n_buckets: usize) -> Self {
+        SideBuckets {
+            slot: vec![0; n_buckets],
+            points: vec![Xyzz::ZERO],
+        }
+    }
+
+    fn entry(&mut self, b: usize) -> &mut Xyzz<F> {
+        if self.slot[b] == 0 {
+            self.slot[b] = self.points.len() as u32;
+            self.points.push(Xyzz::ZERO);
+        }
+        &mut self.points[self.slot[b] as usize]
+    }
+}
+
+impl<F> core::ops::Index<usize> for SideBuckets<F> {
+    type Output = Xyzz<F>;
+
+    fn index(&self, b: usize) -> &Xyzz<F> {
+        &self.points[self.slot[b] as usize]
+    }
 }
 
 /// What one pending entry turned out to be, decided before the shared inversion and
@@ -465,7 +502,8 @@ impl<P: RawCurve> BatchFill<P> {
                 self.occupied[b] = true;
             } else if self.busy[b] {
                 self.side
-                    .get_or_insert_with(|| vec![Xyzz::ZERO; self.bx.len()])[b]
+                    .get_or_insert_with(|| SideBuckets::new(self.bx.len()))
+                    .entry(b)
                     .madd(x, y);
             } else {
                 self.busy[b] = true;
@@ -549,7 +587,9 @@ impl<P: RawCurve> BatchFill<P> {
                     if self.occupied[j] {
                         running.madd(self.bx[j], self.by[j]);
                     }
-                    running.add_assign(&side[j]);
+                    if side.slot[j] != 0 {
+                        running.add_assign(&side[j]);
+                    }
                     total.add_assign(&running);
                 }
             }
