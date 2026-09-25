@@ -79,7 +79,14 @@ fn main() {
 
     // The guard writes the JSON when it drops at the end of `main`. The release profile is
     // `panic = "abort"`, so a panic loses the file rather than flushing it.
-    let _profiler = dhat::Profiler::builder().file_name(&out).build();
+    //
+    // dhat keeps 10 frames by default, and under rayon all 10 are plumbing: 225 MiB of
+    // allocation came back owned by `bridge_producer_consumer::helper` alone. 40 frames
+    // reach the closure that asked for the memory.
+    let _profiler = dhat::Profiler::builder()
+        .file_name(&out)
+        .trim_backtraces(Some(40))
+        .build();
 
     let start = Snap::now();
     let pk = ProvingKey::load(&dir.join("circuit.zkey")).expect("loading circuit.zkey");
