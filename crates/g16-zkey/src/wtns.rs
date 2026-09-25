@@ -7,7 +7,6 @@
 
 use crate::binfile::{self, BinFile, Cursor, FR_BYTES};
 use g16_field::*;
-use rayon::prelude::*;
 
 /// The full witness vector `w = (1, public..., private...)`, length `n_vars`.
 pub struct Witness(pub Vec<Fr>);
@@ -39,10 +38,8 @@ impl Witness {
 
         let data = file.unique_section(2)?;
         binfile::expect_records(data, n_witness, FR_BYTES, 2)?;
-        let values = data
-            .par_chunks_exact(FR_BYTES)
-            .map(|b| binfile::fr_normal(b, 2))
-            .collect::<Result<Vec<Fr>, _>>()?;
+        let values =
+            super::decode_records(data, FR_BYTES, Fr::zero(), |_, b| binfile::fr_normal(b, 2))?;
 
         // w[0] is the constant one wire. Every QAP row and the public-input part of the
         // verifier equation assume it, so a witness that fails here is unusable and the

@@ -122,6 +122,33 @@ fn a_record_count_that_overflows_usize_is_refused() {
     ));
 }
 
+/// The parallel decode writes a placeholder for a bad record rather than stopping, so
+/// what it has to get right is which error comes back: the lowest bad record's, however
+/// the work was split.
+#[test]
+fn decode_records_reports_the_lowest_bad_record() {
+    let n = 1 << 16;
+    let mut data = vec![0u8; n * FR_BYTES];
+    for i in 0..n {
+        data[i * FR_BYTES..][..8].copy_from_slice(&(i as u64).to_le_bytes());
+    }
+    let decode = |_: usize, b: &[u8]| binfile::fr_normal(b, 2);
+    let got = decode_records(&data, FR_BYTES, Fr::zero(), decode).unwrap();
+    assert_eq!(got, (0..n as u64).map(Fr::from).collect::<Vec<_>>());
+
+    for bad in [n - 1, 40_000, 7] {
+        data[bad * FR_BYTES..][..FR_BYTES].fill(0xff);
+    }
+    let err = decode_records(&data, FR_BYTES, Fr::zero(), |i, b| {
+        binfile::fr_normal(b, 2).map_err(|_| ZkeyError::Malformed {
+            section: 2,
+            reason: format!("record {i}"),
+        })
+    })
+    .unwrap_err();
+    assert!(err.to_string().ends_with("record 7"), "{err}");
+}
+
 /// Encodes `v` the way snarkjs writes a section-4 coefficient: the limbs of `v * R^2`.
 fn encode_coef(v: u64) -> [u8; 32] {
     let r = r_inv().inverse().unwrap();

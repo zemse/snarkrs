@@ -415,16 +415,13 @@ fn read_g1_section(
     // never materialised as an intermediate buffer. The curve check rides in the same
     // pass, while the point is still in cache, which is what makes it close to free.
     // BN254 G1 has cofactor 1, so on the curve is in the subgroup.
-    data.par_chunks_exact(G1_BYTES)
-        .enumerate()
-        .map(|(i, b)| {
-            let p = g1(b)?;
-            if check == Check::Full && !valid_g1(&p) {
-                return Err(off_curve(id, i));
-            }
-            Ok(p)
-        })
-        .collect()
+    decode_records(data, G1_BYTES, G1Affine::identity(), |i, b| {
+        let p = g1(b)?;
+        if check == Check::Full && !valid_g1(&p) {
+            return Err(off_curve(id, i));
+        }
+        Ok(p)
+    })
 }
 
 fn read_g2_section(
@@ -437,16 +434,51 @@ fn read_g2_section(
     expect_records(data, n, G2_BYTES, id)?;
     // On the curve only. See `ProvingKey::load` for why the subgroup is checked on the
     // proof rather than on each of these points.
-    data.par_chunks_exact(G2_BYTES)
+    decode_records(data, G2_BYTES, G2Affine::identity(), |i, b| {
+        let p = g2(b)?;
+        if check == Check::Full && !p.is_on_curve() {
+            return Err(off_curve(id, i));
+        }
+        Ok(p)
+    })
+}
+
+/// Decodes fixed-size records in parallel, straight into the one vector that is returned.
+///
+/// Not `collect::<Result<Vec<_>, _>>()`: rayon cannot index a fallible collect, so it
+/// builds a linked list of per-task vectors and then copies them into the result. On
+/// anon-aadhaar's 631 MB key that was 1.8 GB of short-lived allocations, and macOS malloc
+/// kept 181 MB of those pages dirty for the rest of the process. Here a record that fails
+/// is written as `fallback`, which keeps the collect indexed, and the error returned is the
+/// one from the lowest failing record.
+pub(crate) fn decode_records<T, F>(
+    data: &[u8],
+    stride: usize,
+    fallback: T,
+    decode: F,
+) -> Result<Vec<T>, ZkeyError>
+where
+    T: Copy + Send + Sync,
+    F: Fn(usize, &[u8]) -> Result<T, ZkeyError> + Sync,
+{
+    let first_err = std::sync::Mutex::new(None::<(usize, ZkeyError)>);
+    let out = data
+        .par_chunks_exact(stride)
         .enumerate()
         .map(|(i, b)| {
-            let p = g2(b)?;
-            if check == Check::Full && !p.is_on_curve() {
-                return Err(off_curve(id, i));
-            }
-            Ok(p)
+            decode(i, b).unwrap_or_else(|e| {
+                let mut slot = first_err.lock().unwrap_or_else(|p| p.into_inner());
+                if slot.as_ref().is_none_or(|(j, _)| i < *j) {
+                    *slot = Some((i, e));
+                }
+                fallback
+            })
         })
-        .collect()
+        .collect();
+    match first_err.into_inner().unwrap_or_else(|p| p.into_inner()) {
+        None => Ok(out),
+        Some((_, e)) => Err(e),
+    }
 }
 
 fn off_curve(section: u32, i: usize) -> ZkeyError {
