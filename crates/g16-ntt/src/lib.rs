@@ -296,6 +296,24 @@ impl CpuNtt {
             });
     }
 
+    /// Builds every table [`Self::intt_coset_ntt`] reads, each exactly once. The cache lets
+    /// concurrent callers race on a cold entry, which costs nothing in correctness and a
+    /// lot in memory: the prover runs three pipelines at once, so a cold proof built every
+    /// table three times, and on anon-aadhaar (2^21) the two losing copies of each were
+    /// 256 MiB that malloc then kept resident. Call it before fanning out; on a warm cache
+    /// it is three lookups.
+    pub fn prepare_intt_coset_ntt(&self, domain: &Domain, shift: Fr) {
+        rayon::join(
+            || self.twiddles(domain, Direction::Inverse),
+            || {
+                rayon::join(
+                    || self.twiddles(domain, Direction::Forward),
+                    || self.coset_table(domain, shift),
+                )
+            },
+        );
+    }
+
     /// Stages 1-3 for one vector: iNTT, coset shift with the deferred `1/n`, forward
     /// NTT, natural order in and out. Equal to the bit to [`Self::intt_to_bitrev`] then
     /// [`Self::coset_scale_bitrev`] then [`Self::ntt_from_bitrev`], and the reason it

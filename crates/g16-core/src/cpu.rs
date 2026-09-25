@@ -266,6 +266,8 @@ impl PreparedCircuit for CpuCircuit {
         // whole wall-clock window, coset shift included, so from here `pointwise_us`
         // covers stage 4 only.
         let start = Instant::now();
+        self.ntt
+            .prepare_intt_coset_ntt(&self.domain, self.coset_shift);
         let pipeline = |v: &mut [Fr]| self.ntt.intt_coset_ntt(&self.domain, v, self.coset_shift);
         rayon::join(
             || stage!("s1-3 A: iNTT, coset, NTT", pipeline(&mut a)),
