@@ -38,6 +38,10 @@ fn artifacts() -> Vec<(String, PathBuf)> {
                 continue;
             }
             let name = format!("{prefix}{}", d.file_name().unwrap().to_string_lossy());
+            // `large/` is tests/large.rs's, at 2^22 far too slow for a per-artifact loop.
+            if name == "large" {
+                continue;
+            }
             if d.join("circuit.zkey").is_file() && d.join("circuit.wtns").is_file() {
                 out.push((name, d));
             } else if depth > 0 {
