@@ -8,8 +8,8 @@
 //! measured workgroup 128 as 65% off the best size and failed, then passed on its own at
 //! `--test-threads=1`. The kernel was never the problem and neither was the shipped constant.
 //!
-//! A per-process mutex cannot fix a cross-process race, so this is `flock` on one file under
-//! `target/`. Every timing test takes it, so at most one process measures the GPU at a time
+//! A per-process mutex cannot fix a cross-process race, so this is `flock` on one file in the
+//! temp dir. Every timing test takes it, so at most one process measures the GPU at a time
 //! while correctness tests, which do not care about contention, still run in parallel.
 //!
 //! This matters beyond tidiness. A suite that is only green at `--test-threads=1` is a suite
@@ -36,14 +36,10 @@ impl Drop for GpuLock {
 /// of the suite and serialising them would turn a 2 minute run into a much longer one for no
 /// benefit.
 pub fn exclusive_gpu() -> GpuLock {
-    // Under `target/` rather than a temp dir so it is scoped to this checkout, and so two
-    // worktrees of this repo measuring at once do not block each other for no reason: they
-    // are different GPUs' worth of work only if the machine has one GPU, which it does, but
-    // a cross-checkout lock would be a surprise nobody asked for. Contention between
-    // worktrees is rare; contention between this crate's own ten test binaries is constant.
-    let path: PathBuf = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target")
-        .join("g16-wgpu-gpu-timing.lock");
+    // In the temp dir rather than under `target/`, so worktrees of this repo share it: they
+    // share the one GPU, and two checkouts timing it at once corrupt each other's numbers just
+    // as two test binaries of one checkout do.
+    let path: PathBuf = std::env::temp_dir().join("g16-gpu-timing.lock");
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
