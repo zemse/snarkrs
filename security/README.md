@@ -42,7 +42,7 @@ to that tree; the table that follows says what has landed since.
 | 29 | Shifted query sections leak through `C` | Found since; see below. Closed on every checked path, `3a610a5` |
 | 30 | Browser prove returned unchecked proofs | Found since. Fixed, `3a610a5`, `6841752` |
 | 31 | Key with no phase-2 contribution accepted | Found since. Fixed, `9445d85` |
-| 32 | wgpu floor profile cannot hold anon-aadhaar's G2 bases | Found since. **Open**, U15 (chunked base bindings); the `auto` profile works |
+| 32 | wgpu floor profile cannot hold anon-aadhaar's G2 bases | Found since. Fixed, `f8a06eb` (U15): CSR, bases and MSM scratch are cut into pieces that fit; 2^23 is the next frontier |
 
 ## Found since the audit
 
@@ -72,7 +72,9 @@ for development keys.
 **32. The wgpu floor profile has a capacity limit.** Under the browser's 128 MiB binding floor,
 anon-aadhaar's G2 bases (140.9 MB) do not fit and the backend refuses with a clean error. The
 `auto` profile, which is what the browser requests, raises the limit to what the adapter
-grants. Chunking the base bindings is U15.
+grants. Chunking the base bindings is U15. Since `f8a06eb` the CSR, the base vectors and each MSM's scratch are cut into
+pieces that fit a binding, and anon-aadhaar and a 2^22 key prove at the floor. The witness, the
+scalar buffers and the NTT vectors are still bound whole, and are exactly 128 MiB at 2^22.
 
 ## What we checked, and how
 
