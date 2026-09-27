@@ -177,6 +177,35 @@ pub enum HPoly {
     },
 }
 
+/// `H` is a linear image of the witness, so a host copy is zeroed when it goes rather than
+/// left in the heap for the next allocation. A device copy is the owning backend's to scrub.
+impl Drop for HPoly {
+    fn drop(&mut self) {
+        if let HPoly::Host(v) = self {
+            scrub(v);
+        }
+    }
+}
+
+/// Zero a witness-derived vector so the stores survive: volatile writes the optimiser may
+/// not drop as dead, then one fence.
+///
+/// Not `zeroize`'s slice impl, which is correct and costs a fence per element on one
+/// thread: 4-7% of a warm CPU proof on js_16x16_d32 and keccak256 for H plus stage 0's B
+/// and C. This is the same writes spread over the pool, with the fence paid once.
+pub fn scrub(v: &mut [Fr]) {
+    use rayon::prelude::*;
+    v.par_chunks_mut(1 << 12).for_each(|chunk| {
+        for x in chunk {
+            for limb in x.0 .0.iter_mut() {
+                // SAFETY: `limb` is a valid, aligned, exclusive `&mut u64`.
+                unsafe { core::ptr::write_volatile(limb, 0) };
+            }
+        }
+    });
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
 impl HPoly {
     pub fn len(&self) -> usize {
         match self {

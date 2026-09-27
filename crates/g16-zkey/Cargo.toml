@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# Scrubs an owned `.wtns` buffer once it is decoded. Already in the tree through ark-ff;
+# declared because this crate calls it.
+zeroize = "1.9"
 g16-field.workspace = true
 ark-ff.workspace = true
 ark-ec.workspace = true

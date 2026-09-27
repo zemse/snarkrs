@@ -253,7 +253,7 @@ fn compute_h_matches_the_cpu_backend_on_every_artifact() {
         let cpu = CpuCircuit::new(pk).expect("cpu circuit");
         let mut cpu_t = StageTimings::default();
         let want = match cpu.compute_h(&w, &mut cpu_t).expect("cpu compute_h") {
-            HPoly::Host(v) => v,
+            HPoly::Host(ref v) => v.clone(),
             HPoly::Device { .. } => unreachable!("the cpu backend has nowhere to put a device H"),
         };
 
@@ -421,7 +421,7 @@ fn compute_h_matches_the_cpu_backend_at_every_small_domain() {
         let cpu = CpuCircuit::new(pk).expect("cpu circuit");
         let mut t = StageTimings::default();
         let want = match cpu.compute_h(&w, &mut t).unwrap() {
-            HPoly::Host(v) => v,
+            HPoly::Host(ref v) => v.clone(),
             HPoly::Device { .. } => unreachable!(),
         };
         assert_eq!(
@@ -510,7 +510,7 @@ fn a_key_with_no_coefficients_still_binds() {
             .compute_h(&w, &mut StageTimings::default())
             .expect("cpu compute_h")
         {
-            HPoly::Host(v) => v,
+            HPoly::Host(ref v) => v.clone(),
             HPoly::Device { .. } => unreachable!(),
         };
         assert!(want.iter().all(|x| x.is_zero()), "H should be zero here");
@@ -615,7 +615,7 @@ fn the_pooled_scratch_is_exclusive_per_handle_and_returns_on_drop() {
 
     let cpu = CpuCircuit::new(synthetic_key(&mut SplitMix64(0x9001), n, n_vars)).unwrap();
     let host = |w: &[Fr]| match cpu.compute_h(w, &mut StageTimings::default()).unwrap() {
-        HPoly::Host(v) => v,
+        HPoly::Host(ref v) => v.clone(),
         HPoly::Device { .. } => unreachable!(),
     };
     let want1 = host(&w1);
@@ -682,7 +682,7 @@ fn one_circuit_computes_h_concurrently() {
         .iter()
         .map(
             |w| match cpu.compute_h(w, &mut StageTimings::default()).unwrap() {
-                HPoly::Host(v) => fr_words(&v),
+                HPoly::Host(ref v) => fr_words(v),
                 HPoly::Device { .. } => unreachable!(),
             },
         )
@@ -1165,7 +1165,7 @@ fn a_handle_under_another_tag_is_not_a_wgpu_handle() {
     let g = h.device_handle::<WgpuHandle>(TAG).expect("handle");
     let cpu = CpuCircuit::new(synthetic_key(&mut SplitMix64(0x7a6), n, n_vars)).unwrap();
     let want = match cpu.compute_h(&w, &mut StageTimings::default()).unwrap() {
-        HPoly::Host(v) => v,
+        HPoly::Host(ref v) => v.clone(),
         HPoly::Device { .. } => unreachable!(),
     };
     assert_eq!(pollster::block_on(g.to_host(b)).unwrap(), want, "to_host");

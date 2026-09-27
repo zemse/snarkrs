@@ -23,6 +23,9 @@ license.workspace = true
 crate-type = ["rlib"]
 
 [dependencies]
+# Zeroes the witness the browser prover retains between reps. Already in the tree through
+# ark-ff, which implements it for `Fr`; declared because this crate calls it.
+zeroize = "1.9"
 # The modulus and n0 for both fields come from here at run time, so there is no second copy
 # in shader source to drift. See src/gen/field.rs.
 g16-gpu-layout.workspace = true

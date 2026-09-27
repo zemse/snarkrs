@@ -25,7 +25,15 @@ impl Witness {
         Self::parse(BinFile::from_bytes(bytes, b"wtns", 2)?)
     }
 
-    fn parse(file: BinFile) -> Result<Self, super::ZkeyError> {
+    fn parse(mut file: BinFile) -> Result<Self, super::ZkeyError> {
+        let parsed = Self::decode(&file);
+        // Decoded or not, the bytes are the witness, and an owned buffer would otherwise go
+        // back to the allocator as it is.
+        file.scrub();
+        parsed
+    }
+
+    fn decode(file: &BinFile) -> Result<Self, super::ZkeyError> {
         let mut header = Cursor::new(file.unique_section(1)?, 1);
         let n8 = header.u32()? as usize;
         if n8 != FR_BYTES {

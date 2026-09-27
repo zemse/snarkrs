@@ -79,7 +79,8 @@ struct State {
     /// The witness bytes, same reason. snarkjs re-parses its `.wtns` inside every `prove()`
     /// because the argument is a byte array, so a cold rep of ours that did not would be
     /// comparing against a snarkjs that does.
-    wtns_raw: Option<Vec<u8>>,
+    /// Zeroed on drop, like `witness`: these bytes are the witness.
+    wtns_raw: Option<zeroize::Zeroizing<Vec<u8>>>,
     /// `Rc` so [`prove`] can clone a handle out of the `RefCell` and drop the borrow before
     /// it awaits. Holding a `Ref` across an `.await` is how a re-entrant call panics.
     circuit: Option<Rc<WgpuCircuit>>,
@@ -88,7 +89,9 @@ struct State {
     /// contributes, because it shares every line of stage 0 to 11 with the wgpu row and
     /// differs only in where the arithmetic runs.
     cpu: Option<Rc<CpuCircuit>>,
-    witness: Option<Rc<Vec<Fr>>>,
+    /// Zeroed when the last handle goes, so an unloaded or replaced witness does not stay in
+    /// the tab's heap for whatever allocates there next.
+    witness: Option<Rc<zeroize::Zeroizing<Vec<Fr>>>>,
     /// Set for the duration of a proof. See the module docs: the alternative is a deadlock.
     busy: bool,
 }
@@ -282,7 +285,7 @@ pub fn zkey_retain(ptr: *mut u8, len: usize) -> Result<(), JsError> {
 pub fn wtns_retain(ptr: *mut u8, len: usize) -> Result<(), JsError> {
     let bytes = take(ptr, len)?;
     with_state(|s| {
-        s.wtns_raw = Some(bytes);
+        s.wtns_raw = Some(zeroize::Zeroizing::new(bytes));
         s.witness = None;
         Ok(())
     })
@@ -312,7 +315,7 @@ pub fn wtns_take(ptr: *mut u8, len: usize) -> Result<(), JsError> {
     let bytes = take(ptr, len)?;
     let w = Witness::from_bytes(bytes).map_err(js)?;
     with_state(|s| {
-        s.witness = Some(Rc::new(w.0));
+        s.witness = Some(Rc::new(zeroize::Zeroizing::new(w.0)));
         s.wtns_raw = None;
         Ok(())
     })
@@ -697,7 +700,7 @@ fn trace_json(trace: g16_core::trace::Trace, started: Instant, extra: &str) -> S
 /// The `busy` handshake every non-reentrant entry point does. `what` is the caller's own
 /// name, because "a proof is already running" with no name is the least useful thing a
 /// worker with five entry points can say.
-fn claim(what: &str) -> Result<(Rc<WgpuCircuit>, Rc<Vec<Fr>>), JsError> {
+fn claim(what: &str) -> Result<(Rc<WgpuCircuit>, Rc<zeroize::Zeroizing<Vec<Fr>>>), JsError> {
     with_state(|s| {
         if s.busy {
             // Not a queue. See the module docs: `exclusive()` is a std Mutex and on one
@@ -920,7 +923,12 @@ fn reparse() -> Result<(ProvingKey, Vec<Fr>, String), JsError> {
     let pk = ProvingKey::from_bytes(zbytes).map_err(js)?;
     let zkey_parse_us = t0.elapsed().as_micros() as u64;
     let t0 = Instant::now();
-    let witness = Witness::from_bytes(wbytes).map_err(js)?.0;
+    // Out of the `Zeroizing` and into the parser, which scrubs the buffer once it has
+    // decoded it.
+    let mut wbytes = wbytes;
+    let witness = Witness::from_bytes(std::mem::take(&mut *wbytes))
+        .map_err(js)?
+        .0;
     let wtns_parse_us = t0.elapsed().as_micros() as u64;
 
     Ok((

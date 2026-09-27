@@ -298,6 +298,9 @@ impl PreparedCircuit for CpuCircuit {
         );
         t.pointwise_us += start.elapsed().as_micros() as u64;
 
+        // `b` and `c` are witness images too. `a` is now `H` and is zeroed when that drops.
+        crate::scrub(&mut b);
+        crate::scrub(&mut c);
         Ok(HPoly::Host(a))
     }
 

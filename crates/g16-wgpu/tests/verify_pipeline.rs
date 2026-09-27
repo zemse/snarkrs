@@ -452,7 +452,7 @@ fn one_circuit_proves_concurrently_across_both_stage_four_paths() {
         .iter()
         .map(
             |w| match cpu.compute_h(w, &mut StageTimings::default()).unwrap() {
-                HPoly::Host(v) => fr_words(&v),
+                HPoly::Host(ref v) => fr_words(v),
                 HPoly::Device { .. } => unreachable!(),
             },
         )

@@ -821,6 +821,7 @@ dependencies = [
  "g16-wgpu",
  "g16-zkey",
  "hex",
+ "libc",
  "num-bigint",
  "serde",
  "serde_json",
@@ -964,6 +965,7 @@ dependencies = [
  "web-sys",
  "web-time",
  "wgpu",
+ "zeroize",
 ]
 
 [[package]]
@@ -978,6 +980,7 @@ dependencies = [
  "rayon",
  "serde_json",
  "thiserror 2.0.19",
+ "zeroize",
 ]
 
 [[package]]

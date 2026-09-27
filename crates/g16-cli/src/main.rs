@@ -698,6 +698,10 @@ fn run_prove(
     vkey: Option<&std::path::Path>,
     fallback: bool,
 ) -> Result<()> {
+    // This process is about to hold the witness in the clear. `panic = "abort"` means a crash
+    // runs no destructor, so nothing below gets to scrub it, and a core file would write it
+    // to disk.
+    no_core_dumps();
     let pk = ProvingKey::load(zkey).with_context(|| format!("loading {}", zkey.display()))?;
     let n_public = pk.n_public;
     // `n_public` comes from the zkey and decides how much of the witness is written to
@@ -730,7 +734,7 @@ fn run_prove(
             pk.n_vars - 1
         ),
     }
-    let w = Witness::load(witness)
+    let mut w = Witness::load(witness)
         .with_context(|| format!("loading {}", witness.display()))?
         .0;
     // Checked here, not at the slice below, so a witness that does not match the key costs
@@ -752,6 +756,9 @@ fn run_prove(
     // something downstream might pick it up. `prove` does it, and validates the proof's
     // points first; see its docs for why that check is also what keeps a hostile key from
     // reading the witness out of `C`.
+    // Set when the proof came from the CPU fallback, so --stage-timings names the backend
+    // that actually produced the numbers it prints.
+    let fell_back = std::cell::Cell::new(false);
     let proof = if self_verify {
         let attempt = if fallback {
             g16_cli::fallback::prove_with_fallback(
@@ -766,6 +773,9 @@ fn run_prove(
                 },
                 &mut |step| {
                     use g16_cli::fallback::Fallback::*;
+                    if matches!(step, Cpu { .. }) {
+                        fell_back.set(true);
+                    }
                     match step {
                         Retry { backend } => eprintln!(
                             "warning: the {backend} proof failed its self-verify; proving again \
@@ -809,12 +819,21 @@ fn run_prove(
 
     json::write_proof(proof_out, &proof)?;
     json::write_public(public_out, public)?;
+    // Written out, so the in-memory copy has nothing left to do. The backend's own scratch
+    // (H, stage 0's B and C) is zeroed by `g16-core` as it drops.
+    g16_core::scrub(&mut w);
 
     if stage_timings {
         let total = elapsed.as_micros() as u64;
         let known =
             t.gather_us + t.ntt_us + t.pointwise_us + t.msm_us + t.assemble_us + t.verify_us;
-        println!("backend        {}", circuit.backend_name());
+        match fell_back.get() {
+            true => println!(
+                "backend        cpu (fallback from {})",
+                circuit.backend_name()
+            ),
+            false => println!("backend        {}", circuit.backend_name()),
+        }
         println!("domain size    {}", circuit.domain_size());
         println!("gather      us {:>10}", t.gather_us);
         println!("ntt         us {:>10}", t.ntt_us);
@@ -829,6 +848,30 @@ fn run_prove(
         println!("proved in {:.1} ms", elapsed.as_secs_f64() * 1000.0);
     }
     Ok(())
+}
+
+/// No core file for this process, so a crash while the witness is in memory cannot write it
+/// to disk. On Linux the process is also marked non-dumpable, which additionally stops
+/// another process of the same user from attaching to it or reading `/proc/<pid>/mem`.
+/// Best effort: failures are ignored, because refusing to prove would not make anything
+/// safer.
+fn no_core_dumps() {
+    #[cfg(unix)]
+    {
+        let zero = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `zero` is a valid, initialised `rlimit` that outlives the call.
+        unsafe {
+            libc::setrlimit(libc::RLIMIT_CORE, &zero);
+        }
+        #[cfg(target_os = "linux")]
+        // SAFETY: PR_SET_DUMPABLE takes an integer argument and no pointers.
+        unsafe {
+            libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+        }
+    }
 }
 
 /// Prints what two machines must agree on, given the same zkey and witness.

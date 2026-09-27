@@ -112,6 +112,18 @@ pub struct BinFile {
 }
 
 impl BinFile {
+    /// Zero an owned backing. For a file whose bytes are secret, the `.wtns`, once they have
+    /// been decoded. A mapped file is the file on disk, so there is no second copy to scrub.
+    // On wasm32 `Owned` is the only variant, so the pattern cannot fail there.
+    #[allow(irrefutable_let_patterns)]
+    pub fn scrub(&mut self) {
+        if let Backing::Owned(v) = &mut self.data {
+            zeroize::Zeroize::zeroize(v);
+        }
+    }
+}
+
+impl BinFile {
     /// Map the file and index it. Native only, because there is no filesystem to map on
     /// wasm; the browser path is [`BinFile::from_bytes`].
     #[cfg(not(target_family = "wasm"))]

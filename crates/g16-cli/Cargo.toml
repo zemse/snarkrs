@@ -75,3 +75,8 @@ cuda = ["dep:g16-cuda", "g16-cuda/cuda"]
 # Heap profiling. Off by default and optional, so `cargo build --release` neither links
 # dhat nor builds the binary that would install its allocator.
 dhat-heap = ["dep:dhat"]
+
+# setrlimit and prctl, so `prove` leaves no core file with the witness in it. Already in the
+# tree; declared because this crate calls it.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
