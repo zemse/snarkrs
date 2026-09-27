@@ -83,7 +83,7 @@ pub(crate) fn wait_ok(cb: &CommandBufferRef, context: &str) -> Result<(), ProveE
     let status = cb.status();
     #[cfg(test)]
     if inject::fires() {
-        return Err(ProveError::Backend {
+        return Err(ProveError::Device {
             backend: "metal",
             reason: format!("{context}: injected fault (status {status:?})"),
         });
@@ -91,7 +91,7 @@ pub(crate) fn wait_ok(cb: &CommandBufferRef, context: &str) -> Result<(), ProveE
     if status == MTLCommandBufferStatus::Completed {
         return Ok(());
     }
-    Err(ProveError::Backend {
+    Err(ProveError::Device {
         backend: "metal",
         reason: format!(
             "{context}: command buffer did not complete (status {status:?}){}",

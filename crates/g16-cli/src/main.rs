@@ -101,10 +101,10 @@ enum Cmd {
         /// verified against it before anything is written.
         #[arg(long, value_name = "FILE")]
         vkey: Option<PathBuf>,
-        /// When a GPU proof fails its self-verify, prove once more on the same backend and
-        /// then on the CPU, reporting each failure on stderr. A logic bug fails the same way
-        /// every time; a transient accelerator fault does not. No effect with --self-verify
-        /// false or --backend cpu.
+        /// When a GPU proof fails its self-verify or the device faults, prove once more on
+        /// the same backend and then on the CPU, reporting each failure on stderr. A logic
+        /// bug fails the same way every time; a transient accelerator fault does not. No
+        /// effect with --self-verify false or --backend cpu.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         fallback: bool,
         /// MSMs whose cost follows the key and not the witness, so proving time does not
@@ -797,15 +797,14 @@ fn run_prove(
                         fell_back.set(true);
                     }
                     match step {
-                        Retry { backend } => eprintln!(
-                            "warning: the {backend} proof failed its self-verify; proving again \
-                             on {backend}"
+                        Retry { backend, cause } => eprintln!(
+                            "warning: the {backend} proof {cause}; proving again on {backend}"
                         ),
-                        Cpu { backend } => eprintln!(
-                            "warning: {backend} failed its self-verify twice; proving on the cpu"
+                        Cpu { backend, cause } => eprintln!(
+                            "warning: the second {backend} proof {cause}; proving on the cpu"
                         ),
                         DeviceSuspect { backend } => eprintln!(
-                            "warning: the cpu proof verified, so {backend} computed a wrong \
+                            "warning: the cpu proof verified, so {backend} failed the same \
                              proof twice; treat that device as suspect"
                         ),
                     }

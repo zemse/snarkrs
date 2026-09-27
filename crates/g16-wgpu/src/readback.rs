@@ -179,12 +179,12 @@ impl Readback {
         backend
             .device()
             .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|e| bad(format!("waiting for the GPU failed: {e}")))?;
+            .map_err(|e| backend.fault(format!("waiting for the GPU failed: {e}")))?;
 
         rx.recv_async()
             .await
-            .map_err(|_| bad("the map callback was dropped before it fired"))?
-            .map_err(|e| bad(format!("mapping the readback buffer failed: {e}")))?;
+            .map_err(|_| backend.fault("the map callback was dropped before it fired"))?
+            .map_err(|e| backend.fault(format!("mapping the readback buffer failed: {e}")))?;
 
         let slice = self.staging.slice(0..bytes);
         let view = slice
@@ -197,7 +197,7 @@ impl Readback {
         self.staging.unmap();
 
         if let Some(e) = backend.take_error() {
-            return Err(bad(format!("device error during readback: {e}")));
+            return Err(backend.fault(format!("device error during readback: {e}")));
         }
         Ok(out)
     }

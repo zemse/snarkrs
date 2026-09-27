@@ -82,6 +82,14 @@ pub enum ProveError {
         backend: &'static str,
         reason: String,
     },
+    /// Work the backend accepted did not complete: a Metal command buffer macOS killed, a
+    /// lost wgpu device. Unlike [`Self::Backend`] it says nothing about the witness or the
+    /// key, so the same proof may succeed on a second attempt.
+    #[error("backend {backend}: device fault: {reason}")]
+    Device {
+        backend: &'static str,
+        reason: String,
+    },
     #[error("w[0] is the constant-one wire and must be 1")]
     ConstantWire,
     #[error("the RNG produced a zero blinder, which a CSPRNG does with probability 2^-254")]
@@ -111,6 +119,14 @@ pub enum ProveError {
          \n  override: G16_ALLOW_UNOPTIMIZED_PROVING=1 (no effect on wasm32, which has no env)"
     )]
     Unoptimized,
+}
+
+impl ProveError {
+    /// Whether the device failed, rather than anything the caller passed. Every other variant
+    /// fails the same way on a second attempt and on the CPU.
+    pub fn is_device_fault(&self) -> bool {
+        matches!(self, Self::Device { .. })
+    }
 }
 
 /// `Debug` delegates to `Display`, because `Debug` is what `.expect()` and `.unwrap()` print

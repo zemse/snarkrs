@@ -60,7 +60,7 @@
 //! proves nothing. The column that carries information is the adapter's, which is why
 //! [`WgpuBackend::limits_table`] prints all three.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use g16_core::ProveError;
@@ -212,6 +212,8 @@ pub struct WgpuBackend {
     auto_fallback: Option<String>,
     /// First uncaptured device error, if any. See [`Self::take_error`].
     error: Arc<Mutex<Option<String>>>,
+    /// Set by the device-lost callback, and never cleared. See [`Self::fault`].
+    lost: Arc<AtomicBool>,
     /// Held for the whole of one proof's GPU section. See [`Self::exclusive`].
     gpu: Mutex<()>,
     cost: Mutex<PrepareCost>,
@@ -340,8 +342,11 @@ impl WgpuBackend {
         // `TASKS.local.md` records against `g16-metal` for never checking command buffer
         // status.
         let sink = error.clone();
+        let lost = Arc::new(AtomicBool::new(false));
+        let flag = lost.clone();
         device.set_device_lost_callback(move |reason, msg| {
             eprintln!("wgpu device lost: {reason:?}: {msg}");
+            flag.store(true, Ordering::SeqCst);
             let mut slot = sink.lock().unwrap();
             if slot.is_none() {
                 *slot = Some(format!("the device was lost ({reason:?}): {msg}"));
@@ -358,6 +363,7 @@ impl WgpuBackend {
             requested,
             auto_fallback: refusal,
             error,
+            lost,
             gpu: Mutex::new(()),
             cost: Mutex::new(PrepareCost::default()),
             submits: AtomicU64::new(0),
@@ -440,6 +446,19 @@ impl WgpuBackend {
     /// at a time is submitting.** [`Self::exclusive`] is what arranges that.
     pub fn take_error(&self) -> Option<String> {
         self.error.lock().unwrap().take()
+    }
+
+    /// A failure on the proving path, as a [`ProveError::Device`] once the device has been
+    /// lost and a [`ProveError::Backend`] before. An uncaptured error on a live device is the
+    /// API refusing a call, which it does again on a retry.
+    pub(crate) fn fault(&self, reason: impl Into<String>) -> ProveError {
+        if !self.lost.load(Ordering::SeqCst) {
+            return bad(reason);
+        }
+        ProveError::Device {
+            backend: "wgpu",
+            reason: reason.into(),
+        }
     }
 
     /// Exclusive use of this device for one proof's GPU section: hold it from before the
@@ -555,10 +574,10 @@ impl WgpuBackend {
         });
         self.device
             .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|e| bad(format!("waiting for the GPU failed: {e}")))?;
+            .map_err(|e| self.fault(format!("waiting for the GPU failed: {e}")))?;
         rx.recv_async()
             .await
-            .map_err(|_| bad("the submitted-work callback was dropped before it fired"))
+            .map_err(|_| self.fault("the submitted-work callback was dropped before it fired"))
     }
 
     /// Runs `f` inside a WebGPU validation error scope and reports what the scope caught.

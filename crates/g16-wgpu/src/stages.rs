@@ -512,7 +512,7 @@ impl HStages {
             // it reads, so that would be harmless in practice, and "harmless in practice" is
             // not a reason to hand a proof a buffer nobody can describe. The cost is one
             // reallocation on the next proof after a failure.
-            return Err(bad(format!("device error in stages 0 to 4: {e}")));
+            return Err(backend.fault(format!("device error in stages 0 to 4: {e}")));
         }
 
         Ok(HPoly::Device {
