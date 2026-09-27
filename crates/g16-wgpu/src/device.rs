@@ -66,6 +66,7 @@ use std::sync::{Arc, Mutex};
 use g16_core::ProveError;
 
 use crate::pipelines::PrepareCost;
+use crate::readback::SealKernel;
 
 pub(crate) fn bad(reason: impl Into<String>) -> ProveError {
     ProveError::Backend {
@@ -220,6 +221,8 @@ pub struct WgpuBackend {
     /// Command buffers handed to [`WgpuBackend::submit`] since this backend was created.
     /// See that method for why the count exists and what it cannot see.
     submits: AtomicU64,
+    /// One thread copying one word, behind every [`crate::readback::Seal`].
+    seal_kernel: SealKernel,
 }
 
 /// `g16_core::Backend` and `PreparedCircuit` are both `Send + Sync`, so U11 cannot land
@@ -353,6 +356,8 @@ impl WgpuBackend {
             }
         });
 
+        let seal_kernel = SealKernel::new(&device);
+
         Ok(Self {
             _instance: instance,
             adapter,
@@ -367,7 +372,13 @@ impl WgpuBackend {
             gpu: Mutex::new(()),
             cost: Mutex::new(PrepareCost::default()),
             submits: AtomicU64::new(0),
+            seal_kernel,
         })
+    }
+
+    /// The kernel every [`crate::readback::Seal`] on this device dispatches.
+    pub fn seal_kernel(&self) -> &SealKernel {
+        &self.seal_kernel
     }
 
     pub fn device(&self) -> &wgpu::Device {

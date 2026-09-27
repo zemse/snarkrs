@@ -68,7 +68,7 @@ mod gpulock;
 
 use common::{
     argmin, exclusive, fill, general_count, general_scalars, median, read_bytes, read_words,
-    storage_words, witness_shaped, SENTINEL,
+    storage_words, submit_sealed, witness_shaped, SENTINEL,
 };
 
 // ---------------------------------------------------------------------------
@@ -256,19 +256,12 @@ fn run_msm_on(
         .bind_all(b, &ring, &dplan, &pplan, scalars, bases_buf, &sort, &pts)
         .expect("bind points");
 
-    let mut enc = b.device().create_command_encoder(&Default::default());
-    {
-        let mut pass = enc.begin_compute_pass(&Default::default());
-        d.encode_sort(&mut pass, &dplan, &sbind, &soff)
+    submit_sealed(b, "the G1 MSM", |pass| {
+        d.encode_sort(pass, &dplan, &sbind, &soff)
             .expect("encode sort");
-        p.encode(&mut pass, &dplan, &pplan, &pbind, &poff)
+        p.encode(pass, &dplan, &pplan, &pbind, &poff)
             .expect("encode points");
-    }
-    b.submit([enc.finish()]);
-    b.device()
-        .poll(wgpu::PollType::wait_indefinitely())
-        .expect("poll");
-    assert!(b.take_error().is_none(), "device error during the G1 MSM");
+    });
 
     let raw = read_bytes(b, &pts.results, pts.results.size());
     let result = p

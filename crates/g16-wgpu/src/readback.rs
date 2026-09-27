@@ -51,9 +51,244 @@
 //! KiB or so this reads, that is several hundred times clear. If a readback ever grows past
 //! a megabyte, this function is the wrong tool and `as_uint8array()` is the right one.
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use g16_core::ProveError;
 
 use crate::device::{bad, WgpuBackend};
+use crate::gather::storage_entry;
+
+/// How [`Seal::verify`]'s error begins, so [`is_aborted`] can tell it from the other
+/// [`ProveError::Device`] this backend raises, a lost device, which a retry in the same
+/// process cannot bring back.
+const ABORTED: &str = "the GPU did not run this submission to its end";
+
+/// Whether `e` is a submission the GPU cut short, which is the one device fault worth
+/// running again unchanged. See [`Seal`].
+pub fn is_aborted(e: &ProveError) -> bool {
+    matches!(e, ProveError::Device { backend: "wgpu", reason } if reason.starts_with(ABORTED))
+}
+
+/// A token the last dispatch of a submission writes and a blit copies out, so the host can
+/// tell a submission the GPU ran to its end from one it cut short.
+///
+/// # Why a submission has to prove it finished
+///
+/// macOS aborts a Metal command buffer that keeps the GPU from the compositor for too long
+/// (`kIOGPUCommandBufferCallbackErrorImpactingInteractivity`; `g16-metal`'s `cb.rs` and
+/// `fft.rs` carry the measurements), and wgpu 30 does not say so: `wgpu-hal`'s Metal fence
+/// advances on `MTLCommandBufferStatus::Error` exactly as on `Completed`
+/// (`wgpu-hal-30.0.1/src/metal/mod.rs`, `Fence::get_latest`), nothing reads the command
+/// buffer's `error`, and neither `on_uncaptured_error` nor the device-lost callback fires.
+/// `poll` returns, the map callback fires, and the readback holds whatever the buffers held
+/// before: the previous proof's window sums, or a test's sentinel. Measured by reading the
+/// command buffers' own status through the Objective-C runtime while three other processes
+/// proved on this M2 Max: 24 of 30 `js_16x16_d32` proofs had their stage 5 to 9 buffer
+/// aborted, and `g16 prove --backend wgpu` failed its self-verify on 29 of 40 railgun-13x01
+/// proofs. That is BUG-24, and every symptom in it: a G2 MSM at infinity, `pi_b` off, a
+/// 430 ms MSM stage where 590 is typical.
+///
+/// # What an abort skips, measured, and where the token therefore has to be
+///
+/// The abort ends the compute pass that was running and nothing else in the command
+/// buffer: over 40 G2 MSMs under that load, 27 aborted, and in every one of them a dispatch
+/// at the end of the MSM's own pass had not run while a blit after the pass and a second
+/// compute pass after that both had. So a token copied by a blit passes on an aborted
+/// submission (the first draft of this did exactly that: 3 refusals in a run of 40 `g16
+/// prove` calls that still produced 22 wrong proofs), and the token is instead written by
+/// **the last dispatch of the last compute pass**, which is
+/// present only if every dispatch before it ran, and then copied out to a mappable word.
+/// It is a fresh epoch per submission rather than a constant, so a word still holding the
+/// previous submission's token cannot pass for this one. One 4-byte `write_buffer`, one
+/// thread and one 4-byte copy, with no Metal in it: the same check catches a lost WebGPU
+/// device, and the retry it enables is in `crate::backend`.
+pub struct Seal {
+    /// The epoch, `write_buffer`'d before the submit.
+    src: wgpu::Buffer,
+    /// Where the dispatch copies it.
+    dst: wgpu::Buffer,
+    /// Where the blit after the pass copies that, for the host to map.
+    map: wgpu::Buffer,
+    bind: wgpu::BindGroup,
+    epoch: AtomicU32,
+    /// The epoch [`Self::dispatch`] wrote and [`Self::close`] has not yet taken, or 0.
+    armed: AtomicU32,
+}
+
+/// One submission's token in flight: what [`Seal::dispatch`] wrote, for [`Seal::verify`] to
+/// check once the submission has been waited on.
+#[must_use = "a seal that is never verified checks nothing"]
+pub struct Sealed {
+    epoch: u32,
+    rx: flume::Receiver<Result<(), wgpu::BufferAsyncError>>,
+}
+
+/// The one kernel behind every [`Seal`] on a device: one thread copying one word. Built by
+/// `WgpuBackend::with_profile` rather than per seal, because the tests make a [`Readback`]
+/// per read and a pipeline per seal would be a compile per read.
+pub struct SealKernel {
+    bgl: wgpu::BindGroupLayout,
+    pipeline: wgpu::ComputePipeline,
+}
+
+const SEAL_WGSL: &str = "
+@group(0) @binding(0) var<storage, read> SRC: array<u32>;
+@group(0) @binding(1) var<storage, read_write> DST: array<u32>;
+
+@compute @workgroup_size(1)
+fn seal() {
+    DST[0] = SRC[0];
+}
+";
+
+impl SealKernel {
+    pub fn new(device: &wgpu::Device) -> Self {
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("g16 seal"),
+            source: wgpu::ShaderSource::Wgsl(SEAL_WGSL.into()),
+        });
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("g16 seal"),
+            entries: &[storage_entry(0, true), storage_entry(1, false)],
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("g16 seal"),
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("g16 seal"),
+            layout: Some(&layout),
+            module: &module,
+            entry_point: Some("seal"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        Self { bgl, pipeline }
+    }
+}
+
+impl Seal {
+    pub fn new(backend: &WgpuBackend, label: &str) -> Result<Self, ProveError> {
+        let mk = |usage: wgpu::BufferUsages| {
+            backend.device().create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: 4,
+                usage,
+                mapped_at_creation: false,
+            })
+        };
+        let src = mk(wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
+        let dst = mk(wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC);
+        let map = mk(wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ);
+        let bind = backend
+            .device()
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout: &backend.seal_kernel().bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: src.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: dst.as_entire_binding(),
+                    },
+                ],
+            });
+        Ok(Self {
+            src,
+            dst,
+            map,
+            bind,
+            epoch: AtomicU32::new(0),
+            armed: AtomicU32::new(0),
+        })
+    }
+
+    /// Writes this submission's token and dispatches the thread that lands it. **Must be
+    /// the last dispatch of the submission's last compute pass**: a dispatch after it could
+    /// be abandoned with the token already in place. [`Self::close`] follows, after the
+    /// pass ends.
+    pub fn dispatch(&self, backend: &WgpuBackend, pass: &mut wgpu::ComputePass<'_>) {
+        // Never 0, which is what a fresh buffer holds.
+        let mut epoch = self.epoch.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        if epoch == 0 {
+            epoch = self.epoch.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        }
+        backend
+            .queue()
+            .write_buffer(&self.src, 0, &epoch.to_le_bytes());
+        pass.set_pipeline(&backend.seal_kernel().pipeline);
+        pass.set_bind_group(0, &self.bind, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+        self.armed.store(epoch, Ordering::Relaxed);
+    }
+
+    /// Encodes the copy out to the mappable word and registers its map. Last in `enc`,
+    /// before `finish`. A submission whose pass did not call [`Self::dispatch`] gets a pass
+    /// of its own here holding only the token, which is what a blit-only readback needs.
+    pub fn close(&self, backend: &WgpuBackend, enc: &mut wgpu::CommandEncoder) -> Sealed {
+        let mut epoch = self.armed.swap(0, Ordering::Relaxed);
+        if epoch == 0 {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("g16 seal"),
+                timestamp_writes: None,
+            });
+            self.dispatch(backend, &mut pass);
+            drop(pass);
+            epoch = self.armed.swap(0, Ordering::Relaxed);
+        }
+        enc.copy_buffer_to_buffer(&self.dst, 0, &self.map, 0, 4);
+        let (tx, rx) = flume::bounded(1);
+        enc.map_buffer_on_submit(&self.map, wgpu::MapMode::Read, 0..4, move |r| {
+            let _ = tx.send(r);
+        });
+        Sealed { epoch, rx }
+    }
+
+    /// Checks the word, after the submission has been polled to completion the way
+    /// [`Readback::submit_and_read`] and `WgpuBackend::wait_for_submitted_work` do.
+    pub async fn verify(&self, sealed: Sealed) -> Result<(), ProveError> {
+        sealed
+            .rx
+            .recv_async()
+            .await
+            .map_err(|_| bad("the seal's map callback was dropped before it fired"))?
+            .map_err(|e| bad(format!("mapping the seal failed: {e}")))?;
+        let got = {
+            let view = self
+                .map
+                .slice(0..4)
+                .get_mapped_range()
+                .map_err(|e| bad(format!("the seal mapped but did not read: {e}")))?;
+            u32::from_le_bytes([view[0], view[1], view[2], view[3]])
+        };
+        self.map.unmap();
+        if got != sealed.epoch {
+            // `Device` and not `Backend`, so `g16-cli`'s fallback treats it as the
+            // transient it is once the retry in `crate::backend` has given up.
+            return Err(ProveError::Device {
+                backend: "wgpu",
+                reason: format!(
+                    "{ABORTED}: the completion token is {got:#x}, this submission's is \
+                     {:#x}. On macOS that is a compute pass aborted for impacting \
+                     interactivity while another process held the GPU, which wgpu does \
+                     not report",
+                    sealed.epoch
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// The buffer the token is copied from. For `tests/device.rs`, which overwrites it
+    /// between [`Self::dispatch`] and the submit to stand in for a pass the GPU cut short.
+    pub fn source(&self) -> &wgpu::Buffer {
+        &self.src
+    }
+}
 
 /// A staging buffer plus the copy-and-map dance around it.
 ///
@@ -64,6 +299,8 @@ use crate::device::{bad, WgpuBackend};
 pub struct Readback {
     staging: wgpu::Buffer,
     bytes: u64,
+    /// Refuses the data of a submission the GPU abandoned. See [`Seal`].
+    seal: Seal,
 }
 
 impl Readback {
@@ -84,7 +321,18 @@ impl Readback {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        Ok(Self { staging, bytes })
+        Ok(Self {
+            staging,
+            bytes,
+            seal: Seal::new(backend, label)?,
+        })
+    }
+
+    /// The seal every [`Self::submit_and_read`] closes with. A caller whose submission has
+    /// a compute pass calls [`Seal::dispatch`] on it as that pass's last dispatch; one
+    /// without gets a pass of its own from [`Seal::close`].
+    pub fn seal(&self) -> &Seal {
+        &self.seal
     }
 
     /// Queues the device-to-staging copy into an encoder the caller is still building.
@@ -166,10 +414,13 @@ impl Readback {
         // `flume` and not `std::sync::mpsc`: the receiver has to be awaited, not blocked on,
         // and `mpsc::Receiver` has no async form. This is wgpu's own choice in
         // `examples/features/src/repeated_compute`.
+        let mut enc = enc;
         let (tx, rx) = flume::bounded(1);
         enc.map_buffer_on_submit(&self.staging, wgpu::MapMode::Read, 0..bytes, move |r| {
             let _ = tx.send(r);
         });
+        // Last, after every copy into the staging buffer.
+        let sealed = self.seal.close(backend, &mut enc);
         // Counted, so `tests/stages.rs` can hold `compute_h` to design §3's one submit.
         backend.submit([enc.finish()]);
 
@@ -199,6 +450,8 @@ impl Readback {
         if let Some(e) = backend.take_error() {
             return Err(backend.fault(format!("device error during readback: {e}")));
         }
+        // After the unmap, so a refused readback leaves the staging buffer usable.
+        self.seal.verify(sealed).await?;
         Ok(out)
     }
 

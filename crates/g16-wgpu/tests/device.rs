@@ -29,7 +29,7 @@
 use std::sync::OnceLock;
 
 use g16_wgpu::gen::{field_module, Variant};
-use g16_wgpu::{Kernels, LimitsProfile, ParamRing, Readback, WgpuBackend};
+use g16_wgpu::{is_aborted, Kernels, LimitsProfile, ParamRing, Readback, Seal, WgpuBackend};
 
 // ---------------------------------------------------------------------------
 // The kernel the ring and the readback are tested through
@@ -455,4 +455,72 @@ fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
         },
         count: None,
     }
+}
+
+/// A compute pass the GPU cuts short leaves its buffers as they were and wgpu reports
+/// nothing (BUG-24), so every readback closes with a `Seal`: a per-submission token written
+/// by the pass's last dispatch. The abort itself cannot be provoked on demand, so this
+/// stands in for it the one way the word can end up without the token: the dispatch runs
+/// but copies a stale value, which is exactly what it holds when the dispatch never ran.
+#[test]
+fn a_readback_whose_submission_did_not_run_to_its_end_is_refused() {
+    let b = floor();
+    let dev = b.device();
+
+    let seal = Seal::new(b, "seal").expect("seal");
+    let mut enc = dev.create_command_encoder(&Default::default());
+    {
+        let mut pass = enc.begin_compute_pass(&Default::default());
+        seal.dispatch(b, &mut pass);
+    }
+    let sealed = seal.close(b, &mut enc);
+    b.submit([enc.finish()]);
+    dev.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+    pollster::block_on(seal.verify(sealed)).expect("a submission that ran to its end");
+
+    let mut enc = dev.create_command_encoder(&Default::default());
+    {
+        let mut pass = enc.begin_compute_pass(&Default::default());
+        seal.dispatch(b, &mut pass);
+    }
+    let sealed = seal.close(b, &mut enc);
+    b.queue()
+        .write_buffer(seal.source(), 0, &0u32.to_le_bytes());
+    b.submit([enc.finish()]);
+    dev.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+    let err = pollster::block_on(seal.verify(sealed)).expect_err("the token never landed");
+    assert!(
+        is_aborted(&err),
+        "not reported as a cut-short submission: {err}"
+    );
+    println!("refused: {err}");
+
+    // The same through a `Readback`, which is what every stage's data comes back through,
+    // and a refused readback has to stay usable because the retry in `backend.rs` reuses it.
+    let src = dev.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 16,
+        usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    b.queue().write_buffer(&src, 0, &[7u8; 16]);
+    let rb = Readback::new(b, "sealed readback", 16).expect("readback");
+    let mut enc = dev.create_command_encoder(&Default::default());
+    {
+        let mut pass = enc.begin_compute_pass(&Default::default());
+        rb.seal().dispatch(b, &mut pass);
+    }
+    rb.copy_from(&mut enc, &src, 0, 16).expect("copy");
+    b.queue()
+        .write_buffer(rb.seal().source(), 0, &0u32.to_le_bytes());
+    let err = pollster::block_on(rb.submit_and_read(b, enc, 16)).expect_err("stale token");
+    assert!(
+        is_aborted(&err),
+        "not reported as a cut-short submission: {err}"
+    );
+    // A blit-only readback, which is most of the tests': the seal opens its own pass.
+    let mut enc = dev.create_command_encoder(&Default::default());
+    rb.copy_from(&mut enc, &src, 0, 16).expect("copy");
+    let got = pollster::block_on(rb.submit_and_read(b, enc, 16)).expect("a complete readback");
+    assert_eq!(got, vec![7u8; 16]);
 }

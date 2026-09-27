@@ -19,7 +19,7 @@
 use ark_std::rand::Rng;
 use ark_std::UniformRand;
 use g16_field::{Fr, One, Zero};
-use g16_wgpu::{Readback, WgpuBackend};
+use g16_wgpu::{is_aborted, Readback, Seal, WgpuBackend};
 
 /// The sentinel every output buffer is pre-filled with. Not zero, so a kernel that writes
 /// nothing is caught rather than silently agreeing with an identity oracle, and not a
@@ -64,6 +64,38 @@ pub fn read_words(b: &WgpuBackend, buf: &wgpu::Buffer) -> Vec<u32> {
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
+}
+
+/// One compute pass of `encode`, submitted, waited on and sealed, and run again when the GPU
+/// cut it short: another process's proofs on this GPU get a pass aborted for impacting
+/// interactivity, wgpu reports nothing and the buffers hold the sentinel or half an answer
+/// (BUG-24, `g16_wgpu::Seal`). The prover retries the same way in `backend.rs`; here it is
+/// what keeps a correctness test from failing on the scheduler instead of on the kernel.
+/// Every sort begins by zeroing its counters and every point stage by clearing its buckets,
+/// so a second run reads nothing the first one half wrote.
+pub fn submit_sealed(b: &WgpuBackend, what: &str, encode: impl Fn(&mut wgpu::ComputePass<'_>)) {
+    let seal = Seal::new(b, "msm test seal").expect("seal");
+    for attempt in 1..=4 {
+        let mut enc = b.device().create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            encode(&mut pass);
+            seal.dispatch(b, &mut pass);
+        }
+        let sealed = seal.close(b, &mut enc);
+        b.submit([enc.finish()]);
+        b.device()
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        assert!(b.take_error().is_none(), "device error during {what}");
+        match pollster::block_on(seal.verify(sealed)) {
+            Ok(()) => return,
+            Err(e) if is_aborted(&e) && attempt < 4 => {
+                eprintln!("{what}: {e}; attempt {attempt} of 4");
+            }
+            Err(e) => panic!("{what}: {e}"),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -60,6 +60,9 @@ use crate::batch::{G1Bases, G2Bases, Group, Job, MontConvert, MsmBatch, Source};
 use crate::device::{bad, WgpuBackend};
 use crate::stages::{HStages, WgpuHandle};
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::readback::is_aborted;
+
 // `Backend` and `PreparedCircuit` are the synchronous traits, `Stage4` is only reachable
 // through the synchronous `compute_h_with`, and `LimitsProfile::from_env` reads an
 // environment a browser does not have. All four are native only, and importing them
@@ -413,7 +416,9 @@ impl PreparedCircuit for WgpuCircuit {
 
     fn compute_h(&self, witness: &[Fr], t: &mut StageTimings) -> Result<HPoly, ProveError> {
         let _gpu = self.device.exclusive();
-        pollster::block_on(self.compute_h_async(witness, t))
+        retry_aborted("stages 0 to 4", t, |t| {
+            pollster::block_on(self.compute_h_async(witness, t))
+        })
     }
 
     fn msms(
@@ -425,12 +430,54 @@ impl PreparedCircuit for WgpuCircuit {
         // The guard first, then the clock, and the order is the whole point. The reason is
         // the long comment in `msms_async`, which is where the clock starts.
         let _gpu = self.device.exclusive();
-        pollster::block_on(self.msms_async(witness, h, t))
+        retry_aborted("stages 5 to 9", t, |t| {
+            pollster::block_on(self.msms_async(witness, h, t))
+        })
     }
 
     fn h_to_host(&self, h: &HPoly) -> Option<Vec<Fr>> {
         let _gpu = self.device.exclusive();
         pollster::block_on(self.h_to_host_async(h))
+    }
+}
+
+/// Attempts at one stage group whose submission the GPU abandoned, counting the first. The
+/// same count and backoff as `g16-metal`'s ceremony FFT.
+#[cfg(not(target_arch = "wasm32"))]
+const ATTEMPTS: u32 = 4;
+
+/// Runs `f`, and runs it again after a backoff when the GPU abandoned its submission.
+///
+/// An abandoned submission (`crate::readback::Seal`) is a scheduling event and not an
+/// arithmetic one: macOS took the GPU back for the compositor. Both stage groups re-encode
+/// from their first write, stages 0 to 4 from the witness upload and stages 5 to 9 from the
+/// zeroing dispatches, so a retry reads nothing half-written. `t` is restored between
+/// attempts so a stage timing is the attempt that produced the answer. Native only, which
+/// is why it sits on the synchronous `PreparedCircuit` impl and not on the `async fn`s the
+/// browser awaits: there is no thread to sleep there, and the error reaches the page as it
+/// is.
+#[cfg(not(target_arch = "wasm32"))]
+fn retry_aborted<T>(
+    what: &str,
+    t: &mut StageTimings,
+    mut f: impl FnMut(&mut StageTimings) -> Result<T, ProveError>,
+) -> Result<T, ProveError> {
+    let before = *t;
+    let mut attempt = 1;
+    loop {
+        match f(t) {
+            Err(e) if is_aborted(&e) && attempt < ATTEMPTS => {
+                let wait = std::time::Duration::from_millis(200 << attempt);
+                eprintln!(
+                    "wgpu: {what}: {e}; attempt {attempt} of {ATTEMPTS}, retrying in {} ms",
+                    wait.as_millis()
+                );
+                *t = before;
+                std::thread::sleep(wait);
+                attempt += 1;
+            }
+            r => return r,
+        }
     }
 }
 

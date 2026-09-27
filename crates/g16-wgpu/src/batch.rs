@@ -676,6 +676,12 @@ impl MsmBatch {
                     }
                 }
             }
+            // Last, so the token is present only if every MSM's last dispatch ran.
+            sc.readback
+                .as_ref()
+                .expect("just built")
+                .seal()
+                .dispatch(backend, &mut pass);
         }
         let rb = sc.readback.as_ref().expect("just built");
         for (i, (at, bytes)) in slices.iter().enumerate() {

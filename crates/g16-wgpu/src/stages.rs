@@ -63,7 +63,7 @@ use crate::gather::{fr_buffer, fr_from_words, CsrTables, GatherAbc};
 use crate::ntt::{Direction, Epilogue, Ntt, NttTables, Scale, Transform};
 use crate::params::ParamRing;
 use crate::pointwise::HJoin;
-use crate::readback::Readback;
+use crate::readback::{Readback, Seal};
 
 /// The tag on [`g16_core::HPoly::Device`] values produced here.
 ///
@@ -186,6 +186,8 @@ struct Scratch {
     h_mont: wgpu::Buffer,
     h_std: wgpu::Buffer,
     ring: ParamRing,
+    /// Refuses an `H` the GPU did not finish computing. See [`Seal`].
+    seal: Seal,
     /// Host staging for the witness limb split, kept across proofs.
     ///
     /// Same reasoning as `ParamRing`'s own staging vector: this is 4.5 MB at 140,824
@@ -322,6 +324,7 @@ impl HStages {
             h_mont: fr_buffer(backend, "g16 h_mont", n)?,
             h_std: fr_buffer(backend, "g16 h_std", n)?,
             ring: ParamRing::new(backend, "g16 stage 0-4 params", self.ring_slots())?,
+            seal: Seal::new(backend, "g16 stages 0-4 seal")?,
             pack: Vec::with_capacity(self.n_vars * LIMBS),
         })
     }
@@ -490,7 +493,10 @@ impl HStages {
             if let Some((offsets, bind)) = &standalone {
                 self.join.encode(&mut pass, bind, n, offsets)?;
             }
+            // Last, so the token is present only if the join's last store is.
+            sc.seal.dispatch(backend, &mut pass);
         }
+        let sealed = sc.seal.close(backend, &mut enc);
         let cmd = enc.finish();
         // Everything above this line is host work, and it is charged as such. See the
         // attribution note on this method for why that separation is load-bearing.
@@ -514,6 +520,8 @@ impl HStages {
             // reallocation on the next proof after a failure.
             return Err(backend.fault(format!("device error in stages 0 to 4: {e}")));
         }
+        // Same disposal of `sc` on the way out, for the same reason.
+        sc.seal.verify(sealed).await?;
 
         Ok(HPoly::Device {
             tag: TAG,
