@@ -234,7 +234,14 @@ of whose encoders executed (3 in 300 during one episode). Every proving submissi
 a completion token checked by the host (`cb::Seal`, `bec5863`), the same defence g16-wgpu has.
 During recovery episodes a buffer that ran to its end with its token present also produced wrong
 values; no completion token can see that, and `prove`'s self-verify is the only guard for it, so
-`prove_unchecked` on a GPU backend is exposed to it. CUDA device faults (ECC, watchdog, kernel exceptions, out of
+`prove_unchecked` on a GPU backend is exposed to it.
+
+Since `2a2babe` the wgpu MSM batch is several submissions of about 300 ms, each sealed and
+retried alone up to eight times: under two other proof loops 0 of 60 CLI proofs gave up, against
+12 of 60 before. All three CLI proofs whose stage 0 to 4 submission was really aborted and then
+retried verified wrong with every token present; `prove`'s self-verify caught all three. That
+looks like a retry reading buffers a half-run pass left behind rather than a driver fault, and
+is tracked as BUG-33. CUDA device faults (ECC, watchdog, kernel exceptions, out of
 memory) take the same path since `23354b9`, untested on an NVIDIA GPU; a sticky CUDA error
 leaves the context unusable, so the GPU retry fails at once and the proof falls to the CPU.
 
