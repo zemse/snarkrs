@@ -1075,6 +1075,9 @@ pub fn same_ratio(a1: &G1Affine, b1: &G1Affine, a2: &G2Affine, b2: &G2Affine) ->
     if a1.is_zero() || b1.is_zero() || a2.is_zero() || b2.is_zero() {
         return false;
     }
-    // `PairingOutput` is written additively, so the target-group identity is its zero.
-    Bn254::multi_pairing([*a1, -*b1], [*b2, *a2]).is_zero()
+    // `PairingOutput` is written additively, so the target-group identity is its zero. Not
+    // `multi_pairing`, which unwraps a final exponentiation that is `None` on degenerate
+    // input, and these points came off a file.
+    Bn254::final_exponentiation(Bn254::multi_miller_loop([*a1, -*b1], [*b2, *a2]))
+        .is_some_and(|r| r.is_zero())
 }

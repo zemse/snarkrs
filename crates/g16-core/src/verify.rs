@@ -86,18 +86,18 @@ pub fn verify_unchecked(
 ) -> Result<(), VerifyError> {
     let l_bar = aggregate_public(vk, public)?;
 
-    // `multi_pairing` runs one Miller loop per pair and a single final exponentiation
-    // over their product, so the four checks cost one exponentiation rather than four.
-    // The output group is written additively, so "the product is 1" is "the sum is 0".
-    let result = Bn254::multi_pairing(
+    // One Miller loop per pair and a single final exponentiation over their product, so
+    // the four checks cost one exponentiation rather than four. Not `multi_pairing`, which
+    // unwraps the exponentiation: it is `None` when the loop's output is zero, which only
+    // degenerate input reaches, and here that input is the caller's. The output group is
+    // written additively, so "the product is 1" is "the sum is 0".
+    let mlo = Bn254::multi_miller_loop(
         [-proof.a, vk.alpha_g1, l_bar.into_affine(), proof.c],
         [proof.b, vk.beta_g2, vk.gamma_g2, vk.delta_g2],
     );
-
-    if result.is_zero() {
-        Ok(())
-    } else {
-        Err(VerifyError::PairingFailed)
+    match Bn254::final_exponentiation(mlo) {
+        Some(result) if result.is_zero() => Ok(()),
+        _ => Err(VerifyError::PairingFailed),
     }
 }
 
