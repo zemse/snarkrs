@@ -81,42 +81,56 @@ fn distinct_witnesses_concurrently_do_not_cross_talk() {
 
         // Serial reference for each.
         let mut want = Vec::new();
-        for w in &inputs {
+        for (i, w) in inputs.iter().enumerate() {
             let mut t = StageTimings::default();
-            let h = c.compute_h(w, &mut t).unwrap();
+            let h = c
+                .compute_h(w, &mut t)
+                .unwrap_or_else(|e| panic!("{name}: witness {i}: compute_h: {e}"));
             let hv = h.device_handle::<HHandle>(TAG).unwrap().to_host();
-            let m = c.msms(w, &h, &mut t).unwrap();
+            let m = c
+                .msms(w, &h, &mut t)
+                .unwrap_or_else(|e| panic!("{name}: witness {i}: msms: {e}"));
             drop(h);
             want.push((hv, m.a_g1, m.b_g2, m.b_g1, m.l_g1, m.h_g1));
         }
 
         let c: &dyn PreparedCircuit = c.as_ref();
-        let (inputs, want) = (&inputs, &want);
+        let (name, inputs, want) = (&name, &inputs, &want);
+        // A failure names the artifact, the thread, the repetition and the error, and the join
+        // rethrows it rather than replacing it with `Any { .. }`.
         std::thread::scope(|s| {
             let hs: Vec<_> = (0..8usize)
                 .map(|i| {
-                    s.spawn(move || {
-                        // A few repetitions so the threads genuinely overlap.
-                        for _ in 0..3 {
-                            let mut t = StageTimings::default();
-                            let w = &inputs[i];
-                            let h = c.compute_h(w, &mut t).unwrap();
-                            let hv = h.device_handle::<HHandle>(TAG).unwrap().to_host();
-                            let m = c.msms(w, &h, &mut t).unwrap();
-                            drop(h);
-                            let e = &want[i];
-                            assert_eq!(hv, e.0, "thread {i}: H differs under concurrency");
-                            assert_eq!(m.a_g1, e.1, "thread {i}: A differs");
-                            assert_eq!(m.b_g2, e.2, "thread {i}: B G2 differs");
-                            assert_eq!(m.b_g1, e.3, "thread {i}: B G1 differs");
-                            assert_eq!(m.l_g1, e.4, "thread {i}: L differs");
-                            assert_eq!(m.h_g1, e.5, "thread {i}: H MSM differs");
-                        }
-                    })
+                    let thread = std::thread::Builder::new().name(format!("{name} thread {i}"));
+                    thread
+                        .spawn_scoped(s, move || {
+                            // A few repetitions so the threads genuinely overlap.
+                            for rep in 0..3 {
+                                let at = format!("{name}: thread {i} rep {rep}");
+                                let mut t = StageTimings::default();
+                                let w = &inputs[i];
+                                let h = c
+                                    .compute_h(w, &mut t)
+                                    .unwrap_or_else(|e| panic!("{at}: compute_h: {e}"));
+                                let hv = h.device_handle::<HHandle>(TAG).unwrap().to_host();
+                                let m = c
+                                    .msms(w, &h, &mut t)
+                                    .unwrap_or_else(|e| panic!("{at}: msms: {e}"));
+                                drop(h);
+                                let e = &want[i];
+                                assert_eq!(hv, e.0, "{at}: H differs under concurrency");
+                                assert_eq!(m.a_g1, e.1, "{at}: A differs");
+                                assert_eq!(m.b_g2, e.2, "{at}: B G2 differs");
+                                assert_eq!(m.b_g1, e.3, "{at}: B G1 differs");
+                                assert_eq!(m.l_g1, e.4, "{at}: L differs");
+                                assert_eq!(m.h_g1, e.5, "{at}: H MSM differs");
+                            }
+                        })
+                        .unwrap()
                 })
                 .collect();
             for h in hs {
-                h.join().unwrap();
+                h.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
             }
         });
         println!("CROSSTALK {name}: 8 distinct witnesses x 3 reps, every result matched its own serial reference");
