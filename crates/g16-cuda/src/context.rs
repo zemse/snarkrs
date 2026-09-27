@@ -9,7 +9,9 @@
 
 use std::sync::{Arc, OnceLock};
 
-use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream};
+use cudarc::driver::sys::CUresult;
+use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream, DriverError};
+use g16_core::ProveError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CudaError {
@@ -23,6 +25,92 @@ pub enum CudaError {
     UnsupportedArch(i32, i32),
     #[error("{0}")]
     Other(String),
+}
+
+impl From<CudaError> for ProveError {
+    fn from(e: CudaError) -> Self {
+        let reason = e.to_string();
+        match e {
+            CudaError::Driver(d) => fault(reason, d),
+            _ => ProveError::Backend {
+                backend: "cuda",
+                reason,
+            },
+        }
+    }
+}
+
+/// A driver failure as a [`ProveError`]: [`ProveError::Device`] when [`is_device_fault`]
+/// says the device failed, [`ProveError::Backend`] when this crate misused the driver.
+pub(crate) fn fault(reason: String, e: DriverError) -> ProveError {
+    if is_device_fault(e.0) {
+        ProveError::Device {
+            backend: "cuda",
+            reason,
+        }
+    } else {
+        ProveError::Backend {
+            backend: "cuda",
+            reason,
+        }
+    }
+}
+
+/// Whether `code` says the device failed, rather than that this crate passed the driver
+/// something it rejects every time. The quotes are from the driver API's `CUresult` docs.
+///
+/// Every kernel exception is here, although a bug in a kernel raises the same codes: a
+/// hardware fault surfaces as one too (`LAUNCH_FAILED`'s "less common cases can be system
+/// specific"), and nothing on the host tells the two apart. A kernel bug then costs one
+/// failed retry and a CPU proof, as a kernel bug that yields a wrong proof already does
+/// through the self-verify.
+///
+/// The codes the docs call sticky ("leaves the process in an inconsistent state and any
+/// further CUDA work will return the same error") poison the context for the life of the
+/// process, so a retry on the same circuit fails at its first driver call and the proof goes
+/// to the CPU.
+pub(crate) fn is_device_fault(code: CUresult) -> bool {
+    use CUresult::*;
+    matches!(
+        code,
+        // "unable to allocate enough memory": another process holding the card's memory,
+        // or a key too big for it, which the CPU proves either way. Not sticky.
+        CUDA_ERROR_OUT_OF_MEMORY
+            // "unavailable at the current time": an exclusive-process card in use.
+            | CUDA_ERROR_DEVICE_UNAVAILABLE
+            // Hardware: "uncorrectable ECC error", "uncorrectable NVLink error", and an
+            // error the GPU's error containment caught. Sticky.
+            | CUDA_ERROR_ECC_UNCORRECTABLE
+            | CUDA_ERROR_NVLINK_UNCORRECTABLE
+            | CUDA_ERROR_CONTAINED
+            // The display watchdog killed a kernel, the twin of the interactivity kill
+            // g16-metal's cb.rs retries. Sticky.
+            | CUDA_ERROR_LAUNCH_TIMEOUT
+            // Kernel exceptions, all sticky. The kernels carry no device assert, so
+            // `ASSERT` cannot come from this crate's code.
+            | CUDA_ERROR_ILLEGAL_ADDRESS
+            | CUDA_ERROR_ASSERT
+            | CUDA_ERROR_HARDWARE_STACK_ERROR
+            | CUDA_ERROR_ILLEGAL_INSTRUCTION
+            | CUDA_ERROR_MISALIGNED_ADDRESS
+            | CUDA_ERROR_INVALID_ADDRESS_SPACE
+            | CUDA_ERROR_INVALID_PC
+            | CUDA_ERROR_LAUNCH_FAILED
+            // Daemons: "the system is not yet ready to start any CUDA work", and every MPS
+            // failure, which is the MPS server's state and not this process's.
+            | CUDA_ERROR_SYSTEM_NOT_READY
+            | CUDA_ERROR_MPS_CONNECTION_FAILED
+            | CUDA_ERROR_MPS_RPC_FAILURE
+            | CUDA_ERROR_MPS_SERVER_NOT_READY
+            | CUDA_ERROR_MPS_MAX_CLIENTS_REACHED
+            | CUDA_ERROR_MPS_MAX_CONNECTIONS_REACHED
+            | CUDA_ERROR_MPS_CLIENT_TERMINATED
+            // "the wait operation has timed out", and an external device's async error.
+            | CUDA_ERROR_TIMEOUT
+            | CUDA_ERROR_EXTERNAL_DEVICE
+            // "an unknown internal error": the driver's own state, not this call's.
+            | CUDA_ERROR_UNKNOWN
+    )
 }
 
 /// An open CUDA context plus its default stream.
@@ -395,5 +483,98 @@ mod tests {
         // And anything older than Volta is refused rather than silently miscompiled.
         assert!(arch_flag((6, 1)).is_err());
         assert!(arch_flag((5, 0)).is_err());
+    }
+
+    /// The mapping `g16 prove --fallback` retries on, checked code by code so it runs on a
+    /// host with no card.
+    #[test]
+    fn device_faults_are_retried_and_misuse_is_not() {
+        use CUresult::*;
+        for code in [
+            CUDA_ERROR_OUT_OF_MEMORY,
+            CUDA_ERROR_DEVICE_UNAVAILABLE,
+            CUDA_ERROR_ECC_UNCORRECTABLE,
+            CUDA_ERROR_NVLINK_UNCORRECTABLE,
+            CUDA_ERROR_CONTAINED,
+            CUDA_ERROR_LAUNCH_TIMEOUT,
+            CUDA_ERROR_ILLEGAL_ADDRESS,
+            CUDA_ERROR_ASSERT,
+            CUDA_ERROR_HARDWARE_STACK_ERROR,
+            CUDA_ERROR_ILLEGAL_INSTRUCTION,
+            CUDA_ERROR_MISALIGNED_ADDRESS,
+            CUDA_ERROR_INVALID_ADDRESS_SPACE,
+            CUDA_ERROR_INVALID_PC,
+            CUDA_ERROR_LAUNCH_FAILED,
+            CUDA_ERROR_SYSTEM_NOT_READY,
+            CUDA_ERROR_MPS_CONNECTION_FAILED,
+            CUDA_ERROR_MPS_RPC_FAILURE,
+            CUDA_ERROR_MPS_SERVER_NOT_READY,
+            CUDA_ERROR_MPS_MAX_CLIENTS_REACHED,
+            CUDA_ERROR_MPS_MAX_CONNECTIONS_REACHED,
+            CUDA_ERROR_MPS_CLIENT_TERMINATED,
+            CUDA_ERROR_TIMEOUT,
+            CUDA_ERROR_EXTERNAL_DEVICE,
+            CUDA_ERROR_UNKNOWN,
+        ] {
+            let e = fault("op".into(), DriverError(code));
+            assert!(e.is_device_fault(), "{code:?} gave {e}");
+        }
+        // Launch geometry, bad arguments and handles, a missing kernel, a context this
+        // crate destroyed: each fails the same way on a second attempt.
+        for code in [
+            CUDA_ERROR_INVALID_VALUE,
+            CUDA_ERROR_NOT_INITIALIZED,
+            CUDA_ERROR_INVALID_DEVICE,
+            CUDA_ERROR_INVALID_IMAGE,
+            CUDA_ERROR_INVALID_CONTEXT,
+            CUDA_ERROR_INVALID_PTX,
+            CUDA_ERROR_INVALID_HANDLE,
+            CUDA_ERROR_NOT_FOUND,
+            CUDA_ERROR_NOT_READY,
+            CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES,
+            CUDA_ERROR_CONTEXT_IS_DESTROYED,
+            CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE,
+            CUDA_ERROR_NOT_SUPPORTED,
+        ] {
+            let e = fault("op".into(), DriverError(code));
+            assert!(
+                matches!(
+                    e,
+                    ProveError::Backend {
+                        backend: "cuda",
+                        ..
+                    }
+                ),
+                "{code:?} gave {e}"
+            );
+        }
+    }
+
+    /// The rest of [`CudaError`] is this crate's or the host's, never the device's. Its
+    /// `Driver` arm is [`fault`], untested here because formatting a `DriverError` asks
+    /// `libcuda` for the message, and a host without one panics in `cudarc`.
+    #[test]
+    fn other_cuda_errors_are_not_device_faults() {
+        for e in [
+            CudaError::NoDevice("none".into()),
+            CudaError::Compile {
+                unit: "msm",
+                log: "error".into(),
+            },
+            CudaError::UnsupportedArch(6, 1),
+            CudaError::Other("other".into()),
+        ] {
+            let e = ProveError::from(e);
+            assert!(
+                matches!(
+                    e,
+                    ProveError::Backend {
+                        backend: "cuda",
+                        ..
+                    }
+                ),
+                "{e}"
+            );
+        }
     }
 }

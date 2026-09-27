@@ -333,7 +333,7 @@ impl FftKernels {
     /// commands' worth of work pays NVRTC once. Same split as `CudaMsm::compile`.
     pub fn compile(cuda: &Cuda) -> Result<Arc<CudaModule>, ProveError> {
         cuda.compile("fft", &kernels::unit_fft())
-            .map_err(|e| bad(e.to_string()))
+            .map_err(ProveError::from)
     }
 
     /// Bind the kernel handles out of an already-compiled module. `module` must have

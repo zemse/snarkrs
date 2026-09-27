@@ -47,7 +47,7 @@ use std::time::Instant;
 
 use cudarc::driver::{
     sys, CudaContext, CudaEvent, CudaFunction, CudaModule, CudaSlice, CudaStream, DeviceRepr,
-    LaunchConfig, PinnedHostSlice, PushKernelArg,
+    DriverError, LaunchConfig, PinnedHostSlice, PushKernelArg,
 };
 use g16_core::{HPoly, ProveError, StageTimings};
 use g16_field::{Domain, Field, Fr};
@@ -90,11 +90,12 @@ fn bad(reason: impl Into<String>) -> ProveError {
     }
 }
 
-/// Wraps a driver or NVRTC failure with the operation that produced it. The driver's own
-/// message is `CUDA_ERROR_ILLEGAL_ADDRESS` and nothing else, so without the `what` there is
-/// no way to tell which of fourteen launches died.
-fn drv(what: &str, e: impl std::fmt::Display) -> ProveError {
-    bad(format!("{what}: {e}"))
+/// Wraps a driver failure with the operation that produced it. The driver's own message is
+/// `CUDA_ERROR_ILLEGAL_ADDRESS` and nothing else, so without the `what` there is no way to
+/// tell which of fourteen launches died. [`ProveError::Device`] or `Backend` by the code,
+/// per [`crate::context::is_device_fault`].
+fn drv(what: &str, e: DriverError) -> ProveError {
+    crate::context::fault(format!("{what}: {e}"), e)
 }
 
 // ---------------------------------------------------------------------------
@@ -309,7 +310,7 @@ impl CudaStages {
     /// no `Fq2` curve arithmetic to inline.
     pub fn compile(cuda: &Cuda) -> Result<Arc<CudaModule>, ProveError> {
         cuda.compile("stages", &kernels::unit_stages())
-            .map_err(|e| bad(e.to_string()))
+            .map_err(ProveError::from)
     }
 
     /// Upload one key against an already-compiled module.
@@ -325,7 +326,7 @@ impl CudaStages {
         let func = |name: &str| -> Result<CudaFunction, ProveError> {
             module
                 .load_function(name)
-                .map_err(|e| bad(format!("kernel {name} missing: {e}")))
+                .map_err(|e| drv(&format!("kernel {name} missing"), e))
         };
         let gather = func("g16_gather_abc")?;
         let head = func("g16_ntt_head")?;

@@ -75,7 +75,7 @@ use std::time::Instant;
 use ark_ff::{AdditiveGroup, One, Zero};
 use cudarc::driver::{
     sys, CudaContext, CudaEvent, CudaFunction, CudaModule, CudaSlice, CudaStream, DeviceRepr,
-    LaunchConfig, PushKernelArg,
+    DriverError, LaunchConfig, PushKernelArg,
 };
 
 use g16_core::{HPoly, MsmOutputs, ProveError, StageTimings};
@@ -95,9 +95,10 @@ pub(crate) fn bad(reason: impl Into<String>) -> ProveError {
 
 /// Wraps a driver failure with the operation that produced it. The driver's own message is
 /// `CUDA_ERROR_ILLEGAL_ADDRESS` and nothing else, so without the `what` there is no way to
-/// tell which of thirty-seven launches died.
-pub(crate) fn drv(what: &str, e: impl std::fmt::Display) -> ProveError {
-    bad(format!("{what}: {e}"))
+/// tell which of thirty-seven launches died. [`ProveError::Device`] or `Backend` by the
+/// code, per [`crate::context::is_device_fault`].
+pub(crate) fn drv(what: &str, e: DriverError) -> ProveError {
+    crate::context::fault(format!("{what}: {e}"), e)
 }
 
 // ---------------------------------------------------------------------------
@@ -606,7 +607,7 @@ impl Kernel {
     pub(crate) fn load(module: &Arc<CudaModule>, name: &'static str) -> Result<Self, ProveError> {
         let f = module
             .load_function(name)
-            .map_err(|e| bad(format!("kernel {name} missing: {e}")))?;
+            .map_err(|e| drv(&format!("kernel {name} missing"), e))?;
         let max_block = f
             .max_threads_per_block()
             .map_err(|e| drv(&format!("query max block size of {name}"), e))?
@@ -740,7 +741,7 @@ impl CudaMsm {
     /// module to every circuit it prepares.
     pub fn compile(cuda: &Cuda) -> Result<Arc<CudaModule>, ProveError> {
         cuda.compile("msm", &kernels::unit_msm())
-            .map_err(|e| bad(e.to_string()))
+            .map_err(ProveError::from)
     }
 
     /// Bind the seventeen kernel handles out of an already-compiled module. No bases yet.
