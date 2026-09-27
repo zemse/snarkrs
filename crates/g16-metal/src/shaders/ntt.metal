@@ -174,6 +174,10 @@ kernel void g16_ntt_head(
         } else {
             dst[i] = sh[m];
         }
+        // The slice is a linear image of the witness, and threadgroup memory is not
+        // cleared between dispatches (LeftoverLocals, CVE-2023-4969). This thread is the
+        // only reader of slot m after the last barrier, so it can clear it right here.
+        sh[m] = fr_zero();
     }
 }
 
@@ -215,6 +219,8 @@ kernel void g16_ntt_tail(
         } else {
             a[i] = sh[m];
         }
+        // See `g16_ntt_head`.
+        sh[m] = fr_zero();
     }
 }
 

@@ -44,6 +44,32 @@ pub(crate) fn shared_with_data(
     )
 }
 
+/// Zero a shared buffer from the host. For scratch that held witness-derived data and is
+/// going back to a pool, where it would otherwise sit readable until a same-sized proof
+/// overwrote it. The caller guarantees the GPU is done with it: every pooled buffer comes
+/// back only after its command buffer completed.
+pub(crate) fn scrub(buf: &Buffer) {
+    let ptr = buf.contents().cast::<u8>();
+    if ptr.is_null() {
+        return;
+    }
+    let len = buf.length() as usize;
+    // Split over the pool: one thread's memset left 8 ms on an anon-aadhaar proof's
+    // critical path, which is hundreds of MB of scratch. The address travels as a `usize`
+    // because a raw pointer is not `Send`.
+    const CHUNK: usize = 1 << 20;
+    let at = ptr as usize;
+    use rayon::prelude::*;
+    (0..len.div_ceil(CHUNK)).into_par_iter().for_each(|i| {
+        let lo = i * CHUNK;
+        let n = CHUNK.min(len - lo);
+        // SAFETY: `contents` of a shared buffer is host-visible and `len` bytes long, no
+        // command buffer holds it (see above), and the chunks are disjoint.
+        unsafe { core::ptr::write_bytes((at + lo) as *mut u8, 0, n) };
+    });
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
 fn checked(buf: Buffer, bytes: usize) -> Result<Buffer, ProveError> {
     if buf.length() == 0 {
         return Err(ProveError::Backend {

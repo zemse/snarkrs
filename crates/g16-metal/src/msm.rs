@@ -721,6 +721,13 @@ impl Pool {
     }
 
     fn give(&self, bufs: Vec<Buffer>) {
+        // Every one of these held the witness's digits, buckets or partial sums. Zeroed
+        // here, outside the lock, rather than on `take`, so what sits in the pool between
+        // proofs is zeros. A zeroed page stays resident, so the first-touch cost the pool
+        // exists to avoid is not paid again.
+        for b in &bufs {
+            crate::alloc::scrub(b);
+        }
         let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
         free.extend(bufs);
         // Unbounded reuse would keep every shape any circuit ever asked for. This is a
@@ -1672,9 +1679,10 @@ impl Outputs {
         p
     }
 
-    /// A pooled bucket array holds the previous proof's points, and a bucket that no
-    /// slice writes directly has to read as the identity. The legacy accumulation
-    /// writes every bucket, so it needs no clear.
+    /// A bucket that no slice writes directly has to read as the identity. Dispatched on
+    /// the legacy accumulation too, although that one writes every row: skipping it there
+    /// made the legacy path correct only while that kernel stays unconditional, and the
+    /// clear is about 0.1 ms.
     fn encode_clear(
         &self,
         msm: &MetalMsm,
@@ -1682,9 +1690,6 @@ impl Outputs {
         job: &Job<'_>,
         plan: &Plan<'_>,
     ) {
-        if legacy_accumulate() {
-            return;
-        }
         let p = self.params_for(plan);
         let clear_pso = match job {
             Job::G1(_) => &msm.pipelines.clear_g1,
@@ -2262,6 +2267,52 @@ mod tests {
             let ds = m.upload_scalars(&scalars).expect("upload scalars");
             let got = m.msm_g1(&db, &ds).unwrap();
             assert_eq!(got.into_affine(), want.into_affine(), "n = {n}");
+        }
+    }
+
+    /// The three exceptional cases in `pt_madd`, reached on purpose rather than by the luck
+    /// of the scatter order.
+    ///
+    /// One base with one scalar, repeated, puts every copy in the same bucket of every
+    /// window, so the second addition into a bucket is `P + P` and has to double. Its
+    /// negation with the same scalar lands in the same buckets and has to cancel to the
+    /// identity, and the next copy has to restart from it. Bases at infinity with nonzero
+    /// scalars ride along and have to be skipped. The runs are long enough to cross
+    /// accumulation slices, so the spill and merge path sees the same cases.
+    #[test]
+    fn doubling_cancellation_and_infinity_inside_one_bucket_match_a_naive_sum() {
+        use g16_field::PrimeGroup;
+        let m = MetalMsm::new().expect("Metal device");
+        let s = Fr::from(0x1234_5678_9abc_def1u64) * Fr::from(0x0fed_cba9_8765_4321u64);
+        for n in [2usize, 3, 64, 3001] {
+            let p1 = (G1Projective::generator() * Fr::from(7u64)).into_affine();
+            let p2 = (G2Projective::generator() * Fr::from(7u64)).into_affine();
+            let pattern = |i: usize| i % 5;
+            let g1: Vec<G1Affine> = (0..n)
+                .map(|i| match pattern(i) {
+                    0 | 1 => p1,
+                    2 => -p1,
+                    3 => G1Affine::identity(),
+                    _ => p1,
+                })
+                .collect();
+            let g2: Vec<G2Affine> = (0..n)
+                .map(|i| match pattern(i) {
+                    0 | 1 => p2,
+                    2 => -p2,
+                    3 => G2Affine::identity(),
+                    _ => p2,
+                })
+                .collect();
+            let scalars = vec![s; n];
+
+            let want1 = g1.iter().fold(G1Projective::zero(), |a, b| a + *b * s);
+            let want2 = g2.iter().fold(G2Projective::zero(), |a, b| a + *b * s);
+            let ds = m.upload_scalars(&scalars).expect("upload scalars");
+            let got1 = m.msm_g1(&m.upload_g1_bases(&g1).unwrap(), &ds).unwrap();
+            let got2 = m.msm_g2(&m.upload_g2_bases(&g2).unwrap(), &ds).unwrap();
+            assert_eq!(got1.into_affine(), want1.into_affine(), "G1, n = {n}");
+            assert_eq!(got2.into_affine(), want2.into_affine(), "G2, n = {n}");
         }
     }
 

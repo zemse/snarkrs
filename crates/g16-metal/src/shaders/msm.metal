@@ -72,7 +72,8 @@
 //
 //    Identity is ZZ == 0, which is what a freshly allocated Metal buffer already
 //    contains. Bucket arrays are pooled rather than freshly allocated, so
-//    `msm_clear_*` zeroes ZZ across the array before every segmented accumulation.
+//    `msm_clear_*` zeroes every coordinate across the array before every accumulation,
+//    segmented or legacy.
 //
 // 4. THE WINDOW REDUCTION ENDS ON THE HOST.
 //    `msm_reduce_g2` collapses each window's 2^(c-1) buckets through a per-thread
@@ -356,6 +357,12 @@ inline void f_set_one(thread Fq2& a)  { a = fq2_one(); }
 // `Aff<Fq>` is 64 bytes and `Aff<Fq2>` is 128, matching layout::PackedG1Affine and
 // layout::PackedG2Affine exactly, and (0, 0) is the point at infinity in both (it is off
 // curve for y^2 = x^3 + b with b != 0, so the encoding is unambiguous, not a convention).
+//
+// The accumulation kernels negate `b.y` for a negative digit without testing for infinity
+// first, which is correct only because `f_neg(0) == 0` (`fq_neg` is `0 - a`), so the
+// negated infinity is still (0, 0) and `pt_madd` still skips it. A negation that returned
+// the modulus instead of zero would turn every infinity base with a negative digit into a
+// garbage point.
 //
 // `Xyzz<F>` is the accumulator: x = X/ZZ, y = Y/ZZZ, with the invariant ZZ^3 = ZZZ^2.
 // ZZ == 0 is the identity.
@@ -870,6 +877,9 @@ kernel void msm_scan(device const uint* counts [[buffer(0)]],
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     uint running = totals[tid];
+    // Bucket counts are a histogram of the witness's digits. This thread is the slot's only
+    // reader from here, so it clears it now rather than leave it for the next dispatch.
+    totals[tid] = 0u;
     for (uint i = lo; i < hi; i++) {
         cursor[w * p.n_buckets + i] = running;
         running += counts[w * p.n_buckets + i];
@@ -1025,11 +1035,11 @@ constant uint MSM_NO_ROW = 0xffffffffu;
 template <typename F>
 inline void msm_clear_impl(device Xyzz<F>* buckets, constant MsmParams& p, uint gid) {
     if (gid < p.n_windows * p.n_buckets) {
-        // Built in thread space and then stored: MSL address spaces are part of the
-        // type, so a `thread F&` overload cannot bind a `device` member.
-        F z;
-        f_set_zero(z);
-        buckets[gid].zz = z;
+        // Every coordinate, not only ZZ. Clearing ZZ alone was correct only because every
+        // consumer tests ZZ first, and it left three coordinates of the previous proof's
+        // live points in the array; a whole-point store costs about 0.1 ms on the largest
+        // plan and removes both the coupling and the residue.
+        buckets[gid] = pt_zero<F>();
     }
 }
 
@@ -1083,8 +1093,11 @@ inline void msm_segmented_impl(device const uint2* entries,
         uint2 e = entries[base + i];
         if (e.x != cur_row) {
             if (is_first_run) {
-                spill_rows[head_slot] = cur_row;
+                // Point before tag, so a reader that ever ran in the same dispatch could
+                // not see a row tag over a stale point. Today the merge is a separate
+                // dispatch and the order is free; this keeps it free if that changes.
                 spill_pts[head_slot] = acc;
+                spill_rows[head_slot] = cur_row;
                 is_first_run = false;
             } else {
                 // Strictly interior: this thread is the only one that will ever see this
@@ -1105,11 +1118,11 @@ inline void msm_segmented_impl(device const uint2* entries,
     // continues. Spilling one run that did not need to costs the merge one addition;
     // failing to spill one that did would lose it.
     if (is_first_run) {
-        spill_rows[head_slot] = cur_row;
         spill_pts[head_slot] = acc;
+        spill_rows[head_slot] = cur_row;
     } else {
-        spill_rows[tail_slot] = cur_row;
         spill_pts[tail_slot] = acc;
+        spill_rows[tail_slot] = cur_row;
     }
 }
 
@@ -1253,6 +1266,11 @@ inline void msm_merge_wide_impl(device Xyzz<F>* buckets,
     if (tid == 0u) {
         buckets[row] = pt_add(buckets[row], shared[0]);
     }
+    // Witness-derived partial sums, and threadgroup memory outlives the dispatch
+    // (LeftoverLocals, CVE-2023-4969). Only thread 0 read the tree after the barrier
+    // above, so one more barrier and every slot this dispatch wrote can be cleared.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    shared[tid] = pt_zero<F>();
 }
 
 kernel void msm_merge_wide_g1(device PtG1* buckets [[buffer(0)]],
@@ -1377,6 +1395,11 @@ inline void msm_reduce_impl(device const Xyzz<F>* buckets,
     if (tid == 0u) {
         window_sums[tg] = shared[0];
     }
+    // Witness-derived partial sums, and threadgroup memory outlives the dispatch
+    // (LeftoverLocals, CVE-2023-4969). Only thread 0 read the tree after the barrier
+    // above, so one more barrier and every slot this dispatch wrote can be cleared.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    shared[tid] = pt_zero<F>();
 }
 
 // The G1 reduce, with the segment scaling taken off every thread's chain.
@@ -1520,6 +1543,11 @@ inline void msm_ones_impl(device const uint* scalars,
     if (tid == 0u) {
         out[g] = shared[0];
     }
+    // Witness-derived partial sums, and threadgroup memory outlives the dispatch
+    // (LeftoverLocals, CVE-2023-4969). Only thread 0 read the tree after the barrier
+    // above, so one more barrier and every slot this dispatch wrote can be cleared.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    shared[tid] = pt_zero<F>();
 }
 
 kernel void msm_ones_g1(device const uint* scalars [[buffer(0)]],
@@ -1575,6 +1603,11 @@ inline void msm_ones_idx_impl(device const uint* idx,
     if (tid == 0u) {
         out[g] = shared[0];
     }
+    // Witness-derived partial sums, and threadgroup memory outlives the dispatch
+    // (LeftoverLocals, CVE-2023-4969). Only thread 0 read the tree after the barrier
+    // above, so one more barrier and every slot this dispatch wrote can be cleared.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    shared[tid] = pt_zero<F>();
 }
 
 kernel void msm_ones_idx_g1(device const uint* idx [[buffer(0)]],

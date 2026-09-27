@@ -308,6 +308,10 @@ struct Scratch {
 
 type Pool = Arc<Mutex<Vec<Scratch>>>;
 
+/// Scratch sets [`HHandle`] keeps for reuse. More proofs than this in flight still work;
+/// the extra sets are freed rather than kept.
+const MAX_POOLED_SCRATCH: usize = 4;
+
 /// Everything uploaded once per key.
 pub struct HResident {
     domain: Domain,
@@ -860,7 +864,18 @@ impl HHandle {
 impl Drop for HHandle {
     fn drop(&mut self) {
         if let Some(s) = self.scratch.take() {
-            self.pool.lock().unwrap_or_else(|e| e.into_inner()).push(s);
+            // The witness, its three domain images and both copies of H. The handle is only
+            // dropped once the MSMs that read `h` have completed.
+            for b in [&s.witness, &s.a, &s.b, &s.c, &s.t, &s.h_mont, &s.h_std] {
+                crate::alloc::scrub(b);
+            }
+            // One scratch set per proof in flight is all the pool is for. Uncapped, a burst
+            // of concurrent proofs left that many full sets (seven domain-sized buffers
+            // each) resident for the life of the circuit.
+            let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
+            if pool.len() < MAX_POOLED_SCRATCH {
+                pool.push(s);
+            }
         }
     }
 }
