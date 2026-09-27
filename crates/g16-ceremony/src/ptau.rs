@@ -48,7 +48,6 @@ use std::path::{Path, PathBuf};
 use g16_field::{G1Affine, G2Affine};
 use g16_zkey::binfile::{self, BinFile, Cursor, Scan};
 use g16_zkey::ZkeyError;
-use rayon::prelude::*;
 
 use crate::phase1::{POWER_MAX, POWER_MIN};
 use crate::transcript::{
@@ -466,10 +465,12 @@ impl Ptau {
         n: usize,
     ) -> Result<Vec<G1Affine>, CeremonyError> {
         let data = self.section_elements(id, SG1, offset, n)?;
-        Ok(data
-            .par_chunks_exact(SG1)
-            .map(binfile::g1)
-            .collect::<Result<_, _>>()?)
+        Ok(binfile::decode_records(
+            data,
+            SG1,
+            G1Affine::identity(),
+            |_, b| binfile::g1(b),
+        )?)
     }
 
     /// `n` G2 points from element `offset` of section `id`.
@@ -480,10 +481,12 @@ impl Ptau {
         n: usize,
     ) -> Result<Vec<G2Affine>, CeremonyError> {
         let data = self.section_elements(id, SG2, offset, n)?;
-        Ok(data
-            .par_chunks_exact(SG2)
-            .map(binfile::g2)
-            .collect::<Result<_, _>>()?)
+        Ok(binfile::decode_records(
+            data,
+            SG2,
+            G2Affine::identity(),
+            |_, b| binfile::g2(b),
+        )?)
     }
 
     /// The `domain_size`-point Lagrange block of section `id`, which starts at element

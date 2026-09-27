@@ -681,12 +681,13 @@ pub fn write_hs(ptau: &Ptau, domain_size: usize) -> Result<Vec<G1Affine>, Ceremo
     let block = 2 * domain_size;
     if cir_power < Fr::TWO_ADICITY {
         let data = ptau.section_elements(ptau::S_LAGRANGE_TAU_G1, SG1, block - 1, block)?;
-        Ok(data
-            .par_chunks_exact(SG1)
-            .skip(1)
-            .step_by(2)
-            .map(binfile::g1)
-            .collect::<Result<_, _>>()?)
+        // Each record is an (even, odd) pair, so its second half is the odd element.
+        Ok(binfile::decode_records(
+            data,
+            2 * SG1,
+            G1Affine::identity(),
+            |_, b| binfile::g1(&b[SG1..]),
+        )?)
     } else if cir_power == Fr::TWO_ADICITY {
         // At the two-adicity there is no `2*domainSize`-th root of unity, so
         // `lagrangeEvaluations` took its coset branch and wrote the even and odd halves

@@ -27,6 +27,7 @@
 
 use ark_ff::BigInt;
 use g16_field::*;
+use rayon::prelude::*;
 
 use crate::ZkeyError;
 
@@ -505,4 +506,43 @@ pub fn expect_records(data: &[u8], n: usize, stride: usize, section: u32) -> Res
         });
     }
     Ok(())
+}
+
+/// Decodes fixed-size records in parallel, straight into the one vector that is returned.
+///
+/// Not `collect::<Result<Vec<_>, _>>()`: rayon cannot index a fallible collect, so it
+/// builds a linked list of per-task vectors and then copies them into the result. On
+/// anon-aadhaar's 631 MB key that was 1.8 GB of short-lived allocations, and macOS malloc
+/// kept 181 MB of those pages dirty for the rest of the process. Here a record that fails
+/// is written as `fallback`, which keeps the collect indexed, and the error returned is the
+/// one from the lowest failing record.
+pub fn decode_records<T, E, F>(
+    data: &[u8],
+    stride: usize,
+    fallback: T,
+    decode: F,
+) -> Result<Vec<T>, E>
+where
+    T: Copy + Send + Sync,
+    E: Send,
+    F: Fn(usize, &[u8]) -> Result<T, E> + Sync,
+{
+    let first_err = std::sync::Mutex::new(None::<(usize, E)>);
+    let out = data
+        .par_chunks_exact(stride)
+        .enumerate()
+        .map(|(i, b)| {
+            decode(i, b).unwrap_or_else(|e| {
+                let mut slot = first_err.lock().unwrap_or_else(|p| p.into_inner());
+                if slot.as_ref().is_none_or(|(j, _)| i < *j) {
+                    *slot = Some((i, e));
+                }
+                fallback
+            })
+        })
+        .collect();
+    match first_err.into_inner().unwrap_or_else(|p| p.into_inner()) {
+        None => Ok(out),
+        Some((_, e)) => Err(e),
+    }
 }

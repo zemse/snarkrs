@@ -386,10 +386,7 @@ fn process_section<C: PtauGroup>(
     while done < plan.n_points {
         let n = (plan.n_points - done).min(chunk);
         let raw = ptau.section_elements(plan.id, C::SG, done, n)?;
-        let mut points: Vec<C> = raw
-            .par_chunks_exact(C::SG)
-            .map(C::from_lem)
-            .collect::<Result<_, _>>()?;
+        let mut points = binfile::decode_records(raw, C::SG, C::zero(), |_, b| C::from_lem(b))?;
         C::apply_key(scale, &mut points, t, plan.inc)?;
 
         let lem_out = &mut lem[..n * C::SG];

@@ -382,10 +382,8 @@ fn apply_key_to_section(
     }
     w.start_section(id)?;
     for chunk in body.chunks(CHUNK_POINTS * SG1) {
-        let mut points: Vec<G1Affine> = chunk
-            .par_chunks_exact(SG1)
-            .map(binfile::g1)
-            .collect::<Result<_, _>>()?;
+        let mut points =
+            binfile::decode_records(chunk, SG1, G1Affine::identity(), |_, b| binfile::g1(b))?;
         key.apply_key_g1(&mut points, k, Fr::ONE)?;
         w.write_g1_slice(&points)?;
     }
@@ -731,5 +729,5 @@ fn check_h_section(
 }
 
 fn decode_g1(body: &[u8]) -> Result<Vec<G1Affine>, ContainerError> {
-    body.par_chunks_exact(SG1).map(binfile::g1).collect()
+    binfile::decode_records(body, SG1, G1Affine::identity(), |_, b| binfile::g1(b))
 }

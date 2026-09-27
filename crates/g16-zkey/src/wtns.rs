@@ -47,7 +47,7 @@ impl Witness {
         let data = file.unique_section(2)?;
         binfile::expect_records(data, n_witness, FR_BYTES, 2)?;
         let values =
-            super::decode_records(data, FR_BYTES, Fr::zero(), |_, b| binfile::fr_normal(b, 2))?;
+            binfile::decode_records(data, FR_BYTES, Fr::zero(), |_, b| binfile::fr_normal(b, 2))?;
 
         // w[0] is the constant one wire. Every QAP row and the public-input part of the
         // verifier equation assume it, so a witness that fails here is unusable and the
