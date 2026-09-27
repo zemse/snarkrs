@@ -6,6 +6,9 @@
 
 /// Shared prelude: `Fr` as 8 x u32 limbs, add/sub/Montgomery-mul, BN254 scalar modulus.
 pub const FR_MSL: &str = include_str!("shaders/bn254_fr.metal");
+/// The completion token every proving command buffer ends with; see `cb::Seal`. No
+/// field arithmetic, so it goes anywhere in a translation unit.
+pub const SEAL_MSL: &str = include_str!("shaders/seal.metal");
 /// Stage 0: CSR gather.
 pub const GATHER_MSL: &str = include_str!("shaders/gather.metal");
 /// Stages 1-3: radix-2 NTT passes and the coset shift.

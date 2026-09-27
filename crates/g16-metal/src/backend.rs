@@ -860,14 +860,22 @@ mod tests {
             let want = prove_with_blinders(circuit.as_ref(), &witness, r, s, &mut t).unwrap();
             let submissions = inject::calls();
             assert!(submissions > 0, "{name}: no submission was waited on");
-            for at in 0..submissions {
-                inject::arm(Some(at));
-                let got = prove_with_blinders(circuit.as_ref(), &witness, r, s, &mut t)
-                    .unwrap_or_else(|e| panic!("{name}: fault at wait {at}: {e}"));
-                assert!(inject::fired(), "{name}: wait {at} never failed");
-                assert_eq!(got.a, want.a, "{name}: fault at wait {at}");
-                assert_eq!(got.b, want.b, "{name}: fault at wait {at}");
-                assert_eq!(got.c, want.c, "{name}: fault at wait {at}");
+            // A status fault and a stale token at every wait in turn: the second is the
+            // buffer that says `Completed` without having run, and it must take the
+            // same retry as the first.
+            for fault in [inject::Fault::Status, inject::Fault::Stale] {
+                for at in 0..submissions {
+                    inject::arm_with(Some((at, fault)), false);
+                    let got = prove_with_blinders(circuit.as_ref(), &witness, r, s, &mut t)
+                        .unwrap_or_else(|e| panic!("{name}: {fault:?} at wait {at}: {e}"));
+                    assert!(
+                        inject::fired(),
+                        "{name}: wait {at} never failed ({fault:?})"
+                    );
+                    assert_eq!(got.a, want.a, "{name}: {fault:?} at wait {at}");
+                    assert_eq!(got.b, want.b, "{name}: {fault:?} at wait {at}");
+                    assert_eq!(got.c, want.c, "{name}: {fault:?} at wait {at}");
+                }
             }
             inject::arm(None);
         });
@@ -885,6 +893,53 @@ mod tests {
     fn a_retried_constant_work_submission_gives_the_same_proof() {
         a_retried_submission_is_exact(
             "a_retried_constant_work_submission_gives_the_same_proof",
+            MetalBackend::constant_work,
+        );
+    }
+
+    /// Every attempt's token is stale from the chosen wait on, so no retry can pass,
+    /// and the proof must be refused as a device fault rather than returned: the seal
+    /// is a check, not a hint. One wait per stage group (the gather, the MSM batch)
+    /// rather than every one, since each case costs `RETRIES` proofs with backoff.
+    fn a_stale_token_is_refused(test: &str, backend: fn() -> Result<MetalBackend, ProveError>) {
+        use crate::cb::inject;
+        for_each(test, |name, dir| {
+            let (circuit, witness, _) = load_on(dir, backend().unwrap());
+            if circuit.domain_size() > 1 << 12 {
+                return;
+            }
+            let (r, s) = (Fr::from(31337u64), Fr::from(4242u64));
+            let mut t = StageTimings::default();
+            inject::arm(None);
+            prove_with_blinders(circuit.as_ref(), &witness, r, s, &mut t).unwrap();
+            let submissions = inject::calls();
+            for at in [0, submissions - 1] {
+                inject::arm_with(Some((at, inject::Fault::Stale)), true);
+                let err = prove_with_blinders(circuit.as_ref(), &witness, r, s, &mut t)
+                    .err()
+                    .unwrap_or_else(|| panic!("{name}: a stale token from wait {at} proved"));
+                assert!(err.is_device_fault(), "{name}: wait {at}: {err}");
+                assert!(
+                    err.to_string().contains("completion token"),
+                    "{name}: wait {at}: {err}"
+                );
+            }
+            inject::arm(None);
+        });
+    }
+
+    #[test]
+    fn a_stale_token_is_refused_once_the_retries_are_spent() {
+        a_stale_token_is_refused(
+            "a_stale_token_is_refused_once_the_retries_are_spent",
+            MetalBackend::new,
+        );
+    }
+
+    #[test]
+    fn a_stale_constant_work_token_is_refused_once_the_retries_are_spent() {
+        a_stale_token_is_refused(
+            "a_stale_constant_work_token_is_refused_once_the_retries_are_spent",
             MetalBackend::constant_work,
         );
     }

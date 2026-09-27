@@ -49,7 +49,7 @@ use g16_zkey::ProvingKey;
 use metal::objc::rc::autoreleasepool;
 use metal::{Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, Library, MTLSize};
 
-use crate::kernels::{FR_MSL, GATHER_MSL, NTT_MSL, POINTWISE_MSL};
+use crate::kernels::{FR_MSL, GATHER_MSL, NTT_MSL, POINTWISE_MSL, SEAL_MSL};
 use crate::layout::{PackedFr, PackedScalar};
 
 /// The tag on [`g16_core::HPoly::Device`] values produced here. A handle carrying any
@@ -128,6 +128,8 @@ pub struct HStages {
     head: ComputePipelineState,
     tail: ComputePipelineState,
     h_join: ComputePipelineState,
+    /// The completion token every command buffer here ends with.
+    seal: crate::cb::Seal,
     /// Largest number of NTT passes one dispatch can fuse, derived from the device's
     /// threadgroup memory limit rather than hardcoded.
     max_fused: u32,
@@ -137,7 +139,7 @@ impl HStages {
     /// The MSL for stages 0 to 4, in dependency order. `pointwise.metal` must precede
     /// `ntt.metal`: the fused NTT epilogue calls `g16_store_h`, which is defined there.
     pub(crate) fn source() -> String {
-        format!("{FR_MSL}\n{GATHER_MSL}\n{POINTWISE_MSL}\n{NTT_MSL}\n")
+        format!("{FR_MSL}\n{GATHER_MSL}\n{POINTWISE_MSL}\n{NTT_MSL}\n{SEAL_MSL}\n")
     }
 
     /// Picks the system default device and compiles the MSL for stages 0 to 4.
@@ -175,6 +177,7 @@ impl HStages {
         let head = pso("g16_ntt_head")?;
         let tail = pso("g16_ntt_tail")?;
         let h_join = pso("g16_h_join")?;
+        let seal = crate::cb::Seal::new(&device, &library)?;
 
         // Elements of 32 bytes that fit in threadgroup memory, as a power of two. On this
         // M2 Max maxThreadgroupMemoryLength is 32768, so 1024 elements and 10 passes.
@@ -196,6 +199,7 @@ impl HStages {
             head,
             tail,
             h_join,
+            seal,
             max_fused,
         })
     }
@@ -573,23 +577,32 @@ impl HResident {
             // vector whose buffer died half way is no longer an input anything can be
             // re-run from, while the gather rewrites A, B and C from the witness buffer,
             // which nothing on the device writes.
+            //
+            // Each buffer ends with its completion token, and the wait checks it: after
+            // a GPU hang and recovery the driver reported buffers as `Completed` with no
+            // error although neither of their encoders had run (3 of 300 in the seal
+            // probe), which the status alone would have read as a finished proof.
             crate::cb::with_retry(|| {
                 let mut cbs = Vec::with_capacity(1 + N_DOMAIN_VECTORS);
 
-                let cb = st.queue.new_command_buffer();
+                let cb = crate::cb::command_buffer(&st.queue);
                 let enc = cb.new_compute_command_encoder();
+                enc.set_label("stages 0-1 (gather)");
                 self.encode_gather(st, enc, &sc, n);
+                let token = st.seal.encode(enc);
                 enc.end_encoding();
                 cb.commit();
-                cbs.push(("stages 0-1 (gather)", cb));
+                cbs.push(("stages 0-1 (gather)", cb, token));
 
                 for vi in 0..N_DOMAIN_VECTORS {
-                    let cb = st.queue.new_command_buffer();
+                    let cb = crate::cb::command_buffer(&st.queue);
                     let enc = cb.new_compute_command_encoder();
+                    enc.set_label("stages 2-4 (transforms)");
                     self.encode_transforms_vector(st, enc, &sc, n, vi, true);
+                    let token = st.seal.encode(enc);
                     enc.end_encoding();
                     cb.commit();
-                    cbs.push(("stages 2-4 (transforms)", cb));
+                    cbs.push(("stages 2-4 (transforms)", cb, token));
                 }
 
                 // Every buffer is waited on before any failure is returned, so no
@@ -597,8 +610,8 @@ impl HResident {
                 // one is encoded. The error kept is the first in submission order, which
                 // is the first that happened.
                 let mut first = Ok(());
-                for (context, cb) in cbs {
-                    let r = crate::cb::wait_ok(cb, context);
+                for (context, cb, token) in cbs {
+                    let r = st.seal.wait(cb, token, context);
                     if first.is_ok() {
                         first = r;
                     }
@@ -636,12 +649,14 @@ impl HResident {
         pack_us: u64,
     ) -> Result<(), ProveError> {
         let start = Instant::now();
-        let cb = st.queue.new_command_buffer();
+        let cb = crate::cb::command_buffer(&st.queue);
         let enc = cb.new_compute_command_encoder();
+        enc.set_label("stage 0-1 gather (profiled)");
         self.encode_gather(st, enc, sc, n);
+        let token = st.seal.encode(enc);
         enc.end_encoding();
         cb.commit();
-        crate::cb::wait_ok(cb, "stage 0-1 gather (profiled)")?;
+        st.seal.wait(cb, token, "stage 0-1 gather (profiled)")?;
         t.gather_us += pack_us + start.elapsed().as_micros() as u64;
 
         // Split per domain vector here too, and for the reason `compute_h` gives: all six
@@ -651,21 +666,25 @@ impl HResident {
         let start = Instant::now();
         let mut cbs = Vec::with_capacity(N_DOMAIN_VECTORS);
         for vi in 0..N_DOMAIN_VECTORS {
-            let cb = st.queue.new_command_buffer();
+            let cb = crate::cb::command_buffer(&st.queue);
             let enc = cb.new_compute_command_encoder();
+            enc.set_label("stages 2-3 transforms (profiled)");
             self.encode_transforms_vector(st, enc, sc, n, vi, false);
+            let token = st.seal.encode(enc);
             enc.end_encoding();
             cb.commit();
-            cbs.push(cb);
+            cbs.push((cb, token));
         }
-        for cb in cbs {
-            crate::cb::wait_ok(cb, "stages 2-3 transforms (profiled)")?;
+        for (cb, token) in cbs {
+            st.seal
+                .wait(cb, token, "stages 2-3 transforms (profiled)")?;
         }
         t.ntt_us += start.elapsed().as_micros() as u64;
 
         let start = Instant::now();
-        let cb = st.queue.new_command_buffer();
+        let cb = crate::cb::command_buffer(&st.queue);
         let enc = cb.new_compute_command_encoder();
+        enc.set_label("stage 4 h_join (profiled)");
         enc.set_compute_pipeline_state(&st.h_join);
         bind(enc, 0, sc.a());
         bind(enc, 1, sc.b());
@@ -676,9 +695,10 @@ impl HResident {
         enc.set_bytes(5, 4, &nn as *const u32 as *const c_void);
         let tg = st.threads(&st.h_join, n as u64);
         enc.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(tg, 1, 1));
+        let token = st.seal.encode(enc);
         enc.end_encoding();
         cb.commit();
-        crate::cb::wait_ok(cb, "stage 4 h_join (profiled)")?;
+        st.seal.wait(cb, token, "stage 4 h_join (profiled)")?;
         t.pointwise_us += start.elapsed().as_micros() as u64;
         Ok(())
     }

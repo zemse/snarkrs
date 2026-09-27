@@ -73,7 +73,7 @@ use metal::{
 use g16_core::ProveError;
 use g16_field::{Fr, G1Affine, G1Projective, G2Affine, G2Projective};
 
-use crate::kernels::{FR_MSL, MSM_MSL};
+use crate::kernels::{FR_MSL, MSM_MSL, SEAL_MSL};
 use crate::layout::{Packed, PackedFq, PackedFq2, PackedG1Affine, PackedG2Affine, PackedScalar};
 
 fn err(reason: impl Into<String>) -> ProveError {
@@ -841,6 +841,8 @@ pub struct MetalMsm {
     device: Device,
     queue: CommandQueue,
     pipelines: Pipelines,
+    /// The completion token every command buffer here ends with.
+    seal: crate::cb::Seal,
     pool: Pool,
 }
 
@@ -861,7 +863,7 @@ impl MetalMsm {
         // One translation unit: the field prelude followed by this file. There is no
         // include path for a runtime-compiled source string, so the concatenation is the
         // include, and the prelude's header guard is what makes it safe.
-        let source = format!("{FR_MSL}\n{MSM_MSL}\n");
+        let source = format!("{FR_MSL}\n{MSM_MSL}\n{SEAL_MSL}\n");
         let opts = CompileOptions::new();
         let library = device
             .new_library_with_source(&source, &opts)
@@ -899,6 +901,7 @@ impl MetalMsm {
             ones_idx_g1: pso("msm_ones_idx_g1")?,
             ones_idx_g2: pso("msm_ones_idx_g2")?,
         };
+        let seal = crate::cb::Seal::new(&device, &library)?;
 
         let queue = device.new_command_queue();
         Ok(Self {
@@ -909,6 +912,7 @@ impl MetalMsm {
             device,
             queue,
             pipelines,
+            seal,
         })
     }
 
@@ -1091,17 +1095,23 @@ impl MetalMsm {
         len: usize,
     ) -> Result<ScalarBuf, ProveError> {
         let out = crate::alloc::shared(&self.device, len.max(1) * 32)?;
-        let cb = self.queue.new_command_buffer();
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&self.pipelines.mont_to_std);
-        enc.set_buffer(0, Some(mont), 0);
-        enc.set_buffer(1, Some(&out), 0);
-        let n = len as u32;
-        enc.set_bytes(2, 4, (&n as *const u32).cast());
-        dispatch_1d(enc, &self.pipelines.mont_to_std, len, 64);
-        enc.end_encoding();
-        cb.commit();
-        crate::cb::wait_ok(cb, "stage 9 scalar conversion (mont_to_std)")?;
+        // Reads `mont`, which nothing here writes, so a killed attempt re-runs whole.
+        crate::cb::with_retry(|| {
+            let context = "stage 9 scalar conversion (mont_to_std)";
+            let cb = crate::cb::command_buffer(&self.queue);
+            let enc = cb.new_compute_command_encoder();
+            enc.set_label(context);
+            enc.set_compute_pipeline_state(&self.pipelines.mont_to_std);
+            enc.set_buffer(0, Some(mont), 0);
+            enc.set_buffer(1, Some(&out), 0);
+            let n = len as u32;
+            enc.set_bytes(2, 4, (&n as *const u32).cast());
+            dispatch_1d(enc, &self.pipelines.mont_to_std, len, 64);
+            let token = self.seal.encode(enc);
+            enc.end_encoding();
+            cb.commit();
+            self.seal.wait(cb, token, context)
+        })?;
         Ok(ScalarBuf {
             buf: out,
             len,
@@ -1273,17 +1283,19 @@ impl MetalMsm {
                        f: &mut dyn FnMut(&ComputeCommandEncoderRef)|
              -> Result<(), ProveError> {
                 let t = std::time::Instant::now();
-                let cb = self.queue.new_command_buffer();
+                let cb = crate::cb::command_buffer(&self.queue);
                 let enc = cb.new_compute_command_encoder();
+                enc.set_label(&label);
                 f(enc);
+                let token = self.seal.encode(enc);
                 enc.end_encoding();
                 cb.commit();
-                // The production path below checks status; this one must too. A timing
-                // read off a faulted command buffer is not a slow result, it is a
-                // measurement of how long the GPU took to fail, reported as if it were
+                // The production path below checks status and token; this one must too.
+                // A timing read off a faulted command buffer is not a slow result, it is
+                // a measurement of how long the GPU took to fail, reported as if it were
                 // work. This path exists to explain timings, so a wrong one is worse here
                 // than anywhere.
-                crate::cb::wait_ok(cb, "MSM phase")?;
+                self.seal.wait(cb, token, "MSM phase")?;
                 eprintln!(
                     "[msm-phase] {label}: {:.2} ms",
                     t.elapsed().as_secs_f64() * 1e3
@@ -1439,7 +1451,7 @@ impl MetalMsm {
             // previous proof's window sums with an Ok. Split or not, the whole batch is
             // re-encoded from its zeroing dispatches, so a retry reads nothing
             // half-written.
-            crate::cb::with_retry(|| encode(&mut Submission::new(&self.queue, split)))?;
+            crate::cb::with_retry(|| encode(&mut Submission::new(self, split)))?;
         }
 
         // ---- combine ----
@@ -2249,17 +2261,23 @@ impl Outputs {
 /// and waiting at the end kept the queue deep enough that the transforms of a proof
 /// sharing the device were killed instead. The wait stands in for the barrier, and the
 /// cost is one round trip per piece, about 0.16 ms.
+///
+/// Every command buffer ends with its completion token behind a barrier (the encoder is
+/// concurrent, so without one the token's thread could land before the reduce it vouches
+/// for had finished), and every wait checks it.
 struct Submission<'q> {
     queue: &'q CommandQueue,
+    seal: &'q crate::cb::Seal,
     split: bool,
-    cbs: Vec<&'q CommandBufferRef>,
+    cbs: Vec<(&'q CommandBufferRef, crate::cb::Token)>,
     enc: Option<&'q ComputeCommandEncoderRef>,
 }
 
 impl<'q> Submission<'q> {
-    fn new(queue: &'q CommandQueue, split: bool) -> Self {
+    fn new(msm: &'q MetalMsm, split: bool) -> Self {
         Self {
-            queue,
+            queue: &msm.queue,
+            seal: &msm.seal,
             split,
             cbs: Vec::new(),
             enc: None,
@@ -2271,10 +2289,17 @@ impl<'q> Submission<'q> {
         if let Some(enc) = self.enc {
             return enc;
         }
-        let cb = self.queue.new_command_buffer();
+        let cb = crate::cb::command_buffer(self.queue);
         let enc = cb.compute_command_encoder_with_dispatch_type(MTLDispatchType::Concurrent);
-        self.cbs.push(cb);
+        enc.set_label(if self.split {
+            "MSM batch piece"
+        } else {
+            "MSM batch"
+        });
         self.enc = Some(enc);
+        // The token is taken here rather than at `close` so the pair is pushed together;
+        // the dispatch that writes it is encoded last, in `close`.
+        self.cbs.push((cb, self.seal.next()));
         enc
     }
 
@@ -2283,32 +2308,26 @@ impl<'q> Submission<'q> {
         if self.split {
             return self.close();
         }
-        let enc = self.enc();
-        // SAFETY: `ComputeCommandEncoderRef` is `objc::Message`, and
-        // memoryBarrierWithScope: is a documented MTLComputeCommandEncoder method
-        // taking MTLBarrierScope; MTLBarrierScopeBuffers is 1 << 0. metal-rs 0.29 does
-        // not bind it, so it is called the way `cb` reads the unbound timing
-        // properties.
-        unsafe {
-            let () = msg_send![enc, memoryBarrierWithScope: 1u64];
-        }
+        barrier(self.enc());
         Ok(())
     }
 
-    /// Commits the open command buffer, if any, and in split mode waits for it. The
-    /// next `enc` opens a fresh one.
+    /// Seals and commits the open command buffer, if any, and in split mode waits for
+    /// it. The next `enc` opens a fresh one.
     fn close(&mut self) -> Result<(), ProveError> {
         let Some(enc) = self.enc.take() else {
             return Ok(());
         };
-        enc.end_encoding();
-        let cb = self
+        let (cb, token) = *self
             .cbs
             .last()
             .expect("an open encoder has a command buffer");
+        barrier(enc);
+        self.seal.encode_token(enc, token);
+        enc.end_encoding();
         cb.commit();
         if self.split {
-            crate::cb::wait_ok(cb, "MSM batch piece")?;
+            self.seal.wait(cb, token, "MSM batch piece")?;
         }
         Ok(())
     }
@@ -2317,10 +2336,21 @@ impl<'q> Submission<'q> {
     /// reported is the first that happened.
     fn wait(&mut self, context: &str) -> Result<(), ProveError> {
         self.close()?;
-        for cb in &self.cbs {
-            crate::cb::wait_ok(cb, context)?;
+        for (cb, token) in &self.cbs {
+            self.seal.wait(cb, *token, context)?;
         }
         Ok(())
+    }
+}
+
+/// Everything encoded after this on a concurrent encoder reads what came before.
+fn barrier(enc: &ComputeCommandEncoderRef) {
+    // SAFETY: `ComputeCommandEncoderRef` is `objc::Message`, and
+    // memoryBarrierWithScope: is a documented MTLComputeCommandEncoder method taking
+    // MTLBarrierScope; MTLBarrierScopeBuffers is 1 << 0. metal-rs 0.29 does not bind
+    // it, so it is called the way `cb` reads the unbound timing properties.
+    unsafe {
+        let () = msg_send![enc, memoryBarrierWithScope: 1u64];
     }
 }
 

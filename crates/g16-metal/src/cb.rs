@@ -13,6 +13,16 @@
 //! self-verifies as well: the two guards are for the same fault, one at the source and one
 //! at the exit.
 //!
+//! The status is one guard; [`Seal`] is the second. A proving command buffer ends with a
+//! one-thread dispatch that writes the submission's epoch to a slot, as the last dispatch
+//! of its last compute encoder, and the host refuses the buffer's output unless the epoch
+//! is there. That catches a buffer whose work was cut short but whose status still says
+//! `Completed`, which wgpu's Metal path met on this machine (`g16-wgpu`'s `readback::Seal`,
+//! where an abort was measured to end the current compute encoder only, so a token written
+//! by a later encoder or a blit passes). `examples/cb_seal_probe.rs` measures the same
+//! question against this crate's own submissions; its numbers are in the commit that added
+//! the seal.
+//!
 //! `metal-rs` 0.29 binds `status()` but not `error()`, so the NSError has to be read with a
 //! raw `msg_send!`. That is safe here because the crate marks `CommandBufferRef` as
 //! `objc::Message`, which is the same mechanism its own `status()` uses. The `objc` macros
@@ -22,33 +32,109 @@
 
 use std::ffi::CStr;
 use std::os::raw::c_char;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use g16_core::ProveError;
 use metal::objc::runtime::Object;
-use metal::objc::{msg_send, sel, sel_impl};
-use metal::{CommandBufferRef, MTLCommandBufferStatus};
+use metal::objc::{class, msg_send, sel, sel_impl};
+use metal::{
+    Buffer, CommandBufferRef, CommandQueueRef, ComputeCommandEncoderRef, ComputePipelineState,
+    Device, Library, MTLCommandBufferStatus, MTLSize,
+};
 
-/// The NSError text hanging off a failed command buffer, empty when there is none.
+#[link(name = "Metal", kind = "framework")]
+extern "C" {
+    /// The NSError user-info key under which Metal 3 files one
+    /// `MTLCommandBufferEncoderInfo` per encoder of a failed buffer, when the buffer was
+    /// made with [`command_buffer`].
+    static MTLCommandBufferEncoderInfoErrorKey: *mut Object;
+}
+
+/// A Rust `String` from an NSString, empty for nil.
+///
+/// # Safety
+///
+/// `s` is nil or a live NSString.
+unsafe fn nsstring(s: *mut Object) -> String {
+    if s.is_null() {
+        return String::new();
+    }
+    let utf8: *const c_char = msg_send![s, UTF8String];
+    if utf8.is_null() {
+        return String::new();
+    }
+    CStr::from_ptr(utf8).to_string_lossy().into_owned()
+}
+
+/// A command buffer whose NSError, should it fail, names the execution state of every
+/// encoder in it (`MTLCommandBufferErrorOptionEncoderExecutionStatus`). Every proving
+/// submission is made here rather than with `new_command_buffer`, so that a fault says
+/// which encoder faulted and which ones never ran. Priced at nothing measurable: see the
+/// commit that added it.
+pub(crate) fn command_buffer(queue: &CommandQueueRef) -> &CommandBufferRef {
+    // SAFETY: `CommandQueueRef` is `objc::Message`. `MTLCommandBufferDescriptor` is
+    // created at +1 and released once the queue has copied it, and
+    // `commandBufferWithDescriptor:` returns the same autoreleased `+0` buffer as
+    // `commandBuffer`, which is what metal-rs's `new_command_buffer` hands out as a
+    // borrowed ref.
+    unsafe {
+        let desc: *mut Object = msg_send![class!(MTLCommandBufferDescriptor), new];
+        // MTLCommandBufferErrorOptionEncoderExecutionStatus.
+        let () = msg_send![desc, setErrorOptions: 1u64];
+        let cb: &CommandBufferRef = msg_send![queue, commandBufferWithDescriptor: desc];
+        let () = msg_send![desc, release];
+        cb
+    }
+}
+
+/// The NSError text hanging off a failed command buffer, empty when there is none, with
+/// the per-encoder execution states after it when the buffer was made with
+/// [`command_buffer`] and Metal filed them.
 fn error_text(cb: &CommandBufferRef) -> String {
     // SAFETY: `CommandBufferRef` is `objc::Message` (metal-rs asserts this for every
     // foreign object type it defines), `error` is a documented MTLCommandBuffer property
-    // returning an autoreleased NSError or nil, and every result is null-checked before
-    // it is followed. Nothing is retained or released, so there is no ownership to get
-    // wrong.
+    // returning an autoreleased NSError or nil, `userInfo` an NSDictionary, the encoder
+    // infos an NSArray of MTLCommandBufferEncoderInfo, and every result is null-checked
+    // before it is followed. Nothing is retained or released, so there is no ownership
+    // to get wrong.
     unsafe {
         let err: *mut Object = msg_send![cb, error];
         if err.is_null() {
             return String::new();
         }
         let desc: *mut Object = msg_send![err, localizedDescription];
-        if desc.is_null() {
-            return String::new();
+        let mut text = format!(": {}", nsstring(desc));
+        let info: *mut Object = msg_send![err, userInfo];
+        if info.is_null() {
+            return text;
         }
-        let utf8: *const c_char = msg_send![desc, UTF8String];
-        if utf8.is_null() {
-            return String::new();
+        let infos: *mut Object = msg_send![info, objectForKey: MTLCommandBufferEncoderInfoErrorKey];
+        if infos.is_null() {
+            return text;
         }
-        format!(": {}", CStr::from_ptr(utf8).to_string_lossy())
+        let n: usize = msg_send![infos, count];
+        for i in 0..n {
+            let e: *mut Object = msg_send![infos, objectAtIndex: i];
+            let label: *mut Object = msg_send![e, label];
+            let state: i64 = msg_send![e, errorState];
+            // MTLCommandEncoderErrorState.
+            let state = match state {
+                0 => "unknown",
+                1 => "completed",
+                2 => "affected",
+                3 => "pending",
+                4 => "faulted",
+                _ => "?",
+            };
+            text.push_str(if i == 0 { " (encoders: " } else { ", " });
+            text.push_str(&nsstring(label));
+            text.push_str(": ");
+            text.push_str(state);
+        }
+        if n > 0 {
+            text.push(')');
+        }
+        text
     }
 }
 
@@ -146,24 +232,155 @@ pub(crate) fn with_retry<T>(
     Err(err.expect("RETRIES is at least 1"))
 }
 
+/// Slots in a [`Seal`]'s word buffer. A slot is reused after this many submissions on
+/// the same seal, and every submission is waited on inside the call that made it, so
+/// the previous user of a slot is long finished; the epoch, not the slot, is what the
+/// check compares, so a stale value in a reused slot is still a mismatch.
+const SEAL_SLOTS: u32 = 1024;
+
+/// The completion token of a submission: the slot its epoch was written to.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Token {
+    slot: u32,
+    epoch: u32,
+}
+
+/// One pipeline and one page of slots per kernel module, shared by every proof on it.
+///
+/// [`Self::encode`] takes the next epoch and encodes the one-thread dispatch that lands
+/// it; [`Self::wait`] waits on the buffer and refuses it unless the slot holds the
+/// epoch. The epoch is never 0, which is what a fresh slot holds, and it advances on
+/// every submission from every thread, so two proofs in flight cannot share a token.
+pub(crate) struct Seal {
+    pipeline: ComputePipelineState,
+    slots: Buffer,
+    epoch: AtomicU32,
+}
+
+impl Seal {
+    /// From a library that has `seal.metal` in it.
+    pub(crate) fn new(device: &Device, library: &Library) -> Result<Self, ProveError> {
+        let f = library
+            .get_function("g16_seal", None)
+            .map_err(|e| ProveError::Backend {
+                backend: "metal",
+                reason: format!("kernel g16_seal missing: {e}"),
+            })?;
+        let pipeline = device
+            .new_compute_pipeline_state_with_function(&f)
+            .map_err(|e| ProveError::Backend {
+                backend: "metal",
+                reason: format!("pipeline g16_seal: {e}"),
+            })?;
+        let slots = crate::alloc::shared(device, SEAL_SLOTS as usize * 4)?;
+        Ok(Self {
+            pipeline,
+            slots,
+            epoch: AtomicU32::new(0),
+        })
+    }
+
+    /// The next submission's token.
+    pub(crate) fn next(&self) -> Token {
+        let mut epoch = self.epoch.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        if epoch == 0 {
+            epoch = self.epoch.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        }
+        Token {
+            slot: epoch % SEAL_SLOTS,
+            epoch,
+        }
+    }
+
+    /// Encodes the token write. **Must be the last dispatch of the buffer's last compute
+    /// encoder**, behind a memory barrier if the encoder is concurrent: a dispatch after
+    /// it could be abandoned with the token already in place, and a concurrent one could
+    /// still be running.
+    pub(crate) fn encode_token(&self, enc: &ComputeCommandEncoderRef, token: Token) {
+        enc.set_compute_pipeline_state(&self.pipeline);
+        enc.set_buffer(0, Some(&self.slots), 0);
+        let words = [token.slot, token.epoch];
+        enc.set_bytes(1, 8, words.as_ptr().cast());
+        enc.dispatch_threads(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
+    }
+
+    /// [`Self::next`] and [`Self::encode_token`] in one.
+    pub(crate) fn encode(&self, enc: &ComputeCommandEncoderRef) -> Token {
+        let token = self.next();
+        self.encode_token(enc, token);
+        token
+    }
+
+    /// [`wait_ok`], then the token. A buffer that says `Completed` without its token is
+    /// the same [`ProveError::Device`] a killed one is, so `with_retry` re-runs it.
+    pub(crate) fn wait(
+        &self,
+        cb: &CommandBufferRef,
+        token: Token,
+        context: &str,
+    ) -> Result<(), ProveError> {
+        wait_ok(cb, context)?;
+        // SAFETY: `slots` is a shared buffer of `SEAL_SLOTS` u32s and `slot` is below
+        // that; the buffer that wrote it has completed.
+        let got = unsafe { *(self.slots.contents() as *const u32).add(token.slot as usize) };
+        #[cfg(test)]
+        let got = if inject::stale_fires() { !got } else { got };
+        if got == token.epoch {
+            return Ok(());
+        }
+        Err(ProveError::Device {
+            backend: "metal",
+            reason: format!(
+                "{context}: command buffer completed (status {:?}) but its completion \
+                 token is {got:#x}, this submission's is {:#x}: the GPU did not run it to \
+                 its end{}",
+                cb.status(),
+                token.epoch,
+                error_text(cb)
+            ),
+        })
+    }
+}
+
 /// Fails chosen [`wait_ok`] calls on the current thread after the buffer has completed,
 /// so a test can put a retry behind every submission of a proof and check the result is
 /// unchanged. After a completed buffer every in-place dispatch has already run once, which
 /// is the state a retry that skipped any re-initialisation would trip on.
+///
+/// A [`Fault::Stale`] leaves the status alone and corrupts the token [`Seal::wait`] reads
+/// instead, at the same call index, so the check behind the status is exercised the same
+/// way.
 #[cfg(test)]
 pub(crate) mod inject {
     use std::cell::Cell;
 
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(crate) enum Fault {
+        /// `wait_ok` reports the buffer as not completed.
+        Status,
+        /// The token `Seal::wait` reads does not match.
+        Stale,
+    }
+
     thread_local! {
         static CALLS: Cell<u32> = const { Cell::new(0) };
-        static FAIL: Cell<Option<u32>> = const { Cell::new(None) };
+        static FAIL: Cell<Option<(u32, Fault)>> = const { Cell::new(None) };
+        /// Every call from `FAIL`'s index on, not just the one.
+        static STICKY: Cell<bool> = const { Cell::new(false) };
         static FIRED: Cell<bool> = const { Cell::new(false) };
     }
 
-    /// Counts calls from zero again, and fails call `at` if given.
+    /// Counts calls from zero again, and fails call `at` with a status fault if given.
     pub(crate) fn arm(at: Option<u32>) {
+        arm_with(at.map(|n| (n, Fault::Status)), false);
+    }
+
+    /// Counts calls from zero again, and fails call `at` with `fault` if given; with
+    /// `sticky`, every call from `at` on, so no retry can succeed.
+    pub(crate) fn arm_with(at: Option<(u32, Fault)>, sticky: bool) {
         CALLS.set(0);
         FAIL.set(at);
+        STICKY.set(sticky);
         FIRED.set(false);
     }
 
@@ -177,13 +394,58 @@ pub(crate) mod inject {
         FIRED.get()
     }
 
-    pub(super) fn fires() -> bool {
-        let n = CALLS.get();
-        CALLS.set(n + 1);
-        let hit = FAIL.get() == Some(n);
+    fn hits(n: u32, fault: Fault) -> bool {
+        let hit = match FAIL.get() {
+            Some((at, f)) if f == fault => n == at || (STICKY.get() && n > at),
+            _ => false,
+        };
         if hit {
             FIRED.set(true);
         }
         hit
+    }
+
+    pub(super) fn fires() -> bool {
+        let n = CALLS.get();
+        CALLS.set(n + 1);
+        hits(n, Fault::Status)
+    }
+
+    /// For the `wait_ok` call just made, which `Seal::wait` follows at once.
+    pub(super) fn stale_fires() -> bool {
+        hits(CALLS.get().wrapping_sub(1), Fault::Stale)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The check on the real device, without the injector: a sealed buffer passes, and a
+    /// token whose dispatch never ran is refused as a device fault.
+    #[test]
+    fn a_token_that_was_never_written_is_refused() {
+        let device = Device::system_default().expect("no Metal device");
+        let library = device
+            .new_library_with_source(crate::kernels::SEAL_MSL, &metal::CompileOptions::new())
+            .unwrap_or_else(|e| panic!("MSL compile failed:\n{e}"));
+        let seal = Seal::new(&device, &library).unwrap();
+        let queue = device.new_command_queue();
+        metal::objc::rc::autoreleasepool(|| {
+            let cb = command_buffer(&queue);
+            let enc = cb.new_compute_command_encoder();
+            let written = seal.encode(enc);
+            enc.end_encoding();
+            cb.commit();
+            seal.wait(cb, written, "sealed").unwrap();
+            // The next epoch, which no dispatch has written.
+            let skipped = Token {
+                slot: (written.epoch + 1) % SEAL_SLOTS,
+                epoch: written.epoch + 1,
+            };
+            let err = seal.wait(cb, skipped, "unsealed").unwrap_err();
+            assert!(err.is_device_fault(), "{err}");
+            assert!(err.to_string().contains("completion token"), "{err}");
+        });
     }
 }
