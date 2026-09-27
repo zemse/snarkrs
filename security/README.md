@@ -224,7 +224,9 @@ The same kill reaches the wgpu backend, and wgpu 30 does not report it: wgpu-hal
 treats an errored command buffer as completed, so the readback held the previous proof's window
 sums (29 of 40 CLI proofs wrong under load). Since `4ce2c96` every wgpu submission ends with a
 token written by its last dispatch, and a readback without it is refused, retried up to four
-times, then reported as `ProveError::Device`.
+times, then reported as `ProveError::Device`. CUDA device faults (ECC, watchdog, kernel exceptions, out of
+memory) take the same path since `23354b9`, untested on an NVIDIA GPU; a sticky CUDA error
+leaves the context unusable, so the GPU retry fails at once and the proof falls to the CPU.
 
 **8. `[S]` `proof.json` has no canonical encoding, and our two JSON readers disagree.**
 `json.rs:130-146` and `:156-169` accept any nonzero Jacobian `z` and normalise, so there
