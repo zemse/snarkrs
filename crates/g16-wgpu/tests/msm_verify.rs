@@ -1027,40 +1027,22 @@ fn walk_g1(n: usize, rng: &mut impl Rng) -> Vec<G1Affine> {
 /// `crate::msm::window_size` against a measured sweep, at the two `m` where its most
 /// suspicious constant changes the answer.
 ///
-/// # Why these two sizes and not a grid
+/// # Why these three sizes and not a grid
 ///
-/// The model's `SLICE_LEN` is 64 and its comment says "Duplicated from Metal's `SLICE_LEN`
-/// because the kernel that uses it does not exist yet; U9 owns the real one". U9 landed, swept
-/// it on both curves, and shipped **128** (`gen::points::Curve::slice_len`). The model was not
-/// updated, so it now disagrees with the kernel it is modelling, and the comment reads as an
-/// invitation to go and tidy that up.
+/// They straddle the one crossover that matters at prover sizes: c = 8 wins through m = 65536
+/// and c = 13 from m = 140824, and the old Metal-derived constants put that switch too early,
+/// picking c = 13 at 65536 where it is 22% slower (REV-12). The full sweep the constants were
+/// fitted to is in the comment on `g16_wgpu::window_size`.
 ///
-/// Doing so would make the prover slower. `SLICE_LEN` appears only in the merge term, so
-/// doubling it halves that term, and the pick changes at exactly two of the sizes this repo
-/// proves: `m = 18002` goes 8 to 10 and `m = 65536` goes 13 to 10. Measured, medians of
-/// three, whole G1 MSM including the upload, M2 Max, release, milliseconds:
-///
-/// ```text
-/// m         c=8    c=9   c=10   c=11   c=12   c=13   c=14   model  best
-/// 18002    41.5   53.4   45.6   69.9   64.1   64.6  100.6       8     8
-/// 65536    76.0  117.1   82.7  143.0  104.7   75.1  140.5      13    13
-/// ```
-///
-/// The stale constant picks the measured winner at both, and the value it would be "corrected"
-/// to picks a width that is 10.0% worse at `m = 18002` and 10.1% worse at `m = 65536`. So the
-/// 64 stays, the comment in `crate::msm::window_size` now says why, and this test is the thing
-/// that will argue back the next time someone changes it.
-///
-/// The assertion is 10% and not "is the best", because at `m = 65536` the second-placed width
-/// is 1.2% away and that is inside the noise of a three-sample median. 10% still fails on
-/// either of the two substitutions above and on anything larger.
+/// The assertion is 10% and not "is the best", because neighbouring widths can sit within a
+/// few percent of each other, inside the noise of a three-sample median.
 #[test]
 fn the_window_width_the_cost_model_picks_is_within_ten_percent_of_the_measured_best() {
     use std::time::Instant;
     let _one = exclusive();
     let _gpu = gpulock::exclusive_gpu();
     let mut rng = test_rng();
-    for m in [18002usize, 65536usize] {
+    for m in [18002usize, 65536, 140824] {
         let bases = walk_g1(m, &mut rng);
         let words = g1_words(&bases);
         let scalars = general_scalars(m, &mut rng);

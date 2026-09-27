@@ -70,15 +70,31 @@ pub static WINDOW_OVERRIDE: std::sync::atomic::AtomicU32 = std::sync::atomic::At
 ///
 /// # This model is a fit, and the backend has to say so
 ///
-/// The four constants below are `g16-metal`'s, fitted to MSL kernels on this M2 Max, with
-/// `MADD_US` scaled by 2.3 for the measured WGSL-to-MSL field ratio (1.964 against 4.51
-/// G mul/s). None of them has been refitted here. What has been measured here is the
-/// *output*: `tests/msm_verify.rs::the_window_width_the_cost_model_picks_is_within_ten_
-/// percent_of_the_measured_best` sweeps every width over a whole G1 MSM and holds this
-/// function to within ten percent of the winner. It is failing at m = 65536 today, where the
-/// model picks c = 13 and the sweep wants c = 8; see REV-12. So the width is held to a
-/// measurement, not to a green gate, and it is still a fit and not a derivation.
-/// `G16_WGPU_MSM_C` forces one.
+/// The constants below are least-squares fits (weighted by 1/t) to a whole-G1-MSM sweep of
+/// every width from 3 to 15 at nine sizes from 256 to 262,144 scalars, medians of five,
+/// native wgpu on this M2 Max. They replace `g16-metal`'s constants, which were fitted to
+/// MSL kernels and scaled by a field-speed ratio, and which picked c = 13 at m = 65536 where
+/// c = 8 is 22% faster (REV-12). The refit picks the measured winner at every size from 8,192
+/// up and is within 5% below it:
+///
+/// ```text
+/// m         pick  best  over
+/// 256         5     3   3.3%
+/// 2048        5     3   0.0%
+/// 4096        8     5   4.7%
+/// 8192        8     8
+/// 18002       8     8
+/// 32768       8     8
+/// 65536       8     8
+/// 140824     13    13
+/// 262144     13    13
+/// ```
+///
+/// Below 8,192 every width costs 15 to 18 ms, almost all of it fixed overhead, so the pick
+/// barely matters there. It is still a fit and not a derivation, and it was fitted on one
+/// device: `tests/msm_verify.rs::the_window_width_the_cost_model_picks_is_within_ten_percent_
+/// of_the_measured_best` holds it to a sweep across the crossover, and `G16_WGPU_MSM_C`
+/// forces a width.
 ///
 /// # Why this is not the CPU's cost model
 ///
@@ -103,37 +119,16 @@ pub fn window_size(m: usize) -> u32 {
             return c.clamp(2, MAX_WINDOW);
         }
     }
-    /// One mixed addition in the segmented accumulation, microseconds. Metal's 0.00324
-    /// scaled by the 2.3x field ratio.
-    const MADD_US: f64 = 0.00745;
-    /// One bucket's share of the clear, merge and reduction kernels. Metal's, unscaled.
-    const ROW_US: f64 = 0.0580;
-    /// One iteration of the merge loop on the busiest bucket, microseconds. Serial, and
-    /// Metal's, unscaled.
-    const MERGE_US: f64 = 27.0;
-    /// Entries one thread of the segmented accumulation owns, **as this cost model assumes
-    /// them**, which is deliberately not the number the kernel uses.
-    ///
-    /// The kernel ships 128 (`gen::points::Curve::slice_len`, swept on both curves at U9 and
-    /// U10, a clean V with 128 the minimum). This says 64, which is Metal's, and it stays at
-    /// 64 because the model is better with it. `SLICE_LEN` appears only in the merge term, so
-    /// doubling it halves that term, and the width this function returns then changes at two
-    /// of the sizes this repo proves. Measured, whole G1 MSM, medians of three, M2 Max,
-    /// release, milliseconds:
-    ///
-    /// ```text
-    /// m         c=8    c=9   c=10   c=11   c=12   c=13   c=14   at 64  at 128
-    /// 18002    41.5   53.4   45.6   69.9   64.1   64.6  100.6       8      10
-    /// 65536    76.0  117.1   82.7  143.0  104.7   75.1  140.5      13      10
-    /// ```
-    ///
-    /// 64 picks the measured winner at both; 128 picks a width 10.0% and 10.1% worse. The
-    /// model is a fit and not a derivation, and its other three constants are Metal's too, so
-    /// making one of them agree with the kernel while the rest do not is not an improvement.
-    /// `tests/msm_verify.rs::the_window_width_the_cost_model_picks_is_within_ten_percent_of_
-    /// the_measured_best` fails on either substitution.
-    const SLICE_LEN: f64 = 64.0;
-
+    /// One mixed addition in the segmented accumulation, microseconds.
+    const MADD_US: f64 = 0.00661;
+    /// One bucket's share of the clear, merge and reduction kernels, microseconds.
+    const ROW_US: f64 = 0.1605;
+    /// One iteration of the merge loop on the busiest bucket, microseconds. Serial.
+    const MERGE_US: f64 = 164.4;
+    /// Entries one thread of the segmented accumulation owns: the kernel's own value
+    /// (`gen::points::Curve::slice_len`). The Metal-derived model had to keep 64 here to
+    /// pick the right widths; the refit does not.
+    const SLICE_LEN: f64 = 128.0;
     let mut best = 3;
     let mut best_cost = f64::MAX;
     for c in 3..=MAX_WINDOW {
