@@ -57,6 +57,11 @@ pub struct Args {
     /// Append-free CSV output. Without it the numbers are only printed.
     #[arg(long, value_name = "FILE")]
     pub csv: Option<PathBuf>,
+    /// Also have this snarkjs binary verify the first proof of every variant in every mode,
+    /// outside the timed region. Our verifier checks every rep, but it shares the field,
+    /// curve and pairing code with the prover; snarkjs shares none of it.
+    #[arg(long, value_name = "PATH")]
+    pub snarkjs: Option<PathBuf>,
 }
 
 pub const CSV_HEADER: &str = "host,os,arch,cores,variant,constraints,prover,backend,mode,rep,ms,prepare_ms,gather_us,ntt_us,pointwise_us,msm_us,assemble_us,verified";
@@ -156,6 +161,43 @@ fn public_of(witness: &[Fr], n_public: usize) -> Result<Vec<Fr>> {
     Ok(witness[1..=n_public].to_vec())
 }
 
+/// `snarkjs groth16 verify` on one proof, when `--snarkjs` names a binary. BUG-22: the only
+/// check that catches a defect our prover and our verifier share.
+fn foreign_verify(
+    args: &Args,
+    v: &Variant,
+    proof: &g16_core::Proof,
+    public: &[Fr],
+    mode: &str,
+) -> Result<()> {
+    let Some(bin) = &args.snarkjs else {
+        return Ok(());
+    };
+    let dir = std::env::temp_dir().join(format!("g16-bench-snarkjs-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let (p, q) = (dir.join("proof.json"), dir.join("public.json"));
+    crate::json::write_proof(&p, proof)?;
+    crate::json::write_public(&q, public)?;
+    let out = std::process::Command::new(bin)
+        .args(["groth16", "verify"])
+        .arg(v.vkey())
+        .arg(&q)
+        .arg(&p)
+        .output()
+        .with_context(|| format!("running {}", bin.display()))?;
+    std::fs::remove_dir_all(&dir).ok();
+    let said = String::from_utf8_lossy(&out.stdout);
+    if !said.contains("OK!") {
+        bail!(
+            "{} {mode}: our verifier accepted the {} proof and snarkjs rejected it: {said}",
+            v.name,
+            args.backend.as_str()
+        );
+    }
+    println!("  snarkjs accepted the {mode} proof");
+    Ok(())
+}
+
 fn cold(v: &Variant, constraints: i64, args: &Args) -> Result<Vec<Row>> {
     // The verifying key is not part of proving, so it is loaded once and stays out of
     // every timed region in both modes.
@@ -193,6 +235,9 @@ fn cold(v: &Variant, constraints: i64, args: &Args) -> Result<Vec<Row>> {
                 v.name
             )
         })?;
+        if rep == 1 {
+            foreign_verify(args, v, &proof, &public, "cold")?;
+        }
 
         rows.push(Row {
             variant: v.name.clone(),
@@ -239,6 +284,9 @@ fn warm(v: &Variant, constraints: i64, args: &Args) -> Result<Vec<Row>> {
                 v.name
             )
         })?;
+        if rep == 1 {
+            foreign_verify(args, v, &proof, &public, "warm")?;
+        }
 
         rows.push(Row {
             variant: v.name.clone(),

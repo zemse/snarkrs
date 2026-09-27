@@ -290,8 +290,10 @@ for b in $BACKENDS; do
   for c in $READY; do
     log "$c on $b"
     check_load "$c on $b"
+    # snarkjs, when it is here, also checks one proof per mode: it shares no code with us.
     "$G16" bench --artifacts "$ARTIFACTS" --variant "$c" --backend "$b" \
-                 --mode both --reps "$REPS" --csv "$TMP/${b}-${c}.csv" || \
+                 --mode both --reps "$REPS" --csv "$TMP/${b}-${c}.csv" \
+                 ${SNARKJS:+--snarkjs "$SNARKJS"} || \
       echo "    $c on $b failed, leaving it out of the table"
   done
 done

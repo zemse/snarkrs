@@ -67,9 +67,16 @@ fn text(o: &Output) -> String {
 }
 
 fn prove(v: &Variant, out: &Path) -> (PathBuf, PathBuf) {
+    prove_on(v, out, "cpu")
+}
+
+fn prove_on(v: &Variant, out: &Path, backend: &str) -> (PathBuf, PathBuf) {
     let proof = out.join("proof.json");
     let public = out.join("public.json");
-    let o = run(Command::new(g16()).args([
+    // wgpu under `auto`, which is what the browser asks for: the floor's 128 MiB binding
+    // cannot hold anon-aadhaar's G2 bases (140.9 MB) until they are chunked, and that is a
+    // capacity limit with its own clean error, not what this file tests.
+    let o = run(Command::new(g16()).env("G16_WGPU_LIMITS", "auto").args([
         "prove",
         "--zkey",
         v.dir.join("circuit.zkey").to_str().unwrap(),
@@ -80,10 +87,15 @@ fn prove(v: &Variant, out: &Path) -> (PathBuf, PathBuf) {
         "--public",
         public.to_str().unwrap(),
         "--backend",
-        "cpu",
+        backend,
         "--stage-timings",
     ]));
-    assert!(o.status.success(), "{}: prove failed: {}", v.name, text(&o));
+    assert!(
+        o.status.success(),
+        "{} on {backend}: prove failed: {}",
+        v.name,
+        text(&o)
+    );
     (proof, public)
 }
 
@@ -133,9 +145,26 @@ fn prove_then_verify_round_trips() {
     });
 }
 
-/// The encoding oracle. A proof that our verifier accepts but snarkjs rejects means the
-/// JSON is wrong, which is a different bug from the pairing check being wrong, and it is
-/// the one that only shows up at the ecosystem boundary.
+/// Every backend this binary was built with. The GPU ones are where a wrong proof is most
+/// likely to come from, so they are the ones the foreign verifier most needs to see.
+fn backends() -> Vec<&'static str> {
+    let mut out = vec!["cpu"];
+    if cfg!(feature = "wgpu") {
+        out.push("wgpu");
+    }
+    if cfg!(feature = "metal") {
+        out.push("metal");
+    }
+    if cfg!(feature = "cuda") {
+        out.push("cuda");
+    }
+    out
+}
+
+/// The encoding oracle, and the independent-implementation one (BUG-22). A proof that our
+/// verifier accepts but snarkjs rejects means either the JSON is wrong, which only shows up
+/// at the ecosystem boundary, or the prover and our verifier share a defect: they share the
+/// field, curve and pairing code, and snarkjs shares none of it.
 #[test]
 fn snarkjs_accepts_our_proof() {
     if Command::new("snarkjs").arg("--version").output().is_err() {
@@ -143,20 +172,22 @@ fn snarkjs_accepts_our_proof() {
         return;
     }
     each("snarkjs", |v, out| {
-        let (proof, public) = prove(v, out);
-        let o = run(Command::new("snarkjs").args([
-            "groth16",
-            "verify",
-            v.dir.join("vkey.json").to_str().unwrap(),
-            public.to_str().unwrap(),
-            proof.to_str().unwrap(),
-        ]));
-        let said = text(&o);
-        assert!(
-            said.contains("OK!"),
-            "{}: snarkjs rejected our proof: {said}",
-            v.name
-        );
+        for backend in backends() {
+            let (proof, public) = prove_on(v, out, backend);
+            let o = run(Command::new("snarkjs").args([
+                "groth16",
+                "verify",
+                v.dir.join("vkey.json").to_str().unwrap(),
+                public.to_str().unwrap(),
+                proof.to_str().unwrap(),
+            ]));
+            let said = text(&o);
+            assert!(
+                said.contains("OK!"),
+                "{} on {backend}: snarkjs rejected our proof: {said}",
+                v.name
+            );
+        }
     });
 }
 
