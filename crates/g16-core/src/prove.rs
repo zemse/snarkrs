@@ -56,18 +56,27 @@ pub fn prove_unchecked<R: ark_std::rand::RngCore + ark_std::rand::CryptoRng>(
     rng: &mut R,
     timings: &mut StageTimings,
 ) -> Result<Proof, ProveError> {
-    // Stage 10. The whole zero-knowledge property rests on these two, which is why the
-    // bound is `CryptoRng` and why the deterministic path below is a separate function
-    // rather than a default argument someone could reach for by accident.
+    let (r, s) = sample_blinders(rng)?;
+    prove_blinded(circuit, witness, r, s, timings)
+}
+
+/// Stage 10. The whole zero-knowledge property rests on these two, which is why the bound is
+/// `CryptoRng` and why the path that takes fixed blinders is behind a feature rather than a
+/// default argument someone could reach for by accident.
+///
+/// `CryptoRng` constrains the algorithm and never the seed, so a `StdRng::from_seed` still
+/// gets through, and that is exactly what the tests here do. What this can catch is the
+/// broken case: a CSPRNG gives zero with probability 2^-254 a draw, and `r = s = 0` is an
+/// unblinded proof that still verifies, so no later check would see it.
+fn sample_blinders<R: ark_std::rand::RngCore + ark_std::rand::CryptoRng>(
+    rng: &mut R,
+) -> Result<(Fr, Fr), ProveError> {
     let r = Fr::rand(rng);
     let s = Fr::rand(rng);
-    // A CSPRNG gives zero with probability 2^-254 a draw. A zero here means the RNG is
-    // broken, most likely a seeded one threaded through for reproducible benchmarks, and
-    // `r = s = 0` is an unblinded proof that still verifies, so no later check sees it.
     if r.is_zero() || s.is_zero() {
         return Err(ProveError::ZeroBlinder);
     }
-    prove_with_blinders(circuit, witness, r, s, timings)
+    Ok((r, s))
 }
 
 /// Refuse to prove in a build that would take tens of minutes to do it.
@@ -88,11 +97,27 @@ fn refuse_if_unoptimized() -> Result<(), ProveError> {
     Ok(())
 }
 
-/// Deterministic variant with caller-supplied `r`, `s`: for tests that compare a proof
-/// against a reference implementation bit for bit, and for the profiling examples, which
-/// need their reps comparable. Never use in production: reusing `r`/`s` across proofs of
-/// different witnesses leaks the witness.
+/// Deterministic variant with caller-supplied `r`, `s`, unchecked: for tests that compare a
+/// proof against a reference implementation bit for bit, and for the profiling examples,
+/// which need their reps comparable. Never use in production: reusing `r`/`s` across proofs
+/// of different witnesses leaks the witness, and `r = s = 0` is an unblinded proof.
+///
+/// Behind the `deterministic-blinders` feature, which only dev-dependencies turn on, so no
+/// release build of the CLI, the browser prover or a library consumer that did not ask for
+/// it can reach this.
+#[cfg(any(test, feature = "deterministic-blinders"))]
 pub fn prove_with_blinders(
+    circuit: &dyn PreparedCircuit,
+    witness: &[Fr],
+    r: Fr,
+    s: Fr,
+    timings: &mut StageTimings,
+) -> Result<Proof, ProveError> {
+    prove_blinded(circuit, witness, r, s, timings)
+}
+
+/// Stages 0 to 11 with blinders already drawn. The one body behind both public entry points.
+fn prove_blinded(
     circuit: &dyn PreparedCircuit,
     witness: &[Fr],
     r: Fr,
@@ -139,7 +164,7 @@ pub fn prove_trace(
     let (r, s) = crate::trace::blinders();
     let h = circuit.compute_h(witness, timings)?;
     let m = circuit.msms(witness, &h, timings)?;
-    let proof = assemble(circuit.key(), &m, r, s, timings);
+    let proof = assemble_with(circuit.key(), &m, r, s, timings);
     // After the MSMs, not before: a readback inserted ahead of them is an extra submit in
     // the middle of the sequence being investigated, and one hypothesis for the iPhone is
     // that the sequence itself is what goes wrong. The MSMs only read that buffer, so
@@ -178,7 +203,7 @@ fn check_witness_shape(circuit: &dyn PreparedCircuit, witness: &[Fr]) -> Result<
 /// Run `stages` on this thread and [`BlinderTerms::new`] beside it, returning both.
 ///
 /// The two are independent, and `stages` is the one that blocks, so it keeps the caller's
-/// thread and the cheap half goes to a thread of its own. See [`prove_with_blinders`] for
+/// thread and the cheap half goes to a thread of its own. See [`prove_blinded`] for
 /// why a rayon worker is the wrong place for the blocking half.
 #[cfg(not(target_family = "wasm"))]
 fn spawn_terms<T: Send>(
@@ -210,7 +235,7 @@ fn spawn_terms<T>(pk: &ProvingKey, r: Fr, s: Fr, stages: impl FnOnce() -> T) -> 
 
 /// The four stage 11 products that need only the key and the blinders.
 ///
-/// Split out of [`assemble_from_terms`] so [`prove_with_blinders`] can compute them while
+/// Split out of [`assemble_from_terms`] so [`prove_blinded`] can compute them while
 /// stages 0 to 9 are still running: nothing here touches the witness or an MSM output, and
 /// these four are about 70% of stage 11's scalar arithmetic. `r` and `s` travel with the
 /// products so the combination cannot be handed terms built from different blinders than
@@ -239,15 +264,33 @@ impl BlinderTerms {
     }
 }
 
-/// Stage 11 alone: blind the five MSM outputs into `(A, B, C)`.
+/// Stages 10 and 11 alone: draw the blinders from `rng` and blind the five MSM outputs into
+/// `(A, B, C)`. Unchecked, like [`prove_unchecked`]; the caller verifies.
 ///
-/// Split out of [`prove_with_blinders`] because the browser prover cannot go through
-/// [`PreparedCircuit`] at all. That trait is synchronous and every WebGPU readback is
-/// asynchronous, so `g16-wgpu`'s wasm entry point awaits stages 0 to 4 and 5 to 9 itself and
-/// then needs exactly this. Copying these six lines into that crate instead is how a
-/// transcription error gets into one backend and not the other, and the one term that invites
-/// it is `s * pi_a`: that is the *blinded* A, not the raw MSM.
-pub fn assemble(
+/// Split out because the browser prover cannot go through [`PreparedCircuit`] at all. That
+/// trait is synchronous and every WebGPU readback is asynchronous, so `g16-wgpu`'s wasm entry
+/// point awaits stages 0 to 4 and 5 to 9 itself and then needs exactly this. Copying these six
+/// lines into that crate instead is how a transcription error gets into one backend and not
+/// the other, and the one term that invites it is `s * pi_a`: that is the *blinded* A, not
+/// the raw MSM.
+pub fn assemble<R: ark_std::rand::RngCore + ark_std::rand::CryptoRng>(
+    pk: &ProvingKey,
+    m: &MsmOutputs,
+    rng: &mut R,
+    timings: &mut StageTimings,
+) -> Result<Proof, ProveError> {
+    let (r, s) = sample_blinders(rng)?;
+    Ok(assemble_with(pk, m, r, s, timings))
+}
+
+/// [`assemble`] with [`crate::trace::blinders`], for a trace: the proof it returns is one
+/// nobody may publish, for the reasons [`prove_trace`] gives.
+pub fn assemble_trace(pk: &ProvingKey, m: &MsmOutputs, timings: &mut StageTimings) -> Proof {
+    let (r, s) = crate::trace::blinders();
+    assemble_with(pk, m, r, s, timings)
+}
+
+fn assemble_with(
     pk: &ProvingKey,
     m: &MsmOutputs,
     r: Fr,
@@ -260,8 +303,8 @@ pub fn assemble(
     assemble_from_terms(pk, m, &terms, timings)
 }
 
-/// The combination half of stage 11. This is the one copy of the algebra: [`assemble`] and
-/// [`prove_with_blinders`] differ only in when [`BlinderTerms`] gets computed, never in
+/// The combination half of stage 11. This is the one copy of the algebra: [`assemble_with`]
+/// and [`prove_blinded`] differ only in when [`BlinderTerms`] gets computed, never in
 /// what is combined.
 fn assemble_from_terms(
     pk: &ProvingKey,

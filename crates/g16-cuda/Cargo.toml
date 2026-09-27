@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[dev-dependencies]
+# `prove_with_blinders`, for the tests that compare proofs bit for bit at pinned blinders.
+# Dev-only, so the feature never reaches a shipping build of this crate.
+g16-core = { workspace = true, features = ["deterministic-blinders"] }
+
 [features]
 # Off by default so a macOS workspace build never needs CUDA. With the feature on, this
 # crate COMPILES anywhere (cudarc's dynamic-loading feature dlopens libcuda/libnvrtc at

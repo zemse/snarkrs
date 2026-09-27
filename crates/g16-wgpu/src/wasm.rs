@@ -627,8 +627,7 @@ async fn trace_inner(circuit: &WgpuCircuit, witness: &[Fr]) -> Result<String, Js
     let h = circuit.compute_h_async(witness, &mut t).await.map_err(js)?;
     let m = circuit.msms_async(witness, &h, &mut t).await.map_err(js)?;
     let windows = crate::points::window_log_take();
-    let (r, s) = g16_core::trace::blinders();
-    let proof = g16_core::prove::assemble(circuit.key(), &m, r, s, &mut t);
+    let proof = g16_core::prove::assemble_trace(circuit.key(), &m, &mut t);
     let host_h = circuit.h_to_host_async(&h).await;
 
     Ok(trace_json(
@@ -823,38 +822,39 @@ async fn prove_inner(circuit: &WgpuCircuit, witness: &[Fr]) -> Result<String, Js
     let h = circuit.compute_h_async(witness, &mut t).await.map_err(js)?;
     let m = circuit.msms_async(witness, &h, &mut t).await.map_err(js)?;
 
-    let (r, s) = blinders()?;
-    // Stage 11, from `g16-core`, so the browser and the CLI blind identically.
-    let proof = g16_core::prove::assemble(circuit.key(), &m, r, s, &mut t);
-    // The check `g16_core::prove::prove` runs, which this path cannot call because every
-    // readback above is asynchronous. It matters more here than anywhere: the key came
-    // over `fetch` from someone else, and WebKit has miscompiled this prover's shaders
-    // into wrong proofs twice. See `prove`'s docs for what it guards.
-    let checked_at = Instant::now();
-    let public = witness
-        .get(1..=circuit.key().n_public)
-        .ok_or_else(|| JsError::new("witness is shorter than the key's public inputs"))?;
-    verify_proof(&circuit.key().vk, public, &proof).map_err(|e| js(ProveError::SelfVerify(e)))?;
-    t.verify_us += checked_at.elapsed().as_micros() as u64;
+    let proof = seal(circuit.key(), witness, &m, &mut t)?;
     let total_us = t0.elapsed().as_micros() as u64;
 
     result_json(circuit.key(), witness, &proof, &t, total_us, "")
 }
 
-/// Stage 10, the trust boundary. `Fr::rand` over the browser's CSPRNG; see the module docs.
-fn blinders() -> Result<(Fr, Fr), JsError> {
-    with_state(|st| {
-        let mut rng = BrowserRng {
+/// Stages 10 and 11, then the check of the result: the part of `g16_core::prove::prove`
+/// this module cannot call, because every readback before it is asynchronous.
+///
+/// Stage 10 is the trust boundary: the blinders come from `crypto.getRandomValues` through
+/// [`BrowserRng`], see the module docs. The check matters more here than anywhere: the key
+/// came over `fetch` from someone else, and WebKit has miscompiled this prover's shaders into
+/// wrong proofs twice. See `prove`'s docs for what else it guards.
+fn seal(
+    pk: &ProvingKey,
+    witness: &[Fr],
+    m: &g16_core::MsmOutputs,
+    t: &mut StageTimings,
+) -> Result<Proof, JsError> {
+    let mut rng = with_state(|st| {
+        Ok(BrowserRng {
             crypto: st.crypto.clone(),
-        };
-        let r = <Fr as ark_std::UniformRand>::rand(&mut rng);
-        let s = <Fr as ark_std::UniformRand>::rand(&mut rng);
-        // Same guard as `g16_core::prove::prove_unchecked`: a zero here is a broken RNG.
-        if ark_std::Zero::is_zero(&r) || ark_std::Zero::is_zero(&s) {
-            return Err(js(ProveError::ZeroBlinder));
-        }
-        Ok((r, s))
-    })
+        })
+    })?;
+    // Stage 11, from `g16-core`, so the browser and the CLI blind identically.
+    let proof = g16_core::prove::assemble(pk, m, &mut rng, t).map_err(js)?;
+    let checked_at = Instant::now();
+    let public = witness
+        .get(1..=pk.n_public)
+        .ok_or_else(|| JsError::new("witness is shorter than the key's public inputs"))?;
+    verify_proof(&pk.vk, public, &proof).map_err(|e| js(ProveError::SelfVerify(e)))?;
+    t.verify_us += checked_at.elapsed().as_micros() as u64;
+    Ok(proof)
 }
 
 /// The one shape every prove entry point in this module returns, so a warm row, a cold row and
@@ -994,8 +994,7 @@ async fn prove_cold_inner(device: Arc<WgpuBackend>, msm: Arc<MsmBatch>) -> Resul
         .await
         .map_err(js)?;
     let m = circuit.msms_async(&witness, &h, &mut t).await.map_err(js)?;
-    let (r, s) = blinders()?;
-    let proof = g16_core::prove::assemble(circuit.key(), &m, r, s, &mut t);
+    let proof = seal(circuit.key(), &witness, &m, &mut t)?;
     let total_us = t_all.elapsed().as_micros() as u64;
 
     let out = result_json(circuit.key(), &witness, &proof, &t, total_us, &extra);

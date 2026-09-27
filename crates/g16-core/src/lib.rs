@@ -94,7 +94,8 @@ pub enum ProveError {
          prover or its accelerator computed something wrong"
     )]
     SelfVerify(verify::VerifyError),
-    /// Raised by [`prove::prove_with_blinders`] when the crate was built at opt-level 0 or 1.
+    /// Raised by every proving entry point in [`prove`] when the crate was built at opt-level 0
+    /// or 1.
     ///
     /// Not a safety rail on the arithmetic, a rail on wall clock. `cargo test` defaults to
     /// the dev profile, this workspace declares no `[profile.dev]`, and so the default is

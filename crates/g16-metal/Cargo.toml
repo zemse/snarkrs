@@ -26,6 +26,9 @@ thiserror.workspace = true
 metal = "0.29"
 
 [dev-dependencies]
+# `prove_with_blinders`, for the tests that compare proofs bit for bit at pinned blinders.
+# Dev-only, so the feature never reaches a shipping build of this crate.
+g16-core = { workspace = true, features = ["deterministic-blinders"] }
 # The CPU reference the ceremony kernels are tested against: `prepare::point_times_fr`,
 # `prepare::batch_to_affine` and `CpuKeyScale` are the implementations `--backend cpu`
 # runs, and byte-identity with snarkjs rests on them. No cycle: g16-ceremony does not

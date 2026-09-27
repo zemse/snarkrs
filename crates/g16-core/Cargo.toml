@@ -9,6 +9,11 @@ default = []
 # Per-annotation timing of the proving path. Off by default and optional, so a release
 # build neither links hotpath nor pays its instrumentation.
 hotpath = ["dep:hotpath", "hotpath/hotpath"]
+# `prove::prove_with_blinders`, which takes `r` and `s` from the caller. For tests that
+# compare against a reference bit for bit and for profiling runs that need comparable reps.
+# Only ever turned on from a [dev-dependencies] table, so no shipping build reaches it: a
+# reused `(r, s)` leaks the witness and `r = s = 0` is an unblinded proof.
+deterministic-blinders = []
 
 [dependencies]
 g16-field.workspace = true
@@ -36,4 +41,4 @@ web-time = "1.1"
 # without it and a default `cargo check --all-targets` never sees it.
 [[example]]
 name = "hotpath_prove"
-required-features = ["hotpath"]
+required-features = ["hotpath", "deterministic-blinders"]

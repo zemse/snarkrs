@@ -52,6 +52,11 @@ serde_json.workspace = true
 num-bigint.workspace = true
 hex.workspace = true
 
+[dev-dependencies]
+# `prove_with_blinders`, for the tests that compare proofs bit for bit at pinned blinders.
+# Dev-only, so the feature never reaches a shipping build of this crate.
+g16-core = { workspace = true, features = ["deterministic-blinders"] }
+
 [features]
 # `wgpu` is on by default where `metal` and `cuda` are not, and the asymmetry is deliberate.
 # Metal is macOS only and CUDA needs a driver, so both are opt in; the WebGPU backend is pure
