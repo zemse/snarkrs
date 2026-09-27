@@ -226,7 +226,15 @@ The same kill reaches the wgpu backend, and wgpu 30 does not report it: wgpu-hal
 treats an errored command buffer as completed, so the readback held the previous proof's window
 sums (29 of 40 CLI proofs wrong under load). Since `4ce2c96` every wgpu submission ends with a
 token written by its last dispatch, and a readback without it is refused, retried up to four
-times, then reported as `ProveError::Device`. CUDA device faults (ECC, watchdog, kernel exceptions, out of
+times, then reported as `ProveError::Device`.
+
+Metal: a command buffer's `Completed` status is not proof that its dispatches ran. After a GPU
+hang and recovery on the M2 Max the driver returned `Completed` with a nil error for buffers none
+of whose encoders executed (3 in 300 during one episode). Every proving submission now ends with
+a completion token checked by the host (`cb::Seal`, `bec5863`), the same defence g16-wgpu has.
+During recovery episodes a buffer that ran to its end with its token present also produced wrong
+values; no completion token can see that, and `prove`'s self-verify is the only guard for it, so
+`prove_unchecked` on a GPU backend is exposed to it. CUDA device faults (ECC, watchdog, kernel exceptions, out of
 memory) take the same path since `23354b9`, untested on an NVIDIA GPU; a sticky CUDA error
 leaves the context unusable, so the GPU retry fails at once and the proof falls to the CPU.
 
