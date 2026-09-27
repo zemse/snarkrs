@@ -99,6 +99,7 @@ cargo build --release --features cuda      # + NVIDIA CUDA
 g16 prove  --zkey circuit.zkey --witness circuit.wtns \
            --proof proof.json --public public.json \
            [--backend cpu|wgpu|metal|cuda] [--stage-timings] [--self-verify true|false]
+           [--vkey verification_key.json]
 
 g16 verify --vkey verification_key.json --proof proof.json --public public.json
 

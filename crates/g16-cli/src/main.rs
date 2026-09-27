@@ -2,7 +2,7 @@
 //!
 //!   g16 prove  --zkey c.zkey --witness c.wtns --proof p.json --public pub.json
 //!              [--backend cpu|wgpu|metal|cuda] [--stage-timings]
-//!              [--self-verify true|false]
+//!              [--self-verify true|false] [--vkey vkey.json]
 //!   g16 verify --vkey vkey.json --proof p.json --public pub.json
 //!   g16 trace  --zkey c.zkey --witness c.wtns [--backend cpu|wgpu|...] [--out t.txt]
 //!   g16 bench  --artifacts DIR [--variant NAME]... [--reps 15] [--backend cpu|wgpu|...]
@@ -96,6 +96,11 @@ enum Cmd {
         /// verify. On by default; the cost is under 3% of a proof.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         self_verify: bool,
+        /// The circuit's verification_key.json, from a source independent of the zkey.
+        /// Checked against the zkey's public-input count before proving, and the proof is
+        /// verified against it before anything is written.
+        #[arg(long, value_name = "FILE")]
+        vkey: Option<PathBuf>,
     },
     /// Verify a proof against snarkjs' verification_key.json.
     Verify {
@@ -302,6 +307,7 @@ fn main() -> Result<()> {
             backend,
             stage_timings,
             self_verify,
+            vkey,
         } => run_prove(
             &zkey,
             &witness,
@@ -310,6 +316,7 @@ fn main() -> Result<()> {
             backend,
             stage_timings,
             self_verify,
+            vkey.as_deref(),
         ),
         Cmd::Verify {
             vkey,
@@ -680,9 +687,40 @@ fn run_prove(
     backend: BackendKind,
     stage_timings: bool,
     self_verify: bool,
+    vkey: Option<&std::path::Path>,
 ) -> Result<()> {
     let pk = ProvingKey::load(zkey).with_context(|| format!("loading {}", zkey.display()))?;
     let n_public = pk.n_public;
+    // `n_public` comes from the zkey and decides how much of the witness is written to
+    // public.json. A key that overstates it publishes private wires, and its own vk agrees
+    // with it, so self-verify cannot tell. An independent vkey can: its IC has exactly one
+    // point per public input plus the constant wire.
+    let vk = vkey
+        .map(|path| {
+            VerifyingKey::from_json(path).with_context(|| format!("loading {}", path.display()))
+        })
+        .transpose()?;
+    match &vk {
+        Some(vk) => anyhow::ensure!(
+            vk.ic.len() == n_public + 1,
+            "the zkey says {n_public} public inputs and the vkey says {}; they are not the \
+             same circuit, and proving would write {} to public.json",
+            vk.ic.len() - 1,
+            if n_public + 1 > vk.ic.len() {
+                "private wires"
+            } else {
+                "too few signals"
+            }
+        ),
+        // With no vkey, the one lie that can be refused without one: a key that calls every
+        // wire public would write the whole witness out.
+        None => anyhow::ensure!(
+            n_public + 1 < pk.n_vars,
+            "the zkey declares all {} witness wires public, so public.json would hold the \
+             entire witness; pass --vkey to confirm the circuit really has no private inputs",
+            pk.n_vars - 1
+        ),
+    }
     let w = Witness::load(witness)
         .with_context(|| format!("loading {}", witness.display()))?
         .0;
@@ -718,6 +756,14 @@ fn run_prove(
     // from the witness rather than copied from an existing public.json so that `prove`
     // needs nothing but the zkey and the witness.
     let public = &w[1..=n_public];
+    if let (true, Some(vk)) = (self_verify, &vk) {
+        verify(vk, public, &proof).map_err(|e| {
+            anyhow::anyhow!(
+                "the proof verifies against the zkey's own key but not against --vkey ({e}). \
+                 Nothing has been written. The two keys disagree, or the zkey was misread."
+            )
+        })?;
+    }
 
     json::write_proof(proof_out, &proof)?;
     json::write_public(public_out, public)?;
