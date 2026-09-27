@@ -54,6 +54,10 @@ pub struct Args {
     pub backend: BackendKind,
     #[arg(long, value_enum, default_value_t = Mode::Both)]
     pub mode: Mode,
+    /// Time `prove --constant-work` instead: MSMs whose cost follows the key and not the
+    /// witness. cpu and metal backends.
+    #[arg(long)]
+    pub constant_work: bool,
     /// Append-free CSV output. Without it the numbers are only printed.
     #[arg(long, value_name = "FILE")]
     pub csv: Option<PathBuf>,
@@ -122,7 +126,12 @@ pub fn run(args: Args) -> Result<()> {
     let mut rows = Vec::new();
     for v in &variants {
         let constraints = v.constraints();
-        println!("\n=== {} ({constraints} constraints) ===", v.name);
+        let work = if args.constant_work {
+            ", constant work"
+        } else {
+            ""
+        };
+        println!("\n=== {} ({constraints} constraints{work}) ===", v.name);
         for mode in modes {
             let got = match mode {
                 Mode::Cold => cold(v, constraints, &args)?,
@@ -148,6 +157,14 @@ pub fn run(args: Args) -> Result<()> {
         println!("\nwrote {} rows to {}", rows.len(), path.display());
     }
     Ok(())
+}
+
+fn backend(args: &Args) -> Result<Box<dyn g16_core::Backend>> {
+    if args.constant_work {
+        crate::make_constant_work_backend(args.backend)
+    } else {
+        crate::make_backend(args.backend)
+    }
 }
 
 /// The public signals snarkjs would publish for this witness: `w[1..=n_public]`.
@@ -219,7 +236,7 @@ fn cold(v: &Variant, constraints: i64, args: &Args) -> Result<Vec<Row>> {
         // Before the prepare, so a witness too short for the key fails here rather than
         // after a full proof. The copy is `n_public` field elements.
         let public = public_of(&witness, n_public)?;
-        let circuit = crate::make_backend(args.backend)?.prepare(pk)?;
+        let circuit = backend(args)?.prepare(pk)?;
         let prepare_ms = ms(start);
 
         let proof = prove_unchecked(circuit.as_ref(), &witness, &mut rng, &mut t)?;
@@ -267,7 +284,7 @@ fn warm(v: &Variant, constraints: i64, args: &Args) -> Result<Vec<Row>> {
     let witness = Witness::load(&v.wtns())
         .with_context(|| format!("{}: loading circuit.wtns", v.name))?
         .0;
-    let circuit = crate::make_backend(args.backend)?.prepare(pk)?;
+    let circuit = backend(args)?.prepare(pk)?;
     let prepare_ms = ms(start);
     let public = public_of(&witness, n_public)?;
 

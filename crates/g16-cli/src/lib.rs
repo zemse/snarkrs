@@ -49,6 +49,35 @@ pub fn make_backend(kind: BackendKind) -> Result<Box<dyn Backend>> {
     }
 }
 
+/// [`make_backend`] with MSMs whose cost follows the key and not the witness, behind
+/// `prove --constant-work`. Implemented for cpu and metal; the other two are refused
+/// rather than ignored, because a backend that proved in variable time under this flag
+/// would read as a promise it did not keep.
+pub fn make_constant_work_backend(kind: BackendKind) -> Result<Box<dyn Backend>> {
+    match kind {
+        BackendKind::Cpu => Ok(Box::new(CpuBackend::constant_work())),
+        BackendKind::Metal => metal_constant_work_backend(),
+        BackendKind::Wgpu | BackendKind::Cuda => anyhow::bail!(
+            "--constant-work is implemented for the cpu and metal backends only; the {} MSMs \
+             still skip zero and one scalars",
+            kind.as_str()
+        ),
+    }
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn metal_constant_work_backend() -> Result<Box<dyn Backend>> {
+    Ok(Box::new(g16_metal::MetalBackend::constant_work().map_err(
+        |e| anyhow::anyhow!("backend `metal` is unavailable: {e}"),
+    )?))
+}
+
+/// Same three reasons as [`metal_backend`], which is where they are spelled out.
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn metal_constant_work_backend() -> Result<Box<dyn Backend>> {
+    metal_backend()
+}
+
 /// WebGPU has the same two failure modes as CUDA and for a similar reason: `wgpu` compiles on
 /// every target this workspace supports and picks a native backend (Metal, Vulkan, DX12) at
 /// run time, so there is no "wrong operating system" arm. Either the feature is off, or the

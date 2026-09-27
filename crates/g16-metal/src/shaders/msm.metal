@@ -52,6 +52,17 @@
 //    while the other quarter-million threads sat idle. Special-casing 1 is not a
 //    micro-optimisation here, it is what stops the dispatch degenerating to one thread.
 //
+//    Which also means the entry count, and with it every dispatch and buffer the host
+//    sizes from it, follows how many witness entries are 0 or 1. `p.dummy_rows != 0`
+//    is the opt-in constant-work mode (see `Work` in msm.rs): no scalar is skipped and a
+//    zero digit is counted, scattered and accumulated like any other, into one of
+//    `dummy_rows` rows per window that sit after the real buckets and that no merge,
+//    reduce or readback ever touches. Every scalar then emits exactly one entry per
+//    window, so the entry region is always full and the segmented accumulation runs
+//    every slice. The dummy row is picked by thread index, not by value, and there are
+//    several per window only to spread the atomics: on a bit witness nearly every
+//    digit is zero.
+//
 // 3. POINTS ACCUMULATE IN XYZZ, BASES STAY AFFINE.
 //    Extended Jacobian (X, Y, ZZ, ZZZ) with x = X/ZZ, y = Y/ZZZ and ZZ^3 = ZZZ^2. Mixed
 //    addition (madd-2008-s) is 8M + 2S against 7M + 4S for Jacobian madd-2007-bl, and
@@ -780,7 +791,17 @@ struct MsmParams {
     uint merge_wide_base; // first row msm_merge_wide_* owns instead of msm_merge_*
     uint merge_wide_rows; // rows it owns; 0 leaves everything to msm_merge_*
     uint separate_ones; // 1 routes scalar 1 to a gather or scan; 0 recodes it normally
+    uint dummy_rows;  // constant work: rows per window, after the real buckets, that
+                      // take the zero digits; 0 skips them (and the 0/1 scalars)
+    uint seg_first;   // first global slice of this msm_segmented_* dispatch, so a long
+                      // accumulation can go out in several command buffers
 };
+
+// Row a zero digit of scalar `gid` lands in under constant work: window `w`'s block of
+// dummy rows sits after every real bucket, and `dummy_rows` is a power of two.
+inline uint msm_dummy_row(constant MsmParams& p, uint w, uint gid) {
+    return p.n_windows * p.n_buckets + w * p.dummy_rows + (gid & (p.dummy_rows - 1u));
+}
 
 // ---------------------------------------------------------------------------
 // Kernels.
@@ -819,18 +840,24 @@ kernel void msm_count(device const uint* scalars [[buffer(0)]],
         s[i] = scalars[base + i];
     }
     // A classified one has its own gather. Unclassified inputs recode it normally:
-    // digit 1 in the low window, zero above, with capacity bounded by p.n.
-    if (sc_is_zero(s) || (p.separate_ones != 0u && sc_is_one(s))) {
+    // digit 1 in the low window, zero above, with capacity bounded by p.n. Constant
+    // work skips nothing.
+    if (p.dummy_rows == 0u && (sc_is_zero(s) || (p.separate_ones != 0u && sc_is_one(s)))) {
         return;
     }
     for (uint w = 0; w < p.n_windows; w++) {
         uint mag;
         bool neg;
         sc_signed_digit(s, w, p.c, mag, neg);
-        if (mag == 0u) {
+        uint row;
+        if (mag != 0u) {
+            row = w * p.n_buckets + (mag - 1u);
+        } else if (p.dummy_rows != 0u) {
+            row = msm_dummy_row(p, w, gid);
+        } else {
             continue;
         }
-        atomic_fetch_add_explicit(&counts[w * p.n_buckets + (mag - 1u)], 1u, memory_order_relaxed);
+        atomic_fetch_add_explicit(&counts[row], 1u, memory_order_relaxed);
     }
 }
 
@@ -873,6 +900,13 @@ kernel void msm_scan(device const uint* counts [[buffer(0)]],
             uint v = totals[t];
             totals[t] = running;
             running += v;
+        }
+        // The window's dummy rows follow its real runs, so the region ends at
+        // `w * cap + n` exactly: every scalar put one entry somewhere in it.
+        for (uint j = 0; j < p.dummy_rows; j++) {
+            uint d = p.n_windows * p.n_buckets + w * p.dummy_rows + j;
+            cursor[d] = running;
+            running += counts[d];
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -919,17 +953,21 @@ kernel void msm_scatter(device const uint* scalars [[buffer(0)]],
     for (uint i = 0; i < 8u; i++) {
         s[i] = scalars[base + i];
     }
-    if (sc_is_zero(s) || (p.separate_ones != 0u && sc_is_one(s))) {
+    if (p.dummy_rows == 0u && (sc_is_zero(s) || (p.separate_ones != 0u && sc_is_one(s)))) {
         return;
     }
     for (uint w = span.x; w < span.y; w++) {
         uint mag;
         bool neg;
         sc_signed_digit(s, w, p.c, mag, neg);
-        if (mag == 0u) {
+        uint row;
+        if (mag != 0u) {
+            row = w * p.n_buckets + (mag - 1u);
+        } else if (p.dummy_rows != 0u) {
+            row = msm_dummy_row(p, w, gid);
+        } else {
             continue;
         }
-        uint row = w * p.n_buckets + (mag - 1u);
         uint slot = atomic_fetch_add_explicit(&cursor[row], 1u, memory_order_relaxed);
         entries[slot] = uint2(row, (gid << 1) | (neg ? 1u : 0u));
     }
@@ -1064,6 +1102,7 @@ inline void msm_segmented_impl(device const uint2* entries,
                                device uint* spill_rows,
                                constant MsmParams& p,
                                uint gid) {
+    gid += p.seg_first;
     uint w = gid / p.slices;
     uint k = gid - w * p.slices;
     if (w >= p.n_windows) {
@@ -1071,8 +1110,12 @@ inline void msm_segmented_impl(device const uint2* entries,
     }
     uint base = w * p.cap;
     // The scatter left every cursor at its run's end, so the last bucket's cursor is the
-    // end of the whole window region. Slices past it are empty.
-    uint used = cursor[w * p.n_buckets + p.n_buckets - 1u] - base;
+    // end of the whole window region. Slices past it are empty. Under constant work the
+    // last row is the last dummy row and the region is always full.
+    uint last = (p.dummy_rows == 0u)
+        ? w * p.n_buckets + p.n_buckets - 1u
+        : p.n_windows * p.n_buckets + w * p.dummy_rows + p.dummy_rows - 1u;
+    uint used = cursor[last] - base;
 
     uint head_slot = 2u * gid;
     uint tail_slot = head_slot + 1u;

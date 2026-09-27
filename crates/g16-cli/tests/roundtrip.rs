@@ -71,28 +71,35 @@ fn prove(v: &Variant, out: &Path) -> (PathBuf, PathBuf) {
 }
 
 fn prove_on(v: &Variant, out: &Path, backend: &str) -> (PathBuf, PathBuf) {
+    prove_with(v, out, backend, &[])
+}
+
+fn prove_with(v: &Variant, out: &Path, backend: &str, extra: &[&str]) -> (PathBuf, PathBuf) {
     let proof = out.join("proof.json");
     let public = out.join("public.json");
     // wgpu under `auto`, which is what the browser asks for: the floor's 128 MiB binding
     // cannot hold anon-aadhaar's G2 bases (140.9 MB) until they are chunked, and that is a
     // capacity limit with its own clean error, not what this file tests.
-    let o = run(Command::new(g16()).env("G16_WGPU_LIMITS", "auto").args([
-        "prove",
-        "--zkey",
-        v.dir.join("circuit.zkey").to_str().unwrap(),
-        "--witness",
-        v.dir.join("circuit.wtns").to_str().unwrap(),
-        "--proof",
-        proof.to_str().unwrap(),
-        "--public",
-        public.to_str().unwrap(),
-        "--backend",
-        backend,
-        "--stage-timings",
-    ]));
+    let o = run(Command::new(g16())
+        .env("G16_WGPU_LIMITS", "auto")
+        .args([
+            "prove",
+            "--zkey",
+            v.dir.join("circuit.zkey").to_str().unwrap(),
+            "--witness",
+            v.dir.join("circuit.wtns").to_str().unwrap(),
+            "--proof",
+            proof.to_str().unwrap(),
+            "--public",
+            public.to_str().unwrap(),
+            "--backend",
+            backend,
+            "--stage-timings",
+        ])
+        .args(extra));
     assert!(
         o.status.success(),
-        "{} on {backend}: prove failed: {}",
+        "{} on {backend} {extra:?}: prove failed: {}",
         v.name,
         text(&o)
     );
@@ -189,6 +196,51 @@ fn snarkjs_accepts_our_proof() {
             );
         }
     });
+}
+
+/// The same oracle for `--constant-work`, on the bit-heavy circuit where the mode changes
+/// the most: every witness scalar goes through the buckets there, on the cpu and on metal.
+#[test]
+fn snarkjs_accepts_a_constant_work_proof() {
+    if Command::new("snarkjs").arg("--version").output().is_err() {
+        eprintln!("SKIPPED snarkjs_accepts_a_constant_work_proof: snarkjs is not on PATH");
+        return;
+    }
+    let found = variants();
+    let Some(v) = found
+        .iter()
+        .find(|v| v.name == "keccak256")
+        .or(found.first())
+    else {
+        eprintln!("SKIPPED snarkjs_accepts_a_constant_work_proof: no artifacts");
+        return;
+    };
+    let out = scratch("snarkjs-constant-work");
+    let mut backends = vec!["cpu"];
+    if cfg!(feature = "metal") {
+        backends.push("metal");
+    }
+    for backend in backends {
+        eprintln!(
+            "snarkjs_accepts_a_constant_work_proof: {} on {backend}",
+            v.name
+        );
+        let (proof, public) = prove_with(v, &out, backend, &["--constant-work"]);
+        let o = run(Command::new("snarkjs").args([
+            "groth16",
+            "verify",
+            v.dir.join("vkey.json").to_str().unwrap(),
+            public.to_str().unwrap(),
+            proof.to_str().unwrap(),
+        ]));
+        let said = text(&o);
+        assert!(
+            said.contains("OK!"),
+            "{} on {backend} --constant-work: snarkjs rejected our proof: {said}",
+            v.name
+        );
+    }
+    std::fs::remove_dir_all(&out).ok();
 }
 
 #[test]

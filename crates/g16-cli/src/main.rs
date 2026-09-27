@@ -110,7 +110,7 @@ enum Cmd {
         /// MSMs whose cost follows the key and not the witness, so proving time does not
         /// reveal how many witness entries are zero or one (the timing channel USENIX
         /// Security 2020 used on Zcash). From 2.5% slower on a dense circuit to 4x on a
-        /// bit-heavy one. CPU backend only.
+        /// bit-heavy one. cpu and metal backends.
         #[arg(long)]
         constant_work: bool,
     },
@@ -707,14 +707,16 @@ fn run_prove(
     fallback: bool,
     constant_work: bool,
 ) -> Result<()> {
-    // Refused rather than ignored: a GPU backend would prove in variable time and the flag
-    // would read as a promise it did not keep.
-    anyhow::ensure!(
-        !constant_work || matches!(backend, BackendKind::Cpu),
-        "--constant-work is implemented for the cpu backend only; the {} MSMs still skip zero \
-         and one scalars",
-        backend.as_str()
-    );
+    // Before the key is read: a backend this binary cannot run, or one that cannot keep
+    // --constant-work's promise, is refused without the load.
+    let backend_of = |kind| {
+        if constant_work {
+            g16_cli::make_constant_work_backend(kind)
+        } else {
+            make_backend(kind)
+        }
+    };
+    let prover = backend_of(backend)?;
     // This process is about to hold the witness in the clear. `panic = "abort"` means a crash
     // runs no destructor, so nothing below gets to scrub it, and a core file would write it
     // to disk.
@@ -761,11 +763,7 @@ fn run_prove(
         "witness has {} entries, too short for {n_public} public signals",
         w.len()
     );
-    let circuit = if constant_work {
-        g16_core::Backend::prepare(&g16_core::cpu::CpuBackend::constant_work(), pk)?
-    } else {
-        make_backend(backend)?.prepare(pk)?
-    };
+    let circuit = prover.prepare(pk)?;
 
     // Stage 10's blinders come from the OS CSPRNG. Nothing on this command offers a seed
     // override: a reused (r, s) across two proofs of different witnesses leaks the witness.
@@ -788,9 +786,10 @@ fn run_prove(
                 &mut rng,
                 &mut t,
                 || {
-                    // The key moved into the accelerator at prepare, so the CPU loads its own.
+                    // The key moved into the accelerator at prepare, so the CPU loads its
+                    // own. Under --constant-work the fallback keeps the promise too.
                     let pk = ProvingKey::load(zkey)?;
-                    Ok(make_backend(BackendKind::Cpu)?.prepare(pk)?)
+                    Ok(backend_of(BackendKind::Cpu)?.prepare(pk)?)
                 },
                 &mut |step| {
                     use g16_cli::fallback::Fallback::*;

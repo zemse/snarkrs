@@ -151,10 +151,11 @@ fn join(head: &[u8], sections: &[(u32, Vec<u8>)]) -> Vec<u8> {
     out
 }
 
-/// `--constant-work` proves and verifies on the cpu, and a GPU backend refuses it rather
-/// than proving in variable time under a flag that says otherwise.
+/// `--constant-work` proves and verifies on the cpu and on metal, and the other GPU
+/// backends refuse it rather than proving in variable time under a flag that says
+/// otherwise.
 #[test]
-fn constant_work_proves_on_the_cpu_and_is_refused_elsewhere() {
+fn constant_work_proves_on_the_cpu_and_metal_and_is_refused_elsewhere() {
     let Some(tiny) = artifact("tiny_mul") else {
         eprintln!("SKIPPED constant_work: no tiny_mul");
         return;
@@ -175,13 +176,25 @@ fn constant_work_proves_on_the_cpu_and_is_refused_elsewhere() {
             .output()
             .unwrap()
     };
-    let o = run("cpu");
-    assert!(o.status.success(), "cpu: {}", said(&o));
-    std::fs::remove_file(out.join("proof.json")).unwrap();
+    let mut proves = vec!["cpu"];
+    if cfg!(feature = "metal") {
+        proves.push("metal");
+    }
+    for backend in proves {
+        let o = run(backend);
+        assert!(o.status.success(), "{backend}: {}", said(&o));
+        std::fs::remove_file(out.join("proof.json")).unwrap();
+    }
 
-    let o = run("wgpu");
-    assert_eq!(o.status.code(), Some(1), "wgpu: {}", said(&o));
-    assert!(said(&o).contains("cpu backend only"), "{}", said(&o));
-    assert!(!out.join("proof.json").exists());
+    for backend in ["wgpu", "cuda"] {
+        let o = run(backend);
+        assert_eq!(o.status.code(), Some(1), "{backend}: {}", said(&o));
+        assert!(
+            said(&o).contains("cpu and metal backends only"),
+            "{}",
+            said(&o)
+        );
+        assert!(!out.join("proof.json").exists());
+    }
     std::fs::remove_dir_all(&out).ok();
 }

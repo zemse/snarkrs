@@ -33,7 +33,7 @@ use g16_field::Fr;
 use g16_zkey::{Coefficients, ProvingKey};
 use metal::Device;
 
-use crate::msm::{G1Bases, G2Bases, Job, JobG1, JobG2, MetalMsm, ScalarBuf};
+use crate::msm::{G1Bases, G2Bases, Job, JobG1, JobG2, MetalMsm, ScalarBuf, Work};
 use crate::stages::{HHandle, HResident, HStages};
 
 fn bad(reason: impl Into<String>) -> ProveError {
@@ -64,6 +64,7 @@ pub struct PrepareCost {
 pub struct MetalBackend {
     stages: Arc<HStages>,
     msm: Arc<MetalMsm>,
+    work: Work,
 }
 
 impl MetalBackend {
@@ -76,6 +77,33 @@ impl MetalBackend {
             bad("no Metal device on this machine, so the metal backend cannot run")
         })?;
         Self::with_device(device)
+    }
+
+    /// [`Self::new`] with MSMs whose cost follows the key and not the witness, so proving
+    /// time, buffer sizes and dispatch geometry do not reveal how many witness entries
+    /// are zero or one; see [`Work::Constant`].
+    ///
+    /// What stays witness dependent, on the device: which bucket a digit lands in, so
+    /// the atomics' contention, the merge's walk over each bucket's slice span (bounded
+    /// by `n / slice_len`, in one lane per bucket outside the wide top window) and the
+    /// `count == 0` exits of the merge kernels. On the host: the identity tests inside
+    /// the combine's few hundred curve additions, as on the CPU backend. Stages 0 to 4
+    /// are unchanged and were already fixed-shape, except that the gather kernel skips
+    /// the multiply for a 0 or 1 witness value (`gather.metal`), which is per-element
+    /// and coherent but not constant.
+    ///
+    /// Priced warm on the M2 Max, 15 reps, three alternating rounds against the variable
+    /// path on a machine other work was sharing (so the mins are the cleaner figure):
+    /// js_16x16_d32 medians 119-131 ms against 109-125 (mins 107-109 against 92-99,
+    /// +15%), keccak256 325-340 against 39-71 (mins 303-309 against 27-28, 11x),
+    /// rsa2048 305-331 against 41-60 (mins 269-283 against 32-40, 7-8x). Steeper than
+    /// the CPU's 3-4x on the bit-heavy circuits because the variable witness plans
+    /// there were a few hundred scalars over a few windows, and each is now an MSM the
+    /// size of H's, one of them in G2.
+    pub fn constant_work() -> Result<Self, ProveError> {
+        let mut backend = Self::new()?;
+        backend.work = Work::Constant;
+        Ok(backend)
     }
 
     /// Same, on a caller-supplied device.
@@ -94,6 +122,7 @@ impl MetalBackend {
         Ok(Self {
             stages: Arc::new(stages),
             msm: Arc::new(msm),
+            work: Work::Variable,
         })
     }
 
@@ -112,6 +141,7 @@ impl Backend for MetalBackend {
             self.stages.clone(),
             self.msm.clone(),
             pk,
+            self.work,
         )?))
     }
 }
@@ -152,6 +182,7 @@ pub struct MetalCircuit {
     l_bases: G1Bases,
     h_bases: G1Bases,
     cost: PrepareCost,
+    work: Work,
 }
 
 impl MetalCircuit {
@@ -159,6 +190,7 @@ impl MetalCircuit {
         stages: Arc<HStages>,
         msm: Arc<MetalMsm>,
         mut pk: ProvingKey,
+        work: Work,
     ) -> Result<Self, ProveError> {
         // Shape checks first. `crate::msm` would reject an out-of-range job later, but by
         // then the message names buffer offsets rather than the section of the zkey that
@@ -238,6 +270,7 @@ impl MetalCircuit {
             l_bases,
             h_bases,
             cost,
+            work,
         })
     }
 
@@ -321,13 +354,13 @@ impl MetalCircuit {
                 // pointwise kernel had already performed.
                 Ok(self
                     .msm
-                    .scalars_from_device_std(handle.h_std(), handle.len()))
+                    .scalars_from_device_std_with(handle.h_std(), handle.len(), self.work))
             }
             None => {
                 let host = h.to_host().ok_or_else(|| {
                     bad("compute_h output is neither a metal handle nor a host vector")
                 })?;
-                self.msm.upload_scalars(host)
+                self.msm.upload_scalars_with(host, self.work)
             }
         }
     }
@@ -417,7 +450,7 @@ impl PreparedCircuit for MetalCircuit {
 
         let start = Instant::now();
 
-        let w = self.msm.upload_scalars(witness)?;
+        let w = self.msm.upload_scalars_with(witness, self.work)?;
         let h_scalars = self.h_scalars(h)?;
 
         // One command buffer for all five. Order matches the stage numbering, and
@@ -486,7 +519,7 @@ impl PreparedCircuit for MetalCircuit {
         let mut compute_h_us = 0u64;
         let (h_out, wit_out) = std::thread::scope(|s| {
             let wit = s.spawn(|| {
-                let w = self.msm.upload_scalars(witness)?;
+                let w = self.msm.upload_scalars_with(witness, self.work)?;
                 self.msm.msm_batch(&self.witness_jobs(&w))
             });
             let h_out = (|| {
@@ -592,10 +625,17 @@ mod tests {
     /// from the witness rather than parsed out of `public.json` so this crate needs no
     /// JSON dependency to test the whole pipeline.
     fn load(dir: &Path) -> (Box<dyn PreparedCircuit>, Vec<Fr>, VerifyingKey) {
+        load_on(dir, MetalBackend::new().unwrap())
+    }
+
+    fn load_on(
+        dir: &Path,
+        backend: MetalBackend,
+    ) -> (Box<dyn PreparedCircuit>, Vec<Fr>, VerifyingKey) {
         let pk = ProvingKey::load(&dir.join("circuit.zkey")).unwrap();
         let witness = Witness::load(&dir.join("circuit.wtns")).unwrap().0;
         let vk = VerifyingKey::from_json(&dir.join("vkey.json")).unwrap();
-        let circuit = MetalBackend::new().unwrap().prepare(pk).unwrap();
+        let circuit = backend.prepare(pk).unwrap();
         (circuit, witness, vk)
     }
 
@@ -621,6 +661,29 @@ mod tests {
             // A backend that reported nothing would make `bench` print a free prover.
             assert!(t.msm_us > 0, "{name}: msms reported no time");
         });
+    }
+
+    /// The constant-work backend proves every artifact, and at pinned blinders its proof
+    /// is the variable one bit for bit: the two paths compute the same five points by
+    /// different routes, so any drift between them is a wrong MSM, not a different proof.
+    #[test]
+    fn a_constant_work_metal_proof_is_the_variable_one() {
+        for_each(
+            "a_constant_work_metal_proof_is_the_variable_one",
+            |name, dir| {
+                let (constant, witness, vk) = load_on(dir, MetalBackend::constant_work().unwrap());
+                let (variable, _, _) = load(dir);
+                let public = witness[1..=constant.n_public()].to_vec();
+                let mut t = StageTimings::default();
+                let (r, s) = (Fr::from(31337u64), Fr::from(4242u64));
+                let proof = prove_with_blinders(constant.as_ref(), &witness, r, s, &mut t).unwrap();
+                verify(&vk, &public, &proof).unwrap_or_else(|e| panic!("{name}: {e}"));
+                let want = prove_with_blinders(variable.as_ref(), &witness, r, s, &mut t).unwrap();
+                assert_eq!(proof.a, want.a, "{name}");
+                assert_eq!(proof.b, want.b, "{name}");
+                assert_eq!(proof.c, want.c, "{name}");
+            },
+        );
     }
 
     /// `g16_core::trace` is the only caller and it takes the trait default unless a
@@ -764,8 +827,13 @@ mod tests {
             let pk = ProvingKey::load(&dir.join("circuit.zkey")).unwrap();
             let zkey_ms = ms(t);
             let t = Instant::now();
-            let circuit =
-                MetalCircuit::new(backend.stages.clone(), backend.msm.clone(), pk).unwrap();
+            let circuit = MetalCircuit::new(
+                backend.stages.clone(),
+                backend.msm.clone(),
+                pk,
+                Work::Variable,
+            )
+            .unwrap();
             let total = ms(t);
             let c = circuit.prepare_cost();
             println!(
