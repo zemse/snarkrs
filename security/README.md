@@ -20,7 +20,7 @@ to that tree; the table that follows says what has landed since.
 | 4 | Metal command buffer status never checked | Fixed, `69d2802` (`cb::wait_ok`) |
 | 5 | Threadgroup memory never cleared | Fixed, `dd21174` |
 | 6 | Witness-dependent MSM cost | CPU: opt-in constant work, `ae15a9b` (`prove --constant-work`; +2.5% dense, 3.3-4x bit-heavy). Metal: opt-in constant work, `f48db69` (`--backend metal`; +15% dense, 7-11x bit-heavy); bucket occupancy and stage 0's 0/1 multiply skip remain. wgpu, cuda: **open** |
-| 7 | Unreproduced Metal concurrency failure | **Open**; finding 4's fix means the next one reports a cause |
+| 7 | Metal concurrency failure | Fixed, `2e2d06f`: macOS `ImpactingInteractivity` kills of a proving command buffer, now retried whole. One unchecked proof came back wrong after a GPU hang and recovery under deliberate three-process overload: **open**, caught by `prove`'s self-verify |
 | 8 | Lenient proof JSON encoding | Fixed, `d170f78` |
 | 9 | `verify()` validates nothing | Fixed, `d170f78`; `verify_unchecked` is the bare check |
 | 10 | Section 4 read twice, second pass unchecked | Fixed, `9445d85` |
@@ -210,8 +210,13 @@ operator might publish is **open** and is the cheap half of the fix.
 subsequent runs (30 sequential, 45 at 3x concurrency, 60 at 6x, plus cross-process
 contention). The panic message was lost. The pool disciplines and the shared-`Plan` path
 were eliminated by reading, all being read-only or mutex-guarded with `give` after
-`wait_until_completed`. Status: **open and unresolved**. Not asserting it is benign. Land
-finding 4 first so the next occurrence produces a diagnosis instead of a mystery.
+`wait_until_completed`. Status (2026-09-27): **reproduced and fixed** in `2e2d06f`. macOS killed one of the proof's
+command buffers (`kIOGPUCommandBufferCallbackErrorImpactingInteractivity`), which `cb::wait_ok`
+reported and the proving path did not retry; 10 of 20 runs failed while the machine was shared.
+`compute_h` and the variable MSM batch now retry the whole submission (`cb::with_retry`), and
+`a_retried_submission_gives_the_same_proof` pins that a retry is exact. Under a deliberate
+three-process overload the GPU hung and recovered, and one unchecked proof came back wrong:
+**open**, and `prove`'s self-verify is the guard for that case.
 
 **8. `[S]` `proof.json` has no canonical encoding, and our two JSON readers disagree.**
 `json.rs:130-146` and `:156-169` accept any nonzero Jacobian `z` and normalise, so there
