@@ -73,9 +73,7 @@ use g16_core::ProveError;
 use g16_field::{Fr, G1Affine, G1Projective, G2Affine, G2Projective};
 
 use crate::kernels::{FR_MSL, MSM_MSL};
-use crate::layout::{
-    as_bytes, Packed, PackedFq, PackedFq2, PackedG1Affine, PackedG2Affine, PackedScalar,
-};
+use crate::layout::{Packed, PackedFq, PackedFq2, PackedG1Affine, PackedG2Affine, PackedScalar};
 
 fn err(reason: impl Into<String>) -> ProveError {
     ProveError::Backend {
@@ -844,12 +842,22 @@ impl MetalMsm {
         &self.device
     }
 
-    fn shared_buffer<T: Packed>(&self, items: &[T]) -> Result<Buffer, ProveError> {
-        let bytes = as_bytes(items);
-        if bytes.is_empty() {
+    /// `items` packed by `pack` straight into a shared buffer. Packing into a `Vec` and
+    /// copying that in held a third copy of the section at the peak of `prepare`.
+    fn packed_buffer<S, T: Packed>(
+        &self,
+        items: &[S],
+        pack: fn(&[S], &mut [T]),
+    ) -> Result<Buffer, ProveError> {
+        if items.is_empty() {
             return crate::alloc::shared(&self.device, 4);
         }
-        crate::alloc::shared_with_data(&self.device, bytes.as_ptr().cast(), bytes.len())
+        let buf = crate::alloc::shared(&self.device, items.len() * core::mem::size_of::<T>())?;
+        // SAFETY: the buffer was just allocated with room for `items.len()` packed values
+        // and nothing has been encoded against it, so no dispatch can be reading it.
+        let dst = unsafe { core::slice::from_raw_parts_mut(buf.contents().cast(), items.len()) };
+        pack(items, dst);
+        Ok(buf)
     }
 
     /// Repacks and uploads a G1 base vector. `ark_ec::G1Affine` is 72 bytes on this
@@ -857,18 +865,16 @@ impl MetalMsm {
     /// stride where the shader reads 64. [`PackedG1Affine::from_affine`] reads the flag
     /// and maps infinity onto the all-zero encoding the kernels test for.
     pub fn upload_g1_bases(&self, bases: &[G1Affine]) -> Result<G1Bases, ProveError> {
-        let packed = PackedG1Affine::pack_slice(bases);
         Ok(G1Bases {
-            buf: self.shared_buffer(&packed)?,
+            buf: self.packed_buffer(bases, PackedG1Affine::pack_into)?,
             len: bases.len(),
             inf: bases.iter().map(|b| b.infinity).collect(),
         })
     }
 
     pub fn upload_g2_bases(&self, bases: &[G2Affine]) -> Result<G2Bases, ProveError> {
-        let packed = PackedG2Affine::pack_slice(bases);
         Ok(G2Bases {
-            buf: self.shared_buffer(&packed)?,
+            buf: self.packed_buffer(bases, PackedG2Affine::pack_into)?,
             len: bases.len(),
             inf: bases.iter().map(|b| b.infinity).collect(),
         })
@@ -2117,6 +2123,7 @@ mod gpu_probes;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::as_bytes;
     use g16_core::{cpu::CpuBackend, Backend, StageTimings};
     use g16_field::CurveGroup;
     use g16_zkey::{wtns::Witness, ProvingKey};

@@ -30,7 +30,7 @@ use std::time::Instant;
 
 use g16_core::{Backend, HPoly, MsmOutputs, PreparedCircuit, ProveError, StageTimings};
 use g16_field::Fr;
-use g16_zkey::ProvingKey;
+use g16_zkey::{Coefficients, ProvingKey};
 use metal::Device;
 
 use crate::msm::{G1Bases, G2Bases, Job, JobG1, JobG2, MetalMsm, ScalarBuf};
@@ -130,6 +130,17 @@ impl Backend for MetalBackend {
 /// one `MetalCircuit` cannot be handed the same buffer. Command buffers and encoders,
 /// the two Metal objects that are not thread safe, are created and destroyed inside a
 /// single call and never stored.
+///
+/// # What stays on the host
+///
+/// Only the header and the verifying key. The five query sections and the coefficients
+/// are emptied as each one is uploaded, so [`PreparedCircuit::key`] returns a key whose
+/// vectors are empty. Nothing on the host reads them after `prepare`.
+///
+/// Freeing them does not yet lower the peak by itself: macOS malloc keeps freed large
+/// blocks in its large cache, still counted in the footprint, and only later host
+/// allocations reuse them. With `MallocLargeCache=0` in the environment keccak_2048
+/// peaks at 2,104 MB here instead of 3,340.
 pub struct MetalCircuit {
     pk: ProvingKey,
     stages: Arc<HStages>,
@@ -144,7 +155,11 @@ pub struct MetalCircuit {
 }
 
 impl MetalCircuit {
-    fn new(stages: Arc<HStages>, msm: Arc<MetalMsm>, pk: ProvingKey) -> Result<Self, ProveError> {
+    fn new(
+        stages: Arc<HStages>,
+        msm: Arc<MetalMsm>,
+        mut pk: ProvingKey,
+    ) -> Result<Self, ProveError> {
         // Shape checks first. `crate::msm` would reject an out-of-range job later, but by
         // then the message names buffer offsets rather than the section of the zkey that
         // is the wrong length, and the mismatch is a property of the key, not the proof.
@@ -181,17 +196,23 @@ impl MetalCircuit {
         // an error here instead of an out-of-bounds GPU read later.
         let t0 = Instant::now();
         let resident = stages.prepare(&pk)?;
+        pk.coeffs = Coefficients {
+            row_ptr: Default::default(),
+            signal: Default::default(),
+            value: Default::default(),
+        };
         let stages_us = t0.elapsed().as_micros() as u64;
 
         // Stages 5 to 9. Repacking, not casting: `ark_ec::G1Affine` is 72 bytes on this
         // arkworks and `G2Affine` is 136, neither is `repr(C)`, and both carry an
         // infinity flag that the packed layout encodes as all-zero coordinates instead.
+        // Each host vector is taken and dropped as soon as it is uploaded.
         let t1 = Instant::now();
-        let a_bases = msm.upload_g1_bases(&pk.a_query)?;
-        let b_g1_bases = msm.upload_g1_bases(&pk.b_g1_query)?;
-        let b_g2_bases = msm.upload_g2_bases(&pk.b_g2_query)?;
-        let l_bases = msm.upload_g1_bases(&pk.l_query)?;
-        let h_bases = msm.upload_g1_bases(&pk.h_query)?;
+        let a_bases = msm.upload_g1_bases(&std::mem::take(&mut pk.a_query))?;
+        let b_g1_bases = msm.upload_g1_bases(&std::mem::take(&mut pk.b_g1_query))?;
+        let b_g2_bases = msm.upload_g2_bases(&std::mem::take(&mut pk.b_g2_query))?;
+        let l_bases = msm.upload_g1_bases(&std::mem::take(&mut pk.l_query))?;
+        let h_bases = msm.upload_g1_bases(&std::mem::take(&mut pk.h_query))?;
         let bases_us = t1.elapsed().as_micros() as u64;
 
         let cost = PrepareCost {

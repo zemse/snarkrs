@@ -49,7 +49,7 @@ use metal::objc::rc::autoreleasepool;
 use metal::{Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, Library, MTLSize};
 
 use crate::kernels::{FR_MSL, GATHER_MSL, NTT_MSL, POINTWISE_MSL};
-use crate::layout::{as_bytes, PackedFr, PackedScalar};
+use crate::layout::{PackedFr, PackedScalar};
 
 /// The tag on [`g16_core::HPoly::Device`] values produced here. A handle carrying any
 /// other tag came from a different backend and must not be dereferenced as an [`HHandle`].
@@ -214,16 +214,20 @@ impl HStages {
         HResident::new(self, pk)
     }
 
-    fn buf<T: crate::layout::Packed>(&self, data: &[T]) -> Result<Buffer, ProveError> {
+    /// `data` packed into Montgomery form straight into a shared buffer, with no host
+    /// `Vec` of packed values in between.
+    fn buf(&self, data: &[Fr]) -> Result<Buffer, ProveError> {
         // A zero-length MTLBuffer is not a valid allocation, and an empty CSR matrix or a
         // size-1 domain's empty twiddle table both reach here. One padding element keeps
         // the binding legal; no kernel reads it, because every loop that could is bounded
         // by a row pointer or a domain size that is zero.
-        if data.is_empty() {
-            return crate::alloc::shared(&self.device, core::mem::size_of::<T>());
-        }
-        let bytes = as_bytes(data);
-        crate::alloc::shared_with_data(&self.device, bytes.as_ptr() as *const c_void, bytes.len())
+        let buf = self.empty(data.len())?;
+        // SAFETY: the buffer was just allocated with room for `data.len()` packed values
+        // and nothing has been encoded against it, so no dispatch can be reading it.
+        let dst =
+            unsafe { core::slice::from_raw_parts_mut(buf.contents() as *mut PackedFr, data.len()) };
+        PackedFr::pack_into(data, dst);
+        Ok(buf)
     }
 
     fn buf_u32(&self, data: &[u32]) -> Result<Buffer, ProveError> {
@@ -413,13 +417,10 @@ impl HResident {
                 st.buf_u32(&pk.coeffs.signal[0])?,
                 st.buf_u32(&pk.coeffs.signal[1])?,
             ],
-            value: [
-                st.buf(&PackedFr::pack_slice(&pk.coeffs.value[0]))?,
-                st.buf(&PackedFr::pack_slice(&pk.coeffs.value[1]))?,
-            ],
-            tw_fwd: st.buf(&PackedFr::pack_slice(&domain.twiddles()))?,
-            tw_inv: st.buf(&PackedFr::pack_slice(&domain.twiddles_inv()))?,
-            coset_pows: st.buf(&PackedFr::pack_slice(&pows))?,
+            value: [st.buf(&pk.coeffs.value[0])?, st.buf(&pk.coeffs.value[1])?],
+            tw_fwd: st.buf(&domain.twiddles())?,
+            tw_inv: st.buf(&domain.twiddles_inv())?,
+            coset_pows: st.buf(&pows)?,
             domain,
             pool: Arc::new(Mutex::new(Vec::new())),
         })
