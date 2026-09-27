@@ -144,6 +144,25 @@ The blinders come from the OS CSPRNG. There is no seed override on this path on 
 reused `(r, s)` across two proofs of different witnesses leaks the witness, so the
 deterministic entry point stays test-only.
 
+## what it checks
+
+Every entry point validates its input by default, and each has an `_unchecked` twin that
+skips the check for input you already trust:
+
+| checked | what it adds | unchecked |
+| --- | --- | --- |
+| `ProvingKey::load`, `from_bytes` | every point on the curve; refuses a key with no phase-2 contribution | `load_unchecked`, `from_bytes_unchecked` |
+| `VerifyingKey::from_json` | refuses a key anyone can forge against | `from_json_unchecked` |
+| `verify` | proof points on the curve, in the subgroup, not infinity | `verify_unchecked` |
+| `prove` | verifies its own proof before returning it | `prove_unchecked` |
+
+The check in `prove` is also what stops a hostile zkey from reading the witness out of the
+proof, so a key from someone else should only ever meet `prove`, and should still be checked
+with `g16 zkey verify` against the circuit and the ptau. Proving time depends on how many
+witness entries are zero or one unless you pass `--constant-work` (cpu backend, 2.5% to 4x
+slower depending on the circuit). The audit and its current status are in
+[`security/README.md`](security/README.md).
+
 ## References
 
 - [Remco Bloemen: The Groth16 prover, step by step](https://xn--2-umb.com/22/groth16/).
