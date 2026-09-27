@@ -87,6 +87,27 @@ pub(crate) fn command_buffer(queue: &CommandQueueRef) -> &CommandBufferRef {
     }
 }
 
+/// Every dispatch on the proving path goes through this pair rather than the encoder's
+/// own, so a test can stop an attempt at any one of them the way a kill does (see
+/// [`inject::arm_cut`]). Outside tests they forward and nothing else.
+pub(crate) fn dispatch_threads(enc: &ComputeCommandEncoderRef, grid: MTLSize, tg: MTLSize) {
+    #[cfg(test)]
+    let grid = match inject::cut_dispatch(grid.width) {
+        Some(width) => MTLSize::new(width, grid.height, grid.depth),
+        None => return,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
+pub(crate) fn dispatch_thread_groups(enc: &ComputeCommandEncoderRef, groups: MTLSize, tg: MTLSize) {
+    #[cfg(test)]
+    let groups = match inject::cut_dispatch(groups.width) {
+        Some(width) => MTLSize::new(width, groups.height, groups.depth),
+        None => return,
+    };
+    enc.dispatch_thread_groups(groups, tg);
+}
+
 /// The NSError text hanging off a failed command buffer, empty when there is none, with
 /// the per-encoder execution states after it when the buffer was made with
 /// [`command_buffer`] and Metal filed them.
@@ -219,6 +240,8 @@ pub(crate) fn with_retry<T>(
         match submit() {
             Ok(v) => return Ok(v),
             Err(e) => {
+                #[cfg(test)]
+                inject::attempt_failed();
                 let thread = std::thread::current();
                 eprintln!(
                     "metal: attempt {} of {RETRIES} failed on thread {}: {e}",
@@ -297,6 +320,10 @@ impl Seal {
     /// it could be abandoned with the token already in place, and a concurrent one could
     /// still be running.
     pub(crate) fn encode_token(&self, enc: &ComputeCommandEncoderRef, token: Token) {
+        #[cfg(test)]
+        if inject::cut_token() {
+            return;
+        }
         enc.set_compute_pipeline_state(&self.pipeline);
         enc.set_buffer(0, Some(&self.slots), 0);
         let words = [token.slot, token.epoch];
@@ -350,6 +377,14 @@ impl Seal {
 /// A [`Fault::Stale`] leaves the status alone and corrupts the token [`Seal::wait`] reads
 /// instead, at the same call index, so the check behind the status is exercised the same
 /// way.
+///
+/// Neither of those runs a buffer partway. A cut ([`arm_cut`]) does: the chosen dispatch
+/// is encoded at half its width, nothing after it in its command buffer is encoded, the
+/// token included, so the wait refuses the buffer exactly as one the GPU stopped there,
+/// and the retry then runs over whatever the half-run attempt left in the scratch. What
+/// else is dropped is the [`Rest`]: the rest of that command buffer only, as an
+/// interactivity kill of one buffer among several committed back to back, or the rest of
+/// the attempt, as a GPU recovery that voids every buffer in flight.
 #[cfg(test)]
 pub(crate) mod inject {
     use std::cell::Cell;
@@ -362,12 +397,26 @@ pub(crate) mod inject {
         Stale,
     }
 
+    /// What a cut drops after the dispatch it lands on.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(crate) enum Rest {
+        /// The rest of that command buffer; later buffers of the attempt run whole.
+        Buffer,
+        /// Every dispatch and token until `with_retry` sees the failure.
+        Attempt,
+    }
+
     thread_local! {
         static CALLS: Cell<u32> = const { Cell::new(0) };
         static FAIL: Cell<Option<(u32, Fault)>> = const { Cell::new(None) };
         /// Every call from `FAIL`'s index on, not just the one.
         static STICKY: Cell<bool> = const { Cell::new(false) };
         static FIRED: Cell<bool> = const { Cell::new(false) };
+        /// Dispatches through `cb::dispatch_*` on this thread since the last arm.
+        static DISPATCHES: Cell<u32> = const { Cell::new(0) };
+        static CUT: Cell<Option<(u32, Rest)>> = const { Cell::new(None) };
+        /// A cut has landed and not yet run its course: dispatches and tokens are dropped.
+        static CUTTING: Cell<Option<Rest>> = const { Cell::new(None) };
     }
 
     /// Counts calls from zero again, and fails call `at` with a status fault if given.
@@ -382,6 +431,15 @@ pub(crate) mod inject {
         FAIL.set(at);
         STICKY.set(sticky);
         FIRED.set(false);
+        DISPATCHES.set(0);
+        CUT.set(None);
+        CUTTING.set(None);
+    }
+
+    /// Counts from zero again and cuts the attempt at dispatch `at`, dropping `rest`.
+    pub(crate) fn arm_cut(at: u32, rest: Rest) {
+        arm(None);
+        CUT.set(Some((at, rest)));
     }
 
     /// `wait_ok` calls on this thread since [`arm`].
@@ -389,9 +447,52 @@ pub(crate) mod inject {
         CALLS.get()
     }
 
-    /// Whether the armed call was reached.
+    /// Dispatches on this thread since [`arm`].
+    pub(crate) fn dispatches() -> u32 {
+        DISPATCHES.get()
+    }
+
+    /// Whether the armed call or cut was reached.
     pub(crate) fn fired() -> bool {
         FIRED.get()
+    }
+
+    /// The width a dispatch of `width` threads or groups is encoded at, or `None` for
+    /// not at all.
+    pub(super) fn cut_dispatch(width: u64) -> Option<u64> {
+        let n = DISPATCHES.get();
+        DISPATCHES.set(n + 1);
+        if CUTTING.get().is_some() {
+            return None;
+        }
+        match CUT.get() {
+            Some((at, rest)) if n == at => {
+                CUT.set(None);
+                CUTTING.set(Some(rest));
+                FIRED.set(true);
+                Some(width / 2).filter(|w| *w > 0)
+            }
+            _ => Some(width),
+        }
+    }
+
+    /// Whether the token of the buffer being sealed is dropped. A `Rest::Buffer` cut
+    /// ends here; a `Rest::Attempt` one in [`attempt_failed`].
+    pub(super) fn cut_token() -> bool {
+        match CUTTING.get() {
+            Some(Rest::Buffer) => {
+                CUTTING.set(None);
+                true
+            }
+            Some(Rest::Attempt) => true,
+            None => false,
+        }
+    }
+
+    /// `with_retry` saw an attempt fail: whatever a cut was still dropping, the retry
+    /// runs whole.
+    pub(super) fn attempt_failed() {
+        CUTTING.set(None);
     }
 
     fn hits(n: u32, fault: Fault) -> bool {

@@ -1752,7 +1752,8 @@ impl<'a> Plan<'a> {
         );
         set_params(enc, 2, &p);
         let scan_tg = SCAN_TG.min(msm.pipelines.scan.max_total_threads_per_threadgroup() as usize);
-        enc.dispatch_thread_groups(
+        crate::cb::dispatch_thread_groups(
+            enc,
             MTLSize::new(self.n_windows as u64, 1, 1),
             MTLSize::new(scan_tg as u64, 1, 1),
         );
@@ -2140,7 +2141,8 @@ impl Outputs {
             enc.set_buffer(4, Some(plan.cursor.as_ref().unwrap()), 0);
             set_params(enc, 5, &p);
             let tg = MERGE_TG.min(wide_pso.max_total_threads_per_threadgroup() as usize);
-            enc.dispatch_thread_groups(
+            crate::cb::dispatch_thread_groups(
+                enc,
                 MTLSize::new(plan.merge_wide_rows as u64, 1, 1),
                 MTLSize::new(tg as u64, 1, 1),
             );
@@ -2168,7 +2170,8 @@ impl Outputs {
         enc.set_buffer(1, Some(&self.window_sums), 0);
         set_params(enc, 2, &p);
         let tg = msm.reduce_tg(self.is_g2);
-        enc.dispatch_thread_groups(
+        crate::cb::dispatch_thread_groups(
+            enc,
             MTLSize::new((plan.n_windows * plan.reduce_groups) as u64, 1, 1),
             MTLSize::new(tg as u64, 1, 1),
         );
@@ -2207,7 +2210,8 @@ impl Outputs {
             enc.set_buffer(2, Some(&self.ones), 0);
             set_params(enc, 3, &p);
             let tg = REDUCE_TG.min(pso.max_total_threads_per_threadgroup() as usize);
-            enc.dispatch_thread_groups(
+            crate::cb::dispatch_thread_groups(
+                enc,
                 MTLSize::new(self.ones_groups as u64, 1, 1),
                 MTLSize::new(tg as u64, 1, 1),
             );
@@ -2223,7 +2227,8 @@ impl Outputs {
         enc.set_buffer(2, Some(&self.ones), 0);
         set_params(enc, 3, &p);
         let tg = REDUCE_TG.min(ones_pso.max_total_threads_per_threadgroup() as usize);
-        enc.dispatch_thread_groups(
+        crate::cb::dispatch_thread_groups(
+            enc,
             MTLSize::new(self.ones_groups as u64, 1, 1),
             MTLSize::new(tg as u64, 1, 1),
         );
@@ -2565,7 +2570,11 @@ fn dispatch_1d(
     let tg = prefer
         .min(pso.max_total_threads_per_threadgroup() as usize)
         .max(1);
-    enc.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(tg as u64, 1, 1));
+    crate::cb::dispatch_threads(
+        enc,
+        MTLSize::new(n as u64, 1, 1),
+        MTLSize::new(tg as u64, 1, 1),
+    );
 }
 
 /// # Safety

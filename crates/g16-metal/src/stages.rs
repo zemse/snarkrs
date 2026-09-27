@@ -709,7 +709,7 @@ impl HResident {
         let nn = n as u32;
         enc.set_bytes(5, 4, &nn as *const u32 as *const c_void);
         let tg = st.threads(&st.h_join, n as u64);
-        enc.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(tg, 1, 1));
+        crate::cb::dispatch_threads(enc, MTLSize::new(n as u64, 1, 1), MTLSize::new(tg, 1, 1));
         let token = st.seal.encode(enc);
         enc.end_encoding();
         cb.commit();
@@ -742,7 +742,7 @@ impl HResident {
         let constant = u32::from(work == Work::Constant);
         enc.set_bytes(11, 4, &constant as *const u32 as *const c_void);
         let tg = st.threads(&st.gather, n as u64);
-        enc.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(tg, 1, 1));
+        crate::cb::dispatch_threads(enc, MTLSize::new(n as u64, 1, 1), MTLSize::new(tg, 1, 1));
     }
 
     /// The iNTT, the coset shift and the forward NTT for one of the three domain vectors,
@@ -879,7 +879,7 @@ impl HResident {
         // than to a constant.
         enc.set_threadgroup_memory_length(0, (blk * core::mem::size_of::<PackedFr>()) as u64);
         let tg = st.threads(pso, blk as u64);
-        enc.dispatch_thread_groups(MTLSize::new(groups, 1, 1), MTLSize::new(tg, 1, 1));
+        crate::cb::dispatch_thread_groups(enc, MTLSize::new(groups, 1, 1), MTLSize::new(tg, 1, 1));
     }
 }
 

@@ -900,6 +900,65 @@ mod tests {
         );
     }
 
+    /// Every dispatch of a proof cut short in turn: the attempt runs whole up to it, half
+    /// of it, and nothing after it in its command buffer (or in the attempt), so the
+    /// retry runs over a gather that wrote half of A, B and C, an NTT batch stopped
+    /// partway through its in-place passes, counters half incremented, a merge half
+    /// folded into its buckets. The retried proof must still be the unfaulted one bit
+    /// for bit, which holds only if every retried unit starts from inputs no dispatch in
+    /// it writes. The fault injector before this one failed a buffer after it had run to
+    /// its end, which never tests that. Small domains only, as the wait test above.
+    fn a_submission_cut_short_is_retried_exactly(
+        test: &str,
+        backend: fn() -> Result<MetalBackend, ProveError>,
+    ) {
+        use crate::cb::inject;
+        for_each(test, |name, dir| {
+            let (circuit, witness, _) = load_on(dir, backend().unwrap());
+            if circuit.domain_size() > 1 << 14 {
+                return;
+            }
+            let (r, s) = (Fr::from(31337u64), Fr::from(4242u64));
+            let mut t = StageTimings::default();
+            inject::arm(None);
+            let want = prove_with_blinders(circuit.as_ref(), &witness, r, s, &mut t).unwrap();
+            let dispatches = inject::dispatches();
+            assert!(dispatches > 0, "{name}: no dispatch was encoded");
+            for rest in [inject::Rest::Buffer, inject::Rest::Attempt] {
+                for at in 0..dispatches {
+                    inject::arm_cut(at, rest);
+                    let got = prove_with_blinders(circuit.as_ref(), &witness, r, s, &mut t)
+                        .unwrap_or_else(|e| panic!("{name}: cut at dispatch {at} ({rest:?}): {e}"));
+                    assert!(
+                        inject::fired(),
+                        "{name}: dispatch {at} was never encoded ({rest:?})"
+                    );
+                    assert_eq!(got.a, want.a, "{name}: cut at dispatch {at} ({rest:?})");
+                    assert_eq!(got.b, want.b, "{name}: cut at dispatch {at} ({rest:?})");
+                    assert_eq!(got.c, want.c, "{name}: cut at dispatch {at} ({rest:?})");
+                }
+            }
+            eprintln!("{name}: {dispatches} dispatches, each cut twice, retried exactly");
+            inject::arm(None);
+        });
+    }
+
+    #[test]
+    fn a_submission_cut_short_gives_the_same_proof() {
+        a_submission_cut_short_is_retried_exactly(
+            "a_submission_cut_short_gives_the_same_proof",
+            MetalBackend::new,
+        );
+    }
+
+    #[test]
+    fn a_constant_work_submission_cut_short_gives_the_same_proof() {
+        a_submission_cut_short_is_retried_exactly(
+            "a_constant_work_submission_cut_short_gives_the_same_proof",
+            MetalBackend::constant_work,
+        );
+    }
+
     /// Every attempt's token is stale from the chosen wait on, so no retry can pass,
     /// and the proof must be refused as a device fault rather than returned: the seal
     /// is a check, not a hint. One wait per stage group (the gather, the MSM batch)
