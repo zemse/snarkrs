@@ -354,6 +354,15 @@ struct SectionPlan {
     keep: usize,
 }
 
+/// `first` and `inc` are the contribution's private scalars, copied out of the key for the
+/// length of the rescale. They go when the plan does.
+impl Drop for SectionPlan {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.first);
+        zeroize::Zeroize::zeroize(&mut self.inc);
+    }
+}
+
 /// Transform one section into the new file, hashing the compressed form into the response
 /// as it goes, and return the point the contribution record keeps.
 ///
@@ -495,35 +504,35 @@ fn apply_contribution(
             id: ptau::S_TAU_G1,
             n_points: n * 2 - 1,
             first: Fr::ONE,
-            inc: key.tau.prv_key,
+            inc: *key.tau.prv_key.expose(),
             keep: 1,
         },
         SectionPlan {
             id: ptau::S_TAU_G2,
             n_points: n,
             first: Fr::ONE,
-            inc: key.tau.prv_key,
+            inc: *key.tau.prv_key.expose(),
             keep: 1,
         },
         SectionPlan {
             id: ptau::S_ALPHA_TAU_G1,
             n_points: n,
-            first: key.alpha.prv_key,
-            inc: key.tau.prv_key,
+            first: *key.alpha.prv_key.expose(),
+            inc: *key.tau.prv_key.expose(),
             keep: 0,
         },
         SectionPlan {
             id: ptau::S_BETA_TAU_G1,
             n_points: n,
-            first: key.beta.prv_key,
-            inc: key.tau.prv_key,
+            first: *key.beta.prv_key.expose(),
+            inc: *key.tau.prv_key.expose(),
             keep: 0,
         },
         SectionPlan {
             id: ptau::S_BETA_G2,
             n_points: 1,
-            first: key.beta.prv_key,
-            inc: key.tau.prv_key,
+            first: *key.beta.prv_key.expose(),
+            inc: *key.tau.prv_key.expose(),
             keep: 0,
         },
     ];

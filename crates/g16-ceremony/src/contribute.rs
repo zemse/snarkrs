@@ -295,8 +295,8 @@ fn apply(
     // The header points are multiplied by the key, and only sections 8 and 9 by its
     // inverse. Scaling the header by `invDelta` instead produces a file that still parses
     // and fails every ratio check in `zkey verify`.
-    header.delta_g1 = (header.delta_g1 * delta.prv_key).into_affine();
-    header.delta_g2 = (header.delta_g2 * delta.prv_key).into_affine();
+    header.delta_g1 = (header.delta_g1 * delta.prv_key.expose()).into_affine();
+    header.delta_g2 = (header.delta_g2 * delta.prv_key.expose()).into_affine();
 
     let contribution = ZkeyContribution {
         delta_after: header.delta_g1,
@@ -309,10 +309,14 @@ fn apply(
     };
     mpc.contributions.push(contribution.clone());
 
-    let inv_delta = delta
-        .prv_key
-        .inverse()
-        .ok_or_else(|| CeremonyError::BadParams("the contribution key drew zero".into()))?;
+    // As secret as delta itself: sections 8 and 9 are scaled by it, and zeroed on drop.
+    let inv_delta = zeroize::Zeroizing::new(
+        delta
+            .prv_key
+            .expose()
+            .inverse()
+            .ok_or_else(|| CeremonyError::BadParams("the contribution key drew zero".into()))?,
+    );
 
     // Unlike a fresh zkey, whose sections go out `1, 2, 4, 3, 9, 8, 5, 6, 7, 10`, a
     // contribution writes them in id order: `writeHeader` then five `copySection` calls
@@ -328,7 +332,7 @@ fn apply(
         w.write_section_verbatim(id, file.unique_section(id)?)?;
     }
     for id in [S_C, S_H] {
-        apply_key_to_section(&mut w, file.unique_section(id)?, id, inv_delta, key)?;
+        apply_key_to_section(&mut w, file.unique_section(id)?, id, *inv_delta, key)?;
     }
     w.start_section(S_MPC_PARAMS)?;
     mpc.write(&mut w)?;

@@ -681,15 +681,45 @@ pub struct PtauPubKeys {
     pub beta: PtauPubKey,
 }
 
+/// A contributor's private scalar: the toxic waste the whole ceremony exists to destroy.
+///
+/// Not `Copy`, so a use cannot mint a copy nobody tracks; `Debug` prints `<redacted>`, so a
+/// stray `{:?}` cannot put tau on a terminal; and it is zeroed when dropped. Best effort, not
+/// a guarantee: `Fr` is `Copy`, and every multiplication by [`Secret::expose`] leaves the
+/// value in registers and on stack frames this type never sees.
+#[derive(Clone)]
+pub struct Secret(Fr);
+
+impl Secret {
+    pub fn new(x: Fr) -> Self {
+        Self(x)
+    }
+    pub fn expose(&self) -> &Fr {
+        &self.0
+    }
+}
+
+impl core::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Secret(<redacted>)")
+    }
+}
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
+
 /// One phase-1 key, private half included. Only a key we just generated has one.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct PtauKeyPair {
-    pub prv_key: Fr,
+    pub prv_key: Secret,
     pub pubkey: PtauPubKey,
 }
 
 /// A whole phase-1 contribution key.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct PtauKey {
     pub tau: PtauKeyPair,
     pub alpha: PtauKeyPair,
@@ -709,7 +739,7 @@ impl PtauKey {
 /// `calculatePubKey` (`keypair.js:53-59`). Only `g1_s` comes from the RNG; the other
 /// three points are derived.
 fn calculate_pubkey(
-    prv_key: &Fr,
+    prv_key: Secret,
     personalization: u8,
     challenge: &Digest,
     rng: &mut CeremonyRng,
@@ -718,11 +748,11 @@ fn calculate_pubkey(
     // `timesFr` de-Montgomeries the scalar before multiplying (`build_bn128.js:54-72`),
     // so the multiplier is the element's mathematical value, which is what arkworks'
     // `Mul<Fr>` uses too.
-    let g1_sx = (g1_s * prv_key).into_affine();
+    let g1_sx = (g1_s * prv_key.expose()).into_affine();
     let g2_sp = get_g2_sp(personalization, challenge, &g1_s, &g1_sx);
-    let g2_spx = (g2_sp * prv_key).into_affine();
+    let g2_spx = (g2_sp * prv_key.expose()).into_affine();
     PtauKeyPair {
-        prv_key: *prv_key,
+        prv_key,
         pubkey: PtauPubKey {
             g1_s,
             g1_sx,
@@ -736,13 +766,13 @@ fn calculate_pubkey(
 /// the three private scalars up front in tau/alpha/beta order, then one `g1_s` per key in
 /// the same order. Nothing else touches it, and the order is load-bearing for a beacon.
 pub fn create_ptau_key(rng: &mut CeremonyRng, challenge: &Digest) -> PtauKey {
-    let tau_prv = fr_from_rng(rng);
-    let alpha_prv = fr_from_rng(rng);
-    let beta_prv = fr_from_rng(rng);
+    let tau_prv = Secret::new(fr_from_rng(rng));
+    let alpha_prv = Secret::new(fr_from_rng(rng));
+    let beta_prv = Secret::new(fr_from_rng(rng));
     PtauKey {
-        tau: calculate_pubkey(&tau_prv, PERSONALIZATION_TAU, challenge, rng),
-        alpha: calculate_pubkey(&alpha_prv, PERSONALIZATION_ALPHA, challenge, rng),
-        beta: calculate_pubkey(&beta_prv, PERSONALIZATION_BETA, challenge, rng),
+        tau: calculate_pubkey(tau_prv, PERSONALIZATION_TAU, challenge, rng),
+        alpha: calculate_pubkey(alpha_prv, PERSONALIZATION_ALPHA, challenge, rng),
+        beta: calculate_pubkey(beta_prv, PERSONALIZATION_BETA, challenge, rng),
     }
 }
 
@@ -834,9 +864,9 @@ pub fn read_ptau_pubkey(bytes: &[u8], challenge: &Digest) -> Result<PtauPubKeys,
 
 /// The phase-2 delta key (`zkey_contribute.js:54-61`). Unlike phase 1 there is no
 /// personalisation byte: `g2_sp` is `hashToG2(transcript)` directly.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct DeltaKey {
-    pub prv_key: Fr,
+    pub prv_key: Secret,
     pub g1_s: G1Affine,
     pub g1_sx: G1Affine,
     pub g2_sp: G2Affine,
@@ -855,15 +885,15 @@ pub struct DeltaKey {
 /// nothing calls it, and it uses `timesScalar` where both real call sites use `timesFr`.
 /// This follows `zkey_contribute.js`, not that function.
 pub fn create_delta_key(rng: &mut CeremonyRng, prior: Transcript) -> (DeltaKey, Digest) {
-    let prv_key = fr_from_rng(rng);
+    let prv_key = Secret::new(fr_from_rng(rng));
     let g1_s = g1_from_rng(rng);
-    let g1_sx = (g1_s * prv_key).into_affine();
+    let g1_sx = (g1_s * prv_key.expose()).into_affine();
     let mut hasher = prior;
     hasher.update_g1(&g1_s);
     hasher.update_g1(&g1_sx);
     let transcript = hasher.finalize();
     let g2_sp = hash_to_g2(&transcript);
-    let g2_spx = (g2_sp * prv_key).into_affine();
+    let g2_spx = (g2_sp * prv_key.expose()).into_affine();
     (
         DeltaKey {
             prv_key,

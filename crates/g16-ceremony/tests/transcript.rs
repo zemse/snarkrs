@@ -696,15 +696,15 @@ fn create_ptau_key_matches_snarkjs() {
     let key = create_ptau_key(&mut rng, &challenge);
 
     assert_eq!(
-        fr_raw(&key.tau.prv_key),
+        fr_raw(key.tau.prv_key.expose()),
         "42ef4b6b13fed6bbada810fce61ec502cb63c159875cd510741f9b21930fcd05"
     );
     assert_eq!(
-        fr_raw(&key.alpha.prv_key),
+        fr_raw(key.alpha.prv_key.expose()),
         "6e217c68838683cd552195489e616112af3ebd5217f37ab08863669cfc25090e"
     );
     assert_eq!(
-        fr_raw(&key.beta.prv_key),
+        fr_raw(key.beta.prv_key.expose()),
         "f5ec0833ff058baecdf8c2a46cf1eba10d38ee14d0e3a0750167782c7d5f8e2f"
     );
 
@@ -747,7 +747,7 @@ fn create_delta_key_closes_the_transcript_it_names() {
     let (delta, transcript) = create_delta_key(&mut rng, prior.clone());
 
     assert_eq!(
-        fr_raw(&delta.prv_key),
+        fr_raw(delta.prv_key.expose()),
         "42ef4b6b13fed6bbada810fce61ec502cb63c159875cd510741f9b21930fcd05"
     );
     assert_eq!(
@@ -764,7 +764,7 @@ fn create_delta_key_closes_the_transcript_it_names() {
     assert_eq!(transcript, expected.finalize());
     assert_eq!(delta.g2_sp, hash_to_g2(&transcript));
     assert!(delta.g2_sp.is_in_correct_subgroup_assuming_on_curve());
-    let spx: G2Affine = (delta.g2_sp * delta.prv_key).into();
+    let spx: G2Affine = (delta.g2_sp * delta.prv_key.expose()).into();
     assert_eq!(delta.g2_spx, spx);
 }
 

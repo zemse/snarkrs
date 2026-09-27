@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# Scrubs the contributor's toxic waste when it is dropped. Already in the tree through
+# ark-ff, which implements `Zeroize` for `Fr`; declared because this crate calls it.
+zeroize = "1.9"
 g16-field.workspace = true
 g16-zkey.workspace = true
 g16-msm.workspace = true
