@@ -33,8 +33,8 @@
 //! jobs and one G2 that is 112 KiB, against the 64 KiB per-proof ceiling design §3 puts on
 //! the readback. Measured, every artifact in the repo is well inside 64 KiB except
 //! `keccak256` at 86 KiB and `tiny_mul` at 65.5 KiB;
-//! `tests/proof.rs::a_whole_proof_is_two_submits_and_the_readback_is_bounded` prints the
-//! table and asserts the derived ceiling rather than the design's constant.
+//! `tests/proof.rs::a_whole_proof_submits_once_for_h_then_per_msm_slab_and_the_readback_is_bounded`
+//! prints the table and asserts the derived ceiling rather than the design's constant.
 //!
 //! The two bindings are windows into that one buffer at different offsets, and a storage
 //! binding offset must be a multiple of `minStorageBufferOffsetAlignment`, which is **256** in
@@ -51,6 +51,7 @@
 //! the slack survives.
 
 use std::marker::PhantomData;
+use std::ops::Range;
 
 use ark_ff::AdditiveGroup;
 use g16_core::{json, ProveError};
@@ -233,6 +234,18 @@ impl PointPlan {
             slice_len: self.slice_len,
             slices: self.slices,
             ..digits.params(digits.n(), lo)
+        }
+    }
+
+    /// The same block with the window count lowered to `windows`, so a clear, segmented or
+    /// merge dispatch that starts at `lo` stops at the end of window `windows - 1`: all
+    /// three guard on `n_windows * n_buckets` or `n_windows * slices` and read nothing else
+    /// from it. What lets one point stage be encoded as several window slabs
+    /// ([`MsmPoints::plan_slabs`]) with no kernel knowing.
+    pub fn params_to_window(&self, digits: &DigitPlan, lo: u32, windows: u32) -> MsmParams {
+        MsmParams {
+            n_windows: windows,
+            ..self.params(digits, lo)
         }
     }
 }
@@ -449,8 +462,8 @@ const ONES: usize = 4;
 pub static REDUCE_TG_OVERRIDE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Stop a point MSM after the nth kernel, or 0 to run all five. 1 is clear, 2 segmented,
-/// 3 merge, 4 reduce, 5 ones. See [`MsmPoints::encode`] for why: they share one pass and
-/// one submit, so a lost device names none of them.
+/// 3 merge, 4 reduce, 5 ones. See [`MsmPoints::encode`] for why: they share one pass, so a
+/// lost device names none of them.
 pub static STOP_AFTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Record every window sum and `ones` partial that [`MsmPoints::combine`] folds, or 0 to
@@ -488,9 +501,20 @@ impl<C: PointCurve> MsmPoints<C> {
     /// Compiles at this curve's measured shape and this device's workgroup-per-dimension
     /// limit.
     pub fn new(backend: &WgpuBackend) -> Result<Self, ProveError> {
-        let max_wg = backend
+        let mut max_wg = backend
             .granted_limits()
             .max_compute_workgroups_per_dimension;
+        // `G16_WGPU_MSM_DISPATCH_WG` caps the workgroups one dispatch holds, so a point
+        // stage's long kernels run as several shorter dispatches in the same pass. A
+        // diagnostic for BUG-32, where the question was whether macOS's interactivity kill
+        // is triggered by a long dispatch or a long command buffer.
+        if let Some(cap) = std::env::var("G16_WGPU_MSM_DISPATCH_WG")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|c| *c > 0)
+        {
+            max_wg = max_wg.min(cap);
+        }
         let mut wg = C::WGSL.wg;
         // Clamped to what the curve can hold, so an override cannot ask for a workgroup
         // array larger than the floor guarantees and turn a diagnostic into a build failure.
@@ -887,7 +911,7 @@ impl<C: PointCurve> MsmPoints<C> {
         wg * self.workgroups_per_dispatch
     }
 
-    /// Parameter blocks for the whole point stage, in dispatch order.
+    /// Parameter blocks for the whole point stage, in dispatch order, as one slab.
     ///
     /// Separate from [`Self::encode`] because design §3 writes every parameter block for the
     /// whole proof in one `write_buffer` before encoding starts, so the pushes have to happen
@@ -898,17 +922,74 @@ impl<C: PointCurve> MsmPoints<C> {
         points: &PointPlan,
         ring: &mut ParamRing,
     ) -> Result<PointOffsets, ProveError> {
-        let rows = digits.rows();
+        self.plan_slabs(
+            digits,
+            points,
+            ring,
+            std::slice::from_ref(&(0..digits.n_windows())),
+        )
+    }
+
+    /// Same, with the clear, segmented pass and merge cut into one slab per range of
+    /// `slabs`, which must be contiguous, in order, and cover `0..n_windows` exactly. The
+    /// reduction and the ones pass are planned once, for after the last slab.
+    pub fn plan_slabs(
+        &self,
+        digits: &DigitPlan,
+        points: &PointPlan,
+        ring: &mut ParamRing,
+        slabs: &[Range<u32>],
+    ) -> Result<PointOffsets, ProveError> {
+        let mut next = 0u32;
+        let mut out = Vec::with_capacity(slabs.len());
+        for s in slabs {
+            if s.start != next || s.end <= s.start {
+                return Err(bad(format!(
+                    "window slab {}..{} does not follow window {next}",
+                    s.start, s.end
+                )));
+            }
+            next = s.end;
+            let nb = digits.n_buckets();
+            out.push(SlabOffsets {
+                windows: s.clone(),
+                clear: self.push_range(
+                    ring,
+                    digits,
+                    points,
+                    s.start * nb,
+                    s.end * nb,
+                    s.end,
+                    self.wg.clear,
+                )?,
+                segmented: self.push_range(
+                    ring,
+                    digits,
+                    points,
+                    s.start * points.slices,
+                    s.end * points.slices,
+                    s.end,
+                    self.wg.segmented,
+                )?,
+                merge: self.push_range(
+                    ring,
+                    digits,
+                    points,
+                    s.start * nb,
+                    s.end * nb,
+                    s.end,
+                    self.wg.merge,
+                )?,
+            });
+        }
+        if next != digits.n_windows() {
+            return Err(bad(format!(
+                "the window slabs end at window {next} of {}",
+                digits.n_windows()
+            )));
+        }
         Ok(PointOffsets {
-            clear: self.push_range(ring, digits, points, rows, self.wg.clear)?,
-            segmented: self.push_range(
-                ring,
-                digits,
-                points,
-                points.seg_threads(digits),
-                self.wg.segmented,
-            )?,
-            merge: self.push_range(ring, digits, points, rows, self.wg.merge)?,
+            slabs: out,
             // One workgroup per window and per ones group, always one dispatch: n_windows is
             // at most 128 and ones_groups at most 64, against a 65535 limit.
             reduce: ring.push(&points.params(digits, 0))?,
@@ -916,21 +997,25 @@ impl<C: PointCurve> MsmPoints<C> {
         })
     }
 
+    /// One block per dispatch over elements `lo..hi`, each guarded at window `windows`.
+    #[allow(clippy::too_many_arguments)]
     fn push_range(
         &self,
         ring: &mut ParamRing,
         digits: &DigitPlan,
         points: &PointPlan,
-        n: u32,
+        lo: u32,
+        hi: u32,
+        windows: u32,
         wg: u32,
     ) -> Result<Vec<u32>, ProveError> {
         let span = self.span(wg);
-        let mut offsets = Vec::with_capacity(self.dispatches(n, wg) as usize);
-        let mut lo = 0u32;
+        let mut offsets = Vec::with_capacity(self.dispatches(hi - lo, wg) as usize);
+        let mut at = lo;
         loop {
-            offsets.push(ring.push(&points.params(digits, lo))?);
-            lo = lo.saturating_add(span);
-            if lo >= n {
+            offsets.push(ring.push(&points.params_to_window(digits, at, windows))?);
+            at = at.saturating_add(span);
+            if at >= hi {
                 break;
             }
         }
@@ -940,10 +1025,26 @@ impl<C: PointCurve> MsmPoints<C> {
     /// Ring slots the point stage consumes for this plan, which is also its dispatch count.
     /// Five at every shape any artifact reaches.
     pub fn slots(&self, digits: &DigitPlan, points: &PointPlan) -> u32 {
-        self.dispatches(digits.rows(), self.wg.clear)
-            + self.dispatches(points.seg_threads(digits), self.wg.segmented)
-            + self.dispatches(digits.rows(), self.wg.merge)
-            + 2
+        self.slots_slabs(
+            digits,
+            points,
+            std::slice::from_ref(&(0..digits.n_windows())),
+        )
+    }
+
+    /// Same, for a point stage encoded in window slabs. Each slab's clear, segmented pass
+    /// and merge cover its own rows, so the count is the same for one slab or for many
+    /// unless a slab boundary splits a dispatch.
+    pub fn slots_slabs(&self, digits: &DigitPlan, points: &PointPlan, slabs: &[Range<u32>]) -> u32 {
+        let mut n = 2;
+        for s in slabs {
+            let rows = (s.end - s.start) * digits.n_buckets();
+            let threads = (s.end - s.start) * points.slices;
+            n += self.dispatches(rows, self.wg.clear)
+                + self.dispatches(threads, self.wg.segmented)
+                + self.dispatches(rows, self.wg.merge);
+        }
+        n
     }
 
     // ---- encoding ----
@@ -962,53 +1063,54 @@ impl<C: PointCurve> MsmPoints<C> {
         binds: &PointBinds,
         offsets: &PointOffsets,
     ) -> Result<(), ProveError> {
-        // A bisection gate, and normally not one: `stop` is 0 unless something has set it.
-        // The five kernels share one pass and one submit, so when the device dies there is
-        // nothing to say which of them killed it. Encoding a prefix and stopping produces a
-        // wrong answer on purpose; the only question it answers is whether the GPU is still
-        // alive, which is the question when it is not.
-        let stop = STOP_AFTER.load(std::sync::atomic::Ordering::Relaxed);
-        let run = |n: u32| stop == 0 || n <= stop;
-        self.encode_clear(pass, digits, binds, offsets)?;
-        if !run(2) {
-            return Ok(());
+        for k in 0..offsets.slabs.len() {
+            self.encode_slab(pass, digits, points, binds, offsets, k)?;
         }
-        self.encode_segmented(pass, digits, points, binds, offsets)?;
-        if !run(3) {
-            return Ok(());
-        }
-        self.encode_merge(pass, digits, binds, offsets)?;
-        if !run(4) {
-            return Ok(());
-        }
-        self.encode_reduce(pass, digits, binds, offsets)?;
-        if !run(5) {
-            return Ok(());
-        }
-        self.encode_ones(pass, points, binds, offsets)
+        self.encode_tail(pass, digits, points, binds, offsets)
     }
 
-    /// The five separately, so a test can run four of them and look at what the fourth wrote.
-    /// Reading the bucket array after the merge is the only way to tell a correct segmented
-    /// pass from a wrong one whose spills the merge happens to undo.
-    pub fn encode_clear(
+    /// The bisection gate `encode` and its halves share, and normally not one: `stop` is 0
+    /// unless something has set it. The five kernels share one pass, so when the device
+    /// dies there is nothing to say which of them killed it. Encoding a prefix and stopping
+    /// produces a wrong answer on purpose; the only question it answers is whether the GPU
+    /// is still alive, which is the question when it is not.
+    fn run_kernel(n: u32) -> bool {
+        let stop = STOP_AFTER.load(std::sync::atomic::Ordering::Relaxed);
+        stop == 0 || n <= stop
+    }
+
+    /// Slab `k` of the point stage: the clear, segmented pass and merge of its windows.
+    /// Complete on its own from the clear, so a submission holding one slab can be run
+    /// again from the start if the GPU cuts it short (`crate::batch`), and independent of
+    /// every other slab: each touches only its own windows' rows and spill slots.
+    pub fn encode_slab(
         &self,
         pass: &mut wgpu::ComputePass<'_>,
         digits: &DigitPlan,
+        points: &PointPlan,
         binds: &PointBinds,
         offsets: &PointOffsets,
+        k: usize,
     ) -> Result<(), ProveError> {
-        self.encode_range(
-            pass,
-            &self.names[CLEAR],
-            &binds.clear,
-            digits.rows(),
-            self.wg.clear,
-            &offsets.clear,
-        )
+        let slab = offsets.slabs.get(k).ok_or_else(|| {
+            bad(format!(
+                "slab {k} of a point stage planned in {} slabs",
+                offsets.slabs.len()
+            ))
+        })?;
+        self.clear_slab(pass, digits, binds, slab)?;
+        if !Self::run_kernel(2) {
+            return Ok(());
+        }
+        self.segmented_slab(pass, points, binds, slab)?;
+        if !Self::run_kernel(3) {
+            return Ok(());
+        }
+        self.merge_slab(pass, digits, binds, slab)
     }
 
-    pub fn encode_segmented(
+    /// The reduction and the ones pass, over every window, after the last slab.
+    pub fn encode_tail(
         &self,
         pass: &mut wgpu::ComputePass<'_>,
         digits: &DigitPlan,
@@ -1016,14 +1118,43 @@ impl<C: PointCurve> MsmPoints<C> {
         binds: &PointBinds,
         offsets: &PointOffsets,
     ) -> Result<(), ProveError> {
-        self.encode_range(
-            pass,
-            &self.names[SEGMENTED],
-            &binds.segmented,
-            points.seg_threads(digits),
-            self.wg.segmented,
-            &offsets.segmented,
-        )
+        if !Self::run_kernel(4) {
+            return Ok(());
+        }
+        self.encode_reduce(pass, digits, binds, offsets)?;
+        if !Self::run_kernel(5) {
+            return Ok(());
+        }
+        self.encode_ones(pass, points, binds, offsets)
+    }
+
+    /// The five separately, so a test can run four of them and look at what the fourth wrote.
+    /// Reading the bucket array after the merge is the only way to tell a correct segmented
+    /// pass from a wrong one whose spills the merge happens to undo. Each covers every slab.
+    pub fn encode_clear(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        digits: &DigitPlan,
+        binds: &PointBinds,
+        offsets: &PointOffsets,
+    ) -> Result<(), ProveError> {
+        for slab in &offsets.slabs {
+            self.clear_slab(pass, digits, binds, slab)?;
+        }
+        Ok(())
+    }
+
+    pub fn encode_segmented(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        points: &PointPlan,
+        binds: &PointBinds,
+        offsets: &PointOffsets,
+    ) -> Result<(), ProveError> {
+        for slab in &offsets.slabs {
+            self.segmented_slab(pass, points, binds, slab)?;
+        }
+        Ok(())
     }
 
     pub fn encode_merge(
@@ -1033,13 +1164,60 @@ impl<C: PointCurve> MsmPoints<C> {
         binds: &PointBinds,
         offsets: &PointOffsets,
     ) -> Result<(), ProveError> {
+        for slab in &offsets.slabs {
+            self.merge_slab(pass, digits, binds, slab)?;
+        }
+        Ok(())
+    }
+
+    fn clear_slab(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        digits: &DigitPlan,
+        binds: &PointBinds,
+        slab: &SlabOffsets,
+    ) -> Result<(), ProveError> {
+        self.encode_range(
+            pass,
+            &self.names[CLEAR],
+            &binds.clear,
+            (slab.windows.end - slab.windows.start) * digits.n_buckets(),
+            self.wg.clear,
+            &slab.clear,
+        )
+    }
+
+    fn segmented_slab(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        points: &PointPlan,
+        binds: &PointBinds,
+        slab: &SlabOffsets,
+    ) -> Result<(), ProveError> {
+        self.encode_range(
+            pass,
+            &self.names[SEGMENTED],
+            &binds.segmented,
+            (slab.windows.end - slab.windows.start) * points.slices,
+            self.wg.segmented,
+            &slab.segmented,
+        )
+    }
+
+    fn merge_slab(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        digits: &DigitPlan,
+        binds: &PointBinds,
+        slab: &SlabOffsets,
+    ) -> Result<(), ProveError> {
         self.encode_range(
             pass,
             &self.names[MERGE],
             &binds.merge,
-            digits.rows(),
+            (slab.windows.end - slab.windows.start) * digits.n_buckets(),
             self.wg.merge,
-            &offsets.merge,
+            &slab.merge,
         )
     }
 
@@ -1215,19 +1393,33 @@ pub struct PointBinds {
     pub ones: wgpu::BindGroup,
 }
 
-/// Dynamic offsets for one point stage, one group per kernel.
+/// Dynamic offsets for one window slab of a point stage: the clear, the segmented pass and
+/// the merge over the windows in `windows`, one offset per dispatch.
 #[derive(Clone, Debug, Default)]
-pub struct PointOffsets {
+pub struct SlabOffsets {
+    pub windows: Range<u32>,
     pub clear: Vec<u32>,
     pub segmented: Vec<u32>,
     pub merge: Vec<u32>,
+}
+
+/// Dynamic offsets for one point stage: its window slabs, then the reduction and the ones
+/// pass, which run once over every window after the last slab. One slab covering every
+/// window is the stage as [`MsmPoints::plan`] lays it out.
+#[derive(Clone, Debug, Default)]
+pub struct PointOffsets {
+    pub slabs: Vec<SlabOffsets>,
     pub reduce: u32,
     pub ones: u32,
 }
 
 impl PointOffsets {
     pub fn total(&self) -> usize {
-        self.clear.len() + self.segmented.len() + self.merge.len() + 2
+        self.slabs
+            .iter()
+            .map(|s| s.clear.len() + s.segmented.len() + s.merge.len())
+            .sum::<usize>()
+            + 2
     }
 }
 

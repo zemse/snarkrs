@@ -699,7 +699,7 @@ impl Bench {
                     Stage::Merge => {
                         p.encode_clear(&mut pass, &self.dplan, &bind, &poff)
                             .expect("encode");
-                        p.encode_segmented(&mut pass, &self.dplan, &pplan, &bind, &poff)
+                        p.encode_segmented(&mut pass, &pplan, &bind, &poff)
                             .expect("encode");
                     }
                     Stage::Reduction => p
@@ -714,7 +714,7 @@ impl Bench {
                         Stage::Accumulate => {
                             p.encode_clear(&mut pass, &self.dplan, &bind, &poff)
                                 .expect("encode");
-                            p.encode_segmented(&mut pass, &self.dplan, &pplan, &bind, &poff)
+                            p.encode_segmented(&mut pass, &pplan, &bind, &poff)
                                 .expect("encode");
                             p.encode_merge(&mut pass, &self.dplan, &bind, &poff)
                                 .expect("encode");
@@ -723,7 +723,7 @@ impl Bench {
                             .encode_clear(&mut pass, &self.dplan, &bind, &poff)
                             .expect("encode"),
                         Stage::Segmented => p
-                            .encode_segmented(&mut pass, &self.dplan, &pplan, &bind, &poff)
+                            .encode_segmented(&mut pass, &pplan, &bind, &poff)
                             .expect("encode"),
                         Stage::Merge => p
                             .encode_merge(&mut pass, &self.dplan, &bind, &poff)

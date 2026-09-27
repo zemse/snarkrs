@@ -530,12 +530,15 @@ impl WgpuBackend {
 
     /// `queue.submit`, counted.
     ///
-    /// Design §3 puts a whole proof in **two** submits, one for `compute_h` and one for
+    /// Design §3 put a whole proof in **two** submits, one for `compute_h` and one for
     /// `msms`, because an empty submit plus its fence measured 0.1 to 0.3 ms on this
     /// platform against 2 to 3 microseconds for an extra dispatch in an already open
-    /// encoder. That is a claim about the code, so it is counted rather than asserted in a
-    /// comment: `tests/stages.rs` reads [`Self::submits`] either side of `compute_h` and
-    /// requires the difference to be exactly one.
+    /// encoder. Stages 0 to 4 still are one; stages 5 to 9 are as many as
+    /// `crate::batch::SUBMISSION_US` makes them, because one long submission was what
+    /// macOS kept killing under load. Both are claims about the code, so they are counted
+    /// rather than asserted in a comment: `tests/stages.rs` reads [`Self::submits`] either
+    /// side of `compute_h` and requires the difference to be exactly one, and
+    /// `tests/proof.rs` holds a whole proof to one plus what the batch reports.
     ///
     /// What the counter cannot see, stated plainly: [`Self::queue`] is public and a caller
     /// that submits through it directly is invisible here. The counter is a regression

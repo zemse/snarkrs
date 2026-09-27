@@ -1,25 +1,72 @@
-//! Stages 5 to 9 as **one submit**: every MSM in a proof, sharing what can be shared.
+//! Stages 5 to 9 as a few short submissions: every MSM in a proof, sharing what can be shared.
 //!
 //! [`crate::msm`] is the digit half of an MSM and [`crate::points`] is the curve half. This
-//! is the file that makes a proof out of them: five MSMs, three counting sorts, one command
-//! encoder, one submission and one readback.
+//! is the file that makes a proof out of them: five MSMs, three counting sorts, one parameter
+//! ring, and a run of command encoders each holding about 300 ms of GPU time.
 //!
-//! # Why one submit, and what the alternative costs
+//! # Why not one submit, which is what the design asked for
 //!
 //! `g16-metal`'s `msm.rs` puts all five MSMs in one command buffer because committing one and
 //! waiting on it costs 0.16 ms and does not get cheaper with less in it, where an extra
-//! dispatch into an already open encoder costs 2 to 3 microseconds. The same ratio holds here
-//! and is if anything wider: [`crate::stages`] measured an empty submit plus its fence at
-//! **22 to 24 microseconds in release** on this M2 Max, against 2 to 3 for a dispatch. A
-//! proof's MSMs are 38 dispatches at the shapes the artifacts reach; five submissions would
-//! be five fences and five `mapAsync` round trips at about 0.3 ms each, which is 1.6 ms of
-//! pure latency on a stage that is trying to get under 100.
+//! dispatch into an already open encoder costs 2 to 3 microseconds. The same ratio holds here:
+//! [`crate::stages`] measured an empty submit plus its fence at **22 to 24 microseconds in
+//! release** on this M2 Max, and a `mapAsync` round trip at about 0.3 ms. Design §3 therefore
+//! put the whole of stages 5 to 9 in one submission, and that is what this file did until
+//! BUG-32.
 //!
-//! So: one [`wgpu::CommandEncoder`], one compute pass, every dispatch of every MSM in it,
-//! then five `copy_buffer_to_buffer` calls into five windows of a **single** staging buffer,
-//! then one submit and one map. Design §3 caps the whole per-proof readback at 64 KiB and
-//! [`MsmBatch::last_readback_bytes`] reports what a given proof actually asks for, so the
-//! claim is checkable rather than asserted.
+//! What the one submission cost is the whole stage every time macOS took the GPU back. The
+//! kill in [`crate::readback::Seal`]'s docs ends the compute pass that is running, and under
+//! another process's load it ended the 500 to 700 ms MSM pass in 75 of 76 aborts against
+//! once for the 20 ms stage 0 to 4 pass; g16-metal saw 350 ms buffers killed and 200 ms ones
+//! survive. Four retries of the whole pass were not enough (16 of 40 CLI proofs gave up), and
+//! each retry threw away everything that had run.
+//!
+//! So the batch is cut into submissions of about [`SUBMISSION_US`] of estimated GPU time,
+//! each sealed and checked on its own, and a submission the GPU cut short is the only thing
+//! run again, up to [`ATTEMPTS`] times. The cut is by **window slabs** of the point stage,
+//! not by sub-MSMs: a G2 MSM over `js_16x16_d32` is 520 ms of the stage's 700, and cutting
+//! it into five sub-MSMs measured 693 ms, into nine 1,138 ms, because every sub-MSM pays a
+//! bucket clear, merge and reduction of its own and under-occupies the GPU while it runs. A
+//! window slab ([`crate::points::MsmPoints::plan_slabs`]) is the same dispatches
+//! distributed over more encoders: its clear, accumulation and merge touch only its own
+//! windows' rows, so a slab is complete from its clear and independent of every other, and
+//! the reduction runs once after the last.
+//!
+//! # What the kill turned out to be, measured, and what that set the two numbers to
+//!
+//! Sixty `g16 prove` calls per configuration on railgun-13x01 under two other proof loops,
+//! rotated so the load drifted over every configuration alike:
+//!
+//! ```text
+//! configuration                            gave up   aborted attempts   wrong
+//! main (one 700 ms pass, 4 attempts)        12/60          77             1
+//! one pass, 8 attempts                       2/60         102             0
+//! 100 ms slabs, 4 attempts                   1/60         174             0
+//! 100 ms slabs, 8 attempts                   1/60         185             0
+//! 300 ms slabs, 8 attempts                   0/60         108             0
+//! ```
+//!
+//! Two things follow. The kill is mostly per command buffer and only weakly per
+//! millisecond: a 100 ms slab was killed about a quarter of the time where the 700 ms pass
+//! was killed half of it, so seven times the buffers is 3.5 times the kills, and cutting
+//! finer than the GPU's occupancy allows (below) costs more than it saves. And the kills
+//! come in bursts: a submission whose previous attempt was killed was killed again 36 to
+//! 61% of the time against 25% for one that was not, so the fourth attempt at 1.6 s often
+//! sat inside the burst the first one hit, and the attempt count is the lever that moved
+//! the give-up rate, from 12 to 2 in 60 on its own. The split is what makes an attempt
+//! cheap enough to have eight of. The wrong proof is the stage 0 to 4 case in
+//! `security/README.md` finding 7, which this file does not touch.
+//!
+//! The cost is one round trip per submission, about 0.4 ms each, and the occupancy a slab
+//! gives up: the G2 accumulation at `js_16x16_d32` is 270 workgroups of 128 threads over
+//! 38 GPU cores, so a slab of a sixth of it runs the GPU a sixth full. Warm, against one
+//! submission: +3 to 5% of MSM time at 300 ms on `js_16x16_d32` and none on `anon-aadhaar`,
+//! +12 to 17% at 100 ms on both.
+//!
+//! The readback is still one staging buffer, one window of it per sub-MSM, and design §3's
+//! 64 KiB cap on it still applies: [`MsmBatch::last_readback_bytes`] reports what a given
+//! proof actually asked for and [`MsmBatch::last_submits`] how many submissions it took, so
+//! both claims are checkable rather than asserted.
 //!
 //! # Why the caller groups the jobs instead of this file deducing the grouping
 //!
@@ -74,7 +121,7 @@ use crate::gen::points as wgsl;
 use crate::msm::{pack_scalars, storage_buffer, DigitBuffers, DigitPlan, MsmDigits};
 use crate::params::ParamRing;
 use crate::points::{MsmPointsG1, MsmPointsG2, PointBuffers, PointPlan};
-use crate::readback::Readback;
+use crate::readback::{is_aborted, Readback};
 
 /// Bytes one scalar occupies on the device, in either encoding.
 const FR_BYTES: u64 = (LIMBS * 4) as u64;
@@ -86,6 +133,102 @@ const FR_BYTES: u64 = (LIMBS * 4) as u64;
 /// the storage-binding alignment. Keeping the whole readback on the same grid means a dump of
 /// it lines up with the buffers it came from.
 const SLICE_ALIGN: u64 = 256;
+
+/// GPU time one submission of the batch may hold, in microseconds of [`slab_us`]'s
+/// estimate, unless a single window is over it (see [`MsmBatch::pieces`]).
+/// `G16_WGPU_SUBMIT_US` overrides it.
+///
+/// 300 ms and not the 100 the task asked for, from the measurement in the module docs: the
+/// kill is mostly per command buffer, so a 100 ms slab is killed a quarter of the time
+/// where the 700 ms pass was killed half of it, and under two proof loops 100 ms slabs gave
+/// up 1 proof in 60 against 0 in 60 at 300 ms, while costing 12 to 17% of warm MSM time
+/// against 3 to 5%: a G2 accumulation at `js_16x16_d32` is 270 workgroups, and a slab of a
+/// sixth of it leaves most of the GPU idle.
+pub const SUBMISSION_US: f64 = 300_000.0;
+
+/// Attempts at one submission the GPU cut short, counting the first, with `g16-metal`'s
+/// backoff between them, capped at 1.6 s. Native only: the browser has no thread to sleep
+/// on, and the error reaches the page as it is. `G16_WGPU_ATTEMPTS` overrides it.
+///
+/// Twice `g16-metal`'s four, because a submission here is a fraction of the batch and a
+/// lost attempt costs that much less, and because the kills come in bursts (the table in
+/// the module docs), so the fourth attempt at 1.6 s is often still inside the burst the
+/// first one hit.
+#[cfg(not(target_arch = "wasm32"))]
+const ATTEMPTS: u32 = 8;
+#[cfg(target_arch = "wasm32")]
+const ATTEMPTS: u32 = 1;
+
+/// [`ATTEMPTS`], or the override.
+#[cfg(not(target_arch = "wasm32"))]
+fn attempts() -> u32 {
+    std::env::var("G16_WGPU_ATTEMPTS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(ATTEMPTS)
+}
+#[cfg(target_arch = "wasm32")]
+fn attempts() -> u32 {
+    ATTEMPTS
+}
+
+/// Nanoseconds one (window, general scalar) entry costs in the segmented accumulation,
+/// per curve. Measured warm on this M2 Max: G1 5.8 ns at c = 13 (`js_384x384_d32`) to
+/// 8.8 ns at c = 8 (`js_16x16_d32`), G2 93 to 118 ns at the same two shapes. A budget, not
+/// a benchmark: it only has to put a slab within a factor of two of its measured time, and
+/// the 13x between the curves is what matters, not the 3x their arithmetic would predict.
+fn entry_ns(curve: wgsl::Curve) -> f64 {
+    if curve.suffix == wgsl::G2.suffix {
+        105.0
+    } else {
+        7.0
+    }
+}
+
+/// Microseconds one bucket row costs in the clear, the merge and the reduction together.
+/// Measured as the fixed cost of a G1 sub-MSM at c = 13, 25 ms over 81,920 rows.
+const ROW_US: f64 = 0.3;
+
+/// Nanoseconds one (window, scalar) costs in the counting sort. Measured on
+/// `anon-aadhaar`, whose 1.1M scalars are 92% zeros and ones: 39 ms of sort over 35M
+/// digits.
+const SORT_NS: f64 = 1.0;
+
+/// Estimated GPU microseconds of `windows` windows of one sub-MSM's point stage.
+fn slab_us(curve: wgsl::Curve, dplan: &DigitPlan, windows: u32) -> f64 {
+    f64::from(windows)
+        * (entry_ns(curve) * f64::from(dplan.cap()) / 1000.0
+            + ROW_US * f64::from(dplan.n_buckets()))
+}
+
+/// Estimated GPU microseconds of one piece's counting sort.
+fn sort_us(dplan: &DigitPlan) -> f64 {
+    SORT_NS * f64::from(dplan.n()) * f64::from(dplan.n_windows()) / 1000.0
+}
+
+/// [`SUBMISSION_US`], or the override.
+fn submission_us() -> f64 {
+    std::env::var("G16_WGPU_SUBMIT_US")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|us| *us > 0.0)
+        .unwrap_or(SUBMISSION_US)
+}
+
+/// Window slabs for a point stage of `us` estimated microseconds: the fewest of near equal
+/// size that each fit `budget`, and never more than one per window.
+fn slabs_for(n_windows: u32, us: f64, budget: f64) -> Vec<std::ops::Range<u32>> {
+    let k = ((us / budget).ceil().max(1.0) as u32).min(n_windows.max(1));
+    (0..k)
+        .map(|i| {
+            let lo = (u64::from(i) * u64::from(n_windows) / u64::from(k)) as u32;
+            let hi = (u64::from(i + 1) * u64::from(n_windows) / u64::from(k)) as u32;
+            lo..hi
+        })
+        .filter(|r| r.end > r.start)
+        .collect()
+}
 
 // ---------------------------------------------------------------------------
 // Resident base vectors
@@ -334,12 +477,23 @@ struct Piece {
     dplan: DigitPlan,
 }
 
-/// One job over one piece: the base buffer it reads and the point plan inside it.
+/// One job over one piece: the base buffer it reads, the point plan inside it, and the
+/// window slabs its point stage is encoded in.
 struct PieceJob {
     pi: usize,
     ji: usize,
     chunk: usize,
     pplan: PointPlan,
+    slabs: Vec<std::ops::Range<u32>>,
+}
+
+/// One slab of one sub-MSM in encode order, with the sort it depends on when it is the
+/// first of its piece, and what it is estimated to cost. What a submission is packed from.
+struct Unit {
+    pj: usize,
+    slab: usize,
+    sort: Option<usize>,
+    us: f64,
 }
 
 /// Where a group's scalars come from.
@@ -468,6 +622,8 @@ pub struct MsmBatch {
     /// Sub-MSMs the most recent [`Self::run`] dispatched, G1 and G2. See
     /// [`Self::last_sub_msms`].
     last_sub_msms: [AtomicU32; 2],
+    /// Submissions the most recent [`Self::run`] made. See [`Self::last_submits`].
+    last_submits: AtomicU32,
 }
 
 impl MsmBatch {
@@ -480,6 +636,7 @@ impl MsmBatch {
             pool: Mutex::new(Vec::new()),
             last_readback: AtomicU64::new(0),
             last_sub_msms: [AtomicU32::new(0), AtomicU32::new(0)],
+            last_submits: AtomicU32::new(0),
         })
     }
 
@@ -524,6 +681,14 @@ impl MsmBatch {
         )
     }
 
+    /// Submissions the most recent [`Self::run`] made, counting every attempt at one the
+    /// GPU cut short: one for a batch under [`SUBMISSION_US`], more for one that was cut.
+    /// `tests/proof.rs` holds a proof's submit count to one plus this. Same attribution
+    /// caveat as [`Self::last_readback_bytes`].
+    pub fn last_submits(&self) -> u32 {
+        self.last_submits.load(Ordering::Relaxed)
+    }
+
     /// Scratch sets sitting idle in the pool. Public so a test can assert that two concurrent
     /// proofs hold two different sets rather than racing on one, which is not observable from
     /// outside otherwise.
@@ -531,7 +696,8 @@ impl MsmBatch {
         self.pool.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
-    /// Every MSM in `groups`, in one submit, in job order.
+    /// Every MSM in `groups`, in job order, over as few submissions as [`SUBMISSION_US`]
+    /// allows.
     ///
     /// The returned vector is flat: group order, then job order within each group. A job with
     /// `n == 0` contributes the identity and dispatches nothing, which is what an empty L
@@ -539,7 +705,21 @@ impl MsmBatch {
     ///
     /// `mont`, if present, is one `fr_mont_to_std` dispatch encoded before everything else.
     /// The compute pass orders dispatches and makes each one's writes visible to the next, so
-    /// the sorts that read `mont.dst` see the converted values with no explicit barrier.
+    /// the sorts that read `mont.dst` see the converted values with no explicit barrier; a
+    /// later submission reads what an earlier one wrote because the queue runs them in order
+    /// and each is waited on before the next is encoded.
+    ///
+    /// # A submission the GPU cuts short is run again, alone
+    ///
+    /// Every submission ends with [`crate::readback::Seal`]'s token and is refused without
+    /// it. On native it is then re-encoded and submitted again, up to [`ATTEMPTS`] times with
+    /// a backoff, and only it: everything before it was verified complete and nothing it
+    /// writes is read by anything before it. It can be run again because each of its parts
+    /// is complete from its own first write: the conversion is a pure map, a sort zeroes its
+    /// counters first, a window slab clears its buckets first, and the reduction and the
+    /// ones pass only read what the slabs left. Once the attempts are spent the error is a
+    /// `ProveError::Device`, which `g16 prove`'s fallback proves past. The stage timing the
+    /// caller keeps includes the attempts that were lost.
     ///
     /// # A group over the binding limit runs as several sub-MSMs
     ///
@@ -561,7 +741,7 @@ impl MsmBatch {
         groups: &[Group<'_>],
     ) -> Result<Vec<MsmResult>, ProveError> {
         let limit = backend.granted_limits().max_storage_buffer_binding_size;
-        self.run_with_binding_limit(backend, mont, groups, limit)
+        self.run_with_limits(backend, mont, groups, limit, submission_us())
             .await
     }
 
@@ -575,6 +755,20 @@ impl MsmBatch {
         mont: Option<MontConvert<'_>>,
         groups: &[Group<'_>],
         limit: u64,
+    ) -> Result<Vec<MsmResult>, ProveError> {
+        self.run_with_limits(backend, mont, groups, limit, submission_us())
+            .await
+    }
+
+    /// Same, with the submission budget of the caller's choosing as well. Public so a test
+    /// can force a key that fits one submission into one per window.
+    pub async fn run_with_limits(
+        &self,
+        backend: &WgpuBackend,
+        mont: Option<MontConvert<'_>>,
+        groups: &[Group<'_>],
+        limit: u64,
+        budget_us: f64,
     ) -> Result<Vec<MsmResult>, ProveError> {
         // ---- plan, on the host, before anything is allocated or encoded ----
         let mut pieces: Vec<Piece> = Vec::with_capacity(groups.len());
@@ -605,17 +799,59 @@ impl MsmBatch {
                         Job::G1 { .. } => self.g1.plan_points(&p.dplan, local)?,
                         Job::G2 { .. } => self.g2.plan_points(&p.dplan, local)?,
                     };
+                    let us = slab_us(job.curve(), &p.dplan, p.dplan.n_windows());
                     pjobs.push(PieceJob {
                         pi,
                         ji,
                         chunk,
                         pplan,
+                        slabs: slabs_for(p.dplan.n_windows(), us, budget_us),
                     });
                 }
                 pieces.push(p);
             }
         }
         let job_of = |pj: &PieceJob| &groups[pieces[pj.pi].gi].jobs[pj.ji];
+
+        // The slabs in encode order, each with the sort it needs run first, packed into
+        // submissions of at most `budget_us` each unless a single slab is over it.
+        let mut units: Vec<Unit> = Vec::new();
+        let mut sorted: Vec<bool> = vec![false; pieces.len()];
+        for (i, pj) in pjobs.iter().enumerate() {
+            let p = &pieces[pj.pi];
+            let curve = job_of(pj).curve();
+            for (k, s) in pj.slabs.iter().enumerate() {
+                let mut us = slab_us(curve, &p.dplan, s.end - s.start);
+                let sort = (!sorted[pj.pi]).then_some(pj.pi);
+                if sort.is_some() {
+                    sorted[pj.pi] = true;
+                    us += sort_us(&p.dplan);
+                }
+                if k + 1 == pj.slabs.len() {
+                    // The ones pass walks every scalar once.
+                    us += SORT_NS * f64::from(p.dplan.n()) / 1000.0;
+                }
+                units.push(Unit {
+                    pj: i,
+                    slab: k,
+                    sort,
+                    us,
+                });
+            }
+        }
+        let mut subs: Vec<std::ops::Range<usize>> = Vec::new();
+        let mut start = 0usize;
+        let mut acc = 0.0f64;
+        for (ui, u) in units.iter().enumerate() {
+            if ui > start && acc + u.us > budget_us {
+                subs.push(start..ui);
+                start = ui;
+                acc = 0.0;
+            }
+            acc += u.us;
+        }
+        // One submission even with nothing to dispatch, so a `mont` alone still runs.
+        subs.push(start..units.len());
 
         // ---- check out and grow the scratch ----
         let mut sc = self
@@ -710,8 +946,8 @@ impl MsmBatch {
         for pj in &pjobs {
             let dplan = pieces[pj.pi].dplan;
             slots += match job_of(pj) {
-                Job::G1 { .. } => self.g1.slots(&dplan, &pj.pplan),
-                Job::G2 { .. } => self.g2.slots(&dplan, &pj.pplan),
+                Job::G1 { .. } => self.g1.slots_slabs(&dplan, &pj.pplan, &pj.slabs),
+                Job::G2 { .. } => self.g2.slots_slabs(&dplan, &pj.pplan, &pj.slabs),
             };
         }
         let slots = slots.max(1);
@@ -733,18 +969,20 @@ impl MsmBatch {
         for pj in &pjobs {
             let dplan = pieces[pj.pi].dplan;
             point_off.push(match job_of(pj) {
-                Job::G1 { .. } => self.g1.plan(&dplan, &pj.pplan, ring)?,
-                Job::G2 { .. } => self.g2.plan(&dplan, &pj.pplan, ring)?,
+                Job::G1 { .. } => self.g1.plan_slabs(&dplan, &pj.pplan, ring, &pj.slabs)?,
+                Job::G2 { .. } => self.g2.plan_slabs(&dplan, &pj.pplan, ring, &pj.slabs)?,
             });
         }
         ring.flush(backend);
 
-        // ---- the readback, one staging buffer for every sub-MSM's window sums ----
-        let mut slices: Vec<(u64, u64)> = Vec::with_capacity(pjobs.len());
+        // ---- the readback, one staging buffer with a window per sub-MSM ----
+        //
+        // Sized for every sub-MSM at once and filled a submission at a time: the sub-MSMs a
+        // submission finishes are copied into it from offset 0 and read back before the next
+        // submission is encoded, so no submission's slices can be more than all of them.
         let mut total = 0u64;
         for (i, pj) in pjobs.iter().enumerate() {
             let bytes = sc.points[i].bufs.results_bytes(job_of(pj).curve());
-            slices.push((total, bytes));
             total += bytes.div_ceil(SLICE_ALIGN) * SLICE_ALIGN;
         }
         let total = total.max(4);
@@ -810,69 +1048,7 @@ impl MsmBatch {
             });
         }
 
-        // ---- encode: one encoder, one compute pass, every dispatch ----
-        let mut enc = backend
-            .device()
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("g16 stages 5-9"),
-            });
-        {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("g16 stages 5-9"),
-                timestamp_writes: None,
-            });
-            if let (Some(m), Some(bind)) = (&mont, &mont_bind) {
-                self.digits.encode_mont(&mut pass, bind, m.n, &mont_off)?;
-            }
-            for (pi, p) in pieces.iter().enumerate() {
-                self.digits
-                    .encode_sort(&mut pass, &p.dplan, &sort_binds[pi], &sort_off[pi])?;
-            }
-            for (i, pj) in pjobs.iter().enumerate() {
-                let dplan = pieces[pj.pi].dplan;
-                match job_of(pj) {
-                    Job::G1 { .. } => self.g1.encode(
-                        &mut pass,
-                        &dplan,
-                        &pj.pplan,
-                        &point_binds[i],
-                        &point_off[i],
-                    )?,
-                    Job::G2 { .. } => self.g2.encode(
-                        &mut pass,
-                        &dplan,
-                        &pj.pplan,
-                        &point_binds[i],
-                        &point_off[i],
-                    )?,
-                }
-            }
-            // Last, so the token is present only if every MSM's last dispatch ran.
-            sc.readback
-                .as_ref()
-                .expect("just built")
-                .seal()
-                .dispatch(backend, &mut pass);
-        }
-        let rb = sc.readback.as_ref().expect("just built");
-        for (i, (at, bytes)) in slices.iter().enumerate() {
-            rb.copy_from_at(&mut enc, &sc.points[i].bufs.results, 0, *at, *bytes)?;
-        }
-
-        // One submit and one map, for the whole of stages 5 to 9.
-        self.last_readback.store(total, Ordering::Relaxed);
-        let (mut n_g1, mut n_g2) = (0u32, 0u32);
-        for pj in &pjobs {
-            match job_of(pj) {
-                Job::G1 { .. } => n_g1 += 1,
-                Job::G2 { .. } => n_g2 += 1,
-            }
-        }
-        self.last_sub_msms[0].store(n_g1, Ordering::Relaxed);
-        self.last_sub_msms[1].store(n_g2, Ordering::Relaxed);
-        let raw = rb.submit_and_read(backend, enc, total).await?;
-
-        // ---- the host tail: Horner over each sub-MSM's window sums, summed per job ----
+        // ---- encode, submit and read, one submission at a time ----
         //
         // `out` is indexed by the flat job number, `first_job[gi] + ji`, so a group whose
         // jobs were all skipped for `n == 0` still occupies its own slots and the caller's
@@ -887,46 +1063,151 @@ impl MsmBatch {
             n_jobs += g.jobs.len();
         }
         let mut out: Vec<Option<MsmResult>> = vec![None; n_jobs];
-        for (i, pj) in pjobs.iter().enumerate() {
-            let p = &pieces[pj.pi];
-            let (at, bytes) = slices[i];
-            let window = &raw[at as usize..(at + bytes) as usize];
-            let pts = &sc.points[i].bufs;
-            let part = match job_of(pj) {
-                Job::G1 { .. } => MsmResult::G1(self.g1.combine(window, &p.dplan, &pj.pplan, pts)?),
-                Job::G2 { .. } => MsmResult::G2(self.g2.combine(window, &p.dplan, &pj.pplan, pts)?),
-            };
-            let slot = &mut out[first_job[p.gi] + pj.ji];
-            *slot = Some(match (slot.take(), part) {
-                (None, part) => part,
-                (Some(MsmResult::G1(a)), MsmResult::G1(b)) => MsmResult::G1(a + b),
-                (Some(MsmResult::G2(a)), MsmResult::G2(b)) => MsmResult::G2(a + b),
-                _ => return Err(bad("two pieces of one job are in different groups")),
-            });
-            // The trace sees only the five final points. Under the knob, record what
-            // `combine` just folded, so a wrong final point names a window instead of a run.
-            // See `WINDOW_DEBUG` for the iPhone this is for. `i` is the flat sub-MSM index,
-            // in the deterministic order the caller listed the jobs, so the labels line up
-            // between two machines.
-            if crate::points::WINDOW_DEBUG.load(Ordering::Relaxed) != 0 {
-                crate::points::window_log(&match job_of(pj) {
-                    Job::G1 { .. } => self.g1.debug_windows(
-                        &format!("j{i}_g1"),
-                        window,
-                        &p.dplan,
-                        &pj.pplan,
-                        pts,
-                    )?,
-                    Job::G2 { .. } => self.g2.debug_windows(
-                        &format!("j{i}_g2"),
-                        window,
-                        &p.dplan,
-                        &pj.pplan,
-                        pts,
-                    )?,
-                });
+        let (mut n_g1, mut n_g2) = (0u32, 0u32);
+        for pj in &pjobs {
+            match job_of(pj) {
+                Job::G1 { .. } => n_g1 += 1,
+                Job::G2 { .. } => n_g2 += 1,
             }
         }
+        self.last_sub_msms[0].store(n_g1, Ordering::Relaxed);
+        self.last_sub_msms[1].store(n_g2, Ordering::Relaxed);
+        let rb = sc.readback.as_ref().expect("just built");
+        let mut read_bytes = 0u64;
+        let mut submits = 0u32;
+        for (si, sub) in subs.iter().enumerate() {
+            // The sub-MSMs this submission finishes, and their windows of the staging buffer.
+            let done: Vec<usize> = units[sub.clone()]
+                .iter()
+                .filter(|u| u.slab + 1 == pjobs[u.pj].slabs.len())
+                .map(|u| u.pj)
+                .collect();
+            let mut slices: Vec<(u64, u64)> = Vec::with_capacity(done.len());
+            let mut bytes_here = 0u64;
+            for &i in &done {
+                let bytes = sc.points[i].bufs.results_bytes(job_of(&pjobs[i]).curve());
+                slices.push((bytes_here, bytes));
+                bytes_here += bytes.div_ceil(SLICE_ALIGN) * SLICE_ALIGN;
+            }
+            let bytes_here = bytes_here.max(4);
+            read_bytes += bytes_here;
+
+            let mut attempt = 1u32;
+            let attempts = attempts();
+            let raw = loop {
+                let mut enc =
+                    backend
+                        .device()
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("g16 stages 5-9"),
+                        });
+                {
+                    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("g16 stages 5-9"),
+                        timestamp_writes: None,
+                    });
+                    if si == 0 {
+                        if let (Some(m), Some(bind)) = (&mont, &mont_bind) {
+                            self.digits.encode_mont(&mut pass, bind, m.n, &mont_off)?;
+                        }
+                    }
+                    for u in &units[sub.clone()] {
+                        let pj = &pjobs[u.pj];
+                        let dplan = &pieces[pj.pi].dplan;
+                        if let Some(pi) = u.sort {
+                            self.digits.encode_sort(
+                                &mut pass,
+                                dplan,
+                                &sort_binds[pi],
+                                &sort_off[pi],
+                            )?;
+                        }
+                        let last = u.slab + 1 == pj.slabs.len();
+                        match job_of(pj) {
+                            Job::G1 { .. } => {
+                                let (b, o) = (&point_binds[u.pj], &point_off[u.pj]);
+                                self.g1
+                                    .encode_slab(&mut pass, dplan, &pj.pplan, b, o, u.slab)?;
+                                if last {
+                                    self.g1.encode_tail(&mut pass, dplan, &pj.pplan, b, o)?;
+                                }
+                            }
+                            Job::G2 { .. } => {
+                                let (b, o) = (&point_binds[u.pj], &point_off[u.pj]);
+                                self.g2
+                                    .encode_slab(&mut pass, dplan, &pj.pplan, b, o, u.slab)?;
+                                if last {
+                                    self.g2.encode_tail(&mut pass, dplan, &pj.pplan, b, o)?;
+                                }
+                            }
+                        }
+                    }
+                    // Last, so the token is present only if every dispatch above ran.
+                    rb.seal().dispatch(backend, &mut pass);
+                }
+                for (k, &i) in done.iter().enumerate() {
+                    let (at, bytes) = slices[k];
+                    rb.copy_from_at(&mut enc, &sc.points[i].bufs.results, 0, at, bytes)?;
+                }
+                submits += 1;
+                match rb.submit_and_read(backend, enc, bytes_here).await {
+                    Err(e) if is_aborted(&e) && attempt < attempts => {
+                        wait_before_retry(si + 1, subs.len(), &e, attempt, attempts);
+                        attempt += 1;
+                    }
+                    r => break r?,
+                }
+            };
+
+            // ---- the host tail: Horner over each sub-MSM's window sums, summed per job ----
+            for (k, &i) in done.iter().enumerate() {
+                let pj = &pjobs[i];
+                let p = &pieces[pj.pi];
+                let (at, bytes) = slices[k];
+                let window = &raw[at as usize..(at + bytes) as usize];
+                let pts = &sc.points[i].bufs;
+                let part = match job_of(pj) {
+                    Job::G1 { .. } => {
+                        MsmResult::G1(self.g1.combine(window, &p.dplan, &pj.pplan, pts)?)
+                    }
+                    Job::G2 { .. } => {
+                        MsmResult::G2(self.g2.combine(window, &p.dplan, &pj.pplan, pts)?)
+                    }
+                };
+                let slot = &mut out[first_job[p.gi] + pj.ji];
+                *slot = Some(match (slot.take(), part) {
+                    (None, part) => part,
+                    (Some(MsmResult::G1(a)), MsmResult::G1(b)) => MsmResult::G1(a + b),
+                    (Some(MsmResult::G2(a)), MsmResult::G2(b)) => MsmResult::G2(a + b),
+                    _ => return Err(bad("two pieces of one job are in different groups")),
+                });
+                // The trace sees only the five final points. Under the knob, record what
+                // `combine` just folded, so a wrong final point names a window instead of a
+                // run. See `WINDOW_DEBUG` for the iPhone this is for. `i` is the flat
+                // sub-MSM index, in the deterministic order the caller listed the jobs, so
+                // the labels line up between two machines.
+                if crate::points::WINDOW_DEBUG.load(Ordering::Relaxed) != 0 {
+                    crate::points::window_log(&match job_of(pj) {
+                        Job::G1 { .. } => self.g1.debug_windows(
+                            &format!("j{i}_g1"),
+                            window,
+                            &p.dplan,
+                            &pj.pplan,
+                            pts,
+                        )?,
+                        Job::G2 { .. } => self.g2.debug_windows(
+                            &format!("j{i}_g2"),
+                            window,
+                            &p.dplan,
+                            &pj.pplan,
+                            pts,
+                        )?,
+                    });
+                }
+            }
+        }
+        self.last_readback.store(read_bytes, Ordering::Relaxed);
+        self.last_submits.store(submits, Ordering::Relaxed);
         // Every job in a group with `n == 0` was skipped above, and its answer is the empty
         // sum. An empty L query is the real case: a circuit whose wires are all public.
         for (gi, g) in groups.iter().enumerate() {
@@ -957,6 +1238,12 @@ impl MsmBatch {
     /// the window width is chosen per piece from its general count and a narrower window has
     /// more windows: 65,536 general scalars at c = 8 take 32 windows of entries where 100,000
     /// at c = 13 take 20, so a shorter piece can want a larger entry array.
+    ///
+    /// Never cut for [`SUBMISSION_US`]: a window is the finest slab there is, and a job whose
+    /// single window is over the budget (a dense 2^22 key's G2 job under `auto` limits, at
+    /// about 310 ms a window) runs one window per submission rather than paying a second
+    /// sort, clear, merge and reduction. Cutting it into two sub-MSMs instead measured 9.7 s
+    /// of MSM against 7.6 s in one.
     fn pieces(&self, gi: usize, g: &Group<'_>, limit: u64) -> Result<Vec<Piece>, ProveError> {
         if g.n == 0 {
             return Ok(Vec::new());
@@ -1031,4 +1318,22 @@ impl MsmBatch {
         }
         Ok(true)
     }
+}
+
+/// Reports a submission the GPU cut short and sleeps `g16-metal`'s backoff before it is run
+/// again: 400, 800, then 1600 ms from the third attempt on. Native only; see [`ATTEMPTS`].
+#[cfg(not(target_arch = "wasm32"))]
+fn wait_before_retry(which: usize, of: usize, e: &ProveError, attempt: u32, of_attempts: u32) {
+    let wait = std::time::Duration::from_millis(200 << attempt.min(3));
+    eprintln!(
+        "wgpu: stages 5 to 9, submission {which} of {of}: {e}; attempt {attempt} of \
+         {of_attempts}, retrying in {} ms",
+        wait.as_millis()
+    );
+    std::thread::sleep(wait);
+}
+
+/// Never reached: [`ATTEMPTS`] is 1 here, so no submission is run twice.
+#[cfg(target_arch = "wasm32")]
+fn wait_before_retry(_which: usize, _of: usize, _e: &ProveError, _attempt: u32, _of_attempts: u32) {
 }

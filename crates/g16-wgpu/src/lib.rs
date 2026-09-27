@@ -25,9 +25,10 @@
 //! fifth.
 //!
 //! [`batch`] joins the two halves: it shares one set of MSM modules across every circuit and
-//! runs all five jobs of a proof in one submit, cutting any job whose bases or scratch are
-//! over the storage binding limit into sub-MSMs the host sums, the way [`gather`] cuts a
-//! CSR over it into row chunks. [`backend`] is the `g16_core::Backend` and
+//! runs all five jobs of a proof over a few submissions of about 300 ms of GPU time each,
+//! so the one macOS kills under load is the only one run again, cutting any job whose bases
+//! or scratch are over the storage binding limit into sub-MSMs the host sums, the way
+//! [`gather`] cuts a CSR over it into row chunks. [`backend`] is the `g16_core::Backend` and
 //! `g16_core::PreparedCircuit` implementation over the lot, and `wasm` is the same two async
 //! entry points exported to a browser's Web Worker. There is no CPU fallback at any stage and
 //! no size gate, so a `wgpu` number belongs to `wgpu`.
@@ -108,6 +109,6 @@ pub use points::{
     PointBinds, PointBuffers, PointCurve, PointOffsets, PointPlan,
 };
 pub use pointwise::{HJoin, HJoinParams};
-pub use readback::{is_aborted, Readback, Seal, SealKernel, Sealed};
+pub use readback::{is_aborted, Readback, Seal, SealKernel, Sealed, REFUSE_NEXT};
 pub use selftest::Check;
 pub use stages::{HStages, Stage4, WgpuHandle};

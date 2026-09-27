@@ -28,9 +28,10 @@ mod gpulock;
 /// Every test here proves on the one device [`device`] hands out, and
 /// `WgpuBackend::exclusive` already serialises the GPU section of a proof, so a lock here
 /// buys nothing for correctness *on one device*. What it buys is that
-/// `a_whole_proof_is_two_submits_and_the_readback_is_bounded` can read a device-global submit
-/// counter and get the number this binary's own proof made rather than the number four
-/// concurrent tests made: the first draft of that test read 18 where the answer is 2.
+/// `a_whole_proof_submits_once_for_h_then_per_msm_slab_and_the_readback_is_bounded` can read
+/// a device-global submit counter and get the number this binary's own proof made rather
+/// than the number four concurrent tests made: the first draft of that test read 18 where
+/// the answer was 2.
 ///
 /// The obvious fix was to give that one test a **second** `WgpuBackend`, so its counter was
 /// private. That is what the second draft did, and it made three unrelated tests fail with
@@ -272,6 +273,97 @@ fn proving_the_same_witness_twice_is_stable() {
         let p2 = prove_with_blinders(circuit.as_ref(), &witness, r, s, &mut t).expect("2");
         assert_eq!((p1.a, p1.b, p1.c), (p2.a, p2.b, p2.c), "{}", a.name);
     });
+}
+
+/// A proof in which every submission was refused once and run again is the same proof.
+///
+/// The GPU cuts a submission short only under another process's load (`g16_wgpu::Seal`),
+/// so the retry paths, `retry_aborted` around stages 0 to 4 in `g16_wgpu::backend` and the
+/// per-submission loop in `g16_wgpu::batch`, ran only by accident until this. Here
+/// `REFUSE_NEXT` stales the token of the first attempt at stages 0 to 4 and at each MSM
+/// submission in turn, so every retry path runs on every artifact, and the proof has to be
+/// bit for bit the one an unrefused run gives at the same blinders. The submit count is
+/// held to exactly twice the unrefused one, so a retry that re-ran more than its own
+/// submission, or that was silently skipped, shows here.
+///
+/// Written after three CLI proofs whose stage 0 to 4 pass was aborted under load came back
+/// wrong with every token in place (BUG-32's lane, `security/README.md` finding 7). This
+/// test passing says the retry itself is exact and the wrong proofs are something the GPU
+/// does that the token does not see.
+///
+/// Under the cross-process lock, like the timing tests: a submission another process's
+/// load gets killed for real is a retry this test did not plan, and the counts below are
+/// exact.
+#[test]
+fn a_proof_whose_every_submission_was_refused_once_is_the_same_proof() {
+    let _one_at_a_time = exclusive();
+    let _lock = gpulock::exclusive_gpu();
+    let device = device();
+    for_each_artifact(
+        "a_proof_whose_every_submission_was_refused_once_is_the_same_proof",
+        |a| {
+            let circuit = prover().prepare(a.key()).expect("prepare");
+            let witness = a.witness();
+            let (r, s) = (Fr::from(7u64), Fr::from(11u64));
+            let mut t = StageTimings::default();
+            // Warm, so the pools are allocated and the count below is a proof's own.
+            prove_with_blinders(circuit.as_ref(), &witness, r, s, &mut t).expect("warm");
+            let before = device.submits();
+            let want =
+                prove_with_blinders(circuit.as_ref(), &witness, r, s, &mut t).expect("clean");
+            let plain = device.submits() - before;
+            let msm = prover().msm().last_submits();
+            assert_eq!(plain, 1 + u64::from(msm), "{}", a.name);
+            assert!(
+                msm <= 15,
+                "{}: {msm} MSM submits do not fit the 32-bit knob",
+                a.name
+            );
+
+            // Closes, in order: stages 0 to 4 (refused), its retry, then for each MSM
+            // submission its first attempt (refused) and its retry.
+            let mut mask = 1u32;
+            for k in 0..msm {
+                mask |= 1 << (2 + 2 * k);
+            }
+            g16_wgpu::REFUSE_NEXT.store(mask, std::sync::atomic::Ordering::Relaxed);
+            let before = device.submits();
+            let got = prove_with_blinders(circuit.as_ref(), &witness, r, s, &mut t);
+            let left = g16_wgpu::REFUSE_NEXT.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let got = match got {
+                Ok(p) => p,
+                Err(e) => panic!(
+                    "{}: the refused proof failed with {left:#b} left: {e}",
+                    a.name
+                ),
+            };
+            assert_eq!(
+                left, 0,
+                "{}: refusals left over, the proof made fewer closes",
+                a.name
+            );
+            assert_eq!(
+                device.submits() - before,
+                2 * plain,
+                "{}: {} submits for a proof of {plain} with every one refused once",
+                a.name,
+                device.submits() - before
+            );
+            assert_eq!(
+                prover().msm().last_submits(),
+                2 * msm,
+                "{}: the batch counted its retries differently",
+                a.name
+            );
+            assert_eq!(
+                (got.a, got.b, got.c),
+                (want.a, want.b, want.c),
+                "{}",
+                a.name
+            );
+            verify(&a.vkey(), &public_of(&witness, circuit.n_public()), &got).expect("verify");
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -605,8 +697,18 @@ fn an_empty_group_dispatches_nothing_and_keeps_its_result_slots() {
 // 4. The budgets the design writes down
 // ---------------------------------------------------------------------------
 
-/// Design §3 puts a whole proof in **two** submits, one for `compute_h` and one for `msms`.
-/// It also caps the whole per-proof readback at 64 KiB, and that half is wrong; see below.
+/// Design §3 put a whole proof in **two** submits, one for `compute_h` and one for `msms`.
+/// Since BUG-32 the second is several: `g16_wgpu::batch` cuts stages 5 to 9 into
+/// submissions of about `SUBMISSION_US` of estimated GPU time so that the one macOS kills
+/// under load is the only one run again, and reports how many it made. What this pins is
+/// that the count is one for `compute_h` plus exactly what the batch reports: nothing else in
+/// a proof submits, a readback or a parameter ring that opened a submission of its own would
+/// show here, and the batch's number is the one `g16 prove --stage-timings` can be held to.
+/// The batch's own count is pinned from the other side: at least one, at most one per
+/// sub-MSM window plus one, and one when the whole batch fits the budget, which the small
+/// artifacts do.
+///
+/// Design §3 also caps the whole per-proof readback at 64 KiB, and that is wrong; see below.
 ///
 /// # Why the submit count needs [`exclusive`] and not a second device
 ///
@@ -651,7 +753,7 @@ fn an_empty_group_dispatches_nothing_and_keeps_its_result_slots() {
 /// G2; `anon-aadhaar` at the floor is cut into more (`g16_wgpu::batch`), each with its own
 /// window sums, and the batch reports how many it ran.
 #[test]
-fn a_whole_proof_is_two_submits_and_the_readback_is_bounded() {
+fn a_whole_proof_submits_once_for_h_then_per_msm_slab_and_the_readback_is_bounded() {
     let _one_at_a_time = exclusive();
     /// The narrowest window `msm::window_size` will return.
     const C_MIN: u32 = 3;
@@ -659,6 +761,10 @@ fn a_whole_proof_is_two_submits_and_the_readback_is_bounded() {
     const MAX_ONES_GROUPS: u64 = 64;
     /// Design §3's figure, printed against the measurement rather than asserted.
     const DESIGN_BUDGET: u64 = 64 * 1024;
+    /// The widest window `msm::window_size` will return, so the fewest windows a sub-MSM
+    /// can have and the most submissions one can take: one per window and one more for a
+    /// submission holding only the conversion.
+    const C_MAX: u32 = g16_wgpu::msm::MAX_WINDOW;
 
     let windows = u64::from(g16_wgpu::msm::RECODE_BITS.div_ceil(C_MIN));
     let per_job = |pt: u64| (windows * pt).div_ceil(256) * 256 + MAX_ONES_GROUPS * pt;
@@ -669,13 +775,16 @@ fn a_whole_proof_is_two_submits_and_the_readback_is_bounded() {
 
     let found = artifacts();
     if found.is_empty() {
-        eprintln!("SKIPPED a_whole_proof_is_two_submits: no artifacts under bench/artifacts");
+        eprintln!(
+            "SKIPPED a_whole_proof_submits_once_for_h_then_per_msm_slab: no artifacts under \
+             bench/artifacts"
+        );
         return;
     }
     let device = device();
     let prover = prover();
 
-    println!("artifact       constraints  submits  sub-MSMs   readback B  over design 64 KiB");
+    println!("artifact       constraints  submits  msm submits  sub-MSMs   readback B  over design 64 KiB");
     for a in &found {
         let circuit = prover.prepare(a.key()).expect("prepare");
         let witness = a.witness();
@@ -688,16 +797,37 @@ fn a_whole_proof_is_two_submits_and_the_readback_is_bounded() {
         let before = device.submits();
         let proof = prove(circuit.as_ref(), &witness, &mut rng, &mut t).expect("prove");
         let after = device.submits();
+        let msm_submits = prover.msm().last_submits();
+        let (g1, g2) = prover.msm().last_sub_msms();
         assert_eq!(
             after - before,
-            2,
-            "{}: a proof took {} submits, design §3 budgets 2 (compute_h, then msms)",
+            1 + u64::from(msm_submits),
+            "{}: a proof took {} submits against one for compute_h plus the {msm_submits} \
+             the MSM batch reports",
             a.name,
             after - before
         );
+        let most = (g1 + g2) * g16_wgpu::msm::RECODE_BITS.div_ceil(C_MAX) + 1;
+        assert!(
+            msm_submits >= 1 && msm_submits <= most,
+            "{}: the MSM batch took {msm_submits} submits over {g1} G1 and {g2} G2 sub-MSMs; \
+             one to {most} is possible",
+            a.name
+        );
+        // Under 2^14 constraints the whole batch is a few milliseconds and stays one
+        // submission: the cut is for the long batch, and a short one must not pay for it.
+        if a.constraints() > 0 && a.constraints() < 1 << 14 {
+            assert_eq!(
+                msm_submits,
+                1,
+                "{}: {} constraints is far under the budget and still took {msm_submits} MSM \
+                 submits",
+                a.name,
+                a.constraints()
+            );
+        }
 
         let read = prover.msm().last_readback_bytes();
-        let (g1, g2) = prover.msm().last_sub_msms();
         assert!(
             g1 >= 4 && g2 >= 1,
             "{}: {g1} G1 and {g2} G2 sub-MSMs",
@@ -713,10 +843,11 @@ fn a_whole_proof_is_two_submits_and_the_readback_is_bounded() {
         );
         verify(&a.vkey(), &public_of(&witness, circuit.n_public()), &proof).expect("verify");
         println!(
-            "{:14} {:>11}  {:>7}  {:>5}+{:<3}  {:>10}  {}",
+            "{:14} {:>11}  {:>7}  {:>11}  {:>5}+{:<3}  {:>10}  {}",
             a.name,
             a.constraints(),
             after - before,
+            msm_submits,
             g1,
             g2,
             read,
@@ -885,6 +1016,117 @@ fn a_group_cut_into_sub_msms_matches_the_cpu() {
             a_bases.chunks()
         );
     });
+}
+
+/// A point stage cut into window slabs over several submissions (`g16_wgpu::batch`, BUG-32)
+/// is the same dispatches with encoder boundaries between them, and the boundaries are the
+/// whole risk: a slab whose clear or merge reached into a neighbour's rows, or a reduction
+/// that ran before the last slab's merge, is a wrong point with no error anywhere. So the
+/// cut is forced to its finest here, a budget of one microsecond, which is one window per
+/// slab and one slab per submission, and the answer has to be the CPU's exactly. Every
+/// artifact, since the shapes differ: `tiny_mul` has three windows at c = 3 in a batch the
+/// budget would otherwise never cut, `anon-aadhaar` is cut into pieces as well.
+#[test]
+fn a_point_stage_cut_into_one_window_per_submission_matches_the_cpu() {
+    use g16_msm::{CpuMsm, MsmBackend};
+
+    let _one_at_a_time = exclusive();
+    for_each_artifact(
+        "a_point_stage_cut_into_one_window_per_submission_matches_the_cpu",
+        |a| {
+            let pk = a.key();
+            let witness = a.witness();
+            let n_vars = pk.n_vars as u32;
+            let private_from = pk.n_public + 1;
+            let l_len = pk.l_query.len() as u32;
+            let b = device();
+            let batch = prover().msm();
+            let limit = b.granted_limits().max_storage_buffer_binding_size;
+
+            let a_bases = G1Bases::upload(b, &pk.a_query).expect("a");
+            let b_g2_bases = G2Bases::upload(b, &pk.b_g2_query).expect("b_g2");
+            let l_bases = G1Bases::upload(b, &pk.l_query).expect("l");
+            let w_jobs = [
+                Job::G1 {
+                    bases: &a_bases,
+                    base_off: 0,
+                },
+                Job::G2 {
+                    bases: &b_g2_bases,
+                    base_off: 0,
+                },
+            ];
+            let l_jobs = [Job::G1 {
+                bases: &l_bases,
+                base_off: 0,
+            }];
+            let groups = vec![
+                Group {
+                    scalars: Source::Host(&witness),
+                    scalar_off: 0,
+                    n: n_vars,
+                    jobs: &w_jobs,
+                },
+                Group {
+                    scalars: Source::Host(&witness),
+                    scalar_off: private_from as u32,
+                    n: l_len,
+                    jobs: &l_jobs,
+                },
+            ];
+            let before = b.submits();
+            let got = pollster::block_on(batch.run_with_limits(b, None, &groups, limit, 1.0))
+                .expect("run");
+            let submits = b.submits() - before;
+            let msm_submits = batch.last_submits();
+            let (g1, g2) = batch.last_sub_msms();
+            // One window per submission: at least the fewest windows a sub-MSM can have.
+            let fewest = (g1 + g2) * g16_wgpu::msm::RECODE_BITS.div_ceil(g16_wgpu::msm::MAX_WINDOW);
+            assert_eq!(
+                submits,
+                u64::from(msm_submits),
+                "{}: {submits} submits on the device, the batch reports {msm_submits}",
+                a.name
+            );
+            assert!(
+                msm_submits >= fewest,
+                "{}: {msm_submits} submits over {g1} G1 and {g2} G2 sub-MSMs is not one per \
+                 window",
+                a.name
+            );
+
+            let cpu = CpuMsm::new();
+            let l_range = if l_len == 0 {
+                0..0
+            } else {
+                private_from..private_from + l_len as usize
+            };
+            let want = [
+                MsmResult::G1(cpu.msm_g1(&pk.a_query, &witness)),
+                MsmResult::G2(cpu.msm_g2(&pk.b_g2_query, &witness)),
+                MsmResult::G1(cpu.msm_g1(&pk.l_query, &witness[l_range])),
+            ];
+            assert_eq!(got.len(), want.len(), "{}", a.name);
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                match (g, w) {
+                    (MsmResult::G1(g), MsmResult::G1(w)) => {
+                        assert_eq!(g, w, "{}: job {i}", a.name);
+                        assert!(!w.is_zero(), "{}: job {i} is vacuous", a.name);
+                    }
+                    (MsmResult::G2(g), MsmResult::G2(w)) => {
+                        assert_eq!(g, w, "{}: job {i}", a.name);
+                        assert!(!w.is_zero(), "{}: job {i} is vacuous", a.name);
+                    }
+                    _ => panic!("{}: job {i} came back in the wrong group", a.name),
+                }
+            }
+            eprintln!(
+                "  {}: {g1} G1 and {g2} G2 sub-MSMs over {msm_submits} submissions, all \
+                 three jobs match the CPU",
+                a.name
+            );
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------

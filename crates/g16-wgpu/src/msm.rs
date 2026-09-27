@@ -4,7 +4,7 @@
 //! [`crate::gen::msm`] explains the algorithm and every decision behind it. This file is the
 //! other half: the window width, the parameter block, the five pipelines, the three scratch
 //! buffers and the four dispatches that fill them. [`crate::points`] is the other end of it,
-//! and [`crate::batch`] puts a whole proof's dispatches in one submit.
+//! and [`crate::batch`] packs a whole proof's dispatches into a few short submissions.
 //!
 //! # What a digit pipeline is, and why there are three of them per proof rather than five
 //!

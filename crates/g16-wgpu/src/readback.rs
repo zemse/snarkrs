@@ -69,6 +69,15 @@ pub fn is_aborted(e: &ProveError) -> bool {
     matches!(e, ProveError::Device { backend: "wgpu", reason } if reason.starts_with(ABORTED))
 }
 
+/// Which of the next 32 submissions to refuse as if the GPU had cut them short: bit `i`
+/// set means the `i`th [`Seal::close`] from now, on any seal, overwrites its token with 0
+/// before the submit, which is exactly what a pass the GPU abandoned leaves behind. Every
+/// close shifts it down one bit, so 0 is the normal state. A test knob for the retry paths
+/// in `crate::stages` and `crate::batch`, which have to give the same answer on the attempt
+/// after a refusal as they would have on the first; the GPU only produces a refusal under
+/// another process's load, and never on demand.
+pub static REFUSE_NEXT: AtomicU32 = AtomicU32::new(0);
+
 /// A token the last dispatch of a submission writes and a blit copies out, so the host can
 /// tell a submission the GPU ran to its end from one it cut short.
 ///
@@ -240,6 +249,17 @@ impl Seal {
             drop(pass);
             epoch = self.armed.swap(0, Ordering::Relaxed);
         }
+        // The knob: a later `write_buffer` of the same word lands after the one `dispatch`
+        // made, so the thread copies 0 and `verify` refuses it, as `tests/device.rs` does by
+        // hand.
+        let refuse = REFUSE_NEXT
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |m| Some(m >> 1))
+            .unwrap_or(0);
+        if refuse & 1 != 0 {
+            backend
+                .queue()
+                .write_buffer(&self.src, 0, &0u32.to_le_bytes());
+        }
         enc.copy_buffer_to_buffer(&self.dst, 0, &self.map, 0, 4);
         let (tx, rx) = flume::bounded(1);
         enc.map_buffer_on_submit(&self.map, wgpu::MapMode::Read, 0..4, move |r| {
@@ -338,8 +358,8 @@ impl Readback {
     /// Queues the device-to-staging copy into an encoder the caller is still building.
     ///
     /// Separate from [`Self::submit_and_read`] so the copy lands in the same command encoder
-    /// as the dispatches that produced the data. Design §3 puts the whole proof in two
-    /// submits, and a readback that opened its own encoder would make it three.
+    /// as the dispatches that produced the data. A readback that opened its own encoder
+    /// would be a submission of its own, uncounted and unsealed.
     pub fn copy_from(
         &self,
         enc: &mut wgpu::CommandEncoder,
@@ -356,8 +376,8 @@ impl Readback {
     /// separate `results` buffers and the design budgets **one** readback for all of them, so
     /// each one is copied into its own window of a single staging allocation inside the same
     /// encoder as the dispatches. Concatenating them on the device costs five
-    /// `copy_buffer_to_buffer` calls and saves four `mapAsync` round trips at about 0.3 ms
-    /// each.
+    /// `copy_buffer_to_buffer` calls and saves a `mapAsync` round trip at about 0.3 ms for
+    /// every MSM that finishes in the same submission as another.
     ///
     /// WebGPU requires both offsets and the size to be multiples of 4. That is checked here
     /// rather than left to the validation layer, whose message names a byte count and not the

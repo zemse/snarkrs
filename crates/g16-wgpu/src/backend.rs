@@ -429,10 +429,10 @@ impl PreparedCircuit for WgpuCircuit {
     ) -> Result<MsmOutputs, ProveError> {
         // The guard first, then the clock, and the order is the whole point. The reason is
         // the long comment in `msms_async`, which is where the clock starts.
+        // No `retry_aborted` here: the batch retries each of its own submissions, which is
+        // shorter than the stage (`crate::batch`).
         let _gpu = self.device.exclusive();
-        retry_aborted("stages 5 to 9", t, |t| {
-            pollster::block_on(self.msms_async(witness, h, t))
-        })
+        pollster::block_on(self.msms_async(witness, h, t))
     }
 
     fn h_to_host(&self, h: &HPoly) -> Option<Vec<Fr>> {
@@ -441,21 +441,23 @@ impl PreparedCircuit for WgpuCircuit {
     }
 }
 
-/// Attempts at one stage group whose submission the GPU abandoned, counting the first. The
-/// same count and backoff as `g16-metal`'s ceremony FFT.
+/// Attempts at stages 0 to 4 when the GPU abandoned their submission, counting the first.
+/// The same count and backoff as `g16-metal`'s ceremony FFT and as `crate::batch` gives
+/// each of the MSM submissions.
 #[cfg(not(target_arch = "wasm32"))]
 const ATTEMPTS: u32 = 4;
 
 /// Runs `f`, and runs it again after a backoff when the GPU abandoned its submission.
 ///
 /// An abandoned submission (`crate::readback::Seal`) is a scheduling event and not an
-/// arithmetic one: macOS took the GPU back for the compositor. Both stage groups re-encode
-/// from their first write, stages 0 to 4 from the witness upload and stages 5 to 9 from the
-/// zeroing dispatches, so a retry reads nothing half-written. `t` is restored between
+/// arithmetic one: macOS took the GPU back for the compositor. Stages 0 to 4 re-encode from
+/// the witness upload, so a retry reads nothing half-written. `t` is restored between
 /// attempts so a stage timing is the attempt that produced the answer. Native only, which
 /// is why it sits on the synchronous `PreparedCircuit` impl and not on the `async fn`s the
 /// browser awaits: there is no thread to sleep there, and the error reaches the page as it
-/// is.
+/// is. Stages 5 to 9 are not wrapped in it: their pass was the one the kill landed on 75
+/// times in 76, so `crate::batch` cuts it into short submissions and retries each on its
+/// own, and a whole-stage retry on top would only multiply the attempts.
 #[cfg(not(target_arch = "wasm32"))]
 fn retry_aborted<T>(
     what: &str,
