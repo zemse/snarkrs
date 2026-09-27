@@ -81,6 +81,13 @@ pub(crate) fn wait_ok(cb: &CommandBufferRef, context: &str) -> Result<(), ProveE
         );
     }
     let status = cb.status();
+    #[cfg(test)]
+    if inject::fires() {
+        return Err(ProveError::Backend {
+            backend: "metal",
+            reason: format!("{context}: injected fault (status {status:?})"),
+        });
+    }
     if status == MTLCommandBufferStatus::Completed {
         return Ok(());
     }
@@ -91,4 +98,92 @@ pub(crate) fn wait_ok(cb: &CommandBufferRef, context: &str) -> Result<(), ProveE
             error_text(cb)
         ),
     })
+}
+
+/// Attempts at one submission before giving up, counting the first. The ceremony FFT's
+/// contract: a macOS interactivity kill is a scheduling event, not an arithmetic one.
+pub(crate) const RETRIES: u32 = 4;
+
+/// Runs `submit` until it succeeds or [`RETRIES`] attempts have failed, backing off
+/// between them, and returns the last error.
+///
+/// `submit` must be re-runnable from whatever a killed attempt left behind: it encodes
+/// from inputs it does not write, and it has waited on every command buffer it committed
+/// before it returns, so no dispatch of a failed attempt is still writing the scratch the
+/// next one encodes against. Blind rather than keyed on the interactivity error, because
+/// the error text is not an API; a genuine kernel fault fails every attempt instead.
+///
+/// Every failed attempt is reported on stderr with the thread that made it. A kill is rare
+/// on a quiet machine (none in 100 runs of the concurrency test), so the line costs
+/// nothing there, and on a busy one the retry rate is what an operator needs to see. It is
+/// also what says whether a proof that later fails to verify went through a retry.
+///
+/// The proving path needs this as much as the ceremony. Four proofs sharing the device
+/// had one of them killed in 10 of 20 runs of
+/// `backend::tests::one_metal_circuit_proves_concurrently`, on circuits as small as
+/// railgun-13x01, and on the gather, the transforms and the MSM batch alike.
+pub(crate) fn with_retry<T>(
+    mut submit: impl FnMut() -> Result<T, ProveError>,
+) -> Result<T, ProveError> {
+    let mut err = None;
+    for attempt in 0..RETRIES {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(200 << attempt));
+        }
+        match submit() {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                let thread = std::thread::current();
+                eprintln!(
+                    "metal: attempt {} of {RETRIES} failed on thread {}: {e}",
+                    attempt + 1,
+                    thread.name().unwrap_or("unnamed")
+                );
+                err = Some(e);
+            }
+        }
+    }
+    Err(err.expect("RETRIES is at least 1"))
+}
+
+/// Fails chosen [`wait_ok`] calls on the current thread after the buffer has completed,
+/// so a test can put a retry behind every submission of a proof and check the result is
+/// unchanged. After a completed buffer every in-place dispatch has already run once, which
+/// is the state a retry that skipped any re-initialisation would trip on.
+#[cfg(test)]
+pub(crate) mod inject {
+    use std::cell::Cell;
+
+    thread_local! {
+        static CALLS: Cell<u32> = const { Cell::new(0) };
+        static FAIL: Cell<Option<u32>> = const { Cell::new(None) };
+        static FIRED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Counts calls from zero again, and fails call `at` if given.
+    pub(crate) fn arm(at: Option<u32>) {
+        CALLS.set(0);
+        FAIL.set(at);
+        FIRED.set(false);
+    }
+
+    /// `wait_ok` calls on this thread since [`arm`].
+    pub(crate) fn calls() -> u32 {
+        CALLS.get()
+    }
+
+    /// Whether the armed call was reached.
+    pub(crate) fn fired() -> bool {
+        FIRED.get()
+    }
+
+    pub(super) fn fires() -> bool {
+        let n = CALLS.get();
+        CALLS.set(n + 1);
+        let hit = FAIL.get() == Some(n);
+        if hit {
+            FIRED.set(true);
+        }
+        hit
+    }
 }

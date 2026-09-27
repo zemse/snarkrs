@@ -738,10 +738,13 @@ mod tests {
     /// handed two in-flight proofs the same H buffer would not crash: it would produce a
     /// proof that simply fails to verify, which is why the check is a verification and
     /// not just a join.
-    #[test]
-    fn one_metal_circuit_proves_concurrently() {
-        for_each("one_metal_circuit_proves_concurrently", |name, dir| {
-            let (circuit, witness, vk) = load(dir);
+    ///
+    /// Four proofs sharing the device is also what gets a command buffer killed for
+    /// `ImpactingInteractivity`, which failed this test in 10 of 20 runs before the
+    /// proving path retried it. A failure names the artifact, the proof and the error.
+    fn prove_concurrently(test: &str, backend: fn() -> Result<MetalBackend, ProveError>) {
+        for_each(test, |name, dir| {
+            let (circuit, witness, vk) = load_on(dir, backend().unwrap());
             let public = witness[1..=circuit.n_public()].to_vec();
             let circuit = circuit.as_ref();
             let (witness, vk, public) = (&witness, &vk, &public);
@@ -749,25 +752,95 @@ mod tests {
             std::thread::scope(|scope| {
                 let threads: Vec<_> = (1..=4u64)
                     .map(|i| {
-                        scope.spawn(move || {
-                            let mut t = StageTimings::default();
-                            let proof = prove_with_blinders(
-                                circuit,
-                                witness,
-                                Fr::from(i * 7),
-                                Fr::from(i * 11),
-                                &mut t,
-                            )
-                            .unwrap();
-                            verify(vk, public, &proof).unwrap_or_else(|e| panic!("{name}: {e}"));
-                        })
+                        let thread = std::thread::Builder::new().name(format!("{name} proof {i}"));
+                        thread
+                            .spawn_scoped(scope, move || {
+                                let mut t = StageTimings::default();
+                                let proof = prove_with_blinders(
+                                    circuit,
+                                    witness,
+                                    Fr::from(i * 7),
+                                    Fr::from(i * 11),
+                                    &mut t,
+                                )
+                                .unwrap_or_else(|e| panic!("{name}: proof {i}: {e}"));
+                                verify(vk, public, &proof)
+                                    .unwrap_or_else(|e| panic!("{name}: proof {i} verifies: {e}"));
+                            })
+                            .unwrap()
                     })
                     .collect();
                 for t in threads {
-                    t.join().unwrap();
+                    t.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
                 }
             });
         });
+    }
+
+    #[test]
+    fn one_metal_circuit_proves_concurrently() {
+        prove_concurrently("one_metal_circuit_proves_concurrently", MetalBackend::new);
+    }
+
+    #[test]
+    fn one_constant_work_circuit_proves_concurrently() {
+        prove_concurrently(
+            "one_constant_work_circuit_proves_concurrently",
+            MetalBackend::constant_work,
+        );
+    }
+
+    /// Every submission of a proof failed in turn, once, after the GPU had finished it,
+    /// and the retry must give the unfaulted proof bit for bit. A retry that re-ran an
+    /// in-place transform on its own output, or read counters a previous attempt had
+    /// already advanced, gives a different proof here rather than one in a hundred runs
+    /// on a busy machine. Small domains only, to keep it quick and because from
+    /// `OVERLAP_MIN_DOMAIN` up the witness batch is submitted from a second thread, which
+    /// the per-thread injection misses. With the bound lifted and `G16_METAL_OVERLAP=0`
+    /// both work modes passed on every artifact, anon-aadhaar included, in 467 s.
+    fn a_retried_submission_is_exact(
+        test: &str,
+        backend: fn() -> Result<MetalBackend, ProveError>,
+    ) {
+        use crate::cb::inject;
+        for_each(test, |name, dir| {
+            let (circuit, witness, _) = load_on(dir, backend().unwrap());
+            if circuit.domain_size() > 1 << 14 {
+                return;
+            }
+            let (r, s) = (Fr::from(31337u64), Fr::from(4242u64));
+            let mut t = StageTimings::default();
+            inject::arm(None);
+            let want = prove_with_blinders(circuit.as_ref(), &witness, r, s, &mut t).unwrap();
+            let submissions = inject::calls();
+            assert!(submissions > 0, "{name}: no submission was waited on");
+            for at in 0..submissions {
+                inject::arm(Some(at));
+                let got = prove_with_blinders(circuit.as_ref(), &witness, r, s, &mut t)
+                    .unwrap_or_else(|e| panic!("{name}: fault at wait {at}: {e}"));
+                assert!(inject::fired(), "{name}: wait {at} never failed");
+                assert_eq!(got.a, want.a, "{name}: fault at wait {at}");
+                assert_eq!(got.b, want.b, "{name}: fault at wait {at}");
+                assert_eq!(got.c, want.c, "{name}: fault at wait {at}");
+            }
+            inject::arm(None);
+        });
+    }
+
+    #[test]
+    fn a_retried_submission_gives_the_same_proof() {
+        a_retried_submission_is_exact(
+            "a_retried_submission_gives_the_same_proof",
+            MetalBackend::new,
+        );
+    }
+
+    #[test]
+    fn a_retried_constant_work_submission_gives_the_same_proof() {
+        a_retried_submission_is_exact(
+            "a_retried_constant_work_submission_gives_the_same_proof",
+            MetalBackend::constant_work,
+        );
     }
 
     #[test]

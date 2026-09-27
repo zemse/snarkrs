@@ -531,30 +531,43 @@ impl HResident {
             // order, so the cost is four submissions instead of one and not four round
             // trips. The stage 4 fusion survives because it rides out on the last store
             // of vector 2, which is inside that vector's own buffer.
-            let mut cbs = Vec::with_capacity(1 + N_DOMAIN_VECTORS);
+            //
+            // A kill is retried whole, from the gather: the transforms run in place, so a
+            // vector whose buffer died half way is no longer an input anything can be
+            // re-run from, while the gather rewrites A, B and C from the witness buffer,
+            // which nothing on the device writes.
+            crate::cb::with_retry(|| {
+                let mut cbs = Vec::with_capacity(1 + N_DOMAIN_VECTORS);
 
-            let cb = st.queue.new_command_buffer();
-            let enc = cb.new_compute_command_encoder();
-            self.encode_gather(st, enc, &sc, n);
-            enc.end_encoding();
-            cb.commit();
-            cbs.push(("stages 0-1 (gather)", cb));
-
-            for vi in 0..N_DOMAIN_VECTORS {
                 let cb = st.queue.new_command_buffer();
                 let enc = cb.new_compute_command_encoder();
-                self.encode_transforms_vector(st, enc, &sc, n, vi, true);
+                self.encode_gather(st, enc, &sc, n);
                 enc.end_encoding();
                 cb.commit();
-                cbs.push(("stages 2-4 (transforms)", cb));
-            }
+                cbs.push(("stages 0-1 (gather)", cb));
 
-            // In submission order, so the first failure reported is the first that
-            // happened. Waiting on an earlier buffer after a later one has completed
-            // returns immediately.
-            for (context, cb) in cbs {
-                crate::cb::wait_ok(cb, context)?;
-            }
+                for vi in 0..N_DOMAIN_VECTORS {
+                    let cb = st.queue.new_command_buffer();
+                    let enc = cb.new_compute_command_encoder();
+                    self.encode_transforms_vector(st, enc, &sc, n, vi, true);
+                    enc.end_encoding();
+                    cb.commit();
+                    cbs.push(("stages 2-4 (transforms)", cb));
+                }
+
+                // Every buffer is waited on before any failure is returned, so no
+                // dispatch of this attempt is still writing the scratch when the next
+                // one is encoded. The error kept is the first in submission order, which
+                // is the first that happened.
+                let mut first = Ok(());
+                for (context, cb) in cbs {
+                    let r = crate::cb::wait_ok(cb, context);
+                    if first.is_ok() {
+                        first = r;
+                    }
+                }
+                first
+            })?;
             t.ntt_us += start.elapsed().as_micros() as u64;
             Ok(())
         })?;

@@ -134,11 +134,6 @@ const _: () = assert!(DUMMY_ROWS.is_power_of_two());
 /// See [`Submission`].
 const SPLIT_BUDGET: usize = 1 << 22;
 
-/// Attempts at a split batch before giving up, counting the first. Same contract as
-/// `fft.rs`: an interactivity kill is a scheduling event, and the whole batch is
-/// re-encoded from its zeroing dispatches, so a retry reads nothing half-written.
-const SPLIT_RETRIES: u32 = 4;
-
 /// Threads per threadgroup in the reduction and the ones kernel. Must equal `REDUCE_TG`
 /// in `msm.metal`, which sizes the threadgroup array; the dispatch may use fewer if the
 /// pipeline reports a lower maximum, and the kernel reads the real count at runtime.
@@ -1386,24 +1381,10 @@ impl MetalMsm {
             };
             // Before this check the combine reinterpreted pooled buffers regardless of
             // whether the GPU had actually written them, so a fault returned the
-            // previous proof's window sums with an Ok.
-            let attempts = if split { SPLIT_RETRIES } else { 1 };
-            let mut err = None;
-            for attempt in 0..attempts {
-                if attempt > 0 {
-                    std::thread::sleep(std::time::Duration::from_millis(200 << attempt));
-                }
-                match encode(&mut Submission::new(&self.queue, split)) {
-                    Ok(()) => {
-                        err = None;
-                        break;
-                    }
-                    Err(e) => err = Some(e),
-                }
-            }
-            if let Some(e) = err {
-                return Err(e);
-            }
+            // previous proof's window sums with an Ok. Split or not, the whole batch is
+            // re-encoded from its zeroing dispatches, so a retry reads nothing
+            // half-written.
+            crate::cb::with_retry(|| encode(&mut Submission::new(&self.queue, split)))?;
         }
 
         // ---- combine ----
