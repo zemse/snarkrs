@@ -19,7 +19,7 @@ to that tree; the table that follows says what has landed since.
 | 3 | Query sections never validated | Fixed, `9445d85`: every point on the curve at load; the G2 subgroup is checked on the proof's `B` (`d170f78`, `3a610a5`) because per point it costs 1.2-6.6 s. `load_unchecked` skips it |
 | 4 | Metal command buffer status never checked | Fixed, `69d2802` (`cb::wait_ok`) |
 | 5 | Threadgroup memory never cleared | Fixed, `dd21174` |
-| 6 | Witness-dependent MSM cost | CPU: opt-in constant work, `ae15a9b` (`prove --constant-work`; +2.5% dense, 3.3-4x bit-heavy). GPU backends: **open** |
+| 6 | Witness-dependent MSM cost | CPU: opt-in constant work, `ae15a9b` (`prove --constant-work`; +2.5% dense, 3.3-4x bit-heavy). Metal: opt-in constant work, `f48db69` (`--backend metal`; +15% dense, 7-11x bit-heavy); bucket occupancy and stage 0's 0/1 multiply skip remain. wgpu, cuda: **open** |
 | 7 | Unreproduced Metal concurrency failure | **Open**; finding 4's fix means the next one reports a cause |
 | 8 | Lenient proof JSON encoding | Fixed, `d170f78` |
 | 9 | `verify()` validates nothing | Fixed, `d170f78`; `verify_unchecked` is the bare check |
