@@ -39,6 +39,7 @@
 //! [`HStages::prepare`].
 
 use std::ffi::c_void;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -295,6 +296,11 @@ fn split_passes(log_n: u32, max_fused: u32) -> Vec<Batch> {
 /// Per-proof scratch: the three domain vectors, one transform temporary, the packed
 /// witness, and the two H outputs.
 ///
+/// A, B, C and the temporary share `vectors`, one domain apart, so that once
+/// `compute_h` has returned the whole buffer can be lent to stage 9's MSM for its digit
+/// entries: nothing reads the four vectors after that. It is sized for whichever of the
+/// two needs more.
+///
 /// Pooled rather than allocated per proof. A freshly allocated shared buffer is faulted
 /// in on first touch, measured at 15.2 GB/s against 54.8 GB/s once warm, so a cold
 /// allocation of the 48 MB this needs at 2^18 would cost about 3 ms of page faults on
@@ -302,12 +308,34 @@ fn split_passes(log_n: u32, max_fused: u32) -> Vec<Batch> {
 /// which the `PreparedCircuit` contract requires: each in-flight proof holds its own set.
 struct Scratch {
     witness: Buffer,
-    a: Buffer,
-    b: Buffer,
-    c: Buffer,
-    t: Buffer,
+    vectors: Buffer,
+    /// Bytes between consecutive vectors in `vectors`.
+    stride: u64,
     h_mont: Buffer,
     h_std: Buffer,
+}
+
+/// A domain vector: its buffer and the byte offset it starts at.
+type Slot<'a> = (&'a Buffer, u64);
+
+impl Scratch {
+    fn a(&self) -> Slot<'_> {
+        (&self.vectors, 0)
+    }
+    fn b(&self) -> Slot<'_> {
+        (&self.vectors, self.stride)
+    }
+    fn c(&self) -> Slot<'_> {
+        (&self.vectors, 2 * self.stride)
+    }
+    /// The transform temporary.
+    fn t(&self) -> Slot<'_> {
+        (&self.vectors, 3 * self.stride)
+    }
+}
+
+fn bind(enc: &metal::ComputeCommandEncoderRef, index: u64, (buf, off): Slot<'_>) {
+    enc.set_buffer(index, Some(buf), off);
 }
 
 type Pool = Arc<Mutex<Vec<Scratch>>>;
@@ -405,6 +433,15 @@ impl HResident {
             pows.push(acc);
             acc *= coset_shift;
         }
+        // Host tables, released once packed so they do not sit in malloc's large cache.
+        let table = |data: Vec<Fr>| {
+            let buf = st.buf(&data);
+            crate::alloc::release(data);
+            buf
+        };
+        let tw_fwd = table(domain.twiddles())?;
+        let tw_inv = table(domain.twiddles_inv())?;
+        let coset_pows = table(pows)?;
 
         Ok(Self {
             n_vars: pk.n_vars,
@@ -418,9 +455,9 @@ impl HResident {
                 st.buf_u32(&pk.coeffs.signal[1])?,
             ],
             value: [st.buf(&pk.coeffs.value[0])?, st.buf(&pk.coeffs.value[1])?],
-            tw_fwd: st.buf(&domain.twiddles())?,
-            tw_inv: st.buf(&domain.twiddles_inv())?,
-            coset_pows: st.buf(&pows)?,
+            tw_fwd,
+            tw_inv,
+            coset_pows,
             domain,
             pool: Arc::new(Mutex::new(Vec::new())),
         })
@@ -445,12 +482,12 @@ impl HResident {
             return Ok(s);
         }
         let n = self.domain.size;
+        let stride = n * core::mem::size_of::<PackedFr>();
+        let bytes = (4 * stride).max(crate::msm::dense_entries_bytes(n));
         Ok(Scratch {
             witness: st.empty(self.n_vars)?,
-            a: st.empty(n)?,
-            b: st.empty(n)?,
-            c: st.empty(n)?,
-            t: st.empty(n)?,
+            vectors: crate::alloc::shared(&st.device, bytes)?,
+            stride: stride as u64,
             h_mont: st.empty(n)?,
             h_std: st.empty(n)?,
         })
@@ -579,6 +616,7 @@ impl HResident {
                 scratch: Some(sc),
                 pool: Arc::clone(&self.pool),
                 len: n,
+                lent: Arc::new(AtomicBool::new(false)),
             }),
         })
     }
@@ -629,9 +667,9 @@ impl HResident {
         let cb = st.queue.new_command_buffer();
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&st.h_join);
-        enc.set_buffer(0, Some(&sc.a), 0);
-        enc.set_buffer(1, Some(&sc.b), 0);
-        enc.set_buffer(2, Some(&sc.c), 0);
+        bind(enc, 0, sc.a());
+        bind(enc, 1, sc.b());
+        bind(enc, 2, sc.c());
         enc.set_buffer(3, Some(&sc.h_mont), 0);
         enc.set_buffer(4, Some(&sc.h_std), 0);
         let nn = n as u32;
@@ -660,9 +698,9 @@ impl HResident {
         enc.set_buffer(4, Some(&self.signal[1]), 0);
         enc.set_buffer(5, Some(&self.value[1]), 0);
         enc.set_buffer(6, Some(&sc.witness), 0);
-        enc.set_buffer(7, Some(&sc.a), 0);
-        enc.set_buffer(8, Some(&sc.b), 0);
-        enc.set_buffer(9, Some(&sc.c), 0);
+        bind(enc, 7, sc.a());
+        bind(enc, 8, sc.b());
+        bind(enc, 9, sc.c());
         let nn = n as u32;
         enc.set_bytes(10, 4, &nn as *const u32 as *const c_void);
         let tg = st.threads(&st.gather, n as u64);
@@ -690,7 +728,7 @@ impl HResident {
         let size_inv = PackedFr::from_fr(&self.domain.size_inv);
 
         {
-            let v = [&sc.a, &sc.b, &sc.c][vi];
+            let v = [sc.a(), sc.b(), sc.c()][vi];
             // Stage 1, the iNTT. Out of place v -> t for the head, then in place on t.
             // The 1/n normalisation rides in on the load.
             for (bi, b) in self.batches.iter().enumerate() {
@@ -703,9 +741,9 @@ impl HResident {
                     kscale: size_inv,
                 };
                 if bi == 0 {
-                    self.encode_head(st, enc, &p, v, &sc.t, &self.tw_inv, sc, n);
+                    self.encode_head(st, enc, &p, v, sc.t(), &self.tw_inv, sc, n);
                 } else {
-                    self.encode_tail(st, enc, &p, &sc.t, &self.tw_inv, sc, n);
+                    self.encode_tail(st, enc, &p, sc.t(), &self.tw_inv, sc, n);
                 }
             }
 
@@ -723,7 +761,7 @@ impl HResident {
                     kscale: size_inv,
                 };
                 if bi == 0 {
-                    self.encode_head(st, enc, &p, &sc.t, v, &self.tw_fwd, sc, n);
+                    self.encode_head(st, enc, &p, sc.t(), v, &self.tw_fwd, sc, n);
                 } else {
                     self.encode_tail(st, enc, &p, v, &self.tw_fwd, sc, n);
                 }
@@ -737,22 +775,22 @@ impl HResident {
         st: &HStages,
         enc: &metal::ComputeCommandEncoderRef,
         p: &NttParams,
-        src: &Buffer,
-        dst: &Buffer,
+        src: Slot<'_>,
+        dst: Slot<'_>,
         tw: &Buffer,
         sc: &Scratch,
         n: usize,
     ) {
         enc.set_compute_pipeline_state(&st.head);
-        enc.set_buffer(0, Some(src), 0);
-        enc.set_buffer(1, Some(dst), 0);
+        bind(enc, 0, src);
+        bind(enc, 1, dst);
         enc.set_buffer(2, Some(tw), 0);
         enc.set_buffer(3, Some(&self.coset_pows), 0);
         // Every declared argument is bound even when the dispatch-uniform mode means the
         // kernel never reads it: Metal's validation layer objects to a null binding for a
         // declared buffer, whether or not the shader touches it on this path.
-        enc.set_buffer(4, Some(&sc.a), 0);
-        enc.set_buffer(5, Some(&sc.b), 0);
+        bind(enc, 4, sc.a());
+        bind(enc, 5, sc.b());
         enc.set_buffer(6, Some(&sc.h_mont), 0);
         enc.set_buffer(7, Some(&sc.h_std), 0);
         enc.set_bytes(
@@ -769,16 +807,16 @@ impl HResident {
         st: &HStages,
         enc: &metal::ComputeCommandEncoderRef,
         p: &NttParams,
-        a: &Buffer,
+        a: Slot<'_>,
         tw: &Buffer,
         sc: &Scratch,
         n: usize,
     ) {
         enc.set_compute_pipeline_state(&st.tail);
-        enc.set_buffer(0, Some(a), 0);
+        bind(enc, 0, a);
         enc.set_buffer(2, Some(tw), 0);
-        enc.set_buffer(4, Some(&sc.a), 0);
-        enc.set_buffer(5, Some(&sc.b), 0);
+        bind(enc, 4, sc.a());
+        bind(enc, 5, sc.b());
         enc.set_buffer(6, Some(&sc.h_mont), 0);
         enc.set_buffer(7, Some(&sc.h_std), 0);
         enc.set_bytes(
@@ -822,6 +860,8 @@ pub struct HHandle {
     scratch: Option<Scratch>,
     pool: Pool,
     len: usize,
+    /// Set while a [`crate::msm::Lent`] over the domain vectors is alive.
+    lent: Arc<AtomicBool>,
 }
 
 impl HHandle {
@@ -843,6 +883,17 @@ impl HHandle {
     /// `a*R mod r`, which is a different number.
     pub fn h_std(&self) -> &Buffer {
         &self.sc().h_std
+    }
+
+    /// The domain vectors, lent to the MSM over `h_std` for its digit entries. `None`
+    /// while an earlier loan is still out.
+    ///
+    /// The handle must outlive the batch the loan goes into, which it already has to for
+    /// `h_std`. A retried batch re-encodes from its zeroing dispatches and rewrites every
+    /// entry, and a retried `compute_h` happens before this can be called, so no retry
+    /// reads what the other wrote.
+    pub(crate) fn lend_entries(&self) -> Option<crate::msm::Lent> {
+        crate::msm::Lent::claim(&self.sc().vectors, &self.lent)
     }
 
     /// H in **Montgomery form**, matching `layout::PackedFr` and arkworks' internal
@@ -878,13 +929,14 @@ impl HHandle {
 impl Drop for HHandle {
     fn drop(&mut self) {
         if let Some(s) = self.scratch.take() {
-            // The witness, its three domain images and both copies of H. The handle is only
-            // dropped once the MSMs that read `h` have completed.
-            for b in [&s.witness, &s.a, &s.b, &s.c, &s.t, &s.h_mont, &s.h_std] {
+            // The witness, its three domain images (and H's digit entries, if they were
+            // lent) and both copies of H. The handle is only dropped once the MSMs that
+            // read `h` have completed.
+            for b in [&s.witness, &s.vectors, &s.h_mont, &s.h_std] {
                 crate::alloc::scrub(b);
             }
             // One scratch set per proof in flight is all the pool is for. Uncapped, a burst
-            // of concurrent proofs left that many full sets (seven domain-sized buffers
+            // of concurrent proofs left that many full sets (seven domain vectors' worth
             // each) resident for the life of the circuit.
             let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
             if pool.len() < MAX_POOLED_SCRATCH {

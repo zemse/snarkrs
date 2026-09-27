@@ -79,3 +79,50 @@ fn checked(buf: Buffer, bytes: usize) -> Result<Buffer, ProveError> {
     }
     Ok(buf)
 }
+
+// libSystem, which every process links. Declared here rather than taken from `libc` so
+// this crate's dependency set does not change for two calls.
+extern "C" {
+    fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64)
+        -> *mut c_void;
+}
+const PROT_READ: i32 = 0x1;
+const PROT_WRITE: i32 = 0x2;
+const MAP_PRIVATE: i32 = 0x2;
+const MAP_FIXED: i32 = 0x10;
+const MAP_ANON: i32 = 0x1000;
+/// Apple silicon's page. Also a multiple of a 4 KB page, so the rounding stays valid on
+/// a machine that has those.
+const PAGE: usize = 16 << 10;
+
+/// Frees `v` with its pages handed back to the OS now, not whenever malloc reuses them.
+///
+/// Dropping is not enough for a key section. macOS malloc keeps a freed large block in
+/// its large cache, still resident and still counted in the footprint, and
+/// `malloc_zone_pressure_relief` returns 0 without emptying it. On js_384x384_d32 that
+/// was 2.4 GB of dropped zkey sections held for the rest of the process. Mapping fresh
+/// anonymous pages over the block's whole pages releases the old ones at once and leaves
+/// malloc owning an address range that costs nothing until it is touched again.
+pub(crate) fn release<T: Copy>(mut v: Vec<T>) {
+    let start = v.as_mut_ptr() as usize;
+    let lo = start.next_multiple_of(PAGE);
+    let hi = (start + v.capacity() * core::mem::size_of::<T>()) & !(PAGE - 1);
+    if hi > lo {
+        // SAFETY: `lo..hi` lies inside `v`'s allocation, which nothing else references,
+        // and `T: Copy` means the drop below reads none of it. The new pages are private,
+        // readable and writable, as malloc's were, so it can reuse or unmap the block as
+        // it would have. XNU puts the old mapping back if a fixed mapping fails, so a
+        // failure costs only the saving; nothing is checked because nothing changes.
+        unsafe {
+            mmap(
+                lo as *mut c_void,
+                hi - lo,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_FIXED | MAP_ANON,
+                -1,
+                0,
+            );
+        }
+    }
+    drop(v);
+}

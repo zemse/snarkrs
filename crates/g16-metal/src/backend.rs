@@ -167,10 +167,9 @@ impl Backend for MetalBackend {
 /// are emptied as each one is uploaded, so [`PreparedCircuit::key`] returns a key whose
 /// vectors are empty. Nothing on the host reads them after `prepare`.
 ///
-/// Freeing them does not yet lower the peak by itself: macOS malloc keeps freed large
-/// blocks in its large cache, still counted in the footprint, and only later host
-/// allocations reuse them. With `MallocLargeCache=0` in the environment keccak_2048
-/// peaks at 2,104 MB here instead of 3,340.
+/// They go through [`crate::alloc::release`] rather than a plain drop, because macOS
+/// malloc keeps freed large blocks resident in its large cache, and on js_384x384_d32
+/// that held 2.4 GB of the 9.1 GB peak.
 pub struct MetalCircuit {
     pk: ProvingKey,
     stages: Arc<HStages>,
@@ -228,23 +227,45 @@ impl MetalCircuit {
         // an error here instead of an out-of-bounds GPU read later.
         let t0 = Instant::now();
         let resident = stages.prepare(&pk)?;
-        pk.coeffs = Coefficients {
-            row_ptr: Default::default(),
-            signal: Default::default(),
-            value: Default::default(),
-        };
+        let Coefficients {
+            row_ptr,
+            signal,
+            value,
+        } = std::mem::replace(
+            &mut pk.coeffs,
+            Coefficients {
+                row_ptr: Default::default(),
+                signal: Default::default(),
+                value: Default::default(),
+            },
+        );
+        row_ptr
+            .into_iter()
+            .chain(signal)
+            .for_each(crate::alloc::release);
+        value.into_iter().for_each(crate::alloc::release);
         let stages_us = t0.elapsed().as_micros() as u64;
 
         // Stages 5 to 9. Repacking, not casting: `ark_ec::G1Affine` is 72 bytes on this
         // arkworks and `G2Affine` is 136, neither is `repr(C)`, and both carry an
         // infinity flag that the packed layout encodes as all-zero coordinates instead.
-        // Each host vector is taken and dropped as soon as it is uploaded.
+        // Each host vector is taken and released as soon as it is uploaded.
         let t1 = Instant::now();
-        let a_bases = msm.upload_g1_bases(&std::mem::take(&mut pk.a_query))?;
-        let b_g1_bases = msm.upload_g1_bases(&std::mem::take(&mut pk.b_g1_query))?;
-        let b_g2_bases = msm.upload_g2_bases(&std::mem::take(&mut pk.b_g2_query))?;
-        let l_bases = msm.upload_g1_bases(&std::mem::take(&mut pk.l_query))?;
-        let h_bases = msm.upload_g1_bases(&std::mem::take(&mut pk.h_query))?;
+        let g1 = |v: Vec<_>| {
+            let bases = msm.upload_g1_bases(&v);
+            crate::alloc::release(v);
+            bases
+        };
+        let a_bases = g1(std::mem::take(&mut pk.a_query))?;
+        let b_g1_bases = g1(std::mem::take(&mut pk.b_g1_query))?;
+        let b_g2_bases = {
+            let v = std::mem::take(&mut pk.b_g2_query);
+            let bases = msm.upload_g2_bases(&v);
+            crate::alloc::release(v);
+            bases?
+        };
+        let l_bases = g1(std::mem::take(&mut pk.l_query))?;
+        let h_bases = g1(std::mem::take(&mut pk.h_query))?;
         let bases_us = t1.elapsed().as_micros() as u64;
 
         let cost = PrepareCost {
@@ -352,9 +373,13 @@ impl MetalCircuit {
                 // `scalars_from_device_mont` was the old path here, and it cost one
                 // extra command buffer plus a full-domain Montgomery reduction that the
                 // pointwise kernel had already performed.
+                //
+                // The plan's digit entries go into the domain vectors stage 4 is done
+                // with, rather than a buffer of their own from the MSM pool.
                 Ok(self
                     .msm
-                    .scalars_from_device_std_with(handle.h_std(), handle.len(), self.work))
+                    .scalars_from_device_std_with(handle.h_std(), handle.len(), self.work)
+                    .with_lent(handle.lend_entries()))
             }
             None => {
                 let host = h.to_host().ok_or_else(|| {
@@ -709,6 +734,27 @@ mod tests {
             let want = cpu.compute_h(&witness, &mut t).unwrap();
             assert_eq!(host.as_slice(), want.to_host().expect("cpu h"), "{name}");
         });
+    }
+
+    /// The domain vectors go to one MSM at a time. Two MSMs over the same H at once would
+    /// scatter their digit entries into one buffer, so the second has to get `None` and
+    /// take its entries from the pool.
+    #[test]
+    fn h_lends_its_domain_vectors_to_one_msm_at_a_time() {
+        for_each(
+            "h_lends_its_domain_vectors_to_one_msm_at_a_time",
+            |name, dir| {
+                let (circuit, witness, _) = load(dir);
+                let mut t = StageTimings::default();
+                let h = circuit.compute_h(&witness, &mut t).unwrap();
+                let handle = h.device_handle::<HHandle>(crate::stages::TAG).unwrap();
+                let first = handle.lend_entries();
+                assert!(first.is_some(), "{name}: nothing lent");
+                assert!(handle.lend_entries().is_none(), "{name}: lent twice");
+                drop(first);
+                assert!(handle.lend_entries().is_some(), "{name}: never given back");
+            },
+        );
     }
 
     /// Zero blinders remove the masking, so the H evaluations are the only thing between

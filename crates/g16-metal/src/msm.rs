@@ -60,7 +60,8 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use ark_ff::{AdditiveGroup, One, Zero};
 use metal::objc::{msg_send, sel, sel_impl};
@@ -613,11 +614,20 @@ pub struct ScalarBuf {
     /// Under [`Work::Constant`] a plan over this buffer ignores the three fields above
     /// even if they are set, and prices itself for `n` scalars over the full width.
     work: Work,
+    /// Somewhere a plan over the whole buffer may put its digit entries instead of the
+    /// pool. See [`Lent`].
+    lent: Option<Lent>,
 }
 
 impl ScalarBuf {
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    /// This buffer with `lent` offered to the plan that covers all of it.
+    pub(crate) fn with_lent(mut self, lent: Option<Lent>) -> Self {
+        self.lent = lent;
+        self
     }
     pub fn is_empty(&self) -> bool {
         self.len == 0
@@ -647,6 +657,47 @@ impl ScalarBuf {
             None => RECODE_BITS - 1,
         }
     }
+}
+
+/// Device memory its owner lends a plan for the digit entries, and gets back when this is
+/// dropped.
+///
+/// Stage 4's scratch lends H's plan the four domain vectors, which nothing reads once
+/// `compute_h` has returned. At 2^22 that is the 537 MB entry array the pool would
+/// otherwise hold beside them. The owner zeroes it with the rest of its scratch; nothing
+/// here goes into the pool.
+pub(crate) struct Lent {
+    buf: Buffer,
+    busy: Arc<AtomicBool>,
+}
+
+impl Lent {
+    /// `buf`, unless `busy` says another `Lent` over it is still alive: two MSMs over one
+    /// H at once must not scatter into the same entries.
+    pub(crate) fn claim(buf: &Buffer, busy: &Arc<AtomicBool>) -> Option<Self> {
+        if busy.swap(true, Ordering::Acquire) {
+            return None;
+        }
+        Some(Self {
+            buf: buf.clone(),
+            busy: Arc::clone(busy),
+        })
+    }
+}
+
+impl Drop for Lent {
+    fn drop(&mut self) {
+        self.busy.store(false, Ordering::Release);
+    }
+}
+
+/// Bytes of digit entries a plan over `n` unclassified scalars takes, which is what
+/// [`Plan::alloc`] asks for over a device-resident H. Stage 4 sizes the buffer it lends
+/// with this; a lent buffer that turns out smaller is not used, so a disagreement costs
+/// the saving and nothing else.
+pub(crate) fn dense_entries_bytes(n: usize) -> usize {
+    let c = window_size_for(n, RECODE_BITS);
+    RECODE_BITS.div_ceil(c as usize) * n.max(1) * 8
 }
 
 // ---------------------------------------------------------------------------
@@ -970,6 +1021,7 @@ impl MetalMsm {
                 ones_idx: None,
                 chunk_bits: None,
                 work,
+                lent: None,
             });
         }
         let mut prefix = vec![0u32; n + 1];
@@ -1022,6 +1074,7 @@ impl MetalMsm {
             ones_idx: Some(ones_idx),
             chunk_bits: Some(chunk_bits),
             work,
+            lent: None,
         })
     }
 
@@ -1056,6 +1109,7 @@ impl MetalMsm {
             ones_idx: None,
             chunk_bits: None,
             work: Work::Variable,
+            lent: None,
         })
     }
 
@@ -1091,6 +1145,7 @@ impl MetalMsm {
             ones_idx: None,
             chunk_bits: None,
             work,
+            lent: None,
         }
     }
 
@@ -1438,6 +1493,8 @@ struct Plan<'a> {
     /// pipeline and the accumulation ever address them.
     dummy_rows: usize,
     scalars: &'a Buffer,
+    /// Where the entries go if it is big enough; the pool otherwise.
+    lent: Option<&'a Buffer>,
     counts: Option<Buffer>,
     cursor: Option<Buffer>,
     entries: Option<Buffer>,
@@ -1508,6 +1565,13 @@ impl<'a> Plan<'a> {
                     || std::env::var("G16_METAL_MSM_ROUTE_ONES").as_deref() == Ok("0")),
             dummy_rows: if constant { DUMMY_ROWS } else { 0 },
             scalars: &scalars.buf,
+            // Whole-buffer plans only. Two jobs over the same range share one plan, so
+            // this is at most one plan per buffer.
+            lent: scalars
+                .lent
+                .as_ref()
+                .filter(|_| scalar_off == 0 && n == scalars.len)
+                .map(|l| &l.buf),
             counts: None,
             cursor: None,
             entries: None,
@@ -1547,10 +1611,18 @@ impl<'a> Plan<'a> {
         let cursor = pool.take(rows * 4)?;
         // 8 bytes an entry: the bucket row travels with the point index so the
         // segmented accumulation can find run boundaries without recomputing digits.
-        let entries = pool.take(self.n_windows * self.cap * 8)?;
+        let bytes = self.n_windows * self.cap * 8;
+        let entries = match self.lent.filter(|b| b.length() as usize >= bytes) {
+            // Not kept: it goes back to its owner, not into the pool.
+            Some(b) => b.clone(),
+            None => {
+                let e = pool.take(bytes)?;
+                keep.push(e.clone());
+                e
+            }
+        };
         keep.push(counts.clone());
         keep.push(cursor.clone());
-        keep.push(entries.clone());
         self.counts = Some(counts);
         self.cursor = Some(cursor);
         self.entries = Some(entries);
@@ -2419,6 +2491,27 @@ mod tests {
              and must be changed with it."
         );
         assert_eq!(MSM_NO_ROW, u32::MAX);
+    }
+
+    /// Stage 4 sizes the buffer it lends H's plan with `dense_entries_bytes`. If that
+    /// drifted below what `Plan::alloc` asks for, the loan would be refused on every proof
+    /// and the entries would come from the pool again, which nothing else would notice.
+    #[test]
+    fn a_lent_buffer_fits_the_dense_plan_it_is_lent_to() {
+        let m = MetalMsm::new().expect("Metal device");
+        let std = crate::alloc::shared(&m.device, 4).unwrap();
+        for log_n in 0..=26 {
+            let n = 1usize << log_n;
+            for work in [Work::Variable, Work::Constant] {
+                let h = m.scalars_from_device_std_with(&std, n, work);
+                let plan = Plan::new(&h, 0, n);
+                assert_eq!(
+                    plan.n_windows * plan.cap * 8,
+                    dense_entries_bytes(n),
+                    "2^{log_n} {work:?}"
+                );
+            }
+        }
     }
 
     /// The drift guard, same shape as `layout::tests::msl_declares_the_same_constants`:
