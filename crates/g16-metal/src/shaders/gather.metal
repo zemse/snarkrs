@@ -51,24 +51,64 @@
 #ifndef G16_GATHER_METAL
 #define G16_GATHER_METAL
 
+// One CSR row's dot product with the witness.
+//
+// Most witness values on the profiled circuits are bits: an audit of sha256_128 found
+// only 27,776 of matrix A's 2,102,656 SIMD loop slots touch a witness value that is
+// neither 0 nor 1 (17,472 of 781,600 for B). With `skip_trivial` the multiply is skipped
+// for the trivial ones, the same trade the CPU gather makes, but here it only pays
+// because the branch is coherent: neighbouring rows reference the same kind of signal,
+// so whole SIMD groups skip together and the multiply issues on about 1% of group
+// iterations. Exact either way: adding zero and multiplying by one are both
+// bit-identical to the slow path.
+//
+// Without it (constant work, see `Work` in msm.rs) every term costs one multiply and one
+// add whatever the witness holds, so the time follows the key's row lengths only.
+inline Fr g16_row_dot(
+    device const uint* row_ptr,
+    device const uint* signal,
+    device const Fr*   value,
+    device const Fr*   witness,
+    uint row,
+    bool skip_trivial)
+{
+    Fr acc = fr_zero();
+    uint lo = row_ptr[row];
+    uint hi = row_ptr[row + 1u];
+    for (uint k = lo; k < hi; k++) {
+        Fr w = witness[signal[k]];
+        if (skip_trivial && fr_is_zero(w)) {
+            continue;
+        }
+        if (skip_trivial && fr_eq(w, fr_one())) {
+            acc = fr_add(acc, value[k]);
+        } else {
+            acc = fr_add(acc, fr_mul(value[k], w));
+        }
+    }
+    return acc;
+}
+
 // out_a[c] = sum over CSR row c of value_a[k] * witness[signal_a[k]]
 // out_b[c] = the same for matrix B
 // out_c[c] = out_a[c] * out_b[c]
 //
 // `witness` is Montgomery-form Fr (layout::PackedFr), as are the CSR values, so the
-// products need no conversion in either direction.
+// products need no conversion in either direction. `constant_work` is 0 or 1 for the
+// whole dispatch, so the test on it never diverges.
 kernel void g16_gather_abc(
-    device const uint* row_ptr_a [[buffer(0)]],
-    device const uint* signal_a  [[buffer(1)]],
-    device const Fr*   value_a   [[buffer(2)]],
-    device const uint* row_ptr_b [[buffer(3)]],
-    device const uint* signal_b  [[buffer(4)]],
-    device const Fr*   value_b   [[buffer(5)]],
-    device const Fr*   witness   [[buffer(6)]],
-    device Fr*         out_a     [[buffer(7)]],
-    device Fr*         out_b     [[buffer(8)]],
-    device Fr*         out_c     [[buffer(9)]],
-    constant uint&     n         [[buffer(10)]],
+    device const uint* row_ptr_a     [[buffer(0)]],
+    device const uint* signal_a      [[buffer(1)]],
+    device const Fr*   value_a       [[buffer(2)]],
+    device const uint* row_ptr_b     [[buffer(3)]],
+    device const uint* signal_b      [[buffer(4)]],
+    device const Fr*   value_b       [[buffer(5)]],
+    device const Fr*   witness       [[buffer(6)]],
+    device Fr*         out_a         [[buffer(7)]],
+    device Fr*         out_b         [[buffer(8)]],
+    device Fr*         out_c         [[buffer(9)]],
+    constant uint&     n             [[buffer(10)]],
+    constant uint&     constant_work [[buffer(11)]],
     uint gid [[thread_position_in_grid]])
 {
     // dispatch_threads gives a non-uniform final threadgroup, so this is belt and braces
@@ -77,43 +117,9 @@ kernel void g16_gather_abc(
         return;
     }
 
-    // Most witness values on the profiled circuits are bits: an audit of sha256_128
-    // found only 27,776 of matrix A's 2,102,656 SIMD loop slots touch a witness value
-    // that is neither 0 nor 1 (17,472 of 781,600 for B). Skipping the multiply for the
-    // trivial ones is the same trade the CPU gather makes, but here it only pays
-    // because the branch is coherent: neighbouring rows reference the same kind of
-    // signal, so whole SIMD groups skip together and the multiply issues on about 1% of
-    // group iterations. Exact either way: adding zero and multiplying by one are both
-    // bit-identical to the slow path.
-    Fr a = fr_zero();
-    uint lo = row_ptr_a[gid];
-    uint hi = row_ptr_a[gid + 1u];
-    for (uint k = lo; k < hi; k++) {
-        Fr w = witness[signal_a[k]];
-        if (fr_is_zero(w)) {
-            continue;
-        }
-        if (fr_eq(w, fr_one())) {
-            a = fr_add(a, value_a[k]);
-        } else {
-            a = fr_add(a, fr_mul(value_a[k], w));
-        }
-    }
-
-    Fr b = fr_zero();
-    lo = row_ptr_b[gid];
-    hi = row_ptr_b[gid + 1u];
-    for (uint k = lo; k < hi; k++) {
-        Fr w = witness[signal_b[k]];
-        if (fr_is_zero(w)) {
-            continue;
-        }
-        if (fr_eq(w, fr_one())) {
-            b = fr_add(b, value_b[k]);
-        } else {
-            b = fr_add(b, fr_mul(value_b[k], w));
-        }
-    }
+    bool skip = constant_work == 0u;
+    Fr a = g16_row_dot(row_ptr_a, signal_a, value_a, witness, gid, skip);
+    Fr b = g16_row_dot(row_ptr_b, signal_b, value_b, witness, gid, skip);
 
     out_a[gid] = a;
     out_b[gid] = b;

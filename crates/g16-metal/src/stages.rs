@@ -51,6 +51,7 @@ use metal::{Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, 
 
 use crate::kernels::{FR_MSL, GATHER_MSL, NTT_MSL, POINTWISE_MSL, SEAL_MSL};
 use crate::layout::{PackedFr, PackedScalar};
+use crate::msm::Work;
 
 /// The tag on [`g16_core::HPoly::Device`] values produced here. A handle carrying any
 /// other tag came from a different backend and must not be dereferenced as an [`HHandle`].
@@ -514,6 +515,19 @@ impl HResident {
         witness: &[Fr],
         t: &mut StageTimings,
     ) -> Result<HPoly, ProveError> {
+        self.compute_h_with(st, witness, Work::Variable, t)
+    }
+
+    /// [`Self::compute_h`] with the work mode chosen. [`Work::Constant`] stops the gather
+    /// skipping the multiply for a 0 or 1 witness value; nothing else in stages 0 to 4
+    /// looks at a value, and the result is the same either way.
+    pub fn compute_h_with(
+        &self,
+        st: &HStages,
+        witness: &[Fr],
+        work: Work,
+        t: &mut StageTimings,
+    ) -> Result<HPoly, ProveError> {
         if witness.len() != self.n_vars {
             return Err(ProveError::WitnessLength {
                 got: witness.len(),
@@ -549,7 +563,7 @@ impl HResident {
         // waits rather than after each commit, because the refs the waits read are its.
         autoreleasepool(|| -> Result<(), ProveError> {
             if profile {
-                return self.run_profiled(st, &sc, n, t, pack_us);
+                return self.run_profiled(st, &sc, n, work, t, pack_us);
             }
             t.gather_us += pack_us;
             let start = Instant::now();
@@ -588,7 +602,7 @@ impl HResident {
                 let cb = crate::cb::command_buffer(&st.queue);
                 let enc = cb.new_compute_command_encoder();
                 enc.set_label("stages 0-1 (gather)");
-                self.encode_gather(st, enc, &sc, n);
+                self.encode_gather(st, enc, &sc, n, work);
                 let token = st.seal.encode(enc);
                 enc.end_encoding();
                 cb.commit();
@@ -645,6 +659,7 @@ impl HResident {
         st: &HStages,
         sc: &Scratch,
         n: usize,
+        work: Work,
         t: &mut StageTimings,
         pack_us: u64,
     ) -> Result<(), ProveError> {
@@ -652,7 +667,7 @@ impl HResident {
         let cb = crate::cb::command_buffer(&st.queue);
         let enc = cb.new_compute_command_encoder();
         enc.set_label("stage 0-1 gather (profiled)");
-        self.encode_gather(st, enc, sc, n);
+        self.encode_gather(st, enc, sc, n, work);
         let token = st.seal.encode(enc);
         enc.end_encoding();
         cb.commit();
@@ -709,6 +724,7 @@ impl HResident {
         enc: &metal::ComputeCommandEncoderRef,
         sc: &Scratch,
         n: usize,
+        work: Work,
     ) {
         enc.set_compute_pipeline_state(&st.gather);
         enc.set_buffer(0, Some(&self.row_ptr[0]), 0);
@@ -723,6 +739,8 @@ impl HResident {
         bind(enc, 9, sc.c());
         let nn = n as u32;
         enc.set_bytes(10, 4, &nn as *const u32 as *const c_void);
+        let constant = u32::from(work == Work::Constant);
+        enc.set_bytes(11, 4, &constant as *const u32 as *const c_void);
         let tg = st.threads(&st.gather, n as u64);
         enc.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(tg, 1, 1));
     }
@@ -1059,6 +1077,74 @@ mod tests {
             panic!("accepted a row_ptr past the signal total");
         };
         assert!(err.to_string().contains("row_ptr ends at"), "{err}");
+    }
+
+    /// The gather alone, on one key, over witnesses of zeros, the circuit's own and dense
+    /// random values, in both work modes: under `Work::Variable` the time follows how many
+    /// witness values are 0 or 1, under `Work::Constant` it should not. `G16_PROBE_CIRCUIT`
+    /// names the artifact, keccak256 by default.
+    #[test]
+    #[ignore = "GPU measurement; run explicitly on the measurement machine"]
+    fn gather_time_by_witness() {
+        use g16_field::PrimeField;
+        let name = std::env::var("G16_PROBE_CIRCUIT").unwrap_or_else(|_| "keccak256".into());
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../bench/artifacts")
+            .join(&name);
+        let pk = ProvingKey::load(&dir.join("circuit.zkey")).unwrap();
+        let own = g16_zkey::wtns::Witness::load(&dir.join("circuit.wtns"))
+            .unwrap()
+            .0;
+        let st = HStages::new().expect("Metal device");
+        let res = st.prepare(&pk).unwrap();
+        let n = res.domain.size;
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let dense: Vec<Fr> = (0..own.len())
+            .map(|_| {
+                let mut bytes = [0u8; 32];
+                for b in &mut bytes {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    *b = seed as u8;
+                }
+                Fr::from_le_bytes_mod_order(&bytes)
+            })
+            .collect();
+        let zeros = vec![Fr::from(0u64); own.len()];
+        let sc = res.take_scratch(&st).unwrap();
+        for work in [Work::Variable, Work::Constant] {
+            for (label, w) in [("zeros", &zeros), ("own", &own), ("dense", &dense)] {
+                // SAFETY: as in `compute_h`; nothing is in flight against this scratch.
+                let dst = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        sc.witness.contents() as *mut PackedFr,
+                        res.n_vars,
+                    )
+                };
+                PackedFr::pack_into(w, dst);
+                let mut samples = Vec::new();
+                for rep in 0..25 {
+                    let t = Instant::now();
+                    let cb = crate::cb::command_buffer(&st.queue);
+                    let enc = cb.new_compute_command_encoder();
+                    res.encode_gather(&st, enc, &sc, n, work);
+                    let token = st.seal.encode(enc);
+                    enc.end_encoding();
+                    cb.commit();
+                    st.seal.wait(cb, token, "gather probe").unwrap();
+                    if rep >= 5 {
+                        samples.push(t.elapsed().as_secs_f64() * 1e3);
+                    }
+                }
+                samples.sort_by(f64::total_cmp);
+                println!(
+                    "gather {name} {work:?} {label:<5} median {:.3} ms min {:.3}",
+                    samples[samples.len() / 2],
+                    samples[0]
+                );
+            }
+        }
     }
 
     /// The shapes the artifacts actually use, spelled out so a change to the splitting

@@ -88,9 +88,9 @@ impl MetalBackend {
     /// by `n / slice_len`, in one lane per bucket outside the wide top window) and the
     /// `count == 0` exits of the merge kernels. On the host: the identity tests inside
     /// the combine's few hundred curve additions, as on the CPU backend. Stages 0 to 4
-    /// are unchanged and were already fixed-shape, except that the gather kernel skips
-    /// the multiply for a 0 or 1 witness value (`gather.metal`), which is per-element
-    /// and coherent but not constant.
+    /// were already fixed-shape; their one value test, the gather's skip of the multiply
+    /// for a 0 or 1 witness value, is off (keccak256's gather 0.45 ms to 0.71, what a
+    /// dense witness costs; js_16x16_d32 unchanged at 1.56).
     ///
     /// Priced warm on the M2 Max, 15 reps, three alternating rounds against the variable
     /// path on a machine other work was sharing (so the mins are the cleaner figure):
@@ -455,7 +455,8 @@ impl PreparedCircuit for MetalCircuit {
     }
 
     fn compute_h(&self, witness: &[Fr], t: &mut StageTimings) -> Result<HPoly, ProveError> {
-        self.resident.compute_h(&self.stages, witness, t)
+        self.resident
+            .compute_h_with(&self.stages, witness, self.work, t)
     }
 
     fn msms(

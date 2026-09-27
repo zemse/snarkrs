@@ -17,6 +17,7 @@ use std::time::Instant;
 
 use g16_core::{cpu::CpuBackend, Backend, HPoly, StageTimings};
 use g16_field::Fr;
+use g16_metal::msm::Work;
 use g16_metal::stages::{HHandle, HStages, TAG};
 use g16_zkey::{wtns::Witness, ProvingKey};
 
@@ -122,6 +123,17 @@ fn gpu_compute_h_matches_the_cpu_backend() {
         let (mont, std_form) = read_back(&h);
         let m1 = compare(&name, "fused/montgomery", &mont, &want);
         let m2 = compare(&name, "fused/standard", &std_form, &want);
+        drop(h);
+
+        // Constant work multiplies by every witness value the variable gather skips; the
+        // products are the same, so H is too.
+        let mut tk = StageTimings::default();
+        let h = res
+            .compute_h_with(&stages, &w, Work::Constant, &mut tk)
+            .unwrap();
+        let (mont_k, std_k) = read_back(&h);
+        compare(&name, "constant/montgomery", &mont_k, &want);
+        compare(&name, "constant/standard", &std_k, &want);
         drop(h);
 
         // The unfused path, which runs the standalone stage 4 kernel and waits on each
