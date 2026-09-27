@@ -20,7 +20,7 @@ to that tree; the table that follows says what has landed since.
 | 4 | Metal command buffer status never checked | Fixed, `69d2802` (`cb::wait_ok`) |
 | 5 | Threadgroup memory never cleared | Fixed, `dd21174` |
 | 6 | Witness-dependent MSM cost | CPU: opt-in constant work, `ae15a9b` (`prove --constant-work`; +2.5% dense, 3.3-4x bit-heavy). Metal: opt-in constant work, `f48db69` (`--backend metal`; +15% dense, 7-11x bit-heavy); bucket occupancy and stage 0's 0/1 multiply skip remain. wgpu, cuda: **open** |
-| 7 | Metal concurrency failure | Fixed, `2e2d06f`: macOS `ImpactingInteractivity` kills of a proving command buffer, now retried whole. One unchecked proof came back wrong after a GPU hang and recovery under deliberate three-process overload: **open**, caught by `prove`'s self-verify |
+| 7 | GPU concurrency failure | Fixed on Metal, `2e2d06f`, and on wgpu, `4ce2c96`, where wgpu hid the kill and proofs came back wrong: macOS `ImpactingInteractivity` kills of a proving command buffer, now retried whole. One unchecked proof came back wrong after a GPU hang and recovery under deliberate three-process overload: **open**, caught by `prove`'s self-verify |
 | 8 | Lenient proof JSON encoding | Fixed, `d170f78` |
 | 9 | `verify()` validates nothing | Fixed, `d170f78`; `verify_unchecked` is the bare check |
 | 10 | Section 4 read twice, second pass unchecked | Fixed, `9445d85` |
@@ -219,6 +219,12 @@ three-process overload the GPU hung and recovered, and one unchecked proof came 
 **open**, and `prove`'s self-verify is the guard for that case. Follow-up `7f34c54`: when the retries run
 out, or wgpu loses the device, the error is `ProveError::Device`, and `g16 prove`'s fallback
 retries it once on the device and then proves on the CPU instead of failing.
+
+The same kill reaches the wgpu backend, and wgpu 30 does not report it: wgpu-hal's Metal fence
+treats an errored command buffer as completed, so the readback held the previous proof's window
+sums (29 of 40 CLI proofs wrong under load). Since `4ce2c96` every wgpu submission ends with a
+token written by its last dispatch, and a readback without it is refused, retried up to four
+times, then reported as `ProveError::Device`.
 
 **8. `[S]` `proof.json` has no canonical encoding, and our two JSON readers disagree.**
 `json.rs:130-146` and `:156-169` accept any nonzero Jacobian `z` and normalise, so there
