@@ -51,7 +51,7 @@
 //! KiB or so this reads, that is several hundred times clear. If a readback ever grows past
 //! a megabyte, this function is the wrong tool and `as_uint8array()` is the right one.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use g16_core::ProveError;
 
@@ -77,6 +77,49 @@ pub fn is_aborted(e: &ProveError) -> bool {
 /// after a refusal as they would have on the first; the GPU only produces a refusal under
 /// another process's load, and never on demand.
 pub static REFUSE_NEXT: AtomicU32 = AtomicU32::new(0);
+
+/// Which upcoming submission to cut short the way the GPU does, and where: `(closes << 32)
+/// | (k + 1)`, or 0 for none. The submission is the one `closes` [`Seal::close`]s from now,
+/// and of its pass only the first `k` dispatches are encoded whole, the `k`th at half its
+/// workgroups, none after it, and not the seal's, so the token is missing and the
+/// submission is refused exactly as one macOS aborted at that point. Each close before the
+/// chosen one counts it down, and the chosen one clears it, so the retry runs whole.
+///
+/// The other test knob, [`REFUSE_NEXT`], stales the token of a submission that ran to its
+/// end, which tests the retry over consistent buffers and nothing else. This one is for
+/// what BUG-33 asks: that a retry started over buffers a half-run pass left behind gives
+/// the same answer, at every point the pass can stop.
+pub static CUT_NEXT: AtomicU64 = AtomicU64::new(0);
+
+/// Submissions [`CUT_NEXT`] has left the seal out of, so a test can tell a `k` past the end
+/// of a pass, which cuts nothing, from one that cut.
+pub static CUTS: AtomicU32 = AtomicU32::new(0);
+
+/// Dispatches of the submission [`CUT_NEXT`] is cutting that have gone through
+/// [`dispatch`] so far.
+static CUT_ENCODED: AtomicU32 = AtomicU32::new(0);
+
+/// `pass.dispatch_workgroups(x, 1, 1)`, unless [`CUT_NEXT`] leaves it out. Every dispatch
+/// on the proving path goes through here so the knob sees them all; returns whether the
+/// dispatch was encoded whole.
+pub(crate) fn dispatch(pass: &mut wgpu::ComputePass<'_>, x: u32) -> bool {
+    let cut = CUT_NEXT.load(Ordering::Relaxed);
+    if cut != 0 && (cut >> 32) == 0 {
+        let k = (cut as u32) - 1;
+        let n = CUT_ENCODED.fetch_add(1, Ordering::Relaxed);
+        if n > k {
+            return false;
+        }
+        if n == k {
+            if x >= 2 {
+                pass.dispatch_workgroups(x / 2, 1, 1);
+            }
+            return false;
+        }
+    }
+    pass.dispatch_workgroups(x, 1, 1);
+    true
+}
 
 /// A token the last dispatch of a submission writes and a blit copies out, so the host can
 /// tell a submission the GPU ran to its end from one it cut short.
@@ -231,7 +274,9 @@ impl Seal {
             .write_buffer(&self.src, 0, &epoch.to_le_bytes());
         pass.set_pipeline(&backend.seal_kernel().pipeline);
         pass.set_bind_group(0, &self.bind, &[]);
-        pass.dispatch_workgroups(1, 1, 1);
+        if !dispatch(pass, 1) {
+            CUTS.fetch_add(1, Ordering::Relaxed);
+        }
         self.armed.store(epoch, Ordering::Relaxed);
     }
 
@@ -260,6 +305,18 @@ impl Seal {
                 .queue()
                 .write_buffer(&self.src, 0, &0u32.to_le_bytes());
         }
+        // The other knob: this close counts down to the submission it cuts, and the cut one
+        // clears it so the retry is whole.
+        let _ = CUT_NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+            Some(if c == 0 {
+                0
+            } else if c >> 32 == 0 {
+                CUT_ENCODED.store(0, Ordering::Relaxed);
+                0
+            } else {
+                c - (1 << 32)
+            })
+        });
         enc.copy_buffer_to_buffer(&self.dst, 0, &self.map, 0, 4);
         let (tx, rx) = flume::bounded(1);
         enc.map_buffer_on_submit(&self.map, wgpu::MapMode::Read, 0..4, move |r| {

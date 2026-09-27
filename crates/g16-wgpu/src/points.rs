@@ -1231,7 +1231,7 @@ impl<C: PointCurve> MsmPoints<C> {
     ) -> Result<(), ProveError> {
         pass.set_pipeline(self.kernels.get(&self.names[REDUCE])?);
         pass.set_bind_group(0, &binds.reduce, &[offsets.reduce]);
-        pass.dispatch_workgroups(digits.n_windows(), 1, 1);
+        crate::readback::dispatch(pass, digits.n_windows());
         Ok(())
     }
 
@@ -1245,7 +1245,7 @@ impl<C: PointCurve> MsmPoints<C> {
     ) -> Result<(), ProveError> {
         pass.set_pipeline(self.kernels.get(&self.names[ONES])?);
         pass.set_bind_group(0, &binds.ones, &[offsets.ones]);
-        pass.dispatch_workgroups(points.ones_groups, 1, 1);
+        crate::readback::dispatch(pass, points.ones_groups);
         Ok(())
     }
 
@@ -1271,7 +1271,7 @@ impl<C: PointCurve> MsmPoints<C> {
         for &off in offsets {
             let hi = lo.saturating_add(span).min(n);
             pass.set_bind_group(0, bind, &[off]);
-            pass.dispatch_workgroups(hi.saturating_sub(lo).div_ceil(wg).max(1), 1, 1);
+            crate::readback::dispatch(pass, hi.saturating_sub(lo).div_ceil(wg).max(1));
             lo = hi;
         }
         Ok(())

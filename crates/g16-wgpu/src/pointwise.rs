@@ -274,7 +274,7 @@ impl HJoin {
         for &off in offsets {
             let hi = (lo + self.elems_per_dispatch).min(n);
             pass.set_bind_group(0, bind, &[off]);
-            pass.dispatch_workgroups((hi - lo).div_ceil(self.workgroup), 1, 1);
+            crate::readback::dispatch(pass, (hi - lo).div_ceil(self.workgroup));
             lo = hi;
         }
         Ok(())

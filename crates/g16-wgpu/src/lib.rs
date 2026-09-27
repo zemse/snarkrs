@@ -109,6 +109,6 @@ pub use points::{
     PointBinds, PointBuffers, PointCurve, PointOffsets, PointPlan,
 };
 pub use pointwise::{HJoin, HJoinParams};
-pub use readback::{is_aborted, Readback, Seal, SealKernel, Sealed, REFUSE_NEXT};
+pub use readback::{is_aborted, Readback, Seal, SealKernel, Sealed, CUTS, CUT_NEXT, REFUSE_NEXT};
 pub use selftest::Check;
 pub use stages::{HStages, Stage4, WgpuHandle};

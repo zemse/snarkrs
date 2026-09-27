@@ -648,7 +648,7 @@ impl Ntt {
             };
             pass.set_pipeline(self.kernels.get(&mode.entry(b.k))?);
             pass.set_bind_group(0, bind, &[t.offsets[bi]]);
-            pass.dispatch_workgroups((self.n >> b.k).max(1), 1, 1);
+            crate::readback::dispatch(pass, (self.n >> b.k).max(1));
         }
         Ok(())
     }

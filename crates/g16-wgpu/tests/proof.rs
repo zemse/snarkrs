@@ -366,6 +366,95 @@ fn a_proof_whose_every_submission_was_refused_once_is_the_same_proof() {
     );
 }
 
+/// BUG-33's deterministic half: `CUT_NEXT` stops one submission's pass at every point it
+/// can stop, the way a macOS abort does (the first `k` dispatches whole, the next half done,
+/// nothing after it and no token), and the retry has to give the unfaulted proof bit for
+/// bit. Stages 0 to 4 first, then each MSM submission in turn; a `k` at which nothing was
+/// cut is one past that pass's end and ends its sweep. `REFUSE_NEXT` above stales the token
+/// of a pass that ran whole, so a retry that reads what a half-run pass left behind, an
+/// in-place batch stopped partway or an accumulator half filled, is only tested here.
+///
+/// Four artifacts rather than all: one proof per cut point is about 120 proofs on
+/// `js_16x16_d32`, and these four cover a single-batch transform, a multi-batch one, a
+/// point stage in several submissions and a `ones`-heavy key. Under the cross-process lock
+/// for the reason the test above gives.
+#[test]
+fn a_submission_cut_short_at_every_dispatch_is_retried_exactly() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let _one_at_a_time = exclusive();
+    let _lock = gpulock::exclusive_gpu();
+    let picked = ["tiny_mul", "js_2x2_d32", "js_16x16_d32", "keccak256"];
+    let found: Vec<Artifact> = artifacts()
+        .into_iter()
+        .filter(|a| picked.contains(&a.name.as_str()))
+        .collect();
+    if found.is_empty() {
+        eprintln!(
+            "SKIPPED a_submission_cut_short_at_every_dispatch_is_retried_exactly: no artifacts"
+        );
+        return;
+    }
+    for a in &found {
+        let circuit = prover().prepare(a.key()).expect("prepare");
+        let witness = a.witness();
+        let vkey = a.vkey();
+        let public = public_of(&witness, circuit.n_public());
+        let (r, s) = (Fr::from(7u64), Fr::from(11u64));
+        let mut t = StageTimings::default();
+        prove_with_blinders(circuit.as_ref(), &witness, r, s, &mut t).expect("warm");
+        let want = prove_with_blinders(circuit.as_ref(), &witness, r, s, &mut t).expect("clean");
+        let msm = prover().msm().last_submits();
+
+        // Submission 0 is stages 0 to 4, then the MSM batch's in order.
+        for sub in 0..=msm {
+            let mut k = 0u32;
+            loop {
+                let before = g16_wgpu::CUTS.load(Relaxed);
+                g16_wgpu::CUT_NEXT.store((u64::from(sub) << 32) | u64::from(k + 1), Relaxed);
+                let got = prove_with_blinders(circuit.as_ref(), &witness, r, s, &mut t);
+                let left = g16_wgpu::CUT_NEXT.swap(0, Relaxed);
+                assert_eq!(
+                    left, 0,
+                    "{}: submission {sub} never closed, the proof made fewer submissions",
+                    a.name
+                );
+                let cuts = g16_wgpu::CUTS.load(Relaxed) - before;
+                if cuts == 0 {
+                    // Past the end of the pass: nothing left out, nothing to retry.
+                    break;
+                }
+                assert_eq!(cuts, 1, "{}: one cut asked for, {cuts} made", a.name);
+                let got = match got {
+                    Ok(p) => p,
+                    Err(e) => panic!(
+                        "{}: submission {sub} cut after {k} dispatches did not recover: {e}",
+                        a.name
+                    ),
+                };
+                assert_eq!(
+                    (got.a, got.b, got.c),
+                    (want.a, want.b, want.c),
+                    "{}: submission {sub} cut after {k} dispatches, the retry proved something else",
+                    a.name
+                );
+                verify(&vkey, &public, &got).expect("verify");
+                k += 1;
+            }
+            // Every pass holds at least one dispatch of its own plus the seal.
+            assert!(
+                k >= 2,
+                "{}: submission {sub} was cut at {k} points, so the knob did not see its pass",
+                a.name
+            );
+            eprintln!(
+                "{}: submission {sub} of {} cut at each of its {k} points, retried exactly",
+                a.name,
+                msm + 1
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 2. The contract: `&self`, from several threads
 // ---------------------------------------------------------------------------

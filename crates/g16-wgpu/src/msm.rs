@@ -1027,7 +1027,7 @@ impl MsmDigits {
         }
         pass.set_pipeline(self.pipeline(wgsl::ENTRY_SCAN)?);
         pass.set_bind_group(0, &binds.scan, &[offsets.scan[0]]);
-        pass.dispatch_workgroups(plan.n_windows, 1, 1);
+        crate::readback::dispatch(pass, plan.n_windows);
         Ok(())
     }
 
@@ -1105,7 +1105,7 @@ impl MsmDigits {
         for &off in offsets {
             let hi = lo.saturating_add(span).min(n);
             pass.set_bind_group(0, bind, &[off]);
-            pass.dispatch_workgroups(hi.saturating_sub(lo).div_ceil(wg).max(1), 1, 1);
+            crate::readback::dispatch(pass, hi.saturating_sub(lo).div_ceil(wg).max(1));
             lo = hi;
         }
         Ok(())

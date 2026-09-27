@@ -866,7 +866,7 @@ impl GatherAbc {
         pass.set_pipeline(self.kernels.get(wgsl::ENTRY)?);
         for (&off, (ci, lo, hi)) in offsets.iter().zip(ranges) {
             pass.set_bind_group(0, &binds[ci], &[off]);
-            pass.dispatch_workgroups((hi - lo).div_ceil(self.workgroup), 1, 1);
+            crate::readback::dispatch(pass, (hi - lo).div_ceil(self.workgroup));
         }
         Ok(())
     }
