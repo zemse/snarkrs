@@ -101,6 +101,12 @@ enum Cmd {
         /// verified against it before anything is written.
         #[arg(long, value_name = "FILE")]
         vkey: Option<PathBuf>,
+        /// When a GPU proof fails its self-verify, prove once more on the same backend and
+        /// then on the CPU, reporting each failure on stderr. A logic bug fails the same way
+        /// every time; a transient accelerator fault does not. No effect with --self-verify
+        /// false or --backend cpu.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        fallback: bool,
     },
     /// Verify a proof against snarkjs' verification_key.json.
     Verify {
@@ -308,6 +314,7 @@ fn main() -> Result<()> {
             stage_timings,
             self_verify,
             vkey,
+            fallback,
         } => run_prove(
             &zkey,
             &witness,
@@ -317,6 +324,7 @@ fn main() -> Result<()> {
             stage_timings,
             self_verify,
             vkey.as_deref(),
+            fallback,
         ),
         Cmd::Verify {
             vkey,
@@ -688,6 +696,7 @@ fn run_prove(
     stage_timings: bool,
     self_verify: bool,
     vkey: Option<&std::path::Path>,
+    fallback: bool,
 ) -> Result<()> {
     let pk = ProvingKey::load(zkey).with_context(|| format!("loading {}", zkey.display()))?;
     let n_public = pk.n_public;
@@ -744,8 +753,41 @@ fn run_prove(
     // points first; see its docs for why that check is also what keeps a hostile key from
     // reading the witness out of `C`.
     let proof = if self_verify {
-        prove(circuit.as_ref(), &w, &mut rng, &mut t).map_err(|e| {
-            anyhow::anyhow!("{e}. Nothing has been written. Re-run with --self-verify=false to write it anyway.")
+        let attempt = if fallback {
+            g16_cli::fallback::prove_with_fallback(
+                circuit.as_ref(),
+                &w,
+                &mut rng,
+                &mut t,
+                || {
+                    // The key moved into the accelerator at prepare, so the CPU loads its own.
+                    let pk = ProvingKey::load(zkey)?;
+                    Ok(make_backend(BackendKind::Cpu)?.prepare(pk)?)
+                },
+                &mut |step| {
+                    use g16_cli::fallback::Fallback::*;
+                    match step {
+                        Retry { backend } => eprintln!(
+                            "warning: the {backend} proof failed its self-verify; proving again \
+                             on {backend}"
+                        ),
+                        Cpu { backend } => eprintln!(
+                            "warning: {backend} failed its self-verify twice; proving on the cpu"
+                        ),
+                        DeviceSuspect { backend } => eprintln!(
+                            "warning: the cpu proof verified, so {backend} computed a wrong \
+                             proof twice; treat that device as suspect"
+                        ),
+                    }
+                },
+            )
+        } else {
+            prove(circuit.as_ref(), &w, &mut rng, &mut t).map_err(Into::into)
+        };
+        attempt.map_err(|e| {
+            e.context(
+                "Nothing has been written. Re-run with --self-verify=false to write it anyway.",
+            )
         })?
     } else {
         prove_unchecked(circuit.as_ref(), &w, &mut rng, &mut t)?

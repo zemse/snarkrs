@@ -5,6 +5,7 @@
 
 pub mod artifacts;
 pub mod bench;
+pub mod fallback;
 #[cfg(feature = "cuda")]
 pub mod fftbench;
 pub mod json;
