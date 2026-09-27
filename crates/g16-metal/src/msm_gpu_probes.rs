@@ -592,3 +592,112 @@ fn lane_scatter_body() {
         m.pool.give(keep);
     }
 }
+
+/// What `Work::Constant` leaves to bucket occupancy, phase by phase: one constant-work
+/// MSM in each group over the same bases, scalars all zero, bits, and dense random,
+/// each phase in its own command buffer. `G16_REVIEW_N` sets the length (2^18 by
+/// default, H's length on keccak256 and js_16x16_d32).
+#[test]
+#[ignore = "GPU measurement; run explicitly on the measurement machine"]
+fn constant_work_phase_occupancy() {
+    let n: usize = std::env::var("G16_REVIEW_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1 << 18);
+    let m = MetalMsm::new().unwrap();
+    let mut p1 = G1Projective::generator();
+    let mut p2 = G2Projective::generator();
+    let (mut g1, mut g2) = (Vec::with_capacity(n), Vec::with_capacity(n));
+    for _ in 0..n {
+        p1 += G1Projective::generator();
+        p2 += G2Projective::generator();
+        g1.push(p1);
+        g2.push(p2);
+    }
+    let b1 = m
+        .upload_g1_bases(&G1Projective::normalize_batch(&g1))
+        .unwrap();
+    let b2 = m
+        .upload_g2_bases(&G2Projective::normalize_batch(&g2))
+        .unwrap();
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let bits: Vec<Fr> = (0..n).map(|_| Fr::from(next() & 1)).collect();
+    let dense: Vec<Fr> = (0..n)
+        .map(|_| {
+            let mut bytes = [0u8; 32];
+            for b in &mut bytes {
+                *b = next() as u8;
+            }
+            Fr::from_le_bytes_mod_order(&bytes)
+        })
+        .collect();
+    let sets = [
+        ("zeros", vec![Fr::from(0u64); n]),
+        ("bits", bits),
+        ("dense", dense),
+    ];
+    let time = |f: &mut dyn FnMut(&ComputeCommandEncoderRef)| -> f64 {
+        let t = Instant::now();
+        let cb = m.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        f(enc);
+        enc.end_encoding();
+        cb.commit();
+        crate::cb::wait_ok(cb, "occupancy probe").unwrap();
+        t.elapsed().as_secs_f64() * 1e3
+    };
+    for group in ["g1", "g2"] {
+        for (label, scalars) in &sets {
+            let s = m.upload_scalars_with(scalars, Work::Constant).unwrap();
+            let job = if group == "g1" {
+                Job::G1(JobG1 {
+                    bases: &b1,
+                    base_off: 0,
+                    scalars: &s,
+                    scalar_off: 0,
+                    n,
+                })
+            } else {
+                Job::G2(JobG2 {
+                    bases: &b2,
+                    base_off: 0,
+                    scalars: &s,
+                    scalar_off: 0,
+                    n,
+                })
+            };
+            let mut plan = Plan::new(&s, 0, n);
+            let mut keep = Vec::new();
+            plan.alloc(&m.pool, &mut keep).unwrap();
+            let out = Outputs::alloc(&m, &mut keep, &job, &plan).unwrap();
+            let mut t: [Vec<f64>; 5] = Default::default();
+            for rep in 0..12 {
+                let d = time(&mut |enc| plan.encode(&m, enc));
+                let c = time(&mut |enc| out.encode_clear(&m, enc, &job, &plan));
+                let a = time(&mut |enc| out.encode_accumulate(&m, enc, &job, &plan));
+                let g = time(&mut |enc| out.encode_merge(&m, enc, &job, &plan));
+                let r = time(&mut |enc| out.encode_reduce(&m, enc, &job, &plan));
+                if rep >= 3 {
+                    for (v, x) in t.iter_mut().zip([d, c, a, g, r]) {
+                        v.push(x);
+                    }
+                }
+            }
+            let [d, c, a, g, r] = t.map(median);
+            println!(
+                "occupancy {group} {label:<5} n={n} c={} w={} digits {d:.2} clear {c:.2} \
+                 accum {a:.2} merge {g:.2} reduce {r:.2} ms",
+                plan.c, plan.n_windows
+            );
+            drop(out);
+            drop(plan);
+            m.pool.give(keep);
+        }
+    }
+}

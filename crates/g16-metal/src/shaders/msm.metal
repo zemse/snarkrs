@@ -1342,6 +1342,111 @@ kernel void msm_merge_wide_g2(device PtG2* buckets [[buffer(0)]],
     msm_merge_wide_impl<Fq2>(buckets, spill_pts, spill_rows, counts, cursor, p, shared, tg, tid, tcount);
 }
 
+// Constant work's merge. `msm_merge_*` walks each bucket's slice span in one lane, so
+// its time follows occupancy: on a bit witness nearly every digit is 0 or 1, window 0's
+// bucket 1 holds half the entries and one lane walks half the window's slices (40 ms in
+// G1, 177 ms in G2 on keccak256, against 1 and 3 on a dense witness). Here the spill
+// slots are folded the way the segmented accumulation folds entries: a window's slots
+// are sorted by row, so each thread takes `f.z` consecutive slots, writes every run
+// that starts and ends inside them to its bucket, and spills the first and last run to
+// two slots of the next level. The host repeats that until one group spans the window,
+// and that last level writes its first and last run too. Every thread makes exactly
+// `f.z` additions whatever the rows are, and the number of levels and threads follows
+// the key: the same tree runs on every witness.
+//
+// `f` is (slots per window in, groups per window, slots per group, last level). An
+// empty slot (MSM_NO_ROW, a slice or group with one run) adds the identity and never
+// starts a run.
+template <typename F>
+inline void msm_fold_impl(device const Xyzz<F>* in_pts,
+                          device const uint* in_rows,
+                          device Xyzz<F>* out_pts,
+                          device uint* out_rows,
+                          device Xyzz<F>* buckets,
+                          constant MsmParams& p,
+                          constant uint4& f,
+                          uint gid) {
+    uint m_in = f.x;
+    uint groups = f.y;
+    uint len = f.z;
+    bool last = f.w != 0u;
+    uint w = gid / groups;
+    uint g = gid - w * groups;
+    if (w >= p.n_windows) {
+        return;
+    }
+    uint head_slot = 2u * gid;
+    uint tail_slot = head_slot + 1u;
+    if (!last) {
+        out_rows[head_slot] = MSM_NO_ROW;
+        out_rows[tail_slot] = MSM_NO_ROW;
+    }
+
+    uint lo = g * len;
+    uint hi = min(lo + len, m_in);
+    uint cur = MSM_NO_ROW;
+    bool is_first_run = true;
+    Xyzz<F> acc = pt_zero<F>();
+    // `len` iterations in every group, the window's short last one included, so a
+    // thread's additions do not depend on where it sits either.
+    for (uint i = lo; i < lo + len; i++) {
+        uint j = w * m_in + min(i, hi - 1u);
+        uint r = (i < hi) ? in_rows[j] : MSM_NO_ROW;
+        Xyzz<F> q = in_pts[j];
+        if (r == MSM_NO_ROW) {
+            q = pt_zero<F>();
+        } else if (r != cur) {
+            if (cur != MSM_NO_ROW) {
+                if (is_first_run && !last) {
+                    out_pts[head_slot] = acc;
+                    out_rows[head_slot] = cur;
+                } else {
+                    buckets[cur] = acc;
+                }
+                is_first_run = false;
+            }
+            acc = pt_zero<F>();
+            cur = r;
+        }
+        acc = pt_add(acc, q);
+    }
+
+    if (cur == MSM_NO_ROW) {
+        return;
+    }
+    if (last) {
+        buckets[cur] = acc;
+    } else if (is_first_run) {
+        out_pts[head_slot] = acc;
+        out_rows[head_slot] = cur;
+    } else {
+        out_pts[tail_slot] = acc;
+        out_rows[tail_slot] = cur;
+    }
+}
+
+kernel void msm_fold_g1(device const PtG1* in_pts [[buffer(0)]],
+                        device const uint* in_rows [[buffer(1)]],
+                        device PtG1* out_pts [[buffer(2)]],
+                        device uint* out_rows [[buffer(3)]],
+                        device PtG1* buckets [[buffer(4)]],
+                        constant MsmParams& p [[buffer(5)]],
+                        constant uint4& f [[buffer(6)]],
+                        uint gid [[thread_position_in_grid]]) {
+    msm_fold_impl<Fq>(in_pts, in_rows, out_pts, out_rows, buckets, p, f, gid);
+}
+
+kernel void msm_fold_g2(device const PtG2* in_pts [[buffer(0)]],
+                        device const uint* in_rows [[buffer(1)]],
+                        device PtG2* out_pts [[buffer(2)]],
+                        device uint* out_rows [[buffer(3)]],
+                        device PtG2* buckets [[buffer(4)]],
+                        constant MsmParams& p [[buffer(5)]],
+                        constant uint4& f [[buffer(6)]],
+                        uint gid [[thread_position_in_grid]]) {
+    msm_fold_impl<Fq2>(in_pts, in_rows, out_pts, out_rows, buckets, p, f, gid);
+}
+
 // Lane-to-lane point movement for the reduce's simd reduction. A shuffle moves 32-bit
 // registers, so a point is 32 (G1) or 64 (G2) shuffles; lanes past the simdgroup's edge
 // receive undefined values, which is safe in a down-reduction because no lane below the

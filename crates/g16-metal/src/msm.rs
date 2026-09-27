@@ -108,14 +108,16 @@ pub enum Work {
     ///
     /// That closes the channel of "Remote Side-Channel Attacks on Anonymous
     /// Transactions" (USENIX Security 2020), which recovered Zcash witness sparsity from
-    /// proving time. It is not constant time in the strict sense: bucket occupancy still
-    /// follows the digit values, so the atomics' contention, the merge's walk over a fat
-    /// bucket's slices and the `count == 0` exits stay data dependent, as in every
-    /// Pippenger; see [`MetalBackend::constant_work`](crate::MetalBackend::constant_work)
-    /// for what that leaves.
+    /// proving time. The merge is the fixed tree of `msm_fold_*` rather than a walk per
+    /// bucket. It is not constant time in the strict sense: bucket occupancy still
+    /// follows the digit values, so the atomics' contention and the identity shortcuts
+    /// inside the point additions (an empty bucket or slot adds for free) stay data
+    /// dependent, as in every Pippenger; see
+    /// [`MetalBackend::constant_work`](crate::MetalBackend::constant_work) for what that
+    /// leaves.
     ///
     /// What it costs is what the zeros and ones were saving, so it is priced per
-    /// circuit in `MetalBackend::constant_work`: about 15% on a dense witness, 7-11x on
+    /// circuit in `MetalBackend::constant_work`: about 14% on a dense witness, 4-5x on
     /// a bit-heavy one.
     Constant,
     /// Zero scalars are dropped, one scalars go to the ones gather, the window is sized
@@ -283,6 +285,24 @@ fn merge_wide_min_span() -> usize {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(MERGE_WIDE_MIN_SPAN)
+}
+
+/// Spill slots one thread of `msm_fold_*` takes per level: the constant-work merge,
+/// whose shape follows the key rather than which buckets the digits landed in.
+///
+/// Swept at 2^18 (c=13, 8192 slices a window), merge phase on a dense witness, G1/G2:
+/// 4 slots 0.96/3.60 ms over seven levels, 8 0.98/3.88 over five, 16 1.17/4.66, 32
+/// 1.57/7.03; the longer the group the longer each thread's dependent chain. 8 ties 4
+/// with two fewer barriers. Override with `G16_METAL_MSM_FOLD` (at least 4, so every
+/// level shrinks the slot count).
+const FOLD_LEN: usize = 8;
+
+fn fold_len() -> usize {
+    std::env::var("G16_METAL_MSM_FOLD")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v >= 4)
+        .unwrap_or(FOLD_LEN)
 }
 
 /// Bucket rows at or above which the scatter's windows split into two serial
@@ -769,6 +789,8 @@ struct Pipelines {
     merge_g2: ComputePipelineState,
     merge_wide_g1: ComputePipelineState,
     merge_wide_g2: ComputePipelineState,
+    fold_g1: ComputePipelineState,
+    fold_g2: ComputePipelineState,
     reduce_g1: ComputePipelineState,
     reduce_g2: ComputePipelineState,
     ones_g1: ComputePipelineState,
@@ -894,6 +916,8 @@ impl MetalMsm {
             merge_g2: pso("msm_merge_g2")?,
             merge_wide_g1: pso("msm_merge_wide_g1")?,
             merge_wide_g2: pso("msm_merge_wide_g2")?,
+            fold_g1: pso("msm_fold_g1")?,
+            fold_g2: pso("msm_fold_g2")?,
             reduce_g1: pso("msm_reduce_g1")?,
             reduce_g2: pso("msm_reduce_g2")?,
             ones_g1: pso("msm_ones_g1")?,
@@ -1437,8 +1461,24 @@ impl MetalMsm {
                     }
                 }
                 sub.phase()?;
-                for (i, (job, out)) in jobs.iter().zip(&outs).enumerate() {
-                    out.encode_merge(self, sub.enc(), job, &plans[job_plan[i]]);
+                // One merge level of every job at a time, a barrier between levels. The
+                // constant-work fold of a G2 job is 3.9 ms at 2^18, all levels, so they
+                // share one command buffer even when the batch is split.
+                for level in 0.. {
+                    let mut more = false;
+                    for (i, (job, out)) in jobs.iter().zip(&outs).enumerate() {
+                        more |= out.encode_merge_level(
+                            self,
+                            sub.enc(),
+                            job,
+                            &plans[job_plan[i]],
+                            level,
+                        );
+                    }
+                    if !more {
+                        break;
+                    }
+                    barrier(sub.enc());
                 }
                 sub.phase()?;
                 for (i, (job, out)) in jobs.iter().zip(&outs).enumerate() {
@@ -1587,6 +1627,26 @@ impl<'a> Plan<'a> {
             counts: None,
             cursor: None,
             entries: None,
+        }
+    }
+
+    /// The constant-work merge's levels, as (spill slots per window in, groups per
+    /// window), from the accumulation's two slots per slice down to one group; empty on
+    /// every other plan, which merges with `msm_merge_*`.
+    fn fold_levels(&self) -> Vec<(usize, usize)> {
+        if self.dummy_rows == 0 || legacy_accumulate() {
+            return Vec::new();
+        }
+        let len = fold_len();
+        let mut levels = Vec::new();
+        let mut m = 2 * self.slices;
+        loop {
+            let groups = m.div_ceil(len);
+            levels.push((m, groups));
+            if groups == 1 {
+                return levels;
+            }
+            m = 2 * groups;
         }
     }
 
@@ -1750,6 +1810,9 @@ struct Outputs {
     /// `msm_ones_*` scan over all `n` scalars, which is the only option for a
     /// device-resident buffer.
     ones_idx: Option<(Buffer, usize)>,
+    /// The second half of the constant-work merge's ping-pong, sized for its first
+    /// level's output; the spill buffers are the other half. `None` off that path.
+    fold: Option<(Buffer, Buffer)>,
     base_off: usize,
     is_g2: bool,
 }
@@ -1846,6 +1909,17 @@ impl Outputs {
         let spill_slots = 2 * plan.n_windows * plan.slices;
         let spill_pts = pool.take(spill_slots * point_bytes)?;
         let spill_rows = pool.take(spill_slots * 4)?;
+        let fold = match plan.fold_levels().first() {
+            Some(&(_, groups)) => {
+                let slots = 2 * plan.n_windows * groups;
+                let pts = pool.take(slots * point_bytes)?;
+                let rows = pool.take(slots * 4)?;
+                keep.push(pts.clone());
+                keep.push(rows.clone());
+                Some((pts, rows))
+            }
+            None => None,
+        };
         // The G1 reduce writes a pair per simdgroup. Query this pipeline's width:
         // at width 16 a 64-thread group writes eight points, not four.
         let sums_per_group = if is_g2 {
@@ -1872,6 +1946,7 @@ impl Outputs {
             ones,
             ones_groups,
             ones_idx,
+            fold,
             base_off,
             is_g2,
         })
@@ -1979,6 +2054,8 @@ impl Outputs {
         }
     }
 
+    /// Every level of the merge, with a barrier between levels. The production path
+    /// calls [`Self::encode_merge_level`] instead, one level of every job at a time.
     fn encode_merge(
         &self,
         msm: &MetalMsm,
@@ -1986,8 +2063,53 @@ impl Outputs {
         job: &Job<'_>,
         plan: &Plan<'_>,
     ) {
-        if legacy_accumulate() || plan.host_tail {
-            return;
+        let mut level = 0;
+        while self.encode_merge_level(msm, enc, job, plan, level) {
+            barrier(enc);
+            level += 1;
+        }
+    }
+
+    /// Level `level` of the merge; true when another follows and reads what this one
+    /// wrote. A constant-work plan folds its spill slots through
+    /// [`Plan::fold_levels`], ping-ponging between the spill buffers and `fold`;
+    /// every other plan merges in one level.
+    fn encode_merge_level(
+        &self,
+        msm: &MetalMsm,
+        enc: &ComputeCommandEncoderRef,
+        job: &Job<'_>,
+        plan: &Plan<'_>,
+        level: usize,
+    ) -> bool {
+        let levels = plan.fold_levels();
+        if let Some(&(m_in, groups)) = levels.get(level) {
+            let (fold_pts, fold_rows) = self.fold.as_ref().expect("a fold plan has its buffers");
+            let spill = (&self.spill_pts, &self.spill_rows);
+            let (src, dst) = if level.is_multiple_of(2) {
+                (spill, (fold_pts, fold_rows))
+            } else {
+                ((fold_pts, fold_rows), spill)
+            };
+            let last = level + 1 == levels.len();
+            let f: [u32; 4] = [m_in as u32, groups as u32, fold_len() as u32, last as u32];
+            let pso = match job {
+                Job::G1(_) => &msm.pipelines.fold_g1,
+                Job::G2(_) => &msm.pipelines.fold_g2,
+            };
+            enc.set_compute_pipeline_state(pso);
+            enc.set_buffer(0, Some(src.0), 0);
+            enc.set_buffer(1, Some(src.1), 0);
+            enc.set_buffer(2, Some(dst.0), 0);
+            enc.set_buffer(3, Some(dst.1), 0);
+            enc.set_buffer(4, Some(&self.buckets), 0);
+            set_params(enc, 5, &self.params_for(plan));
+            enc.set_bytes(6, 16, f.as_ptr().cast());
+            dispatch_1d(enc, pso, plan.n_windows * groups, 64);
+            return !last;
+        }
+        if level > 0 || legacy_accumulate() || plan.host_tail {
+            return false;
         }
         let p = self.params_for(plan);
         let merge_pso = match job {
@@ -2023,6 +2145,7 @@ impl Outputs {
                 MTLSize::new(tg as u64, 1, 1),
             );
         }
+        false
     }
 
     fn encode_reduce(
@@ -2970,7 +3093,7 @@ mod tests {
         let sparse: Vec<Fr> = (0..n).map(|i| Fr::from((i % 2) as u64)).collect();
         let dense: Vec<Fr> = (0..n).map(|i| -Fr::from(i as u64 * 7919 + 3)).collect();
 
-        // Everything a dispatch or an allocation is sized from, in one tuple.
+        // Everything a dispatch or an allocation is sized from, the merge tree included.
         let shape = |p: &Plan<'_>| {
             vec![
                 p.n,
@@ -2988,6 +3111,9 @@ mod tests {
                 p.dummy_rows,
                 p.rows(),
             ]
+            .into_iter()
+            .chain(p.fold_levels().into_iter().flat_map(|(m, g)| [m, g]))
+            .collect::<Vec<_>>()
         };
         let mut seen = Vec::new();
         for scalars in [&sparse, &dense] {

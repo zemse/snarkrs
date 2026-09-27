@@ -84,22 +84,24 @@ impl MetalBackend {
     /// are zero or one; see [`Work::Constant`].
     ///
     /// What stays witness dependent, on the device: which bucket a digit lands in, so
-    /// the atomics' contention, the merge's walk over each bucket's slice span (bounded
-    /// by `n / slice_len`, in one lane per bucket outside the wide top window) and the
-    /// `count == 0` exits of the merge kernels. On the host: the identity tests inside
-    /// the combine's few hundred curve additions, as on the CPU backend. Stages 0 to 4
-    /// were already fixed-shape; their one value test, the gather's skip of the multiply
-    /// for a 0 or 1 witness value, is off (keccak256's gather 0.45 ms to 0.71, what a
-    /// dense witness costs; js_16x16_d32 unchanged at 1.56).
+    /// the atomics' contention and the identity shortcuts in the point additions. The
+    /// merge is a fixed tree (`msm_fold_*`), so its time moves only by those shortcuts:
+    /// at 2^18 a witness of bits against a dense one reads 0.94 against 0.98 ms in G1
+    /// and 3.71 against 3.88 in G2, where the per-bucket walk it replaced read 49
+    /// against 1 and 221 against 3. The reduce is the larger remainder: an empty bucket
+    /// adds for free, so the same pair reads 0.25 against 1.45 ms in G1 and 0.8 against
+    /// 9.7 in G2. On the host: the identity tests inside the combine's few hundred curve
+    /// additions, as on the CPU backend. Stages 0 to 4 were already fixed-shape; their
+    /// one value test, the gather's skip of the multiply for a 0 or 1 witness value, is
+    /// off (keccak256's gather 0.45 ms to 0.71, what a dense witness costs;
+    /// js_16x16_d32 unchanged at 1.56).
     ///
-    /// Priced warm on the M2 Max, 15 reps, three alternating rounds against the variable
-    /// path on a machine other work was sharing (so the mins are the cleaner figure):
-    /// js_16x16_d32 medians 119-131 ms against 109-125 (mins 107-109 against 92-99,
-    /// +15%), keccak256 325-340 against 39-71 (mins 303-309 against 27-28, 11x),
-    /// rsa2048 305-331 against 41-60 (mins 269-283 against 32-40, 7-8x). Steeper than
-    /// the CPU's 3-4x on the bit-heavy circuits because the variable witness plans
-    /// there were a few hundred scalars over a few windows, and each is now an MSM the
-    /// size of H's, one of them in G2.
+    /// Priced warm on the M2 Max, 15 reps, alternating rounds under the GPU lock,
+    /// medians against the variable path: js_16x16_d32 103 ms against 91 (+14%),
+    /// keccak256 130 against 27 (4.8x), rsa2048 117 against 35 (3.3x). The bit-heavy
+    /// circuits pay more than on the CPU because the variable witness plans there were
+    /// a few hundred scalars over a few windows, and each is now an MSM the size of
+    /// H's, one of them in G2.
     pub fn constant_work() -> Result<Self, ProveError> {
         let mut backend = Self::new()?;
         backend.work = Work::Constant;
