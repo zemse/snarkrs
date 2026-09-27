@@ -63,8 +63,13 @@ pub struct GatherParams {
     pub nz_base_a: u32,
     /// Index of B's first nonzero, which is A's nonzero count.
     pub nz_base_b: u32,
-    pub pad0: u32,
-    pub pad1: u32,
+    /// The first nonzero of A that the bound `SIGNAL` and `VALUE` hold. `row_ptr` numbers
+    /// nonzeros from the start of the matrix and a chunked CSR binds only its own rows'
+    /// nonzeros, so the kernel subtracts this before adding `nz_base_a`. Zero for a key that
+    /// fits in one chunk.
+    pub nz_lo_a: u32,
+    /// Same for B.
+    pub nz_lo_b: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -195,9 +200,70 @@ impl CsrHost {
             row_base_b: self.row_base[1],
             nz_base_a: self.nz_base[0],
             nz_base_b: self.nz_base[1],
-            pad0: 0,
-            pad1: 0,
+            nz_lo_a: 0,
+            nz_lo_b: 0,
         }
+    }
+
+    /// Splits the rows into chunks of at most `chunk_nz` nonzeros, A's and B's together.
+    ///
+    /// Greedy from row 0: a chunk takes rows until the next one would push it over. The
+    /// nonzeros of a row range are contiguous in both matrices, so a chunk's `signal` and
+    /// `value` are two slices of the host arrays and no per-nonzero work happens here. A
+    /// single row over `chunk_nz` on its own is an error, because no partition holds it.
+    pub fn row_chunks(&self, chunk_nz: u32) -> Result<Vec<CsrChunkHost>, ProveError> {
+        if chunk_nz == 0 {
+            return Err(bad("a CSR chunk of zero nonzeros holds no row"));
+        }
+        let rows = self.n_rows as usize;
+        let rp_a = &self.row_ptr[..rows + 1];
+        let rp_b = &self.row_ptr[rows + 1..];
+        let mut out = Vec::new();
+        let mut r0 = 0usize;
+        while r0 < rows {
+            let (ka0, kb0) = (rp_a[r0], rp_b[r0]);
+            let mut r1 = r0;
+            while r1 < rows {
+                let held = u64::from(rp_a[r1 + 1] - ka0) + u64::from(rp_b[r1 + 1] - kb0);
+                if held > u64::from(chunk_nz) {
+                    break;
+                }
+                r1 += 1;
+            }
+            if r1 == r0 {
+                return Err(bad(format!(
+                    "row {r0} has {} nonzeros across A and B, more than the {chunk_nz} a CSR \
+                     chunk can bind",
+                    (rp_a[r0 + 1] - ka0) + (rp_b[r0 + 1] - kb0)
+                )));
+            }
+            out.push(CsrChunkHost {
+                row_lo: r0 as u32,
+                row_hi: r1 as u32,
+                nz_lo: [ka0, kb0],
+                nz_hi: [rp_a[r1], rp_b[r1]],
+            });
+            r0 = r1;
+        }
+        Ok(out)
+    }
+}
+
+/// One row chunk of a [`CsrHost`]: which rows, and which nonzeros of each matrix they own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CsrChunkHost {
+    pub row_lo: u32,
+    pub row_hi: u32,
+    /// First nonzero of each matrix in this chunk, in the matrix's own numbering.
+    pub nz_lo: [u32; 2],
+    /// One past the last.
+    pub nz_hi: [u32; 2],
+}
+
+impl CsrChunkHost {
+    /// Nonzeros this chunk binds, both matrices together.
+    pub fn nnz(&self) -> u32 {
+        (self.nz_hi[0] - self.nz_lo[0]) + (self.nz_hi[1] - self.nz_lo[1])
     }
 }
 
@@ -247,13 +313,32 @@ pub fn fr_from_words(words: &[u32]) -> Option<Vec<Fr>> {
 // The concatenated CSR, on the device
 // ---------------------------------------------------------------------------
 
-/// [`CsrHost`] uploaded. Witness independent, so this is built in `prepare` and outlives
-/// every proof against the key.
-pub struct CsrTables {
-    row_ptr: wgpu::Buffer,
+/// One row chunk of the CSR on the device: its rows' nonzeros of both matrices, A's first,
+/// and the parameter block that tells the kernel where they start.
+struct CsrChunk {
+    row_lo: u32,
+    row_hi: u32,
     signal: wgpu::Buffer,
     value: wgpu::Buffer,
     params: GatherParams,
+}
+
+/// [`CsrHost`] uploaded. Witness independent, so this is built in `prepare` and outlives
+/// every proof against the key.
+///
+/// # Row chunks, for a CSR over the storage binding limit
+///
+/// The coefficient values are 32 bytes a nonzero and a storage binding is 128 MiB at the
+/// floor, so a key past 4.19 million nonzeros cannot bind them at once: `js_384x384_d32` has
+/// 17.7 million and wants 567 MB. The kernel binds seven storage buffers and the floor allows
+/// eight, so the values cannot be spread over several bindings either. Instead the rows are
+/// split into chunks whose nonzeros fit, each chunk gets its own `signal` and `value` buffers
+/// and its own bind group, and the gather is dispatched per chunk. `row_ptr` stays whole and
+/// unbiased; the chunk's `nz_lo_*` tells the kernel where its buffers start in the matrix's
+/// numbering. A key that fits is one chunk, one bind group and the same dispatch as before.
+pub struct CsrTables {
+    row_ptr: wgpu::Buffer,
+    chunks: Vec<CsrChunk>,
     n_rows: u32,
     n_vars: u32,
     nnz: [u32; 2],
@@ -261,53 +346,97 @@ pub struct CsrTables {
 }
 
 impl CsrTables {
-    /// Uploads a prepared [`CsrHost`].
+    /// Uploads a prepared [`CsrHost`] in chunks that fit this device's storage binding.
     pub fn upload(backend: &WgpuBackend, host: &CsrHost) -> Result<Self, ProveError> {
-        let limits = backend.granted_limits();
-        let value_bytes = host.value.len() as u64 * 4;
-        // The first thing that breaks at scale, so it is named rather than left to a wgpu
-        // validation message about an anonymous buffer. 128 MiB at the Floor is 4.19 million
-        // nonzeros, and this buffer holds A's and B's together, so at the measured 1.13 + 1.69
-        // per row that is about 1.5 million rows and a 2^21 domain is already over.
-        if value_bytes > limits.max_storage_buffer_binding_size {
+        Self::upload_chunked(backend, host, Self::chunk_nz(backend))
+    }
+
+    /// Same, with at most `chunk_nz` nonzeros per chunk. Public so a test can force the
+    /// chunked path on a key that would otherwise fit in one.
+    pub fn upload_chunked(
+        backend: &WgpuBackend,
+        host: &CsrHost,
+        chunk_nz: u32,
+    ) -> Result<Self, ProveError> {
+        let limit = Self::chunk_nz(backend);
+        if chunk_nz > limit {
             return Err(bad(format!(
-                "the concatenated coefficient values are {value_bytes} bytes ({} nonzeros at \
-                 {FR_BYTES} each), over the {} byte storage binding limit; chunking the CSR is \
-                 unit U15",
-                host.signal.len(),
-                limits.max_storage_buffer_binding_size
+                "a CSR chunk of {chunk_nz} nonzeros is {} bytes of values, over the {} byte \
+                 storage binding limit ({limit} nonzeros)",
+                u64::from(chunk_nz) * FR_BYTES,
+                backend.granted_limits().max_storage_buffer_binding_size
             )));
         }
-
         let row_ptr = storage_u32(backend, "g16 csr row_ptr", &host.row_ptr)?;
-        let signal = storage_u32(backend, "g16 csr signal", &host.signal)?;
-        // Padded to a whole `Fr` and not to one word, which is what `storage_u32` does and
-        // what this call site used to rely on.
-        //
-        // Found at U7 by a 2^0 synthetic key whose B matrix has no nonzeros: WebGPU sizes a
-        // runtime-sized array binding by its element stride, so binding a 4-byte buffer as
-        // `array<Fr>` is a hard validation error, "the buffer bound at binding index 3 is
-        // bound with size 4 where the shader expects 32", and the whole dispatch is dropped.
-        // `signal` and `row_ptr` are `array<u32>` and one word really is enough for them.
-        // `crate::ntt::NttTables` already pads its `Fr` tables to `LIMBS` words for the same
-        // reason; this was the one place that did not.
-        let value = if host.value.is_empty() {
-            storage_u32(backend, "g16 csr value", &[0u32; LIMBS])?
-        } else {
-            storage_u32(backend, "g16 csr value", &host.value)?
-        };
-        let bytes = row_ptr.size() + signal.size() + value.size();
+        let mut bytes = row_ptr.size();
+        let nnz_a = host.nnz[0] as usize;
+        let mut chunks = Vec::new();
+        for c in host.row_chunks(chunk_nz)? {
+            let (a, b) = (
+                c.nz_lo[0] as usize..c.nz_hi[0] as usize,
+                nnz_a + c.nz_lo[1] as usize..nnz_a + c.nz_hi[1] as usize,
+            );
+            let signal = storage_parts(
+                backend,
+                "g16 csr signal",
+                &[&host.signal[a.clone()], &host.signal[b.clone()]],
+                1,
+            )?;
+            // Padded to a whole `Fr` and not to one word, which is what `storage_parts`
+            // would do on its own.
+            //
+            // Found at U7 by a 2^0 synthetic key whose B matrix has no nonzeros: WebGPU sizes
+            // a runtime-sized array binding by its element stride, so binding a 4-byte buffer
+            // as `array<Fr>` is a hard validation error, "the buffer bound at binding index 3
+            // is bound with size 4 where the shader expects 32", and the whole dispatch is
+            // dropped. `signal` and `row_ptr` are `array<u32>` and one word really is enough
+            // for them. `crate::ntt::NttTables` already pads its `Fr` tables to `LIMBS` words
+            // for the same reason; this was the one place that did not.
+            let value = storage_parts(
+                backend,
+                "g16 csr value",
+                &[
+                    &host.value[a.start * LIMBS..a.end * LIMBS],
+                    &host.value[b.start * LIMBS..b.end * LIMBS],
+                ],
+                LIMBS,
+            )?;
+            bytes += signal.size() + value.size();
+            chunks.push(CsrChunk {
+                row_lo: c.row_lo,
+                row_hi: c.row_hi,
+                signal,
+                value,
+                params: GatherParams {
+                    // B's nonzeros follow A's chunk, so B's base is A's count in this chunk
+                    // and not in the whole matrix.
+                    nz_base_b: c.nz_hi[0] - c.nz_lo[0],
+                    nz_lo_a: c.nz_lo[0],
+                    nz_lo_b: c.nz_lo[1],
+                    ..host.params()
+                },
+            });
+        }
 
         Ok(Self {
             row_ptr,
-            signal,
-            value,
-            params: host.params(),
+            chunks,
             n_rows: host.n_rows,
             n_vars: host.n_vars,
             nnz: host.nnz,
             bytes,
         })
+    }
+
+    /// Nonzeros one chunk's value buffer can hold on this device: 4,194,304 at the floor.
+    pub fn chunk_nz(backend: &WgpuBackend) -> u32 {
+        let limit = backend.granted_limits().max_storage_buffer_binding_size / FR_BYTES;
+        u32::try_from(limit).unwrap_or(u32::MAX)
+    }
+
+    /// Row chunks the CSR was uploaded in. One for every key that fits the binding limit.
+    pub fn chunks(&self) -> usize {
+        self.chunks.len()
     }
 
     /// Build and upload in one step, which is what `prepare` calls.
@@ -354,7 +483,7 @@ impl CsrTables {
 ///
 /// One word is enough only for an `array<u32>` binding. A buffer bound as `array<Fr>` must
 /// be at least one 32-byte element or bind-group creation fails outright, so the caller
-/// pads those itself; see `CsrTables::upload` and `NttTables::new`.
+/// pads those itself; see `CsrTables::upload_chunked` and `NttTables::new`.
 pub(crate) fn storage_u32(
     backend: &WgpuBackend,
     label: &str,
@@ -388,6 +517,44 @@ pub(crate) fn storage_u32(
         backend
             .queue()
             .write_buffer(&buf, 0, bytemuck::cast_slice(data));
+    }
+    Ok(buf)
+}
+
+/// [`storage_u32`] over several slices laid end to end, without concatenating them on the
+/// host: one buffer of their total length, at least `min_words`, and one `write_buffer` per
+/// slice at its offset. A CSR chunk is two slices of the host arrays, A's nonzeros then B's,
+/// and at 17.7 million nonzeros copying them into a temporary first would be 640 MB of
+/// memcpy for nothing.
+pub(crate) fn storage_parts(
+    backend: &WgpuBackend,
+    label: &str,
+    parts: &[&[u32]],
+    min_words: usize,
+) -> Result<wgpu::Buffer, ProveError> {
+    let words = parts.iter().map(|p| p.len()).sum::<usize>().max(min_words);
+    let bytes = words as u64 * 4;
+    let limits = backend.granted_limits();
+    if bytes > limits.max_storage_buffer_binding_size {
+        return Err(bad(format!(
+            "{label} wants {bytes} bytes, over the {} byte storage binding limit",
+            limits.max_storage_buffer_binding_size
+        )));
+    }
+    let buf = backend.device().create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: bytes,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut at = 0u64;
+    for p in parts {
+        if !p.is_empty() {
+            backend
+                .queue()
+                .write_buffer(&buf, at, bytemuck::cast_slice(p));
+        }
+        at += p.len() as u64 * 4;
     }
     Ok(buf)
 }
@@ -568,7 +735,8 @@ impl GatherAbc {
             .count() as u32
     }
 
-    /// Binds one CSR, one witness and three outputs. Valid until any of them is dropped.
+    /// Binds one CSR, one witness and three outputs, one bind group per CSR chunk. Valid
+    /// until any of them is dropped.
     ///
     /// The three outputs are checked against `csr.n_rows()` and the witness against
     /// `csr.n_vars()` here, because WebGPU derives a runtime-sized array's length from the
@@ -584,7 +752,7 @@ impl GatherAbc {
         out_a: &wgpu::Buffer,
         out_b: &wgpu::Buffer,
         out_c: &wgpu::Buffer,
-    ) -> Result<wgpu::BindGroup, ProveError> {
+    ) -> Result<Vec<wgpu::BindGroup>, ProveError> {
         let want_out = csr.n_rows as u64 * FR_BYTES;
         for (name, buf) in [("out_a", out_a), ("out_b", out_b), ("out_c", out_c)] {
             if buf.size() < want_out {
@@ -610,25 +778,46 @@ impl GatherAbc {
                 resource: buf.as_entire_binding(),
             }
         }
-        Ok(backend
-            .device()
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("g16 gather"),
-                layout: &self.bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: wgsl::BIND_PARAMS,
-                        resource: wgpu::BindingResource::Buffer(ring.binding()),
-                    },
-                    entry(wgsl::BIND_ROW_PTR, &csr.row_ptr),
-                    entry(wgsl::BIND_SIGNAL, &csr.signal),
-                    entry(wgsl::BIND_VALUE, &csr.value),
-                    entry(wgsl::BIND_WITNESS, witness),
-                    entry(wgsl::BIND_OUT_A, out_a),
-                    entry(wgsl::BIND_OUT_B, out_b),
-                    entry(wgsl::BIND_OUT_C, out_c),
-                ],
-            }))
+        Ok(csr
+            .chunks
+            .iter()
+            .map(|c| {
+                backend
+                    .device()
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("g16 gather"),
+                        layout: &self.bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: wgsl::BIND_PARAMS,
+                                resource: wgpu::BindingResource::Buffer(ring.binding()),
+                            },
+                            entry(wgsl::BIND_ROW_PTR, &csr.row_ptr),
+                            entry(wgsl::BIND_SIGNAL, &c.signal),
+                            entry(wgsl::BIND_VALUE, &c.value),
+                            entry(wgsl::BIND_WITNESS, witness),
+                            entry(wgsl::BIND_OUT_A, out_a),
+                            entry(wgsl::BIND_OUT_B, out_b),
+                            entry(wgsl::BIND_OUT_C, out_c),
+                        ],
+                    })
+            })
+            .collect())
+    }
+
+    /// The dispatches `csr` takes, in order: each chunk's rows in slices of
+    /// `rows_per_dispatch`, as `(chunk, row_lo, row_hi)`.
+    fn ranges(&self, csr: &CsrTables) -> Vec<(usize, u32, u32)> {
+        let mut out = Vec::new();
+        for (ci, c) in csr.chunks.iter().enumerate() {
+            let mut lo = c.row_lo;
+            while lo < c.row_hi {
+                let hi = (lo + self.rows_per_dispatch).min(c.row_hi);
+                out.push((ci, lo, hi));
+                lo = hi;
+            }
+        }
+        out
     }
 
     /// Pushes one parameter block per dispatch and returns their dynamic offsets.
@@ -637,50 +826,55 @@ impl GatherAbc {
     /// written in one `write_buffer` before encoding starts (design §3), so the pushes have
     /// to happen before the compute pass exists rather than inside it.
     pub fn plan(&self, csr: &CsrTables, ring: &mut ParamRing) -> Result<Vec<u32>, ProveError> {
-        let mut offsets = Vec::with_capacity(self.dispatches(csr.n_rows) as usize);
-        let mut lo = 0u32;
-        while lo < csr.n_rows {
-            let hi = (lo + self.rows_per_dispatch).min(csr.n_rows);
-            offsets.push(ring.push(&GatherParams {
-                row_lo: lo,
-                row_hi: hi,
-                ..csr.params
-            })?);
-            lo = hi;
-        }
-        Ok(offsets)
+        self.ranges(csr)
+            .into_iter()
+            .map(|(ci, lo, hi)| {
+                ring.push(&GatherParams {
+                    row_lo: lo,
+                    row_hi: hi,
+                    ..csr.chunks[ci].params
+                })
+            })
+            .collect()
     }
 
-    /// Records the dispatches. `offsets` is what [`Self::plan`] returned for the same `csr`.
+    /// Records the dispatches. `binds` is what [`Self::bind`] returned for `csr` and
+    /// `offsets` is what [`Self::plan`] returned for it.
     pub fn encode(
         &self,
         pass: &mut wgpu::ComputePass<'_>,
-        bind: &wgpu::BindGroup,
+        binds: &[wgpu::BindGroup],
         csr: &CsrTables,
         offsets: &[u32],
     ) -> Result<(), ProveError> {
-        let want = self.dispatches(csr.n_rows) as usize;
-        if offsets.len() != want {
+        let ranges = self.ranges(csr);
+        if offsets.len() != ranges.len() {
             return Err(bad(format!(
-                "the gather over {} rows needs {want} dispatches, got {} parameter offsets",
+                "the gather over {} rows needs {} dispatches, got {} parameter offsets",
                 csr.n_rows,
+                ranges.len(),
                 offsets.len()
             )));
         }
+        if binds.len() != csr.chunks.len() {
+            return Err(bad(format!(
+                "the gather over {} CSR chunks needs as many bind groups, got {}",
+                csr.chunks.len(),
+                binds.len()
+            )));
+        }
         pass.set_pipeline(self.kernels.get(wgsl::ENTRY)?);
-        let mut lo = 0u32;
-        for &off in offsets {
-            let hi = (lo + self.rows_per_dispatch).min(csr.n_rows);
-            pass.set_bind_group(0, bind, &[off]);
+        for (&off, (ci, lo, hi)) in offsets.iter().zip(ranges) {
+            pass.set_bind_group(0, &binds[ci], &[off]);
             pass.dispatch_workgroups((hi - lo).div_ceil(self.workgroup), 1, 1);
-            lo = hi;
         }
         Ok(())
     }
 
-    /// Dispatches `n_rows` needs, which is also the parameter ring slots stage 0 consumes.
-    pub fn dispatches(&self, n_rows: u32) -> u32 {
-        n_rows.div_ceil(self.rows_per_dispatch)
+    /// Dispatches `csr` needs, which is also the parameter ring slots stage 0 consumes: one
+    /// per `rows_per_dispatch` rows of each chunk.
+    pub fn dispatches(&self, csr: &CsrTables) -> u32 {
+        self.ranges(csr).len() as u32
     }
 
     /// Rows one dispatch covers: 8,388,480 at the Floor (128 threads x 65535 workgroups),

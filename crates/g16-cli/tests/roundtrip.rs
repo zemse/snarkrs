@@ -77,11 +77,9 @@ fn prove_on(v: &Variant, out: &Path, backend: &str) -> (PathBuf, PathBuf) {
 fn prove_with(v: &Variant, out: &Path, backend: &str, extra: &[&str]) -> (PathBuf, PathBuf) {
     let proof = out.join("proof.json");
     let public = out.join("public.json");
-    // wgpu under `auto`, which is what the browser asks for: the floor's 128 MiB binding
-    // cannot hold anon-aadhaar's G2 bases (140.9 MB) until they are chunked, and that is a
-    // capacity limit with its own clean error, not what this file tests.
+    // No `G16_WGPU_LIMITS`: wgpu proves at its default floor profile, anon-aadhaar's 140.9 MB
+    // of G2 bases included, since the backend chunks a base vector over the binding limit.
     let o = run(Command::new(g16())
-        .env("G16_WGPU_LIMITS", "auto")
         .args([
             "prove",
             "--zkey",

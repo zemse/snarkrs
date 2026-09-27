@@ -25,7 +25,9 @@
 //! fifth.
 //!
 //! [`batch`] joins the two halves: it shares one set of MSM modules across every circuit and
-//! runs all five jobs of a proof in one submit. [`backend`] is the `g16_core::Backend` and
+//! runs all five jobs of a proof in one submit, cutting any job whose bases or scratch are
+//! over the storage binding limit into sub-MSMs the host sums, the way [`gather`] cuts a
+//! CSR over it into row chunks. [`backend`] is the `g16_core::Backend` and
 //! `g16_core::PreparedCircuit` implementation over the lot, and `wasm` is the same two async
 //! entry points exported to a browser's Web Worker. There is no CPU fallback at any stage and
 //! no size gate, so a `wgpu` number belongs to `wgpu`.

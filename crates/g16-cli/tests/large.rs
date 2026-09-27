@@ -86,8 +86,10 @@ fn every_backend_proves_the_large_artifacts() {
             let tag = format!("{} on {backend}", v.name);
             let proof = out.join(format!("{}-{backend}-proof.json", v.name));
             let public = out.join(format!("{}-{backend}-public.json", v.name));
-            // wgpu under `auto`: the floor's 128 MiB binding is far below this key's bases.
-            let o = run(Command::new(g16()).env("G16_WGPU_LIMITS", "auto").args([
+            // No `G16_WGPU_LIMITS`: wgpu proves this at its default floor profile, which is
+            // the point. The 567 MB of CSR values, the 256 MiB H query and the 431 MB G2
+            // query are all over the floor's 128 MiB binding, and the backend chunks them.
+            let o = run(Command::new(g16()).args([
                 "prove",
                 "--zkey",
                 v.zkey().to_str().unwrap(),

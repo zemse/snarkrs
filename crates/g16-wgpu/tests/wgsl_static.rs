@@ -936,8 +936,8 @@ fn every_uniform_parameter_struct_matches_its_host_mirror() {
                 "row_base_b",
                 "nz_base_a",
                 "nz_base_b",
-                "pad0",
-                "pad1",
+                "nz_lo_a",
+                "nz_lo_b",
             ],
         ),
         (

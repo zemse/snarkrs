@@ -94,6 +94,8 @@ struct Run {
     /// The one row past `n_rows` in each buffer, which must still be [`SENTINEL`].
     tail: [Vec<u32>; 3],
     dispatches: u32,
+    /// Row chunks the CSR went up in. One unless `nz_per_chunk` forced more.
+    chunks: usize,
     /// Microseconds one gather costs on the device, submit overhead removed.
     ///
     /// Taken as `(time for 1 + REPEATS passes) - (time for 1 pass)` divided by `REPEATS`,
@@ -113,17 +115,23 @@ struct Run {
 /// Uploads, dispatches and reads back all three outputs.
 ///
 /// `rows_per_dispatch` of `None` is the device's own cap, which is one dispatch for anything
-/// under 2^23 rows.
+/// under 2^23 rows. `nz_per_chunk` of `None` is the device's own binding limit, which is one
+/// CSR chunk for anything under 4.19 million nonzeros.
 fn run_gather(
     coeffs: &Coefficients,
     witness: &[Fr],
     domain_size: usize,
     rows_per_dispatch: Option<u32>,
     workgroup: Option<u32>,
+    nz_per_chunk: Option<u32>,
 ) -> Run {
     let b = floor();
     let host = CsrHost::build(coeffs, domain_size, witness.len()).expect("CSR rejected");
-    let csr = CsrTables::upload(b, &host).expect("CSR upload");
+    let csr = match nz_per_chunk {
+        None => CsrTables::upload(b, &host),
+        Some(nz) => CsrTables::upload_chunked(b, &host, nz),
+    }
+    .expect("CSR upload");
 
     let gather = match (rows_per_dispatch, workgroup) {
         (None, None) => GatherAbc::new(b),
@@ -153,7 +161,7 @@ fn run_gather(
         .collect();
 
     let mut ring =
-        ParamRing::new(b, "gather params", gather.dispatches(n).max(1)).expect("parameter ring");
+        ParamRing::new(b, "gather params", gather.dispatches(&csr).max(1)).expect("parameter ring");
     let offsets = gather.plan(&csr, &mut ring).expect("plan");
     ring.flush(b);
     let bind = gather
@@ -224,6 +232,7 @@ fn run_gather(
         c,
         tail: [ta, tb, tc],
         dispatches: offsets.len() as u32,
+        chunks: csr.chunks(),
         kernel_us,
     }
 }
@@ -295,7 +304,7 @@ fn the_gather_matches_the_cpu_backend_on_every_artifact() {
         let (ma, ea, la) = stats(0);
         let (mb, eb, lb) = stats(1);
 
-        let run = run_gather(&pk.coeffs, &w, domain_size, None, None);
+        let run = run_gather(&pk.coeffs, &w, domain_size, None, None, None);
 
         let cpu = CpuCircuit::new(pk).expect("cpu circuit");
         let want_a = cpu.gather(0, &w);
@@ -510,7 +519,7 @@ fn a_ragged_asymmetric_csr_gathers_exactly_and_chunks_identically() {
     let nz_b = want_b.iter().filter(|x| !x.is_zero()).count();
     assert!(nz_a > 100 && nz_b > 100, "{nz_a} / {nz_b} nonzero rows");
 
-    let one = run_gather(&coeffs, &w, ROWS, None, None);
+    let one = run_gather(&coeffs, &w, ROWS, None, None, None);
     assert_eq!(
         one.dispatches, 1,
         "{ROWS} rows is one dispatch at the Floor"
@@ -525,7 +534,7 @@ fn a_ragged_asymmetric_csr_gathers_exactly_and_chunks_identically() {
     // the tail guard are all exercised at once. Every artifact on this machine is one
     // dispatch, so without this the path a 2^23 domain needs would never run.
     let chunk = 3 * wgsl::WORKGROUP;
-    let many = run_gather(&coeffs, &w, ROWS, Some(chunk), None);
+    let many = run_gather(&coeffs, &w, ROWS, Some(chunk), None, None);
     assert_eq!(
         many.dispatches,
         (ROWS as u32).div_ceil(chunk),
@@ -536,13 +545,96 @@ fn a_ragged_asymmetric_csr_gathers_exactly_and_chunks_identically() {
     compare("chunked out_c", &many.c, &want_c);
     check_tail(&many);
 
+    // The chunked CSR: the nonzeros in row chunks small enough that the two 95-long rows
+    // each sit in a chunk with little else, so a chunk's `nz_lo`, its B base and the
+    // per-chunk bind group are all exercised. Both dispatch splits at once, at 32 rows per
+    // dispatch so every chunk of about 70 rows is several dispatches, because a row chunk
+    // that is also more than one dispatch is the shape a 2^23 domain would take.
+    let nz = 200;
+    let host = CsrHost::build(&coeffs, ROWS, VARS).unwrap();
+    let pieces = host.row_chunks(nz).unwrap();
+    assert!(pieces.len() > 4, "{} chunks of {nz} nonzeros", pieces.len());
+    assert!(pieces.iter().all(|c| c.nnz() <= nz && c.row_lo < c.row_hi));
+    assert_eq!(pieces[0].row_lo, 0);
+    assert_eq!(pieces.last().unwrap().row_hi, ROWS as u32);
+    for (p, q) in pieces.iter().zip(&pieces[1..]) {
+        assert_eq!(p.row_hi, q.row_lo, "the chunks are not contiguous");
+        assert_eq!(p.nz_hi, q.nz_lo);
+    }
+    let split = run_gather(&coeffs, &w, ROWS, Some(32), Some(32), Some(nz));
+    assert_eq!(split.chunks, pieces.len());
+    assert!(
+        split.dispatches > 2 * split.chunks as u32,
+        "{} dispatches over {} chunks",
+        split.dispatches,
+        split.chunks
+    );
+    compare("csr-chunked out_a", &split.a, &want_a);
+    compare("csr-chunked out_b", &split.b, &want_b);
+    compare("csr-chunked out_c", &split.c, &want_c);
+    check_tail(&split);
+
+    // A chunk too small for the longest row is refused on the host, not silently dropped.
+    let e = host.row_chunks(94).unwrap_err().to_string();
+    assert!(e.contains("nonzeros across A and B"), "{e}");
+
     println!(
         "synthetic: {ROWS} rows, {VARS} vars, A nnz {} B nnz {}, {differing} rows differ, \
-         {nz_a}/{nz_b} nonzero; 1 dispatch and {} dispatches agree elementwise",
+         {nz_a}/{nz_b} nonzero; 1 dispatch, {} dispatches and {} CSR chunks agree elementwise",
         coeffs.signal[0].len(),
         coeffs.signal[1].len(),
         many.dispatches,
+        split.chunks,
     );
+}
+
+/// The chunked CSR on real keys, against `g16_core::cpu`. Every artifact fits one binding at
+/// the floor, so without a forced chunk the path `js_384x384_d32`'s 17.7 million nonzeros
+/// take would run only under the ignored large-artifact test.
+#[test]
+fn the_gather_matches_the_cpu_backend_with_the_csr_in_chunks() {
+    let found = artifacts();
+    assert!(!found.is_empty(), "no artifacts under bench/artifacts");
+    // The two smallest keys with enough nonzeros to cut seven ways (`tiny_mul` has 8): the
+    // point is the chunk boundaries and not the row count.
+    let mut found: Vec<_> = found
+        .into_iter()
+        .map(|(name, dir)| {
+            let pk = ProvingKey::load(&dir.join("circuit.zkey")).expect("zkey");
+            (name, dir, pk)
+        })
+        .filter(|(_, _, pk)| pk.coeffs.signal[0].len() + pk.coeffs.signal[1].len() >= 4096)
+        .collect();
+    found.sort_by_key(|(_, _, pk)| pk.domain_size);
+    assert!(
+        found.len() >= 2,
+        "fewer than two artifacts with 4096 nonzeros"
+    );
+    for (name, dir, pk) in found.into_iter().take(2) {
+        let w = Witness::load(&dir.join("circuit.wtns")).expect("wtns").0;
+        let domain_size = pk.domain_size;
+        let nnz = pk.coeffs.signal[0].len() + pk.coeffs.signal[1].len();
+        // About seven chunks, never fewer than the longest row.
+        let nz = (nnz / 7).max(256) as u32;
+        let run = run_gather(&pk.coeffs, &w, domain_size, None, None, Some(nz));
+        assert!(
+            run.chunks > 1,
+            "{name}: {nnz} nonzeros in {nz} per chunk is one chunk"
+        );
+
+        let cpu = CpuCircuit::new(pk).expect("cpu circuit");
+        let want_a = cpu.gather(0, &w);
+        let want_b = cpu.gather(1, &w);
+        let want_c: Vec<Fr> = want_a.iter().zip(&want_b).map(|(x, y)| *x * y).collect();
+        compare(&format!("{name} chunked out_a"), &run.a, &want_a);
+        compare(&format!("{name} chunked out_b"), &run.b, &want_b);
+        compare(&format!("{name} chunked out_c"), &run.c, &want_c);
+        check_tail(&run);
+        println!(
+            "{name}: {nnz} nonzeros in {} CSR chunks of at most {nz}, {} dispatches",
+            run.chunks, run.dispatches
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -769,7 +861,7 @@ fn sweep_once() -> (f64, String, usize) {
         let mut rows = Vec::new();
         let mut usable = true;
         for wg in SIZES {
-            let run = run_gather(&cpu.key().coeffs, &w, domain_size, None, Some(wg));
+            let run = run_gather(&cpu.key().coeffs, &w, domain_size, None, Some(wg), None);
             // The correctness half never depends on the timing half. Every size gathers the
             // same vectors or this test fails, contention or not.
             compare(&format!("{name} wg{wg} out_a"), &run.a, &want_a);

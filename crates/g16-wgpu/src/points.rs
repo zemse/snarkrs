@@ -194,6 +194,33 @@ impl PointPlan {
         2 * self.seg_threads(digits)
     }
 
+    /// Byte offset of the `ones` partials inside the results buffer: the window sums,
+    /// rounded up to the storage binding alignment. See the module docs for why G1 needs
+    /// the rounding and G2 gets it for free.
+    pub fn ones_offset(&self, digits: &DigitPlan, curve: wgsl::Curve) -> u64 {
+        let sums = u64::from(digits.n_windows()) * curve.point_bytes;
+        sums.div_ceil(BINDING_ALIGN) * BINDING_ALIGN
+    }
+
+    /// Bytes the host reads back for one MSM of this shape: the window sums, the padding
+    /// and the `ones` partials.
+    pub fn results_bytes(&self, digits: &DigitPlan, curve: wgsl::Curve) -> u64 {
+        self.ones_offset(digits, curve) + u64::from(self.ones_groups) * curve.point_bytes
+    }
+
+    /// The largest storage binding [`PointBuffers::new`] would make for this plan, in bytes.
+    /// The bucket array or the spill points, depending on `c`: at c = 13 over 2^19 general
+    /// scalars the G2 buckets are 21 MB and the spill points 42 MB.
+    pub fn largest_binding(&self, digits: &DigitPlan, curve: wgsl::Curve) -> u64 {
+        let pt = curve.point_bytes;
+        let rows = u64::from(digits.rows());
+        let slots = u64::from(self.spill_slots(digits));
+        (rows * pt)
+            .max(slots * pt)
+            .max(slots * 4)
+            .max(self.results_bytes(digits, curve))
+    }
+
     /// The full parameter block, digit fields and point fields together.
     ///
     /// `n` is the element count the *dispatching* kernel's guard uses, and `lo` is where this
@@ -272,8 +299,7 @@ impl PointBuffers {
             )));
         }
 
-        let ones_off = u64::from(digits.n_windows()) * pt;
-        let ones_off = ones_off.div_ceil(BINDING_ALIGN) * BINDING_ALIGN;
+        let ones_off = points.ones_offset(digits, curve);
         let results_bytes = ones_off + u64::from(ones_groups + slack) * pt;
 
         Ok(Self {

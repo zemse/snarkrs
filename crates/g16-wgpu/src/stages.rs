@@ -286,7 +286,8 @@ impl HStages {
 
     /// Dispatches one [`Self::compute_h`] encodes at `mode`.
     ///
-    /// The gather is one dispatch below a 2^23 domain and the standalone join one below a
+    /// The gather is one dispatch below a 2^23 domain on a CSR that fits one storage binding
+    /// (one per row chunk past that, see [`CsrTables`]) and the standalone join one below a
     /// 2^24 one (128 threads against 256), but both are computed rather than assumed so the
     /// number stays right when a bigger artifact arrives.
     pub fn dispatches(&self, mode: Stage4) -> u32 {
@@ -295,7 +296,7 @@ impl HStages {
             Stage4::Fused => 0,
             Stage4::Standalone => self.join.dispatches(n),
         };
-        self.gather.dispatches(n) + 6 * self.ntt.dispatches() as u32 + joins
+        self.gather.dispatches(&self.csr) + 6 * self.ntt.dispatches() as u32 + joins
     }
 
     /// Parameter ring slots one proof consumes. Same count as [`Self::dispatches`], because

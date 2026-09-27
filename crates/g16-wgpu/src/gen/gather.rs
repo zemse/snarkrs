@@ -171,6 +171,11 @@ pub fn entry_point_at(workgroup: u32) -> String {
 // inside ROW_PTR, and `nz_base_*` is where its nonzeros start inside SIGNAL and VALUE.
 // ROW_PTR entries are stored unbiased, exactly as g16-zkey produced them, so nz_base has
 // to be added here rather than folded in on the host. See the module docs.
+//
+// `nz_lo_*` is the first nonzero of each matrix that the bound SIGNAL and VALUE hold. A CSR
+// too large for one storage binding is uploaded in row chunks, each chunk carrying only its
+// own rows' nonzeros, and ROW_PTR still numbers them from the start of the matrix. Zero
+// for a key that fits in one chunk.
 struct GatherParams {{
     row_lo: u32,
     row_hi: u32,
@@ -178,8 +183,8 @@ struct GatherParams {{
     row_base_b: u32,
     nz_base_a: u32,
     nz_base_b: u32,
-    pad0: u32,
-    pad1: u32,
+    nz_lo_a: u32,
+    nz_lo_b: u32,
 }};
 
 @group(0) @binding({BIND_PARAMS}) var<uniform> P: GatherParams;
@@ -195,10 +200,10 @@ struct GatherParams {{
 // literal inside fr_add and fr_mul, so it is not the dynamically indexed local array that
 // the sweep measured a 3.8x penalty for. `k` indexes storage,
 // which is memory either way.
-fn gather_row(row_base: u32, nz_base: u32, row: u32) -> Fr {{
+fn gather_row(row_base: u32, nz_base: u32, nz_lo: u32, row: u32) -> Fr {{
     var acc = fr_zero();
-    let lo = nz_base + ROW_PTR[row_base + row];
-    let hi = nz_base + ROW_PTR[row_base + row + 1u];
+    let lo = nz_base + (ROW_PTR[row_base + row] - nz_lo);
+    let hi = nz_base + (ROW_PTR[row_base + row + 1u] - nz_lo);
     for (var k = lo; k < hi; k = k + 1u) {{
         acc = fr_add(acc, fr_mul(VALUE[k], WITNESS[SIGNAL[k]]));
     }}
@@ -213,8 +218,8 @@ fn {ENTRY}(@builtin(global_invocation_id) gid: vec3<u32>) {{
     // chunk boundary need not be.
     if (row >= P.row_hi) {{ return; }}
 
-    let a = gather_row(P.row_base_a, P.nz_base_a, row);
-    let b = gather_row(P.row_base_b, P.nz_base_b, row);
+    let a = gather_row(P.row_base_a, P.nz_base_a, P.nz_lo_a, row);
+    let b = gather_row(P.row_base_b, P.nz_base_b, P.nz_lo_b, row);
     OUT_A[row] = a;
     OUT_B[row] = b;
     OUT_C[row] = fr_mul(a, b);

@@ -317,6 +317,14 @@ impl DigitPlan {
         self.n_windows * self.cap
     }
 
+    /// The largest storage binding [`DigitBuffers::new`] would make for this plan, in bytes,
+    /// which is what decides whether a sub-MSM of this shape fits a device at all. The entry
+    /// array, at every shape any key reaches: 20 windows of 8-byte entries per general
+    /// scalar at c = 13, so 4.19 million of them fill a 128 MiB binding twice over.
+    pub fn largest_binding(&self) -> u64 {
+        (u64::from(self.rows()) * 4).max(u64::from(self.entries()) * ENTRY_BYTES)
+    }
+
     /// The parameter block the digit kernels read, with the four point-stage fields left at
     /// zero. [`crate::points::PointPlan::params`] is the one that fills them.
     pub fn params(&self, n: u32, lo: u32) -> MsmParams {
@@ -383,7 +391,7 @@ pub(crate) fn storage_buffer(
     if bytes > limits.max_storage_buffer_binding_size {
         return Err(bad(format!(
             "{label} wants {bytes} bytes, over the {} byte storage binding limit. Lower the \
-             window width or chunk the input range; see design §3.",
+             window width or cut the input range; `crate::batch` cuts it before it gets here.",
             limits.max_storage_buffer_binding_size
         )));
     }

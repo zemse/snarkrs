@@ -125,44 +125,13 @@ impl Artifact {
             .and_then(|t| t.parse().ok())
             .unwrap_or(-1)
     }
-
-    /// `n_vars`, read from `r1cs-info.txt` rather than from the key, because the point of
-    /// asking is to decide whether to open a 631 MB zkey at all. snarkjs calls it "# of
-    /// Wires" and it is exactly `ProvingKey::n_vars`, checked against `anon-aadhaar`
-    /// (1,101,048 both ways).
-    fn wires(&self) -> i64 {
-        let Ok(text) = std::fs::read_to_string(self.dir.join("r1cs-info.txt")) else {
-            return -1;
-        };
-        text.lines()
-            .find(|l| l.contains("# of Wires"))
-            .and_then(|l| l.split_whitespace().last())
-            .and_then(|t| t.parse().ok())
-            .unwrap_or(-1)
-    }
 }
 
-/// The G2 base vector is `n_vars` points of 128 bytes, and a WebGPU storage binding is capped
-/// at 134,217,728 bytes at the spec floor, so a key with more than 2^20 variables cannot bind
-/// its B query in one buffer. That is design §8's U15, chunked base bindings, which the design
-/// filed as "gated on an artifact that needs it" and left unbuilt.
-///
-/// The artifact arrived: `anon-aadhaar` has 1,101,048 variables and wants 140,934,144 bytes.
-/// Until U15 lands the backend refuses such a key with exactly that message, which is correct
-/// behaviour rather than a defect, so these tests skip it loudly instead of failing. Delete
-/// this filter when U15 lands; the tests will then cover the artifact and U15's own test can
-/// stop being the only thing that does.
-const G2_BINDING_FLOOR_BYTES: i64 = 134_217_728;
-
-fn over_the_g2_binding_floor(a: &Artifact) -> Option<i64> {
-    let wires = a.wires();
-    let want = wires.checked_mul(128)?;
-    (wires > 0 && want > G2_BINDING_FLOOR_BYTES).then_some(want)
-}
-
-/// Every artifact on disk, including ones this backend cannot yet prepare. Only U15's own
-/// test and [`artifacts`] should call this.
-fn artifacts_all() -> Vec<Artifact> {
+/// Every artifact on disk. That includes `anon-aadhaar`, whose 1,101,048 variables put its
+/// G2 bases at 140,934,144 bytes against the floor's 134,217,728 byte storage binding: the
+/// backend uploads a base vector in buffers that fit and runs a job over it as several
+/// sub-MSMs (`g16_wgpu::batch`), so it proves at the floor like every other key here.
+fn artifacts() -> Vec<Artifact> {
     let Ok(root) = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../bench/artifacts")
         .canonicalize()
@@ -187,28 +156,6 @@ fn artifacts_all() -> Vec<Artifact> {
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
-}
-
-/// Every artifact this backend can currently prepare.
-///
-/// Filters out keys whose G2 base vector is over the storage binding floor, which is design
-/// §8's U15 and is not built. The skip is printed once per test binary rather than silently,
-/// because a shrinking corpus is exactly the failure mode that hides: `bench/artifacts` is a
-/// gitignored symlink into another worktree and another session is actively adding keys to it.
-fn artifacts() -> Vec<Artifact> {
-    let all = artifacts_all();
-    let (ok, skipped): (Vec<_>, Vec<_>) = all
-        .into_iter()
-        .partition(|a| over_the_g2_binding_floor(a).is_none());
-    for a in &skipped {
-        let want = over_the_g2_binding_floor(a).unwrap_or(0);
-        eprintln!(
-            "SKIPPED {}: {want} bytes of G2 bases, over the {G2_BINDING_FLOOR_BYTES} byte \
-             storage binding floor. Needs U15, chunked base bindings.",
-            a.name
-        );
-    }
-    ok
 }
 
 /// Runs `f` over every artifact. An empty artifact directory reports a skip on stderr rather
@@ -697,10 +644,12 @@ fn an_empty_group_dispatches_nothing_and_keeps_its_result_slots() {
 /// `ArrayBuffer` into linear memory, 33.8 ms for 64 MiB) is three orders of magnitude away.
 ///
 /// This asserts a bound that is a theorem about the code rather than the design's constant:
-/// `ceil(255/c_min)` windows plus `ones_groups` partials, over four G1 jobs and one G2, with
-/// `c_min = 3` because `msm::window_size` searches `3..=16`. That is loose, because a `c` low
-/// enough to give 85 windows only happens for an `n` far too small to give 64 ones groups,
-/// and it is still the honest ceiling.
+/// `ceil(255/c_min)` windows plus `ones_groups` partials, per sub-MSM, with `c_min = 3`
+/// because `msm::window_size` searches `3..=16`. That is loose, because a `c` low enough to
+/// give 85 windows only happens for an `n` far too small to give 64 ones groups, and it is
+/// still the honest ceiling. A key that fits the binding limit is four G1 sub-MSMs and one
+/// G2; `anon-aadhaar` at the floor is cut into more (`g16_wgpu::batch`), each with its own
+/// window sums, and the batch reports how many it ran.
 #[test]
 fn a_whole_proof_is_two_submits_and_the_readback_is_bounded() {
     let _one_at_a_time = exclusive();
@@ -713,8 +662,10 @@ fn a_whole_proof_is_two_submits_and_the_readback_is_bounded() {
 
     let windows = u64::from(g16_wgpu::msm::RECODE_BITS.div_ceil(C_MIN));
     let per_job = |pt: u64| (windows * pt).div_ceil(256) * 256 + MAX_ONES_GROUPS * pt;
-    let ceiling = 4 * per_job(g16_wgpu::gen::points::G1.point_bytes)
-        + per_job(g16_wgpu::gen::points::G2.point_bytes);
+    let ceiling = |g1: u32, g2: u32| {
+        u64::from(g1) * per_job(g16_wgpu::gen::points::G1.point_bytes)
+            + u64::from(g2) * per_job(g16_wgpu::gen::points::G2.point_bytes)
+    };
 
     let found = artifacts();
     if found.is_empty() {
@@ -724,7 +675,7 @@ fn a_whole_proof_is_two_submits_and_the_readback_is_bounded() {
     let device = device();
     let prover = prover();
 
-    println!("artifact       constraints  submits   readback B  over design 64 KiB");
+    println!("artifact       constraints  submits  sub-MSMs   readback B  over design 64 KiB");
     for a in &found {
         let circuit = prover.prepare(a.key()).expect("prepare");
         let witness = a.witness();
@@ -746,23 +697,194 @@ fn a_whole_proof_is_two_submits_and_the_readback_is_bounded() {
         );
 
         let read = prover.msm().last_readback_bytes();
+        let (g1, g2) = prover.msm().last_sub_msms();
+        assert!(
+            g1 >= 4 && g2 >= 1,
+            "{}: {g1} G1 and {g2} G2 sub-MSMs",
+            a.name
+        );
+        let ceiling = ceiling(g1, g2);
         assert!(
             read > 0 && read <= ceiling,
             "{}: the MSM readback is {read} bytes, over the {ceiling} byte ceiling that \
-             {windows} windows at c = {C_MIN} and {MAX_ONES_GROUPS} ones groups allow",
+             {windows} windows at c = {C_MIN} and {MAX_ONES_GROUPS} ones groups allow over \
+             {g1} G1 and {g2} G2 sub-MSMs",
             a.name
         );
         verify(&a.vkey(), &public_of(&witness, circuit.n_public()), &proof).expect("verify");
         println!(
-            "{:14} {:>11}  {:>7}   {:>10}  {}",
+            "{:14} {:>11}  {:>7}  {:>5}+{:<3}  {:>10}  {}",
             a.name,
             a.constraints(),
             after - before,
+            g1,
+            g2,
             read,
             if read > DESIGN_BUDGET { "yes" } else { "no" }
         );
     }
-    println!("ceiling from the constants: {ceiling} bytes");
+    println!(
+        "ceiling from the constants: {} bytes for one sub-MSM per job",
+        ceiling(4, 1)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 4b. The cut path, forced on keys that fit
+// ---------------------------------------------------------------------------
+
+/// A base vector over the storage binding limit is uploaded in several buffers and a job
+/// over it runs as several sub-MSMs, and so does a group whose sort or point scratch would
+/// not fit (`g16_wgpu::batch`). Every artifact under 2^21 variables fits at the floor, so
+/// both cuts are forced here: bases in buffers of about a seventh of the vector, at a size
+/// that is not a power of two so the buffer boundaries land at odd offsets, and a binding
+/// limit of 2 MiB for the scratch, which cuts the pieces again on their entry arrays. The
+/// answer has to be the CPU's, exactly.
+///
+/// Two more shapes a whole proof never reaches: a job whose `base_off` is not zero, so the
+/// first piece is short and the buffer boundaries do not line up with the scalar range, and
+/// a group of two such jobs whose boundaries differ from each other.
+#[test]
+fn a_group_cut_into_sub_msms_matches_the_cpu() {
+    use g16_msm::{CpuMsm, MsmBackend};
+
+    let _one_at_a_time = exclusive();
+    /// Small enough that `js_1x1_d8`'s 3,234 general scalars are cut on their entry array.
+    const LIMIT: u64 = 2 << 20;
+    for_each_artifact("a_group_cut_into_sub_msms_matches_the_cpu", |a| {
+        let pk = a.key();
+        let witness = a.witness();
+        let n_vars = pk.n_vars as u32;
+        // Under 2^21 variables the default cut is one piece, and the test is about the cut.
+        if n_vars > 1 << 20 {
+            eprintln!(
+                "  {}: {n_vars} variables is cut at the floor already, skipped",
+                a.name
+            );
+            return;
+        }
+        let private_from = pk.n_public + 1;
+        let l_len = pk.l_query.len() as u32;
+        let b = device();
+        let batch = prover().msm();
+
+        let chunk = (n_vars / 7).max(3) | 1;
+        let a_bases = G1Bases::upload_chunked(b, &pk.a_query, chunk).expect("a");
+        let b_g1_bases = G1Bases::upload_chunked(b, &pk.b_g1_query, chunk).expect("b_g1");
+        let b_g2_bases = G2Bases::upload_chunked(b, &pk.b_g2_query, chunk).expect("b_g2");
+        let l_bases = G1Bases::upload_chunked(b, &pk.l_query, chunk + 2).expect("l");
+        assert!(
+            a_bases.chunks() >= 2,
+            "{} buffers of {chunk}",
+            a_bases.chunks()
+        );
+
+        // `tail` is zero on `tiny_mul`, whose six variables leave no room; the group then
+        // has `n == 0` and both jobs come back as the identity, which is checked too.
+        let off = 91u32.min(n_vars / 2);
+        let tail = n_vars.saturating_sub(off + 7);
+        let w_jobs = [
+            Job::G1 {
+                bases: &a_bases,
+                base_off: 0,
+            },
+            Job::G2 {
+                bases: &b_g2_bases,
+                base_off: 0,
+            },
+            Job::G1 {
+                bases: &b_g1_bases,
+                base_off: 0,
+            },
+        ];
+        let l_jobs = [Job::G1 {
+            bases: &l_bases,
+            base_off: 0,
+        }];
+        // Bases from `off` and `off + 7` against the same scalars, so the two jobs' buffer
+        // boundaries fall at different scalar indices and the group is cut at both.
+        let off_jobs = [
+            Job::G1 {
+                bases: &a_bases,
+                base_off: off,
+            },
+            Job::G1 {
+                bases: &b_g1_bases,
+                base_off: off + 7,
+            },
+        ];
+        let groups = vec![
+            Group {
+                scalars: Source::Host(&witness),
+                scalar_off: 0,
+                n: n_vars,
+                jobs: &w_jobs,
+            },
+            Group {
+                scalars: Source::Host(&witness),
+                scalar_off: private_from as u32,
+                n: l_len,
+                jobs: &l_jobs,
+            },
+            Group {
+                scalars: Source::Host(&witness),
+                scalar_off: off,
+                n: tail,
+                jobs: &off_jobs,
+            },
+        ];
+        let got =
+            pollster::block_on(batch.run_with_binding_limit(b, None, &groups, LIMIT)).expect("run");
+        let (g1, g2) = batch.last_sub_msms();
+        assert!(
+            g1 >= 5 && g2 >= 2,
+            "{}: {g1} G1 and {g2} G2 sub-MSMs over {} base buffers, so nothing was cut",
+            a.name,
+            a_bases.chunks()
+        );
+
+        let cpu = CpuMsm::new();
+        // `tail == 0` makes `off + 7` a slice start past the end of a six element key.
+        let range = |lo: u32, n: u32| {
+            if n == 0 {
+                0..0
+            } else {
+                lo as usize..(lo + n) as usize
+            }
+        };
+        let want = [
+            MsmResult::G1(cpu.msm_g1(&pk.a_query, &witness)),
+            MsmResult::G2(cpu.msm_g2(&pk.b_g2_query, &witness)),
+            MsmResult::G1(cpu.msm_g1(&pk.b_g1_query, &witness)),
+            MsmResult::G1(cpu.msm_g1(&pk.l_query, &witness[range(private_from as u32, l_len)])),
+            MsmResult::G1(cpu.msm_g1(&pk.a_query[range(off, tail)], &witness[range(off, tail)])),
+            MsmResult::G1(cpu.msm_g1(
+                &pk.b_g1_query[range(off + 7, tail)],
+                &witness[range(off, tail)],
+            )),
+        ];
+        assert_eq!(got.len(), want.len(), "{}", a.name);
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            let vacuous = i >= 4 && tail == 0;
+            match (g, w) {
+                (MsmResult::G1(g), MsmResult::G1(w)) => {
+                    assert_eq!(g, w, "{}: job {i}", a.name);
+                    assert!(vacuous || !w.is_zero(), "{}: job {i} is vacuous", a.name);
+                }
+                (MsmResult::G2(g), MsmResult::G2(w)) => {
+                    assert_eq!(g, w, "{}: job {i}", a.name);
+                    assert!(!w.is_zero(), "{}: job {i} is vacuous", a.name);
+                }
+                _ => panic!("{}: job {i} came back in the wrong group", a.name),
+            }
+        }
+        eprintln!(
+            "  {}: {n_vars} variables in {} base buffers of {chunk}, {g1} G1 and {g2} G2 \
+             sub-MSMs at a {LIMIT} byte limit, all six jobs match the CPU",
+            a.name,
+            a_bases.chunks()
+        );
+    });
 }
 
 // ---------------------------------------------------------------------------

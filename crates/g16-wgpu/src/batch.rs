@@ -62,7 +62,7 @@
 //! steady state the plans are equal on every proof of one circuit and the pool never
 //! allocates.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use g16_core::ProveError;
@@ -91,20 +91,77 @@ const SLICE_ALIGN: u64 = 256;
 // Resident base vectors
 // ---------------------------------------------------------------------------
 
-fn upload_packed<T: Packed>(
-    backend: &WgpuBackend,
-    label: &str,
-    packed: &[T],
-) -> Result<wgpu::Buffer, ProveError> {
-    // `max(1)`: a zero length WebGPU buffer is not a thing, and an empty query section is
-    // legal (a circuit whose private witness is empty has no L bases). One zeroed element is
-    // the point at infinity in this wire format, so the pad is also the right value.
-    let bytes = (packed.len().max(1) * size_of::<T>()) as u64;
-    let buf = storage_buffer(backend, label, bytes)?;
-    if !packed.is_empty() {
-        backend.queue().write_buffer(&buf, 0, as_bytes(packed));
+/// Points per base buffer on this device: the largest power of two whose G2 chunk, at 128
+/// bytes a point, fits one storage binding. 2^20 at the floor, 2^25 under `auto` here.
+///
+/// One size for both groups rather than twice as many G1 points per buffer, because the
+/// sub-MSMs of a group are cut at every job's buffer boundaries (see [`MsmBatch::run`]) and
+/// a G1 job sharing a sort with a G2 one would be cut at the G2 boundaries anyway.
+pub fn base_chunk_elems(backend: &WgpuBackend) -> u32 {
+    let limits = backend.granted_limits();
+    let bytes = limits
+        .max_storage_buffer_binding_size
+        .min(limits.max_buffer_size);
+    let elems = bytes / wgsl::G2.base_bytes;
+    u32::try_from(elems.max(1)).map_or(1u32 << 31, |e| {
+        if e.is_power_of_two() {
+            e
+        } else {
+            1 << (31 - e.leading_zeros())
+        }
+    })
+}
+
+/// One base vector in buffers of `chunk` points each, the last one shorter.
+///
+/// Several buffers and not one bound in ranges: a range binding needs a 256-byte aligned
+/// offset, which a job's `base_off` does not promise, and it does nothing for a vector over
+/// `maxBufferSize`, which the H query already is at a 2^22 domain (4M points at 64 bytes is
+/// exactly 256 MiB, the floor). A vector that fits is one buffer, bound whole as before.
+struct BaseChunks {
+    bufs: Vec<wgpu::Buffer>,
+    len: usize,
+    chunk: u32,
+}
+
+impl BaseChunks {
+    fn upload<T: Packed, P>(
+        backend: &WgpuBackend,
+        label: &str,
+        ps: &[P],
+        chunk: u32,
+        pack: impl Fn(&[P]) -> Vec<T>,
+    ) -> Result<Self, ProveError> {
+        if chunk == 0 {
+            return Err(bad(format!(
+                "{label}: a base chunk of zero points holds nothing"
+            )));
+        }
+        let mut bufs = Vec::with_capacity(ps.len().div_ceil(chunk as usize).max(1));
+        // `max(1)`: a zero length WebGPU buffer is not a thing, and an empty query section
+        // is legal (a circuit whose private witness is empty has no L bases). One zeroed
+        // element is the point at infinity in this wire format, so the pad is also the right
+        // value. Packed a chunk at a time, so the host never holds a second copy of the whole
+        // vector: 431 MB of G2 at `js_384x384_d32`.
+        if ps.is_empty() {
+            bufs.push(storage_buffer(backend, label, size_of::<T>() as u64)?);
+        }
+        for part in ps.chunks(chunk as usize) {
+            let packed = pack(part);
+            let buf = storage_buffer(backend, label, as_bytes(&packed).len() as u64)?;
+            backend.queue().write_buffer(&buf, 0, as_bytes(&packed));
+            bufs.push(buf);
+        }
+        Ok(Self {
+            bufs,
+            len: ps.len(),
+            chunk,
+        })
     }
-    Ok(buf)
+
+    fn bytes(&self) -> u64 {
+        self.bufs.iter().map(|b| b.size()).sum()
+    }
 }
 
 /// One G1 base vector, resident on the device for the life of the key.
@@ -118,60 +175,105 @@ fn upload_packed<T: Packed>(
 /// and carries an infinity flag that [`PackedG1Affine`] encodes as all-zero coordinates
 /// instead. The A query really does contain points at infinity, 1,187 of `js_16x16_d32`'s
 /// 140,824, so this is a live case and not a theoretical one.
+///
+/// Held in buffers of [`base_chunk_elems`] points each, so a vector over the storage binding
+/// limit (the H query at a 2^22 domain is 256 MiB) is several buffers and a job over it is
+/// several sub-MSMs. A vector that fits is one buffer.
 pub struct G1Bases {
-    buf: wgpu::Buffer,
-    len: usize,
+    chunks: BaseChunks,
 }
 
 impl G1Bases {
     pub fn upload(backend: &WgpuBackend, ps: &[G1Affine]) -> Result<Self, ProveError> {
+        Self::upload_chunked(backend, ps, base_chunk_elems(backend))
+    }
+
+    /// Same, at `chunk_elems` points per buffer. Public so a test can force the chunked
+    /// path on a key that would otherwise fit in one.
+    pub fn upload_chunked(
+        backend: &WgpuBackend,
+        ps: &[G1Affine],
+        chunk_elems: u32,
+    ) -> Result<Self, ProveError> {
         Ok(Self {
-            buf: upload_packed(backend, "g16 msm g1 bases", &PackedG1Affine::pack_slice(ps))?,
-            len: ps.len(),
+            chunks: BaseChunks::upload(
+                backend,
+                "g16 msm g1 bases",
+                ps,
+                chunk_elems,
+                PackedG1Affine::pack_slice,
+            )?,
         })
     }
 
     pub fn len(&self) -> usize {
-        self.len
+        self.chunks.len
     }
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.chunks.len == 0
     }
     /// Device bytes, for a report.
     pub fn bytes(&self) -> u64 {
-        self.buf.size()
+        self.chunks.bytes()
     }
-    pub fn buffer(&self) -> &wgpu::Buffer {
-        &self.buf
+    /// Points per buffer.
+    pub fn chunk_elems(&self) -> u32 {
+        self.chunks.chunk
+    }
+    /// Buffers this vector occupies. One unless it is over the binding limit.
+    pub fn chunks(&self) -> usize {
+        self.chunks.bufs.len()
+    }
+    /// Buffer `i`, holding points `i * chunk_elems..`.
+    pub fn chunk(&self, i: usize) -> &wgpu::Buffer {
+        &self.chunks.bufs[i]
     }
 }
 
 /// One G2 base vector. 128 bytes a point, so the B-G2 query is twice the bytes of a G1 one of
 /// the same length and its MSM is 3.05x the arithmetic. See [`G1Bases`].
 pub struct G2Bases {
-    buf: wgpu::Buffer,
-    len: usize,
+    chunks: BaseChunks,
 }
 
 impl G2Bases {
     pub fn upload(backend: &WgpuBackend, ps: &[G2Affine]) -> Result<Self, ProveError> {
+        Self::upload_chunked(backend, ps, base_chunk_elems(backend))
+    }
+
+    pub fn upload_chunked(
+        backend: &WgpuBackend,
+        ps: &[G2Affine],
+        chunk_elems: u32,
+    ) -> Result<Self, ProveError> {
         Ok(Self {
-            buf: upload_packed(backend, "g16 msm g2 bases", &PackedG2Affine::pack_slice(ps))?,
-            len: ps.len(),
+            chunks: BaseChunks::upload(
+                backend,
+                "g16 msm g2 bases",
+                ps,
+                chunk_elems,
+                PackedG2Affine::pack_slice,
+            )?,
         })
     }
 
     pub fn len(&self) -> usize {
-        self.len
+        self.chunks.len
     }
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.chunks.len == 0
     }
     pub fn bytes(&self) -> u64 {
-        self.buf.size()
+        self.chunks.bytes()
     }
-    pub fn buffer(&self) -> &wgpu::Buffer {
-        &self.buf
+    pub fn chunk_elems(&self) -> u32 {
+        self.chunks.chunk
+    }
+    pub fn chunks(&self) -> usize {
+        self.chunks.bufs.len()
+    }
+    pub fn chunk(&self, i: usize) -> &wgpu::Buffer {
+        &self.chunks.bufs[i]
     }
 }
 
@@ -189,10 +291,10 @@ pub enum Job<'a> {
 }
 
 impl Job<'_> {
-    fn bases(&self) -> &wgpu::Buffer {
+    fn chunks(&self) -> &BaseChunks {
         match self {
-            Job::G1 { bases, .. } => &bases.buf,
-            Job::G2 { bases, .. } => &bases.buf,
+            Job::G1 { bases, .. } => &bases.chunks,
+            Job::G2 { bases, .. } => &bases.chunks,
         }
     }
     fn base_off(&self) -> u32 {
@@ -207,11 +309,37 @@ impl Job<'_> {
         }
     }
     fn base_len(&self) -> usize {
-        match self {
-            Job::G1 { bases, .. } => bases.len,
-            Job::G2 { bases, .. } => bases.len,
-        }
+        self.chunks().len
     }
+    /// Which base buffer holds this job's point for scalar `i`, and where in it.
+    fn locate(&self, i: u32) -> (usize, u32) {
+        let at = u64::from(self.base_off()) + u64::from(i);
+        let chunk = u64::from(self.chunks().chunk);
+        ((at / chunk) as usize, (at % chunk) as u32)
+    }
+    /// The first scalar index past `i` whose point is in a different base buffer.
+    fn next_boundary(&self, i: u32) -> u32 {
+        let at = u64::from(self.base_off()) + u64::from(i);
+        let chunk = u64::from(self.chunks().chunk);
+        let next = (at / chunk + 1) * chunk - u64::from(self.base_off());
+        u32::try_from(next).unwrap_or(u32::MAX)
+    }
+}
+
+/// One sub-MSM's scalar range: a slice of one group that fits every scratch buffer this
+/// device can bind and lies inside one base buffer of every job. See [`MsmBatch::run`].
+struct Piece {
+    gi: usize,
+    lo: u32,
+    dplan: DigitPlan,
+}
+
+/// One job over one piece: the base buffer it reads and the point plan inside it.
+struct PieceJob {
+    pi: usize,
+    ji: usize,
+    chunk: usize,
+    pplan: PointPlan,
 }
 
 /// Where a group's scalars come from.
@@ -337,6 +465,9 @@ pub struct MsmBatch {
     pool: Mutex<Vec<Scratch>>,
     /// Bytes the most recent [`Self::run`] copied down. See [`Self::last_readback_bytes`].
     last_readback: AtomicU64,
+    /// Sub-MSMs the most recent [`Self::run`] dispatched, G1 and G2. See
+    /// [`Self::last_sub_msms`].
+    last_sub_msms: [AtomicU32; 2],
 }
 
 impl MsmBatch {
@@ -348,6 +479,7 @@ impl MsmBatch {
             g2: MsmPointsG2::new(backend)?,
             pool: Mutex::new(Vec::new()),
             last_readback: AtomicU64::new(0),
+            last_sub_msms: [AtomicU32::new(0), AtomicU32::new(0)],
         })
     }
 
@@ -382,6 +514,16 @@ impl MsmBatch {
         self.last_readback.load(Ordering::Relaxed)
     }
 
+    /// Sub-MSMs the most recent [`Self::run`] dispatched, `(G1, G2)`: one per job on a key
+    /// whose scratch and bases fit the binding limit, more on one that had to be cut. Same
+    /// attribution caveat as [`Self::last_readback_bytes`].
+    pub fn last_sub_msms(&self) -> (u32, u32) {
+        (
+            self.last_sub_msms[0].load(Ordering::Relaxed),
+            self.last_sub_msms[1].load(Ordering::Relaxed),
+        )
+    }
+
     /// Scratch sets sitting idle in the pool. Public so a test can assert that two concurrent
     /// proofs hold two different sets rather than racing on one, which is not observable from
     /// outside otherwise.
@@ -398,26 +540,46 @@ impl MsmBatch {
     /// `mont`, if present, is one `fr_mont_to_std` dispatch encoded before everything else.
     /// The compute pass orders dispatches and makes each one's writes visible to the next, so
     /// the sorts that read `mont.dst` see the converted values with no explicit barrier.
+    ///
+    /// # A group over the binding limit runs as several sub-MSMs
+    ///
+    /// Everything a sub-MSM allocates grows with its scalar count: the entry array is
+    /// `n_windows * general * 8` bytes, 20 windows at c = 13, so 4.19 million general scalars
+    /// want 671 MB of it against a 128 MiB binding at the floor, and the spill points and the
+    /// base buffers follow. So each group's range is cut into [`Piece`]s, the largest power
+    /// of two whose plan fits every binding, and cut again wherever a job's base vector moves
+    /// to its next buffer. Every piece is a whole counting sort plus a whole point stage for
+    /// each job, encoded into the same pass, and the host sums a job's pieces after the
+    /// readback, one addition per extra piece. A group that fits is one piece and encodes
+    /// exactly what it did before this existed; `js_384x384_d32`'s H query at the floor is
+    /// eight. The pieces have separate scratch, so a key that has to be cut holds one bucket
+    /// and spill set per piece rather than per job.
     pub async fn run(
         &self,
         backend: &WgpuBackend,
         mont: Option<MontConvert<'_>>,
         groups: &[Group<'_>],
     ) -> Result<Vec<MsmResult>, ProveError> {
+        let limit = backend.granted_limits().max_storage_buffer_binding_size;
+        self.run_with_binding_limit(backend, mont, groups, limit)
+            .await
+    }
+
+    /// Same, cutting the pieces for a binding limit of the caller's choosing rather than the
+    /// device's. Public so a test can run the cut path on a key that fits: the pieces are
+    /// planned against `limit` and allocated against the device, so a limit above the
+    /// device's is refused at allocation as it would be without this.
+    pub async fn run_with_binding_limit(
+        &self,
+        backend: &WgpuBackend,
+        mont: Option<MontConvert<'_>>,
+        groups: &[Group<'_>],
+        limit: u64,
+    ) -> Result<Vec<MsmResult>, ProveError> {
         // ---- plan, on the host, before anything is allocated or encoded ----
-        let mut dplans: Vec<DigitPlan> = Vec::with_capacity(groups.len());
-        // (group index, job index within the group, point plan).
-        let mut pplans: Vec<(usize, usize, PointPlan)> = Vec::new();
+        let mut pieces: Vec<Piece> = Vec::with_capacity(groups.len());
+        let mut pjobs: Vec<PieceJob> = Vec::new();
         for (gi, g) in groups.iter().enumerate() {
-            let general = match &g.scalars {
-                Source::Device { general, .. } => *general,
-                // Not available at plan time: this loop runs before the upload below, so
-                // `pack_scalars` has not walked these scalars yet. `None` means `n`, which
-                // is the overestimate `Source::Device`'s `general` documents as the safe
-                // direction.
-                Source::Host(_) => None,
-            };
-            let dplan = DigitPlan::new(g.n.max(1), g.scalar_off, general)?;
             for (ji, job) in g.jobs.iter().enumerate() {
                 if g.n == 0 {
                     continue;
@@ -434,14 +596,26 @@ impl MsmBatch {
                         job.base_len()
                     )));
                 }
-                let pplan = match job {
-                    Job::G1 { .. } => self.g1.plan_points(&dplan, job.base_off())?,
-                    Job::G2 { .. } => self.g2.plan_points(&dplan, job.base_off())?,
-                };
-                pplans.push((gi, ji, pplan));
             }
-            dplans.push(dplan);
+            for p in self.pieces(gi, g, limit)? {
+                let pi = pieces.len();
+                for (ji, job) in g.jobs.iter().enumerate() {
+                    let (chunk, local) = job.locate(p.lo);
+                    let pplan = match job {
+                        Job::G1 { .. } => self.g1.plan_points(&p.dplan, local)?,
+                        Job::G2 { .. } => self.g2.plan_points(&p.dplan, local)?,
+                    };
+                    pjobs.push(PieceJob {
+                        pi,
+                        ji,
+                        chunk,
+                        pplan,
+                    });
+                }
+                pieces.push(p);
+            }
         }
+        let job_of = |pj: &PieceJob| &groups[pieces[pj.pi].gi].jobs[pj.ji];
 
         // ---- check out and grow the scratch ----
         let mut sc = self
@@ -451,12 +625,15 @@ impl MsmBatch {
             .pop()
             .unwrap_or_default();
 
-        sc.digits.truncate(dplans.len());
-        for (i, plan) in dplans.iter().enumerate() {
-            let stale = sc.digits.get(i).map(|s| s.plan != *plan).unwrap_or(true);
+        sc.digits.truncate(pieces.len());
+        for (i, p) in pieces.iter().enumerate() {
+            let stale = sc.digits.get(i).map(|s| s.plan != p.dplan).unwrap_or(true);
             if stale {
-                let bufs = DigitBuffers::new(backend, plan, 0)?;
-                let slot = DigitSlot { plan: *plan, bufs };
+                let bufs = DigitBuffers::new(backend, &p.dplan, 0)?;
+                let slot = DigitSlot {
+                    plan: p.dplan,
+                    bufs,
+                };
                 match sc.digits.get_mut(i) {
                     Some(s) => *s = slot,
                     None => sc.digits.push(slot),
@@ -464,18 +641,18 @@ impl MsmBatch {
             }
         }
 
-        sc.points.truncate(pplans.len());
-        for (i, (gi, _, pplan)) in pplans.iter().enumerate() {
-            let dplan = dplans[*gi];
-            let curve = groups[*gi].jobs[pplans[i].1].curve();
-            let key = (dplan, *pplan);
+        sc.points.truncate(pjobs.len());
+        for (i, pj) in pjobs.iter().enumerate() {
+            let dplan = pieces[pj.pi].dplan;
+            let curve = job_of(pj).curve();
+            let key = (dplan, pj.pplan);
             let stale = sc
                 .points
                 .get(i)
                 .map(|s| s.plan != key || s.curve != curve.suffix)
                 .unwrap_or(true);
             if stale {
-                let bufs = PointBuffers::new(backend, &dplan, pplan, 0, curve)?;
+                let bufs = PointBuffers::new(backend, &dplan, &pj.pplan, 0, curve)?;
                 let slot = PointSlot {
                     plan: key,
                     curve: curve.suffix,
@@ -527,17 +704,14 @@ impl MsmBatch {
 
         // ---- the parameter ring, sized before anything is pushed ----
         let mut slots = mont.as_ref().map_or(0, |m| self.digits.mont_slots(m.n));
-        for (gi, plan) in dplans.iter().enumerate() {
-            if groups[gi].n == 0 {
-                continue;
-            }
-            slots += self.digits.sort_slots(plan);
+        for p in &pieces {
+            slots += self.digits.sort_slots(&p.dplan);
         }
-        for (i, (gi, _, pplan)) in pplans.iter().enumerate() {
-            let dplan = dplans[*gi];
-            slots += match groups[*gi].jobs[pplans[i].1] {
-                Job::G1 { .. } => self.g1.slots(&dplan, pplan),
-                Job::G2 { .. } => self.g2.slots(&dplan, pplan),
+        for pj in &pjobs {
+            let dplan = pieces[pj.pi].dplan;
+            slots += match job_of(pj) {
+                Job::G1 { .. } => self.g1.slots(&dplan, &pj.pplan),
+                Job::G2 { .. } => self.g2.slots(&dplan, &pj.pplan),
             };
         }
         let slots = slots.max(1);
@@ -551,30 +725,25 @@ impl MsmBatch {
             Some(m) => self.digits.plan_mont(m.n, ring)?,
             None => Vec::new(),
         };
-        let mut sort_off = Vec::with_capacity(dplans.len());
-        for (gi, plan) in dplans.iter().enumerate() {
-            sort_off.push(if groups[gi].n == 0 {
-                None
-            } else {
-                Some(self.digits.plan_sort(plan, ring)?)
-            });
+        let mut sort_off = Vec::with_capacity(pieces.len());
+        for p in &pieces {
+            sort_off.push(self.digits.plan_sort(&p.dplan, ring)?);
         }
-        let mut point_off = Vec::with_capacity(pplans.len());
-        for (i, (gi, _, pplan)) in pplans.iter().enumerate() {
-            let dplan = dplans[*gi];
-            point_off.push(match groups[*gi].jobs[pplans[i].1] {
-                Job::G1 { .. } => self.g1.plan(&dplan, pplan, ring)?,
-                Job::G2 { .. } => self.g2.plan(&dplan, pplan, ring)?,
+        let mut point_off = Vec::with_capacity(pjobs.len());
+        for pj in &pjobs {
+            let dplan = pieces[pj.pi].dplan;
+            point_off.push(match job_of(pj) {
+                Job::G1 { .. } => self.g1.plan(&dplan, &pj.pplan, ring)?,
+                Job::G2 { .. } => self.g2.plan(&dplan, &pj.pplan, ring)?,
             });
         }
         ring.flush(backend);
 
-        // ---- the readback, one staging buffer for every job's window sums ----
-        let mut slices: Vec<(u64, u64)> = Vec::with_capacity(pplans.len());
+        // ---- the readback, one staging buffer for every sub-MSM's window sums ----
+        let mut slices: Vec<(u64, u64)> = Vec::with_capacity(pjobs.len());
         let mut total = 0u64;
-        for (i, (gi, _, _)) in pplans.iter().enumerate() {
-            let curve = groups[*gi].jobs[pplans[i].1].curve();
-            let bytes = sc.points[i].bufs.results_bytes(curve);
+        for (i, pj) in pjobs.iter().enumerate() {
+            let bytes = sc.points[i].bufs.results_bytes(job_of(pj).curve());
             slices.push((total, bytes));
             total += bytes.div_ceil(SLICE_ALIGN) * SLICE_ALIGN;
         }
@@ -600,44 +769,41 @@ impl MsmBatch {
                 Source::Host(_) => &sc.uploads[upload_at[gi].expect("planned above")],
             }
         };
-        let mut sort_binds = Vec::with_capacity(dplans.len());
-        for (gi, plan) in dplans.iter().enumerate() {
-            sort_binds.push(if groups[gi].n == 0 {
-                None
-            } else {
-                Some(self.digits.bind_sort(
-                    backend,
-                    ring,
-                    plan,
-                    scalar_buf(gi),
-                    &sc.digits[gi].bufs,
-                )?)
-            });
+        let mut sort_binds = Vec::with_capacity(pieces.len());
+        for (pi, p) in pieces.iter().enumerate() {
+            sort_binds.push(self.digits.bind_sort(
+                backend,
+                ring,
+                &p.dplan,
+                scalar_buf(p.gi),
+                &sc.digits[pi].bufs,
+            )?);
         }
-        let mut point_binds = Vec::with_capacity(pplans.len());
-        for (i, (gi, ji, pplan)) in pplans.iter().enumerate() {
-            let dplan = dplans[*gi];
-            let job = &groups[*gi].jobs[*ji];
-            let sort = &sc.digits[*gi].bufs;
+        let mut point_binds = Vec::with_capacity(pjobs.len());
+        for (i, pj) in pjobs.iter().enumerate() {
+            let p = &pieces[pj.pi];
+            let job = job_of(pj);
+            let sort = &sc.digits[pj.pi].bufs;
             let pts = &sc.points[i].bufs;
+            let bases = &job.chunks().bufs[pj.chunk];
             point_binds.push(match job {
                 Job::G1 { .. } => self.g1.bind_all(
                     backend,
                     ring,
-                    &dplan,
-                    pplan,
-                    scalar_buf(*gi),
-                    job.bases(),
+                    &p.dplan,
+                    &pj.pplan,
+                    scalar_buf(p.gi),
+                    bases,
                     sort,
                     pts,
                 )?,
                 Job::G2 { .. } => self.g2.bind_all(
                     backend,
                     ring,
-                    &dplan,
-                    pplan,
-                    scalar_buf(*gi),
-                    job.bases(),
+                    &p.dplan,
+                    &pj.pplan,
+                    scalar_buf(p.gi),
+                    bases,
                     sort,
                     pts,
                 )?,
@@ -658,22 +824,27 @@ impl MsmBatch {
             if let (Some(m), Some(bind)) = (&mont, &mont_bind) {
                 self.digits.encode_mont(&mut pass, bind, m.n, &mont_off)?;
             }
-            for (gi, plan) in dplans.iter().enumerate() {
-                if let (Some(bind), Some(off)) = (&sort_binds[gi], &sort_off[gi]) {
-                    self.digits.encode_sort(&mut pass, plan, bind, off)?;
-                }
+            for (pi, p) in pieces.iter().enumerate() {
+                self.digits
+                    .encode_sort(&mut pass, &p.dplan, &sort_binds[pi], &sort_off[pi])?;
             }
-            for (i, (gi, ji, pplan)) in pplans.iter().enumerate() {
-                let dplan = dplans[*gi];
-                match groups[*gi].jobs[*ji] {
-                    Job::G1 { .. } => {
-                        self.g1
-                            .encode(&mut pass, &dplan, pplan, &point_binds[i], &point_off[i])?
-                    }
-                    Job::G2 { .. } => {
-                        self.g2
-                            .encode(&mut pass, &dplan, pplan, &point_binds[i], &point_off[i])?
-                    }
+            for (i, pj) in pjobs.iter().enumerate() {
+                let dplan = pieces[pj.pi].dplan;
+                match job_of(pj) {
+                    Job::G1 { .. } => self.g1.encode(
+                        &mut pass,
+                        &dplan,
+                        &pj.pplan,
+                        &point_binds[i],
+                        &point_off[i],
+                    )?,
+                    Job::G2 { .. } => self.g2.encode(
+                        &mut pass,
+                        &dplan,
+                        &pj.pplan,
+                        &point_binds[i],
+                        &point_off[i],
+                    )?,
                 }
             }
             // Last, so the token is present only if every MSM's last dispatch ran.
@@ -690,15 +861,25 @@ impl MsmBatch {
 
         // One submit and one map, for the whole of stages 5 to 9.
         self.last_readback.store(total, Ordering::Relaxed);
+        let (mut n_g1, mut n_g2) = (0u32, 0u32);
+        for pj in &pjobs {
+            match job_of(pj) {
+                Job::G1 { .. } => n_g1 += 1,
+                Job::G2 { .. } => n_g2 += 1,
+            }
+        }
+        self.last_sub_msms[0].store(n_g1, Ordering::Relaxed);
+        self.last_sub_msms[1].store(n_g2, Ordering::Relaxed);
         let raw = rb.submit_and_read(backend, enc, total).await?;
 
-        // ---- the host tail: Horner over each job's window sums ----
+        // ---- the host tail: Horner over each sub-MSM's window sums, summed per job ----
         //
         // `out` is indexed by the flat job number, `first_job[gi] + ji`, so a group whose
         // jobs were all skipped for `n == 0` still occupies its own slots and the caller's
         // job list and the result list stay in step. Getting that wrong is a proof that does
         // not verify with nothing else to go on, which is why it is a prefix sum and not a
-        // `push` inside the loop that skips.
+        // `push` inside the loop that skips. A job cut into several pieces lands in the same
+        // slot several times and the pieces add.
         let mut first_job = Vec::with_capacity(groups.len() + 1);
         let mut n_jobs = 0usize;
         for g in groups {
@@ -706,30 +887,43 @@ impl MsmBatch {
             n_jobs += g.jobs.len();
         }
         let mut out: Vec<Option<MsmResult>> = vec![None; n_jobs];
-        for (i, (gi, ji, pplan)) in pplans.iter().enumerate() {
-            let dplan = dplans[*gi];
+        for (i, pj) in pjobs.iter().enumerate() {
+            let p = &pieces[pj.pi];
             let (at, bytes) = slices[i];
             let window = &raw[at as usize..(at + bytes) as usize];
             let pts = &sc.points[i].bufs;
-            out[first_job[*gi] + *ji] = Some(match groups[*gi].jobs[*ji] {
-                Job::G1 { .. } => MsmResult::G1(self.g1.combine(window, &dplan, pplan, pts)?),
-                Job::G2 { .. } => MsmResult::G2(self.g2.combine(window, &dplan, pplan, pts)?),
+            let part = match job_of(pj) {
+                Job::G1 { .. } => MsmResult::G1(self.g1.combine(window, &p.dplan, &pj.pplan, pts)?),
+                Job::G2 { .. } => MsmResult::G2(self.g2.combine(window, &p.dplan, &pj.pplan, pts)?),
+            };
+            let slot = &mut out[first_job[p.gi] + pj.ji];
+            *slot = Some(match (slot.take(), part) {
+                (None, part) => part,
+                (Some(MsmResult::G1(a)), MsmResult::G1(b)) => MsmResult::G1(a + b),
+                (Some(MsmResult::G2(a)), MsmResult::G2(b)) => MsmResult::G2(a + b),
+                _ => return Err(bad("two pieces of one job are in different groups")),
             });
             // The trace sees only the five final points. Under the knob, record what
             // `combine` just folded, so a wrong final point names a window instead of a run.
-            // See `WINDOW_DEBUG` for the iPhone this is for. `i` is the flat job index, in
-            // the deterministic order the caller listed the jobs, so the labels line up
+            // See `WINDOW_DEBUG` for the iPhone this is for. `i` is the flat sub-MSM index,
+            // in the deterministic order the caller listed the jobs, so the labels line up
             // between two machines.
             if crate::points::WINDOW_DEBUG.load(Ordering::Relaxed) != 0 {
-                crate::points::window_log(&match groups[*gi].jobs[*ji] {
-                    Job::G1 { .. } => {
-                        self.g1
-                            .debug_windows(&format!("j{i}_g1"), window, &dplan, pplan, pts)?
-                    }
-                    Job::G2 { .. } => {
-                        self.g2
-                            .debug_windows(&format!("j{i}_g2"), window, &dplan, pplan, pts)?
-                    }
+                crate::points::window_log(&match job_of(pj) {
+                    Job::G1 { .. } => self.g1.debug_windows(
+                        &format!("j{i}_g1"),
+                        window,
+                        &p.dplan,
+                        &pj.pplan,
+                        pts,
+                    )?,
+                    Job::G2 { .. } => self.g2.debug_windows(
+                        &format!("j{i}_g2"),
+                        window,
+                        &p.dplan,
+                        &pj.pplan,
+                        pts,
+                    )?,
                 });
             }
         }
@@ -754,5 +948,87 @@ impl MsmBatch {
         self.pool.lock().unwrap_or_else(|e| e.into_inner()).push(sc);
 
         Ok(out.into_iter().map(|x| x.expect("filled above")).collect())
+    }
+
+    /// Cuts one group's range into sub-MSMs. See [`Self::run`].
+    ///
+    /// The cap starts at the whole range and halves to the next power of two until every
+    /// piece's plan fits `limit`. Checked piece by piece rather than once at the cap, because
+    /// the window width is chosen per piece from its general count and a narrower window has
+    /// more windows: 65,536 general scalars at c = 8 take 32 windows of entries where 100,000
+    /// at c = 13 take 20, so a shorter piece can want a larger entry array.
+    fn pieces(&self, gi: usize, g: &Group<'_>, limit: u64) -> Result<Vec<Piece>, ProveError> {
+        if g.n == 0 {
+            return Ok(Vec::new());
+        }
+        let general = match &g.scalars {
+            Source::Device { general, .. } => *general,
+            // Not available at plan time: this runs before the upload, so `pack_scalars`
+            // has not walked these scalars yet. `None` means `n`, which is the overestimate
+            // `Source::Device`'s `general` documents as the safe direction.
+            Source::Host(_) => None,
+        };
+        let mut cap = g.n;
+        loop {
+            let mut pieces = Vec::new();
+            let mut lo = 0u32;
+            let mut fits = true;
+            while lo < g.n {
+                let mut hi = lo.saturating_add(cap).min(g.n);
+                for job in g.jobs {
+                    hi = hi.min(job.next_boundary(lo));
+                }
+                let n = hi - lo;
+                // A piece never has more general scalars than the whole range, and never
+                // more than its own length.
+                let dplan = DigitPlan::new(n, g.scalar_off + lo, general.map(|x| x.min(n)))?;
+                if !self.fits(&dplan, g.jobs, limit)? {
+                    fits = false;
+                    break;
+                }
+                pieces.push(Piece { gi, lo, dplan });
+                lo = hi;
+            }
+            if fits {
+                return Ok(pieces);
+            }
+            if cap == 1 {
+                return Err(bad(format!(
+                    "group {gi}: no sub-MSM of its {} scalars fits the {limit} byte storage \
+                     binding limit, down to one scalar; the bucket array alone is over it at \
+                     this window width",
+                    g.n
+                )));
+            }
+            cap = if cap.is_power_of_two() {
+                cap / 2
+            } else {
+                1 << (31 - cap.leading_zeros())
+            };
+        }
+    }
+
+    /// Whether every buffer one sub-MSM at `dplan` allocates, for the sort and for each of
+    /// `jobs`, is at most `limit` bytes.
+    fn fits(&self, dplan: &DigitPlan, jobs: &[Job<'_>], limit: u64) -> Result<bool, ProveError> {
+        if dplan.largest_binding() > limit {
+            return Ok(false);
+        }
+        for job in jobs {
+            let largest = match job {
+                Job::G1 { .. } => self
+                    .g1
+                    .plan_points(dplan, 0)?
+                    .largest_binding(dplan, wgsl::G1),
+                Job::G2 { .. } => self
+                    .g2
+                    .plan_points(dplan, 0)?
+                    .largest_binding(dplan, wgsl::G2),
+            };
+            if largest > limit {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 }
