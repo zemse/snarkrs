@@ -910,29 +910,31 @@ fn where_the_msm_time_goes() {
         let all = vec![w_group(), l_group(), h_group()];
         pollster::block_on(batch.run(b, Some(mont()), &all)).expect("warm");
 
-        let time = |groups: Vec<Group<'_>>, mont: Option<MontConvert<'_>>| -> f64 {
-            let mut best = f64::MAX;
-            for _ in 0..3 {
-                let start = std::time::Instant::now();
-                pollster::block_on(batch.run(
-                    b,
-                    mont.as_ref().map(|m| MontConvert {
-                        src: m.src,
-                        dst: m.dst,
-                        n: m.n,
-                    }),
-                    &groups,
-                ))
-                .expect("run");
-                best = best.min(start.elapsed().as_secs_f64() * 1000.0);
-            }
-            best
+        let once = |groups: Vec<Group<'_>>, mont: Option<MontConvert<'_>>| -> f64 {
+            let start = std::time::Instant::now();
+            pollster::block_on(batch.run(b, mont, &groups)).expect("run");
+            start.elapsed().as_secs_f64() * 1000.0
         };
 
-        let t_w = time(vec![w_group()], Some(mont()));
-        let t_l = time(vec![l_group()], None);
-        let t_h = time(vec![h_group()], None);
-        let t_all = time(vec![w_group(), l_group(), h_group()], Some(mont()));
+        // Five interleaved rounds, and the median of each configuration. Interleaved because
+        // the lock only keeps out other timing tests: other lanes' correctness tests still
+        // load this GPU in spells, and timed back to back one configuration can sit inside a
+        // spell while another misses it. Medians rather than minima because the witness
+        // group's own time is bimodal, 543 and 624 to 657 ms at js_16x16_d32 within one run
+        // with correct results each time, so a minimum sets one configuration's lucky run
+        // against another's typical one. Three-sample minima taken back to back failed this by
+        // 11 to 12% on three whole-file runs in three.
+        let mut samples = [const { Vec::new() }; 4];
+        for _ in 0..5 {
+            samples[0].push(once(vec![w_group()], Some(mont())));
+            samples[1].push(once(vec![l_group()], None));
+            samples[2].push(once(vec![h_group()], None));
+            samples[3].push(once(vec![w_group(), l_group(), h_group()], Some(mont())));
+        }
+        let [t_w, t_l, t_h, t_all] = samples.map(|mut xs| {
+            xs.sort_by(|a, b| a.total_cmp(b));
+            xs[xs.len() / 2]
+        });
 
         println!(
             "{:14} n_vars {:>7} general {:>7} domain {:>7} | A+B2+B1 {:8.2} ms  L {:8.2}  \
@@ -948,8 +950,8 @@ fn where_the_msm_time_goes() {
             t_all
         );
         // The batch cannot be slower than running the same work in three submissions, which
-        // is the claim `msm_batch` is built on. Allowed 10% of slack for the medians being
-        // three-sample minima on a machine that is not idle.
+        // is the claim `msm_batch` is built on. Allowed 10% of slack for these being
+        // five-sample medians on a machine that is not idle.
         assert!(
             t_all <= 1.10 * (t_w + t_l + t_h),
             "{}: one batch took {t_all:.2} ms where three took {:.2}",

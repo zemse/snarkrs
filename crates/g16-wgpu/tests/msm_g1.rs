@@ -1081,6 +1081,28 @@ impl Bench {
         let full = once(reps);
         ((full - base) / reps as f64).max(0.0)
     }
+
+    /// [`Self::time`] for each `(pipelines, slice_len)` case, the median of `rounds`
+    /// interleaved rounds.
+    ///
+    /// For sweeps. The GPU lock keeps out other timing tests and nothing else, so load
+    /// comes and goes while a sweep runs; case after case, whichever cases meet it read
+    /// slow. Interleaved, every case samples the same spells.
+    fn time_each(
+        &self,
+        cases: &[(&MsmPointsG1, u32)],
+        reps: u32,
+        what: Stage,
+        rounds: u32,
+    ) -> Vec<f64> {
+        let mut samples = vec![Vec::new(); cases.len()];
+        for _ in 0..rounds {
+            for (&(p, slice_len), s) in cases.iter().zip(&mut samples) {
+                s.push(self.time(p, slice_len, reps, what));
+            }
+        }
+        samples.into_iter().map(median).collect()
+    }
 }
 
 /// Which kernels a timed repetition contains.
@@ -1138,28 +1160,31 @@ fn the_g1_workgroup_sizes_are_measured() {
         (wgsl::G1.entry_merge(), Stage::Merge, 20),
     ];
 
+    // Through `Bench::time_each`, not a median of five per size, one size after another.
+    // The lock keeps out other timing tests and nothing else, and 16 of this binary's 21 tests
+    // run beside this one: timed back to back, the shipped segmented size read 10.9% slow on
+    // one whole-file run in four while a neighbour missed the load.
     let mut rows: Vec<(String, Vec<f64>)> = Vec::new();
     for (name, stage, reps) in cases {
-        let mut row = Vec::new();
-        for &sz in &sizes {
-            let mut wg = shipped;
-            match stage {
-                Stage::Clear => wg.clear = sz,
-                Stage::Segmented => wg.segmented = sz,
-                _ => wg.merge = sz,
-            }
-            let p = MsmPointsG1::with_shape(floor(), wg, 65535).expect("pipelines");
-            row.push(median(
-                (0..5)
-                    .map(|_| bench.time(&p, wgsl::G1.slice_len, reps, stage))
-                    .collect(),
-            ));
-        }
-        rows.push((name, row));
+        let pipelines: Vec<MsmPointsG1> = sizes
+            .iter()
+            .map(|&sz| {
+                let mut wg = shipped;
+                match stage {
+                    Stage::Clear => wg.clear = sz,
+                    Stage::Segmented => wg.segmented = sz,
+                    _ => wg.merge = sz,
+                }
+                MsmPointsG1::with_shape(floor(), wg, 65535).expect("pipelines")
+            })
+            .collect();
+        let cases: Vec<_> = pipelines.iter().map(|p| (p, wgsl::G1.slice_len)).collect();
+        rows.push((name, bench.time_each(&cases, reps, stage, 7)));
     }
 
     println!(
-        "32,768 general scalars, c = 12, slice_len {}, each kernel alone, medians of five, us",
+        "32,768 general scalars, c = 12, slice_len {}, each kernel alone, medians of seven \
+         interleaved rounds, us",
         wgsl::G1.slice_len
     );
     print!("{:20}", "kernel");
@@ -1212,17 +1237,23 @@ fn the_g1_reduction_threadgroup_is_measured() {
     let curve = wgsl::G1;
 
     // Up to 128, where G2 stops at 64: `array<PtG1, 128>` is 16384 bytes, exactly the floor.
-    println!("32,768 general scalars, c = 12, reduce + ones only, medians of five, us");
+    // Through `Bench::time_each`: timed one size after another, load landing on tg = 128
+    // alone once read it 0.4% behind 64, which it beats by 10% on a quiet GPU.
+    println!(
+        "32,768 general scalars, c = 12, reduce + ones only, medians of five interleaved \
+         rounds, us"
+    );
     println!("{:>4} {:>10} {:>10}", "tg", "shared B", "us");
+    let tgs = [8u32, 16, 32, 64, 128];
+    let pipelines: Vec<MsmPointsG1> = tgs
+        .iter()
+        .map(|&tg| MsmPointsG1::with_shape(floor(), curve.with_tg(tg), 65535).expect("pipelines"))
+        .collect();
+    let cases: Vec<_> = pipelines.iter().map(|p| (p, curve.slice_len)).collect();
+    let times = bench.time_each(&cases, 5, Stage::Reduction, 5);
     let mut best = (f64::MAX, 0u32);
     let mut shipped_us = 0.0;
-    for tg in [8u32, 16, 32, 64, 128] {
-        let p = MsmPointsG1::with_shape(floor(), curve.with_tg(tg), 65535).expect("pipelines");
-        let us = median(
-            (0..5)
-                .map(|_| bench.time(&p, curve.slice_len, 5, Stage::Reduction))
-                .collect(),
-        );
+    for (tg, us) in tgs.into_iter().zip(times) {
         println!("{tg:>4} {:>10} {us:>10.1}", curve.workgroup_bytes(tg));
         if us < best.0 {
             best = (us, tg);
@@ -1257,16 +1288,13 @@ fn the_g1_slice_length_is_measured() {
     let _gpu = exclusive();
     let bench = Bench::new(32_768, 12);
     let p = points();
-    println!("32,768 general scalars, c = 12, clear + segmented + merge, medians of three, us");
+    println!(
+        "32,768 general scalars, c = 12, clear + segmented + merge, medians of three \
+         interleaved rounds, us"
+    );
     let lens = [16u32, 32, 64, 128, 256, 512, 1024];
-    let mut row = Vec::new();
-    for &l in &lens {
-        row.push(median(
-            (0..3)
-                .map(|_| bench.time(p, l, 3, Stage::Accumulate))
-                .collect(),
-        ));
-    }
+    let cases: Vec<_> = lens.iter().map(|&l| (p, l)).collect();
+    let row = bench.time_each(&cases, 3, Stage::Accumulate, 3);
     print!("{:12}", "slice_len");
     for l in lens {
         print!("{l:>9}");

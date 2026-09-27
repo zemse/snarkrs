@@ -38,7 +38,7 @@ use g16_ntt::{CpuNtt, Direction as CpuDirection};
 use g16_wgpu::gather::{fr_buffer, fr_words};
 use g16_wgpu::gen::ntt as wgsl;
 use g16_wgpu::gen::ntt::Mode;
-use g16_wgpu::{Direction, Epilogue, LimitsProfile, Ntt, NttTables, ParamRing, Readback};
+use g16_wgpu::{Direction, Epilogue, LimitsProfile, Ntt, NttTables, ParamRing, Planned, Readback};
 use g16_wgpu::{Scale, Transform, WgpuBackend};
 
 #[path = "gpulock/mod.rs"]
@@ -711,61 +711,72 @@ fn a_max_fused_over_the_granted_budget_is_refused() {
 // 7. The shape, measured rather than inherited
 // ---------------------------------------------------------------------------
 
-/// Microseconds for one `iNTT -> coset -> NTT` chain at a given shape, submit overhead
-/// removed by differencing 1 chain against `1 + REPEATS` in a single submit.
-///
-/// `tests/gather.rs` measured that fixed cost at 230 us on this machine, which would swamp
-/// the 0.4 ms a 2^12 chain takes. `None` means the many-chain submit came back no slower than
-/// the one-chain submit, which happens when another test is contending for the same GPU;
-/// reporting that as a number is the failure `bench/scripts` was fixed for.
-fn chain_us(log_n: u32, max_fused: u32, workgroup: Option<u32>, x: &[Fr]) -> Option<f64> {
-    const REPEATS: u32 = 10;
-    let b = floor();
-    let n = 1usize << log_n;
-    let nn = n as u32;
-    let ntt = Ntt::with_shape(b, log_n, max_fused, workgroup).expect("pipelines");
-    let tables = NttTables::new(b, n).expect("tables");
-    let v = scratch("shape v", nn, Some(x));
-    let t = scratch("shape t", nn, None);
-    let mut ring = ParamRing::new(b, "shape params", 2 * ntt.dispatches() as u32).expect("ring");
-    let p0 = ntt
-        .plan(
-            b,
-            &tables,
-            &mut ring,
-            &Transform {
-                dir: Direction::Inverse,
-                scale: Scale::SizeInv,
-                src: &v,
-                dst: &t,
-                epilogue: Epilogue::Plain,
-            },
-        )
-        .expect("plan");
-    let p1 = ntt
-        .plan(
-            b,
-            &tables,
-            &mut ring,
-            &Transform {
-                dir: Direction::Forward,
-                scale: Scale::CosetPowers,
-                src: &t,
-                dst: &v,
-                epilogue: Epilogue::Plain,
-            },
-        )
-        .expect("plan");
-    ring.flush(b);
+/// One `iNTT -> coset -> NTT` chain at a given shape, planned once so that [`chains_us`]
+/// can come back to it round after round.
+struct Chain {
+    ntt: Ntt,
+    p0: Planned,
+    p1: Planned,
+}
 
-    let once = |chains: u32| -> u128 {
+impl Chain {
+    /// `v` and `t` are shared by every chain of one domain. Each run overwrites `v` with a
+    /// transform of itself, which is harmless: nothing reads it and the time does not depend
+    /// on the values.
+    fn new(
+        log_n: u32,
+        max_fused: u32,
+        workgroup: Option<u32>,
+        tables: &NttTables,
+        v: &wgpu::Buffer,
+        t: &wgpu::Buffer,
+    ) -> Self {
+        let b = floor();
+        let ntt = Ntt::with_shape(b, log_n, max_fused, workgroup).expect("pipelines");
+        let mut ring =
+            ParamRing::new(b, "shape params", 2 * ntt.dispatches() as u32).expect("ring");
+        let p0 = ntt
+            .plan(
+                b,
+                tables,
+                &mut ring,
+                &Transform {
+                    dir: Direction::Inverse,
+                    scale: Scale::SizeInv,
+                    src: v,
+                    dst: t,
+                    epilogue: Epilogue::Plain,
+                },
+            )
+            .expect("plan");
+        let p1 = ntt
+            .plan(
+                b,
+                tables,
+                &mut ring,
+                &Transform {
+                    dir: Direction::Forward,
+                    scale: Scale::CosetPowers,
+                    src: t,
+                    dst: v,
+                    epilogue: Epilogue::Plain,
+                },
+            )
+            .expect("plan");
+        ring.flush(b);
+        Chain { ntt, p0, p1 }
+    }
+
+    /// Wall-clock microseconds for `chains` chains in one submit.
+    fn once(&self, chains: u32) -> u128 {
+        let b = floor();
         let t0 = std::time::Instant::now();
         let mut enc = b.device().create_command_encoder(&Default::default());
         {
             let mut pass = enc.begin_compute_pass(&Default::default());
             for _ in 0..chains {
-                ntt.encode(&mut pass, &p0).expect("encode");
-                ntt.encode(&mut pass, &p1).expect("encode");
+                self.ntt.encode(&mut pass, &self.p0).expect("encode");
+                self.ntt.encode(&mut pass, &self.p1).expect("encode");
             }
         }
         b.queue().submit([enc.finish()]);
@@ -773,14 +784,64 @@ fn chain_us(log_n: u32, max_fused: u32, workgroup: Option<u32>, x: &[Fr]) -> Opt
             .poll(wgpu::PollType::wait_indefinitely())
             .expect("poll");
         t0.elapsed().as_micros()
-    };
-    once(1);
-    once(1 + REPEATS);
-    let mut one: Vec<u128> = (0..3).map(|_| once(1)).collect();
-    let mut many: Vec<u128> = (0..3).map(|_| once(1 + REPEATS)).collect();
-    one.sort_unstable();
-    many.sort_unstable();
-    (many[1] > one[1]).then(|| (many[1] - one[1]) as f64 / REPEATS as f64)
+    }
+}
+
+/// Microseconds for one chain at each `(log_n, max_fused, workgroup)` shape, submit overhead
+/// removed by differencing 1 chain against `1 + REPEATS` in a single submit.
+///
+/// `tests/gather.rs` measured that fixed cost at 230 us on this machine, which would swamp
+/// the 0.4 ms a 2^12 chain takes. `None` means the many-chain submit came back no slower than
+/// the one-chain submit, which happens when another test is contending for the same GPU;
+/// reporting that as a number is the failure `bench/scripts` was fixed for.
+///
+/// Every shape is planned first and then timed in interleaved rounds, keeping the minimum of
+/// each submit size. The GPU lock keeps out other timing tests and nothing else: this
+/// binary's correctness tests run beside the sweep for its first seconds, and other
+/// checkouts' tests come and go. Timed one shape after another, whichever shapes fell in a
+/// busy spell read up to 25x slow (10787 us for a 2^14 cell beside 382), and this failed its
+/// 1.5x bar on two whole-file runs in three. Interleaved, every shape samples the whole run.
+fn chains_us(shapes: &[(u32, u32, Option<u32>)], inputs: &[(u32, Vec<Fr>)]) -> Vec<Option<f64>> {
+    const REPEATS: u32 = 10;
+    const ROUNDS: usize = 5;
+    let b = floor();
+    let domains: Vec<(u32, NttTables, wgpu::Buffer, wgpu::Buffer)> = inputs
+        .iter()
+        .map(|(log_n, x)| {
+            let n = 1usize << log_n;
+            let tables = NttTables::new(b, n).expect("tables");
+            let v = scratch("shape v", n as u32, Some(x));
+            let t = scratch("shape t", n as u32, None);
+            (*log_n, tables, v, t)
+        })
+        .collect();
+    let chains: Vec<Chain> = shapes
+        .iter()
+        .map(|&(log_n, max_fused, workgroup)| {
+            let (_, tables, v, t) = domains
+                .iter()
+                .find(|d| d.0 == log_n)
+                .expect("a shape outside the swept domains");
+            Chain::new(log_n, max_fused, workgroup, tables, v, t)
+        })
+        .collect();
+
+    for c in &chains {
+        c.once(1);
+        c.once(1 + REPEATS);
+    }
+    let mut one = vec![u128::MAX; chains.len()];
+    let mut many = vec![u128::MAX; chains.len()];
+    for _ in 0..ROUNDS {
+        for (i, c) in chains.iter().enumerate() {
+            one[i] = one[i].min(c.once(1));
+            many[i] = many[i].min(c.once(1 + REPEATS));
+        }
+    }
+    one.iter()
+        .zip(&many)
+        .map(|(&one, &many)| (many > one).then(|| (many - one) as f64 / REPEATS as f64))
+        .collect()
 }
 
 /// The four artifact domains, so the sweep is over sizes this prover actually meets.
@@ -802,25 +863,41 @@ fn the_ntt_shape_is_measured_and_not_inherited() {
         .map(|&log_n| (log_n, sample(1usize << log_n, 0x5EED ^ log_n as u64)))
         .collect();
 
+    // Both sweeps' shapes, timed together so that whatever load there is lands on all alike.
+    // The rule column below is the shipped column of the first table, measured once.
+    const SIZES: [u32; 4] = [32, 64, 128, 256];
+    let ceiling = Ntt::max_fused(b);
+    let mut shapes = Vec::new();
+    for &log_n in &SWEEP_DOMAINS {
+        shapes.extend((4..=ceiling).map(|mf| (log_n, mf, None)));
+        shapes.extend(SIZES.map(|wg| (log_n, Ntt::preferred_fused(b), Some(wg))));
+    }
+    let times = chains_us(&shapes, &inputs);
+    let chain_us = |log_n: u32, mf: u32, wg: Option<u32>| {
+        times[shapes
+            .iter()
+            .position(|&s| s == (log_n, mf, wg))
+            .expect("a shape that was timed")]
+    };
+
     // ---- the tile: how many passes to fuse ----
     println!(
         "one iNTT + coset + NTT chain in microseconds, submit overhead differenced out.\n\
          Passes fused per dispatch, each column at its own measured workgroup size:"
     );
-    let ceiling = Ntt::max_fused(b);
     print!("{:>8}", "domain");
     for mf in 4..=ceiling {
         print!("{:>16}", format!("mf {mf}"));
     }
     println!();
     let mut shipped_regret: f64 = 0.0;
-    for (log_n, x) in &inputs {
+    for log_n in SWEEP_DOMAINS {
         print!("{:>8}", format!("2^{log_n}"));
         let mut best = f64::MAX;
         let mut shipped = None;
         for mf in 4..=ceiling {
-            let us = chain_us(*log_n, mf, None, x);
-            let k = g16_wgpu::split_passes(*log_n, mf)[0].k;
+            let us = chain_us(log_n, mf, None);
+            let k = g16_wgpu::split_passes(log_n, mf)[0].k;
             match us {
                 Some(us) => {
                     print!("{:>16}", format!("{us:.0} (k{k})"));
@@ -844,7 +921,6 @@ fn the_ntt_shape_is_measured_and_not_inherited() {
     );
 
     // ---- the workgroup, at the shipped tile ----
-    const SIZES: [u32; 4] = [32, 64, 128, 256];
     println!("\nThreads per workgroup at the shipped tile:");
     print!("{:>8}{:>6}", "domain", "k");
     for wg in SIZES {
@@ -853,14 +929,14 @@ fn the_ntt_shape_is_measured_and_not_inherited() {
     print!("{:>9}", "rule");
     println!();
     let mut wg_regret: f64 = 0.0;
-    for (log_n, x) in &inputs {
+    for log_n in SWEEP_DOMAINS {
         let mf = Ntt::preferred_fused(b);
-        let k = g16_wgpu::split_passes(*log_n, mf)[0].k;
+        let k = g16_wgpu::split_passes(log_n, mf)[0].k;
         print!("{:>8}{:>6}", format!("2^{log_n}"), k);
         let mut best = f64::MAX;
         for wg in SIZES {
             // Correctness at every size, always. Only the timing is allowed to be absent.
-            match chain_us(*log_n, mf, Some(wg), x) {
+            match chain_us(log_n, mf, Some(wg)) {
                 Some(us) => {
                     print!("{us:>9.0}");
                     best = best.min(us);
@@ -868,7 +944,7 @@ fn the_ntt_shape_is_measured_and_not_inherited() {
                 None => print!("{:>9}", "-"),
             }
         }
-        match chain_us(*log_n, mf, None, x) {
+        match chain_us(log_n, mf, None) {
             Some(us) => {
                 print!("{us:>9.0}");
                 if best < f64::MAX {

@@ -757,6 +757,28 @@ impl Bench {
         let full = once(reps);
         ((full - base) / reps as f64).max(0.0)
     }
+
+    /// [`Self::time`] for each `(pipelines, slice_len)` case, the median of `rounds`
+    /// interleaved rounds.
+    ///
+    /// For sweeps, as `tests/msm_g1.rs` has it: the GPU lock keeps out other timing tests and
+    /// nothing else, so case after case, whichever cases meet the load read slow.
+    /// Interleaved, every case samples the same spells.
+    fn time_each(
+        &self,
+        cases: &[(&MsmPointsG2, u32)],
+        reps: u32,
+        what: Stage,
+        rounds: u32,
+    ) -> Vec<f64> {
+        let mut samples = vec![Vec::new(); cases.len()];
+        for _ in 0..rounds {
+            for (&(p, slice_len), s) in cases.iter().zip(&mut samples) {
+                s.push(self.time(p, slice_len, reps, what));
+            }
+        }
+        samples.into_iter().map(median).collect()
+    }
 }
 
 /// Which kernels a timed repetition contains.
@@ -807,26 +829,25 @@ fn the_g2_workgroup_sizes_are_measured() {
 
     let mut rows: Vec<(String, Vec<f64>)> = Vec::new();
     for (name, stage, reps) in cases {
-        let mut row = Vec::new();
-        for &sz in &sizes {
-            let mut wg = shipped;
-            match stage {
-                Stage::Clear => wg.clear = sz,
-                Stage::Segmented => wg.segmented = sz,
-                _ => wg.merge = sz,
-            }
-            let p = MsmPointsG2::with_shape(floor(), wg, 65535).expect("pipelines");
-            row.push(median(
-                (0..5)
-                    .map(|_| bench.time(&p, wgsl::G2.slice_len, reps, stage))
-                    .collect(),
-            ));
-        }
-        rows.push((name, row));
+        let pipelines: Vec<MsmPointsG2> = sizes
+            .iter()
+            .map(|&sz| {
+                let mut wg = shipped;
+                match stage {
+                    Stage::Clear => wg.clear = sz,
+                    Stage::Segmented => wg.segmented = sz,
+                    _ => wg.merge = sz,
+                }
+                MsmPointsG2::with_shape(floor(), wg, 65535).expect("pipelines")
+            })
+            .collect();
+        let cases: Vec<_> = pipelines.iter().map(|p| (p, wgsl::G2.slice_len)).collect();
+        rows.push((name, bench.time_each(&cases, reps, stage, 7)));
     }
 
     println!(
-        "32,768 general scalars, c = 12, slice_len {}, each kernel alone, medians of five, us",
+        "32,768 general scalars, c = 12, slice_len {}, each kernel alone, medians of seven \
+         interleaved rounds, us",
         wgsl::G2.slice_len
     );
     print!("{:20}", "kernel");
@@ -891,17 +912,23 @@ fn the_reduction_threadgroup_is_measured() {
     let bench = Bench::new(32_768, 12);
     let curve = wgsl::G2;
 
-    println!("32,768 general scalars, c = 12, reduce + ones only, medians of five, us");
+    println!(
+        "32,768 general scalars, c = 12, reduce + ones only, medians of five interleaved \
+         rounds, us"
+    );
     println!("{:>4} {:>10} {:>10}", "tg", "shared B", "us");
+    let tgs = [8u32, 16, 32, 64];
+    let pipelines: Vec<MsmPointsG2> = tgs
+        .iter()
+        .map(|&tg| {
+            MsmPointsG2::with_shape(floor(), wgsl::G2.with_tg(tg), 65535).expect("pipelines")
+        })
+        .collect();
+    let cases: Vec<_> = pipelines.iter().map(|p| (p, wgsl::G2.slice_len)).collect();
+    let times = bench.time_each(&cases, 5, Stage::Reduction, 5);
     let mut best = (f64::MAX, 0u32);
     let mut shipped_us = 0.0;
-    for tg in [8u32, 16, 32, 64] {
-        let p = MsmPointsG2::with_shape(floor(), wgsl::G2.with_tg(tg), 65535).expect("pipelines");
-        let us = median(
-            (0..5)
-                .map(|_| bench.time(&p, wgsl::G2.slice_len, 5, Stage::Reduction))
-                .collect(),
-        );
+    for (tg, us) in tgs.into_iter().zip(times) {
         println!("{tg:>4} {:>10} {us:>10.1}", curve.workgroup_bytes(tg));
         if us < best.0 {
             best = (us, tg);
@@ -946,16 +973,13 @@ fn the_slice_length_is_measured() {
     let _gpu = exclusive();
     let bench = Bench::new(32_768, 12);
     let p = points();
-    println!("32,768 general scalars, c = 12, clear + segmented + merge, medians of three, us");
+    println!(
+        "32,768 general scalars, c = 12, clear + segmented + merge, medians of three \
+         interleaved rounds, us"
+    );
     let lens = [16u32, 32, 64, 128, 256, 512, 1024];
-    let mut row = Vec::new();
-    for &l in &lens {
-        row.push(median(
-            (0..3)
-                .map(|_| bench.time(p, l, 3, Stage::Accumulate))
-                .collect(),
-        ));
-    }
+    let cases: Vec<_> = lens.iter().map(|&l| (p, l)).collect();
+    let row = bench.time_each(&cases, 3, Stage::Accumulate, 3);
     print!("{:12}", "slice_len");
     for l in lens {
         print!("{l:>9}");
