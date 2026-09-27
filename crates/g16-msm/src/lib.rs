@@ -118,14 +118,59 @@ pub fn window_size(n: usize) -> u32 {
 
 pub struct CpuMsm {
     pub threads: usize,
+    /// Send every scalar through the bucket loop, so the cost follows the key and not the
+    /// witness. Off by default because of what it costs; see [`Work`].
+    pub constant_work: bool,
 }
 
 impl CpuMsm {
     pub fn new() -> Self {
         Self {
             threads: rayon::current_num_threads(),
+            constant_work: false,
         }
     }
+
+    /// [`CpuMsm::new`] with `constant_work` on.
+    pub fn constant_work() -> Self {
+        Self {
+            constant_work: true,
+            ..Self::new()
+        }
+    }
+
+    fn work(&self) -> Work {
+        if self.constant_work {
+            Work::Constant
+        } else {
+            Work::Variable
+        }
+    }
+}
+
+/// Whether the MSM's cost may depend on the scalar values.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Work {
+    /// Every scalar whose base is not the point at infinity goes through the bucket loop,
+    /// and a zero digit costs a mixed addition into a bucket nobody reads. Which bases are
+    /// at infinity is fixed by the key, so the scalar count, the window width, every
+    /// allocation and the number of additions depend on the key and not on the witness.
+    ///
+    /// That closes the channel of "Remote Side-Channel Attacks on Anonymous Transactions"
+    /// (USENIX Security 2020), which recovered Zcash witness sparsity from proving time. It
+    /// is not constant time in the strict sense: the batched fill's conflict rounds and the
+    /// order of bucket hits still depend on the digit values, as in every Pippenger.
+    ///
+    /// What it costs is what the witness's zeros and ones were saving, so it is priced per
+    /// circuit. Warm CPU proofs on the M2 Max, 15 reps, three alternating rounds against the
+    /// variable-time path: js_16x16_d32 399-404 ms against 390-392 (+2.5%), keccak256
+    /// 520-534 against 161-162 (3.3x), rsa2048 668-700 against 169-170 (about 4x). The
+    /// earlier "under 2%" held for the dense circuits only.
+    Constant,
+    /// Zero scalars are dropped, one scalars cost one addition in total, and the window is
+    /// sized for the rest. Running time, allocation size and the number of Montgomery
+    /// reductions then follow how many witness entries are zero or one.
+    Variable,
 }
 
 impl Default for CpuMsm {
@@ -139,10 +184,10 @@ impl MsmBackend for CpuMsm {
         "cpu"
     }
     fn msm_g1(&self, bases: &[G1Affine], scalars: &[Fr]) -> G1Projective {
-        pippenger(bases, scalars, self.threads)
+        pippenger(bases, scalars, self.threads, self.work())
     }
     fn msm_g2(&self, bases: &[G2Affine], scalars: &[Fr]) -> G2Projective {
-        pippenger(bases, scalars, self.threads)
+        pippenger(bases, scalars, self.threads, self.work())
     }
 }
 
@@ -236,18 +281,18 @@ struct Prescan<P: SWCurveConfig> {
 /// information about Zcash shielded transactions by timing the prover. The measured effect
 /// there was a correlation between proving time and the sparsity of the witness.
 ///
-/// It is kept because every production Groth16 prover does it and the cost is nil; on
-/// this benchmark ladder the measured gain is small (0/1 scalars are 1.8-4.1% of the
-/// witness, about 1.02x; an earlier comment claimed 5.1x from a synthetic sparse
-/// workload), but on a genuinely bit-heavy witness it grows with the sparsity. But
-/// it means **this prover is not constant time with respect to the witness**, and a
-/// deployment where an attacker can measure proving time or memory must treat that as part
-/// of its threat model rather than assuming zero-knowledge covers it. Zero-knowledge is a
-/// property of the proof, not of the process that produced it.
+/// It is the default because every production Groth16 prover does it and because on a
+/// bit-heavy circuit it is most of the MSM: the constant-work path costs 2.5% on the dense
+/// js_16x16_d32 (0/1 scalars are 1.8% of its witness) but 3.3x on keccak256 and about 4x on
+/// rsa2048. So by default **this prover is not constant time with respect to the witness**,
+/// and a deployment where an attacker can measure proving time or memory must either turn
+/// on [`CpuMsm::constant_work`] (`g16 prove --constant-work`) or treat the channel as part
+/// of its threat model. Zero-knowledge is a property of the proof, not of the process that
+/// produced it.
 ///
-/// A constant-time variant would have to process every scalar through the general path,
-/// giving up both fast paths and the compaction.
-fn prescan<P: RawCurve>(bases: &[Affine<P>], scalars: &[Fr], n: usize) -> Prescan<P>
+/// [`Work::Constant`] processes every scalar through the general path and gives up both
+/// fast paths and the compaction.
+fn prescan<P: RawCurve>(bases: &[Affine<P>], scalars: &[Fr], n: usize, work: Work) -> Prescan<P>
 where
     P::BaseField: Send + Sync,
 {
@@ -258,7 +303,7 @@ where
         let mut ones_sum = Xyzz::<P::RF>::ZERO;
         for i in lo..hi {
             let s = &scalars[i];
-            if s.is_zero() {
+            if work == Work::Variable && s.is_zero() {
                 // No bucket touched, no Montgomery reduction, no base read.
                 continue;
             }
@@ -272,7 +317,7 @@ where
             if bases[i].infinity {
                 continue;
             }
-            if s.is_one() {
+            if work == Work::Variable && s.is_one() {
                 // One mixed addition, total, for the whole scalar. Through the raw
                 // XYZZ madd, not ark's Jacobian one: on a bit-heavy witness this loop
                 // runs tens of thousands of times per MSM, and the branchy ark madd
@@ -333,20 +378,27 @@ fn window_chunk<P: RawCurve>(
     range: core::ops::Range<usize>,
     window: usize,
     c: u32,
+    work: Work,
 ) -> Projective<P> {
     // `d` is in [-2^(c-1), 2^(c-1)], so `2^(c-1)` buckets is tight.
     let n_buckets = 1usize << (c - 1);
     let mut buckets = vec![Xyzz::<P::RF>::ZERO; n_buckets];
+    // Where a zero digit's addition goes under `Work::Constant`. Never read into the
+    // result; `black_box` below keeps the additions from being optimised out.
+    let mut dummy = Xyzz::<P::RF>::ZERO;
     for k in range {
         let d = signed_digit(scan.bigints[k].as_ref(), window, c);
-        // The zero digit must not touch a bucket. It is not a rare case: a random scalar
-        // hits it about once every 2^(c-1) windows, and a small witness value like 2 or 7
-        // is zero in every window but the lowest.
-        if d == 0 {
-            continue;
-        }
         // Never infinity: prescan filtered those, so raw_xy is total here.
         let (x, y) = P::raw_xy(&bases[scan.idx[k] as usize]);
+        // The zero digit must not touch a real bucket. It is not a rare case: a random
+        // scalar hits it about once every 2^(c-1) windows, and a small witness value like
+        // 2 or 7 is zero in every window but the lowest.
+        if d == 0 {
+            if work == Work::Constant {
+                dummy.madd(x, y);
+            }
+            continue;
+        }
         if d > 0 {
             buckets[(d - 1) as usize].madd(x, y);
         } else {
@@ -365,6 +417,7 @@ fn window_chunk<P: RawCurve>(
         running.add_assign(b);
         total.add_assign(&running);
     }
+    core::hint::black_box(&dummy);
     to_projective(&total)
 }
 
@@ -616,27 +669,41 @@ fn window_chunk_batch<P: RawCurve>(
     range: core::ops::Range<usize>,
     window: usize,
     c: u32,
+    work: Work,
 ) -> Projective<P> {
     // `d` is in [-2^(c-1), 2^(c-1)], so `2^(c-1)` buckets is tight.
     let n_buckets = 1usize << (c - 1);
     let mut fill = BatchFill::<P>::new(n_buckets);
+    // See `window_chunk`. XYZZ rather than a batched slot: a zero scalar sends every one
+    // of its digits here, and one batched bucket that contended would push them all through
+    // the retry and side-bucket machinery instead.
+    let mut dummy = Xyzz::<P::RF>::ZERO;
     for k in range {
         let d = signed_digit(scan.bigints[k].as_ref(), window, c);
-        if d == 0 {
-            continue;
-        }
         // Never infinity: prescan filtered those, so raw_xy is total here.
         let (x, y) = P::raw_xy(&bases[scan.idx[k] as usize]);
+        if d == 0 {
+            if work == Work::Constant {
+                dummy.madd(x, y);
+            }
+            continue;
+        }
         if d > 0 {
             fill.insert((d - 1) as usize, x, y);
         } else {
             fill.insert((-d - 1) as usize, x, y.neg());
         }
     }
+    core::hint::black_box(&dummy);
     fill.finish()
 }
 
-fn pippenger<P: RawCurve>(bases: &[Affine<P>], scalars: &[Fr], threads: usize) -> Projective<P>
+fn pippenger<P: RawCurve>(
+    bases: &[Affine<P>],
+    scalars: &[Fr],
+    threads: usize,
+    work: Work,
+) -> Projective<P>
 where
     P::BaseField: Send + Sync,
 {
@@ -654,7 +721,7 @@ where
         return Projective::zero();
     }
 
-    let scan = prescan(bases, scalars, n);
+    let scan = prescan(bases, scalars, n, work);
     let m = scan.idx.len();
     // Nothing reached the general path: every scalar was 0 or 1, or its base was
     // infinity. Skip Pippenger rather than allocate W bucket arrays for nothing.
@@ -700,9 +767,9 @@ where
                     // narrow ones stay on the XYZZ fill, which has no round overhead
                     // to amortise.
                     if n_buckets >= BATCH_MIN_BUCKETS {
-                        window_chunk_batch(bases, &scan, lo..hi, w, c)
+                        window_chunk_batch(bases, &scan, lo..hi, w, c, work)
                     } else {
-                        window_chunk(bases, &scan, lo..hi, w, c)
+                        window_chunk(bases, &scan, lo..hi, w, c, work)
                     }
                 })
                 .reduce(Projective::zero, |a, b| a + b)
@@ -995,8 +1062,8 @@ mod tests {
         for c in [5u32, 8] {
             for w in 0..RECODE_BITS.div_ceil(c as usize) {
                 assert_eq!(
-                    window_chunk_batch(bases, &scan, 0..bases.len(), w, c),
-                    window_chunk(bases, &scan, 0..bases.len(), w, c),
+                    window_chunk_batch(bases, &scan, 0..bases.len(), w, c, Work::Constant),
+                    window_chunk(bases, &scan, 0..bases.len(), w, c, Work::Constant),
                     "window {w} at c = {c}"
                 );
             }
@@ -1073,7 +1140,10 @@ mod tests {
         use std::time::Instant;
         let mut rng = test_rng();
         let msm = CpuMsm::new();
-        let serial = CpuMsm { threads: 1 };
+        let serial = CpuMsm {
+            threads: 1,
+            ..CpuMsm::new()
+        };
         let one_thread = rayon::ThreadPoolBuilder::new()
             .num_threads(1)
             .build()

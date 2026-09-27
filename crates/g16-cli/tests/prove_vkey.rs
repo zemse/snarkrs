@@ -150,3 +150,38 @@ fn join(head: &[u8], sections: &[(u32, Vec<u8>)]) -> Vec<u8> {
     }
     out
 }
+
+/// `--constant-work` proves and verifies on the cpu, and a GPU backend refuses it rather
+/// than proving in variable time under a flag that says otherwise.
+#[test]
+fn constant_work_proves_on_the_cpu_and_is_refused_elsewhere() {
+    let Some(tiny) = artifact("tiny_mul") else {
+        eprintln!("SKIPPED constant_work: no tiny_mul");
+        return;
+    };
+    let out = scratch("constant-work");
+    let run = |backend: &str| {
+        Command::new(env!("CARGO_BIN_EXE_g16"))
+            .args(["prove", "--constant-work", "--backend", backend, "--zkey"])
+            .arg(tiny.join("circuit.zkey"))
+            .arg("--witness")
+            .arg(tiny.join("circuit.wtns"))
+            .arg("--proof")
+            .arg(out.join("proof.json"))
+            .arg("--public")
+            .arg(out.join("public.json"))
+            .arg("--vkey")
+            .arg(tiny.join("vkey.json"))
+            .output()
+            .unwrap()
+    };
+    let o = run("cpu");
+    assert!(o.status.success(), "cpu: {}", said(&o));
+    std::fs::remove_file(out.join("proof.json")).unwrap();
+
+    let o = run("wgpu");
+    assert_eq!(o.status.code(), Some(1), "wgpu: {}", said(&o));
+    assert!(said(&o).contains("cpu backend only"), "{}", said(&o));
+    assert!(!out.join("proof.json").exists());
+    std::fs::remove_dir_all(&out).ok();
+}

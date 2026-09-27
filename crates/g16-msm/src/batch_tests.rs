@@ -234,14 +234,26 @@ fn threshold_and_infinity<P: RawCurve<ScalarField = Fr>>() {
         bases.insert(i, Affine::<P>::identity());
         scalars.insert(i, s);
     }
-    assert_eq!(prescan(&bases, &scalars, bases.len()).idx.len(), n);
-    assert_eq!(pippenger(&bases, &scalars, 1), want);
+    assert_eq!(
+        prescan(&bases, &scalars, bases.len(), Work::Constant)
+            .idx
+            .len(),
+        n
+    );
+    assert_eq!(pippenger(&bases, &scalars, 1, Work::Constant), want);
+    assert_eq!(pippenger(&bases, &scalars, 1, Work::Variable), want);
     let last = scalars.len() - 1;
     scalars[last] -= Fr::from(2u64);
     bases.push(p);
     scalars.push(Fr::from(2u64));
-    assert_eq!(prescan(&bases, &scalars, bases.len()).idx.len(), n + 1);
-    assert_eq!(pippenger(&bases, &scalars, 12), want);
+    assert_eq!(
+        prescan(&bases, &scalars, bases.len(), Work::Constant)
+            .idx
+            .len(),
+        n + 1
+    );
+    assert_eq!(pippenger(&bases, &scalars, 12, Work::Constant), want);
+    assert_eq!(pippenger(&bases, &scalars, 12, Work::Variable), want);
 
     // Ones can double, cancel, and refill an XYZZ accumulator across scan chunks.
     for n in [17, 4 * SCAN_CHUNK, 4 * SCAN_CHUNK + 1] {
@@ -253,8 +265,54 @@ fn threshold_and_infinity<P: RawCurve<ScalarField = Fr>>() {
             })
             .collect();
         let want = bases.iter().fold(Projective::<P>::zero(), |acc, p| acc + p);
-        assert_eq!(pippenger(&bases, &vec![Fr::one(); n], 12), want);
+        assert_eq!(
+            pippenger(&bases, &vec![Fr::one(); n], 12, Work::Variable),
+            want
+        );
+        assert_eq!(
+            pippenger(&bases, &vec![Fr::one(); n], 12, Work::Constant),
+            want
+        );
     }
+}
+
+/// `Work::Constant`'s promise, checked where it is decided: what reaches the bucket loop is
+/// fixed by which bases are at infinity, not by the scalars. A witness that is all zeros and
+/// ones and a dense one of the same length give the same general count, so the same window
+/// width and the same allocations, and the same result as the variable-time path.
+fn constant_work_ignores_the_scalar_values<P: RawCurve<ScalarField = Fr>>() {
+    let n = 3 * SCAN_CHUNK + 5;
+    let p = P::GENERATOR;
+    let bases: Vec<_> = (0..n)
+        .map(|i| {
+            if i % 7 == 3 {
+                Affine::<P>::identity()
+            } else {
+                (Projective::<P>::from(p) * Fr::from(i as u64 + 1)).into()
+            }
+        })
+        .collect();
+    let finite = bases.iter().filter(|b| !b.infinity).count();
+    let sparse: Vec<Fr> = (0..n).map(|i| Fr::from((i % 2) as u64)).collect();
+    let dense: Vec<Fr> = (0..n).map(|i| -Fr::from(i as u64 * 7919 + 3)).collect();
+    for s in [&sparse, &dense] {
+        assert_eq!(prescan(&bases, s, n, Work::Constant).idx.len(), finite);
+        assert_eq!(
+            pippenger(&bases, s, 12, Work::Constant),
+            pippenger(&bases, s, 12, Work::Variable)
+        );
+    }
+    assert!(prescan(&bases, &sparse, n, Work::Variable).idx.is_empty());
+}
+
+#[test]
+fn constant_work_ignores_the_scalar_values_g1() {
+    constant_work_ignores_the_scalar_values::<g16_field::g1::Config>();
+}
+
+#[test]
+fn constant_work_ignores_the_scalar_values_g2() {
+    constant_work_ignores_the_scalar_values::<g16_field::g2::Config>();
 }
 
 #[test]

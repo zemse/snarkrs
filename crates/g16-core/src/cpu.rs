@@ -18,11 +18,24 @@ use rayon::prelude::*;
 /// the global rayon pool, so a knob here would describe a pool nobody uses. Set
 /// `RAYON_NUM_THREADS` or build a `ThreadPoolBuilder` instead.
 #[derive(Default)]
-pub struct CpuBackend;
+pub struct CpuBackend {
+    constant_work: bool,
+}
 
 impl CpuBackend {
     pub fn new() -> Self {
-        Self
+        Self {
+            constant_work: false,
+        }
+    }
+
+    /// MSMs whose cost follows the key and not the witness, so proving time does not reveal
+    /// how many witness entries are zero or one. From 2.5% slower on a dense circuit to 4x
+    /// on a bit-heavy one; see `g16_msm::CpuMsm::constant_work`.
+    pub fn constant_work() -> Self {
+        Self {
+            constant_work: true,
+        }
     }
 }
 
@@ -31,7 +44,9 @@ impl Backend for CpuBackend {
         "cpu"
     }
     fn prepare(&self, pk: ProvingKey) -> Result<Box<dyn PreparedCircuit>, ProveError> {
-        Ok(Box::new(CpuCircuit::new(pk)?))
+        let mut circuit = CpuCircuit::new(pk)?;
+        circuit.msm.constant_work = self.constant_work;
+        Ok(Box::new(circuit))
     }
 }
 
