@@ -216,7 +216,9 @@ reported and the proving path did not retry; 10 of 20 runs failed while the mach
 `compute_h` and the variable MSM batch now retry the whole submission (`cb::with_retry`), and
 `a_retried_submission_gives_the_same_proof` pins that a retry is exact. Under a deliberate
 three-process overload the GPU hung and recovered, and one unchecked proof came back wrong:
-**open**, and `prove`'s self-verify is the guard for that case.
+**open**, and `prove`'s self-verify is the guard for that case. Follow-up `7f34c54`: when the retries run
+out, or wgpu loses the device, the error is `ProveError::Device`, and `g16 prove`'s fallback
+retries it once on the device and then proves on the CPU instead of failing.
 
 **8. `[S]` `proof.json` has no canonical encoding, and our two JSON readers disagree.**
 `json.rs:130-146` and `:156-169` accept any nonzero Jacobian `z` and normalise, so there
