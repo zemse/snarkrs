@@ -172,7 +172,7 @@ pub const G1: Curve = Curve {
     slice_len: 128,
     wg: Workgroups {
         clear: 256,
-        segmented: 128,
+        segmented: 64,
         merge: 256,
         tg: 64,
     },
@@ -409,8 +409,10 @@ pub const NO_ROW: u32 = 0xffff_ffff;
 /// ```
 ///
 /// G2 ships 64: 11% under 128, and the `tests/msm_g2.rs` sweep now runs at that size so
-/// it measures throughput rather than the latency of 44 workgroups. G1 stays at 128, within
-/// 3% of 64 at either size.
+/// it measures throughput rather than the latency of 44 workgroups. G1 ships 64 as well:
+/// four runs of the `tests/msm_g1.rs` sweep at 32,768 put it ahead of 128 by 1.1% to
+/// 4.1%, failing that test's 3% bound twice while 128 shipped, and the whole 2^22 stage
+/// reads the same at either size.
 ///
 /// **The clear row is noise and is not a decision.** Its whole spread is 1.5 microseconds
 /// over G1 and 2.8 over G2, on a kernel that writes one `Fq`-worth of zeros per bucket and is
