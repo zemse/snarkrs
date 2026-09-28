@@ -806,6 +806,19 @@ impl MsmResult {
             MsmResult::G1(_) => Err(err("expected a G2 MSM result, got G1")),
         }
     }
+
+    /// Whether the point satisfies the curve equation. The partial sums come back as
+    /// XYZZ words that `to_projective` takes on trust, and the addition formulas are
+    /// rational maps, so one partial sum that is not a curve point (a buffer the GPU
+    /// reported written but did not write, BUG-28) leaves the whole sum off the curve
+    /// with all but negligible probability. One inversion per job.
+    fn on_curve(&self) -> bool {
+        use g16_field::CurveGroup;
+        match self {
+            MsmResult::G1(p) => p.into_affine().is_on_curve(),
+            MsmResult::G2(p) => p.into_affine().is_on_curve(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1363,13 +1376,38 @@ impl MetalMsm {
             )?);
         }
 
+        // ---- combine ----
+        //
+        // Independent per job, and each one is a serial Horner plus a partial sum, so
+        // the five jobs split over the thread pool rather than queueing behind B_g2's
+        // G2 arithmetic. A result off the curve is a device fault, not an answer: the
+        // batch that produced it is re-run whole by the retry below, as a killed one is.
+        let combine = || -> Result<Vec<MsmResult>, ProveError> {
+            use rayon::prelude::*;
+            let results: Vec<MsmResult> = outs
+                .par_iter()
+                .enumerate()
+                .map(|(i, out)| out.combine(self, &plans[job_plan[i]]))
+                .collect();
+            if let Some(i) = results.iter().position(|r| !r.on_curve()) {
+                return Err(ProveError::Device {
+                    backend: "metal",
+                    reason: format!(
+                        "MSM batch: job {i}'s sum is not a point on the curve: a partial \
+                         sum read back is not one the GPU wrote"
+                    ),
+                });
+            }
+            Ok(results)
+        };
+
         // ---- encode, once ----
         //
         // `G16_METAL_MSM_PHASES=1` splits the single command buffer into one per digit
         // pipeline and one per point pipeline, waiting on each, and prints wall times to
         // stderr. Strictly a measurement aid: it adds one ~0.15 ms submission floor per
         // piece, so the sum reads slightly worse than the production path it explains.
-        if std::env::var_os("G16_METAL_MSM_PHASES").is_some() {
+        let results = if std::env::var_os("G16_METAL_MSM_PHASES").is_some() {
             let detail = std::env::var("G16_METAL_MSM_PHASES")
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
@@ -1455,6 +1493,7 @@ impl MetalMsm {
                     &mut |enc| out.encode_ones(self, enc, job, p),
                 )?;
             }
+            combine()?
         } else {
             // A concurrent encoder, staged. The default serial encoder barriers every
             // dispatch against the previous one, so the 37 dispatches ran strictly one
@@ -1562,20 +1601,10 @@ impl MetalMsm {
             // previous proof's window sums with an Ok. Split or not, the whole batch is
             // re-encoded from its zeroing dispatches, so a retry reads nothing
             // half-written.
-            crate::cb::with_retry(|| encode(&mut Submission::new(self, split)))?;
-        }
-
-        // ---- combine ----
-        //
-        // Independent per job, and each one is a serial Horner plus a partial sum, so
-        // the five jobs split over the thread pool rather than queueing behind B_g2's
-        // G2 arithmetic.
-        let results: Vec<MsmResult> = {
-            use rayon::prelude::*;
-            outs.par_iter()
-                .enumerate()
-                .map(|(i, out)| out.combine(self, &plans[job_plan[i]]))
-                .collect()
+            crate::cb::with_retry(|| {
+                encode(&mut Submission::new(self, split))?;
+                combine()
+            })?
         };
 
         // Buffers go home. Anything the plan and the outputs still reference is dead

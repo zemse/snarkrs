@@ -50,7 +50,7 @@ use metal::objc::rc::autoreleasepool;
 use metal::{Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, Library, MTLSize};
 
 use crate::kernels::{FR_MSL, GATHER_MSL, NTT_MSL, POINTWISE_MSL, SEAL_MSL};
-use crate::layout::{PackedFr, PackedScalar};
+use crate::layout::{PackedFr, PackedScalar, FR_MODULUS};
 use crate::msm::Work;
 
 /// The tag on [`g16_core::HPoly::Device`] values produced here. A handle carrying any
@@ -342,6 +342,64 @@ fn bind(enc: &metal::ComputeCommandEncoderRef, index: u64, (buf, off): Slot<'_>)
     enc.set_buffer(index, Some(buf), off);
 }
 
+/// How many of the `n` words of `h_std` lie outside `[0, r)`, and the index of the first,
+/// or `None` when every one is a canonical residue.
+///
+/// Stage 4's store is `fr_from_mont`, which ends in a conditional subtraction whatever
+/// its input, so no dispatch of this module can leave a word outside the field. One that
+/// is there was not written by the transforms: the buffer's completion token says the
+/// GPU ran the buffer to its end, this says whether what it wrote is what the host
+/// reads. Priced in the commit that added it.
+fn h_off_field(buf: &Buffer, n: usize) -> Option<(usize, usize)> {
+    use rayon::prelude::*;
+    const CHUNK: usize = 1 << 16;
+    // SAFETY: the buffer holds `n` `PackedScalar` in shared storage and every command
+    // buffer that wrote it has completed.
+    let words = unsafe { core::slice::from_raw_parts(buf.contents() as *const PackedScalar, n) };
+    words
+        .par_chunks(CHUNK)
+        .enumerate()
+        .map(|(ci, chunk)| {
+            let mut count = 0;
+            let mut first = None;
+            for (i, w) in chunk.iter().enumerate() {
+                if !canonical(&w.v) {
+                    count += 1;
+                    first.get_or_insert(ci * CHUNK + i);
+                }
+            }
+            first.map(|first| (count, first))
+        })
+        .reduce(
+            || None,
+            |a, b| match (a, b) {
+                (Some((ca, fa)), Some((cb, fb))) => Some((ca + cb, fa.min(fb))),
+                (a, None) => a,
+                (None, b) => b,
+            },
+        )
+}
+
+/// Whether the little-endian limbs `v` are below the field modulus.
+fn canonical(v: &[u32; 8]) -> bool {
+    for i in (0..8).rev() {
+        if v[i] != FR_MODULUS[i] {
+            return v[i] < FR_MODULUS[i];
+        }
+    }
+    false
+}
+
+fn off_field_error(context: &str, count: usize, n: usize, first: usize) -> ProveError {
+    ProveError::Device {
+        backend: "metal",
+        reason: format!(
+            "{context}: {count} of {n} H words are outside the field, the first at index \
+             {first}: the GPU reported the buffer complete but its writes are not there"
+        ),
+    }
+}
+
 type Pool = Arc<Mutex<Vec<Scratch>>>;
 
 /// Scratch sets [`HHandle`] keeps for reuse. More proofs than this in flight still work;
@@ -628,7 +686,16 @@ impl HResident {
                         first = r;
                     }
                 }
-                first
+                first?;
+                // Every buffer ran to its end. Whether H is there is a separate question
+                // (BUG-28: words outside the field under a GPU recovery, with every
+                // token present), and a wrong answer to it is retried like a kill.
+                match h_off_field(&sc.h_std, n) {
+                    Some((count, at)) => {
+                        Err(off_field_error("stages 2-4 (transforms)", count, n, at))
+                    }
+                    None => Ok(()),
+                }
             })?;
             t.ntt_us += start.elapsed().as_micros() as u64;
             Ok(())
@@ -711,6 +778,9 @@ impl HResident {
         enc.end_encoding();
         cb.commit();
         st.seal.wait(cb, token, "stage 4 h_join (profiled)")?;
+        if let Some((count, at)) = h_off_field(&sc.h_std, n) {
+            return Err(off_field_error("stage 4 h_join (profiled)", count, n, at));
+        }
         t.pointwise_us += start.elapsed().as_micros() as u64;
         Ok(())
     }
@@ -1124,6 +1194,61 @@ mod tests {
                     samples[0]
                 );
             }
+        }
+    }
+
+    /// The check refuses a word at the modulus and above and passes one below it, and
+    /// counts and locates them.
+    #[test]
+    fn off_field_words_are_counted_and_located() {
+        let st = HStages::new().expect("Metal device");
+        let n = 3 * (1 << 16) + 5;
+        let buf = st.empty(n).unwrap();
+        assert_eq!(h_off_field(&buf, n), None, "zeros are canonical");
+        // SAFETY: shared storage, `n` words, nothing in flight.
+        let words =
+            unsafe { core::slice::from_raw_parts_mut(buf.contents() as *mut PackedScalar, n) };
+        let mut below = FR_MODULUS;
+        below[0] -= 1;
+        words[7] = PackedScalar { v: below };
+        assert_eq!(h_off_field(&buf, n), None, "r - 1 is canonical");
+        words[1 << 16] = PackedScalar { v: FR_MODULUS };
+        assert_eq!(h_off_field(&buf, n), Some((1, 1 << 16)), "r is not");
+        words[n - 1] = PackedScalar { v: [u32::MAX; 8] };
+        words[3] = PackedScalar {
+            v: [0, 0, 0, 0, 0, 0, 0, 0x4000_0000],
+        };
+        assert_eq!(h_off_field(&buf, n), Some((3, 3)));
+    }
+
+    /// What the check adds to a proof, printed: a scan of H at the domain sizes the
+    /// artifacts use. Run with
+    /// `cargo test -p g16-metal --release off_field_check_costs -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "measurement, not a check"]
+    fn off_field_check_costs_this_much() {
+        let st = HStages::new().expect("Metal device");
+        for log_n in [14u32, 18, 21, 22] {
+            let n = 1usize << log_n;
+            let buf = st.empty(n).unwrap();
+            // SAFETY: as above.
+            let words =
+                unsafe { core::slice::from_raw_parts_mut(buf.contents() as *mut PackedScalar, n) };
+            for (i, w) in words.iter_mut().enumerate() {
+                *w = PackedScalar::from_fr(&Fr::from(i as u64 + 1));
+            }
+            let mut samples = Vec::new();
+            for _ in 0..20 {
+                let t = Instant::now();
+                assert_eq!(h_off_field(&buf, n), None);
+                samples.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+            samples.sort_by(f64::total_cmp);
+            println!(
+                "h_off_field 2^{log_n}: median {:.3} ms, min {:.3} ms",
+                samples[samples.len() / 2],
+                samples[0]
+            );
         }
     }
 
