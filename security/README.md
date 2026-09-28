@@ -239,9 +239,16 @@ values; no completion token can see that, and `prove`'s self-verify is the only 
 Since `2a2babe` the wgpu MSM batch is several submissions of about 300 ms, each sealed and
 retried alone up to eight times: under two other proof loops 0 of 60 CLI proofs gave up, against
 12 of 60 before. All three CLI proofs whose stage 0 to 4 submission was really aborted and then
-retried verified wrong with every token present; `prove`'s self-verify caught all three. That
-looks like a retry reading buffers a half-run pass left behind rather than a driver fault, and
-is tracked as BUG-33. CUDA device faults (ECC, watchdog, kernel exceptions, out of
+retried verified wrong with every token present; `prove`'s self-verify caught all three. Root
+cause (`ffc790f`): wgpu flushes queued `write_buffer` copies in a blit command buffer at the head
+of the next submission, so a fresh process's first proof carried the whole key ahead of its
+pass; a kill inside that blit lost the key, and the retry re-uploaded only the witness. The key
+now lands in a sealed submission of its own inside `prepare` and is uploaded again when refused,
+and a refused MSM submission re-queues its own uploads. Over 1,200 fresh circuits under load the
+fixed backend re-uploaded 7 refused keys and produced no wrong proof; a retry cut short at any
+dispatch of any submission is exact by test (`CUT_NEXT`, and `inject::arm_cut` on Metal,
+`ee4ced5`). Metal fills every buffer by memcpy into Shared storage and has no blits, so it is
+not exposed to this; its wrong-with-token values during recovery episodes remain unexplained. CUDA device faults (ECC, watchdog, kernel exceptions, out of
 memory) take the same path since `23354b9`, untested on an NVIDIA GPU; a sticky CUDA error
 leaves the context unusable, so the GPU retry fails at once and the proof falls to the CPU.
 
