@@ -394,3 +394,99 @@ fn challenge_and_response_match_snarkjs() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// A zkey contribution made in bellman's format, and the Solidity verifier. Export and
+/// import are deterministic and held to snarkjs' bytes and log; the contribution is random,
+/// so snarkjs' `zkvi` has to accept the key it ends in. The verifier is our own contract,
+/// so it is held to the library's output and only its log to snarkjs'.
+#[test]
+fn bellman_and_solidity_match_snarkjs() {
+    let Some(js) = snarkjs_bin() else {
+        return;
+    };
+    let Some(tiny) = tiny_mul() else {
+        eprintln!("SKIPPED bellman_and_solidity_match_snarkjs: no tiny_mul");
+        return;
+    };
+    let dir = scratch("bellman");
+    let run = |line: &str| {
+        let o = snarkrs(&dir, line);
+        expect(&o, 0, line);
+        stdout(&o)
+    };
+    let js_run = |line: &str| {
+        let (code, out) = snarkjs(&js, &dir, line);
+        assert_eq!(code, 0, "snarkjs {line}: {out}");
+        out
+    };
+    std::fs::copy(tiny.join("circuit.r1cs"), dir.join("circuit.r1cs")).unwrap();
+    run("ptn bn128 4 pot_0000.ptau");
+    run("ptc pot_0000.ptau pot_0001.ptau -e=one");
+    run("pt2 pot_0001.ptau powersoftau.ptau");
+    run("g16s");
+    run("zkc circuit_0000.zkey circuit_0001.zkey -e=two -n=First");
+
+    // `circuit.mpcparams` is the default name.
+    let ours = run("zkey export bellman circuit_0001.zkey");
+    let theirs = js_run("zkeb circuit_0001.zkey js.mpcparams");
+    same_bytes(&dir, "circuit.mpcparams", "js.mpcparams");
+    assert_eq!(ours, theirs);
+
+    let out =
+        run("zkey bellman contribute bn128 circuit.mpcparams circuit_response.mpcparams -e=three");
+    assert!(
+        out.starts_with("[INFO]  snarkJS: Contribution Hash: \n\t\t"),
+        "{out}"
+    );
+    js_run("zkbc bn128 circuit.mpcparams js_response.mpcparams -e=four");
+
+    // Import is deterministic given the response, whichever tool contributed.
+    for (resp, tag) in [("circuit_response", ""), ("js_response", "b")] {
+        let ours = run(&format!(
+            "zkey import bellman circuit_0001.zkey {resp}.mpcparams circuit_0002{tag}.zkey -n=Bell"
+        ));
+        let theirs = js_run(&format!(
+            "zkib circuit_0001.zkey {resp}.mpcparams js_0002{tag}.zkey -n=Bell"
+        ));
+        same_bytes(
+            &dir,
+            &format!("circuit_0002{tag}.zkey"),
+            &format!("js_0002{tag}.zkey"),
+        );
+        assert_eq!(ours, theirs, "{resp}");
+        let out = js_run(&format!(
+            "zkvi circuit_0000.zkey powersoftau.ptau circuit_0002{tag}.zkey"
+        ));
+        assert!(out.contains("ZKey Ok!"), "{out}");
+    }
+
+    // A response whose chain the zkey does not continue is a verdict, worded as snarkjs'.
+    let line = "zkib circuit_0002.zkey js_response.mpcparams never.zkey";
+    let o = snarkrs(&dir, line);
+    expect(&o, 1, line);
+    let (code, theirs) = snarkjs(&js, &dir, line);
+    assert_eq!(code, 1, "{theirs}");
+    assert_eq!(stdout(&o), theirs);
+    let line = "zkbc bls12381 circuit.mpcparams x.mpcparams -e=x";
+    let o = snarkrs(&dir, line);
+    expect(&o, 1, line);
+    assert!(said(&o).contains("not supported"), "{}", said(&o));
+
+    // `circuit_final.zkey` and `verifier.sol` are the defaults.
+    std::fs::copy(
+        dir.join("circuit_0002.zkey"),
+        dir.join("circuit_final.zkey"),
+    )
+    .unwrap();
+    let ours = run("zkey export solidityverifier");
+    let theirs = js_run("zkesv circuit_final.zkey js_verifier.sol");
+    assert_eq!(ours, theirs);
+    let want = g16_ceremony::solidity::solidity_verifier(&dir.join("circuit_final.zkey")).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.join("verifier.sol")).unwrap(),
+        want
+    );
+    run("generateverifier");
+
+    std::fs::remove_dir_all(&dir).ok();
+}

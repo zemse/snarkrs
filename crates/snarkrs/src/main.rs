@@ -20,6 +20,10 @@
 //!   snarkrs zkey verify init [circuit_0000.zkey] [powersoftau.ptau] [circuit_final.zkey]
 //!                                                                          (zkvi)
 //!   snarkrs zkey export verificationkey [circuit_final.zkey] [circuit_vk.json]    (zkev)
+//!   snarkrs zkey export solidityverifier [circuit_final.zkey] [verifier.sol]     (zkesv)
+//!   snarkrs zkey export bellman <in.zkey> [circuit.mpcparams]              (zkeb)
+//!   snarkrs zkey bellman contribute bn128 <in.mpcparams> <out.mpcparams> [-e=TEXT] (zkbc)
+//!   snarkrs zkey import bellman <old.zkey> <in.mpcparams> <new.zkey> [-n=NAME]    (zkib)
 //!   snarkrs file info <file>                                               (fi)
 //!
 //!   snarkrs bench  --artifacts DIR [--variant NAME]... [--reps 15] [--backend cpu|wgpu|...]
@@ -48,7 +52,7 @@
 //! arguments and prints what came back.
 //!
 //! Their `--backend` is not `prove`'s. `prove` selects a whole `g16_core::Backend`; a
-//! ceremony command selects one primitive, and the seven that have the flag are the seven
+//! ceremony command selects one primitive, and the eight that have the flag are the eight
 //! with a primitive worth moving. The bar every one of them is held to is that
 //! `--backend cpu` and `--backend metal` write **byte-identical** files, which is what
 //! carries the snarkjs equivalence the CPU path already has.
@@ -59,8 +63,8 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use g16_ceremony::{
-    challenge, contribute as zkey_mpc, phase1, prepare, ptau as ptau_file, setup, vkey,
-    CpuGroupFft, CpuKeyScale,
+    bellman, challenge, contribute as zkey_mpc, phase1, prepare, ptau as ptau_file, setup,
+    solidity, vkey, CeremonyError, CpuGroupFft, CpuKeyScale,
 };
 use g16_core::{
     prove::{prove, prove_trace, prove_unchecked},
@@ -386,6 +390,43 @@ enum ZkeyCmd {
         #[command(subcommand)]
         cmd: ZkeyExportCmd,
     },
+    Bellman {
+        #[command(subcommand)]
+        cmd: ZkeyBellmanCmd,
+    },
+    Import {
+        #[command(subcommand)]
+        cmd: ZkeyImportCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ZkeyBellmanCmd {
+    /// Contribute to a bellman MPCParameters file, as Zcash's phase2 tool does. The
+    /// result goes back into the zkey with `zkey import bellman`.
+    Contribute {
+        /// bn128 (also bn254, alt_bn128). bls12381 is not supported.
+        curve: String,
+        input: PathBuf,
+        output: PathBuf,
+        #[command(flatten)]
+        entropy: Entropy,
+        #[command(flatten)]
+        backend: CeremonyBackend,
+    },
+}
+
+#[derive(Subcommand)]
+enum ZkeyImportCmd {
+    /// Take the contributions a bellman MPCParameters file adds onto the zkey it was
+    /// exported from. Deterministic, byte for byte snarkjs'.
+    Bellman {
+        zkey: PathBuf,
+        mpcparams: PathBuf,
+        out: PathBuf,
+        #[command(flatten)]
+        contributor: Contributor,
+    },
 }
 
 #[derive(Subcommand)]
@@ -421,6 +462,21 @@ enum ZkeyExportCmd {
         /// snarkjs' usage line says verification_key.json; the code it runs writes
         /// circuit_vk.json, and so does this.
         #[arg(default_value = "circuit_vk.json")]
+        out: PathBuf,
+    },
+    /// Write a Solidity verifier with snarkjs' interface, so its soliditycalldata calls it
+    /// unchanged. The contract is our own MIT one, not snarkjs' GPL-3.0 template.
+    Solidityverifier {
+        #[arg(default_value = "circuit_final.zkey")]
+        zkey: PathBuf,
+        #[arg(default_value = "verifier.sol")]
+        out: PathBuf,
+    },
+    /// Write the zkey as a bellman MPCParameters file for Zcash's phase2 tool.
+    /// Deterministic, byte for byte snarkjs'.
+    Bellman {
+        zkey: PathBuf,
+        #[arg(default_value = "circuit.mpcparams")]
         out: PathBuf,
     },
 }
@@ -1022,8 +1078,81 @@ fn run_zkey(cmd: ZkeyCmd) -> Result<u8> {
             log::info("EXPORT VERIFICATION KEY FINISHED");
             log::debug(format!("wrote {}", out.display()));
         }
+        ZkeyCmd::Export {
+            cmd: ZkeyExportCmd::Solidityverifier { zkey, out },
+        } => {
+            // snarkjs builds the contract from the verification key, and prints that
+            // export's three lines on the way.
+            log::info("EXPORT VERIFICATION KEY STARTED");
+            let source = solidity::solidity_verifier(&zkey)
+                .with_context(|| format!("exporting from {}", zkey.display()))?;
+            log::info("> Detected protocol: groth16");
+            log::info("EXPORT VERIFICATION KEY FINISHED");
+            std::fs::write(&out, source).with_context(|| format!("writing {}", out.display()))?;
+            log::debug(format!("wrote {}", out.display()));
+        }
+        ZkeyCmd::Export {
+            cmd: ZkeyExportCmd::Bellman { zkey, out },
+        } => {
+            bellman::export_bellman(&zkey, &out)
+                .with_context(|| format!("exporting from {}", zkey.display()))?;
+            log::debug(format!("wrote {}", out.display()));
+        }
+        ZkeyCmd::Bellman {
+            cmd:
+                ZkeyBellmanCmd::Contribute {
+                    curve,
+                    input,
+                    output,
+                    entropy,
+                    backend,
+                },
+        } => {
+            cli::check_curve(&curve)?;
+            let key = key_backend(backend.backend)?;
+            let entropy = entropy_or_prompt(entropy.entropy)?;
+            let hash = bellman::bellman_contribute(&input, &output, &entropy, key.as_ref())
+                .with_context(|| format!("contributing to {}", input.display()))?;
+            log::info(log::format_hash(&hash, "Contribution Hash: "));
+            log::debug(format!("wrote {}", output.display()));
+        }
+        ZkeyCmd::Import {
+            cmd:
+                ZkeyImportCmd::Bellman {
+                    zkey,
+                    mpcparams,
+                    out,
+                    contributor,
+                },
+        } => {
+            match bellman::import_bellman(&zkey, &mpcparams, &out, contributor.name.as_deref()) {
+                Ok(report) => log::debug(format!(
+                    "{} contributions imported onto {}, written to {}",
+                    report.contribution_hashes.len() - report.n_prior,
+                    zkey.display(),
+                    out.display()
+                )),
+                // A file that does not continue this zkey's chain is a verdict, as in
+                // `zkey_import_bellman.js`: its reason on an ERROR line and exit 1.
+                Err(CeremonyError::Verification(why)) => {
+                    log::error(capitalise(&why));
+                    return Ok(1);
+                }
+                Err(e) => {
+                    return Err(anyhow::Error::from(e)
+                        .context(format!("importing {}", mpcparams.display())))
+                }
+            }
+        }
     }
     Ok(0)
+}
+
+/// snarkjs starts its verdicts with a capital; g16-ceremony's errors do not.
+fn capitalise(s: &str) -> String {
+    let mut c = s.chars();
+    c.next()
+        .map_or_else(String::new, |f| f.to_uppercase().chain(c).collect())
 }
 
 /// `file info`. For a ptau this is our lenient report rather than snarkjs' section table:

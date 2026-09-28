@@ -210,19 +210,19 @@ pub const COMMANDS: &[Command] = &[
         cmd: "zkey export bellman <circuit_xxxx.zkey> [circuit.mpcparams]",
         alias: &["zkeb"],
         description: "Export a zKey to a MPCParameters file compatible with kobi/phase2 (Bellman)",
-        support: Later,
+        support: Yes,
     },
     Command {
         cmd: "zkey bellman contribute <curve> <circuit.mpcparams> <circuit_response.mpcparams>",
         alias: &["zkbc"],
         description: "contributes to a challenge file in bellman format",
-        support: Later,
+        support: Yes,
     },
     Command {
         cmd: "zkey import bellman <circuit_old.zkey> <circuit.mpcparams> <circuit_new.zkey>",
         alias: &["zkib"],
         description: "Export a zKey to a MPCParameters file compatible with kobi/phase2 (Bellman) ",
-        support: Later,
+        support: Yes,
     },
     Command {
         cmd: "zkey beacon <circuit_old.zkey> <circuit_new.zkey> <beaconHash(Hex)> <numIterationsExp>",
@@ -258,7 +258,7 @@ pub const COMMANDS: &[Command] = &[
         cmd: "zkey export solidityverifier [circuit_final.zkey] [verifier.sol]",
         alias: &["zkesv", "generateverifier -vk|verificationkey -v|verifier"],
         description: "Creates a verifier in solidity",
-        support: Later,
+        support: Yes,
     },
     Command {
         cmd: "zkey export soliditycalldata [public.json] [proof.json]",
@@ -595,6 +595,11 @@ mod tests {
             ("ptec a", "powersoftau export challenge a"),
             ("ptcc bn128 c", "powersoftau challenge contribute bn128 c"),
             ("ptir a r b", "powersoftau import response a r b"),
+            ("zkeb a", "zkey export bellman a"),
+            ("zkbc bn128 a b", "zkey bellman contribute bn128 a b"),
+            ("zkib a m b", "zkey import bellman a m b"),
+            ("zkesv", "zkey export solidityverifier"),
+            ("generateverifier", "zkey export solidityverifier"),
         ] {
             assert_eq!(clap(alias).join(" "), words, "{alias}");
         }
