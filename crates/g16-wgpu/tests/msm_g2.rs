@@ -597,13 +597,18 @@ fn the_g2_module_compiles_and_reports_what_it_cost() {
     // research file 03 recorded 129 s natively for one monolithic WGSL shader with an
     // unrolled multiply inlined at a dozen sites. This module inlines `fq_mul` at about
     // sixty. If that number were going to bite anywhere it would bite here, so it is asserted
-    // rather than printed.
+    // rather than printed. Cold on this M2 Max, one sample each: 4.6 s with `fq2_mul`
+    // spelled as three `fq_mul` call sites, 5.1 s with the one-site spelling that made the
+    // G2 kernels 2.7x faster (`gen::field::FQ2_OPS`), 6.0 s with that spelling's operands
+    // picked by an if chain rather than an array. 8 s is under Chrome's line with room for
+    // that spread and still an order of magnitude under the shape this exists to catch.
     assert!(
-        cost.compile_us < 5_000_000,
+        cost.compile_us < 8_000_000,
         "the G2 point module took {:.1} s to build",
         cost.compile_us as f64 / 1e6
     );
-    assert_eq!(cost.pipelines, 5);
+    // Seven since constant work: the five, the fold and the constant reduce.
+    assert_eq!(cost.pipelines, 7);
     assert_eq!(cost.modules, 1);
 }
 
@@ -807,7 +812,12 @@ enum Stage {
 #[test]
 fn the_g2_workgroup_sizes_are_measured() {
     let _gpu = exclusive();
-    let bench = Bench::new(32_768, 12);
+    // 2^19 general scalars at c = 13, the floor's sub-MSM at a 2^22 key, so the segmented
+    // pass is 81,920 threads and the sweep measures its throughput. At the 32,768 the other
+    // sweeps run it is 5,632 threads, 44 workgroups of 128 on 38 cores, and every size reads
+    // the latency of an underfilled GPU: 53 ns per entry there against 27 here, and a ranking
+    // that put 16 first by 4%. See `gen::points::Workgroups`.
+    let bench = Bench::new(1 << 19, 13);
     let sizes = [16u32, 32, 64, 128, 256];
     let shipped = wgsl::G2.wg;
 
@@ -841,7 +851,7 @@ fn the_g2_workgroup_sizes_are_measured() {
     }
 
     println!(
-        "32,768 general scalars, c = 12, slice_len {}, each kernel alone, medians of seven \
+        "2^19 general scalars, c = 13, slice_len {}, each kernel alone, medians of seven \
          interleaved rounds, us",
         wgsl::G2.slice_len
     );

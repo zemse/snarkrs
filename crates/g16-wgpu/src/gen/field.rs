@@ -207,10 +207,32 @@ fn mul64(a: u32, b: u32) -> vec2<u32> {
 /// `Fq2 = Fq[u]/(u^2 + 1)`, the field BN254's G2 lives over.
 ///
 /// Static text, because it is written entirely in terms of `fq_*` and so has no limb loop to
-/// unroll. Ported line for line from `g16-metal/src/shaders/msm.metal:236-313`, including
-/// Karatsuba (3 `Fq` multiplies rather than 4) and the `(a0+a1)(a0-a1)` squaring (2 rather
-/// than 3), so the two backends compute G2 the same way and a mismatch is a real bug rather
-/// than a different formula.
+/// unroll. The formulas are `g16-metal/src/shaders/msm.metal:236-313`'s, Karatsuba (3 `Fq`
+/// multiplies rather than 4) and the `(a0+a1)(a0-a1)` squaring (2 rather than 3), so the two
+/// backends compute G2 the same way and a mismatch is a real bug rather than a different
+/// formula. The shape is not Metal's: the products go through one `fq_mul` call site each.
+///
+/// # Why one call site, measured
+///
+/// A chain of multiplies per thread, 2^18 threads, this M2 Max, `tests/msm_trace.rs`:
+///
+/// ```text
+/// loop body                          ns per fq_mul
+/// one fq_mul call site                    0.48
+/// two, chained                            0.49
+/// three, chained                          2.07
+/// fq2_mul, three sites (the old text)     2.27   (6.8 per fq2_mul)
+/// fq2_mul, one site (below)               0.60   (1.79 per fq2_mul)
+/// ```
+///
+/// The two- and three-site chains keep the same values live, so the 4.3x step between them
+/// is the size of the inlined code and not register pressure, and it does not matter whether
+/// the three copies sit in one function, in the loop body or behind a struct (every spelling
+/// of the old `fq2_mul` measured 6.6 to 6.9 ns). Every G2 point kernel calls `fq2_mul` from
+/// one site, so with the old text it held three copies of `fq_mul` and paid the cliff on
+/// every product: a G2 mixed addition cost 83 ns against a G1 one's 6.2, 13x, where the
+/// arithmetic says 3x. `gen::points::POINT_BODY`'s table form is the same rule applied one
+/// level up.
 pub const FQ2_OPS: &str = r#"
 struct Fq2 { c0: Fq, c1: Fq }
 
@@ -223,20 +245,28 @@ fn fq2_sub(a: Fq2, b: Fq2) -> Fq2 { return Fq2(fq_sub(a.c0, b.c0), fq_sub(a.c1, 
 fn fq2_neg(a: Fq2) -> Fq2 { return Fq2(fq_neg(a.c0), fq_neg(a.c1)); }
 
 // (a0 + a1 u)(b0 + b1 u) = (a0 b0 - a1 b1) + (a0 b1 + a1 b0) u, with the cross term taken as
-// (a0 + a1)(b0 + b1) - a0 b0 - a1 b1 so it costs one multiply instead of two.
+// (a0 + a1)(b0 + b1) - a0 b0 - a1 b1 so it costs one multiply instead of two. The three
+// products run through one fq_mul call site, chosen by the step: a kernel that inlines three
+// copies of fq_mul runs every one of them 4.3x slower than a kernel that inlines one.
 fn fq2_mul(a: Fq2, b: Fq2) -> Fq2 {
-    let v0 = fq_mul(a.c0, b.c0);
-    let v1 = fq_mul(a.c1, b.c1);
-    let cross = fq_sub(fq_sub(fq_mul(fq_add(a.c0, a.c1), fq_add(b.c0, b.c1)), v0), v1);
-    return Fq2(fq_sub(v0, v1), cross);
+    var l: array<Fq, 3>;
+    var r: array<Fq, 3>;
+    var p: array<Fq, 3>;
+    l[0] = a.c0; l[1] = a.c1; l[2] = fq_add(a.c0, a.c1);
+    r[0] = b.c0; r[1] = b.c1; r[2] = fq_add(b.c0, b.c1);
+    for (var s = 0u; s < 3u; s = s + 1u) { p[s] = fq_mul(l[s], r[s]); }
+    return Fq2(fq_sub(p[0], p[1]), fq_sub(fq_sub(p[2], p[0]), p[1]));
 }
 
-// (a0 + a1 u)^2 = (a0 + a1)(a0 - a1) + 2 a0 a1 u.
+// (a0 + a1 u)^2 = (a0 + a1)(a0 - a1) + 2 a0 a1 u, both products through one site.
 fn fq2_sqr(a: Fq2) -> Fq2 {
-    let t0 = fq_add(a.c0, a.c1);
-    let t1 = fq_sub(a.c0, a.c1);
-    let t2 = fq_mul(a.c0, a.c1);
-    return Fq2(fq_mul(t0, t1), fq_add(t2, t2));
+    var l: array<Fq, 2>;
+    var r: array<Fq, 2>;
+    var p: array<Fq, 2>;
+    l[0] = a.c0; l[1] = fq_add(a.c0, a.c1);
+    r[0] = a.c1; r[1] = fq_sub(a.c0, a.c1);
+    for (var s = 0u; s < 2u; s = s + 1u) { p[s] = fq_mul(l[s], r[s]); }
+    return Fq2(p[1], fq_add(p[0], p[0]));
 }
 "#;
 

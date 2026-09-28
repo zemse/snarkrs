@@ -195,7 +195,7 @@ pub const G2: Curve = Curve {
     slice_len: 128,
     wg: Workgroups {
         clear: 256,
-        segmented: 128,
+        segmented: 64,
         merge: 256,
         tg: 64,
     },
@@ -395,6 +395,22 @@ pub const NO_ROW: u32 = 0xffff_ffff;
 /// base vector and the entry array, not occupancy-bound, so the workgroup size barely moves
 /// it. The design's reasoning (register pressure decides the accumulation) predicts a large
 /// effect and there is not one.
+///
+/// That held for the G2 accumulation only while `fq2_mul` inlined three `fq_mul` copies and
+/// the kernel ran at a quarter of its speed (`gen::field::FQ2_OPS`). With one copy, and at
+/// a size that fills the GPU (2^19 general scalars at c = 13, 81,920 threads against the
+/// 5,632 above), `tests/msm_trace.rs::the_segmented_workgroup_at_scale` reads, medians of
+/// five, milliseconds:
+///
+/// ```text
+/// workgroup              32      64     128     256
+/// msm_segmented_g1     70.8    62.6    64.3    71.2
+/// msm_segmented_g2    283.8   281.1   314.8   306.7
+/// ```
+///
+/// G2 ships 64: 11% under 128, and the `tests/msm_g2.rs` sweep now runs at that size so
+/// it measures throughput rather than the latency of 44 workgroups. G1 stays at 128, within
+/// 3% of 64 at either size.
 ///
 /// **The clear row is noise and is not a decision.** Its whole spread is 1.5 microseconds
 /// over G1 and 2.8 over G2, on a kernel that writes one `Fq`-worth of zeros per bucket and is
