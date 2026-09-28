@@ -6,10 +6,10 @@
 //! with [`Logplease`], so the comparison covers snarkjs' colour codes too.
 //!
 //! snarkjs is `$SNARKJS` when set, either an executable or a `cli.js` to run under node,
-//! and `snarkjs` on `PATH` otherwise. The reference is 0.7.6, and each test prints the
-//! version it ran against. Everything skips with a message when snarkjs or the artifacts
-//! under `bench/artifacts` are absent. The circom-compiled cases additionally need
-//! `circom` on `PATH`, since the artifacts carry no `.sym` and no custom gates.
+//! and `snarkjs` on `PATH` otherwise. The reference is 0.7.6, and any other version skips,
+//! as does everything when snarkjs or the artifacts under `bench/artifacts` are absent.
+//! The circom-compiled cases additionally need `circom` on `PATH`, since the artifacts
+//! carry no `.sym` and no custom gates.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -42,13 +42,19 @@ fn snarkjs() -> Command {
     }
 }
 
-/// Whether snarkjs runs at all, printing its version or the skip.
+/// Whether the reference snarkjs runs, printing the skip when it does not. Only 0.7.6
+/// counts: the outputs are pinned to it, and 0.7.2 already differs (`wtns check` there
+/// logs "Ouputs:").
 fn have_snarkjs(test: &str) -> bool {
     match snarkjs().arg("--version").output() {
+        Ok(o) if String::from_utf8_lossy(&o.stdout).starts_with("snarkjs@0.7.6") => true,
         Ok(o) => {
             let banner = String::from_utf8_lossy(&o.stdout);
-            eprintln!("{test}: {}", banner.lines().next().unwrap_or("snarkjs"));
-            true
+            eprintln!(
+                "SKIPPED {test}: found {}, need snarkjs@0.7.6 (point $SNARKJS at its cli.js)",
+                banner.lines().next().unwrap_or("an unknown snarkjs")
+            );
+            false
         }
         Err(_) => {
             eprintln!("SKIPPED {test}: snarkjs not found");
