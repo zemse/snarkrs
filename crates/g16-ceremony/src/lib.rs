@@ -37,6 +37,7 @@ pub mod prepare;
 pub mod ptau;
 pub mod r1cs;
 pub mod setup;
+pub mod solidity;
 pub mod transcript;
 pub mod vkey;
 pub mod write;
