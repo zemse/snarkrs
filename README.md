@@ -90,12 +90,12 @@ bench/scripts/run-benchmark.sh --reps 10
 ## using it from the command line
 
 ```sh
-cargo build --release                      # CPU only
-cargo build --release --features metal     # + Apple Metal
-cargo build --release --features cuda      # + NVIDIA CUDA
+cargo install --path crates/cli                     # CPU and WebGPU
+cargo install --path crates/cli --features metal    # + Apple Metal
+cargo install --path crates/cli --features cuda     # + NVIDIA CUDA
 ```
 
-The binary is `snarkrs`, a drop-in for the snarkjs 0.7.6 command line on Groth16 and
+The package is `snarkrs-cli` and the binary is `snarkrs`, a drop-in for the snarkjs 0.7.6 command line on Groth16 and
 BN254: the same commands, aliases, positional file names and defaults, `-e=`/`-n=`/`-v`
 options, exit codes (0 ok, 1 failed or invalid, 99 bad usage) and `[INFO]  snarkJS: OK!`
 log lines. `snarkrs --help` lists what it runs; a snarkjs command it does not run yet
@@ -155,25 +155,42 @@ a circuit is MSM-bound or transform-bound:
 
 ## using it as a library
 
+```toml
+snarkrs = { git = "https://github.com/zemse/gpu-snark", features = ["metal"] }
+```
+
+The prover, verifier, key formats and CPU backend are always in. The rest is opt in, so a
+build compiles only the backend it runs on:
+
+| feature | adds |
+| --- | --- |
+| `metal` | `snarkrs::metal`, Apple GPUs |
+| `cuda` | `snarkrs::cuda`, NVIDIA GPUs |
+| `wgpu` | `snarkrs::wgpu`, WebGPU |
+| `ceremony` | `snarkrs::ceremony`, powers of tau and phase 2 |
+| `witness` | `snarkrs::witness`, circom's native witness binary |
+| `witness-wasm` | `witness` plus circom's `circuit.wasm` on wasmtime |
+
 ```rust
-use snarkrs_groth16::{prove::prove, verify::verify, Backend, StageTimings};
-use snarkrs_formats::{wtns::Witness, ProvingKey};
+use snarkrs::{prove, verify, Backend, ProvingKey, StageTimings, Witness};
 
 // warm pk once for repeated proving the same circuit
-let pk = ProvingKey::load(std::path::Path::new("circuit.zkey"))?;
+let pk = ProvingKey::load("circuit.zkey".as_ref())?;
 let n_public = pk.n_public;
-let circuit = snarkrs_metal::MetalBackend::new()?.prepare(pk)?;
+let circuit = snarkrs::metal::MetalBackend::new()?.prepare(pk)?;
 
-let w = Witness::load(std::path::Path::new("circuit.wtns"))?.0;
+let w = Witness::load("circuit.wtns".as_ref())?.0;
 let mut t = StageTimings::default();
-let proof = prove(circuit.as_ref(), &w, &mut ark_std::rand::thread_rng(), &mut t)?;
+let proof = prove(circuit.as_ref(), &w, &mut snarkrs::rand::thread_rng(), &mut t)?;
 
 let public = &w[1..=n_public];
 verify(&circuit.key().vk, public, &proof)?;
+snarkrs::write_proof("proof.json".as_ref(), &proof)?;
+snarkrs::write_public("public.json".as_ref(), public)?;
 ```
 
-Swap `MetalBackend` for `snarkrs_groth16::cpu::CpuBackend` or `snarkrs_cuda::CudaBackend` to change
-where it runs; nothing else in the snippet changes, which is the point of the trait.
+Swap `MetalBackend` for `snarkrs::CpuBackend` or `snarkrs::cuda::CudaBackend` to change where
+it runs; nothing else in the snippet changes, which is the point of the trait.
 
 The blinders come from the OS CSPRNG. There is no seed override on this path on purpose: a
 reused `(r, s)` across two proofs of different witnesses leaks the witness, so the
@@ -184,19 +201,18 @@ deterministic entry point stays test-only.
 `prove` takes the witness as `&[Fr]`, so it never has to be a file:
 
 ```rust
-use snarkrs_groth16::{prove::prove, Backend, StageTimings};
-use snarkrs_witness::{Input, WitnessCalculator};
-use snarkrs_formats::ProvingKey;
+use snarkrs::witness::{Input, WitnessCalculator};
+use snarkrs::{prove, Backend, ProvingKey, StageTimings};
 
-let pk = ProvingKey::load(std::path::Path::new("circuit.zkey"))?;
-let circuit = snarkrs_metal::MetalBackend::new()?.prepare(pk)?;
+let pk = ProvingKey::load("circuit.zkey".as_ref())?;
+let circuit = snarkrs::metal::MetalBackend::new()?.prepare(pk)?;
 
-// compile the wasm once, then one witness per input
-let calc = WitnessCalculator::from_file(std::path::Path::new("circuit_js/circuit.wasm"))?;
+// compile the wasm once, then one witness per input (feature `witness-wasm`)
+let calc = WitnessCalculator::from_file("circuit_js/circuit.wasm".as_ref())?;
 let w = calc.calculate(&Input::from_json_str(r#"{"a": "3", "b": "11"}"#)?)?;
 
 let mut t = StageTimings::default();
-let proof = prove(circuit.as_ref(), &w, &mut ark_std::rand::thread_rng(), &mut t)?;
+let proof = prove(circuit.as_ref(), &w, &mut snarkrs::rand::thread_rng(), &mut t)?;
 ```
 
 `w` is just `1`, the public signals, then the other wires in circom's order (the second

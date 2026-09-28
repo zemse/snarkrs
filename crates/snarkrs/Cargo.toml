@@ -1,0 +1,44 @@
+[package]
+name = "snarkrs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The prover, verifier, key formats and CPU backend are always in; everything else is a
+# feature, so a library user compiles only the backend it runs on.
+[features]
+default = []
+metal = ["dep:snarkrs-metal"]
+# `dep:snarkrs-cuda` alone compiles an empty shell: that crate gates its backend behind its
+# own `cuda` feature so a default build never pulls cudarc.
+cuda = ["dep:snarkrs-cuda", "snarkrs-cuda/cuda"]
+wgpu = ["dep:snarkrs-wgpu"]
+# Powers of tau, phase 2 setup, contributions, verification keys and the Solidity verifier.
+ceremony = ["dep:snarkrs-ceremony"]
+# circom's native C++ witness binary, run as a subprocess. No new dependencies.
+witness = ["dep:snarkrs-witness"]
+# circom's circuit.wasm, run on wasmtime.
+witness-wasm = ["witness", "snarkrs-witness/wasm"]
+
+[dependencies]
+snarkrs-field.workspace = true
+snarkrs-formats.workspace = true
+snarkrs-ntt.workspace = true
+snarkrs-msm.workspace = true
+snarkrs-groth16.workspace = true
+snarkrs-metal = { workspace = true, optional = true }
+snarkrs-cuda = { workspace = true, optional = true }
+snarkrs-wgpu = { workspace = true, optional = true }
+snarkrs-ceremony = { workspace = true, optional = true }
+# The workspace entry has no default features, so wasmtime comes only with `witness-wasm`.
+snarkrs-witness = { workspace = true, optional = true }
+# `getrandom` is ark-std's name for rand/std: `prove` needs an OS-seeded RNG for the
+# blinders, and `snarkrs::rand::thread_rng` is that.
+ark-std = { workspace = true, features = ["std", "getrandom"] }
+thiserror.workspace = true
+
+# The README snippets prove on Metal, so they cannot compile without it. The witness one
+# also needs `witness-wasm` and is compiled only when that is on.
+[[example]]
+name = "readme_library_usage"
+required-features = ["metal"]

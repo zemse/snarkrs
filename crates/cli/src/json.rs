@@ -1,41 +1,15 @@
-//! The path-taking half of snarkjs' `proof.json` and `public.json` interop.
+//! snarkjs' `proof.json` and `public.json` interop, from the library.
 //!
-//! The encoding itself lives in [`snarkrs_groth16::json`], which is where the browser prover can
-//! reach it: a wasm build has no filesystem and still has to hand `snarkjs.groth16.verify`
-//! exactly the same bytes this CLI writes. Everything about `c0`/`c1` ordering, normal-form
-//! decimals and the projective third component is documented there, in one copy.
+//! The encoding lives in [`snarkrs_groth16::json`], which is where the browser prover can
+//! reach it, and the path-taking readers and writers in [`snarkrs::json`], which is where a
+//! library user writing a proof.json reaches them. This module only re-exports both, so the
+//! CLI writes exactly what the library writes.
 
-use anyhow::{Context, Result};
-use snarkrs_field::*;
-use std::path::Path;
-
-pub use snarkrs_groth16::json::{
+pub use snarkrs::json::{
     dec, parse_field, proof_from_str, proof_from_value, proof_to_string, public_from_str,
-    public_from_value, public_to_string, read_g1, read_g2, JsonError,
+    public_from_value, public_to_string, read_g1, read_g2, read_proof, read_public, write_proof,
+    write_public, FileError, JsonError,
 };
-use snarkrs_groth16::Proof;
-
-pub fn write_proof(path: &Path, p: &Proof) -> Result<()> {
-    std::fs::write(path, proof_to_string(p))
-        .with_context(|| format!("writing proof to {}", path.display()))
-}
-
-pub fn write_public(path: &Path, public: &[Fr]) -> Result<()> {
-    std::fs::write(path, public_to_string(public))
-        .with_context(|| format!("writing public signals to {}", path.display()))
-}
-
-pub fn read_proof(path: &Path) -> Result<Proof> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading proof from {}", path.display()))?;
-    proof_from_str(&text).with_context(|| format!("in {}", path.display()))
-}
-
-pub fn read_public(path: &Path) -> Result<Vec<Fr>> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading public signals from {}", path.display()))?;
-    public_from_str(&text).with_context(|| format!("in {}", path.display()))
-}
 
 #[cfg(test)]
 mod tests {
@@ -43,6 +17,9 @@ mod tests {
     use crate::artifacts::variants;
     use num_bigint::BigUint;
     use serde_json::Value;
+    use snarkrs_field::*;
+    use snarkrs_groth16::Proof;
+    use std::path::Path;
 
     fn value(s: &str) -> Value {
         serde_json::from_str(s).unwrap()

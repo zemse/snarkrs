@@ -20,16 +20,10 @@ name = "snarkrs-dhat"
 path = "src/bin/dhat.rs"
 required-features = ["dhat-heap"]
 
-# Same reasoning, for the same reason it exists: the README snippets prove against a GPU
-# backend, so they cannot compile without one, and one computes its witness with the wasm
-# calculator. Left ungated it is a compilation target under the default features, where
-# `snarkrs_metal` is not linked, and `cargo test --workspace` goes red on a tree with nothing
-# wrong with it.
-[[example]]
-name = "readme_library_usage"
-required-features = ["metal", "witness-wasm"]
-
 [dependencies]
+# The library facade, with everything the CLI runs. The GPU backends and the wasm witness
+# calculator stay this crate's own features and forward to it.
+snarkrs = { workspace = true, features = ["ceremony", "witness"] }
 snarkrs-field.workspace = true
 snarkrs-formats.workspace = true
 snarkrs-groth16.workspace = true
@@ -68,17 +62,17 @@ snarkrs-groth16 = { workspace = true, features = ["deterministic-blinders"] }
 # a binary that cannot ask.
 default = ["cpu", "wgpu", "witness-wasm"]
 cpu = []
-wgpu = ["dep:snarkrs-wgpu"]
-metal = ["dep:snarkrs-metal"]
+wgpu = ["dep:snarkrs-wgpu", "snarkrs/wgpu"]
+metal = ["dep:snarkrs-metal", "snarkrs/metal"]
 # `dep:snarkrs-cuda` alone is not enough: snarkrs-cuda gates its whole backend behind its own
 # `cuda` feature so that a default macOS workspace build never pulls cudarc. Without
 # forwarding the feature the crate compiles to an empty shell and `CudaBackend` is
 # "configured out", which rustc reports as a missing item rather than a missing feature.
-cuda = ["dep:snarkrs-cuda", "snarkrs-cuda/cuda"]
+cuda = ["dep:snarkrs-cuda", "snarkrs-cuda/cuda", "snarkrs/cuda"]
 # `wtns calculate` and `fullprove` on circom's circuit.wasm, through wasmtime. On by default
 # because that is what snarkjs users have; off, the release binary is about 5 MB smaller
 # and runs only circom's native witness binaries.
-witness-wasm = ["snarkrs-witness/wasm"]
+witness-wasm = ["snarkrs-witness/wasm", "snarkrs/witness-wasm"]
 # Heap profiling. Off by default and optional, so `cargo build --release` neither links
 # dhat nor builds the binary that would install its allocator.
 dhat-heap = ["dep:dhat"]

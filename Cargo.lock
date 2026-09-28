@@ -2135,6 +2135,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "snarkrs"
+version = "0.1.0"
+dependencies = [
+ "ark-std",
+ "snarkrs-ceremony",
+ "snarkrs-cuda",
+ "snarkrs-field",
+ "snarkrs-formats",
+ "snarkrs-groth16",
+ "snarkrs-metal",
+ "snarkrs-msm",
+ "snarkrs-ntt",
+ "snarkrs-wgpu",
+ "snarkrs-witness",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "snarkrs-ceremony"
 version = "0.1.0"
 dependencies = [
@@ -2176,6 +2194,7 @@ dependencies = [
  "num-bigint",
  "serde",
  "serde_json",
+ "snarkrs",
  "snarkrs-ceremony",
  "snarkrs-cuda",
  "snarkrs-field",
