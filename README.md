@@ -95,23 +95,34 @@ cargo build --release --features metal     # + Apple Metal
 cargo build --release --features cuda      # + NVIDIA CUDA
 ```
 
+The binary is `snarkrs`, a drop-in for the snarkjs 0.7.6 command line on Groth16 and
+BN254: the same commands, aliases, positional file names and defaults, `-e=`/`-n=`/`-v`
+options, exit codes (0 ok, 1 failed or invalid, 99 bad usage) and `[INFO]  snarkJS: OK!`
+log lines. `snarkrs --help` lists what it runs; a snarkjs command it does not run yet
+fails with exit 1 and says so.
+
 ```sh
-g16 prove  --zkey circuit.zkey --witness circuit.wtns \
-           --proof proof.json --public public.json \
-           [--backend cpu|wgpu|metal|cuda] [--stage-timings] [--self-verify true|false]
-           [--vkey verification_key.json]
+snarkrs powersoftau new bn128 12                              # powersOfTau12_0000.ptau
+snarkrs powersoftau contribute powersOfTau12_0000.ptau pot_0001.ptau -e=... -n=me
+snarkrs powersoftau prepare phase2 pot_0001.ptau powersoftau.ptau
+snarkrs groth16 setup circuit.r1cs powersoftau.ptau circuit_0000.zkey
+snarkrs zkey contribute circuit_0000.zkey circuit_final.zkey -e=...
+snarkrs zkey export verificationkey circuit_final.zkey verification_key.json
+snarkrs groth16 prove circuit_final.zkey witness.wtns proof.json public.json \
+        [--backend cpu|wgpu|metal|cuda] [--stage-timings] [--self-verify true|false] \
+        [--vkey verification_key.json] [--constant-work]
+snarkrs groth16 verify verification_key.json public.json proof.json
 
-g16 verify --vkey verification_key.json --proof proof.json --public public.json
-
-g16 bench  --artifacts <DIR> [--variant NAME]... [--reps N] \
-           [--backend cpu|wgpu|metal|cuda] [--mode cold|warm|both] [--csv FILE]
+snarkrs bench --artifacts <DIR> [--variant NAME]... [--reps N] \
+        [--backend cpu|wgpu|metal|cuda] [--mode cold|warm|both] [--csv FILE]
 ```
 
-The output is what snarkjs expects, so the two are interchangeable in either direction:
+The short aliases work too (`ptn`, `ptc`, `pt2`, `g16s`, `zkc`, `zkev`, `g16p`, `g16v`, ...),
+and the ceremony commands take `--backend cpu|metal`. The output is what snarkjs expects,
+so the two are interchangeable in either direction:
 
 ```sh
-g16 prove --zkey circuit.zkey --witness circuit.wtns \
-          --proof proof.json --public public.json --backend metal
+snarkrs g16p circuit.zkey circuit.wtns proof.json public.json --backend metal
 snarkjs groth16 verify verification_key.json public.json proof.json    # OK!
 ```
 
@@ -158,7 +169,7 @@ skips the check for input you already trust:
 
 The check in `prove` is also what stops a hostile zkey from reading the witness out of the
 proof, so a key from someone else should only ever meet `prove`, and should still be checked
-with `g16 zkey verify` against the circuit and the ptau. Proving time depends on how many
+with `snarkrs zkey verify` against the circuit and the ptau. Proving time depends on how many
 witness entries are zero or one unless you pass `--constant-work` (cpu, metal and wgpu
 backends, 2.5% to about 10x slower depending on the circuit and backend). The audit and its
 current status are in

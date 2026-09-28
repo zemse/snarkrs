@@ -228,16 +228,16 @@ echo "    reps:               $REPS (snarkjs $SNARKJS_REPS)"
 # --no-build for the same reason as --commit: a box holding a prebuilt binary has no source
 # to build from, and running cargo there either fails or, worse, silently rebuilds something
 # other than the binary that is about to be measured.
-G16="$HERE/target/release/g16"
+G16="$HERE/target/release/snarkrs"
 if [ "${NO_BUILD:-0}" = "1" ]; then
   log "using the prebuilt binary, not building"
   [ -x "$G16" ] || { echo "--no-build given but $G16 is not executable" >&2; exit 1; }
 else
   log "building"
   if [ -n "$FEATURES" ]; then
-    ( cd "$HERE" && cargo build --release -p g16-cli --features "$FEATURES" )
+    ( cd "$HERE" && cargo build --release -p snarkrs --features "$FEATURES" )
   else
-    ( cd "$HERE" && cargo build --release -p g16-cli )
+    ( cd "$HERE" && cargo build --release -p snarkrs )
   fi
 fi
 

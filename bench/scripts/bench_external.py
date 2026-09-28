@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Time the provers that are not ours: rapidsnark and snarkjs, on the same artifacts.
 
-Rows are written in the same schema `g16 bench --csv` emits, so one renderer reads every
+Rows are written in the same schema `snarkrs bench --csv` emits, so one renderer reads every
 prover's numbers out of one directory without knowing which tool produced them. The only
-column that tells them apart is `prover`: `g16 bench` stamps `ours`, this stamps
+column that tells them apart is `prover`: `snarkrs bench` stamps `ours`, this stamps
 `rapidsnark` or `snarkjs`.
 
 Cold and warm mean here exactly what they mean for our backend. Cold is one fresh process
@@ -92,7 +92,7 @@ def make_verifier(rapidsnark_verify, g16, snarkjs):
     Three oracles answer three different questions, and any one of them catches a prover
     that is emitting nonsense:
       rapidsnark-verify  an independent C++ implementation accepts it
-      g16 verify         our own pairing check accepts it
+      snarkrs verify     our own pairing check accepts it
       snarkjs verify     the JSON encoding is what the ecosystem expects
     The cold loop calls this once per rep, so cost decides the order: the two native
     verifiers are milliseconds, snarkjs is about a second a call.
@@ -106,9 +106,9 @@ def make_verifier(rapidsnark_verify, g16, snarkjs):
         return f, "rapidsnark-verify"
     if g16 and os.path.exists(g16):
         def f(vkey, public, proof):
-            r = sh([g16, "verify", "--vkey", vkey, "--proof", proof, "--public", public])
+            r = sh([g16, "groth16", "verify", vkey, public, proof])
             return r.returncode == 0
-        return f, "g16 verify"
+        return f, "snarkrs verify"
     if snarkjs:
         def f(vkey, public, proof):
             r = sh([snarkjs, "groth16", "verify", vkey, public, proof])
@@ -158,8 +158,8 @@ def main():
     ap.add_argument("--rapidsnark", default="")
     ap.add_argument("--rapidsnark-warm", default="")
     ap.add_argument("--rapidsnark-verify", default="",
-                    help="fast verification oracle; falls back to g16, then snarkjs")
-    ap.add_argument("--g16", default="", help="our CLI, used as a fallback verifier")
+                    help="fast verification oracle; falls back to snarkrs, then snarkjs")
+    ap.add_argument("--g16", default="", help="our CLI (snarkrs), used as a fallback verifier")
     ap.add_argument("--snarkjs", default="",
                     help="path to the snarkjs launcher (default: PATH, then the usual "
                          "pnpm and npm locations)")
@@ -182,7 +182,7 @@ def main():
         # Refuse rather than record. An unverified timing looks exactly like a verified one
         # in the finished table, and there is no way to tell them apart after the fact.
         print("  external: no verification oracle available "
-              "(rapidsnark-verify, g16 and snarkjs are all missing), recording nothing")
+              "(rapidsnark-verify, snarkrs and snarkjs are all missing), recording nothing")
         return 0
 
     # A private scratch directory per invocation. Fixed /tmp names collide when two

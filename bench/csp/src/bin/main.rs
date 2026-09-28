@@ -17,7 +17,7 @@ enum Cmd {
     /// Time proving and verification, and write one metrics row per variant.
     Bench(BenchArgs),
     /// Write `input.json`, `circuit.wtns`, `vkey.json` and `public.json` next to each
-    /// zkey, so `g16 bench` and the audit tests can use the same circuits.
+    /// zkey, so `snarkrs bench` and the audit tests can use the same circuits.
     Artifacts(ArtifactArgs),
     /// Print the variants and their constraint counts, proving nothing.
     List(ArtifactArgs),

@@ -30,26 +30,26 @@ rsync -az -e "ssh -i $KEY -o StrictHostKeyChecking=no" \
   "$HERE/" "$HOST:~/g16/"
 
 echo "==> building with cuda"
-"${SSH[@]}" 'source ~/.cargo/env; cd ~/g16 && cargo build --release -p g16-cli --features cuda 2>&1 | tail -2'
+"${SSH[@]}" 'source ~/.cargo/env; cd ~/g16 && cargo build --release -p snarkrs --features cuda 2>&1 | tail -2'
 
 if [ "${2:-}" = "--first-compile" ]; then
   echo "==> measuring a genuine first compile (clearing both caches)"
   "${SSH[@]}" 'source ~/.cargo/env; cd ~/g16 && rm -rf ~/.cache/g16-cuda ~/.nv && \
     /usr/bin/time -f "FIRST COMPILE + first proof: %e s" \
-    ./target/release/g16 prove --zkey bench/artifacts/tiny_mul/circuit.zkey \
-      --witness bench/artifacts/tiny_mul/circuit.wtns --proof /tmp/fc.json \
-      --public /tmp/fcp.json --backend cuda 2>&1 | tail -2 && \
+    ./target/release/snarkrs groth16 prove bench/artifacts/tiny_mul/circuit.zkey \
+      bench/artifacts/tiny_mul/circuit.wtns /tmp/fc.json \
+      /tmp/fcp.json --backend cuda 2>&1 | tail -2 && \
     /usr/bin/time -f "SECOND (both caches warm): %e s" \
-    ./target/release/g16 prove --zkey bench/artifacts/tiny_mul/circuit.zkey \
-      --witness bench/artifacts/tiny_mul/circuit.wtns --proof /tmp/fc.json \
-      --public /tmp/fcp.json --backend cuda 2>&1 | tail -2'
+    ./target/release/snarkrs groth16 prove bench/artifacts/tiny_mul/circuit.zkey \
+      bench/artifacts/tiny_mul/circuit.wtns /tmp/fc.json \
+      /tmp/fcp.json --backend cuda 2>&1 | tail -2'
   exit 0
 fi
 
 echo "==> warming the kernel cache so it is not inside the first rep"
-"${SSH[@]}" 'source ~/.cargo/env; cd ~/g16 && ./target/release/g16 prove \
-  --zkey bench/artifacts/tiny_mul/circuit.zkey --witness bench/artifacts/tiny_mul/circuit.wtns \
-  --proof /tmp/warm.json --public /tmp/warmp.json --backend cuda >/dev/null 2>&1 && echo warmed'
+"${SSH[@]}" 'source ~/.cargo/env; cd ~/g16 && ./target/release/snarkrs groth16 prove \
+  bench/artifacts/tiny_mul/circuit.zkey bench/artifacts/tiny_mul/circuit.wtns \
+  /tmp/warm.json /tmp/warmp.json --backend cuda >/dev/null 2>&1 && echo warmed'
 
 echo "==> benchmarking (reps=$REPS), nothing else should be running"
 "${SSH[@]}" "source ~/.cargo/env; cd ~/g16 && uptime && python3 bench/scripts/run-comparison.py --reps $REPS --backends cpu cuda"

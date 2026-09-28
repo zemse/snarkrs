@@ -24,7 +24,7 @@ BACKENDS="${G16_LOCAL_BACKENDS:-cpu metal}"
 FEATURES="--features metal"
 
 echo "==> building"
-cargo build --release -p g16-cli $FEATURES 2>&1 | tail -2
+cargo build --release -p snarkrs $FEATURES 2>&1 | tail -2
 
 echo "==> correctness gate"
 # Run once, keep the output, decide from it. Running the suite twice -- once to show and
@@ -39,7 +39,7 @@ echo "    -> $TESTS"
 
 for b in $BACKENDS; do
   echo "==> bench backend=$b"
-  ./target/release/g16 bench --artifacts bench/artifacts --reps "$REPS" \
+  ./target/release/snarkrs bench --artifacts bench/artifacts --reps "$REPS" \
     --backend "$b" --mode both --csv "$OUT/$b.csv"
 done
 

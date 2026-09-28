@@ -4,10 +4,10 @@
 # Two different questions, two different tools, and conflating them is the usual way a
 # prover benchmark ends up misleading:
 #
-#   1. hyperfine times the whole `g16 prove` PROCESS. That is what a CLI user pays:
+#   1. hyperfine times the whole `snarkrs groth16 prove` PROCESS. That is what a CLI user pays:
 #      exec, dyld, zkey parse, witness parse, prepare, prove, JSON write, exit. It is the
 #      only number here that includes the parts of the cost nobody instruments.
-#   2. `g16 bench` times the inside: cold (parse + prepare + prove, per rep) and warm
+#   2. `snarkrs bench` times the inside: cold (parse + prepare + prove, per rep) and warm
 #      (prove only, key resident), with the five-stage split from StageTimings.
 #
 # Reporting only (2) flatters us by the whole parse; reporting only (1) hides which stage
@@ -21,7 +21,7 @@ reps="${1:-10}"
 warmup="${2:-2}"
 art="$root/bench/artifacts"
 out="$root/bench/results/profiling"
-bin="$root/target/release/g16"
+bin="$root/target/release/snarkrs"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
@@ -41,10 +41,10 @@ for v in "${variants[@]}"; do
     --command-name "$v" \
     --export-json "$out/hyperfine-$v.json" \
     --export-markdown "$out/hyperfine-$v.md" \
-    "$bin prove --zkey $d/circuit.zkey --witness $d/circuit.wtns --proof $tmp/p.json --public $tmp/pub.json"
+    "$bin groth16 prove $d/circuit.zkey $d/circuit.wtns $tmp/p.json $tmp/pub.json"
 done
 
-# The process floor: what `g16` costs before it has done any proving at all. Subtracting
+# The process floor: what `snarkrs` costs before it has done any proving at all. Subtracting
 # this from the tiny_mul number is what separates "our prover is slow" from "exec and
 # dyld are slow", and at 2 constraints those are the same order of magnitude.
 echo "== hyperfine: process floor (--version, no proving at all) =="
@@ -53,7 +53,7 @@ hyperfine --warmup "$warmup" --runs 50 --command-name "process-floor" \
   --export-markdown "$out/hyperfine-process-floor.md" \
   "$bin --version"
 
-echo "== g16 bench: cold and warm, in-process, with the stage split =="
+echo "== snarkrs bench: cold and warm, in-process, with the stage split =="
 "$bin" bench --artifacts "$art" --reps "$reps" --mode both --backend cpu \
   --csv "$out/stage-split.csv" | tee "$out/stage-split.txt"
 

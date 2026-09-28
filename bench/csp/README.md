@@ -21,7 +21,7 @@ bench/scripts/csp-bench.sh --backend cpu --reps 5 --mem-reps 3     # a quicker p
 `bench/artifacts` is tracked.
 
 To write `input.json`, `circuit.wtns`, `vkey.json` and `public.json` next to each zkey, so
-that `g16 bench` and the backend audit tests can use the same circuits:
+that `snarkrs bench` and the backend audit tests can use the same circuits:
 
 ```sh
 bench/csp/target/release/g16-csp artifacts
@@ -37,7 +37,7 @@ reports a number 10-20% below what the page compares against.
 
 **So is the zkey read.** `groth16_prover_zkey_file_wrapper` takes a path, so every timed
 iteration re-reads the whole key: 1.1 GB per iteration for `keccak_2048`. This is the cold
-mode of `g16 bench`, not the warm one, and a warm number is not comparable to the page.
+mode of `snarkrs bench`, not the warm one, and a warm number is not comparable to the page.
 
 **Verification re-reads the zkey too**, and derives the verifying key from it rather than
 loading a `verification_key.json`. That is why the published verify times run to hundreds

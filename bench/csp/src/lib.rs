@@ -14,7 +14,7 @@
 //!   prover would report a number 10-20% below what the page compares against.
 //! * **So is the zkey read.** `groth16_prover_zkey_file_wrapper` takes a *path*, so every
 //!   timed iteration re-reads the whole key. For keccak_2048 that is 1.1 GB per
-//!   iteration. This is the cold mode of `g16 bench`, not the warm one.
+//!   iteration. This is the cold mode of `snarkrs bench`, not the warm one.
 //! * **Verification re-reads the zkey too**, and derives the verifying key from it rather
 //!   than loading a `verification_key.json`. That is why the published verify times run
 //!   to hundreds of milliseconds for a pairing check that costs about one.

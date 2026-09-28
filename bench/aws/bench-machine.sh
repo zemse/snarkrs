@@ -186,7 +186,7 @@ rsh "$IP" 'source ~/.cargo/env
 # carried on past a build that had failed to compile libc.
 say "building (release${FEATURES:+, cuda})"
 BUILD_T0=$(date +%s)
-if ! rsh "$IP" "set -o pipefail; source ~/.cargo/env; cd ~/g16 && cargo build --release -p g16-cli $FEATURES" > "$OUT/build.log" 2>&1; then
+if ! rsh "$IP" "set -o pipefail; source ~/.cargo/env; cd ~/g16 && cargo build --release -p snarkrs $FEATURES" > "$OUT/build.log" 2>&1; then
   say "BUILD FAILED after $(( $(date +%s) - BUILD_T0 ))s:"
   tail -25 "$OUT/build.log" | tee -a "$LOG"
   exit 1
@@ -224,9 +224,9 @@ if [ -n "$GPU" ] && [ "$FIRST_COMPILE" = 1 ]; then
   FIRST_COMPILE_S="$(rsh "$IP" 'source ~/.cargo/env; cd ~/g16
     rm -rf ~/.cache/g16-cuda ~/.nv
     s=$(date +%s.%N)
-    ./target/release/g16 prove --zkey bench/artifacts/tiny_mul/circuit.zkey \
-      --witness bench/artifacts/tiny_mul/circuit.wtns --proof /tmp/fc.json \
-      --public /tmp/fcp.json --backend cuda >/dev/null 2>&1
+    ./target/release/snarkrs groth16 prove bench/artifacts/tiny_mul/circuit.zkey \
+      bench/artifacts/tiny_mul/circuit.wtns /tmp/fc.json \
+      /tmp/fcp.json --backend cuda >/dev/null 2>&1
     e=$(date +%s.%N); echo "$e - $s" | bc' 2>/dev/null | tr -d '\r')"
   say "first compile + first proof: ${FIRST_COMPILE_S}s"
 fi
@@ -245,14 +245,14 @@ if [ -n "$GPU" ]; then
   # caches explicitly and is therefore order-independent.
   say "first CUDA run after the gate (warm ~/.nv unless tests were skipped)"
   W0=$(date +%s)
-  rsh "$IP" 'source ~/.cargo/env; cd ~/g16 && ./target/release/g16 prove \
-    --zkey bench/artifacts/tiny_mul/circuit.zkey --witness bench/artifacts/tiny_mul/circuit.wtns \
-    --proof /tmp/w.json --public /tmp/wp.json --backend cuda >/dev/null 2>&1 && echo ok' 2>&1 | tee -a "$LOG"
+  rsh "$IP" 'source ~/.cargo/env; cd ~/g16 && ./target/release/snarkrs groth16 prove \
+    bench/artifacts/tiny_mul/circuit.zkey bench/artifacts/tiny_mul/circuit.wtns \
+    /tmp/w.json /tmp/wp.json --backend cuda >/dev/null 2>&1 && echo ok' 2>&1 | tee -a "$LOG"
   [ -z "$FIRST_COMPILE_S" ] && FIRST_COMPILE_S=$(( $(date +%s) - W0 ))
   say "first kernel build took ${FIRST_COMPILE_S}s (meaningful only if the gate was skipped)"
-  rsh "$IP" 'source ~/.cargo/env; cd ~/g16 && ./target/release/g16 prove \
-    --zkey bench/artifacts/tiny_mul/circuit.zkey --witness bench/artifacts/tiny_mul/circuit.wtns \
-    --proof /tmp/w.json --public /tmp/wp.json --backend cuda >/dev/null 2>&1 && echo warmed' 2>&1 | tee -a "$LOG"
+  rsh "$IP" 'source ~/.cargo/env; cd ~/g16 && ./target/release/snarkrs groth16 prove \
+    bench/artifacts/tiny_mul/circuit.zkey bench/artifacts/tiny_mul/circuit.wtns \
+    /tmp/w.json /tmp/wp.json --backend cuda >/dev/null 2>&1 && echo warmed' 2>&1 | tee -a "$LOG"
 fi
 
 VARG=""
@@ -260,7 +260,7 @@ for v in $VARIANTS; do VARG="$VARG --variant $v"; done
 
 for b in $BACKENDS; do
   say "benchmarking backend=$b mode=both reps=$REPS"
-  rsh "$IP" "source ~/.cargo/env; cd ~/g16 && uptime && ./target/release/g16 bench \
+  rsh "$IP" "source ~/.cargo/env; cd ~/g16 && uptime && ./target/release/snarkrs bench \
     --artifacts bench/artifacts $VARG --reps $REPS --backend $b --mode both \
     --csv ~/g16/out-$b.csv" 2>&1 | tee -a "$LOG"
   scp -q -i "$KEY_PATH" "${SSH_OPTS[@]}" "ubuntu@$IP:~/g16/out-$b.csv" "$OUT/$b.csv" \

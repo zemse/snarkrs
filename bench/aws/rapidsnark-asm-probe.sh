@@ -90,7 +90,7 @@ rsh "$IP" "set -e; mkdir -p ~/g16/bench/artifacts
   curl -sS -o /tmp/a.tgz '$(presign artifacts.tgz)'; tar xzf /tmp/a.tgz -C ~/g16/bench/artifacts" 2>&1 | tail -2 | tee -a "$LOG"
 
 say "building our prover"
-rsh "$IP" 'source ~/.cargo/env; cd ~/g16 && cargo build --release -p g16-cli 2>&1 | tail -2' 2>&1 | tee -a "$LOG"
+rsh "$IP" 'source ~/.cargo/env; cd ~/g16 && cargo build --release -p snarkrs 2>&1 | tail -2' 2>&1 | tee -a "$LOG"
 
 say "building rapidsnark twice: USE_ASM=YES and USE_ASM=NO"
 rsh "$IP" 'set -e; source ~/.cargo/env; cd ~/g16
@@ -130,7 +130,7 @@ rsh "$IP" "set -e; source ~/.cargo/env; cd ~/g16
     for p in asm noasm; do
       for i in \$(seq 1 $REPS); do
         s=\$(date +%s%N); ./bench/bin/rapidsnark-\$p \$Z \$W /tmp/p.json /tmp/pub.json >/dev/null 2>&1; e=\$(date +%s%N)
-        ./target/release/g16 verify --vkey \$K --proof /tmp/p.json --public /tmp/pub.json >/dev/null 2>&1 \\
+        ./target/release/snarkrs groth16 verify \$K /tmp/pub.json /tmp/p.json >/dev/null 2>&1 \\
           && echo \"\$v,rapidsnark-\$p,cold,\$i,\$(( (e-s)/1000000 ))\" >> /tmp/asm.csv
       done
       if [ -x bench/bin/rapidsnark-warm-\$p ]; then
@@ -144,7 +144,7 @@ rsh "$IP" "set -e; source ~/.cargo/env; cd ~/g16
   # times and \$v still held the last value of the loop above: three runs of one circuit
   # instead of one run of three.
   VARGS=''; for v in $VARIANTS; do VARGS="\$VARGS --variant \$v"; done
-  ./target/release/g16 bench --artifacts bench/artifacts \$VARGS \\
+  ./target/release/snarkrs bench --artifacts bench/artifacts \$VARGS \\
     --reps $REPS --backend cpu --mode both --csv /tmp/ours.csv >/dev/null
   wc -l /tmp/asm.csv /tmp/ours.csv" 2>&1 | tail -5 | tee -a "$LOG"
 

@@ -23,7 +23,7 @@ column each rather than a backend column apiece.
 import argparse, csv, glob, os, statistics
 
 # (header, prover, backend, modes it can be measured in)
-# `prover` is the CSV column that separates the tools: `g16 bench` stamps `ours`,
+# `prover` is the CSV column that separates the tools: `snarkrs bench` stamps `ours`,
 # bench_external.py stamps `rapidsnark` or `snarkjs`.
 COLUMNS = [
     ("gpu-snark cpu",   "ours",       "cpu",   ("cold", "warm")),

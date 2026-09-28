@@ -21,7 +21,7 @@ REPO="https://github.com/ethereum/csp-benchmarks.git"
 RELEASE="https://github.com/ethereum/csp-benchmarks/releases/download/zkeys-v2"
 CIRCOMLIB_SHA="35e54ea21da3e8762557234298dbb553c175ea8d"
 
-# name:zkey basename. The zkey lands as circuit.zkey so `g16 bench` finds it by the same
+# name:zkey basename. The zkey lands as circuit.zkey so `snarkrs bench` finds it by the same
 # four filenames it looks for in every other artifact directory.
 VARIANTS="${VARIANTS:-
 sha256_128 sha256_256 sha256_512 sha256_1024 sha256_2048

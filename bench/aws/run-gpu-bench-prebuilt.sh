@@ -35,10 +35,10 @@ REPS="${2:-10}"
 # without a rebuild. Pinning above it would fail at exec with a version error that looks
 # nothing like its cause.
 TARGET="x86_64-unknown-linux-gnu.2.31"
-BIN="$HERE/target/x86_64-unknown-linux-gnu/release/g16"
+BIN="$HERE/target/x86_64-unknown-linux-gnu/release/snarkrs"
 
 echo "==> cross-compiling for $TARGET on this machine"
-( cd "$HERE" && cargo zigbuild --release -p g16-cli --features cuda --target "$TARGET" )
+( cd "$HERE" && cargo zigbuild --release -p snarkrs --features cuda --target "$TARGET" )
 file "$BIN" | grep -q 'ELF 64-bit.*x86-64' || { echo "not an x86-64 ELF, refusing to ship"; exit 1; }
 echo "    $(ls -lh "$BIN" | awk '{print $5}')  $(cd "$HERE" && git rev-parse --short HEAD)"
 
@@ -52,13 +52,13 @@ rsync -azL -e "$RSH" \
 
 echo "==> shipping the prebuilt binary"
 "${SSH[@]}" 'mkdir -p ~/g16/target/release'
-rsync -az -e "$RSH" "$BIN" "$HOST:~/g16/target/release/g16"
-"${SSH[@]}" 'chmod +x ~/g16/target/release/g16 && ~/g16/target/release/g16 --version 2>/dev/null || true'
+rsync -az -e "$RSH" "$BIN" "$HOST:~/g16/target/release/snarkrs"
+"${SSH[@]}" 'chmod +x ~/g16/target/release/snarkrs && ~/g16/target/release/snarkrs --version 2>/dev/null || true'
 
 echo "==> warming the kernel cache so it is not inside the first rep"
-"${SSH[@]}" 'cd ~/g16 && ./target/release/g16 prove \
-  --zkey bench/artifacts/tiny_mul/circuit.zkey --witness bench/artifacts/tiny_mul/circuit.wtns \
-  --proof /tmp/warm.json --public /tmp/warmp.json --backend cuda >/dev/null 2>&1 && echo warmed'
+"${SSH[@]}" 'cd ~/g16 && ./target/release/snarkrs groth16 prove \
+  bench/artifacts/tiny_mul/circuit.zkey bench/artifacts/tiny_mul/circuit.wtns \
+  /tmp/warm.json /tmp/warmp.json --backend cuda >/dev/null 2>&1 && echo warmed'
 
 echo "==> benchmarking (reps=$REPS), nothing else should be running"
 "${SSH[@]}" "cd ~/g16 && uptime && python3 bench/scripts/run-comparison.py --reps $REPS --backends cpu cuda"

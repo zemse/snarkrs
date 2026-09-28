@@ -17,14 +17,14 @@
 set -uo pipefail
 cd ~/g16
 export G16_ARTIFACTS=~/g16/bench/artifacts
-BIN=./target/release/g16
+BIN=./target/release/snarkrs
 OUT=~/g16/out; mkdir -p "$OUT"
 log() { echo; echo "===== $* ====="; }
 
 warm() { # warm <env assignments...>
-  env "$@" $BIN prove --zkey bench/artifacts/tiny_mul/circuit.zkey \
-    --witness bench/artifacts/tiny_mul/circuit.wtns \
-    --proof /tmp/w.json --public /tmp/wp.json --backend cuda >/dev/null 2>&1
+  env "$@" $BIN groth16 prove bench/artifacts/tiny_mul/circuit.zkey \
+    bench/artifacts/tiny_mul/circuit.wtns \
+    /tmp/w.json /tmp/wp.json --backend cuda >/dev/null 2>&1
 }
 
 log "device"

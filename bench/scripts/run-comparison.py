@@ -155,7 +155,7 @@ def main():
         safe = "".join(c if c.isalnum() or c in "-._" else "-" for c in machine)
         args.csv = str(HERE / "results" / f"comparison-{safe}.csv")
 
-    g16 = HERE.parent / "target" / "release" / "g16"
+    g16 = HERE.parent / "target" / "release" / "snarkrs"
     variants = args.variants or sorted(
         d.name for d in ART.iterdir() if d.is_dir() and (d / "circuit.zkey").exists())
     if not variants:
@@ -209,9 +209,9 @@ def main():
                 notes.append(f"{g16} not built, skipped our {b} backend")
                 break
             configs.append((f"ours", b, "cold",
-                            [str(g16), "prove", "--zkey", str(zkey), "--witness", str(wtns),
-                             "--proof", "/tmp/g16bench_proof.json",
-                             "--public", "/tmp/g16bench_public.json", "--backend", b]))
+                            [str(g16), "groth16", "prove", str(zkey), str(wtns),
+                             "/tmp/g16bench_proof.json", "/tmp/g16bench_public.json",
+                             "--backend", b]))
 
         for prover, backend, mode, cmd in configs:
             ms, err = time_cold(cmd, args.reps, vkey,
@@ -229,7 +229,7 @@ def main():
                                  rep=i, ms=round(m, 3), verified="yes",
                                  snarkjs_compatible=compat_cell(compat)))
 
-        # warm: rapidsnark through its object API, ours through `g16 bench --mode warm`
+        # warm: rapidsnark through its object API, ours through `snarkrs bench --mode warm`
         if not args.skip_rapidsnark and (BIN / "rapidsnark-warm").exists():
             r = sh([str(BIN / "rapidsnark-warm"), str(zkey), str(wtns),
                     "/tmp/g16bench_proof.json", "/tmp/g16bench_public.json", str(args.reps)])
@@ -258,7 +258,7 @@ def main():
             p = Path(f"/tmp/g16bench_warm_{v}_{b}.csv")
             if p.exists():
                 got = list(csv.DictReader(p.open()))
-                # g16 bench writes its own columns; stamp the machine on them too or the
+                # snarkrs bench writes its own columns; stamp the machine on them too or the
                 # warm rows would be the only ones in the file with no machine label.
                 for row in got:
                     row.update(stamp)
