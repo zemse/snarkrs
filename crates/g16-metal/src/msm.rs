@@ -66,7 +66,7 @@ use std::sync::{Arc, Mutex};
 use ark_ff::{AdditiveGroup, One, Zero};
 use metal::objc::{msg_send, sel, sel_impl};
 use metal::{
-    Buffer, CommandBufferRef, CommandQueue, CompileOptions, ComputeCommandEncoderRef,
+    Buffer, CommandBufferRef, CommandQueueRef, CompileOptions, ComputeCommandEncoderRef,
     ComputePipelineState, Device, MTLDispatchType, MTLSize,
 };
 
@@ -917,7 +917,7 @@ impl Pool {
 
 pub struct MetalMsm {
     device: Device,
-    queue: CommandQueue,
+    queue: crate::cb::Queue,
     pipelines: Pipelines,
     /// The completion token every command buffer here ends with.
     seal: crate::cb::Seal,
@@ -985,7 +985,7 @@ impl MetalMsm {
         };
         let seal = crate::cb::Seal::new(&device, &library)?;
 
-        let queue = device.new_command_queue();
+        let queue = crate::cb::Queue::new(&device);
         Ok(Self {
             pool: Pool {
                 device: device.clone(),
@@ -1187,9 +1187,9 @@ impl MetalMsm {
     ) -> Result<ScalarBuf, ProveError> {
         let out = crate::alloc::shared(&self.device, len.max(1) * 32)?;
         // Reads `mont`, which nothing here writes, so a killed attempt re-runs whole.
-        crate::cb::with_retry(|| {
+        crate::cb::with_retry(&self.queue, |queue| {
             let context = "stage 9 scalar conversion (mont_to_std)";
-            let cb = crate::cb::command_buffer(&self.queue);
+            let cb = crate::cb::command_buffer(queue);
             let enc = cb.new_compute_command_encoder();
             enc.set_label(context);
             enc.set_compute_pipeline_state(&self.pipelines.mont_to_std);
@@ -1412,11 +1412,12 @@ impl MetalMsm {
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
                 .unwrap_or(1);
+            let queue = self.queue.get();
             let run = |label: String,
                        f: &mut dyn FnMut(&ComputeCommandEncoderRef)|
              -> Result<(), ProveError> {
                 let t = std::time::Instant::now();
-                let cb = crate::cb::command_buffer(&self.queue);
+                let cb = crate::cb::command_buffer(&queue);
                 let enc = cb.new_compute_command_encoder();
                 enc.set_label(&label);
                 f(enc);
@@ -1601,8 +1602,8 @@ impl MetalMsm {
             // previous proof's window sums with an Ok. Split or not, the whole batch is
             // re-encoded from its zeroing dispatches, so a retry reads nothing
             // half-written.
-            crate::cb::with_retry(|| {
-                encode(&mut Submission::new(self, split))?;
+            crate::cb::with_retry(&self.queue, |queue| {
+                encode(&mut Submission::new(self, queue, split))?;
                 combine()
             })?
         };
@@ -2489,10 +2490,14 @@ impl Outputs {
 ///
 /// macOS kills a command buffer that holds the GPU too long while the display wants it
 /// (`ImpactingInteractivity`; `fft.rs` measured 350 ms buffers losing five runs in six
-/// and 200 ms ones none). A variable-time batch is under that on every artifact, and
-/// one buffer is the shape its 0.16 ms submission floor was measured against, so it
-/// keeps it. A constant-work batch is not: its four witness jobs are each the size of
-/// H's, 1.5 s on anon-aadhaar in one buffer, and that buffer was killed the first time
+/// and 200 ms ones none). A variable-time batch keeps one buffer, the shape its 0.16 ms
+/// submission floor was measured against, although at 2^22 (js_384x384_d32) that buffer
+/// is 1.2 s of GPU time: under two 2^22 proof loops beside two wgpu ones it was killed
+/// about once in four proofs, and cut into pieces of at most 130 ms about once in two
+/// (62 kills in 137 proofs against 40 in 159), since every piece can be killed and a
+/// kill re-runs the whole batch; in neither did the MSM spend all eight attempts. A
+/// constant-work batch goes out split: its four witness jobs are each the size of H's,
+/// 1.5 s on anon-aadhaar in one buffer, and that buffer was killed the first time
 /// another batch shared the device. Split, each piece is committed and waited on before
 /// the next is encoded, the way the ceremony FFT submits: committing them back to back
 /// and waiting at the end kept the queue deep enough that the transforms of a proof
@@ -2503,7 +2508,7 @@ impl Outputs {
 /// concurrent, so without one the token's thread could land before the reduce it vouches
 /// for had finished), and every wait checks it.
 struct Submission<'q> {
-    queue: &'q CommandQueue,
+    queue: &'q CommandQueueRef,
     seal: &'q crate::cb::Seal,
     split: bool,
     cbs: Vec<(&'q CommandBufferRef, crate::cb::Token)>,
@@ -2511,9 +2516,9 @@ struct Submission<'q> {
 }
 
 impl<'q> Submission<'q> {
-    fn new(msm: &'q MetalMsm, split: bool) -> Self {
+    fn new(msm: &'q MetalMsm, queue: &'q CommandQueueRef, split: bool) -> Self {
         Self {
-            queue: &msm.queue,
+            queue,
             seal: &msm.seal,
             split,
             cbs: Vec::new(),
@@ -3340,7 +3345,8 @@ mod tests {
 
             // The digit pipeline, then the histogram it built: every scalar is in
             // every window exactly once, in a real row or a dummy one.
-            let cb = m.queue.new_command_buffer();
+            let queue = m.queue.get();
+            let cb = queue.new_command_buffer();
             let enc = cb.new_compute_command_encoder();
             plan.encode(&m, enc);
             enc.end_encoding();

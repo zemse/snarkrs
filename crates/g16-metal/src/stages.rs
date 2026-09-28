@@ -47,7 +47,7 @@ use g16_core::{HPoly, ProveError, StageTimings};
 use g16_field::{Domain, Field, Fr};
 use g16_zkey::ProvingKey;
 use metal::objc::rc::autoreleasepool;
-use metal::{Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, Library, MTLSize};
+use metal::{Buffer, CompileOptions, ComputePipelineState, Device, Library, MTLSize};
 
 use crate::kernels::{FR_MSL, GATHER_MSL, NTT_MSL, POINTWISE_MSL, SEAL_MSL};
 use crate::layout::{PackedFr, PackedScalar, FR_MODULUS};
@@ -124,7 +124,7 @@ const STORE_JOIN: u32 = 1;
 /// region or a per-proof path.
 pub struct HStages {
     device: Device,
-    queue: CommandQueue,
+    queue: crate::cb::Queue,
     gather: ComputePipelineState,
     head: ComputePipelineState,
     tail: ComputePipelineState,
@@ -155,7 +155,7 @@ impl HStages {
             // The compiler diagnostic names the offending line of MSL and is the only
             // thing that does, so it is propagated verbatim rather than summarised.
             .map_err(|e| bad(format!("MSL compile failed:\n{e}")))?;
-        let queue = device.new_command_queue();
+        let queue = crate::cb::Queue::new(&device);
         Self::new_with_library(device, queue, library)
     }
 
@@ -163,7 +163,7 @@ impl HStages {
     /// prover (stages 0 to 4 plus the MSM kernels) as a single translation unit.
     pub(crate) fn new_with_library(
         device: Device,
-        queue: CommandQueue,
+        queue: crate::cb::Queue,
         library: Library,
     ) -> Result<Self, ProveError> {
         let pso = |name: &str| -> Result<ComputePipelineState, ProveError> {
@@ -652,10 +652,10 @@ impl HResident {
             // a GPU hang and recovery the driver reported buffers as `Completed` with no
             // error although neither of their encoders had run (3 of 300 in the seal
             // probe), which the status alone would have read as a finished proof.
-            crate::cb::with_retry(|| {
+            crate::cb::with_retry(&st.queue, |queue| {
                 let mut cbs = Vec::with_capacity(1 + N_DOMAIN_VECTORS);
 
-                let cb = crate::cb::command_buffer(&st.queue);
+                let cb = crate::cb::command_buffer(queue);
                 let enc = cb.new_compute_command_encoder();
                 enc.set_label("stages 0-1 (gather)");
                 self.encode_gather(st, enc, &sc, n, work);
@@ -665,7 +665,7 @@ impl HResident {
                 cbs.push(("stages 0-1 (gather)", cb, token));
 
                 for vi in 0..N_DOMAIN_VECTORS {
-                    let cb = crate::cb::command_buffer(&st.queue);
+                    let cb = crate::cb::command_buffer(queue);
                     let enc = cb.new_compute_command_encoder();
                     enc.set_label("stages 2-4 (transforms)");
                     self.encode_transforms_vector(st, enc, &sc, n, vi, true);
@@ -728,8 +728,9 @@ impl HResident {
         t: &mut StageTimings,
         pack_us: u64,
     ) -> Result<(), ProveError> {
+        let queue = st.queue.get();
         let start = Instant::now();
-        let cb = crate::cb::command_buffer(&st.queue);
+        let cb = crate::cb::command_buffer(&queue);
         let enc = cb.new_compute_command_encoder();
         enc.set_label("stage 0-1 gather (profiled)");
         self.encode_gather(st, enc, sc, n, work);
@@ -746,7 +747,7 @@ impl HResident {
         let start = Instant::now();
         let mut cbs = Vec::with_capacity(N_DOMAIN_VECTORS);
         for vi in 0..N_DOMAIN_VECTORS {
-            let cb = crate::cb::command_buffer(&st.queue);
+            let cb = crate::cb::command_buffer(&queue);
             let enc = cb.new_compute_command_encoder();
             enc.set_label("stages 2-3 transforms (profiled)");
             self.encode_transforms_vector(st, enc, sc, n, vi, false);
@@ -762,7 +763,7 @@ impl HResident {
         t.ntt_us += start.elapsed().as_micros() as u64;
 
         let start = Instant::now();
-        let cb = crate::cb::command_buffer(&st.queue);
+        let cb = crate::cb::command_buffer(&queue);
         let enc = cb.new_compute_command_encoder();
         enc.set_label("stage 4 h_join (profiled)");
         enc.set_compute_pipeline_state(&st.h_join);
@@ -1174,9 +1175,10 @@ mod tests {
                 };
                 PackedFr::pack_into(w, dst);
                 let mut samples = Vec::new();
+                let queue = st.queue.get();
                 for rep in 0..25 {
                     let t = Instant::now();
-                    let cb = crate::cb::command_buffer(&st.queue);
+                    let cb = crate::cb::command_buffer(&queue);
                     let enc = cb.new_compute_command_encoder();
                     res.encode_gather(&st, enc, &sc, n, work);
                     let token = st.seal.encode(enc);

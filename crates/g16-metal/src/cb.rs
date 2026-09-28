@@ -33,13 +33,14 @@
 use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Mutex;
 
 use g16_core::ProveError;
 use metal::objc::runtime::Object;
 use metal::objc::{class, msg_send, sel, sel_impl};
 use metal::{
-    Buffer, CommandBufferRef, CommandQueueRef, ComputeCommandEncoderRef, ComputePipelineState,
-    Device, Library, MTLCommandBufferStatus, MTLSize,
+    Buffer, CommandBufferRef, CommandQueue, CommandQueueRef, ComputeCommandEncoderRef,
+    ComputePipelineState, Device, Library, MTLCommandBufferStatus, MTLSize,
 };
 
 #[link(name = "Metal", kind = "framework")]
@@ -209,16 +210,109 @@ pub(crate) fn wait_ok(cb: &CommandBufferRef, context: &str) -> Result<(), ProveE
 
 /// Attempts at one submission before giving up, counting the first. The ceremony FFT's
 /// contract: a macOS interactivity kill is a scheduling event, not an arithmetic one.
-pub(crate) const RETRIES: u32 = 4;
+/// Eight, as `g16-wgpu`'s sealed submissions: under two 2^22 proof loops beside two wgpu
+/// ones and a probe, about one compute_h attempt in two was killed, and four attempts gave
+/// up 13 of 161 proofs; eight gave up none of 320 in two such runs.
+pub(crate) const RETRIES: u32 = 8;
 
-/// Runs `submit` until it succeeds or [`RETRIES`] attempts have failed, backing off
-/// between them, and returns the last error.
+/// Backoff before attempt `attempt` (from 1): 400, 800, then 1600 ms, so eight attempts
+/// wait 9.2 s in all.
+fn backoff(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(200 << attempt.min(3))
+}
+
+/// What the driver said about a refused submission, read from the `kIOGPU...` name in
+/// its NSError text. The NSError code does not tell them apart (1 for a kill and for a
+/// victim alike), and the text is not an API, so anything unrecognised is [`Self::Other`]
+/// and takes the blind retry.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Refusal {
+    /// `ImpactingInteractivity`: stopped so the display could have the GPU.
+    Kill,
+    /// `InnocentVictim`: discarded by the recovery from another buffer's hang.
+    Victim,
+    /// `Hang`: this buffer was running when the GPU hung.
+    Hang,
+    /// `SubmissionsIgnored`: never run, because its queue had caused GPU errors before.
+    Ignored,
+    /// Anything else: a missing token, H off the field, an unrecognised status.
+    Other,
+}
+
+impl Refusal {
+    pub(crate) fn of(e: &ProveError) -> Self {
+        let ProveError::Device { reason, .. } = e else {
+            return Self::Other;
+        };
+        if reason.contains("ErrorSubmissionsIgnored") {
+            Self::Ignored
+        } else if reason.contains("ErrorImpactingInteractivity") {
+            Self::Kill
+        } else if reason.contains("ErrorInnocentVictim") {
+            Self::Victim
+        } else if reason.contains("ErrorHang") {
+            Self::Hang
+        } else {
+            Self::Other
+        }
+    }
+}
+
+/// A command queue that can be swapped for a fresh one.
+///
+/// After its buffers hang the GPU twice in a few seconds, macOS stops running a queue's
+/// buffers at all: every one comes back `SubmissionsIgnored` at once, and waiting does
+/// not end it (388 s and 16,412 refusals in the BUG-28 lane's h_probe, until it was
+/// killed). The refusal sticks to the queue, not the process: a `g16 prove` whose stages
+/// queue was ignored had its MSM queue's buffers run in the same second, and an h_probe
+/// that swapped both refused queues had its next buffers run and every result after it
+/// come back. A one-shot CLI gets fresh queues with its next process; a caller holding a
+/// backend for its life did not, and every proof after the refusal failed. So
+/// [`with_retry`] swaps the queue on that refusal and runs the attempt on the new one.
+pub(crate) struct Queue {
+    device: Device,
+    current: Mutex<CommandQueue>,
+}
+
+impl Queue {
+    pub(crate) fn new(device: &Device) -> Self {
+        Self {
+            device: device.clone(),
+            current: Mutex::new(device.new_command_queue()),
+        }
+    }
+
+    /// The queue to submit on now. A clone is a retain, so a swap does not pull it out
+    /// from under an attempt still waiting on it.
+    pub(crate) fn get(&self) -> CommandQueue {
+        self.current
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// Replaces `refused` with a fresh queue, unless another thread already has.
+    fn renew(&self, refused: &CommandQueueRef) {
+        let mut current = self.current.lock().unwrap_or_else(|p| p.into_inner());
+        if std::ptr::eq::<CommandQueueRef>(&**current, refused) {
+            *current = self.device.new_command_queue();
+        }
+    }
+}
+
+/// Runs `submit` on `queue` until it succeeds or [`RETRIES`] attempts have failed, and
+/// returns the last error.
 ///
 /// `submit` must be re-runnable from whatever a killed attempt left behind: it encodes
 /// from inputs it does not write, and it has waited on every command buffer it committed
 /// before it returns, so no dispatch of a failed attempt is still writing the scratch the
-/// next one encodes against. Blind rather than keyed on the interactivity error, because
-/// the error text is not an API; a genuine kernel fault fails every attempt instead.
+/// next one encodes against. It must commit only on the queue it is handed.
+///
+/// A kill, a victim, a hang and anything unrecognised are retried after [`backoff`]:
+/// the failure means something else wants the GPU, and a genuine kernel fault fails
+/// every attempt instead. A `SubmissionsIgnored` refusal is retried at once on a fresh
+/// queue (see [`Queue`]); waiting would not help, since the old queue is never run
+/// again.
 ///
 /// Every failed attempt is reported on stderr with the thread that made it. A kill is rare
 /// on a quiet machine (none in 100 runs of the concurrency test), so the line costs
@@ -230,24 +324,37 @@ pub(crate) const RETRIES: u32 = 4;
 /// `backend::tests::one_metal_circuit_proves_concurrently`, on circuits as small as
 /// railgun-13x01, and on the gather, the transforms and the MSM batch alike.
 pub(crate) fn with_retry<T>(
-    mut submit: impl FnMut() -> Result<T, ProveError>,
+    queue: &Queue,
+    mut submit: impl FnMut(&CommandQueueRef) -> Result<T, ProveError>,
 ) -> Result<T, ProveError> {
     let mut err = None;
+    let mut wait = false;
     for attempt in 0..RETRIES {
-        if attempt > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(200 << attempt));
+        if wait {
+            std::thread::sleep(backoff(attempt));
         }
-        match submit() {
+        let q = queue.get();
+        match submit(&q) {
             Ok(v) => return Ok(v),
             Err(e) => {
                 #[cfg(test)]
                 inject::attempt_failed();
+                let refusal = Refusal::of(&e);
                 let thread = std::thread::current();
                 eprintln!(
-                    "metal: attempt {} of {RETRIES} failed on thread {}: {e}",
+                    "metal: attempt {} of {RETRIES} failed on thread {}: {e}{}",
                     attempt + 1,
-                    thread.name().unwrap_or("unnamed")
+                    thread.name().unwrap_or("unnamed"),
+                    if refusal == Refusal::Ignored {
+                        "; retrying on a new command queue"
+                    } else {
+                        ""
+                    }
                 );
+                wait = refusal != Refusal::Ignored;
+                if !wait {
+                    queue.renew(&q);
+                }
                 err = Some(e);
             }
         }
@@ -548,5 +655,73 @@ mod tests {
             assert!(err.is_device_fault(), "{err}");
             assert!(err.to_string().contains("completion token"), "{err}");
         });
+    }
+
+    fn refused(status: &str) -> ProveError {
+        ProveError::Device {
+            backend: "metal",
+            reason: format!(
+                "stages 0-1 (gather): command buffer did not complete (status Error): {status}"
+            ),
+        }
+    }
+
+    /// The four statuses as the driver words them, from the BUG-28 and BUG-29 burst logs.
+    #[test]
+    fn the_driver_statuses_are_told_apart() {
+        for (status, want) in [
+            (
+                "Impacting Interactivity (0000000e:kIOGPUCommandBufferCallbackErrorImpactingInteractivity)",
+                Refusal::Kill,
+            ),
+            (
+                "Discarded (victim of GPU error/recovery) (00000005:kIOGPUCommandBufferCallbackErrorInnocentVictim)",
+                Refusal::Victim,
+            ),
+            (
+                "Caused GPU Hang Error (00000003:kIOGPUCommandBufferCallbackErrorHang)",
+                Refusal::Hang,
+            ),
+            (
+                "Ignored (for causing prior/excessive GPU errors) (00000004:kIOGPUCommandBufferCallbackErrorSubmissionsIgnored)",
+                Refusal::Ignored,
+            ),
+            ("injected fault (status Completed)", Refusal::Other),
+        ] {
+            assert_eq!(Refusal::of(&refused(status)), want, "{status}");
+        }
+    }
+
+    /// An ignored submission is retried at once on a new queue; a kill keeps the queue
+    /// and backs off.
+    #[test]
+    fn an_ignored_submission_is_retried_on_a_new_queue() {
+        let device = Device::system_default().expect("no Metal device");
+        let queue = Queue::new(&device);
+        for (status, renews) in [
+            (
+                "Ignored (for causing prior/excessive GPU errors) (00000004:kIOGPUCommandBufferCallbackErrorSubmissionsIgnored)",
+                true,
+            ),
+            (
+                "Impacting Interactivity (0000000e:kIOGPUCommandBufferCallbackErrorImpactingInteractivity)",
+                false,
+            ),
+        ] {
+            let mut seen: Vec<*const CommandQueueRef> = Vec::new();
+            let start = std::time::Instant::now();
+            with_retry(&queue, |q| {
+                seen.push(q);
+                if seen.len() == 1 {
+                    Err(refused(status))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap();
+            assert_eq!(seen.len(), 2);
+            assert_eq!(seen[0] != seen[1], renews, "{status}");
+            assert_eq!(start.elapsed() < backoff(1), renews, "{status}");
+        }
     }
 }

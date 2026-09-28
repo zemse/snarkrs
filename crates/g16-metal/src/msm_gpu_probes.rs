@@ -182,7 +182,8 @@ fn review_reduce_body() {
             for mode in 0..3 {
                 let pso = &pipelines[mode];
                 assert!(pso.max_total_threads_per_threadgroup() >= threads as u64);
-                let cb = m.queue.new_command_buffer();
+                let queue = m.queue.get();
+                let cb = queue.new_command_buffer();
                 let enc = cb.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(pso);
                 enc.set_buffer(0, Some(&input), 0);
@@ -282,7 +283,8 @@ fn lane_first_cb_cost() {
     let out = crate::alloc::shared(&m.device, n * 4).unwrap();
     let reused = crate::alloc::shared(&m.device, bytes).unwrap();
     let run = |buf: &Buffer| -> (f64, f64) {
-        let cb = m.queue.new_command_buffer();
+        let queue = m.queue.get();
+        let cb = queue.new_command_buffer();
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&pso);
         enc.set_buffer(0, Some(buf), 0);
@@ -495,7 +497,8 @@ fn lane_scatter_body() {
         // also hands every scatter a freshly scanned cursor.
         const ROUNDS: usize = 8;
         let time_cb = |encode_scatter: Option<&ComputePipelineState>| -> f64 {
-            let cb = m.queue.new_command_buffer();
+            let queue = m.queue.get();
+            let cb = queue.new_command_buffer();
             let enc = cb.new_compute_command_encoder();
             for _ in 0..ROUNDS {
                 plan.encode_zero(&m, enc);
@@ -526,7 +529,8 @@ fn lane_scatter_body() {
         };
         // The span variant, dispatched over `parts` serial window ranges per round.
         let time_span = |parts: usize| -> f64 {
-            let cb = m.queue.new_command_buffer();
+            let queue = m.queue.get();
+            let cb = queue.new_command_buffer();
             let enc = cb.new_compute_command_encoder();
             for _ in 0..ROUNDS {
                 plan.encode_zero(&m, enc);
@@ -644,7 +648,8 @@ fn constant_work_phase_occupancy() {
     ];
     let time = |f: &mut dyn FnMut(&ComputeCommandEncoderRef)| -> f64 {
         let t = Instant::now();
-        let cb = m.queue.new_command_buffer();
+        let queue = m.queue.get();
+        let cb = queue.new_command_buffer();
         let enc = cb.new_compute_command_encoder();
         f(enc);
         enc.end_encoding();
