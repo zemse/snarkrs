@@ -29,8 +29,11 @@
 //! writer every output goes through, [`transcript`] is the hash-and-RNG layer shared by
 //! both phases, [`accel`] is the CPU side of the two seams a GPU can take over, and
 //! [`phase1`], [`prepare`], [`setup`], [`contribute`] and [`vkey`] are the commands.
+//! [`challenge`] and [`bellman`] are the two ways to contribute without the `.ptau` or
+//! `.zkey` in hand, and [`solidity`] writes the on-chain verifier.
 
 pub mod accel;
+pub mod bellman;
 pub mod challenge;
 pub mod contribute;
 pub mod phase1;

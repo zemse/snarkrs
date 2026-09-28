@@ -350,7 +350,7 @@ fn apply(
 /// Section 1 holds one u32 and nothing else. Checked before the header, because a plonk
 /// or fflonk zkey has a different section 2 that would otherwise parse far enough to give
 /// a confusing error.
-fn check_protocol(file: &BinFile) -> Result<(), CeremonyError> {
+pub(crate) fn check_protocol(file: &BinFile) -> Result<(), CeremonyError> {
     let mut cur = Cursor::new(file.unique_section(S_PROTOCOL)?, S_PROTOCOL);
     let id = cur.u32()?;
     if id != crate::PROTOCOL_GROTH16 {
