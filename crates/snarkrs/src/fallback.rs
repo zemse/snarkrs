@@ -1,5 +1,5 @@
-//! What `g16 prove` does when an accelerator hands back a proof that does not verify, or
-//! fails to finish one.
+//! What `snarkrs groth16 prove` does when an accelerator hands back a proof that does not
+//! verify, or fails to finish one.
 //!
 //! A logic bug fails the same way on every run and dies in CI. A GPU that returns a wrong
 //! proof in production is far more likely to be transient: the DSN 2026 silent data

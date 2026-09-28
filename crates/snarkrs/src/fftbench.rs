@@ -1,4 +1,4 @@
-//! `g16 ptau fft-bench`: the CUDA FFT kernel-variant sweep, in one process.
+//! `snarkrs fft-bench`: the CUDA FFT kernel-variant sweep, in one process.
 //!
 //! The economics this command exists for: any edit to `kernels/fft.cu` costs a full
 //! NVRTC + ptxas rebuild on the measuring machine, minutes of billed GPU time, because

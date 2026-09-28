@@ -1,4 +1,4 @@
-//! `g16 bench`: cold and warm proving timings, with every proof verified first.
+//! `snarkrs bench`: cold and warm proving timings, with every proof verified first.
 //!
 //! Cold and warm each mean exactly one thing here, and the difference is the whole point
 //! of the subcommand:
