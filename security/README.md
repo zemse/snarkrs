@@ -232,9 +232,15 @@ Metal: a command buffer's `Completed` status is not proof that its dispatches ra
 hang and recovery on the M2 Max the driver returned `Completed` with a nil error for buffers none
 of whose encoders executed (3 in 300 during one episode). Every proving submission now ends with
 a completion token checked by the host (`cb::Seal`, `bec5863`), the same defence g16-wgpu has.
-During recovery episodes a buffer that ran to its end with its token present also produced wrong
-values; no completion token can see that, and `prove`'s self-verify is the only guard for it, so
-`prove_unchecked` on a GPU backend is exposed to it.
+Most of the "wrong with token present" results reported during recovery episodes were retry
+exhaustion misread: the audit's panics are `compute_h`'s error after four attempts in one
+episode. Over 8,574 concurrent results beside metal and wgpu proof loops, through two hang and
+recovery episodes, every H word and every MSM point that came back Ok matched the CPU
+(`643775f`, `examples/h_probe.rs`). One earlier A MSM did come back wrong as a valid curve point
+during a recovery; no token or range check can see that, `prove`'s self-verify is the guard, and
+`prove_unchecked` on Metal stays exposed. Since `643775f` an H word outside the field or an MSM
+sum off the curve is a `ProveError::Device` and the attempt is re-run (0.3 ms per proof at 2^18,
+1.7 ms at 2^22).
 
 Since `2a2babe` the wgpu MSM batch is several submissions of about 300 ms, each sealed and
 retried alone up to eight times: under two other proof loops 0 of 60 CLI proofs gave up, against
@@ -248,7 +254,7 @@ and a refused MSM submission re-queues its own uploads. Over 1,200 fresh circuit
 fixed backend re-uploaded 7 refused keys and produced no wrong proof; a retry cut short at any
 dispatch of any submission is exact by test (`CUT_NEXT`, and `inject::arm_cut` on Metal,
 `ee4ced5`). Metal fills every buffer by memcpy into Shared storage and has no blits, so it is
-not exposed to this; its wrong-with-token values during recovery episodes remain unexplained. CUDA device faults (ECC, watchdog, kernel exceptions, out of
+not exposed to this. CUDA device faults (ECC, watchdog, kernel exceptions, out of
 memory) take the same path since `23354b9`, untested on an NVIDIA GPU; a sticky CUDA error
 leaves the context unusable, so the GPU retry fails at once and the proof falls to the CPU.
 
