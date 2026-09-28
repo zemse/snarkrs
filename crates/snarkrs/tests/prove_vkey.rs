@@ -1,4 +1,4 @@
-//! `g16 prove --vkey`, and the `n_public` the zkey declares.
+//! `snarkrs groth16 prove --vkey`, and the `n_public` the zkey declares.
 //!
 //! `n_public` decides how much of the witness `prove` writes to public.json, and it comes
 //! from the zkey. A key that overstates it publishes private wires, and its own verifying key
@@ -24,14 +24,12 @@ fn scratch(test: &str) -> PathBuf {
 
 fn prove(zkey: &Path, wtns: &Path, out: &Path, vkey: Option<&Path>) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_snarkrs"));
-    cmd.args(["prove", "--backend", "cpu", "--zkey"])
+    cmd.args(["groth16", "prove"])
         .arg(zkey)
-        .arg("--witness")
         .arg(wtns)
-        .arg("--proof")
         .arg(out.join("proof.json"))
-        .arg("--public")
-        .arg(out.join("public.json"));
+        .arg(out.join("public.json"))
+        .args(["--backend", "cpu"]);
     if let Some(v) = vkey {
         cmd.arg("--vkey").arg(v);
     }
@@ -162,14 +160,12 @@ fn constant_work_proves_on_the_cpu_wgpu_and_metal_and_is_refused_on_cuda() {
     let out = scratch("constant-work");
     let run = |backend: &str| {
         Command::new(env!("CARGO_BIN_EXE_snarkrs"))
-            .args(["prove", "--constant-work", "--backend", backend, "--zkey"])
+            .args(["groth16", "prove"])
             .arg(tiny.join("circuit.zkey"))
-            .arg("--witness")
             .arg(tiny.join("circuit.wtns"))
-            .arg("--proof")
             .arg(out.join("proof.json"))
-            .arg("--public")
             .arg(out.join("public.json"))
+            .args(["--constant-work", "--backend", backend])
             .arg("--vkey")
             .arg(tiny.join("vkey.json"))
             .output()

@@ -1,4 +1,4 @@
-//! `g16 setup --backend cpu` against `g16 setup --backend metal`, whole file, byte for byte.
+//! `snarkrs groth16 setup --backend cpu` against `--backend metal`, whole file, byte for byte.
 //!
 //! That comparison is the whole milestone. `tests/setup.rs` already pins the CPU path to
 //! snarkjs' own bytes, so a Metal zkey equal to a CPU zkey is a Metal zkey equal to
@@ -15,7 +15,7 @@
 //!
 //! `MetalMsmBackend` lives in `g16-metal`, which dev-depends on this crate to test its
 //! kernels against `prepare::point_times_fr` and `CpuKeyScale`. Depending back on it, even
-//! for a test, closes that loop. Driving `target/release/g16` costs a process spawn and
+//! for a test, closes that loop. Driving `target/release/snarkrs` costs a process spawn and
 //! tests the thing the correctness bar actually names: the shipped command, its
 //! `--backend` flag and its file output.
 //!
@@ -97,11 +97,11 @@ fn tmp_dir(test: &str) -> PathBuf {
     dir
 }
 
-/// The `g16` binary, or `None` when it was never built.
+/// The `snarkrs` binary, or `None` when it was never built.
 fn g16_bin() -> Option<PathBuf> {
     let bin = match std::env::var("G16_BIN") {
         Ok(p) => PathBuf::from(p),
-        Err(_) => root().join("target/release/g16"),
+        Err(_) => root().join("target/release/snarkrs"),
     };
     bin.exists().then_some(bin)
 }
@@ -113,7 +113,7 @@ fn inputs(case: &Case, builds: &Path) -> Option<(PathBuf, PathBuf)> {
     (r1cs.exists() && ptau.exists()).then_some((r1cs, ptau))
 }
 
-/// `g16 setup`, timed. `Err` carries stderr so the caller can tell a missing feature from
+/// `snarkrs groth16 setup`, timed. `Err` carries stderr so the caller can tell a missing feature from
 /// a real failure: those two must not both look like a skip.
 fn setup(
     bin: &Path,
@@ -124,16 +124,13 @@ fn setup(
 ) -> Result<Duration, String> {
     let start = Instant::now();
     let res = Command::new(bin)
-        .arg("setup")
-        .arg("--r1cs")
+        .args(["groth16", "setup"])
         .arg(r1cs)
-        .arg("--ptau")
         .arg(ptau)
-        .arg("--out")
         .arg(out)
         .args(["--backend", backend])
         .output()
-        .expect("g16");
+        .expect("snarkrs");
     if res.status.success() {
         Ok(start.elapsed())
     } else {
@@ -150,7 +147,7 @@ fn has_metal(bin: &Path) -> bool {
     let missing = root().join("bench/artifacts/does-not-exist.r1cs");
     let out = std::env::temp_dir().join("g16-metal-probe.zkey");
     match setup(bin, &missing, &missing, &out, "metal") {
-        Ok(_) => panic!("`g16 setup` succeeded on a nonexistent r1cs"),
+        Ok(_) => panic!("`snarkrs groth16 setup` succeeded on a nonexistent r1cs"),
         Err(e) => !e.contains("WITHOUT the `metal` feature"),
     }
 }
@@ -161,7 +158,7 @@ fn has_metal(bin: &Path) -> bool {
 /// and the four production cases together would leave 1.6 GB in the temp directory.
 fn compare(cases: &[Case], builds: &Path, label: &str) -> usize {
     let Some(bin) = g16_bin() else {
-        eprintln!("skipping: no `g16` binary; run `cargo build --release --features metal`");
+        eprintln!("skipping: no `snarkrs` binary; run `cargo build --release --features metal`");
         return 0;
     };
     if !has_metal(&bin) {

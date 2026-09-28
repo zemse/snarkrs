@@ -1,37 +1,38 @@
-//! `g16` - prove, verify, benchmark, and run the ceremony that produces a key.
+//! `snarkrs` - a drop-in for the snarkjs 0.7.6 command line, Groth16 on BN254.
 //!
-//!   g16 prove  --zkey c.zkey --witness c.wtns --proof p.json --public pub.json
-//!              [--backend cpu|wgpu|metal|cuda] [--stage-timings]
-//!              [--self-verify true|false] [--vkey vkey.json]
-//!   g16 verify --vkey vkey.json --proof p.json --public pub.json
-//!   g16 trace  --zkey c.zkey --witness c.wtns [--backend cpu|wgpu|...] [--out t.txt]
-//!   g16 bench  --artifacts DIR [--variant NAME]... [--reps 15] [--backend cpu|wgpu|...]
-//!              [--mode cold|warm|both] [--csv out.csv]
+//!   snarkrs powersoftau new bn128 <power> [powersoftau_0000.ptau]         (ptn)
+//!   snarkrs powersoftau contribute <in.ptau> <out.ptau> [-e=TEXT] [-n=NAME] (ptc)
+//!   snarkrs powersoftau beacon <in.ptau> <out.ptau> <hashHex> <iterExp>    (ptb)
+//!   snarkrs powersoftau prepare phase2 <in.ptau> <out.ptau>                (pt2)
+//!   snarkrs powersoftau verify <in.ptau>                                   (ptv)
+//!   snarkrs groth16 setup [circuit.r1cs] [powersoftau.ptau] [circuit_0000.zkey]   (g16s)
+//!   snarkrs groth16 prove [circuit_final.zkey] [witness.wtns] [proof.json] [public.json]
+//!                                                                          (g16p)
+//!   snarkrs groth16 verify [verification_key.json] [public.json] [proof.json]     (g16v)
+//!   snarkrs zkey contribute <in.zkey> <out.zkey> [-e=TEXT] [-n=NAME]       (zkc)
+//!   snarkrs zkey beacon <in.zkey> <out.zkey> <hashHex> <iterExp>           (zkb)
+//!   snarkrs zkey verify r1cs [circuit.r1cs] [powersoftau.ptau] [circuit_final.zkey] (zkv)
+//!   snarkrs zkey verify init [circuit_0000.zkey] [powersoftau.ptau] [circuit_final.zkey]
+//!                                                                          (zkvi)
+//!   snarkrs zkey export verificationkey [circuit_final.zkey] [circuit_vk.json]    (zkev)
+//!   snarkrs file info <file>                                               (fi)
 //!
-//!   g16 setup  --r1cs c.r1cs --ptau prepared.ptau --out c_0000.zkey [--backend cpu|metal]
+//!   snarkrs bench  --artifacts DIR [--variant NAME]... [--reps 15] [--backend cpu|wgpu|...]
+//!                  [--mode cold|warm|both] [--csv out.csv]
+//!   snarkrs trace  --zkey c.zkey --witness c.wtns [--backend cpu|wgpu|...] [--out t.txt]
+//!   snarkrs fft-bench --power N [--variants NAME,...] [--block-size N,...]  (cuda only)
 //!
-//!   g16 ptau info       --ptau p.ptau
-//!   g16 ptau new        --power 12 --out p_0000.ptau
-//!   g16 ptau contribute --ptau p_0000.ptau --out p_0001.ptau --entropy STRING [--name S]
-//!                       [--backend cpu|metal]
-//!   g16 ptau beacon     --ptau p_0001.ptau --out p_final.ptau
-//!                       --beacon-hash HEX --num-iterations-exp N [--name S]
-//!                       [--backend cpu|metal]
-//!   g16 ptau prepare    --ptau p_final.ptau --out prepared.ptau
-//!                       [--backend cpu|metal|cuda]
-//!   g16 ptau verify     --ptau p.ptau
-//!   g16 ptau fft-bench  --power N [--variants NAME,...] [--block-size N,...]   (cuda only)
+//! The snarkjs commands take snarkjs' words, aliases, positionals, defaults and options;
+//! `cli.rs` turns that line into one clap parses, and has the table. Our own options sit on
+//! top as `--` flags: `groth16 prove` takes `--backend cpu|wgpu|metal|cuda`,
+//! `--stage-timings`, `--self-verify true|false`, `--vkey vkey.json`, `--fallback` and
+//! `--constant-work`, and the ceremony commands take `--backend cpu|metal`.
 //!
-//!   g16 zkey contribute               --zkey c_0000.zkey --out c_0001.zkey
-//!                                     --entropy STRING [--name S] [--backend cpu|metal]
-//!   g16 zkey beacon                   --zkey c_0001.zkey --out c_final.zkey
-//!                                     --beacon-hash HEX --num-iterations-exp N [--name S]
-//!                                     [--backend cpu|metal]
-//!   g16 zkey verify                   --zkey c_final.zkey --ptau prepared.ptau
-//!                                     (--r1cs c.r1cs | --init c_0000.zkey)
-//!   g16 zkey export-verificationkey   --zkey c_final.zkey --out vkey.json
+//! Exit codes are snarkjs': 0 for success, 1 for a failure or a proof or file that does not
+//! verify, 99 for a line that names no command or gives it the wrong parameters. The log
+//! lines are too (`log.rs`), on stdout, so a script that greps `snarkJS: OK!` keeps working.
 //!
-//! `prove` writes snarkjs' `proof.json` and `public.json` verbatim, so the output is
+//! `groth16 prove` writes snarkjs' `proof.json` and `public.json` verbatim, so the output is
 //! checkable by `snarkjs groth16 verify` and by rapidsnark's verifier, not only by ours.
 //! Cold and warm are `bench`'s whole reason to exist: see `bench.rs` for what each one
 //! puts inside the timed region and why reporting only one of them misleads.
@@ -47,7 +48,8 @@
 //! `--backend cpu` and `--backend metal` write **byte-identical** files, which is what
 //! carries the snarkjs equivalence the CPU path already has.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -57,35 +59,192 @@ use g16_ceremony::{
 };
 use g16_core::{
     prove::{prove, prove_trace, prove_unchecked},
-    verify::verify,
+    verify::{verify, VerifyError},
     StageTimings,
 };
 use g16_msm::{CpuMsm, GroupFft, KeyScale, MsmBackend};
 use g16_zkey::{wtns::Witness, ProvingKey, VerifyingKey};
-use snarkrs::{bench, json, make_backend, BackendKind};
+use snarkrs::{
+    bench,
+    cli::{self, Parsed, Support},
+    json, log, make_backend, BackendKind,
+};
+
+/// snarkjs' exit code for a line it could not use.
+const BAD_USAGE: u8 = 99;
 
 #[derive(Parser)]
 #[command(
-    name = "g16",
+    name = "snarkrs",
     version,
-    about = "Groth16 prover for BN254, snarkjs-compatible"
+    about = "A drop-in for the snarkjs 0.7.6 command line: Groth16 on BN254",
+    disable_help_subcommand = true
 )]
 struct Cli {
+    /// Debug-level log lines, snarkjs' `-v`.
+    #[arg(short, long, global = true)]
+    verbose: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Prove: zkey + witness -> proof.json and public.json.
-    Prove {
+    /// Powers of tau: the circuit-independent phase-1 ceremony.
+    Powersoftau {
+        #[command(subcommand)]
+        cmd: PtauCmd,
+    },
+    /// Groth16 setup, prove and verify.
+    Groth16 {
+        #[command(subcommand)]
+        cmd: Groth16Cmd,
+    },
+    /// Proving keys: the circuit-specific phase-2 ceremony.
+    Zkey {
+        #[command(subcommand)]
+        cmd: ZkeyCmd,
+    },
+    /// iden3 binary files.
+    File {
+        #[command(subcommand)]
+        cmd: FileCmd,
+    },
+    /// Benchmark proving, cold and warm, verifying every proof.
+    Bench(bench::Args),
+    /// Print a deterministic execution trace, for diffing against another machine.
+    ///
+    /// Debugging only. It pins stage 10's blinders, so it emits no proof.json: see
+    /// `g16_core::trace`.
+    Trace {
         #[arg(long, value_name = "FILE")]
         zkey: PathBuf,
         #[arg(long, value_name = "FILE")]
         witness: PathBuf,
+        #[arg(long, value_enum, default_value_t = BackendKind::Cpu)]
+        backend: BackendKind,
+        /// Write the trace here instead of to stdout, so two of them can be diffed.
         #[arg(long, value_name = "FILE")]
+        out: Option<PathBuf>,
+    },
+    /// Sweep the CUDA FFT kernel variants: one NVRTC compile carries every candidate,
+    /// and the fixed context and compile cost is paid once for the whole table.
+    #[cfg(feature = "cuda")]
+    FftBench(snarkrs::fftbench::Args),
+}
+
+/// `--name` and `--entropy` as snarkjs reads them: `-n=VALUE`, and a bare `-n` is the
+/// string "true", which is what `options.name` holds in that case.
+#[derive(clap::Args)]
+struct Contributor {
+    /// Recorded in the contribution and printed by every later `verify`. `-n=NAME`.
+    #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true")]
+    name: Option<String>,
+}
+
+#[derive(clap::Args)]
+struct Entropy {
+    /// Mixed with 64 bytes from the OS CSPRNG. Prompted for on stdin when absent, as
+    /// snarkjs does. `-e=TEXT`.
+    #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true")]
+    entropy: Option<String>,
+}
+
+/// cpu or metal. Both must write byte-identical output; that equivalence is what carries
+/// the snarkjs one.
+#[derive(clap::Args)]
+struct CeremonyBackend {
+    #[arg(long, value_enum, default_value_t = BackendKind::Cpu)]
+    backend: BackendKind,
+}
+
+#[derive(Subcommand)]
+enum PtauCmd {
+    /// Write a fresh accumulator at 2^POWER. Fully determined by the power: no randomness
+    /// and no timestamps, so two runs produce identical bytes.
+    New {
+        /// bn128 (also bn254, alt_bn128). bls12381 is not supported.
+        curve: String,
+        /// 1 to 28.
+        power: String,
+        /// Defaults to powersOfTau<POWER>_0000.ptau.
+        out: Option<PathBuf>,
+    },
+    /// Add a contribution from your own entropy.
+    ///
+    /// Non-deterministic by design: the entropy string is mixed with 64 bytes from the OS
+    /// CSPRNG, so the same string twice gives two different keys.
+    Contribute {
+        ptau: PathBuf,
+        out: PathBuf,
+        #[command(flatten)]
+        contributor: Contributor,
+        #[command(flatten)]
+        entropy: Entropy,
+        #[command(flatten)]
+        backend: CeremonyBackend,
+    },
+    /// Add the final contribution from a public beacon, the one anyone can reproduce.
+    Beacon {
+        ptau: PathBuf,
+        out: PathBuf,
+        /// Hex, even length, at most 255 bytes.
+        beacon_hash: String,
+        /// SHA-256 is iterated 2^N times over the beacon hash. 10 to 63.
+        num_iterations_exp: String,
+        #[command(flatten)]
+        contributor: Contributor,
+        #[command(flatten)]
+        backend: CeremonyBackend,
+    },
+    /// Precompute the Lagrange sections phase 2 needs.
+    Prepare {
+        #[command(subcommand)]
+        cmd: PrepareCmd,
+    },
+    /// Check the contribution chain and recompute the challenge hashes.
+    Verify { ptau: PathBuf },
+}
+
+#[derive(Subcommand)]
+enum PrepareCmd {
+    /// The expensive one: every butterfly of its inverse FFT is a full point scalar
+    /// multiplication.
+    Phase2 {
+        ptau: PathBuf,
+        out: PathBuf,
+        /// cpu, metal or cuda. All must write byte-identical output; that equivalence is
+        /// what carries the snarkjs one.
+        #[arg(long, value_enum, default_value_t = BackendKind::Cpu)]
+        backend: BackendKind,
+    },
+}
+
+#[derive(Subcommand)]
+enum Groth16Cmd {
+    /// Phase-2 setup: circuit + prepared powers of tau -> an initial zkey.
+    ///
+    /// The key this writes has delta = 1 and is not safe to prove with. It is the input to
+    /// `zkey contribute`, which is what gives it a delta nobody knows.
+    Setup {
+        #[arg(default_value = "circuit.r1cs")]
+        r1cs: PathBuf,
+        #[arg(default_value = "powersoftau.ptau")]
+        ptau: PathBuf,
+        #[arg(default_value = "circuit_0000.zkey")]
+        out: PathBuf,
+        #[command(flatten)]
+        backend: CeremonyBackend,
+    },
+    /// Prove: zkey + witness -> proof.json and public.json.
+    Prove {
+        #[arg(default_value = "circuit_final.zkey")]
+        zkey: PathBuf,
+        #[arg(default_value = "witness.wtns")]
+        witness: PathBuf,
+        #[arg(default_value = "proof.json")]
         proof: PathBuf,
-        #[arg(long, value_name = "FILE")]
+        #[arg(default_value = "public.json")]
         public: PathBuf,
         #[arg(long, value_enum, default_value_t = BackendKind::Cpu)]
         backend: BackendKind,
@@ -102,9 +261,9 @@ enum Cmd {
         #[arg(long, value_name = "FILE")]
         vkey: Option<PathBuf>,
         /// When a GPU proof fails its self-verify or the device faults, prove once more on
-        /// the same backend and then on the CPU, reporting each failure on stderr. A logic
-        /// bug fails the same way every time; a transient accelerator fault does not. No
-        /// effect with --self-verify false or --backend cpu.
+        /// the same backend and then on the CPU, reporting each failure. A logic bug fails
+        /// the same way every time; a transient accelerator fault does not. No effect with
+        /// --self-verify false or --backend cpu.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         fallback: bool,
         /// MSMs whose cost follows the key and not the witness, so proving time does not
@@ -114,139 +273,19 @@ enum Cmd {
         /// metal and wgpu backends.
         #[arg(long)]
         constant_work: bool,
+        /// snarkjs' `-protocol`, which its groth16 prove accepts and never reads.
+        #[arg(long, hide = true, require_equals = true, num_args = 0..=1)]
+        protocol: Option<String>,
     },
     /// Verify a proof against snarkjs' verification_key.json.
     Verify {
-        #[arg(long, value_name = "FILE")]
+        #[arg(default_value = "verification_key.json")]
         vkey: PathBuf,
-        #[arg(long, value_name = "FILE")]
-        proof: PathBuf,
-        #[arg(long, value_name = "FILE")]
+        #[arg(default_value = "public.json")]
         public: PathBuf,
+        #[arg(default_value = "proof.json")]
+        proof: PathBuf,
     },
-    /// Print a deterministic execution trace, for diffing against another machine.
-    ///
-    /// Debugging only. It pins stage 10's blinders, so it emits no proof.json: see
-    /// `g16_core::trace`.
-    Trace {
-        #[arg(long, value_name = "FILE")]
-        zkey: PathBuf,
-        #[arg(long, value_name = "FILE")]
-        witness: PathBuf,
-        #[arg(long, value_enum, default_value_t = BackendKind::Cpu)]
-        backend: BackendKind,
-        /// Write the trace here instead of to stdout, so two of them can be diffed.
-        #[arg(long, value_name = "FILE")]
-        out: Option<PathBuf>,
-    },
-    /// Benchmark proving, cold and warm, verifying every proof.
-    Bench(bench::Args),
-    /// Groth16 phase-2 setup: circuit + prepared powers of tau -> an initial zkey.
-    ///
-    /// The key this writes has delta = 1 and is not safe to prove with. It is the input to
-    /// `zkey contribute`, which is what gives it a delta nobody knows.
-    Setup {
-        #[arg(long, value_name = "FILE")]
-        r1cs: PathBuf,
-        #[arg(long, value_name = "FILE")]
-        ptau: PathBuf,
-        #[arg(long, value_name = "FILE")]
-        out: PathBuf,
-        /// cpu or metal. Both must write byte-identical output; that equivalence is what
-        /// carries the snarkjs one.
-        #[arg(long, value_enum, default_value_t = BackendKind::Cpu)]
-        backend: BackendKind,
-    },
-    /// Powers of tau: the circuit-independent phase-1 ceremony.
-    Ptau {
-        #[command(subcommand)]
-        cmd: PtauCmd,
-    },
-    /// Proving keys: the circuit-specific phase-2 ceremony.
-    Zkey {
-        #[command(subcommand)]
-        cmd: ZkeyCmd,
-    },
-}
-
-#[derive(Subcommand)]
-enum PtauCmd {
-    /// Report the header, every section's declared and present size, and the contribution
-    /// count.
-    ///
-    /// Reads leniently, so it describes a truncated download instead of refusing to open
-    /// it. That is the only command here that does.
-    Info {
-        #[arg(long, value_name = "FILE")]
-        ptau: PathBuf,
-    },
-    /// Write a fresh accumulator at 2^POWER. Fully determined by `--power`: no randomness
-    /// and no timestamps, so two runs produce identical bytes.
-    New {
-        #[arg(long)]
-        power: u32,
-        #[arg(long, value_name = "FILE")]
-        out: PathBuf,
-    },
-    /// Add a contribution from your own entropy.
-    ///
-    /// Non-deterministic by design: the entropy string is mixed with 64 bytes from the OS
-    /// CSPRNG, so the same string twice gives two different keys.
-    Contribute {
-        #[arg(long, value_name = "FILE")]
-        ptau: PathBuf,
-        #[arg(long, value_name = "FILE")]
-        out: PathBuf,
-        #[arg(long, value_name = "STRING")]
-        entropy: String,
-        /// Recorded in the contribution and printed by every later `verify`.
-        #[arg(long, value_name = "NAME")]
-        name: Option<String>,
-        /// cpu or metal. Both must write byte-identical output; that equivalence is what
-        /// carries the snarkjs one.
-        #[arg(long, value_enum, default_value_t = BackendKind::Cpu)]
-        backend: BackendKind,
-    },
-    /// Add the final contribution from a public beacon, the one anyone can reproduce.
-    Beacon {
-        #[arg(long, value_name = "FILE")]
-        ptau: PathBuf,
-        #[arg(long, value_name = "FILE")]
-        out: PathBuf,
-        /// Hex, even length, at most 255 bytes.
-        #[arg(long, value_name = "HEX")]
-        beacon_hash: String,
-        /// SHA-256 is iterated 2^N times over the beacon hash. 10 to 63.
-        #[arg(long, value_name = "N")]
-        num_iterations_exp: String,
-        #[arg(long, value_name = "NAME")]
-        name: Option<String>,
-        /// cpu or metal. Both must write byte-identical output; that equivalence is what
-        /// carries the snarkjs one.
-        #[arg(long, value_enum, default_value_t = BackendKind::Cpu)]
-        backend: BackendKind,
-    },
-    /// Precompute the Lagrange sections phase 2 needs. This is the expensive one: every
-    /// butterfly of its inverse FFT is a full point scalar multiplication.
-    Prepare {
-        #[arg(long, value_name = "FILE")]
-        ptau: PathBuf,
-        #[arg(long, value_name = "FILE")]
-        out: PathBuf,
-        /// cpu, metal or cuda. All must write byte-identical output; that equivalence is
-        /// what carries the snarkjs one.
-        #[arg(long, value_enum, default_value_t = BackendKind::Cpu)]
-        backend: BackendKind,
-    },
-    /// Check the contribution chain and recompute the challenge hashes.
-    Verify {
-        #[arg(long, value_name = "FILE")]
-        ptau: PathBuf,
-    },
-    /// Sweep the CUDA FFT kernel variants: one NVRTC compile carries every candidate,
-    /// and the fixed context and compile cost is paid once for the whole table.
-    #[cfg(feature = "cuda")]
-    FftBench(snarkrs::fftbench::Args),
 }
 
 #[derive(Subcommand)]
@@ -254,107 +293,158 @@ enum ZkeyCmd {
     /// Add a contribution from your own entropy. Sections 3 to 7 are copied verbatim, so
     /// this costs two MSM-free rescalings and nothing else.
     Contribute {
-        #[arg(long, value_name = "FILE")]
         zkey: PathBuf,
-        #[arg(long, value_name = "FILE")]
         out: PathBuf,
-        #[arg(long, value_name = "STRING")]
-        entropy: String,
-        #[arg(long, value_name = "NAME")]
-        name: Option<String>,
-        /// cpu or metal. Both must write byte-identical output; that equivalence is what
-        /// carries the snarkjs one.
-        #[arg(long, value_enum, default_value_t = BackendKind::Cpu)]
-        backend: BackendKind,
+        #[command(flatten)]
+        contributor: Contributor,
+        #[command(flatten)]
+        entropy: Entropy,
+        #[command(flatten)]
+        backend: CeremonyBackend,
     },
     /// Add the final contribution from a public beacon.
     Beacon {
-        #[arg(long, value_name = "FILE")]
         zkey: PathBuf,
-        #[arg(long, value_name = "FILE")]
         out: PathBuf,
-        #[arg(long, value_name = "HEX")]
         beacon_hash: String,
-        #[arg(long, value_name = "N")]
         num_iterations_exp: String,
-        #[arg(long, value_name = "NAME")]
-        name: Option<String>,
-        /// cpu or metal. Both must write byte-identical output; that equivalence is what
-        /// carries the snarkjs one.
-        #[arg(long, value_enum, default_value_t = BackendKind::Cpu)]
-        backend: BackendKind,
+        #[command(flatten)]
+        contributor: Contributor,
+        #[command(flatten)]
+        backend: CeremonyBackend,
     },
     /// Check the contribution chain and that the final key is a consistent rescaling of
     /// the initial one.
-    ///
-    /// With `--init` that is all it checks: nothing ties the initial key to any circuit.
-    /// `--r1cs` re-runs the whole setup to produce the initial key itself, which is the
-    /// only form that checks the key against the circuit, and it costs a full setup.
     Verify {
-        #[arg(long, value_name = "FILE")]
-        zkey: PathBuf,
-        #[arg(long, value_name = "FILE")]
-        ptau: PathBuf,
-        #[arg(long, value_name = "FILE", conflicts_with = "init")]
-        r1cs: Option<PathBuf>,
-        #[arg(long, value_name = "FILE", required_unless_present = "r1cs")]
-        init: Option<PathBuf>,
+        #[command(subcommand)]
+        cmd: ZkeyVerifyCmd,
     },
+    Export {
+        #[command(subcommand)]
+        cmd: ZkeyExportCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ZkeyVerifyCmd {
+    /// Re-run the whole setup to produce the initial key, then check the chain from it.
+    /// The only form that checks the key against the circuit, and it costs a full setup.
+    R1cs {
+        #[arg(default_value = "circuit.r1cs")]
+        r1cs: PathBuf,
+        #[arg(default_value = "powersoftau.ptau")]
+        ptau: PathBuf,
+        #[arg(default_value = "circuit_final.zkey")]
+        zkey: PathBuf,
+    },
+    /// Check the chain from a given initial key. Nothing ties that key to any circuit.
+    Init {
+        #[arg(default_value = "circuit_0000.zkey")]
+        init: PathBuf,
+        #[arg(default_value = "powersoftau.ptau")]
+        ptau: PathBuf,
+        #[arg(default_value = "circuit_final.zkey")]
+        zkey: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum ZkeyExportCmd {
     /// Write snarkjs' verification_key.json: the four verifier points, the precomputed
     /// pairing, and IC.
-    ExportVerificationkey {
-        #[arg(long, value_name = "FILE")]
+    Verificationkey {
+        #[arg(default_value = "circuit_final.zkey")]
         zkey: PathBuf,
-        #[arg(long, value_name = "FILE")]
+        /// snarkjs' usage line says verification_key.json; the code it runs writes
+        /// circuit_vk.json, and so does this.
+        #[arg(default_value = "circuit_vk.json")]
         out: PathBuf,
     },
 }
 
-fn main() -> Result<()> {
-    match Cli::parse().cmd {
-        Cmd::Prove {
-            zkey,
-            witness,
-            proof,
-            public,
-            backend,
-            stage_timings,
-            self_verify,
-            vkey,
-            fallback,
-            constant_work,
-        } => run_prove(
-            &zkey,
-            &witness,
-            &proof,
-            &public,
-            backend,
-            stage_timings,
-            self_verify,
-            vkey.as_deref(),
-            fallback,
-            constant_work,
-        ),
-        Cmd::Verify {
-            vkey,
-            proof,
-            public,
-        } => run_verify(&vkey, &proof, &public),
+#[derive(Subcommand)]
+enum FileCmd {
+    /// Report the header, every section's declared and present size, and the contribution
+    /// count.
+    ///
+    /// Reads leniently, so it describes a truncated download instead of refusing to open
+    /// it. That is the only command here that does.
+    ///
+    /// The file is optional in snarkjs' usage line and required by the code behind it,
+    /// which throws without one. So it fails here too, with exit 1 and not clap's 99.
+    Info { file: Option<PathBuf> },
+}
+
+fn main() -> ExitCode {
+    let line = match cli::normalise(std::env::args_os()) {
+        Parsed::Clap(line) => line,
+        Parsed::Help => {
+            print!("{}", cli::help_all());
+            return ExitCode::SUCCESS;
+        }
+        Parsed::NoCommand => {
+            print!("{}", cli::help_all());
+            return ExitCode::from(BAD_USAGE);
+        }
+        Parsed::Unknown(_) => {
+            println!("Invalid command");
+            print!("{}", cli::help_all());
+            return ExitCode::from(BAD_USAGE);
+        }
+        Parsed::Unsupported(c) => {
+            let words = c.words().join(" ");
+            log::error(match c.support {
+                Support::Never => {
+                    format!("`{words}` is not supported: snarkrs is Groth16 on BN254 only")
+                }
+                _ => format!("`{words}` is a snarkjs command snarkrs does not implement yet"),
+            });
+            return ExitCode::FAILURE;
+        }
+    };
+    let cli = match Cli::try_parse_from(line) {
+        Ok(cli) => cli,
+        Err(e) => {
+            // Help and version are errors to clap and successes to everyone else.
+            let _ = e.print();
+            return match e.use_stderr() {
+                true => ExitCode::from(BAD_USAGE),
+                false => ExitCode::SUCCESS,
+            };
+        }
+    };
+    log::set_verbose(cli.verbose);
+    match run(cli.cmd) {
+        Ok(code) => ExitCode::from(code),
+        Err(e) => {
+            // `logger.error(err)` in cli.js, which prints the thrown Error as `Error: msg`.
+            log::error(format!("Error: {e:#}"));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Runs one command. `Ok(1)` is a verdict: a proof or a file that does not verify.
+fn run(cmd: Cmd) -> Result<u8> {
+    match cmd {
+        Cmd::Powersoftau { cmd } => run_ptau(cmd),
+        Cmd::Groth16 { cmd } => run_groth16(cmd),
+        Cmd::Zkey { cmd } => run_zkey(cmd),
+        Cmd::File {
+            cmd: FileCmd::Info { file },
+        } => {
+            let file = file.ok_or_else(|| anyhow::anyhow!("file info needs a file"))?;
+            run_file_info(&file).map(|()| 0)
+        }
+        Cmd::Bench(args) => bench::run(args).map(|()| 0),
         Cmd::Trace {
             zkey,
             witness,
             backend,
             out,
-        } => run_trace(&zkey, &witness, backend, out.as_deref()),
-        Cmd::Bench(args) => bench::run(args),
-        Cmd::Setup {
-            r1cs,
-            ptau,
-            out,
-            backend,
-        } => run_setup(&r1cs, &ptau, &out, backend),
-        Cmd::Ptau { cmd } => run_ptau(cmd),
-        Cmd::Zkey { cmd } => run_zkey(cmd),
+        } => run_trace(&zkey, &witness, backend, out.as_deref()).map(|()| 0),
+        #[cfg(feature = "cuda")]
+        Cmd::FftBench(args) => snarkrs::fftbench::run(args).map(|()| 0),
     }
 }
 
@@ -488,212 +578,361 @@ fn no_wgpu() -> anyhow::Error {
     )
 }
 
-fn run_setup(
-    r1cs: &std::path::Path,
-    ptau: &std::path::Path,
-    out: &std::path::Path,
-    backend: BackendKind,
-) -> Result<()> {
-    let msm = msm_backend(backend)?;
-    let report = setup::setup(r1cs, ptau, out, msm.as_ref())
-        .with_context(|| format!("setting up {}", r1cs.display()))?;
-    println!("constraints    {}", report.n_constraints);
-    println!("vars           {}", report.n_vars);
-    println!("public         {}", report.n_public);
-    println!(
-        "domain size    {} (2^{})",
-        report.domain_size, report.cir_power
-    );
-    println!("coefficients   {}", report.n_coefs);
-    println!("circuit hash   {}", hex::encode(report.cs_hash));
-    eprintln!("wrote {}", out.display());
-    Ok(())
+/// `getRandomRng` in snarkjs' `misc.js`: no `-e`, or an empty one, and the contributor is
+/// asked on stdin until they type something. A closed stdin is an error rather than
+/// snarkjs' silent exit, so a script that forgot `-e` fails instead of hanging.
+fn entropy_or_prompt(given: Option<String>) -> Result<String> {
+    if let Some(e) = given.filter(|e| !e.is_empty()) {
+        return Ok(e);
+    }
+    use std::io::{BufRead, Write};
+    let stdin = std::io::stdin();
+    loop {
+        print!("Enter a random text. (Entropy): ");
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        if stdin.lock().read_line(&mut line)? == 0 {
+            anyhow::bail!("no entropy: stdin closed before a line was read. Pass -e=TEXT");
+        }
+        let line = line.trim_end_matches(['\r', '\n']);
+        if !line.is_empty() {
+            return Ok(line.to_string());
+        }
+    }
 }
 
-fn run_ptau(cmd: PtauCmd) -> Result<()> {
+fn run_ptau(cmd: PtauCmd) -> Result<u8> {
     match cmd {
-        #[cfg(feature = "cuda")]
-        PtauCmd::FftBench(args) => snarkrs::fftbench::run(args),
-        PtauCmd::Info { ptau } => {
-            let file = ptau_file::Ptau::open_lenient(&ptau)
-                .with_context(|| format!("opening {}", ptau.display()))?;
-            let info = file.info();
-            println!("power          {}", info.power);
-            println!("ceremony power {}", info.ceremony_power);
-            println!("prepared       {}", info.prepared);
-            println!("contributions  {}", info.n_contributions);
-            println!(
-                "sections       {} of {} declared",
-                info.sections.len(),
-                info.declared_sections
-            );
-            println!(
-                "bytes          {} (chain ends at {})",
-                info.file_bytes, info.chain_end
-            );
-            // Declared, present and expected are printed side by side rather than reduced
-            // to a verdict: a length that is short is truncation, a length that disagrees
-            // with `power` is corruption, and the two need different responses.
-            println!("  id     declared      present     expected");
-            for s in &info.sections {
-                let expected = match s.expected {
-                    Some(e) => e.to_string(),
-                    None => "-".to_string(),
-                };
-                println!(
-                    "  {:>3} {:>12} {:>12} {:>12}",
-                    s.id, s.declared, s.present, expected
-                );
-            }
-            if let Some(t) = info.truncation {
-                println!(
-                    "TRUNCATED: section {:?} declares {} bytes, {} present",
-                    t.section, t.declared, t.present
-                );
-            }
-            Ok(())
-        }
-        PtauCmd::New { power, out } => {
+        PtauCmd::New { curve, power, out } => {
+            cli::check_curve(&curve)?;
+            let power: u32 = power
+                .parse()
+                .ok()
+                .filter(|p| (1..=28).contains(p))
+                .ok_or_else(|| anyhow::anyhow!("Power must be between 1 and 28"))?;
+            let out = out.unwrap_or_else(|| format!("powersOfTau{power}_0000.ptau").into());
             let challenge = phase1::ptau_new(power, &out)
                 .with_context(|| format!("writing {}", out.display()))?;
-            println!("first challenge {}", hex::encode(challenge));
-            eprintln!("wrote {}", out.display());
-            Ok(())
+            log::info(log::format_hash(&challenge, "First Contribution Hash:"));
+            log::debug(format!("wrote {}", out.display()));
         }
         PtauCmd::Contribute {
             ptau,
             out,
+            contributor,
             entropy,
-            name,
             backend,
         } => {
-            let key = key_backend(backend)?;
-            let report = phase1::contribute(&ptau, &out, name.as_deref(), &entropy, key.as_ref())
-                .with_context(|| format!("contributing to {}", ptau.display()))?;
-            print_phase1(&report);
-            eprintln!("wrote {}", out.display());
-            Ok(())
+            let key = key_backend(backend.backend)?;
+            let entropy = entropy_or_prompt(entropy.entropy)?;
+            let report = phase1::contribute(
+                &ptau,
+                &out,
+                contributor.name.as_deref(),
+                &entropy,
+                key.as_ref(),
+            )
+            .with_context(|| format!("contributing to {}", ptau.display()))?;
+            print_phase1(&report, &out);
         }
         PtauCmd::Beacon {
             ptau,
             out,
             beacon_hash,
             num_iterations_exp,
-            name,
+            contributor,
             backend,
         } => {
             let (hash, exp) = phase1::parse_beacon_args(&beacon_hash, &num_iterations_exp)?;
-            let key = key_backend(backend)?;
-            let report = phase1::beacon(&ptau, &out, name.as_deref(), &hash, exp, key.as_ref())
-                .with_context(|| format!("beaconing {}", ptau.display()))?;
-            print_phase1(&report);
-            eprintln!("wrote {}", out.display());
-            Ok(())
+            let key = key_backend(backend.backend)?;
+            let report = phase1::beacon(
+                &ptau,
+                &out,
+                contributor.name.as_deref(),
+                &hash,
+                exp,
+                key.as_ref(),
+            )
+            .with_context(|| format!("beaconing {}", ptau.display()))?;
+            print_phase1(&report, &out);
         }
-        PtauCmd::Prepare { ptau, out, backend } => {
+        PtauCmd::Prepare {
+            cmd: PrepareCmd::Phase2 { ptau, out, backend },
+        } => {
             let fft = fft_backend(backend)?;
             prepare::prepare_phase2(&ptau, &out, fft.as_ref())
                 .with_context(|| format!("preparing {}", ptau.display()))?;
-            eprintln!("wrote {}", out.display());
-            Ok(())
+            log::debug(format!("wrote {}", out.display()));
         }
         PtauCmd::Verify { ptau } => {
-            let report =
-                phase1::verify(&ptau).with_context(|| format!("verifying {}", ptau.display()))?;
-            println!("power          {}", report.power);
-            println!("ceremony power {}", report.ceremony_power);
-            println!("prepared       {}", report.prepared);
-            for (i, h) in report.contribution_hashes.iter().enumerate() {
-                println!("contribution {i:>3} {}", hex::encode(h));
+            let report = match phase1::verify(&ptau) {
+                Ok(r) => r,
+                // A file that does not verify is a verdict, as in snarkjs: the reason on
+                // an ERROR line and exit 1.
+                Err(e) => {
+                    log::error(format!("{:#}", anyhow::Error::from(e)));
+                    return Ok(1);
+                }
+            };
+            log::info("Powers Of tau file OK!");
+            log::debug(format!(
+                "power {}, ceremony power {}, prepared {}",
+                report.power, report.ceremony_power, report.prepared
+            ));
+            // Newest first, as `powersoftau_verify.js` prints them.
+            for (i, h) in report.contribution_hashes.iter().enumerate().rev() {
+                log::info("-----------------------------------------------------");
+                log::info(format!("Contribution #{}:", i + 1));
+                log::info(log::format_hash(h, "Response Hash:"));
             }
+            log::info("-----------------------------------------------------");
             // Saying which check was skipped is the point: a truncated file cannot have
             // its final next-challenge compared, and reporting "OK" without that caveat
             // overstates what was verified.
             if !report.next_challenge_checked {
-                println!("next challenge NOT checked: this file is truncated");
+                log::warn("next challenge NOT checked: this file is truncated");
             }
-            println!("OK");
-            Ok(())
+            if !report.prepared {
+                log::warn(
+                    "this file does not contain phase2 precalculated values. Please run: \n   \
+                     snarkrs \"powersoftau prepare phase2\" to prepare this file to be used in \
+                     the phase2 ceremony.",
+                );
+            }
+            log::info("Powers of Tau Ok!");
         }
+    }
+    Ok(0)
+}
+
+fn print_phase1(report: &phase1::Phase1Report, out: &Path) {
+    log::info(log::format_hash(
+        &report.response_hash,
+        "Contribution Response Hash imported: ",
+    ));
+    log::info(log::format_hash(
+        &report.next_challenge,
+        "Next Challenge Hash: ",
+    ));
+    log::debug(format!(
+        "contribution #{} written to {}",
+        report.index,
+        out.display()
+    ));
+}
+
+fn run_groth16(cmd: Groth16Cmd) -> Result<u8> {
+    match cmd {
+        Groth16Cmd::Setup {
+            r1cs,
+            ptau,
+            out,
+            backend,
+        } => {
+            let msm = msm_backend(backend.backend)?;
+            let report = setup::setup(&r1cs, &ptau, &out, msm.as_ref())
+                .with_context(|| format!("setting up {}", r1cs.display()))?;
+            log::debug(format!(
+                "constraints {}, vars {}, public {}, domain size {} (2^{}), coefficients {}",
+                report.n_constraints,
+                report.n_vars,
+                report.n_public,
+                report.domain_size,
+                report.cir_power,
+                report.n_coefs
+            ));
+            log::info(log::format_hash(&report.cs_hash, "Circuit hash: "));
+            log::debug(format!("wrote {}", out.display()));
+            Ok(0)
+        }
+        Groth16Cmd::Prove {
+            zkey,
+            witness,
+            proof,
+            public,
+            backend,
+            stage_timings,
+            self_verify,
+            vkey,
+            fallback,
+            constant_work,
+            protocol: _,
+        } => run_prove(
+            &zkey,
+            &witness,
+            &proof,
+            &public,
+            backend,
+            stage_timings,
+            self_verify,
+            vkey.as_deref(),
+            fallback,
+            constant_work,
+        )
+        .map(|()| 0),
+        Groth16Cmd::Verify {
+            vkey,
+            public,
+            proof,
+        } => run_verify(&vkey, &public, &proof),
     }
 }
 
-fn print_phase1(report: &phase1::Phase1Report) {
-    println!("contribution   {}", report.index);
-    println!("response hash  {}", hex::encode(report.response_hash));
-    println!("next challenge {}", hex::encode(report.next_challenge));
-}
-
-fn run_zkey(cmd: ZkeyCmd) -> Result<()> {
+fn run_zkey(cmd: ZkeyCmd) -> Result<u8> {
     match cmd {
         ZkeyCmd::Contribute {
             zkey,
             out,
+            contributor,
             entropy,
-            name,
             backend,
         } => {
-            let key = key_backend(backend)?;
-            let report = zkey_mpc::contribute(&zkey, &out, name.as_deref(), &entropy, key.as_ref())
-                .with_context(|| format!("contributing to {}", zkey.display()))?;
-            println!("contribution   {}", report.index);
-            println!("hash           {}", hex::encode(report.hash));
-            eprintln!("wrote {}", out.display());
-            Ok(())
+            let key = key_backend(backend.backend)?;
+            let entropy = entropy_or_prompt(entropy.entropy)?;
+            let report = zkey_mpc::contribute(
+                &zkey,
+                &out,
+                contributor.name.as_deref(),
+                &entropy,
+                key.as_ref(),
+            )
+            .with_context(|| format!("contributing to {}", zkey.display()))?;
+            log::info(log::format_hash(&report.hash, "Contribution Hash: "));
+            log::debug(format!(
+                "contribution #{} written to {}",
+                report.index,
+                out.display()
+            ));
         }
         ZkeyCmd::Beacon {
             zkey,
             out,
             beacon_hash,
             num_iterations_exp,
-            name,
+            contributor,
             backend,
         } => {
             let (hash, exp) = phase1::parse_beacon_args(&beacon_hash, &num_iterations_exp)?;
-            let key = key_backend(backend)?;
-            let report = zkey_mpc::beacon(&zkey, &out, name.as_deref(), &hash, exp, key.as_ref())
-                .with_context(|| format!("beaconing {}", zkey.display()))?;
-            println!("contribution   {}", report.index);
-            println!("hash           {}", hex::encode(report.hash));
-            eprintln!("wrote {}", out.display());
-            Ok(())
+            let key = key_backend(backend.backend)?;
+            let report = zkey_mpc::beacon(
+                &zkey,
+                &out,
+                contributor.name.as_deref(),
+                &hash,
+                exp,
+                key.as_ref(),
+            )
+            .with_context(|| format!("beaconing {}", zkey.display()))?;
+            log::info(log::format_hash(&report.hash, "Contribution Hash: "));
+            log::debug(format!(
+                "contribution #{} written to {}",
+                report.index,
+                out.display()
+            ));
         }
-        ZkeyCmd::Verify {
-            zkey,
-            ptau,
-            r1cs,
-            init,
-        } => {
-            // No `--backend`: with `--r1cs` this re-runs the whole setup, and a verifier
-            // that shares the accelerator with the thing it is checking checks less.
+        ZkeyCmd::Verify { cmd } => {
+            // No `--backend`: with the r1cs form this re-runs the whole setup, and a
+            // verifier that shares the accelerator with the thing it is checking checks less.
             let msm = msm_backend(BackendKind::Cpu)?;
-            let report = match (&r1cs, &init) {
-                (Some(r1cs), _) => zkey_mpc::verify_from_r1cs(r1cs, &ptau, &zkey, msm.as_ref()),
-                (None, Some(init)) => zkey_mpc::verify_from_init(init, &ptau, &zkey, msm.as_ref()),
-                // clap's `required_unless_present` already rules this out; the arm exists
-                // so the match is total rather than a panic waiting for a flag change.
-                (None, None) => anyhow::bail!("one of --r1cs or --init is required"),
+            let (report, zkey) = match &cmd {
+                ZkeyVerifyCmd::R1cs { r1cs, ptau, zkey } => (
+                    zkey_mpc::verify_from_r1cs(r1cs, ptau, zkey, msm.as_ref()),
+                    zkey,
+                ),
+                ZkeyVerifyCmd::Init { init, ptau, zkey } => (
+                    zkey_mpc::verify_from_init(init, ptau, zkey, msm.as_ref()),
+                    zkey,
+                ),
+            };
+            let report = match report {
+                Ok(r) => r,
+                Err(e) => {
+                    let e = anyhow::Error::from(e).context(format!("verifying {}", zkey.display()));
+                    log::error(format!("{e:#}"));
+                    return Ok(1);
+                }
+            };
+            log::debug(format!(
+                "vars {}, public {}, domain size {}",
+                report.n_vars, report.n_public, report.domain_size
+            ));
+            // Newest first, as `zkey_verify_frominit.js` prints them.
+            for (i, h) in report.contribution_hashes.iter().enumerate().rev() {
+                log::info("-------------------------");
+                log::info(log::format_hash(h, &format!("contribution #{}:", i + 1)));
             }
-            .with_context(|| format!("verifying {}", zkey.display()))?;
-            println!("vars           {}", report.n_vars);
-            println!("public         {}", report.n_public);
-            println!("domain size    {}", report.domain_size);
-            for (i, h) in report.contribution_hashes.iter().enumerate() {
-                println!("contribution {i:>3} {}", hex::encode(h));
+            log::info("-------------------------");
+            if matches!(cmd, ZkeyVerifyCmd::Init { .. }) {
+                log::debug("the init form checks the chain, not that the key matches a circuit");
             }
-            if r1cs.is_none() {
-                println!("note: --init checks the chain, not that the key matches a circuit");
-            }
-            println!("OK");
-            Ok(())
+            log::info("ZKey Ok!");
         }
-        ZkeyCmd::ExportVerificationkey { zkey, out } => {
+        ZkeyCmd::Export {
+            cmd: ZkeyExportCmd::Verificationkey { zkey, out },
+        } => {
+            log::info("EXPORT VERIFICATION KEY STARTED");
             vkey::export_verification_key(&zkey, &out)
                 .with_context(|| format!("exporting from {}", zkey.display()))?;
-            eprintln!("wrote {}", out.display());
-            Ok(())
+            log::info("> Detected protocol: groth16");
+            log::info("EXPORT VERIFICATION KEY FINISHED");
+            log::debug(format!("wrote {}", out.display()));
         }
     }
+    Ok(0)
+}
+
+/// `file info`. For a ptau this is our lenient report rather than snarkjs' section table:
+/// it keeps working on a truncated download, which is when anyone runs it.
+fn run_file_info(file: &Path) -> Result<()> {
+    let ext = file
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default();
+    match ext {
+        "ptau" => {}
+        // TODO: a generic iden3 binfile reader for the other three.
+        "zkey" | "r1cs" | "wtns" => {
+            anyhow::bail!("file info for .{ext} files is not implemented yet, only .ptau")
+        }
+        _ => anyhow::bail!("Extension {ext} is not allowed."),
+    }
+    let file = ptau_file::Ptau::open_lenient(file)
+        .with_context(|| format!("opening {}", file.display()))?;
+    let info = file.info();
+    println!("power          {}", info.power);
+    println!("ceremony power {}", info.ceremony_power);
+    println!("prepared       {}", info.prepared);
+    println!("contributions  {}", info.n_contributions);
+    println!(
+        "sections       {} of {} declared",
+        info.sections.len(),
+        info.declared_sections
+    );
+    println!(
+        "bytes          {} (chain ends at {})",
+        info.file_bytes, info.chain_end
+    );
+    // Declared, present and expected are printed side by side rather than reduced to a
+    // verdict: a length that is short is truncation, a length that disagrees with `power`
+    // is corruption, and the two need different responses.
+    println!("  id     declared      present     expected");
+    for s in &info.sections {
+        let expected = match s.expected {
+            Some(e) => e.to_string(),
+            None => "-".to_string(),
+        };
+        println!(
+            "  {:>3} {:>12} {:>12} {:>12}",
+            s.id, s.declared, s.present, expected
+        );
+    }
+    if let Some(t) = info.truncation {
+        println!(
+            "TRUNCATED: section {:?} declares {} bytes, {} present",
+            t.section, t.declared, t.present
+        );
+    }
+    Ok(())
 }
 
 fn run_prove(
@@ -768,7 +1007,7 @@ fn run_prove(
 
     // Stage 10's blinders come from the OS CSPRNG. Nothing on this command offers a seed
     // override: a reused (r, s) across two proofs of different witnesses leaks the witness.
-    // `g16 trace` does fix them, and writes no proof.json for exactly that reason.
+    // `snarkrs trace` does fix them, and writes no proof.json for exactly that reason.
     let mut rng = ark_std::rand::thread_rng();
     let mut t = StageTimings::default();
     let started = std::time::Instant::now();
@@ -925,23 +1164,65 @@ fn run_trace(
     Ok(())
 }
 
-fn run_verify(
-    vkey: &std::path::Path,
-    proof: &std::path::Path,
-    public: &std::path::Path,
-) -> Result<()> {
+/// `groth16 verify`: the verdict on an INFO or ERROR line and in the exit code, worded as
+/// `groth16_verify.js` words it. A file that cannot be read is an error, not a verdict.
+fn run_verify(vkey: &Path, public: &Path, proof: &Path) -> Result<u8> {
     let vk =
         VerifyingKey::from_json(vkey).with_context(|| format!("loading {}", vkey.display()))?;
     let public = json::read_public(public)?;
     let proof = json::read_proof(proof)?;
-    verify(&vk, &public, &proof)?;
-    println!("OK");
-    Ok(())
+    match verify(&vk, &public, &proof) {
+        Ok(()) => {
+            log::info("OK!");
+            Ok(0)
+        }
+        Err(VerifyError::PairingFailed) => {
+            log::error("Invalid proof");
+            Ok(1)
+        }
+        Err(VerifyError::InvalidProof(what)) => {
+            log::error("Proof commitments are not valid.");
+            log::debug(format!("proof element {what}"));
+            Ok(1)
+        }
+        Err(e) => {
+            log::error(format!("Invalid proof: {e}"));
+            Ok(1)
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// clap checks a derive tree only when asked, and a clash between a global `--verbose`
+    /// and a subcommand's flag would otherwise surface as a panic on some user's line.
+    #[test]
+    fn the_clap_tree_is_consistent() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
+
+    /// Every command the table marks as supported has to reach a clap subcommand, or the
+    /// normaliser hands clap words it rejects with exit 99.
+    #[test]
+    fn every_supported_snarkjs_command_parses() {
+        for c in cli::COMMANDS.iter().filter(|c| c.support == Support::Yes) {
+            let mut line = vec!["snarkrs".to_string()];
+            line.extend(c.words().iter().map(|w| w.to_string()));
+            // The required positionals, so only the words are under test.
+            let required = c
+                .params()
+                .split_whitespace()
+                .filter(|p| p.starts_with('<'))
+                .count();
+            line.extend((0..required).map(|i| format!("p{i}")));
+            if let Err(e) = Cli::try_parse_from(&line) {
+                panic!("{line:?}: {e}");
+            }
+        }
+    }
 
     /// Every seam needs a CPU implementation under the same spelling, because
     /// `--backend cpu` is the file every accelerated run is `cmp`'d against and the only

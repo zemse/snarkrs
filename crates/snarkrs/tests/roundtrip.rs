@@ -1,4 +1,4 @@
-//! End-to-end tests that drive the real `g16` binary.
+//! End-to-end tests that drive the real `snarkrs` binary.
 //!
 //! These exist because unit tests on the JSON module can only prove that our reader and
 //! our writer agree with each other. The thing that actually has to hold is that
@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-fn g16() -> &'static str {
+fn snarkrs() -> &'static str {
     env!("CARGO_BIN_EXE_snarkrs")
 }
 
@@ -79,16 +79,13 @@ fn prove_with(v: &Variant, out: &Path, backend: &str, extra: &[&str]) -> (PathBu
     let public = out.join("public.json");
     // No `G16_WGPU_LIMITS`: wgpu proves at its default floor profile, anon-aadhaar's 140.9 MB
     // of G2 bases included, since the backend chunks a base vector over the binding limit.
-    let o = run(Command::new(g16())
+    let o = run(Command::new(snarkrs())
         .args([
+            "groth16",
             "prove",
-            "--zkey",
             v.dir.join("circuit.zkey").to_str().unwrap(),
-            "--witness",
             v.dir.join("circuit.wtns").to_str().unwrap(),
-            "--proof",
             proof.to_str().unwrap(),
-            "--public",
             public.to_str().unwrap(),
             "--backend",
             backend,
@@ -122,14 +119,12 @@ fn each(test: &str, f: impl Fn(&Variant, &Path)) {
 fn prove_then_verify_round_trips() {
     each("prove_then_verify", |v, out| {
         let (proof, public) = prove(v, out);
-        let o = run(Command::new(g16()).args([
+        let o = run(Command::new(snarkrs()).args([
+            "groth16",
             "verify",
-            "--vkey",
             v.dir.join("vkey.json").to_str().unwrap(),
-            "--proof",
-            proof.to_str().unwrap(),
-            "--public",
             public.to_str().unwrap(),
+            proof.to_str().unwrap(),
         ]));
         assert!(
             o.status.success(),
@@ -255,14 +250,12 @@ fn verify_rejects_a_tampered_public_input() {
         let tampered = out.join("public-tampered.json");
         std::fs::write(&tampered, serde_json::to_string(&signals).unwrap()).unwrap();
 
-        let o = run(Command::new(g16()).args([
+        let o = run(Command::new(snarkrs()).args([
+            "groth16",
             "verify",
-            "--vkey",
             v.dir.join("vkey.json").to_str().unwrap(),
-            "--proof",
-            proof.to_str().unwrap(),
-            "--public",
             tampered.to_str().unwrap(),
+            proof.to_str().unwrap(),
         ]));
         assert!(
             !o.status.success(),
@@ -283,7 +276,7 @@ fn bench_writes_a_verified_csv() {
     };
     let out = scratch("bench");
     let csv = out.join("bench.csv");
-    let o = run(Command::new(g16()).args([
+    let o = run(Command::new(snarkrs()).args([
         "bench",
         "--artifacts",
         artifacts_root().to_str().unwrap(),
@@ -367,7 +360,7 @@ fn bench_writes_a_verified_csv() {
 
 #[test]
 fn bench_rejects_an_unknown_variant() {
-    let o = run(Command::new(g16()).args([
+    let o = run(Command::new(snarkrs()).args([
         "bench",
         "--artifacts",
         artifacts_root().to_str().unwrap(),
@@ -389,15 +382,12 @@ fn metal_without_the_feature_fails_with_a_clear_message() {
         return;
     };
     let out = scratch("metal");
-    let o = run(Command::new(g16()).args([
+    let o = run(Command::new(snarkrs()).args([
+        "groth16",
         "prove",
-        "--zkey",
         v.dir.join("circuit.zkey").to_str().unwrap(),
-        "--witness",
         v.dir.join("circuit.wtns").to_str().unwrap(),
-        "--proof",
         out.join("proof.json").to_str().unwrap(),
-        "--public",
         out.join("public.json").to_str().unwrap(),
         "--backend",
         "metal",

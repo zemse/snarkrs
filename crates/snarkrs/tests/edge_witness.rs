@@ -207,14 +207,11 @@ fn the_wtns_loader_rejects_a_non_one_constant_wire() {
     let proof = out.join("proof.json");
     let o = Command::new(env!("CARGO_BIN_EXE_snarkrs"))
         .args([
+            "groth16",
             "prove",
-            "--zkey",
             v.dir.join("circuit.zkey").to_str().unwrap(),
-            "--witness",
             wtns.to_str().unwrap(),
-            "--proof",
             proof.to_str().unwrap(),
-            "--public",
             out.join("public.json").to_str().unwrap(),
             "--backend",
             "cpu",
@@ -362,14 +359,11 @@ fn the_cli_rejects_a_truncated_witness_without_panicking() {
     let proof = out.join("proof.json");
     let o = Command::new(env!("CARGO_BIN_EXE_snarkrs"))
         .args([
+            "groth16",
             "prove",
-            "--zkey",
             v.dir.join("circuit.zkey").to_str().unwrap(),
-            "--witness",
             wtns.to_str().unwrap(),
-            "--proof",
             proof.to_str().unwrap(),
-            "--public",
             out.join("public.json").to_str().unwrap(),
             "--backend",
             "cpu",

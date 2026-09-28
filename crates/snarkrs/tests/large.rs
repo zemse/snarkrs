@@ -18,7 +18,7 @@ use std::process::{Command, Output};
 
 use snarkrs::artifacts::variants;
 
-fn g16() -> &'static str {
+fn snarkrs() -> &'static str {
     env!("CARGO_BIN_EXE_snarkrs")
 }
 
@@ -89,15 +89,12 @@ fn every_backend_proves_the_large_artifacts() {
             // No `G16_WGPU_LIMITS`: wgpu proves this at its default floor profile, which is
             // the point. The 567 MB of CSR values, the 256 MiB H query and the 431 MB G2
             // query are all over the floor's 128 MiB binding, and the backend chunks them.
-            let o = run(Command::new(g16()).args([
+            let o = run(Command::new(snarkrs()).args([
+                "groth16",
                 "prove",
-                "--zkey",
                 v.zkey().to_str().unwrap(),
-                "--witness",
                 v.wtns().to_str().unwrap(),
-                "--proof",
                 proof.to_str().unwrap(),
-                "--public",
                 public.to_str().unwrap(),
                 "--backend",
                 &backend,
@@ -119,14 +116,12 @@ fn every_backend_proves_the_large_artifacts() {
                 ));
             }
 
-            let o = run(Command::new(g16()).args([
+            let o = run(Command::new(snarkrs()).args([
+                "groth16",
                 "verify",
-                "--vkey",
                 v.vkey().to_str().unwrap(),
-                "--proof",
-                proof.to_str().unwrap(),
-                "--public",
                 public.to_str().unwrap(),
+                proof.to_str().unwrap(),
             ]));
             if !o.status.success() || !text(&o).contains("OK") {
                 failures.push(format!("{tag}: our verifier rejected it: {}", text(&o)));

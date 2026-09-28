@@ -1,14 +1,16 @@
-//! Everything `g16` does that is not argument parsing.
+//! Everything `snarkrs` does besides dispatching commands, and the snarkjs command line itself.
 //!
 //! Split out of `main.rs` so the JSON encoding and the benchmark can be tested directly
 //! instead of only through the process boundary.
 
 pub mod artifacts;
 pub mod bench;
+pub mod cli;
 pub mod fallback;
 #[cfg(feature = "cuda")]
 pub mod fftbench;
 pub mod json;
+pub mod log;
 
 use anyhow::Result;
 use g16_core::{cpu::CpuBackend, Backend};
