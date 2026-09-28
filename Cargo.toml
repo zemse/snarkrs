@@ -13,6 +13,7 @@ members = [
     "crates/g16-cuda",
     "crates/g16-wgpu",
     "crates/g16-wasm",
+    "crates/g16-witness",
     "crates/snarkrs",
 ]
 # Its own workspace: it links a C++ witness generator and pulls rand, sha3 and
@@ -83,6 +84,7 @@ g16-metal = { path = "crates/g16-metal" }
 g16-cuda  = { path = "crates/g16-cuda" }
 g16-wgpu  = { path = "crates/g16-wgpu" }
 g16-wasm  = { path = "crates/g16-wasm" }
+g16-witness = { path = "crates/g16-witness" }
 
 [profile.release]
 opt-level = 3
