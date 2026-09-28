@@ -43,8 +43,8 @@
 //! element, so `WgpuCircuit::backend_name` can honestly say "wgpu" for the whole proof.
 //! There is deliberately no "small circuits go to the CPU" gate either, for the reason
 //! `g16-metal` gives: a gate that quietly ran the other backend would make
-//! `g16 prove --backend wgpu` report a number that belongs to somebody else. The crossover is
-//! a measurement to publish, and `tests/proof.rs` publishes it.
+//! `snarkrs groth16 prove --backend wgpu` report a number that belongs to somebody else.
+//! The crossover is a measurement to publish, and `tests/proof.rs` publishes it.
 
 use std::sync::Arc;
 // Not `std::time`: `Instant::now()` panics at run time on wasm32-unknown-unknown, and every
@@ -398,14 +398,15 @@ impl WgpuCircuit {
     /// of its pass, and a kill anywhere in it leaves the token missing and the retry
     /// re-uploading the witness and the parameters and nothing else: the key stays as the
     /// cut copy left it, every later token is present, and the proof is wrong. In about
-    /// 900 `g16 prove` calls under load, each a fresh process, all 3 whose first submission
-    /// was refused proved wrong (BUG-33), while 30 stage 0-4 refusals in one process with
-    /// the key long resident retried exactly; `tests/abort_probe.rs` over 1,200 fresh
-    /// circuits under the same load had 14 first submissions refused, and the 4 that then
-    /// proved wrong had `H` zero at every entry and all five MSMs wrong, which is a gather
-    /// over a CSR and MSMs over bases the cut copy never delivered. The epoch's copy is
-    /// the last one queued, so a blit encoder cut anywhere before it leaves the token
-    /// missing and this refuses it; [`WgpuProver::prepare`] then uploads the key again.
+    /// 900 `snarkrs groth16 prove` calls under load, each a fresh process, all 3 whose
+    /// first submission was refused proved wrong (BUG-33), while 30 stage 0-4 refusals in
+    /// one process with the key long resident retried exactly; `tests/abort_probe.rs` over
+    /// 1,200 fresh circuits under the same load had 14 first submissions refused, and the 4
+    /// that then proved wrong had `H` zero at every entry and all five MSMs wrong, which is
+    /// a gather over a CSR and MSMs over bases the cut copy never delivered. The epoch's
+    /// copy is the last one queued, so a blit encoder cut anywhere before it leaves the
+    /// token missing and this refuses it; [`WgpuProver::prepare`] then uploads the key
+    /// again.
     pub async fn key_landed(&self) -> Result<(), ProveError> {
         let seal = Seal::new(&self.device, "g16 key upload")?;
         let mut enc =

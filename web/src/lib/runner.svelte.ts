@@ -46,7 +46,7 @@ export type Row = {
   stages?: Record<string, number>;
   snarkjsWorkers?: number | null;
   /// `?trace=1` only: the GPU's deterministic trace and the CPU control's, as the plain text
-  /// `g16 trace` writes, so the two are `diff`-able against a laptop's with no reformatting.
+  /// `snarkrs trace` writes, so the two are `diff`-able against a laptop's with no reformatting.
   trace?: { gpu?: string; cpu?: string; error?: string };
   /// Each prover's proof, checked by the other one's verifier.
   crossVerified?: boolean;
@@ -139,7 +139,7 @@ export class Run {
   /// may publish and neither is a measurement; see `g16_core::trace`.
   ///
   /// This is the tool for a device that completes a proof and gets it rejected. `diff` the
-  /// GPU block against `g16 trace --backend cpu` on a laptop and the first row that differs
+  /// GPU block against `snarkrs trace --backend cpu` on a laptop and the first row that differs
   /// names the stage. The CPU block is the control that says whether to suspect the GPU at
   /// all: every browser on iOS is WebKit, so there is no second engine there to ask.
   private readonly traceMode = new URLSearchParams(q()).get('trace') === '1';
@@ -431,7 +431,7 @@ export class Run {
           (r.note ? ` note ${r.note}` : '')
       ),
       // Last, and verbatim. This block is the whole output of `?trace=1` and the reader's
-      // next move is to paste it into a file and `diff` it against `g16 trace` on a laptop,
+      // next move is to paste it into a file and `diff` it against `snarkrs trace` on a laptop,
       // so nothing here may be summarised, wrapped or re-ordered.
       ...this.rows.flatMap((r) =>
         r.trace

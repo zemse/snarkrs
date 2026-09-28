@@ -31,7 +31,7 @@ to that tree; the table that follows says what has landed since.
 | 15 | Bucket-clear couplings | Fixed, `dd21174` |
 | 16 | Exceptional additions untested | Fixed, `dd21174` |
 | 18, 19 | Section-count reservation, 32-bit arithmetic | Accepted risk |
-| 20 | Section 10 never read | Accepted risk; `g16 zkey verify` is the non-circular check |
+| 20 | Section 10 never read | Accepted risk; `snarkrs zkey verify` is the non-circular check |
 | 21, 22 | Infinity in a proof, degenerate key | Fixed, `d170f78` |
 | 23 | Empty IC panics | Fixed, `b46c3e8` |
 | 24 | `multi_pairing` unwraps | Fixed, `b48d1b7` |
@@ -54,7 +54,7 @@ read back by computing the honest `C` from `A` and `B`. Run, not reasoned:
 The defence is the self-verify that `prove` now runs by default: with `delta` nonzero in both
 groups `A` and `B` are uniform, so a proof that verifies under a fixed key has `C` determined
 by `A`, `B` and the statement. What is left is one bit per call, whether that check passed,
-and the key chooses the linear condition on the witness that decides it. Only `g16 zkey
+and the key chooses the linear condition on the witness that decides it. Only `snarkrs zkey
 verify` against the circuit and the ptau closes that, and `prove_unchecked` is exposed to the
 whole leak.
 
@@ -83,7 +83,7 @@ Four dimensions, each read line by line and then attacked.
 **Untrusted inputs** (`g16-zkey`). Every line of `binfile.rs`, `lib.rs` and `wtns.rs`
 read. Then **60 crafted mutants** of `bench/artifacts/tiny_mul/circuit.zkey` and
 `circuit.wtns` plus two live timing races against the 94 MB `js_16x16_d32` key, all run
-through `target/release/g16`. Executed, not reasoned: the 34 GB allocation, the SIGBUS,
+through the release binary (then `g16`, now `snarkrs`). Executed, not reasoned: the 34 GB allocation, the SIGBUS,
 the SIGABRT, and the zero-knowledge break all have run output behind them.
 
 **Verifier soundness** (`g16-core/src/verify.rs`, `g16-cli/src/json.rs`, the vkey reader
@@ -219,7 +219,7 @@ reported and the proving path did not retry; 10 of 20 runs failed while the mach
 `a_retried_submission_gives_the_same_proof` pins that a retry is exact. Under a deliberate
 three-process overload the GPU hung and recovered, and one unchecked proof came back wrong:
 **open**, and `prove`'s self-verify is the guard for that case. Follow-up `7f34c54`: when the retries run
-out, or wgpu loses the device, the error is `ProveError::Device`, and `g16 prove`'s fallback
+out, or wgpu loses the device, the error is `ProveError::Device`, and `snarkrs groth16 prove`'s fallback
 retries it once on the device and then proves on the CPU instead of failing.
 
 The same kill reaches the wgpu backend, and wgpu 30 does not report it: wgpu-hal's Metal fence

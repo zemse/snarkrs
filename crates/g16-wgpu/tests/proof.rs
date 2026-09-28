@@ -846,10 +846,10 @@ fn an_empty_group_dispatches_nothing_and_keeps_its_result_slots() {
 /// under load is the only one run again, and reports how many it made. What this pins is
 /// that the count is one for `compute_h` plus exactly what the batch reports: nothing else in
 /// a proof submits, a readback or a parameter ring that opened a submission of its own would
-/// show here, and the batch's number is the one `g16 prove --stage-timings` can be held to.
-/// The batch's own count is pinned from the other side: at least one, at most one per
-/// sub-MSM window plus one, and one when the whole batch fits the budget, which the small
-/// artifacts do.
+/// show here, and the batch's number is the one `snarkrs groth16 prove --stage-timings` can
+/// be held to. The batch's own count is pinned from the other side: at least one, at most
+/// one per sub-MSM window plus one, and one when the whole batch fits the budget, which the
+/// small artifacts do.
 ///
 /// Design §3 also caps the whole per-proof readback at 64 KiB, and that is wrong; see below.
 ///

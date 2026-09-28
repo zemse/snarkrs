@@ -117,7 +117,7 @@ pub enum CeremonyError {
     PtauTooSmall { needed: u32, have: u32 },
     /// Sections 12 to 15 are absent, so `powersoftau prepare phase2` has not been run
     /// (`zkey_new.js:66-69`).
-    #[error("powers of tau is not prepared: run `g16 ptau prepare` first")]
+    #[error("powers of tau is not prepared: run `snarkrs powersoftau prepare phase2` first")]
     NotPrepared,
     /// `powersoftau_contribute.js:37-40`. A truncated ptau (`power != ceremonyPower`) can
     /// still be set up against, but it can never be contributed to again.

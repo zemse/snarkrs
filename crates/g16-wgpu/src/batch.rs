@@ -34,8 +34,8 @@
 //!
 //! # What the kill turned out to be, measured, and what that set the two numbers to
 //!
-//! Sixty `g16 prove` calls per configuration on railgun-13x01 under two other proof loops,
-//! rotated so the load drifted over every configuration alike:
+//! Sixty `snarkrs groth16 prove` calls per configuration on railgun-13x01 under two other
+//! proof loops, rotated so the load drifted over every configuration alike:
 //!
 //! ```text
 //! configuration                            gave up   aborted attempts   wrong
@@ -740,8 +740,8 @@ impl MsmBatch {
     /// are queued again first, because a kill has been seen to take them with it (BUG-33),
     /// and the first submission's are the parameter ring every later one reads through.
     /// Once the attempts are spent the error is a
-    /// `ProveError::Device`, which `g16 prove`'s fallback proves past. The stage timing the
-    /// caller keeps includes the attempts that were lost.
+    /// `ProveError::Device`, which `snarkrs groth16 prove`'s fallback proves past. The
+    /// stage timing the caller keeps includes the attempts that were lost.
     ///
     /// # A group over the binding limit runs as several sub-MSMs
     ///

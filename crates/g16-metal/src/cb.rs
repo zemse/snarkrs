@@ -9,7 +9,7 @@
 //!
 //! That is the failure icicle-snark shipped as issue #18, where large circuits produced
 //! mathematically invalid proofs. It is invisible on this side of the boundary and only
-//! surfaces when somebody else's verifier says no, which is why `g16 prove` now
+//! surfaces when somebody else's verifier says no, which is why `snarkrs groth16 prove` now
 //! self-verifies as well: the two guards are for the same fault, one at the source and one
 //! at the exit.
 //!
@@ -263,11 +263,11 @@ impl Refusal {
 /// After its buffers hang the GPU twice in a few seconds, macOS stops running a queue's
 /// buffers at all: every one comes back `SubmissionsIgnored` at once, and waiting does
 /// not end it (388 s and 16,412 refusals in the BUG-28 lane's h_probe, until it was
-/// killed). The refusal sticks to the queue, not the process: a `g16 prove` whose stages
-/// queue was ignored had its MSM queue's buffers run in the same second, and an h_probe
-/// that swapped both refused queues had its next buffers run and every result after it
-/// come back. A one-shot CLI gets fresh queues with its next process; a caller holding a
-/// backend for its life did not, and every proof after the refusal failed. So
+/// killed). The refusal sticks to the queue, not the process: a `snarkrs groth16 prove`
+/// whose stages queue was ignored had its MSM queue's buffers run in the same second, and
+/// an h_probe that swapped both refused queues had its next buffers run and every result
+/// after it come back. A one-shot CLI gets fresh queues with its next process; a caller
+/// holding a backend for its life did not, and every proof after the refusal failed. So
 /// [`with_retry`] swaps the queue on that refusal and runs the attempt on the new one.
 pub(crate) struct Queue {
     device: Device,

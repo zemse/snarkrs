@@ -8,8 +8,9 @@
 //!
 //! `startup_cost.rs` reports `MetalBackend::new()` at ~2.7 ms, but it runs after another
 //! test in the same process has already created an `MTLDevice`. That hides the one-time
-//! Metal runtime + driver initialisation, which a real `g16 prove` invocation pays.
-//! Run alone: `cargo test -p g16-metal --release --test cold_process_cost -- --nocapture`.
+//! Metal runtime + driver initialisation, which a real `snarkrs groth16 prove` invocation
+//! pays. Run alone:
+//! `cargo test -p g16-metal --release --test cold_process_cost -- --nocapture`.
 
 use std::time::Instant;
 

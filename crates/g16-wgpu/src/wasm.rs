@@ -548,8 +548,9 @@ pub async fn prepare() -> Result<String, JsError> {
 /// shape, and the [`StageTimings`] the native harness records, so a browser row and a native
 /// row have the same columns.
 ///
-/// `constant_work` is the browser's `g16 prove --constant-work`: MSMs whose cost follows
-/// the key and not the witness ([`Work::Constant`]). Absent or false is the variable path.
+/// `constant_work` is the browser's `snarkrs groth16 prove --constant-work`: MSMs whose
+/// cost follows the key and not the witness ([`Work::Constant`]). Absent or false is the
+/// variable path.
 #[wasm_bindgen]
 pub async fn prove(constant_work: Option<bool>) -> Result<String, JsError> {
     // Everything needed is cloned out under a short borrow, and the borrow is dropped before
@@ -619,8 +620,8 @@ pub async fn prove_h_only() -> Result<String, JsError> {
 /// This is the tool for the iPhone that runs the whole pipeline, loses no device, agrees on
 /// every public signal and still produces a proof snarkjs rejects. Public signals matching
 /// says the witness arrived intact; the rejection says something between there and the five
-/// MSM outputs is wrong. Diff this against `g16 trace --backend cpu` on a laptop and the
-/// first row that differs names the stage.
+/// MSM outputs is wrong. Diff this against `snarkrs trace --backend cpu` on a laptop and
+/// the first row that differs names the stage.
 ///
 /// `H` is copied down after the MSMs have run, which costs `domain_size * 32` bytes of
 /// readback and is why this is not the proving path. After, not before: the sequence of

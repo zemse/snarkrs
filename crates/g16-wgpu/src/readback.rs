@@ -144,9 +144,9 @@ pub(crate) fn dispatch(pass: &mut wgpu::ComputePass<'_>, x: u32) -> bool {
 /// before: the previous proof's window sums, or a test's sentinel. Measured by reading the
 /// command buffers' own status through the Objective-C runtime while three other processes
 /// proved on this M2 Max: 24 of 30 `js_16x16_d32` proofs had their stage 5 to 9 buffer
-/// aborted, and `g16 prove --backend wgpu` failed its self-verify on 29 of 40 railgun-13x01
-/// proofs. That is BUG-24, and every symptom in it: a G2 MSM at infinity, `pi_b` off, a
-/// 430 ms MSM stage where 590 is typical.
+/// aborted, and `snarkrs groth16 prove --backend wgpu` failed its self-verify on 29 of 40
+/// railgun-13x01 proofs. That is BUG-24, and every symptom in it: a G2 MSM at infinity,
+/// `pi_b` off, a 430 ms MSM stage where 590 is typical.
 ///
 /// # What an abort skips, measured, and where the token therefore has to be
 ///

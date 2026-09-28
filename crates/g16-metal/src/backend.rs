@@ -21,9 +21,9 @@
 //! element, so no stage falls back and [`MetalCircuit::backend_name`] can honestly say
 //! "metal" for the whole proof. There is deliberately no size gate either: the GPU does
 //! lose to the CPU below roughly 3,400 constraints, but a gate that quietly ran the CPU
-//! would mean `g16 prove --backend metal` reported a number that belongs to the other
-//! backend, which is the exact failure this crate is meant to avoid. The crossover is a
-//! measurement to report, not a thing to hide.
+//! would mean `snarkrs groth16 prove --backend metal` reported a number that belongs to the
+//! other backend, which is the exact failure this crate is meant to avoid. The crossover is
+//! a measurement to report, not a thing to hide.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -516,8 +516,8 @@ impl PreparedCircuit for MetalCircuit {
     }
 
     /// Without this the trait default reports "no H" for every device handle, so
-    /// `g16 trace` on this backend would print the H rows empty. Debugging seam only: it
-    /// costs a full-domain readback, which is the round trip [`HPoly`] exists to avoid.
+    /// `snarkrs trace` on this backend would print the H rows empty. Debugging seam only:
+    /// it costs a full-domain readback, which is the round trip [`HPoly`] exists to avoid.
     fn h_to_host(&self, h: &HPoly) -> Option<Vec<Fr>> {
         match h.device_handle::<HHandle>(crate::stages::TAG) {
             Some(handle) => handle.to_host(),

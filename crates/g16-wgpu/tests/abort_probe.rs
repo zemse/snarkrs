@@ -1,6 +1,6 @@
 //! BUG-33's real half: stages 0 to 4 looped under another process's GPU load until macOS
 //! aborts one, then the retried `H` against the CPU's and the proof it finishes through the
-//! verifier, with the pools as fresh as `g16 prove`'s are.
+//! verifier, with the pools as fresh as `snarkrs groth16 prove`'s are.
 //!
 //! Ignored, because on a quiet GPU nothing aborts and it proves nothing. Run it beside two
 //! proof loops (the 2a2babe lane's `load.sh`), under the cross-process lock so no timing
@@ -11,13 +11,13 @@
 //!   cargo test --release -p g16-wgpu --test abort_probe -- --ignored --nocapture
 //! ```
 //!
-//! Every iteration prepares the circuit again, as a `g16 prove` process does, so the
-//! scratch stages 0 to 4 allocate after an abort and the MSM batch's are as new as the
-//! CLI's; then it runs `compute_h` until one attempt is refused (or `TRIES` have run), reads
-//! `H` back and compares it with the CPU's, runs the MSMs over it, assembles the proof at
-//! the trace blinders, compares it with the CPU proof at the same blinders and verifies it.
-//! One line per iteration says which of those held. `ARTIFACT` picks the key, default
-//! `railgun-13x01`, the one the CLI runs used.
+//! Every iteration prepares the circuit again, as a `snarkrs groth16 prove` process does,
+//! so the scratch stages 0 to 4 allocate after an abort and the MSM batch's are as new as
+//! the CLI's; then it runs `compute_h` until one attempt is refused (or `TRIES` have run),
+//! reads `H` back and compares it with the CPU's, runs the MSMs over it, assembles the
+//! proof at the trace blinders, compares it with the CPU proof at the same blinders and
+//! verifies it. One line per iteration says which of those held. `ARTIFACT` picks the key,
+//! default `railgun-13x01`, the one the CLI runs used.
 
 use std::path::Path;
 use std::sync::Arc;
