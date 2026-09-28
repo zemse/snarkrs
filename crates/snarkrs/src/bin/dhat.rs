@@ -1,8 +1,8 @@
 //! Heap profile of one cold proof, phase by phase.
 //!
-//! `cargo run --release -p g16-cli --features dhat-heap --bin g16-dhat -- ARTIFACT_DIR [OUT.json]`
+//! `cargo run --release -p snarkrs --features dhat-heap --bin snarkrs-dhat -- ARTIFACT_DIR [OUT.json]`
 //!
-//! This is a separate binary rather than a flag on `g16` because it installs a global
+//! This is a separate binary rather than a flag on `snarkrs` because it installs a global
 //! allocator. `dhat::Alloc` wraps every allocation with a backtrace capture, which is
 //! both slow and a permanent property of the process, so it must not be reachable from
 //! the binary anyone benchmarks. The `dhat-heap` feature defaults off and the `dhat`

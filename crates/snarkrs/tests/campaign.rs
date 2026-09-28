@@ -27,13 +27,13 @@ use std::path::{Path, PathBuf};
 
 use ark_serialize::CanonicalSerialize;
 use ark_std::rand::{rngs::StdRng, thread_rng, SeedableRng};
-use g16_cli::artifacts::{variants, Variant};
-use g16_cli::{make_backend, BackendKind};
 use g16_core::prove::{prove, prove_unchecked, prove_with_blinders};
 use g16_core::verify::verify;
 use g16_core::{PreparedCircuit, Proof, ProveError, StageTimings};
 use g16_field::{Fr, PrimeField, UniformRand};
 use g16_zkey::{wtns::Witness, ProvingKey, VerifyingKey};
+use snarkrs::artifacts::{variants, Variant};
+use snarkrs::{make_backend, BackendKind};
 
 fn artifacts_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/artifacts")
@@ -474,7 +474,7 @@ fn degenerate_blinders_still_verify() {
 /// the same ground in under a minute and is the one that has to stay in everyone's
 /// `cargo test`.
 ///
-///     cargo test --release -p g16-cli --test campaign -- --ignored --nocapture
+///     cargo test --release -p snarkrs --test campaign -- --ignored --nocapture
 #[test]
 #[ignore = "long: 200 proofs per variant, roughly four minutes in release mode"]
 fn deep_campaign_two_hundred_proofs_per_variant() {

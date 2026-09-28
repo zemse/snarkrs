@@ -11,15 +11,15 @@
 //! device computed: with self-verify on, a wrong GPU proof is retried and then replaced by a
 //! CPU one, and this test would pass on exactly the defect it exists to catch.
 //!
-//!     cargo test --release -p g16-cli --features metal --test large -- --ignored --nocapture
+//!     cargo test --release -p snarkrs --features metal --test large -- --ignored --nocapture
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use g16_cli::artifacts::variants;
+use snarkrs::artifacts::variants;
 
 fn g16() -> &'static str {
-    env!("CARGO_BIN_EXE_g16")
+    env!("CARGO_BIN_EXE_snarkrs")
 }
 
 fn large_root() -> PathBuf {
@@ -75,7 +75,7 @@ fn every_backend_proves_the_large_artifacts() {
         "snarkjs is not on PATH, and it is the independent verifier here"
     );
 
-    let out = std::env::temp_dir().join(format!("g16-cli-large-{}", std::process::id()));
+    let out = std::env::temp_dir().join(format!("snarkrs-large-{}", std::process::id()));
     std::fs::create_dir_all(&out).unwrap();
     let mut failures = Vec::new();
     for v in &found {

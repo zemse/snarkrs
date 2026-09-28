@@ -55,7 +55,6 @@ use g16_ceremony::{
     contribute as zkey_mpc, phase1, prepare, ptau as ptau_file, setup, vkey, CpuGroupFft,
     CpuKeyScale,
 };
-use g16_cli::{bench, json, make_backend, BackendKind};
 use g16_core::{
     prove::{prove, prove_trace, prove_unchecked},
     verify::verify,
@@ -63,6 +62,7 @@ use g16_core::{
 };
 use g16_msm::{CpuMsm, GroupFft, KeyScale, MsmBackend};
 use g16_zkey::{wtns::Witness, ProvingKey, VerifyingKey};
+use snarkrs::{bench, json, make_backend, BackendKind};
 
 #[derive(Parser)]
 #[command(
@@ -246,7 +246,7 @@ enum PtauCmd {
     /// Sweep the CUDA FFT kernel variants: one NVRTC compile carries every candidate,
     /// and the fixed context and compile cost is paid once for the whole table.
     #[cfg(feature = "cuda")]
-    FftBench(g16_cli::fftbench::Args),
+    FftBench(snarkrs::fftbench::Args),
 }
 
 #[derive(Subcommand)]
@@ -513,7 +513,7 @@ fn run_setup(
 fn run_ptau(cmd: PtauCmd) -> Result<()> {
     match cmd {
         #[cfg(feature = "cuda")]
-        PtauCmd::FftBench(args) => g16_cli::fftbench::run(args),
+        PtauCmd::FftBench(args) => snarkrs::fftbench::run(args),
         PtauCmd::Info { ptau } => {
             let file = ptau_file::Ptau::open_lenient(&ptau)
                 .with_context(|| format!("opening {}", ptau.display()))?;
@@ -712,7 +712,7 @@ fn run_prove(
     // --constant-work's promise, is refused without the load.
     let backend_of = |kind| {
         if constant_work {
-            g16_cli::make_constant_work_backend(kind)
+            snarkrs::make_constant_work_backend(kind)
         } else {
             make_backend(kind)
         }
@@ -781,7 +781,7 @@ fn run_prove(
     let fell_back = std::cell::Cell::new(false);
     let proof = if self_verify {
         let attempt = if fallback {
-            g16_cli::fallback::prove_with_fallback(
+            snarkrs::fallback::prove_with_fallback(
                 circuit.as_ref(),
                 &w,
                 &mut rng,
@@ -793,7 +793,7 @@ fn run_prove(
                     Ok(backend_of(BackendKind::Cpu)?.prepare(pk)?)
                 },
                 &mut |step| {
-                    use g16_cli::fallback::Fallback::*;
+                    use snarkrs::fallback::Fallback::*;
                     if matches!(step, Cpu { .. }) {
                         fell_back.set(true);
                     }

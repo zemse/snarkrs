@@ -801,33 +801,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "g16-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "ark-bn254",
- "ark-ec",
- "ark-ff",
- "ark-serialize",
- "ark-std",
- "clap",
- "dhat",
- "g16-ceremony",
- "g16-core",
- "g16-cuda",
- "g16-field",
- "g16-metal",
- "g16-msm",
- "g16-wgpu",
- "g16-zkey",
- "hex",
- "libc",
- "num-bigint",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "g16-core"
 version = "0.1.0"
 dependencies = [
@@ -1950,6 +1923,33 @@ name = "smallvec"
 version = "1.15.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
+
+[[package]]
+name = "snarkrs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ark-bn254",
+ "ark-ec",
+ "ark-ff",
+ "ark-serialize",
+ "ark-std",
+ "clap",
+ "dhat",
+ "g16-ceremony",
+ "g16-core",
+ "g16-cuda",
+ "g16-field",
+ "g16-metal",
+ "g16-msm",
+ "g16-wgpu",
+ "g16-zkey",
+ "hex",
+ "libc",
+ "num-bigint",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "spin"

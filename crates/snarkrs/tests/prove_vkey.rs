@@ -23,7 +23,7 @@ fn scratch(test: &str) -> PathBuf {
 }
 
 fn prove(zkey: &Path, wtns: &Path, out: &Path, vkey: Option<&Path>) -> Output {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_g16"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_snarkrs"));
     cmd.args(["prove", "--backend", "cpu", "--zkey"])
         .arg(zkey)
         .arg("--witness")
@@ -161,7 +161,7 @@ fn constant_work_proves_on_the_cpu_wgpu_and_metal_and_is_refused_on_cuda() {
     };
     let out = scratch("constant-work");
     let run = |backend: &str| {
-        Command::new(env!("CARGO_BIN_EXE_g16"))
+        Command::new(env!("CARGO_BIN_EXE_snarkrs"))
             .args(["prove", "--constant-work", "--backend", backend, "--zkey"])
             .arg(tiny.join("circuit.zkey"))
             .arg("--witness")

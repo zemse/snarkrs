@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 fn g16() -> &'static str {
-    env!("CARGO_BIN_EXE_g16")
+    env!("CARGO_BIN_EXE_snarkrs")
 }
 
 fn artifacts_root() -> PathBuf {
@@ -48,7 +48,7 @@ fn variants() -> Vec<Variant> {
 /// A scratch directory per test, so two tests running concurrently cannot overwrite each
 /// other's proof and turn a real failure into a confusing one.
 fn scratch(test: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("g16-cli-{test}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("snarkrs-{test}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }

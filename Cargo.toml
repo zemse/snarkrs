@@ -13,7 +13,7 @@ members = [
     "crates/g16-cuda",
     "crates/g16-wgpu",
     "crates/g16-wasm",
-    "crates/g16-cli",
+    "crates/snarkrs",
 ]
 # Its own workspace: it links a C++ witness generator and pulls rand, sha3 and
 # witnesscalc-adapter, and none of that belongs in a `cargo build` of the prover.

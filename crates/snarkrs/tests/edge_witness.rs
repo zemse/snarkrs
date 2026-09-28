@@ -205,7 +205,7 @@ fn the_wtns_loader_rejects_a_non_one_constant_wire() {
     std::fs::write(&wtns, &patched).unwrap();
 
     let proof = out.join("proof.json");
-    let o = Command::new(env!("CARGO_BIN_EXE_g16"))
+    let o = Command::new(env!("CARGO_BIN_EXE_snarkrs"))
         .args([
             "prove",
             "--zkey",
@@ -360,7 +360,7 @@ fn the_cli_rejects_a_truncated_witness_without_panicking() {
     std::fs::write(&wtns, &patched).unwrap();
 
     let proof = out.join("proof.json");
-    let o = Command::new(env!("CARGO_BIN_EXE_g16"))
+    let o = Command::new(env!("CARGO_BIN_EXE_snarkrs"))
         .args([
             "prove",
             "--zkey",

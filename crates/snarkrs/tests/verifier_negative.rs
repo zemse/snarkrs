@@ -36,7 +36,6 @@
 
 use std::path::{Path, PathBuf};
 
-use g16_cli::json::{proof_from_value, proof_to_string, read_public};
 use g16_core::cpu::CpuBackend;
 use g16_core::prove::prove_with_blinders;
 use g16_core::verify::{verify, verify_unchecked, VerifyError};
@@ -44,6 +43,7 @@ use g16_core::{Backend, PreparedCircuit, Proof, StageTimings};
 use g16_field::*;
 use g16_zkey::{wtns::Witness, ProvingKey, VerifyingKey};
 use num_bigint::BigUint;
+use snarkrs::json::{proof_from_value, proof_to_string, read_public};
 
 /// The small circuit (3 public signals) and one mid-size circuit (6 public signals).
 /// Two sizes rather than one because the small one has a domain small enough that a

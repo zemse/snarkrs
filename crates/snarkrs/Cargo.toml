@@ -1,22 +1,22 @@
 [package]
-name = "g16-cli"
+name = "snarkrs"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [lib]
-name = "g16_cli"
+name = "snarkrs"
 path = "src/lib.rs"
 
 [[bin]]
-name = "g16"
+name = "snarkrs"
 path = "src/main.rs"
 
-# Installs a global allocator, so it is a separate binary rather than a flag on `g16`.
+# Installs a global allocator, so it is a separate binary rather than a flag on `snarkrs`.
 # `required-features` means it is not even a compilation target without the feature, which
 # is the strongest available guarantee that a benchmarked build never links dhat.
 [[bin]]
-name = "g16-dhat"
+name = "snarkrs-dhat"
 path = "src/bin/dhat.rs"
 required-features = ["dhat-heap"]
 
