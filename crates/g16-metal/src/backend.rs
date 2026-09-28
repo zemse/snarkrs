@@ -317,9 +317,10 @@ impl MetalCircuit {
     }
 
     /// Stages 5-8: the four MSM jobs whose scalars are the witness. One upload of the
-    /// witness serves all four. Passing the same `ScalarBuf` over the same range is what
-    /// makes the first three share a single counting sort inside `msm_batch`; a second
-    /// upload would silently cost two more digit pipelines as well as the copy.
+    /// witness serves all four. Passing the same `ScalarBuf`, over the same range or a
+    /// short suffix of it, is what makes all four share a single counting sort inside
+    /// `msm_batch`; a second upload would silently cost more digit pipelines as well as
+    /// the copy.
     fn witness_jobs<'a>(&'a self, w: &'a ScalarBuf) -> [Job<'a>; 4] {
         [
             Job::G1(JobG1 {

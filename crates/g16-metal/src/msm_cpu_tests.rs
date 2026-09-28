@@ -227,3 +227,24 @@ fn ordinary_recoding_preserves_unclassified_ones_and_top_carries() {
         "count and scatter must agree"
     );
 }
+
+/// The proving batch's shape: A, B and B over the whole witness, L over it past the
+/// public prefix, H on a buffer of its own. L joins the witness plan whatever order the
+/// jobs come in; a suffix that skips too much, or a range ending elsewhere, does not.
+#[test]
+fn a_short_suffix_rides_the_wider_plan() {
+    let (wit, h) = (1, 2);
+    let l = (wit, 3, 997);
+    let a = (wit, 0, 1000);
+    assert_eq!(
+        plan_starts(&[a, a, a, l, (h, 0, 1024)]),
+        vec![0, 0, 0, 0, 0]
+    );
+    assert_eq!(plan_starts(&[l, a]), vec![0, 0]);
+    assert_eq!(plan_starts(&[l]), vec![3]);
+    // 125 of 1000 is the most a suffix may skip.
+    assert_eq!(plan_starts(&[a, (wit, 125, 875)]), vec![0, 0]);
+    assert_eq!(plan_starts(&[a, (wit, 126, 874)]), vec![0, 126]);
+    assert_eq!(plan_starts(&[a, (wit, 3, 996)]), vec![0, 3]);
+    assert_eq!(plan_starts(&[a, (h, 3, 997)]), vec![0, 3]);
+}

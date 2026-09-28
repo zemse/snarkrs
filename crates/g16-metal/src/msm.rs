@@ -331,6 +331,43 @@ fn scatter_split_rows() -> usize {
     }
 }
 
+/// A job whose scalar range is a suffix of another job's in the same batch rides that
+/// job's digit pipeline when the prefix it skips is at most `1 / SHARE_MAX_SKIP` of the
+/// wider range.
+///
+/// The L MSM reads the witness past its public inputs, a few entries short of what A and
+/// B read, and its own plan was a second counting sort over the same digits: at 2^22 an
+/// entry array of about 420 MB and a count, scan and scatter. Riding the wider plan, its
+/// accumulation steps over the skipped points' entries, a load and a branch each, and its
+/// window, buckets and spill follow the wider range. Both costs grow with the prefix,
+/// hence the bound; the proving path skips `n_public + 1` of `n_vars`. Which entries
+/// are skipped follows the digits of the constant wire and the public inputs, so under
+/// [`Work::Constant`] the branch reveals nothing the verifier does not hold.
+const SHARE_MAX_SKIP: usize = 8;
+
+/// Where the plan of each `(buffer, scalar_off, n)` job starts. Two jobs share a digit
+/// pipeline when they read the same scalars over the same range, or when one's range is
+/// a suffix of the other's that skips at most `1 / SHARE_MAX_SKIP` of it.
+fn plan_starts(jobs: &[(usize, usize, usize)]) -> Vec<usize> {
+    // The lowest start of every range that ends at the same scalar of the same buffer.
+    let mut lowest: HashMap<(usize, usize), usize> = HashMap::new();
+    for &(id, soff, n) in jobs {
+        let lo = lowest.entry((id, soff + n)).or_insert(soff);
+        *lo = (*lo).min(soff);
+    }
+    jobs.iter()
+        .map(|&(id, soff, n)| {
+            let end = soff + n;
+            let lo = lowest[&(id, end)];
+            if (soff - lo) * SHARE_MAX_SKIP <= end - lo {
+                lo
+            } else {
+                soff
+            }
+        })
+        .collect()
+}
+
 /// `G16_METAL_MSM_LEGACY_ACC=1` swaps the segmented accumulation for the simple
 /// one-thread-per-bucket kernel. Kept only so the load-imbalance claim in
 /// `shaders/msm.metal` can be reproduced rather than taken on trust.
@@ -487,6 +524,7 @@ struct MsmParams {
     separate_ones: u32,
     dummy_rows: u32,
     seg_first: u32,
+    skip: u32,
 }
 
 /// A G1 point in extended Jacobian coordinates, as the kernels write it: 128 bytes,
@@ -511,7 +549,7 @@ pub struct PackedXyzzG2 {
 }
 
 const _: () = {
-    assert!(core::mem::size_of::<MsmParams>() == 64);
+    assert!(core::mem::size_of::<MsmParams>() == 68);
     assert!(core::mem::size_of::<PackedXyzzG1>() == 128);
     assert!(core::mem::size_of::<PackedXyzzG2>() == 256);
 };
@@ -1246,11 +1284,13 @@ impl MetalMsm {
     ///
     /// Jobs that share a scalar buffer, offset and length share their digit pipeline:
     /// the A, B-in-G2 and B-in-G1 MSMs all run over the whole witness, so the counting
-    /// sort runs once for the three of them and only the point stages are repeated. A
-    /// plan costs four dispatches (`zero`, `count`, `scan`, `scatter`), so collapsing the
-    /// five proving jobs to three plans removes eight of the twenty and, more to the
-    /// point, two thirds of the scatter's memory traffic. A bucket array past
-    /// `SCATTER_SPLIT_ROWS` splits the scatter in two, which scales both counts.
+    /// sort runs once for the three of them and only the point stages are repeated. L
+    /// reads the witness past its public prefix and rides the same plan (see
+    /// [`SHARE_MAX_SKIP`]). A plan costs four dispatches (`zero`, `count`, `scan`,
+    /// `scatter`), so collapsing the five proving jobs to two plans removes twelve of
+    /// the twenty and, more to the point, three of the four witness scatters' memory
+    /// traffic. A bucket array past `SCATTER_SPLIT_ROWS` splits the scatter in two,
+    /// which scales both counts.
     pub fn msm_batch<'a>(&self, jobs: &[Job<'a>]) -> Result<Vec<MsmResult>, ProveError> {
         if jobs.is_empty() {
             return Ok(Vec::new());
@@ -1260,7 +1300,9 @@ impl MetalMsm {
         let mut plans: Vec<Plan<'a>> = Vec::new();
         let mut by_key: HashMap<(usize, usize, usize), usize> = HashMap::new();
         let mut job_plan = Vec::with_capacity(jobs.len());
+        let mut job_skip = Vec::with_capacity(jobs.len());
 
+        let mut ranges = Vec::with_capacity(jobs.len());
         for job in jobs {
             let (sbuf, soff, n, bases_len, boff) = match job {
                 Job::G1(j) => (j.scalars, j.scalar_off, j.n, j.bases.len, j.base_off),
@@ -1282,19 +1324,26 @@ impl MetalMsm {
                     bases_len
                 )));
             }
-            // Identity of the uploaded vector, not of its contents: two jobs share a
-            // digit pipeline exactly when they read the same scalars over the same range.
-            let key = (sbuf as *const ScalarBuf as usize, soff, n);
+            // Identity of the uploaded vector, not of its contents.
+            ranges.push((sbuf, sbuf as *const ScalarBuf as usize, soff, n));
+        }
+        let keys: Vec<_> = ranges
+            .iter()
+            .map(|&(_, id, soff, n)| (id, soff, n))
+            .collect();
+        for (&(sbuf, id, soff, n), start) in ranges.iter().zip(plan_starts(&keys)) {
+            let key = (id, start, soff + n - start);
             let idx = match by_key.get(&key) {
                 Some(&i) => i,
                 None => {
                     let i = plans.len();
-                    plans.push(Plan::new(sbuf, soff, n));
+                    plans.push(Plan::new(sbuf, start, soff + n - start));
                     by_key.insert(key, i);
                     i
                 }
             };
             job_plan.push(idx);
+            job_skip.push(soff - start);
         }
 
         // ---- allocate ----
@@ -1304,8 +1353,14 @@ impl MetalMsm {
         }
         let mut outs: Vec<Outputs> = Vec::with_capacity(jobs.len());
         for job in jobs {
-            let plan = &plans[job_plan[outs.len()]];
-            outs.push(Outputs::alloc(self, &mut scratch, job, plan)?);
+            let i = outs.len();
+            outs.push(Outputs::alloc(
+                self,
+                &mut scratch,
+                job,
+                &plans[job_plan[i]],
+                job_skip[i],
+            )?);
         }
 
         // ---- encode, once ----
@@ -1690,6 +1745,7 @@ impl<'a> Plan<'a> {
             separate_ones: self.separate_ones as u32,
             dummy_rows: self.dummy_rows as u32,
             seg_first: 0,
+            skip: 0,
         }
     }
 
@@ -1831,6 +1887,9 @@ struct Outputs {
     /// level's output; the spill buffers are the other half. `None` off that path.
     fold: Option<(Buffer, Buffer)>,
     base_off: usize,
+    /// Leading scalars of the plan's range this job does not cover, when it rides a wider
+    /// job's plan (see [`SHARE_MAX_SKIP`]); 0 otherwise.
+    skip: usize,
     is_g2: bool,
 }
 
@@ -1860,14 +1919,16 @@ impl Outputs {
         keep: &mut Vec<Buffer>,
         job: &Job<'_>,
         plan: &Plan<'_>,
+        skip: usize,
     ) -> Result<Self, ProveError> {
         let pool = &msm.pool;
-        let (is_g2, base_off, point_bytes, scalar_off, sbuf, inf) = match job {
+        let (is_g2, base_off, point_bytes, scalar_off, n, sbuf, inf) = match job {
             Job::G1(j) => (
                 false,
                 j.base_off,
                 core::mem::size_of::<PackedXyzzG1>(),
                 j.scalar_off,
+                j.n,
                 j.scalars,
                 &j.bases.inf,
             ),
@@ -1876,6 +1937,7 @@ impl Outputs {
                 j.base_off,
                 core::mem::size_of::<PackedXyzzG2>(),
                 j.scalar_off,
+                j.n,
                 j.scalars,
                 &j.bases.inf,
             ),
@@ -1891,7 +1953,7 @@ impl Outputs {
         let ones_idx = match sbuf.ones_idx.as_ref().filter(|_| plan.dummy_rows == 0) {
             Some(idx) => {
                 let lo = idx.partition_point(|&e| (e as usize) < scalar_off);
-                let hi = idx.partition_point(|&e| (e as usize) < scalar_off + plan.n);
+                let hi = idx.partition_point(|&e| (e as usize) < scalar_off + n);
                 let gather: Vec<u32> = idx[lo..hi]
                     .iter()
                     .map(|&e| (base_off + (e as usize - scalar_off)) as u32)
@@ -1915,7 +1977,7 @@ impl Outputs {
         };
         let ones_groups = match &ones_idx {
             Some((_, count)) => ones_groups_for(*count),
-            None if plan.separate_ones => ones_groups_for(plan.n),
+            None if plan.separate_ones => ones_groups_for(n),
             None => 0,
         };
         // The dummy rows are written by the accumulation like any interior run, and
@@ -1965,6 +2027,7 @@ impl Outputs {
             ones_idx,
             fold,
             base_off,
+            skip,
             is_g2,
         })
     }
@@ -1991,6 +2054,7 @@ impl Outputs {
         let mut p = plan.params();
         p.base_off = self.base_off as u32;
         p.ones_groups = self.ones_groups as u32;
+        p.skip = self.skip as u32;
         p
     }
 
@@ -2234,6 +2298,9 @@ impl Outputs {
             Job::G1(j) => (&msm.pipelines.ones_g1, &j.bases.buf),
             Job::G2(j) => (&msm.pipelines.ones_g2, &j.bases.buf),
         };
+        // The scan walks the job's own range, not the plan's.
+        p.n = (plan.n - self.skip) as u32;
+        p.scalar_off = (plan.scalar_off + self.skip) as u32;
         enc.set_compute_pipeline_state(ones_pso);
         enc.set_buffer(0, Some(plan.scalars), 0);
         enc.set_buffer(1, Some(bases), 0);
@@ -3120,6 +3187,72 @@ mod tests {
         }
     }
 
+    /// A suffix job riding a wider job's plan, the way L rides A and B's, in both work
+    /// modes and both groups, on every sparsity: listed before the job it rides, over
+    /// bases of its own and over the wider job's bases at an offset.
+    #[test]
+    fn a_suffix_sharing_the_wider_plan_matches_the_cpu() {
+        use g16_msm::MsmBackend;
+        let m = MetalMsm::new().expect("Metal device");
+        let cpu = g16_msm::CpuMsm::new();
+        let n = 3 * CLASSIFY_CHUNK + 7;
+        let off = 5;
+        let (g1, g2) = bases_with_infinity(n);
+        let b1 = m.upload_g1_bases(&g1).expect("upload bases");
+        let b2 = m.upload_g2_bases(&g2).expect("upload bases");
+        let l1 = m.upload_g1_bases(&g1[off..]).expect("upload bases");
+        for (label, scalars) in scalars_of_every_sparsity(n) {
+            let want_full = cpu.msm_g1(&g1, &scalars).into_affine();
+            let want1 = cpu.msm_g1(&g1[off..], &scalars[off..]).into_affine();
+            let want2 = cpu.msm_g2(&g2[off..], &scalars[off..]).into_affine();
+            for work in [Work::Constant, Work::Variable] {
+                let s = m
+                    .upload_scalars_with(&scalars, work)
+                    .expect("upload scalars");
+                let got = m
+                    .msm_batch(&[
+                        Job::G1(JobG1 {
+                            bases: &l1,
+                            base_off: 0,
+                            scalars: &s,
+                            scalar_off: off,
+                            n: n - off,
+                        }),
+                        Job::G1(JobG1 {
+                            bases: &b1,
+                            base_off: 0,
+                            scalars: &s,
+                            scalar_off: 0,
+                            n,
+                        }),
+                        Job::G2(JobG2 {
+                            bases: &b2,
+                            base_off: off,
+                            scalars: &s,
+                            scalar_off: off,
+                            n: n - off,
+                        }),
+                    ])
+                    .unwrap();
+                assert_eq!(
+                    got[0].g1().unwrap().into_affine(),
+                    want1,
+                    "{label} {work:?}: L"
+                );
+                assert_eq!(
+                    got[1].g1().unwrap().into_affine(),
+                    want_full,
+                    "{label} {work:?}: A"
+                );
+                assert_eq!(
+                    got[2].g2().unwrap().into_affine(),
+                    want2,
+                    "{label} {work:?}: G2"
+                );
+            }
+        }
+    }
+
     /// `Work::Constant`'s promise, checked where it is decided: a plan over a witness
     /// of bits and a plan over a dense one have the same shape, allocate the same bytes,
     /// dispatch the same threads, and fill every window's entry region exactly. The
@@ -3171,7 +3304,7 @@ mod tests {
                 scalar_off: 0,
                 n,
             });
-            let out = Outputs::alloc(&m, &mut keep, &job, &plan).expect("outputs");
+            let out = Outputs::alloc(&m, &mut keep, &job, &plan, 0).expect("outputs");
             assert_eq!(out.ones_groups, 0);
             assert!(out.ones_idx.is_none());
             let bytes: Vec<u64> = keep.iter().map(|b| b.length()).collect();

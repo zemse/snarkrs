@@ -993,6 +993,9 @@ struct MsmParams {
                       // take the zero digits; 0 skips them (and the 0/1 scalars)
     uint seg_first;   // first global slice of this msm_segmented_* dispatch, so a long
                       // accumulation can go out in several command buffers
+    uint skip;        // accumulation only: entries whose point is below this belong to a
+                      // wider job sharing the plan, and a kept point reads base
+                      // `base_off + point - skip`
 };
 
 // Row a zero digit of scalar `gid` lands in under constant work: window `w`'s block of
@@ -1202,7 +1205,10 @@ inline void msm_accumulate_impl(device const uint2* entries,
     Xyzz<F> acc = pt_zero<F>();
     for (uint i = start; i < end; i++) {
         uint e = entries[i].y;
-        Aff<F> b = bases[p.base_off + (e >> 1)];
+        if ((e >> 1) < p.skip) {
+            continue;
+        }
+        Aff<F> b = bases[p.base_off + (e >> 1) - p.skip];
         if ((e & 1u) != 0u) {
             b.y = f_neg(b.y);
         }
@@ -1348,7 +1354,12 @@ inline void msm_segmented_impl(device const uint2* entries,
             acc = pt_zero<F>();
             cur_row = e.x;
         }
-        Aff<F> b = bases[p.base_off + (e.y >> 1)];
+        // A point below `skip` is the wider job's alone. Skipped after the run check,
+        // so the runs and spills this slice reports are the plan's either way.
+        if ((e.y >> 1) < p.skip) {
+            continue;
+        }
+        Aff<F> b = bases[p.base_off + (e.y >> 1) - p.skip];
         if ((e.y & 1u) != 0u) {
             b.y = f_neg(b.y);
         }

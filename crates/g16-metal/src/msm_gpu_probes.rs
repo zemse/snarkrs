@@ -675,7 +675,7 @@ fn constant_work_phase_occupancy() {
             let mut plan = Plan::new(&s, 0, n);
             let mut keep = Vec::new();
             plan.alloc(&m.pool, &mut keep).unwrap();
-            let out = Outputs::alloc(&m, &mut keep, &job, &plan).unwrap();
+            let out = Outputs::alloc(&m, &mut keep, &job, &plan, 0).unwrap();
             let mut t: [Vec<f64>; 5] = Default::default();
             for rep in 0..12 {
                 let d = time(&mut |enc| plan.encode(&m, enc));
