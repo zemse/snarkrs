@@ -132,7 +132,7 @@ leaves most high windows empty.
 **Deploy from a machine, not from a git push.** `static/pkg` is gitignored and building it
 needs the Rust toolchain, wasm-pack and binaryen, none of which exist in Vercel's build
 image. A git-linked project would clone a checkout with no prover in it, run `vite build`
-successfully, and serve a page that 404s on `g16_wasm_bg.wasm` at `init()`. Nothing in the
+successfully, and serve a page that 404s on `snarkrs_web_bg.wasm` at `init()`. Nothing in the
 build would go red. `.vercelignore` is what keeps `static/pkg` in the CLI's upload, and it
 replaces `.gitignore` rather than adding to it, which is the only reason the wasm travels.
 

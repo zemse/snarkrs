@@ -164,8 +164,8 @@ const handlers: Record<string, (a: Args, emit: (p: unknown) => void) => Promise<
     // the glue resolves it against its own module URL, and that resolution drops the query,
     // so leaving it implicit would version the glue and pin the wasm.
     const v = `?v=${PKG_VERSION}`;
-    const mod = (await import(/* @vite-ignore */ `${pkgBase}/g16_wasm.js${v}`)) as Wasm;
-    await mod.default({ module_or_path: `${pkgBase}/g16_wasm_bg.wasm${v}` });
+    const mod = (await import(/* @vite-ignore */ `${pkgBase}/snarkrs_web.js${v}`)) as Wasm;
+    await mod.default({ module_or_path: `${pkgBase}/snarkrs_web_bg.wasm${v}` });
     mod.start();
     // Before create_prover, which is where the pipelines are compiled. See `set_reduce_tg`
     // in crates/wgpu/src/wasm.rs.
