@@ -32,9 +32,9 @@
 //
 //    What accumulates over that layout is `msm_segmented_*`, where a thread owns a
 //    fixed-length slice of the entry array rather than a bucket, so per-thread work is
-//    uniform whatever the digit distribution does. A run that touches neither end of its
-//    slice cannot continue into another, so it is written straight to its bucket with no
-//    synchronisation; a run at either end goes to one of the slice's two spill slots and
+//    uniform whatever the digit distribution does. A run that starts inside its slice
+//    has no earlier slice writing its bucket, so it is written straight there with no
+//    synchronisation; the run at the slice's start goes to the slice's spill slot and
 //    `msm_merge_*` folds it in. One thread per bucket is `msm_accumulate_*`, kept behind
 //    `G16_METAL_MSM_LEGACY_ACC=1` as the baseline the imbalance is measured against.
 //
@@ -1251,12 +1251,11 @@ kernel void msm_accumulate_g2(device const uint2* entries [[buffer(0)]],
 // per-thread work is uniform BY CONSTRUCTION rather than by hoping the digits spread.
 // Within its slice a thread finds bucket boundaries by watching `entry.x` change.
 //
-//   * A run that neither starts at the slice's first entry nor ends at its last is
-//     wholly contained here, so no other thread will ever touch that bucket, and it is
-//     written straight to `buckets[row]` with no synchronisation.
-//   * The first and last runs may continue into the neighbouring slices, so they are
-//     written to that slice's two spill slots, tagged with their row. That is at most
-//     two spills per thread, and a slice containing a single run spills once.
+//   * A run that does not start at the slice's first entry starts here, so no other
+//     thread writes that bucket, and it is written straight to `buckets[row]` with no
+//     synchronisation, even when it continues into the next slice.
+//   * The first run may continue a bucket an earlier slice started, so it is written to
+//     the slice's spill slot, tagged with its row. That is one spill per thread.
 //
 // `msm_merge_*` then adds a bucket's spills to whatever was direct-written. It only has
 // to look at the slices its own run overlaps, which it computes from the run's start and
@@ -1321,10 +1320,16 @@ inline void msm_segmented_impl(device const uint2* entries,
         : p.n_windows * p.n_buckets + w * p.dummy_rows + p.dummy_rows - 1u;
     uint used = cursor[last] - base;
 
-    uint head_slot = 2u * gid;
+    // The constant-work fold overwrites the buckets it writes, so there the run that ends
+    // the slice spills too, to a second slot, and no bucket a spill names is ever
+    // direct-written. Everywhere else one slot per slice is enough.
+    bool fold = p.dummy_rows != 0u;
+    uint head_slot = fold ? 2u * gid : gid;
     uint tail_slot = head_slot + 1u;
     spill_rows[head_slot] = MSM_NO_ROW;
-    spill_rows[tail_slot] = MSM_NO_ROW;
+    if (fold) {
+        spill_rows[tail_slot] = MSM_NO_ROW;
+    }
 
     uint lo = k * p.slice_len;
     if (lo >= used) {
@@ -1366,15 +1371,19 @@ inline void msm_segmented_impl(device const uint2* entries,
         acc = pt_madd(acc, b);
     }
 
-    // The run that ends at the slice boundary always spills, whether or not it actually
-    // continues. Spilling one run that did not need to costs the merge one addition;
-    // failing to spill one that did would lose it.
+    // The first run always spills, whether or not it actually continues an earlier
+    // slice's bucket. Spilling one run that did not need to costs the merge one addition;
+    // failing to spill one that did would lose it. A later run started here, so this
+    // slice owns its bucket even when the next slices continue it: those spill, and the
+    // merge adds them to what is written here.
     if (is_first_run) {
         spill_pts[head_slot] = acc;
         spill_rows[head_slot] = cur_row;
-    } else {
+    } else if (fold) {
         spill_pts[tail_slot] = acc;
         spill_rows[tail_slot] = cur_row;
+    } else {
+        buckets[cur_row] = acc;
     }
 }
 
@@ -1401,7 +1410,8 @@ kernel void msm_segmented_g2(device const uint2* entries [[buffer(0)]],
 }
 
 // Fold each bucket's spilled partials into it. One thread per bucket, and it looks only
-// at the slices its own run overlaps, so there is no search and no atomic.
+// at the slices its own run overlaps, so there is no search and no atomic. Only
+// variable-work plans merge here, so every slice has one spill slot.
 template <typename F>
 inline void msm_merge_impl(device Xyzz<F>* buckets,
                            device const Xyzz<F>* spill_pts,
@@ -1429,12 +1439,9 @@ inline void msm_merge_impl(device Xyzz<F>* buckets,
 
     Xyzz<F> acc = buckets[row];
     for (uint k = k_lo; k <= k_hi; k++) {
-        uint slot = 2u * (w * p.slices + k);
+        uint slot = w * p.slices + k;
         if (spill_rows[slot] == row) {
             acc = pt_add(acc, spill_pts[slot]);
-        }
-        if (spill_rows[slot + 1u] == row) {
-            acc = pt_add(acc, spill_pts[slot + 1u]);
         }
     }
     buckets[row] = acc;
@@ -1498,12 +1505,9 @@ inline void msm_merge_wide_impl(device Xyzz<F>* buckets,
 
     Xyzz<F> acc = pt_zero<F>();
     for (uint k = k_lo + tid; k <= k_hi; k += tcount) {
-        uint slot = 2u * (w * p.slices + k);
+        uint slot = w * p.slices + k;
         if (spill_rows[slot] == row) {
             acc = pt_add(acc, spill_pts[slot]);
-        }
-        if (spill_rows[slot + 1u] == row) {
-            acc = pt_add(acc, spill_pts[slot + 1u]);
         }
     }
     shared[tid] = acc;

@@ -1751,6 +1751,21 @@ impl<'a> Plan<'a> {
         }
     }
 
+    /// Spill slots the segmented accumulation writes per slice. One holds the run a slice
+    /// starts with, which may continue an earlier slice's bucket; every later run starts
+    /// in the slice and goes straight to its bucket. The constant-work fold overwrites
+    /// the buckets it writes, so there the slice's last run takes a second slot instead.
+    ///
+    /// A second slot on every plan was 67 MB of the H plan's scratch at 2^21 (c=16,
+    /// 32,768 slices a window, 128 bytes a point).
+    fn spill_per_slice(&self) -> usize {
+        if self.dummy_rows > 0 {
+            2
+        } else {
+            1
+        }
+    }
+
     /// Rows in `counts`, `cursor` and the bucket array: the real buckets of every window,
     /// then every window's dummy rows.
     fn rows(&self) -> usize {
@@ -2013,9 +2028,9 @@ impl Outputs {
         // The dummy rows are written by the accumulation like any interior run, and
         // never read; the clear covers the real rows only.
         let buckets = pool.take(plan.rows() * point_bytes)?;
-        // Two spill slots per slice: at most one run of a slice continues backwards and
-        // at most one continues forwards.
-        let spill_slots = 2 * plan.n_windows * plan.slices;
+        // At most one run of a slice continues backwards, into a bucket an earlier slice
+        // owns. See [`Plan::spill_per_slice`] for the second slot.
+        let spill_slots = plan.spill_per_slice() * plan.n_windows * plan.slices;
         let spill_pts = pool.take(spill_slots * point_bytes)?;
         let spill_rows = pool.take(spill_slots * 4)?;
         let fold = match plan.fold_levels().first() {
@@ -2361,10 +2376,10 @@ impl Outputs {
                 let b: &[PackedXyzzG2] = unsafe { read_back(&self.buckets, plan.n_buckets) };
                 let mut buckets: Vec<G2Projective> = b.iter().map(|x| x.to_projective()).collect();
                 if !legacy_accumulate() {
-                    let slots = 2 * plan.slices;
-                    // SAFETY: both spill arrays hold `2 * n_windows * slices` slots and
-                    // the single window again makes `slots` the whole of each. The
-                    // accumulation writes every slot, sentinel row included.
+                    let slots = plan.spill_per_slice() * plan.slices;
+                    // SAFETY: both spill arrays hold `spill_per_slice * n_windows *
+                    // slices` slots and the single window again makes `slots` the whole
+                    // of each. The accumulation writes every slot, sentinel row included.
                     let rows: &[u32] = unsafe { read_back(&self.spill_rows, slots) };
                     let pts: &[PackedXyzzG2] = unsafe { read_back(&self.spill_pts, slots) };
                     for (r, pt) in rows.iter().zip(pts) {
@@ -2419,7 +2434,7 @@ impl Outputs {
                 let b: &[PackedXyzzG1] = unsafe { read_back(&self.buckets, plan.n_buckets) };
                 let mut buckets: Vec<G1Projective> = b.iter().map(|x| x.to_projective()).collect();
                 if !legacy_accumulate() {
-                    let slots = 2 * plan.slices;
+                    let slots = plan.spill_per_slice() * plan.slices;
                     // SAFETY: `slots` is the whole of each one-window spill array.
                     let rows: &[u32] = unsafe { read_back(&self.spill_rows, slots) };
                     let pts: &[PackedXyzzG1] = unsafe { read_back(&self.spill_pts, slots) };

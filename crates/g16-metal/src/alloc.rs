@@ -10,7 +10,7 @@
 //!
 //! The sizes make that a real condition rather than a theoretical one. An H plan at a
 //! 2^20 domain picks c = 15, so its entry array alone is 17 * 2^20 * 8 bytes = 143 MB,
-//! with another 71 MB of spill points and 36 MB of buckets beside it: a quarter of a
+//! with another 36 MB of spill points and 36 MB of buckets beside it: a fifth of a
 //! gigabyte of scratch for one job, on a machine that may have 8 GB for everything.
 //!
 //! So every allocation the prover makes goes through this module. A nil handle answers 0
