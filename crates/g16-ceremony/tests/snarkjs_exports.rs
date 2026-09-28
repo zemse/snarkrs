@@ -18,6 +18,8 @@ use g16_ceremony::r1cs::R1cs;
 use g16_ceremony::r1cs_export::{r1cs_export_json, r1cs_info, r1cs_print};
 use g16_ceremony::snarkjs_log::Logplease;
 use g16_ceremony::sym::Syms;
+use g16_ceremony::wtns_check::wtns_check;
+use g16_ceremony::CeremonyError;
 
 /// Small enough that snarkjs finishes each in a second or two.
 const VARIANTS: [&str; 2] = ["tiny_mul", "js_1x1_d8"];
@@ -72,9 +74,28 @@ fn scratch(test: &str) -> PathBuf {
     dir
 }
 
+/// Run with stdout and stderr sent to files rather than pipes. snarkjs ends with
+/// `process.exit`, and Node writes to a pipe asynchronously, so a pipe loses the tail of a
+/// large print (`r1cs print` on js_1x1_d8 came back 460 KB short); writes to a file are
+/// synchronous.
 fn run(cmd: &mut Command) -> Output {
-    cmd.output()
-        .unwrap_or_else(|e| panic!("failed to run {cmd:?}: {e}"))
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("snarkjs-out-{}-{n}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (out, err) = (dir.join("stdout"), dir.join("stderr"));
+    let status = cmd
+        .stdout(std::fs::File::create(&out).unwrap())
+        .stderr(std::fs::File::create(&err).unwrap())
+        .status()
+        .unwrap_or_else(|e| panic!("failed to run {cmd:?}: {e}"));
+    let o = Output {
+        status,
+        stdout: std::fs::read(&out).unwrap(),
+        stderr: std::fs::read(&err).unwrap(),
+    };
+    let _ = std::fs::remove_dir_all(&dir);
+    o
 }
 
 /// Run a snarkjs command that must succeed and return its stdout.
@@ -252,4 +273,110 @@ fn r1cs_print_matches_snarkjs() {
             &theirs,
         );
     }
+}
+
+/// The witness bytes with value `k` of section 2 rewritten by `f`, which gets its 32 bytes.
+fn edit_witness(wtns: &[u8], k: usize, f: impl FnOnce(&mut [u8])) -> Vec<u8> {
+    let file = g16_zkey::binfile::BinFile::from_bytes(wtns.to_vec(), b"wtns", 2).unwrap();
+    let start = file.sections().iter().find(|s| s.id == 2).unwrap().start;
+    let mut out = wtns.to_vec();
+    f(&mut out[start + 32 * k..start + 32 * (k + 1)]);
+    out
+}
+
+/// `v + r` in place, which fits in 256 bits for any `v < r` and is the same field element.
+fn add_modulus(v: &mut [u8]) {
+    let r = g16_ceremony::r_le();
+    let mut carry = 0u16;
+    for (b, m) in v.iter_mut().zip(r) {
+        let s = *b as u16 + m as u16 + carry;
+        *b = s as u8;
+        carry = s >> 8;
+    }
+    assert_eq!(carry, 0);
+}
+
+/// A good witness passes, one with a wire nudged by one fails at the constraint snarkjs
+/// names, and one holding `v + r` for a wire passes, because both sides reduce it.
+#[test]
+fn wtns_check_matches_snarkjs() {
+    if !have_snarkjs("wtns_check_matches_snarkjs") {
+        return;
+    }
+    let out = scratch("wtns-check");
+    for dir in variants("wtns_check_matches_snarkjs") {
+        let r1cs = dir.join("circuit.r1cs");
+        let good = std::fs::read(dir.join("circuit.wtns")).unwrap();
+        let n = (good.len() - 76) / 32;
+        let cases = [
+            ("good", good.clone(), true),
+            (
+                "nudged",
+                edit_witness(&good, n - 1, |v| v[0] = v[0].wrapping_add(1)),
+                false,
+            ),
+            ("plus_r", edit_witness(&good, n - 1, add_modulus), true),
+        ];
+        for (name, bytes, want) in cases {
+            let wtns = out.join(format!("{name}.wtns"));
+            std::fs::write(&wtns, bytes).unwrap();
+            let o = run(snarkjs().args([
+                "wtns".as_ref(),
+                "check".as_ref(),
+                r1cs.as_os_str(),
+                wtns.as_os_str(),
+            ]));
+            assert_eq!(o.status.success(), want, "{name}: snarkjs said {o:?}");
+            let mut log = Logplease::new(Vec::new());
+            let got = wtns_check(&r1cs, &wtns, &mut log).unwrap();
+            assert_eq!(got, want, "{} {name}", dir.display());
+            assert_same(
+                &format!("{} {name} wtns check", dir.display()),
+                &log.out,
+                &o.stdout,
+            );
+        }
+    }
+}
+
+/// A witness for another field is refused before any constraint is read, with the lines
+/// snarkjs logs up to its throw and its message.
+#[test]
+fn wtns_check_refuses_another_curve_like_snarkjs() {
+    if !have_snarkjs("wtns_check_refuses_another_curve_like_snarkjs") {
+        return;
+    }
+    let Some(dir) = variants("wtns_check_refuses_another_curve_like_snarkjs")
+        .into_iter()
+        .next()
+    else {
+        return;
+    };
+    let out = scratch("wtns-curve");
+    let r1cs = dir.join("circuit.r1cs");
+    let mut bytes = std::fs::read(dir.join("circuit.wtns")).unwrap();
+    // Section 1's payload starts at 24: `n8`, then the prime.
+    bytes[28] ^= 1;
+    let wtns = out.join("other.wtns");
+    std::fs::write(&wtns, bytes).unwrap();
+    let o = run(snarkjs().args([
+        "wtns".as_ref(),
+        "check".as_ref(),
+        r1cs.as_os_str(),
+        wtns.as_os_str(),
+    ]));
+    assert!(!o.status.success());
+    let mut log = Logplease::new(Vec::new());
+    let err = wtns_check(&r1cs, &wtns, &mut log).unwrap_err();
+    assert!(matches!(err, CeremonyError::WitnessCurveMismatch), "{err}");
+    let theirs = String::from_utf8_lossy(&o.stdout);
+    let ours = String::from_utf8(log.out).unwrap();
+    assert!(
+        theirs.starts_with(&ours),
+        "ours:\n{ours}\nsnarkjs:\n{theirs}"
+    );
+    assert!(
+        theirs.contains(&format!("Error: {err}")),
+        "snarkjs:\n{theirs}"
+    );
 }

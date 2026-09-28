@@ -36,7 +36,7 @@ use g16_field::{Fr, PrimeField};
 use g16_zkey::binfile::Cursor;
 use g16_zkey::json_out::{js_number, JsonWriter};
 
-use crate::r1cs::{R1cs, S_CUSTOM_GATES_LIST, S_CUSTOM_GATES_USES};
+use crate::r1cs::{R1cs, S_CONSTRAINTS, S_CUSTOM_GATES_LIST, S_CUSTOM_GATES_USES};
 use crate::snarkjs_log::SnarkjsLog;
 use crate::sym::Syms;
 use crate::{CeremonyError, N8};
@@ -59,24 +59,34 @@ pub fn r1cs_info<L: SnarkjsLog + ?Sized>(r1cs: &R1cs, log: &mut L) -> Result<(),
     Ok(())
 }
 
-/// Every constraint as three [`LinearCombination`]s, A then B then C, in file order.
-pub fn linear_combinations(r1cs: &R1cs) -> Result<Vec<[LinearCombination; 3]>, CeremonyError> {
-    r1cs.constraints()?
-        .into_iter()
-        .map(|c| {
-            let lc = |terms: &[crate::r1cs::Term]| -> Result<LinearCombination, CeremonyError> {
-                let mut out = LinearCombination::new();
-                for t in terms {
-                    out.insert(
-                        t.signal,
-                        Fr::from_le_bytes_mod_order(r1cs.coef_bytes(t.coef_ptr)?),
-                    );
-                }
-                Ok(out)
-            };
-            Ok([lc(&c.a)?, lc(&c.b)?, lc(&c.c)?])
-        })
-        .collect()
+/// Walk section 2 the way `readConstraints` does, handing `f` each constraint as three
+/// [`LinearCombination`]s, A then B then C, in file order, until `f` returns `false`.
+///
+/// Streams, where [`R1cs::constraints`] collects, so `wtns check` can stop at the first
+/// failure and neither printer holds the circuit. Like `readLC` it does not check a
+/// signal against `nVars`; a combination running past the section is still an error,
+/// where snarkjs would read zeros.
+pub fn for_each_constraint<F>(r1cs: &R1cs, mut f: F) -> Result<(), CeremonyError>
+where
+    F: FnMut(u32, [LinearCombination; 3]) -> Result<bool, CeremonyError>,
+{
+    let mut cur = Cursor::new(r1cs.constraint_bytes()?, S_CONSTRAINTS);
+    let mut read_lc = || -> Result<LinearCombination, CeremonyError> {
+        let n = cur.u32()?;
+        let mut lc = LinearCombination::new();
+        for _ in 0..n {
+            let signal = cur.u32()?;
+            lc.insert(signal, Fr::from_le_bytes_mod_order(cur.take(N8)?));
+        }
+        Ok(lc)
+    };
+    for i in 0..r1cs.header().n_constraints {
+        let lcs = [read_lc()?, read_lc()?, read_lc()?];
+        if !f(i, lcs)? {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// `r1cs print <circuit.r1cs> <circuit.sym>`: one `[ A ] * [ B ] - [ C ] = 0` line per
@@ -86,7 +96,7 @@ pub fn r1cs_print<L: SnarkjsLog + ?Sized>(
     syms: &Syms,
     log: &mut L,
 ) -> Result<(), CeremonyError> {
-    for [a, b, c] in linear_combinations(r1cs)? {
+    for_each_constraint(r1cs, |_, [a, b, c]| {
         let line = format!(
             "[ {} ] * [ {} ] - [ {} ] = 0",
             lc_to_string(&a, syms),
@@ -94,8 +104,8 @@ pub fn r1cs_print<L: SnarkjsLog + ?Sized>(
             lc_to_string(&c, syms)
         );
         log.info(&line)?;
-    }
-    Ok(())
+        Ok(true)
+    })
 }
 
 /// `lc2str` (`r1cs_print.js:25-40`).
@@ -123,7 +133,7 @@ fn lc_to_string(lc: &LinearCombination, syms: &Syms) -> String {
     s
 }
 
-fn fr_dec(v: &Fr) -> String {
+pub(crate) fn fr_dec(v: &Fr) -> String {
     v.into_bigint().to_string()
 }
 
@@ -155,7 +165,7 @@ pub fn r1cs_export_json<W: Write>(r1cs: &R1cs, out: W) -> Result<(), CeremonyErr
 
     w.key("constraints")?;
     w.begin_array()?;
-    for constraint in linear_combinations(r1cs)? {
+    for_each_constraint(r1cs, |_, constraint| {
         w.begin_array()?;
         for lc in &constraint {
             w.begin_object()?;
@@ -165,7 +175,8 @@ pub fn r1cs_export_json<W: Write>(r1cs: &R1cs, out: W) -> Result<(), CeremonyErr
             w.end()?;
         }
         w.end()?;
-    }
+        Ok(true)
+    })?;
     w.end()?;
 
     w.key("map")?;

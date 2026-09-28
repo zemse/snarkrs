@@ -31,8 +31,8 @@
 //! [`phase1`], [`prepare`], [`setup`], [`contribute`] and [`vkey`] are the commands.
 //! [`challenge`] and [`bellman`] are the two ways to contribute without the `.ptau` or
 //! `.zkey` in hand, and [`solidity`] writes the on-chain verifier.
-//! [`r1cs_export`] holds the commands that only show a file, with [`sym`] for signal
-//! names and [`snarkjs_log`] for the logger lines they print.
+//! [`r1cs_export`] and [`wtns_check`] hold the commands that only inspect files, with
+//! [`sym`] for signal names and [`snarkjs_log`] for the logger lines they print.
 
 pub mod accel;
 pub mod bellman;
@@ -50,6 +50,7 @@ pub mod sym;
 pub mod transcript;
 pub mod vkey;
 pub mod write;
+pub mod wtns_check;
 
 use g16_field::{BigInteger, Fq, Fr, G1Affine, G2Affine, PrimeField};
 use g16_zkey::binfile::{Cursor, G1_BYTES, G2_BYTES};
@@ -134,6 +135,10 @@ pub enum CeremonyError {
     /// not the fix, in the shape snarkjs prints.
     #[error("verification failed: {0}")]
     Verification(String),
+    /// `wtns check` on a witness whose header names another field than the circuit's. The
+    /// text is snarkjs' own (`wtns_check.js:46-48`), proving key and all.
+    #[error("Curve of the witness does not match the curve of the proving key")]
+    WitnessCurveMismatch,
 }
 
 impl CeremonyError {
