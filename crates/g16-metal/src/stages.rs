@@ -299,7 +299,7 @@ fn split_passes(log_n: u32, max_fused: u32) -> Vec<Batch> {
 }
 
 /// Per-proof scratch: the three domain vectors, one transform temporary, the packed
-/// witness, and the two H outputs.
+/// witness, and H.
 ///
 /// A, B, C and the temporary share `vectors`, one domain apart, so that once
 /// `compute_h` has returned the whole buffer can be lent to stage 9's MSM for its digit
@@ -316,7 +316,6 @@ struct Scratch {
     vectors: Buffer,
     /// Bytes between consecutive vectors in `vectors`.
     stride: u64,
-    h_mont: Buffer,
     h_std: Buffer,
 }
 
@@ -493,7 +492,6 @@ impl HResident {
             witness: st.empty(self.n_vars)?,
             vectors: crate::alloc::shared(&st.device, bytes)?,
             stride: stride as u64,
-            h_mont: st.empty(n)?,
             h_std: st.empty(n)?,
         })
     }
@@ -704,10 +702,9 @@ impl HResident {
         bind(enc, 0, sc.a());
         bind(enc, 1, sc.b());
         bind(enc, 2, sc.c());
-        enc.set_buffer(3, Some(&sc.h_mont), 0);
-        enc.set_buffer(4, Some(&sc.h_std), 0);
+        enc.set_buffer(3, Some(&sc.h_std), 0);
         let nn = n as u32;
-        enc.set_bytes(5, 4, &nn as *const u32 as *const c_void);
+        enc.set_bytes(4, 4, &nn as *const u32 as *const c_void);
         let tg = st.threads(&st.h_join, n as u64);
         crate::cb::dispatch_threads(enc, MTLSize::new(n as u64, 1, 1), MTLSize::new(tg, 1, 1));
         let token = st.seal.encode(enc);
@@ -829,10 +826,9 @@ impl HResident {
         // declared buffer, whether or not the shader touches it on this path.
         bind(enc, 4, sc.a());
         bind(enc, 5, sc.b());
-        enc.set_buffer(6, Some(&sc.h_mont), 0);
-        enc.set_buffer(7, Some(&sc.h_std), 0);
+        enc.set_buffer(6, Some(&sc.h_std), 0);
         enc.set_bytes(
-            8,
+            7,
             core::mem::size_of::<NttParams>() as u64,
             p as *const NttParams as *const c_void,
         );
@@ -855,10 +851,9 @@ impl HResident {
         enc.set_buffer(2, Some(tw), 0);
         bind(enc, 4, sc.a());
         bind(enc, 5, sc.b());
-        enc.set_buffer(6, Some(&sc.h_mont), 0);
-        enc.set_buffer(7, Some(&sc.h_std), 0);
+        enc.set_buffer(6, Some(&sc.h_std), 0);
         enc.set_bytes(
-            8,
+            7,
             core::mem::size_of::<NttParams>() as u64,
             p as *const NttParams as *const c_void,
         );
@@ -934,29 +929,14 @@ impl HHandle {
         crate::msm::Lent::claim(&self.sc().vectors, &self.lent)
     }
 
-    /// H in **Montgomery form**, matching `layout::PackedFr` and arkworks' internal
-    /// representation. For further field arithmetic and for host comparisons.
-    pub fn h_mont(&self) -> &Buffer {
-        &self.sc().h_mont
-    }
-
-    /// Copies H down to the host. Tests and cross-checks want this; the proving path
-    /// must not, because forcing the copy is exactly the round trip that
-    /// [`g16_core::HPoly`] exists to avoid.
-    pub fn to_host(&self) -> Vec<Fr> {
-        // SAFETY: the buffer holds exactly `len` `PackedFr` in shared storage and the
+    /// Copies H down to the host, validated: `None` if any value is not a canonical
+    /// residue, which would mean the reduction in `fr_from_mont` is wrong; a silent
+    /// modular reduction here would hide exactly that bug. Tests and cross-checks want
+    /// this; the proving path must not, because forcing the copy is exactly the round
+    /// trip that [`g16_core::HPoly`] exists to avoid.
+    pub fn to_host(&self) -> Option<Vec<Fr>> {
+        // SAFETY: the buffer holds exactly `len` `PackedScalar` in shared storage and the
         // command buffer that wrote it was waited on before `compute_h` returned.
-        let s = unsafe {
-            core::slice::from_raw_parts(self.sc().h_mont.contents() as *const PackedFr, self.len)
-        };
-        PackedFr::unpack_slice(s)
-    }
-
-    /// The standard-form copy, read back and validated. `None` at any index whose limbs
-    /// are not a canonical residue, which would mean the reduction in `fr_from_mont` is
-    /// wrong; a silent modular reduction here would hide exactly that bug.
-    pub fn to_host_std(&self) -> Option<Vec<Fr>> {
-        // SAFETY: as above.
         let s = unsafe {
             core::slice::from_raw_parts(self.sc().h_std.contents() as *const PackedScalar, self.len)
         };
@@ -968,13 +948,13 @@ impl Drop for HHandle {
     fn drop(&mut self) {
         if let Some(s) = self.scratch.take() {
             // The witness, its three domain images (and H's digit entries, if they were
-            // lent) and both copies of H. The handle is only dropped once the MSMs that
+            // lent) and H. The handle is only dropped once the MSMs that
             // read `h` have completed.
-            for b in [&s.witness, &s.vectors, &s.h_mont, &s.h_std] {
+            for b in [&s.witness, &s.vectors, &s.h_std] {
                 crate::alloc::scrub(b);
             }
             // One scratch set per proof in flight is all the pool is for. Uncapped, a burst
-            // of concurrent proofs left that many full sets (seven domain vectors' worth
+            // of concurrent proofs left that many full sets (six domain vectors' worth
             // each) resident for the life of the circuit.
             let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
             if pool.len() < MAX_POOLED_SCRATCH {

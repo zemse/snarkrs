@@ -90,7 +90,7 @@ fn distinct_witnesses_concurrently_do_not_cross_talk() {
             let h = c
                 .compute_h(w, &mut t)
                 .unwrap_or_else(|e| panic!("{name}: witness {i}: compute_h: {e}"));
-            let hv = h.device_handle::<HHandle>(TAG).unwrap().to_host();
+            let hv = h.device_handle::<HHandle>(TAG).unwrap().to_host().unwrap();
             let m = c
                 .msms(w, &h, &mut t)
                 .unwrap_or_else(|e| panic!("{name}: witness {i}: msms: {e}"));
@@ -116,7 +116,8 @@ fn distinct_witnesses_concurrently_do_not_cross_talk() {
                                 let h = c
                                     .compute_h(w, &mut t)
                                     .unwrap_or_else(|e| panic!("{at}: compute_h: {e}"));
-                                let hv = h.device_handle::<HHandle>(TAG).unwrap().to_host();
+                                let hv =
+                                    h.device_handle::<HHandle>(TAG).unwrap().to_host().unwrap();
                                 let m = c
                                     .msms(w, &h, &mut t)
                                     .unwrap_or_else(|e| panic!("{at}: msms: {e}"));
@@ -165,7 +166,7 @@ fn dump_h_and_points() {
             let mut t = StageTimings::default();
             let h = c.compute_h(&witness, &mut t).unwrap();
             let hv = match h.device_handle::<HHandle>(TAG) {
-                Some(d) => d.to_host(),
+                Some(d) => d.to_host().unwrap(),
                 None => h.to_host().unwrap().to_vec(),
             };
             let mut s = String::new();
@@ -214,13 +215,12 @@ fn gpu_output_is_load_bearing() {
             m.h_g1
         };
 
-        // Now scribble one bit on the H buffer the MSM reads. Note this is `h_std`,
-        // not `h_mont`: `MetalCircuit::msms` wraps stage 4's standard-form output
-        // directly through `scalars_from_device_std`, so the Montgomery copy is never
-        // read on the proving path any more. (It used to be the other way around, when
-        // `msms` re-derived standard form from `h_mont` with its own `fr_mont_to_std`
-        // dispatch; this test flipped the corrupted buffer the day that dispatch was
-        // removed, which is exactly the drift it exists to catch.)
+        // Now scribble one bit on the H buffer the MSM reads, `h_std`:
+        // `MetalCircuit::msms` wraps stage 4's standard-form output directly through
+        // `scalars_from_device_std`. (It used to read a Montgomery copy, when `msms`
+        // re-derived standard form with its own `fr_mont_to_std` dispatch; this test
+        // flipped the corrupted buffer the day that dispatch was removed, which is
+        // exactly the drift it exists to catch.)
         let h = c.compute_h(&witness, &mut t).unwrap();
         {
             let handle = h.device_handle::<HHandle>(TAG).unwrap();

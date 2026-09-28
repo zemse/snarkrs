@@ -85,30 +85,15 @@ fn every_stage_of_the_metal_backend_matches_the_cpu() {
             .expect("{name}: not a metal handle");
 
         let want = hc.to_host().unwrap();
-        let got_mont = handle.to_host();
         let got_std = handle
-            .to_host_std()
+            .to_host()
             .expect("h_std holds a non-canonical residue");
-        assert_eq!(got_mont.len(), want.len(), "{name}: H length");
+        assert_eq!(got_std.len(), want.len(), "{name}: H length");
 
-        let mut mont_ok = 0usize;
-        let mut std_ok = 0usize;
-        for i in 0..want.len() {
-            if got_mont[i] == want[i] {
-                mont_ok += 1;
-            }
-            if got_std[i] == want[i] {
-                std_ok += 1;
-            }
-        }
-        println!(
-            "H  {name:<14} montgomery {mont_ok}/{}  standard {std_ok}/{}",
-            want.len(),
-            want.len()
-        );
-        assert_eq!(mont_ok, want.len(), "{name}: H montgomery mismatch");
+        let std_ok = (0..want.len()).filter(|&i| got_std[i] == want[i]).count();
+        println!("H  {name:<14} standard {std_ok}/{}", want.len());
         assert_eq!(std_ok, want.len(), "{name}: H standard mismatch");
-        h_total += mont_ok + std_ok;
+        h_total += std_ok;
 
         // Five MSMs. CPU takes the CPU H; the GPU takes its own device-resident H, so
         // this is the production path and not a rewired one.
@@ -170,11 +155,11 @@ fn proving_the_same_witness_twice_is_stable() {
         let mut t = StageTimings::default();
 
         let h1 = c.compute_h(&witness, &mut t).unwrap();
-        let v1 = h1.device_handle::<HHandle>(TAG).unwrap().to_host();
+        let v1 = h1.device_handle::<HHandle>(TAG).unwrap().to_host().unwrap();
         let m1 = c.msms(&witness, &h1, &mut t).unwrap();
         drop(h1);
         let h2 = c.compute_h(&witness, &mut t).unwrap();
-        let v2 = h2.device_handle::<HHandle>(TAG).unwrap().to_host();
+        let v2 = h2.device_handle::<HHandle>(TAG).unwrap().to_host().unwrap();
         let m2 = c.msms(&witness, &h2, &mut t).unwrap();
         drop(h2);
 
@@ -427,55 +412,6 @@ fn two_circuits_share_one_backend_under_load() {
         "CROSS-CIRCUIT {} circuits x 3 threads x 3 proofs, all identical and all verify",
         loaded.len()
     );
-}
-
-/// What the duplicated H conversion costs.
-///
-/// Stage 4 already writes H in standard form (`h_std`), but `MetalCircuit::msms` cannot
-/// wrap a foreign buffer in a `ScalarBuf`, so it recomputes the same values from
-/// `h_mont` with `fr_mont_to_std` in a command buffer of its own. This measures that
-/// second conversion; the first one's cost is the extra `n * 32` bytes stage 4 writes
-/// and is not separable without editing the shader.
-#[test]
-fn the_second_h_conversion_costs_this_much() {
-    use g16_metal::msm::MetalMsm;
-    use g16_metal::stages::HStages;
-    use std::time::Instant;
-
-    let stages = HStages::new().unwrap();
-    let msm = MetalMsm::new().unwrap();
-    for (name, dir) in artifacts() {
-        let pk = ProvingKey::load(&dir.join("circuit.zkey")).unwrap();
-        let witness = Witness::load(&dir.join("circuit.wtns")).unwrap().0;
-        let res = stages.prepare(&pk).unwrap();
-        let mut t = StageTimings::default();
-
-        let mut conv = Vec::new();
-        let mut whole = Vec::new();
-        for rep in 0..15 {
-            let s = Instant::now();
-            let h = res.compute_h(&stages, &witness, &mut t).unwrap();
-            let w = s.elapsed().as_secs_f64() * 1e3;
-            let handle = h.device_handle::<HHandle>(TAG).unwrap();
-            let s = Instant::now();
-            let _ = msm
-                .scalars_from_device_mont(handle.h_mont(), handle.len())
-                .unwrap();
-            let c = s.elapsed().as_secs_f64() * 1e3;
-            drop(h);
-            if rep >= 5 {
-                conv.push(c);
-                whole.push(w);
-            }
-        }
-        conv.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        whole.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        println!(
-            "CONV {name:<14} stages 0-4 {:6.3} ms   redundant mont->std {:6.3} ms",
-            whole[whole.len() / 2],
-            conv[conv.len() / 2]
-        );
-    }
 }
 
 /// Adversarial scalar vectors through the GPU MSM, against arkworks' own

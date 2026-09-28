@@ -41,16 +41,13 @@ fn artifacts() -> Vec<(String, PathBuf)> {
     out
 }
 
-/// Both encodings of the GPU's H, unpacked. `h_std` is validated as a canonical residue
-/// on the way out, so a broken `fr_from_mont` cannot hide behind a silent reduction.
-fn read_back(h: &HPoly) -> (Vec<Fr>, Vec<Fr>) {
-    let handle = h
-        .device_handle::<HHandle>(TAG)
-        .expect("compute_h returned something other than a metal device handle");
-    let std_form = handle
-        .to_host_std()
-        .expect("h_std contains a value that is not a canonical residue below r");
-    (handle.to_host(), std_form)
+/// The GPU's H, unpacked. `h_std` is validated as a canonical residue on the way out,
+/// so a broken `fr_from_mont` cannot hide behind a silent reduction.
+fn read_back(h: &HPoly) -> Vec<Fr> {
+    h.device_handle::<HHandle>(TAG)
+        .expect("compute_h returned something other than a metal device handle")
+        .to_host()
+        .expect("h_std contains a value that is not a canonical residue below r")
 }
 
 fn compare(name: &str, label: &str, got: &[Fr], want: &[Fr]) -> usize {
@@ -120,9 +117,7 @@ fn gpu_compute_h_matches_the_cpu_backend() {
         let mut tg = StageTimings::default();
         let h = res.compute_h(&stages, &w, &mut tg).unwrap();
         assert_eq!(h.len(), res.domain_size());
-        let (mont, std_form) = read_back(&h);
-        let m1 = compare(&name, "fused/montgomery", &mont, &want);
-        let m2 = compare(&name, "fused/standard", &std_form, &want);
+        let m1 = compare(&name, "fused", &read_back(&h), &want);
         drop(h);
 
         // Constant work multiplies by every witness value the variable gather skips; the
@@ -131,9 +126,7 @@ fn gpu_compute_h_matches_the_cpu_backend() {
         let h = res
             .compute_h_with(&stages, &w, Work::Constant, &mut tk)
             .unwrap();
-        let (mont_k, std_k) = read_back(&h);
-        compare(&name, "constant/montgomery", &mont_k, &want);
-        compare(&name, "constant/standard", &std_k, &want);
+        let m2 = compare(&name, "constant", &read_back(&h), &want);
         drop(h);
 
         // The unfused path, which runs the standalone stage 4 kernel and waits on each
@@ -141,17 +134,15 @@ fn gpu_compute_h_matches_the_cpu_backend() {
         std::env::set_var("G16_METAL_PROFILE", "1");
         let mut tp = StageTimings::default();
         let h = res.compute_h(&stages, &w, &mut tp).unwrap();
-        let (mont_u, std_u) = read_back(&h);
-        let m3 = compare(&name, "unfused/montgomery", &mont_u, &want);
-        let m4 = compare(&name, "unfused/standard", &std_u, &want);
+        let m3 = compare(&name, "unfused", &read_back(&h), &want);
         drop(h);
         std::env::remove_var("G16_METAL_PROFILE");
 
         println!(
-            "H MATCHED  {name:<14} {}/{} elements, all four encodings ({} comparisons)",
+            "H MATCHED  {name:<14} {}/{} elements, fused, constant and unfused ({} comparisons)",
             m1,
             want.len(),
-            m1 + m2 + m3 + m4
+            m1 + m2 + m3
         );
         println!(
             "STAGE US   {name:<14} gpu gather {} ntt {} pointwise {}   cpu gather {} ntt {} pointwise {}",
@@ -161,7 +152,7 @@ fn gpu_compute_h_matches_the_cpu_backend() {
             "FUSED US   {name:<14} host pack {} gpu stages 0-4 {}",
             tg.gather_us, tg.ntt_us
         );
-        total += m1 + m2 + m3 + m4;
+        total += m1 + m2 + m3;
     }
     println!("TOTAL ELEMENT COMPARISONS MATCHED  {total}");
 }

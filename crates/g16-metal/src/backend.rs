@@ -375,11 +375,11 @@ impl MetalCircuit {
                         self.pk.domain_size
                     )));
                 }
-                // Stage 4 wrote H in both Montgomery and standard form; the MSM reads
-                // the standard copy directly. Re-deriving it from `h_mont` through
-                // `scalars_from_device_mont` was the old path here, and it cost one
-                // extra command buffer plus a full-domain Montgomery reduction that the
-                // pointwise kernel had already performed.
+                // Stage 4 wrote H in standard form, which the MSM reads directly.
+                // Converting a Montgomery copy through `scalars_from_device_mont` was
+                // the old path here, and it cost one extra command buffer plus a
+                // full-domain Montgomery reduction that the pointwise kernel had
+                // already performed.
                 //
                 // The plan's digit entries go into the domain vectors stage 4 is done
                 // with, rather than a buffer of their own from the MSM pool.
@@ -520,7 +520,7 @@ impl PreparedCircuit for MetalCircuit {
     /// costs a full-domain readback, which is the round trip [`HPoly`] exists to avoid.
     fn h_to_host(&self, h: &HPoly) -> Option<Vec<Fr>> {
         match h.device_handle::<HHandle>(crate::stages::TAG) {
-            Some(handle) => Some(handle.to_host()),
+            Some(handle) => handle.to_host(),
             None => h.to_host().map(<[Fr]>::to_vec),
         }
     }

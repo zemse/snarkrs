@@ -133,9 +133,8 @@ kernel void g16_ntt_head(
     device const Fr*     ptab   [[buffer(3)]], // shift^j table, G16_SCALE_TABLE only
     device const Fr*     join_a [[buffer(4)]], // G16_STORE_JOIN only
     device const Fr*     join_b [[buffer(5)]],
-    device Fr*           h_mont [[buffer(6)]],
-    device Fr*           h_std  [[buffer(7)]],
-    constant NttParams&  p      [[buffer(8)]],
+    device Fr*           h_std  [[buffer(6)]],
+    constant NttParams&  p      [[buffer(7)]],
     threadgroup Fr*      sh     [[threadgroup(0)]],
     uint tg   [[threadgroup_position_in_grid]],
     uint tid  [[thread_position_in_threadgroup]],
@@ -170,7 +169,7 @@ kernel void g16_ntt_head(
     for (uint m = tid; m < blk; m += tgsz) {
         uint i = base + m;
         if (p.store_mode == G16_STORE_JOIN) {
-            g16_store_h(h_mont, h_std, i, fr_sub(fr_mul(join_a[i], join_b[i]), sh[m]));
+            g16_store_h(h_std, i, fr_sub(fr_mul(join_a[i], join_b[i]), sh[m]));
         } else {
             dst[i] = sh[m];
         }
@@ -192,9 +191,8 @@ kernel void g16_ntt_tail(
     device const Fr*     tw     [[buffer(2)]],
     device const Fr*     join_a [[buffer(4)]],
     device const Fr*     join_b [[buffer(5)]],
-    device Fr*           h_mont [[buffer(6)]],
-    device Fr*           h_std  [[buffer(7)]],
-    constant NttParams&  p      [[buffer(8)]],
+    device Fr*           h_std  [[buffer(6)]],
+    constant NttParams&  p      [[buffer(7)]],
     threadgroup Fr*      sh     [[threadgroup(0)]],
     uint tg   [[threadgroup_position_in_grid]],
     uint tid  [[thread_position_in_threadgroup]],
@@ -215,7 +213,7 @@ kernel void g16_ntt_tail(
     for (uint m = tid; m < blk; m += tgsz) {
         uint i = base + (m << p.s0);
         if (p.store_mode == G16_STORE_JOIN) {
-            g16_store_h(h_mont, h_std, i, fr_sub(fr_mul(join_a[i], join_b[i]), sh[m]));
+            g16_store_h(h_std, i, fr_sub(fr_mul(join_a[i], join_b[i]), sh[m]));
         } else {
             a[i] = sh[m];
         }
