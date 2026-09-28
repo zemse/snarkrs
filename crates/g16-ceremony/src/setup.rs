@@ -72,6 +72,10 @@ pub const COEF_RECORD_BYTES: usize = 12 + crate::N8;
 /// are identical whatever the split, and 8192 records is 352 KB.
 const COEF_BATCH: usize = 8192;
 
+/// Points per `normalize_batch` call in [`to_affine`]: one field inversion each, so the
+/// split only trades inversions against scratch, and the affine output is the same.
+const NORMALIZE_CHUNK: usize = 4096;
+
 /// Points per `hashHPoints` chunk, snarkjs' `CHUNK_SIZE` at `zkey_new.js:505`. Unlike the
 /// coefficient batch this one IS load bearing, because the missing `- i` at `:511` makes
 /// the number of points hashed a function of it.
@@ -547,14 +551,14 @@ pub fn compose_points_g1(
     r1cs: &R1cs,
     msm: &dyn MsmBackend,
 ) -> Result<Vec<G1Affine>, CeremonyError> {
-    let acc: Vec<G1Projective> = slots
-        .par_iter()
-        .map(|slot| {
+    let acc = binfile::collect_records(
+        slots.par_iter().map(|slot| -> Result<_, CeremonyError> {
             let (points, scalars) = gather(slot, r1cs, |term| bases.g1(term))?;
             Ok(combine(&points, &scalars, |b, s| msm.msm_g1(b, s)))
-        })
-        .collect::<Result<_, CeremonyError>>()?;
-    Ok(G1Projective::normalize_batch(&acc))
+        }),
+        G1Projective::zero(),
+    )?;
+    Ok(to_affine(&acc))
 }
 
 /// [`compose_points_g1`] for section 7, the only G2 output.
@@ -564,14 +568,27 @@ pub fn compose_points_g2(
     r1cs: &R1cs,
     msm: &dyn MsmBackend,
 ) -> Result<Vec<G2Affine>, CeremonyError> {
-    let acc: Vec<G2Projective> = slots
-        .par_iter()
-        .map(|slot| {
+    let acc = binfile::collect_records(
+        slots.par_iter().map(|slot| -> Result<_, CeremonyError> {
             let (points, scalars) = gather(slot, r1cs, |term| bases.g2(term))?;
             Ok(combine(&points, &scalars, |b, s| msm.msm_g2(b, s)))
-        })
-        .collect::<Result<_, CeremonyError>>()?;
-    Ok(G2Projective::normalize_batch(&acc))
+        }),
+        G2Projective::zero(),
+    )?;
+    Ok(to_affine(&acc))
+}
+
+/// [`CurveGroup::normalize_batch`] a chunk at a time, into the one vector returned.
+///
+/// Over the whole slice it would hold a second vector of every `z` and a third of their
+/// running products, one field element per signal each, while the projective input is
+/// still alive.
+fn to_affine<P: CurveGroup>(acc: &[P]) -> Vec<P::Affine> {
+    let mut out = vec![P::Affine::zero(); acc.len()];
+    out.par_chunks_mut(NORMALIZE_CHUNK)
+        .zip(acc.par_chunks(NORMALIZE_CHUNK))
+        .for_each(|(out, acc)| out.copy_from_slice(&P::normalize_batch(acc)));
+    out
 }
 
 /// The bases and scalars of one slot, in term order.
