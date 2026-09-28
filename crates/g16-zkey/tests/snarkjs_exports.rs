@@ -70,9 +70,28 @@ fn scratch(test: &str) -> PathBuf {
     dir
 }
 
+/// Run with stdout and stderr sent to files rather than pipes. snarkjs ends with
+/// `process.exit`, and Node writes to a pipe asynchronously, so a pipe loses the tail of a
+/// large print (`r1cs print` on js_1x1_d8 came back 460 KB short); writes to a file are
+/// synchronous.
 fn run(cmd: &mut Command) -> Output {
-    cmd.output()
-        .unwrap_or_else(|e| panic!("failed to run {cmd:?}: {e}"))
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("snarkjs-out-{}-{n}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (out, err) = (dir.join("stdout"), dir.join("stderr"));
+    let status = cmd
+        .stdout(std::fs::File::create(&out).unwrap())
+        .stderr(std::fs::File::create(&err).unwrap())
+        .status()
+        .unwrap_or_else(|e| panic!("failed to run {cmd:?}: {e}"));
+    let o = Output {
+        status,
+        stdout: std::fs::read(&out).unwrap(),
+        stderr: std::fs::read(&err).unwrap(),
+    };
+    let _ = std::fs::remove_dir_all(&dir);
+    o
 }
 
 /// First differing byte, with context, so a mismatch in a megabyte of JSON is readable.
