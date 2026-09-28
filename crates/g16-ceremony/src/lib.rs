@@ -31,6 +31,7 @@
 //! [`phase1`], [`prepare`], [`setup`], [`contribute`] and [`vkey`] are the commands.
 
 pub mod accel;
+pub mod challenge;
 pub mod contribute;
 pub mod phase1;
 pub mod prepare;

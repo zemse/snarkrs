@@ -94,7 +94,7 @@ const fn challenge_chunk(sg: usize) -> usize {
 /// The two point groups a `.ptau` section can hold, with the three encodings each one is
 /// written or hashed in. Sections 2, 4 and 5 are G1, sections 3 and 6 are G2, and every
 /// step below differs only in these constants.
-trait PtauGroup: AffineRepr<ScalarField = Fr> + Send + Sync {
+pub(crate) trait PtauGroup: AffineRepr<ScalarField = Fr> + Send + Sync {
     /// `sG`, bytes on disk (LEM and uncompressed are both this wide).
     const SG: usize;
     /// `scG`, bytes compressed.
@@ -257,7 +257,7 @@ pub fn first_challenge_hash(power: u32) -> Digest {
 /// section size, so a 40-byte three-field header is rejected. `writePTauHeader` treats a
 /// falsy `ceremonyPower` as "same as power" (`:30`), which is how `powersoftau new` ends
 /// up writing `power` twice.
-fn write_header(
+pub(crate) fn write_header(
     w: &mut BinFileWriter,
     power: u32,
     ceremony_power: u32,
@@ -269,7 +269,7 @@ fn write_header(
     w.end_section()
 }
 
-fn check_power(power: u32) -> Result<(), CeremonyError> {
+pub(crate) fn check_power(power: u32) -> Result<(), CeremonyError> {
     if !(POWER_MIN..=POWER_MAX).contains(&power) {
         return Err(CeremonyError::BadParams(format!(
             "power must be between {POWER_MIN} and {POWER_MAX}, got {power}"
@@ -424,7 +424,7 @@ fn process_section<C: PtauGroup>(
 
 /// Absorb one written section's **uncompressed** form into the next-challenge hash,
 /// reading it back off the new file (`hashSection`, `powersoftau_contribute.js:161-182`).
-fn hash_section_u<C: PtauGroup>(
+pub(crate) fn hash_section_u<C: PtauGroup>(
     file: &mut File,
     offset: u64,
     n_points: usize,
