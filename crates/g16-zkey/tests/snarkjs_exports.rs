@@ -14,6 +14,7 @@ use std::process::{Command, Output};
 
 use g16_zkey::calldata::groth16_solidity_calldata;
 use g16_zkey::export_json::{wtns_export_json, zkey_export_json};
+use g16_zkey::file_info::file_info;
 
 /// Small enough that snarkjs finishes each in a second or two.
 const VARIANTS: [&str; 2] = ["tiny_mul", "js_1x1_d8"];
@@ -172,5 +173,59 @@ fn soliditycalldata_matches_snarkjs() {
             ours.as_bytes(),
             &o.stdout,
         );
+    }
+}
+
+/// `file info` on every kind of binfile, and on the broken shapes it exists to describe:
+/// a payload running off the end, a header cut mid-length, a version cut mid-word, a
+/// duplicated and an empty section, the wrong magic, a missing file, a bad extension.
+#[test]
+fn file_info_matches_snarkjs() {
+    if !have_snarkjs("file_info_matches_snarkjs") {
+        return;
+    }
+    let dirs = variants("file_info_matches_snarkjs");
+    let Some(dir) = dirs.first() else { return };
+    let out = scratch("file-info");
+    let zkey = std::fs::read(dir.join("circuit.zkey")).unwrap();
+
+    let mut cases: Vec<PathBuf> = ["circuit.zkey", "circuit.r1cs", "circuit.wtns"]
+        .iter()
+        .map(|f| dir.join(f))
+        .collect();
+    let mut write = |name: &str, bytes: &[u8]| {
+        let p = out.join(name);
+        std::fs::write(&p, bytes).unwrap();
+        cases.push(p);
+    };
+    write("payload_cut.zkey", &zkey[..1000]);
+    write("length_cut.zkey", &zkey[..20]);
+    write("version_cut.zkey", &zkey[..6]);
+    write("empty.zkey", &[]);
+    write(
+        "magic.zkey",
+        &std::fs::read(dir.join("circuit.wtns")).unwrap(),
+    );
+    // Section 1 twice, then a zero-length section 5.
+    let mut dup = b"zkey".to_vec();
+    dup.extend_from_slice(&1u32.to_le_bytes());
+    dup.extend_from_slice(&3u32.to_le_bytes());
+    for (id, body) in [(1u32, &[1u8, 0, 0, 0][..]), (1, &[2, 0, 0, 0]), (5, &[])] {
+        dup.extend_from_slice(&id.to_le_bytes());
+        dup.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        dup.extend_from_slice(body);
+    }
+    write("dup.zkey", &dup);
+    cases.push(out.join("missing.zkey"));
+    cases.push(out.join("notes.txt"));
+
+    for case in cases {
+        let name = case.to_str().unwrap();
+        let o = run(snarkjs().args(["file", "info", name]));
+        assert!(o.status.success(), "snarkjs failed: {o:?}");
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        file_info(name, &mut stdout, &mut stderr).unwrap();
+        assert_same(&format!("{name} stdout"), &stdout, &o.stdout);
+        assert_same(&format!("{name} stderr"), &stderr, &o.stderr);
     }
 }

@@ -18,6 +18,8 @@ pub mod binfile;
 pub mod calldata;
 #[cfg(not(target_family = "wasm"))]
 pub mod export_json;
+#[cfg(not(target_family = "wasm"))]
+pub mod file_info;
 pub mod json_out;
 pub mod wtns;
 
