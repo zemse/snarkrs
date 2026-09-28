@@ -93,6 +93,9 @@ fn type_bytes(ty: &str) -> Option<u64> {
         // that decides whether `msm_reduce_*` fits the browser floor.
         "PtG1" => Some(pointsgen::G1.point_bytes),
         "PtG2" => Some(pointsgen::G2.point_bytes),
+        // The projective points of the constant-work reduce: three coordinates.
+        "ProjG1" => Some(pointsgen::G1.proj_bytes()),
+        "ProjG2" => Some(pointsgen::G2.proj_bytes()),
         _ => None,
     }
 }
@@ -841,6 +844,7 @@ fn no_entry_point_inlines_more_point_operations_than_the_device_survives() {
             let ops = [
                 format!("pt_add_{}", c.suffix),
                 format!("pt_madd_{}", c.suffix),
+                format!("pt_add_complete_{}", c.suffix),
             ];
             let mut memo = std::collections::HashMap::new();
             for f in &m.fns {
@@ -972,10 +976,10 @@ fn every_uniform_parameter_struct_matches_its_host_mirror() {
             msmgen::fused_module_at(v, Workgroups::default(), LimbPick::default()),
             "MsmParams",
             std::mem::size_of::<g16_wgpu::MsmParams>(),
-            // The last four are the point stages'. They were added to both sides when the
-            // G2 MSM landed and this list was not, which is precisely the drift this test
-            // exists to catch: the host struct and the WGSL struct agreed with each other
-            // and disagreed with the expectation written here.
+            // The last eight are the point stages'. The first four of them were added to
+            // both sides when the G2 MSM landed and this list was not, which is precisely
+            // the drift this test exists to catch: the host struct and the WGSL struct
+            // agreed with each other and disagreed with the expectation written here.
             &[
                 "n",
                 "c",
@@ -988,7 +992,11 @@ fn every_uniform_parameter_struct_matches_its_host_mirror() {
                 "ones_groups",
                 "slice_len",
                 "slices",
-                "pad0",
+                "dummy_rows",
+                "dummy_base",
+                "fold_in",
+                "fold_groups",
+                "fold_len",
             ],
         ),
     ];

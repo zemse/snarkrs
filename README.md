@@ -159,8 +159,9 @@ skips the check for input you already trust:
 The check in `prove` is also what stops a hostile zkey from reading the witness out of the
 proof, so a key from someone else should only ever meet `prove`, and should still be checked
 with `g16 zkey verify` against the circuit and the ptau. Proving time depends on how many
-witness entries are zero or one unless you pass `--constant-work` (cpu and metal backends,
-2.5% to about 5x slower depending on the circuit and backend). The audit and its current status are in
+witness entries are zero or one unless you pass `--constant-work` (cpu, metal and wgpu
+backends, 2.5% to about 10x slower depending on the circuit and backend). The audit and its
+current status are in
 [`security/README.md`](security/README.md).
 
 ## References

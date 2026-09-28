@@ -30,7 +30,13 @@
 //!
 //! It also means the prover is not constant time with respect to the witness. `security/`
 //! and `g16-msm`'s `prescan` docs carry that analysis; it is a deliberate trade, not an
-//! oversight.
+//! oversight. `P.dummy_rows != 0` is the opt-in constant-work mode (`crate::msm::Work`): no
+//! scalar is skipped and a zero digit is counted and scattered like any other, into one of
+//! `dummy_rows` rows per window that sit after every real bucket and that no merge, reduce
+//! or readback ever touches. Every scalar then emits exactly one entry per window, so the
+//! entry region is always full and the segmented accumulation runs every slice. The dummy
+//! row is picked by scalar index, not by value, and there are several per window only to
+//! spread the atomics: on a bit witness nearly every digit is zero.
 //!
 //! # The recoding, and why the top carry is provably zero
 //!
@@ -418,15 +424,15 @@ fn fr_prelude(v: Variant) -> String {
 /// The `MsmParams` fields, shared verbatim by every module that dispatches part of an MSM,
 /// so the declarations cannot drift.
 ///
-/// **Twelve `u32`, 48 bytes, and the last four are U10's.** The digit kernels here ignore
-/// `base_off`, `ones_groups`, `slice_len` and `slices` entirely; they are in this struct
-/// rather than in a second one because `g16-metal` has exactly one `MsmParams` covering both
-/// halves, because design §3 puts every parameter block for a proof in one uniform ring, and
-/// because two structs would be two host mirrors for
-/// `tests/wgsl_static.rs::every_uniform_parameter_struct_matches_its_host_mirror` to check
-/// and one more place for a field to be added on one side only.
+/// **Sixteen `u32`, 64 bytes, and the last eight are the point stages'.** The digit kernels
+/// here ignore `base_off`, `ones_groups`, `slice_len`, `slices` and the four `fold_*`
+/// entirely; they are in this struct rather than in a second one because `g16-metal` has
+/// exactly one `MsmParams` covering both halves, because design §3 puts every parameter
+/// block for a proof in one uniform ring, and because two structs would be two host mirrors
+/// for `tests/wgsl_static.rs::every_uniform_parameter_struct_matches_its_host_mirror` to
+/// check and one more place for a field to be added on one side only.
 ///
-/// 48 is a multiple of the 16 WGSL rounds every uniform struct up to, so there is no
+/// 64 is a multiple of the 16 WGSL rounds every uniform struct up to, so there is no
 /// invisible tail padding for `crate::msm::MsmParams` to disagree with, and it is well under
 /// the 256-byte ring slot.
 const PARAM_FIELDS: &str = "\
@@ -460,7 +466,18 @@ const PARAM_FIELDS: &str = "\
     slice_len: u32,\n\
     // ceil(cap / slice_len), threads per window in msm_segmented_*.\n\
     slices: u32,\n\
-    pad0: u32,\n";
+    // Constant work: rows per window, after the real buckets, that take the zero digits;\n\
+    // 0 skips them (and the 0/1 scalars). Uniform, so every test on it is one branch for\n\
+    // the whole dispatch.\n\
+    dummy_rows: u32,\n\
+    // The first dummy row, which is the plan's whole real row count. Not n_windows *\n\
+    // n_buckets: a window slab lowers n_windows to its own end.\n\
+    dummy_base: u32,\n\
+    // One msm_fold_* level: spill slots per window it reads, groups per window it writes\n\
+    // (1 on the last level), and slots per group. Zero for every other kernel.\n\
+    fold_in: u32,\n\
+    fold_groups: u32,\n\
+    fold_len: u32,\n";
 
 /// The parameter struct and its uniform binding. One copy per module, whichever module.
 ///
@@ -675,12 +692,31 @@ fn classify(pick: LimbPick) -> String {
     // collects one entry per one-scalar and every one of those points is then added a
     // second time by msm_ones_*. It is also what stops that single bucket, owned by a single
     // thread, from serially accumulating 100k points while the rest of the machine idles.
+    //
+    // Constant work skips neither: the ones pass is off, so a 1 recodes into bucket (0, 0)
+    // like any other scalar, and a 0 takes its window's dummy rows.
     let hi = {hi};
-    if ((hi | {zero}) == 0u) {{ return; }}
-    if (hi == 0u && {zero} == 1u) {{ return; }}
+    if (P.dummy_rows == 0u) {{
+        if ((hi | {zero}) == 0u) {{ return; }}
+        if (hi == 0u && {zero} == 1u) {{ return; }}
+    }}
 "
     );
     s
+}
+
+/// The row a digit of scalar `i` in window `w` lands in, as a `let row` the caller binds,
+/// or a `continue` for a zero digit under variable work. Shared by count and scatter.
+///
+/// Under constant work the zero digit's row is window `w`'s block of dummy rows, which sits
+/// after every real bucket, and `dummy_rows` is a power of two.
+fn digit_row() -> &'static str {
+    "        var row = w * P.n_buckets + (d.x - 1u);
+        if (d.x == 0u) {
+            if (P.dummy_rows == 0u) { continue; }
+            row = P.dummy_base + w * P.dummy_rows + (i & (P.dummy_rows - 1u));
+        }
+"
 }
 
 fn entry_zero(workgroup: u32) -> String {
@@ -715,12 +751,13 @@ fn {ENTRY_COUNT}(@builtin(global_invocation_id) gid: vec3<u32>) {{
 {}\
 \x20   for (var w = 0u; w < P.n_windows; w = w + 1u) {{
         let d = sc_digit({call}, w, P.c);
-        if (d.x == 0u) {{ continue; }}
-        atomicAdd(&COUNTS_A[w * P.n_buckets + (d.x - 1u)], 1u);
+{}\
+\x20       atomicAdd(&COUNTS_A[row], 1u);
     }}
 }}
 ",
-        classify(pick)
+        classify(pick),
+        digit_row()
     );
     s
 }
@@ -771,6 +808,16 @@ fn {ENTRY_SCAN}(@builtin(workgroup_id) wid: vec3<u32>,
         workgroupBarrier();
         running = running + total;
     }}
+    // The window's dummy rows follow its real runs, so under constant work the region ends
+    // at `w * cap + n` exactly: every scalar put one entry somewhere in it. One lane and no
+    // barrier: `running` is the same in every lane, and at most 64 rows follow.
+    if (tid == 0u) {{
+        for (var j = 0u; j < P.dummy_rows; j = j + 1u) {{
+            let d = P.dummy_base + w * P.dummy_rows + j;
+            CURSOR_W[d] = running;
+            running = running + COUNTS_R[d];
+        }}
+    }}
 }}
 ",
         last = workgroup - 1
@@ -804,16 +851,16 @@ fn {ENTRY_SCATTER}(@builtin(global_invocation_id) gid: vec3<u32>) {{
 {}\
 \x20   for (var w = 0u; w < P.n_windows; w = w + 1u) {{
         let d = sc_digit({call}, w, P.c);
-        if (d.x == 0u) {{ continue; }}
-        let row = w * P.n_buckets + (d.x - 1u);
-        let slot = atomicAdd(&CURSOR_A[row], 1u);
+{}\
+\x20       let slot = atomicAdd(&CURSOR_A[row], 1u);
         // i, not scalar_off + i: the point stages index the base vector as
         // bases[base_off + (e >> 1)], so the entry carries the position within this MSM.
         ENTRIES[slot] = vec2<u32>(row, (i << 1u) | d.y);
     }}
 }}
 ",
-        classify(pick)
+        classify(pick),
+        digit_row()
     );
     s
 }

@@ -75,6 +75,9 @@
 
 use std::fmt::Write as _;
 
+use g16_field::{AffineRepr, G1Affine, G2Affine};
+use g16_gpu_layout::{PackedFq, PackedFq2, LIMBS};
+
 use crate::gen::field::{Variant, FQ, FQ2_OPS, MUL64};
 use crate::gen::msm::params_struct;
 
@@ -245,16 +248,56 @@ impl Curve {
     pub fn entry_ones(&self) -> String {
         format!("msm_ones_{}", self.suffix)
     }
+    /// One level of the constant-work merge: fold the spill slots as a fixed tree.
+    pub fn entry_fold(&self) -> String {
+        format!("msm_fold_{}", self.suffix)
+    }
+    /// The reduce on the complete formulas, for a constant-work plan.
+    pub fn entry_reduce_constant(&self) -> String {
+        format!("msm_reduce_constant_{}", self.suffix)
+    }
 
-    /// The five, in the order a proof dispatches them.
-    pub fn entries(&self) -> [String; 5] {
+    /// The seven, in the order a proof dispatches them; a proof runs the merge and the
+    /// reduce, or the fold and the constant reduce, never both.
+    pub fn entries(&self) -> [String; 7] {
         [
             self.entry_clear(),
             self.entry_segmented(),
             self.entry_merge(),
             self.entry_reduce(),
             self.entry_ones(),
+            self.entry_fold(),
+            self.entry_reduce_constant(),
         ]
+    }
+
+    /// The projective point type of the constant-work kernels, `ProjG1` or `ProjG2`.
+    pub fn proj(&self) -> String {
+        format!("Proj{}", &self.pt[2..])
+    }
+
+    /// Bytes one [`Self::proj`] occupies: three coordinates against XYZZ's four.
+    pub const fn proj_bytes(&self) -> u64 {
+        self.point_bytes / 4 * 3
+    }
+
+    /// `3b` of this group, as the limbs the shader holds: `9` on G1 and `3 * 3 / (9 + u)`
+    /// on G2, one `Fq` per coordinate. Derived from the generator through the curve
+    /// equation (`a = 0` on both, so `b = y^2 - x^3`) rather than typed, and checked
+    /// against the constant term the module docs quote for G1.
+    pub fn b3_limbs(&self) -> Vec<[u32; LIMBS]> {
+        if self.needs_fq2 {
+            let g = G2Affine::generator();
+            let three = g16_field::Fq2::new(g16_field::Fq::from(3u64), g16_field::Fq::from(0u64));
+            let b3 = (g.y * g.y - g.x * g.x * g.x) * three;
+            let packed = PackedFq2::from_fq2(&b3);
+            vec![packed.c0.v, packed.c1.v]
+        } else {
+            let g = G1Affine::generator();
+            let b3 = (g.y * g.y - g.x * g.x * g.x) * g16_field::Fq::from(3u64);
+            assert_eq!(b3, g16_field::Fq::from(9u64), "BN254 G1 is y^2 = x^3 + 3");
+            vec![PackedFq::from_fq(&b3).v]
+        }
     }
 }
 
@@ -286,18 +329,24 @@ pub const BIND_WSUMS: u32 = 8;
 pub const BIND_SCALARS: u32 = 9;
 /// One point per ones group.
 pub const BIND_ONES: u32 = 10;
+/// The other half of the constant-work fold's ping-pong: the level's output slots, read
+/// back through the spill bindings on the next level with the two buffers swapped.
+pub const BIND_FOLD_PTS: u32 = 11;
+/// The bucket row each fold output slot belongs to, or [`NO_ROW`].
+pub const BIND_FOLD_ROWS: u32 = 12;
 
 /// Storage buffers each entry point's pipeline layout declares. The browser floor allows 8
 /// and this adapter reports 9 under strict compliance, so a kernel at 9 passes here and
 /// fails in Chrome. `tests/msm_g1.rs` and `tests/msm_g2.rs` assert these against the layouts
 /// the host builds and `tests/wgsl_static.rs` asserts them against the emitted text, which
 /// are different questions: the first is what the device enforces, the second is what a
-/// browser would. Curve-independent: the same eleven resources over either group.
+/// browser would. Curve-independent: the same thirteen resources over either group.
 pub const STORAGE_CLEAR: u32 = 1;
 pub const STORAGE_SEGMENTED: u32 = 6;
 pub const STORAGE_MERGE: u32 = 5;
 pub const STORAGE_REDUCE: u32 = 2;
 pub const STORAGE_ONES: u32 = 3;
+pub const STORAGE_FOLD: u32 = 5;
 
 /// The spill-slot tag meaning "this slot holds nothing". Not 0, which is bucket row 0.
 pub const NO_ROW: u32 = 0xffff_ffff;
@@ -486,13 +535,16 @@ pub fn points_module_at(v: Variant, c: Curve, wg: Workgroups) -> String {
     }
     s.push_str(&point_types(c));
     s.push_str(&point_ops(c));
+    s.push_str(&proj_ops(c));
     s.push_str(&params_struct());
     s.push_str(&bindings(c));
     s.push_str(&entry_clear(c, wg.clear));
     s.push_str(&entry_segmented(c, wg.segmented));
     s.push_str(&entry_merge(c, wg.merge));
-    s.push_str(&entry_reduce(c, wg.tg));
+    s.push_str(&entry_reduce(c, wg.tg, false));
     s.push_str(&entry_ones(c, wg.tg));
+    s.push_str(&entry_fold(c, wg.merge));
+    s.push_str(&entry_reduce(c, wg.tg, true));
     s
 }
 
@@ -1070,7 +1122,244 @@ fn pt_mul_small_{sfx}(p: {pt}, k: u32) -> {pt} {{
 /// the function body. A bisection gate, kept for `MERGE_BODY`'s reason.
 pub static MUL_SMALL_BODY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// The eleven module-scope resources. No entry point reaches more than six.
+/// A limb list as a WGSL constructor of `ty`, for a module-scope `const`. That is the one
+/// place an array value constructor is allowed: WebKit emits a module-scope one with
+/// braces, which Metal accepts, and `tests/wgsl_static.rs` exempts exactly those.
+fn const_limbs(ty: &str, limbs: &[u32]) -> String {
+    let items = limbs
+        .iter()
+        .map(|l| format!("{l}u"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{ty}({items})")
+}
+
+/// Homogeneous projective points with the complete formulas of Renes, Costello and Batina
+/// ("Complete addition formulas for prime order elliptic curves", 2016), for the
+/// constant-work fold and reduce (`crate::msm::Work::Constant`).
+///
+/// `pt_add_*` returns the other operand when one is the identity, so a thread whose
+/// buckets are empty skips the fourteen products, and a whole SIMD group of them skips
+/// them together: at 2^18 the reduce read 1.56 ms on a witness of bits against 11.64 on a
+/// dense one in G1, 2.5 against 161 in G2, and the fold 1.75 against 2.62 and 13.6
+/// against 21.5. `g16-metal` tried selecting the result after the products and it spilled;
+/// the complete formulas have no case at all: one polynomial map gives the sum for any two
+/// points, the identity `(0 : 1 : 0)`, a doubling and a cancellation included, in 12M + 2
+/// products by 3b against add-2008-s's 12M + 2S. So an addition costs the same whatever
+/// the bucket holds, and a doubling is `pt_add_complete(p, p)`, which is what keeps the
+/// constant reduce's ladder on one call site.
+///
+/// Buckets, spill slots and window sums stay XYZZ: the accumulation writes them and the
+/// host reads them. A constant-work kernel converts what it loads (3M, and Y = 1 for the
+/// identity, whose XYZZ form is all zero) and what it stores (4M).
+///
+/// Microcoded like `pt_add_*`, for `POINT_BODY`'s reason: fourteen inlined `fq2_mul` is
+/// past the Mali compile-time cliff, and this module is built at page load whether or not
+/// the page ever asks for constant work. G1's two products by 3b = 9 are four additions
+/// each, taken in the fixup after step 5 while the table's steps 6 and 7 are skipped by
+/// step index, so the one `{f}_mul` call site stays.
+fn proj_ops(c: Curve) -> String {
+    let (f, fty, pt, sfx) = (c.f, c.fty, c.pt, c.suffix);
+    let proj = c.proj();
+    let up = sfx.to_uppercase();
+    let mut s = String::new();
+
+    // The constant, the select and the two conversions.
+    let b3 = c.b3_limbs();
+    let b3_const = if c.needs_fq2 {
+        format!(
+            "Fq2({}, {})",
+            const_limbs("Fq", &b3[0]),
+            const_limbs("Fq", &b3[1])
+        )
+    } else {
+        const_limbs("Fq", &b3[0])
+    };
+    let sel = (0..LIMBS)
+        .map(|i| format!("    r[{i}] = select(a[{i}], b[{i}], take_b);"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let _ = write!(
+        s,
+        "
+// See gen::points::proj_ops. {proj} is {bytes} bytes; (0 : 1 : 0) is the identity.
+struct {proj} {{ x: {fty}, y: {fty}, z: {fty} }}
+
+// 3b of this group in Montgomery form, derived from the generator at generation time.
+const B3_{up} = {b3_const};
+
+fn fq_sel_{sfx}(a: Fq, b: Fq, take_b: bool) -> Fq {{
+    var r: Fq;
+{sel}
+    return r;
+}}
+",
+        bytes = c.proj_bytes(),
+    );
+    if c.needs_fq2 {
+        let _ = write!(
+            s,
+            "
+fn fq2_sel_{sfx}(a: Fq2, b: Fq2, take_b: bool) -> Fq2 {{
+    return Fq2(fq_sel_{sfx}(a.c0, b.c0, take_b), fq_sel_{sfx}(a.c1, b.c1, take_b));
+}}
+"
+        );
+    }
+    let _ = write!(
+        s,
+        "
+fn proj_zero_{sfx}() -> {proj} {{
+    return {proj}({f}_zero(), {f}_one(), {f}_zero());
+}}
+
+// (X/ZZ, Y/ZZZ) = (X ZZZ : Y ZZ : ZZ ZZZ). The XYZZ identity is ZZ = 0 and nothing else:
+// msm_clear_{sfx} writes only zz, so a cleared bucket's other three coordinates are what
+// the pool left there, and (X ZZZ : Y ZZ : 0) with them is not a point. So X becomes 0
+// and Y becomes 1 for it; the selects read what the products just consumed, so nothing
+// stays live.
+fn proj_from_xyzz_{sfx}(p: {pt}) -> {proj} {{
+    let x = {f}_mul(p.x, p.zzz);
+    let y = {f}_mul(p.y, p.zz);
+    let z = {f}_mul(p.zz, p.zzz);
+    let inf = {f}_is_zero(p.zz);
+    return {proj}({f}_sel_{sfx}(x, {f}_zero(), inf), {f}_sel_{sfx}(y, {f}_one(), inf), z);
+}}
+
+// (X/Z, Y/Z) = (X Z, Y Z^2, Z^2, Z^3) in XYZZ. Z = 0 gives all zero, the XYZZ identity.
+fn xyzz_from_proj_{sfx}(p: {proj}) -> {pt} {{
+    let zz = {f}_sqr(p.z);
+    let zzz = {f}_mul(zz, p.z);
+    return {pt}({f}_mul(p.x, p.z), {f}_mul(p.y, zz), zz, zzz);
+}}
+"
+    );
+
+    // Algorithm 7 of the paper, a = 0: 12M + 2 products by 3b + 19 additions.
+    //   X3 = (X1 Y2 + X2 Y1)(Y1 Y2 - 3b Z1 Z2) - 3b (Y1 Z2 + Y2 Z1)(X1 Z2 + X2 Z1)
+    //   Y3 = (Y1 Y2 + 3b Z1 Z2)(Y1 Y2 - 3b Z1 Z2) + 9b X1 X2 (X1 Z2 + X2 Z1)
+    //   Z3 = (Y1 Z2 + Y2 Z1)(Y1 Y2 + 3b Z1 Z2) + 3 X1 X2 (X1 Y2 + X2 Y1)
+    if !microcoded() {
+        let mul_b3 = |x: &str| {
+            if c.needs_fq2 {
+                format!("{f}_mul({x}, B3_{up})")
+            } else {
+                format!("{f}_add({f}_add({f}_add({f}_add({x}, {x}), {f}_add({x}, {x})), {f}_add({f}_add({x}, {x}), {f}_add({x}, {x}))), {x})")
+            }
+        };
+        let _ = write!(
+            s,
+            "
+fn pt_add_complete_{sfx}(a: {proj}, b: {proj}) -> {proj} {{
+    var t0 = {f}_mul(a.x, b.x);
+    var t1 = {f}_mul(a.y, b.y);
+    var t2 = {f}_mul(a.z, b.z);
+    var t3 = {f}_mul({f}_add(a.x, a.y), {f}_add(b.x, b.y));
+    t3 = {f}_sub(t3, {f}_add(t0, t1));
+    var t4 = {f}_mul({f}_add(a.y, a.z), {f}_add(b.y, b.z));
+    t4 = {f}_sub(t4, {f}_add(t1, t2));
+    var t5 = {f}_mul({f}_add(a.x, a.z), {f}_add(b.x, b.z));
+    t5 = {f}_sub(t5, {f}_add(t0, t2));
+    t0 = {f}_add({f}_add(t0, t0), t0);
+    t2 = {b3_t2};
+    let z3 = {f}_add(t1, t2);
+    t1 = {f}_sub(t1, t2);
+    t5 = {b3_t5};
+    return {proj}(
+        {f}_sub({f}_mul(t3, t1), {f}_mul(t4, t5)),
+        {f}_add({f}_mul(z3, t1), {f}_mul(t5, t0)),
+        {f}_add({f}_mul(t4, z3), {f}_mul(t0, t3)));
+}}
+",
+            b3_t2 = mul_b3("t2"),
+            b3_t5 = mul_b3("t5"),
+        );
+        return s;
+    }
+
+    // The same schedule as a table over one register file: 0..2 are a, 3..5 are b, 6 is
+    // 3b, 7..13 are t0..t5 and z3, 14 and 15 the two products a fixup combines.
+    let nine = |r: usize| {
+        format!(
+            "R[{r}] = {f}_add({f}_add({f}_add({f}_add(R[{r}], R[{r}]), {f}_add(R[{r}], R[{r}])), \
+             {f}_add({f}_add(R[{r}], R[{r}]), {f}_add(R[{r}], R[{r}]))), R[{r}]);"
+        )
+    };
+    let (run, after5_b3) = if c.needs_fq2 {
+        ("true".to_string(), String::new())
+    } else {
+        (
+            "s != 6u && s != 7u".to_string(),
+            format!("\n            {}\n            {}", nine(9), nine(12)),
+        )
+    };
+    let body = format!(
+        "
+const ADDC_OPS_{up} = array<vec3<u32>, 14>(
+    vec3<u32>(7u, 0u, 3u),    // t0 = X1 X2
+    vec3<u32>(8u, 1u, 4u),    // t1 = Y1 Y2
+    vec3<u32>(9u, 2u, 5u),    // t2 = Z1 Z2
+    vec3<u32>(10u, 10u, 11u), // (X1 + Y1)(X2 + Y2)
+    vec3<u32>(11u, 11u, 12u), // (Y1 + Z1)(Y2 + Z2)
+    vec3<u32>(12u, 12u, 13u), // (X1 + Z1)(X2 + Z2)
+    vec3<u32>(9u, 9u, 6u),    // 3b t2 (G2; four additions on G1)
+    vec3<u32>(12u, 12u, 6u),  // 3b t5 (G2; four additions on G1)
+    vec3<u32>(14u, 10u, 8u),  // t3 t1
+    vec3<u32>(15u, 11u, 12u), // t4 t5
+    vec3<u32>(14u, 13u, 8u),  // z3 t1
+    vec3<u32>(15u, 12u, 7u),  // t5 t0
+    vec3<u32>(14u, 11u, 13u), // t4 z3
+    vec3<u32>(15u, 7u, 10u),  // t0 t3
+);
+
+fn pt_add_complete_{sfx}(a: {proj}, b: {proj}) -> {proj} {{
+    var R: array<{fty}, 16>;
+    R[0] = a.x; R[1] = a.y; R[2] = a.z;
+    R[3] = b.x; R[4] = b.y; R[5] = b.z;
+    R[6] = B3_{up};
+    for (var s = 0u; s < 14u; s = s + 1u) {{
+        if ({run}) {{
+            let op = ADDC_OPS_{up}[s];
+            R[op.x] = {f}_mul(R[op.y], R[op.z]);
+        }}
+        if (s == 2u) {{
+            R[10] = {f}_add(R[0], R[1]);
+            R[11] = {f}_add(R[3], R[4]);
+        }} else if (s == 3u) {{
+            R[10] = {f}_sub(R[10], {f}_add(R[7], R[8]));
+            R[11] = {f}_add(R[1], R[2]);
+            R[12] = {f}_add(R[4], R[5]);
+        }} else if (s == 4u) {{
+            R[11] = {f}_sub(R[11], {f}_add(R[8], R[9]));
+            R[12] = {f}_add(R[0], R[2]);
+            R[13] = {f}_add(R[3], R[5]);
+        }} else if (s == 5u) {{
+            R[12] = {f}_sub(R[12], {f}_add(R[7], R[9]));
+            R[7] = {f}_add({f}_add(R[7], R[7]), R[7]);{after5_b3}
+        }} else if (s == 6u) {{
+            R[13] = {f}_add(R[8], R[9]);
+            R[8] = {f}_sub(R[8], R[9]);
+        }} else if (s == 9u) {{
+            R[0] = {f}_sub(R[14], R[15]);
+        }} else if (s == 11u) {{
+            R[1] = {f}_add(R[14], R[15]);
+        }} else if (s == 13u) {{
+            R[2] = {f}_add(R[14], R[15]);
+        }}
+    }}
+    return {proj}(R[0], R[1], R[2]);
+}}
+"
+    );
+    if split_regs(c) {
+        s.push_str(&split_reg_file(c, 16, &body));
+    } else {
+        s.push_str(&body);
+    }
+    s
+}
+
+/// The thirteen module-scope resources. No entry point reaches more than six.
 ///
 /// Every resource gets its own binding number even though no entry point uses them all, so
 /// the module is legal under the strictest reading of WGSL's "two resource variables in one
@@ -1078,10 +1367,11 @@ pub static MUL_SMALL_BODY: std::sync::atomic::AtomicU32 = std::sync::atomic::Ato
 /// gets a pipeline layout declaring only what it reads. A pipeline layout is allowed to
 /// declare bindings the shader ignores, so this costs nothing.
 ///
-/// `SPILL_PTS` and `SPILL_ROWS` are `read_write` even though `msm_merge_*` only reads them,
-/// because one declaration serves both entry points and WGSL has no way to vary the access
-/// mode per entry point. The bind group layouts follow, so merge declares them writable and
-/// writes nothing.
+/// `SPILL_PTS` and `SPILL_ROWS` are `read_write` even though `msm_merge_*` and `msm_fold_*`
+/// only read them, because one declaration serves every entry point and WGSL has no way to
+/// vary the access mode per entry point. The bind group layouts follow, so merge declares
+/// them writable and writes nothing. The fold reads its level's input through them and
+/// writes `FOLD_*`; the host swaps the two buffer pairs between levels.
 fn bindings(c: Curve) -> String {
     let pt = c.pt;
     let aff = c.aff;
@@ -1106,6 +1396,8 @@ const NO_ROW: u32 = {NO_ROW}u;
 @group(0) @binding({BIND_WSUMS}) var<storage, read_write> WSUMS: array<{pt}>;
 @group(0) @binding({BIND_SCALARS}) var<storage, read> SCALARS: array<Scalar>;
 @group(0) @binding({BIND_ONES}) var<storage, read_write> ONES: array<{pt}>;
+@group(0) @binding({BIND_FOLD_PTS}) var<storage, read_write> FOLD_PTS: array<{pt}>;
+@group(0) @binding({BIND_FOLD_ROWS}) var<storage, read_write> FOLD_ROWS: array<u32>;
 "
     );
     s
@@ -1176,8 +1468,16 @@ fn {entry}(@builtin(global_invocation_id) gid: vec3<u32>) {{
     let k = t - w * P.slices;
     let base = w * P.cap;
     // The scatter left every cursor at its run's end, so the last bucket's cursor is the end
-    // of this window's whole region. Slices past it are empty.
-    let used = CURSOR[w * P.n_buckets + P.n_buckets - 1u] - base;
+    // of this window's whole region. Slices past it are empty. Under constant work the last
+    // row is the last dummy row and the region is always full. `dummy_base` and not
+    // `n_windows * n_buckets`: inside a window slab `n_windows` is the slab's end, and a
+    // base taken from it read a real bucket of a later window as the region end and ran
+    // this slice into the next window's entries.
+    var last_row = w * P.n_buckets + P.n_buckets - 1u;
+    if (P.dummy_rows != 0u) {{
+        last_row = P.dummy_base + w * P.dummy_rows + P.dummy_rows - 1u;
+    }}
+    let used = CURSOR[last_row] - base;
 
     let head_slot = 2u * t;
     let tail_slot = head_slot + 1u;
@@ -1407,32 +1707,63 @@ fn {entry}(@builtin(global_invocation_id) gid: vec3<u32>) {{
 /// question is what Metal is asked to compile.
 pub static REDUCE_BODY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-fn entry_reduce(c: Curve, tg: u32) -> String {
+/// The reduce, on the XYZZ shortcuts (`constant` false) or on the complete formulas over
+/// projective points for a constant-work plan (`constant` true, `msm_reduce_constant_*`).
+/// Same state machine over one call site either way; the constant one converts what it
+/// loads and what it stores and keeps its own, smaller, workgroup array.
+fn entry_reduce(c: Curve, tg: u32, constant: bool) -> String {
     let (pt, sfx) = (c.pt, c.suffix);
-    let entry = c.entry_reduce();
-    let level = REDUCE_BODY.load(std::sync::atomic::Ordering::Relaxed);
+    let proj = c.proj();
+    let (entry, ty, zero, add, load, store, shared, shared_bytes) = if constant {
+        (
+            c.entry_reduce_constant(),
+            proj.as_str(),
+            format!("proj_zero_{sfx}"),
+            format!("pt_add_complete_{sfx}"),
+            format!("proj_from_xyzz_{sfx}("),
+            format!("xyzz_from_proj_{sfx}("),
+            "SHARED_C",
+            c.proj_bytes() * u64::from(tg),
+        )
+    } else {
+        (
+            c.entry_reduce(),
+            pt,
+            format!("pt_zero_{sfx}"),
+            format!("pt_add_{sfx}"),
+            String::from("("),
+            String::from("("),
+            "SHARED",
+            c.workgroup_bytes(tg),
+        )
+    };
+    let level = if constant {
+        0
+    } else {
+        REDUCE_BODY.load(std::sync::atomic::Ordering::Relaxed)
+    };
     let mine = if level != 1 {
         format!(
-            "    // One pt_add call site for everything this thread computes: even steps of
-    // phase A fold a bucket into run (pts[0]), odd steps fold run into tot (pts[1]);
-    // phase B is pt_mul_small's double-and-add on pts[2] with run as the addend; the
-    // last step joins pts[2] into tot. What this dodges is REDUCE_BODY 1: three or more
-    // inlined G2 point operations in one entry point, which corrupt every window sum on an
-    // iPhone 15 Pro.
-    var pts: array<{pt}, 3>;
-    pts[0] = pt_zero_{sfx}();
-    pts[1] = pt_zero_{sfx}();
-    pts[2] = pt_zero_{sfx}();
+            "    // One point-operation call site for everything this thread computes: even
+    // steps of phase A fold a bucket into run (pts[0]), odd steps fold run into tot
+    // (pts[1]); phase B is pt_mul_small's double-and-add on pts[2] with run as the
+    // addend; the last step joins pts[2] into tot. What this dodges is REDUCE_BODY 1:
+    // three or more inlined G2 point operations in one entry point, which corrupt every
+    // window sum on an iPhone 15 Pro.
+    var pts: array<{ty}, 3>;
+    pts[0] = {zero}();
+    pts[1] = {zero}();
+    pts[2] = {zero}();
     let a_steps = 2u * (hi - min(lo, hi));
     let top = select(0u, 31u - countLeadingZeros(lo), lo != 0u);
     let b_steps = select(0u, 2u * (top + 1u), lo != 0u);
     for (var step = 0u; step < a_steps + b_steps + 1u; step = step + 1u) {{
         var dst = 0u;
-        var src: {pt};
+        var src: {ty};
         var skip = false;
         if (step < a_steps) {{
             if ((step & 1u) == 0u) {{
-                src = BUCKETS[w * P.n_buckets + (hi - 1u - (step >> 1u))];
+                src = {load}BUCKETS[w * P.n_buckets + (hi - 1u - (step >> 1u))]);
             }} else {{
                 dst = 1u;
                 src = pts[0];
@@ -1450,9 +1781,9 @@ fn entry_reduce(c: Curve, tg: u32) -> String {
             dst = 1u;
             src = pts[2];
         }}
-        if (!skip) {{ pts[dst] = pt_add_{sfx}(pts[dst], src); }}
+        if (!skip) {{ pts[dst] = {add}(pts[dst], src); }}
     }}
-    SHARED[tid] = pts[1];"
+    {shared}[tid] = pts[1];"
         )
     } else {
         format!(
@@ -1473,17 +1804,26 @@ fn entry_reduce(c: Curve, tg: u32) -> String {
         "    for (var s = 1u; s < {tg}u; s = s << 1u) {{
         workgroupBarrier();
         if ((tid & ((s << 1u) - 1u)) == 0u && tid + s < {tg}u) {{
-            SHARED[tid] = pt_add_{sfx}(SHARED[tid], SHARED[tid + s]);
+            {shared}[tid] = {add}({shared}[tid], {shared}[tid + s]);
         }}
     }}
     workgroupBarrier();
-    if (tid == 0u) {{ WSUMS[w] = SHARED[0]; }}"
+    if (tid == 0u) {{ WSUMS[w] = {store}{shared}[0]); }}"
     );
-    let mut s = String::new();
-    let _ = write!(
-        s,
-        "
-// Collapse one window's 2^(c-1) buckets to one point. One workgroup per window.
+    let about = if constant {
+        format!(
+            "// The same reduce on the complete formulas (gen::points::proj_ops), which the host
+// dispatches for a constant-work plan: a bucket that is empty costs what a full one does,
+// where pt_add_{sfx} returns early and a whole SIMD group of empty buckets returns
+// together. Buckets and window sums stay XYZZ and are converted at the load and the
+// store; the doubling steps of phase B are additions of a point to itself, which the
+// complete formulas allow and which keeps the one call site.
+//
+// {tg} threads is {shared_bytes} bytes of workgroup storage, three coordinates a point."
+        )
+    } else {
+        format!(
+            "// Collapse one window's 2^(c-1) buckets to one point. One workgroup per window.
 //
 // The window sum is sum_j (j+1) B_j. Split the buckets into one segment per thread at
 // [lo, hi). Inside a segment the reverse running sum gives P = sum_j (j - lo + 1) B_j and
@@ -1501,9 +1841,16 @@ fn entry_reduce(c: Curve, tg: u32) -> String {
 // WebKit's WGSL-to-Metal path, the merge kernel's 29b5940 class with a lower edge.
 // `REDUCE_BODY` keeps the failing spelling reachable.
 //
-// {tg} threads is {shared} bytes of workgroup storage. See gen::points::Workgroups::tg for
-// what the alternatives measured and why this one ships.
-var<workgroup> SHARED: array<{pt}, {tg}>;
+// {tg} threads is {shared_bytes} bytes of workgroup storage. See gen::points::Workgroups::tg
+// for what the alternatives measured and why this one ships."
+        )
+    };
+    let mut s = String::new();
+    let _ = write!(
+        s,
+        "
+{about}
+var<workgroup> {shared}: array<{ty}, {tg}>;
 
 @compute @workgroup_size({tg})
 fn {entry}(@builtin(workgroup_id) wid: vec3<u32>,
@@ -1520,8 +1867,104 @@ fn {entry}(@builtin(workgroup_id) wid: vec3<u32>,
     // that a hard shader-creation error to get wrong; MSL merely makes it undefined.
 {tail}
 }}
-",
-        shared = c.workgroup_bytes(tg),
+"
+    );
+    s
+}
+
+fn entry_fold(c: Curve, wg: u32) -> String {
+    let sfx = c.suffix;
+    let entry = c.entry_fold();
+    let mut s = String::new();
+    let _ = write!(
+        s,
+        "
+// Constant work's merge. msm_merge_{sfx} walks each bucket's slice span in one lane and
+// returns early from an empty bucket, so its time follows occupancy: on a bit witness nearly
+// every digit is 0 or 1, window 0's bucket 1 holds half the entries and one lane walks half
+// the window's slices. Here the spill slots are folded the way the segmented pass folds
+// entries: a window's slots are sorted by row, so each thread takes P.fold_len consecutive
+// slots, writes every run that starts and ends inside them to its bucket, and spills the
+// first and last run to two slots of the next level. The host repeats that until one group
+// spans the window, and that last level writes its first and last run too. Every thread
+// makes exactly P.fold_len additions whatever the rows are, and the number of levels and
+// threads follows the key: the same tree runs on every witness. A row is either wholly in
+// spill slots or wholly written by the segmented pass, never both, which is what lets the
+// fold store rather than accumulate.
+//
+// One point-operation call site, in the loop, and nothing else that touches a point but
+// the two conversions: the shape the merge and reduce kernels were cut down to after an
+// iPhone 15 Pro lost its device on two inlined G2 point operations in one loop (see
+// msm_merge_{sfx}). The accumulator is projective and the addition complete (see
+// gen::points::proj_ops), so an empty slot (NO_ROW: a slice or group with one run) adds
+// the identity at the price of any point and never starts a run. Every slot loaded is
+// converted, and the run is converted back at the top of every iteration whether or not
+// the iteration stores it, so the stores' data dependence stays in the store itself.
+@compute @workgroup_size({wg})
+fn {entry}(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    let t = P.lo + gid.x;
+    let groups = P.fold_groups;
+    if (t >= P.n_windows * groups) {{ return; }}
+    let w = t / groups;
+    let g = t - w * groups;
+    let m_in = P.fold_in;
+    let len = P.fold_len;
+    // The last level is the one whose group spans the window.
+    let last = groups == 1u;
+    let head_slot = 2u * t;
+    let tail_slot = head_slot + 1u;
+    if (!last) {{
+        FOLD_ROWS[head_slot] = NO_ROW;
+        FOLD_ROWS[tail_slot] = NO_ROW;
+    }}
+
+    let lo = g * len;
+    let hi = min(lo + len, m_in);
+    var cur = NO_ROW;
+    var first_run = true;
+    var acc = proj_zero_{sfx}();
+    // `len` iterations in every group, the window's short last one included, so a thread's
+    // additions do not depend on where it sits either. `hi > lo` because groups is
+    // ceil(m_in / len), so the clamp below reads a slot the window owns.
+    for (var i = lo; i < lo + len; i = i + 1u) {{
+        let j = w * m_in + min(i, hi - 1u);
+        var r = NO_ROW;
+        if (i < hi) {{ r = SPILL_ROWS[j]; }}
+        let acc_out = xyzz_from_proj_{sfx}(acc);
+        let empty = r == NO_ROW;
+        if (!empty && r != cur) {{
+            if (cur != NO_ROW) {{
+                if (first_run && !last) {{
+                    FOLD_PTS[head_slot] = acc_out;
+                    FOLD_ROWS[head_slot] = cur;
+                }} else {{
+                    BUCKETS[cur] = acc_out;
+                }}
+                first_run = false;
+            }}
+            acc = proj_zero_{sfx}();
+            cur = r;
+        }}
+        var q = proj_from_xyzz_{sfx}(SPILL_PTS[j]);
+        if (empty) {{
+            q = proj_zero_{sfx}();
+        }}
+        acc = pt_add_complete_{sfx}(acc, q);
+    }}
+
+    if (cur == NO_ROW) {{ return; }}
+    let acc_out = xyzz_from_proj_{sfx}(acc);
+    if (last) {{
+        BUCKETS[cur] = acc_out;
+    }} else if (first_run) {{
+        FOLD_PTS[head_slot] = acc_out;
+        FOLD_ROWS[head_slot] = cur;
+    }} else {{
+        FOLD_PTS[tail_slot] = acc_out;
+        FOLD_ROWS[tail_slot] = cur;
+    }}
+}}
+"
     );
     s
 }

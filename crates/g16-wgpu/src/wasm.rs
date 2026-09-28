@@ -61,6 +61,7 @@ use web_time::Instant;
 use crate::backend::WgpuCircuit;
 use crate::batch::MsmBatch;
 use crate::device::{LimitsProfile, WgpuBackend};
+use crate::msm::Work;
 use crate::selftest::json_string;
 
 /// Everything one worker holds. There is exactly one, in a `thread_local`, because there is
@@ -546,19 +547,31 @@ pub async fn prepare() -> Result<String, JsError> {
 /// Returns JSON: `proof` in snarkjs' `proof.json` shape, `publicSignals` in `public.json`
 /// shape, and the [`StageTimings`] the native harness records, so a browser row and a native
 /// row have the same columns.
+///
+/// `constant_work` is the browser's `g16 prove --constant-work`: MSMs whose cost follows
+/// the key and not the witness ([`Work::Constant`]). Absent or false is the variable path.
 #[wasm_bindgen]
-pub async fn prove() -> Result<String, JsError> {
+pub async fn prove(constant_work: Option<bool>) -> Result<String, JsError> {
     // Everything needed is cloned out under a short borrow, and the borrow is dropped before
     // the first `.await`. A `RefCell` borrow held across an await panics the moment the page
     // calls anything else on this module.
     let (circuit, witness) = claim("prove")?;
 
-    let out = prove_inner(&circuit, &witness).await;
+    let out = prove_inner(&circuit, &witness, work_of(constant_work)).await;
     with_state(|s| {
         s.busy = false;
         Ok(())
     })?;
     out
+}
+
+/// The page's flag as a [`Work`]. Absent means variable, which is the native default too.
+fn work_of(constant_work: Option<bool>) -> Work {
+    if constant_work.unwrap_or(false) {
+        Work::Constant
+    } else {
+        Work::Variable
+    }
 }
 
 /// Stages 0 to 4 alone, and then stop.
@@ -821,12 +834,15 @@ pub async fn prove_msm_probe(which: String) -> Result<String, JsError> {
     ))
 }
 
-async fn prove_inner(circuit: &WgpuCircuit, witness: &[Fr]) -> Result<String, JsError> {
+async fn prove_inner(circuit: &WgpuCircuit, witness: &[Fr], work: Work) -> Result<String, JsError> {
     let mut t = StageTimings::default();
     let t0 = Instant::now();
 
     let h = circuit.compute_h_async(witness, &mut t).await.map_err(js)?;
-    let m = circuit.msms_async(witness, &h, &mut t).await.map_err(js)?;
+    let m = circuit
+        .msms_async_with(witness, &h, work, &mut t)
+        .await
+        .map_err(js)?;
 
     let proof = seal(circuit.key(), witness, &m, &mut t)?;
     let total_us = t0.elapsed().as_micros() as u64;
@@ -957,8 +973,9 @@ fn reparse() -> Result<(ProvingKey, Vec<Fr>, String), JsError> {
 /// circuit (which on this backend means uploading every base vector and both twiddle tables),
 /// stages 0 to 11, and dropping all of it. That is the row to compare against snarkjs, because
 /// snarkjs re-reads zkey sections 4 through 9 inside every `prove()` and has no `prepare()`.
+/// `constant_work` is as on [`prove`].
 #[wasm_bindgen]
-pub async fn prove_cold() -> Result<String, JsError> {
+pub async fn prove_cold(constant_work: Option<bool>) -> Result<String, JsError> {
     let (device, msm) = with_state(|s| {
         if s.busy {
             return Err(JsError::new(
@@ -969,7 +986,7 @@ pub async fn prove_cold() -> Result<String, JsError> {
         Ok((Arc::clone(&s.device), Arc::clone(&s.msm)))
     })?;
 
-    let out = prove_cold_inner(device, msm).await;
+    let out = prove_cold_inner(device, msm, work_of(constant_work)).await;
     with_state(|s| {
         s.busy = false;
         Ok(())
@@ -977,7 +994,11 @@ pub async fn prove_cold() -> Result<String, JsError> {
     out
 }
 
-async fn prove_cold_inner(device: Arc<WgpuBackend>, msm: Arc<MsmBatch>) -> Result<String, JsError> {
+async fn prove_cold_inner(
+    device: Arc<WgpuBackend>,
+    msm: Arc<MsmBatch>,
+    work: Work,
+) -> Result<String, JsError> {
     let mut t = StageTimings::default();
     let t_all = Instant::now();
 
@@ -1005,7 +1026,10 @@ async fn prove_cold_inner(device: Arc<WgpuBackend>, msm: Arc<MsmBatch>) -> Resul
         .compute_h_async(&witness, &mut t)
         .await
         .map_err(js)?;
-    let m = circuit.msms_async(&witness, &h, &mut t).await.map_err(js)?;
+    let m = circuit
+        .msms_async_with(&witness, &h, work, &mut t)
+        .await
+        .map_err(js)?;
     let proof = seal(circuit.key(), &witness, &m, &mut t)?;
     let total_us = t_all.elapsed().as_micros() as u64;
 

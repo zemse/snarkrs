@@ -109,8 +109,9 @@ enum Cmd {
         fallback: bool,
         /// MSMs whose cost follows the key and not the witness, so proving time does not
         /// reveal how many witness entries are zero or one (the timing channel USENIX
-        /// Security 2020 used on Zcash). From 2.5% (cpu) or 14% (metal) slower on a dense
-        /// circuit to about 5x on a bit-heavy one. cpu and metal backends.
+        /// Security 2020 used on Zcash). From 2.5% (cpu), 26% (metal) or 55% (wgpu) slower
+        /// on a dense circuit to 4x (cpu), 6x (metal) or 10x (wgpu) on a bit-heavy one. cpu,
+        /// metal and wgpu backends.
         #[arg(long)]
         constant_work: bool,
     },

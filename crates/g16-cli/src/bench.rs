@@ -55,7 +55,7 @@ pub struct Args {
     #[arg(long, value_enum, default_value_t = Mode::Both)]
     pub mode: Mode,
     /// Time `prove --constant-work` instead: MSMs whose cost follows the key and not the
-    /// witness. cpu and metal backends.
+    /// witness. cpu, metal and wgpu backends.
     #[arg(long)]
     pub constant_work: bool,
     /// Append-free CSV output. Without it the numbers are only printed.

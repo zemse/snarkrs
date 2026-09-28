@@ -98,7 +98,10 @@ pub use backend::{CircuitCost, WgpuCircuit, WgpuProver};
 pub use batch::{G1Bases, G2Bases, Group, Job, MontConvert, MsmBatch, MsmResult, Source};
 pub use device::{LimitsProfile, WgpuBackend};
 pub use gather::{CsrHost, CsrTables, GatherAbc, GatherParams};
-pub use msm::{window_size, DigitBuffers, DigitPlan, MsmDigits, MsmParams, SortBinds, SortOffsets};
+pub use msm::{
+    window_size, DigitBuffers, DigitPlan, MsmDigits, MsmParams, SortBinds, SortOffsets, Work,
+    DUMMY_ROWS,
+};
 pub use ntt::{
     split_passes, Batch, Direction, Epilogue, Ntt, NttParams, NttTables, Planned, Scale, Transform,
 };
@@ -109,6 +112,9 @@ pub use points::{
     PointBinds, PointBuffers, PointCurve, PointOffsets, PointPlan,
 };
 pub use pointwise::{HJoin, HJoinParams};
-pub use readback::{is_aborted, Readback, Seal, SealKernel, Sealed, CUTS, CUT_NEXT, REFUSE_NEXT};
+pub use readback::{
+    is_aborted, Readback, Seal, SealKernel, Sealed, CUTS, CUT_NEXT, DISPATCHES, REFUSE_NEXT,
+    WORKGROUPS,
+};
 pub use selftest::Check;
 pub use stages::{HStages, Stage4, WgpuHandle};

@@ -99,10 +99,18 @@ pub static CUTS: AtomicU32 = AtomicU32::new(0);
 /// [`dispatch`] so far.
 static CUT_ENCODED: AtomicU32 = AtomicU32::new(0);
 
+/// Every dispatch that has gone through [`dispatch`] since the process started, cut or
+/// not, and the workgroups they asked for. What `tests/constant_work.rs` holds two
+/// witnesses' geometry to, since every proving dispatch passes here.
+pub static DISPATCHES: AtomicU64 = AtomicU64::new(0);
+pub static WORKGROUPS: AtomicU64 = AtomicU64::new(0);
+
 /// `pass.dispatch_workgroups(x, 1, 1)`, unless [`CUT_NEXT`] leaves it out. Every dispatch
 /// on the proving path goes through here so the knob sees them all; returns whether the
 /// dispatch was encoded whole.
 pub(crate) fn dispatch(pass: &mut wgpu::ComputePass<'_>, x: u32) -> bool {
+    DISPATCHES.fetch_add(1, Ordering::Relaxed);
+    WORKGROUPS.fetch_add(u64::from(x), Ordering::Relaxed);
     let cut = CUT_NEXT.load(Ordering::Relaxed);
     if cut != 0 && (cut >> 32) == 0 {
         let k = (cut as u32) - 1;

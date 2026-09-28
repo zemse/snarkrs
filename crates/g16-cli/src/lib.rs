@@ -50,19 +50,33 @@ pub fn make_backend(kind: BackendKind) -> Result<Box<dyn Backend>> {
 }
 
 /// [`make_backend`] with MSMs whose cost follows the key and not the witness, behind
-/// `prove --constant-work`. Implemented for cpu and metal; the other two are refused
-/// rather than ignored, because a backend that proved in variable time under this flag
-/// would read as a promise it did not keep.
+/// `prove --constant-work`. Implemented for cpu, metal and wgpu; cuda is refused rather
+/// than ignored, because a backend that proved in variable time under this flag would read
+/// as a promise it did not keep.
 pub fn make_constant_work_backend(kind: BackendKind) -> Result<Box<dyn Backend>> {
     match kind {
         BackendKind::Cpu => Ok(Box::new(CpuBackend::constant_work())),
+        BackendKind::Wgpu => wgpu_constant_work_backend(),
         BackendKind::Metal => metal_constant_work_backend(),
-        BackendKind::Wgpu | BackendKind::Cuda => anyhow::bail!(
-            "--constant-work is implemented for the cpu and metal backends only; the {} MSMs \
-             still skip zero and one scalars",
+        BackendKind::Cuda => anyhow::bail!(
+            "--constant-work is implemented for the cpu, metal and wgpu backends only; the {} \
+             MSMs still skip zero and one scalars",
             kind.as_str()
         ),
     }
+}
+
+#[cfg(feature = "wgpu")]
+fn wgpu_constant_work_backend() -> Result<Box<dyn Backend>> {
+    Ok(Box::new(g16_wgpu::WgpuProver::constant_work().map_err(
+        |e| anyhow::anyhow!("backend `wgpu` is unavailable: {e}"),
+    )?))
+}
+
+/// Same two reasons as [`wgpu_backend`], which is where they are spelled out.
+#[cfg(not(feature = "wgpu"))]
+fn wgpu_constant_work_backend() -> Result<Box<dyn Backend>> {
+    wgpu_backend()
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]

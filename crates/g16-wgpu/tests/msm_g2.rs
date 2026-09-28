@@ -507,6 +507,8 @@ fn every_g2_pipeline_layout_declares_at_most_eight_storage_buffers() {
         (wgsl::G2.entry_merge(), wgsl::STORAGE_MERGE),
         (wgsl::G2.entry_reduce(), wgsl::STORAGE_REDUCE),
         (wgsl::G2.entry_ones(), wgsl::STORAGE_ONES),
+        (wgsl::G2.entry_fold(), wgsl::STORAGE_FOLD),
+        (wgsl::G2.entry_reduce_constant(), wgsl::STORAGE_REDUCE),
     ];
     let got = MsmPointsG2::storage_buffer_counts();
     assert_eq!(got.len(), want.len());
@@ -1044,7 +1046,7 @@ fn the_point_plan_derives_its_shape_once() {
     assert_eq!(params.slice_len, p.slice_len());
     assert_eq!(params.slices, p.slices());
     assert_eq!(params.ones_groups, p.ones_groups());
-    assert_eq!(std::mem::size_of_val(&params), 48);
+    assert_eq!(std::mem::size_of_val(&params), 64);
 
     // And a caller that mixes a plan built for one reduction width with a module built for
     // another is refused, because ones_groups would not match the stride the kernel walks.

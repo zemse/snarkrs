@@ -22,6 +22,11 @@
 //! window and spend half a million point additions reducing buckets that 34k additions
 //! filled. [`DigitPlan::new`] takes that count from the caller, because the caller is the
 //! host packer which already walked every scalar.
+//!
+//! Which is also why the shape follows the witness. Under [`Work::Constant`] the plan takes
+//! `m = n` whatever the scalars hold, the kernels skip nothing and a zero digit lands in one
+//! of [`DUMMY_ROWS`] rows per window behind the real buckets, so every window's entry region
+//! is exactly full and every dispatch is sized from the key.
 
 use bytemuck::{Pod, Zeroable};
 use g16_core::ProveError;
@@ -59,6 +64,44 @@ pub const RECODE_BITS: u32 = 255;
 /// `(1u << width) - 1u`, and a width of 32 would be a shift by the full word width, which
 /// WGSL leaves indeterminate.
 pub const MAX_WINDOW: u32 = 16;
+
+/// Whether an MSM's cost may depend on the scalar values. The wgpu twin of `g16_msm`'s
+/// and `g16_metal::msm::Work`, decided per [`crate::batch::Group`] and inherited by the
+/// plans built over it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Work {
+    /// No scalar is classified or skipped: every one of the `n` scalars emits one entry per
+    /// window, a zero digit into one of [`DUMMY_ROWS`] rows behind the real buckets that
+    /// nothing reads, and the window is priced for `n` scalars. The ones pass is off and
+    /// the merge is the fixed tree of `msm_fold_*` rather than a walk per bucket. The
+    /// window width, every buffer, every dispatch and the number of mixed additions then
+    /// follow the key (`n`, and which bases are at infinity) and not the witness.
+    ///
+    /// That closes the channel of "Remote Side-Channel Attacks on Anonymous Transactions"
+    /// (USENIX Security 2020), which recovered Zcash witness sparsity from proving time.
+    /// The fold and the reduce add with the complete formulas (`gen::points::proj_ops`),
+    /// so an empty bucket or slot costs what a full one does. It is not constant time in
+    /// the strict sense: bucket occupancy still follows the digit values, so the atomics'
+    /// contention and the accumulation's run count stay data dependent, as in every
+    /// Pippenger. Stages 0 to 4 were fixed-shape already: the gather multiplies every term
+    /// and the field prelude reduces with `select`.
+    ///
+    /// What it costs is what the zeros and ones were saving, so it is priced per circuit
+    /// on [`crate::backend::WgpuProver::constant_work`]: about half again on a dense
+    /// witness, 3.5x to 10x on a bit-heavy one.
+    Constant,
+    /// Zero scalars are dropped, one scalars go to the ones pass, the window is sized for
+    /// the rest. Running time, buffer sizes and the dispatch geometry then follow how many
+    /// witness entries are zero or one.
+    #[default]
+    Variable,
+}
+
+/// Dummy rows per window under [`Work::Constant`]. A power of two, so a scalar's row is
+/// its index masked; several rather than one only so the zero digits' atomics spread over
+/// that many addresses instead of serialising on one. `g16-metal` uses the same 64.
+pub const DUMMY_ROWS: u32 = 64;
+const _: () = assert!(DUMMY_ROWS.is_power_of_two());
 
 /// Forces the window width, or 0 to compute it. The browser's counterpart to
 /// `G16_WGPU_MSM_C`, which cannot work there: `std::env::var` on wasm always fails, so a
@@ -150,15 +193,15 @@ pub fn window_size(m: usize) -> u32 {
 // The parameter block
 // ---------------------------------------------------------------------------
 
-/// Mirrors `struct MsmParams` in [`crate::gen::msm`]. 48 bytes, which is already a multiple
+/// Mirrors `struct MsmParams` in [`crate::gen::msm`]. 64 bytes, which is already a multiple
 /// of the 16 WGSL rounds every uniform struct up to, so there is no invisible tail padding
 /// for the two declarations to disagree about.
 ///
-/// The last four fields are the point stages', and nothing in this file reads them. They live
-/// here rather than in a second struct because `g16-metal` has one `MsmParams` covering both
-/// halves of an MSM, because design §3 puts every parameter block for a proof in one uniform
-/// ring, and because a second struct is a second host mirror to keep in step. See
-/// [`crate::points::PointPlan`], which fills them.
+/// The last eight fields are the point stages', and nothing in this file reads them but
+/// `dummy_rows`. They live here rather than in a second struct because `g16-metal` has one
+/// `MsmParams` covering both halves of an MSM, because design §3 puts every parameter block
+/// for a proof in one uniform ring, and because a second struct is a second host mirror to
+/// keep in step. See [`crate::points::PointPlan`], which fills them.
 ///
 /// `ParamRing::push` cannot check the correspondence and nothing else will either: a
 /// mismatch reads plausible garbage with no validation error anywhere.
@@ -187,10 +230,23 @@ pub struct MsmParams {
     pub slice_len: u32,
     /// `ceil(cap / slice_len)`. Zero for every digit kernel.
     pub slices: u32,
-    pub pad0: u32,
+    /// [`DUMMY_ROWS`] under [`Work::Constant`], 0 otherwise. Read by the digit kernels,
+    /// which skip nothing when it is set, and by the segmented pass.
+    pub dummy_rows: u32,
+    /// The first dummy row: the real rows of every window, `n_windows * n_buckets` over
+    /// the plan's own window count. Carried rather than recomputed because a window slab
+    /// lowers `n_windows` to its end and the segmented pass reads this inside one.
+    pub dummy_base: u32,
+    /// Spill slots per window this `msm_fold_*` level reads. Zero for every other kernel.
+    pub fold_in: u32,
+    /// Groups per window this level writes; 1 on the last level, which writes every run
+    /// to its bucket.
+    pub fold_groups: u32,
+    /// Slots one group folds.
+    pub fold_len: u32,
 }
 
-const _: () = assert!(core::mem::size_of::<MsmParams>() == 48);
+const _: () = assert!(core::mem::size_of::<MsmParams>() == 64);
 
 // ---------------------------------------------------------------------------
 // One digit pipeline's shape
@@ -210,6 +266,10 @@ pub struct DigitPlan {
     n_windows: u32,
     n_buckets: u32,
     cap: u32,
+    /// [`DUMMY_ROWS`] under [`Work::Constant`], 0 otherwise. The dummy rows follow the real
+    /// bucket rows in the counters, the cursors and the bucket array, and only the digit
+    /// kernels and the accumulation ever address them.
+    dummy_rows: u32,
 }
 
 impl DigitPlan {
@@ -223,8 +283,7 @@ impl DigitPlan {
     /// below the true general count loses entries with no error anywhere. That is why this
     /// takes a count rather than a hint, and why `None` means `n` rather than a guess.
     pub fn new(n: u32, scalar_off: u32, general: Option<u32>) -> Result<Self, ProveError> {
-        let general = Self::classified(n, general)?;
-        Self::at(n, scalar_off, general, window_size(general as usize))
+        Self::with_work(n, scalar_off, general, Work::Variable)
     }
 
     /// Same, at a forced window width. For the acceptance sweep over several `c`, and for
@@ -235,16 +294,40 @@ impl DigitPlan {
         general: Option<u32>,
         c: u32,
     ) -> Result<Self, ProveError> {
-        Self::at(n, scalar_off, Self::classified(n, general)?, c)
+        Self::with_work_c(n, scalar_off, general, c, Work::Variable)
     }
 
-    fn classified(n: u32, general: Option<u32>) -> Result<u32, ProveError> {
+    /// [`Self::new`] with the work mode chosen. Under [`Work::Constant`] `general` is
+    /// ignored: the plan prices `n` scalars whatever the caller knows about them, so
+    /// nothing in its shape depends on a value.
+    pub fn with_work(
+        n: u32,
+        scalar_off: u32,
+        general: Option<u32>,
+        work: Work,
+    ) -> Result<Self, ProveError> {
+        let general = Self::classified(n, general, work)?;
+        Self::at(n, scalar_off, general, window_size(general as usize), work)
+    }
+
+    /// [`Self::with_c`] with the work mode chosen.
+    pub fn with_work_c(
+        n: u32,
+        scalar_off: u32,
+        general: Option<u32>,
+        c: u32,
+        work: Work,
+    ) -> Result<Self, ProveError> {
+        Self::at(n, scalar_off, Self::classified(n, general, work)?, c, work)
+    }
+
+    fn classified(n: u32, general: Option<u32>, work: Work) -> Result<u32, ProveError> {
         match general {
             Some(g) if g > n => Err(bad(format!(
                 "digit plan over {n} scalars was told {g} of them are general"
             ))),
-            Some(g) => Ok(g),
-            None => Ok(n),
+            Some(g) if work == Work::Variable => Ok(g),
+            _ => Ok(n),
         }
     }
 
@@ -255,7 +338,7 @@ impl DigitPlan {
     /// duplicate the two lines, and a mutation test that replaced `div_ceil` with `/` in one
     /// copy went **undetected**, because every test that fixes `c` went through the other
     /// copy. A derivation written twice is a derivation that can be wrong once.
-    fn at(n: u32, scalar_off: u32, general: u32, c: u32) -> Result<Self, ProveError> {
+    fn at(n: u32, scalar_off: u32, general: u32, c: u32, work: Work) -> Result<Self, ProveError> {
         if !(2..=MAX_WINDOW).contains(&c) {
             return Err(bad(format!(
                 "window width {c} is outside 2..={MAX_WINDOW}; sc_bits masks with \
@@ -285,6 +368,10 @@ impl DigitPlan {
             n_windows,
             n_buckets: 1u32 << (c - 1),
             cap,
+            dummy_rows: match work {
+                Work::Constant => DUMMY_ROWS,
+                Work::Variable => 0,
+            },
         })
     }
 
@@ -306,10 +393,21 @@ impl DigitPlan {
     pub fn cap(&self) -> u32 {
         self.cap
     }
+    pub fn dummy_rows(&self) -> u32 {
+        self.dummy_rows
+    }
+    pub fn work(&self) -> Work {
+        if self.dummy_rows == 0 {
+            Work::Variable
+        } else {
+            Work::Constant
+        }
+    }
 
-    /// Counters, and cursors: `n_windows * n_buckets` of each.
+    /// Counters, cursors and bucket rows: the real buckets of every window, then every
+    /// window's dummy rows. `n_windows * n_buckets` under [`Work::Variable`].
     pub fn rows(&self) -> u32 {
-        self.n_windows * self.n_buckets
+        self.n_windows * (self.n_buckets + self.dummy_rows)
     }
 
     /// Slots in the entry array: `n_windows * cap`.
@@ -325,7 +423,7 @@ impl DigitPlan {
         (u64::from(self.rows()) * 4).max(u64::from(self.entries()) * ENTRY_BYTES)
     }
 
-    /// The parameter block the digit kernels read, with the four point-stage fields left at
+    /// The parameter block the digit kernels read, with the point-stage fields left at
     /// zero. [`crate::points::PointPlan::params`] is the one that fills them.
     pub fn params(&self, n: u32, lo: u32) -> MsmParams {
         MsmParams {
@@ -340,7 +438,11 @@ impl DigitPlan {
             ones_groups: 0,
             slice_len: 0,
             slices: 0,
-            pad0: 0,
+            dummy_rows: self.dummy_rows,
+            dummy_base: self.n_windows * self.n_buckets,
+            fold_in: 0,
+            fold_groups: 0,
+            fold_len: 0,
         }
     }
 }
@@ -830,10 +932,12 @@ impl MsmDigits {
         for (name, buf) in [("counts", &bufs.counts), ("cursor", &bufs.cursor)] {
             if buf.size() < want_rows {
                 return Err(bad(format!(
-                    "{name} is {} bytes, {} windows x {} buckets need {want_rows}",
+                    "{name} is {} bytes, {} windows x {} buckets and {} dummy rows need \
+                     {want_rows}",
                     buf.size(),
                     plan.n_windows,
-                    plan.n_buckets
+                    plan.n_buckets,
+                    plan.dummy_rows
                 )));
             }
         }

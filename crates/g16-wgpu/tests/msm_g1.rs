@@ -785,6 +785,8 @@ fn every_g1_pipeline_layout_declares_at_most_eight_storage_buffers() {
         (wgsl::G1.entry_merge(), wgsl::STORAGE_MERGE),
         (wgsl::G1.entry_reduce(), wgsl::STORAGE_REDUCE),
         (wgsl::G1.entry_ones(), wgsl::STORAGE_ONES),
+        (wgsl::G1.entry_fold(), wgsl::STORAGE_FOLD),
+        (wgsl::G1.entry_reduce_constant(), wgsl::STORAGE_REDUCE),
     ];
     let got = MsmPointsG1::storage_buffer_counts();
     assert_eq!(got.len(), want.len());
@@ -1355,7 +1357,7 @@ fn the_point_plan_derives_its_shape_once() {
     assert_eq!(params.slice_len, p.slice_len());
     assert_eq!(params.slices, p.slices());
     assert_eq!(params.ones_groups, p.ones_groups());
-    assert_eq!(std::mem::size_of_val(&params), 48);
+    assert_eq!(std::mem::size_of_val(&params), 64);
 
     assert!(PointPlan::with_slice_len(&d, 0, 32, 0).is_err());
     assert!(PointPlan::new(&d, 0, 0, wgsl::G1).is_err());

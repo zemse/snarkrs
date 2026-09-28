@@ -197,7 +197,8 @@ fn snarkjs_accepts_our_proof() {
 }
 
 /// The same oracle for `--constant-work`, on the bit-heavy circuit where the mode changes
-/// the most: every witness scalar goes through the buckets there, on the cpu and on metal.
+/// the most: every witness scalar goes through the buckets there, on the cpu, on wgpu and
+/// on metal.
 #[test]
 fn snarkjs_accepts_a_constant_work_proof() {
     if Command::new("snarkjs").arg("--version").output().is_err() {
@@ -215,6 +216,9 @@ fn snarkjs_accepts_a_constant_work_proof() {
     };
     let out = scratch("snarkjs-constant-work");
     let mut backends = vec!["cpu"];
+    if cfg!(feature = "wgpu") {
+        backends.push("wgpu");
+    }
     if cfg!(feature = "metal") {
         backends.push("metal");
     }

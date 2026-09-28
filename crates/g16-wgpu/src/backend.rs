@@ -58,6 +58,7 @@ use g16_zkey::ProvingKey;
 
 use crate::batch::{G1Bases, G2Bases, Group, Job, MontConvert, MsmBatch, Source};
 use crate::device::{bad, WgpuBackend};
+use crate::msm::Work;
 use crate::readback::Seal;
 use crate::stages::{HStages, WgpuHandle};
 
@@ -98,6 +99,7 @@ pub struct CircuitCost {
 pub struct WgpuProver {
     device: Arc<WgpuBackend>,
     msm: Arc<MsmBatch>,
+    work: Work,
 }
 
 impl WgpuProver {
@@ -117,6 +119,37 @@ impl WgpuProver {
         Self::with_profile(LimitsProfile::from_env()?)
     }
 
+    /// [`Self::new`] with MSMs whose cost follows the key and not the witness, so proving
+    /// time, buffer sizes and dispatch geometry do not reveal how many witness entries are
+    /// zero or one; see [`Work::Constant`].
+    ///
+    /// What stays witness dependent, on the device: which bucket a digit lands in, so the
+    /// atomics' contention and the run count of the accumulation's slices. The merge is a
+    /// fixed tree (`msm_fold_*`) and it and the reduce (`msm_reduce_constant_*`) add with
+    /// the complete formulas, so an empty bucket or slot costs what a full one does:
+    /// `tests/constant_work.rs::constant_work_phase_occupancy` at 2^18 reads the G1 fold
+    /// at 24.0, 26.9 and 25.7 ms and the G1 reduce at 32.2 on a witness of zeros, of bits
+    /// and a dense one, and in G2 103, 103 and 104 against 186 on all three (at fold
+    /// length 16, the run that saw no abort), where the shortcut kernels read 1.75
+    /// against 2.62 and 1.56 against 11.6 in G1. On the host: the identity tests inside
+    /// the combine's few dozen curve additions, as on the CPU backend. Stages 0 to 4 were
+    /// fixed-shape already: the gather multiplies every term and the field prelude
+    /// reduces with `select`.
+    ///
+    /// Priced warm on the M2 Max at the floor profile, 15 reps, alternating rounds under
+    /// the GPU lock, medians against the variable path: js_16x16_d32 1097 ms against 708
+    /// (+55%), keccak256 1301 against 133 (9.8x), rsa2048 1099 against 316 (3.5x),
+    /// anon-aadhaar 5363 against 1087 (4.9x, 3 reps). Steeper than Metal's +26% and 5.7x
+    /// because the constant-work kernels are all curve arithmetic, where WGSL is 2.3x
+    /// behind MSL, and the bit-heavy circuits' G2 job goes from a few hundred scalars to
+    /// the size of H's.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn constant_work() -> Result<Self, ProveError> {
+        let mut prover = Self::new()?;
+        prover.work = Work::Constant;
+        Ok(prover)
+    }
+
     /// Native only: opening a device is async and blocking a browser's only thread on it
     /// hangs the tab. The browser opens the device with `.await` in `crate::wasm`.
     #[cfg(not(target_arch = "wasm32"))]
@@ -128,6 +161,12 @@ impl WgpuProver {
     /// Same, on a device the caller already opened. `tests/proof.rs` uses it to share one
     /// adapter across every artifact in a binary, which is 5 fewer device creations.
     pub fn with_device(device: Arc<WgpuBackend>) -> Result<Self, ProveError> {
+        Self::with_device_and_work(device, Work::Variable)
+    }
+
+    /// Same, with the work mode chosen. The three MSM modules carry both modes, so a
+    /// constant-work prover and a variable one on the same device compile nothing twice.
+    pub fn with_device_and_work(device: Arc<WgpuBackend>, work: Work) -> Result<Self, ProveError> {
         let start = Instant::now();
         let msm = MsmBatch::new(&device)?;
         let cost = msm.cost();
@@ -145,11 +184,16 @@ impl WgpuProver {
         Ok(Self {
             device,
             msm: Arc::new(msm),
+            work,
         })
     }
 
     pub fn device(&self) -> &Arc<WgpuBackend> {
         &self.device
+    }
+
+    pub fn work(&self) -> Work {
+        self.work
     }
 
     /// The shared MSM pipelines, for a report. `tests/proof.rs` reads
@@ -170,7 +214,12 @@ impl Backend for WgpuProver {
 
     fn prepare(&self, pk: ProvingKey) -> Result<Box<dyn PreparedCircuit>, ProveError> {
         let _gpu = self.device.exclusive();
-        let mut circuit = WgpuCircuit::new(Arc::clone(&self.device), Arc::clone(&self.msm), pk)?;
+        let mut circuit = WgpuCircuit::with_work(
+            Arc::clone(&self.device),
+            Arc::clone(&self.msm),
+            pk,
+            self.work,
+        )?;
         // The key lands in a sealed submission of its own, and one the GPU cut short is
         // uploaded again: see `WgpuCircuit::key_landed`.
         let mut first = true;
@@ -208,6 +257,8 @@ pub struct WgpuCircuit {
     l_bases: G1Bases,
     h_bases: G1Bases,
     cost: CircuitCost,
+    /// What [`PreparedCircuit::msms`] proves under; the browser chooses per call instead.
+    work: Work,
 }
 
 impl WgpuCircuit {
@@ -218,6 +269,16 @@ impl WgpuCircuit {
         device: Arc<WgpuBackend>,
         msm: Arc<MsmBatch>,
         pk: ProvingKey,
+    ) -> Result<Self, ProveError> {
+        Self::with_work(device, msm, pk, Work::Variable)
+    }
+
+    /// Same, with the work mode [`PreparedCircuit::msms`] proves under.
+    pub fn with_work(
+        device: Arc<WgpuBackend>,
+        msm: Arc<MsmBatch>,
+        pk: ProvingKey,
+        work: Work,
     ) -> Result<Self, ProveError> {
         // Shape checks first. `crate::batch` would reject an out-of-range job later, but by
         // then the message names buffer offsets rather than the section of the zkey that is
@@ -261,6 +322,7 @@ impl WgpuCircuit {
             l_bases: bases.3,
             h_bases: bases.4,
             cost,
+            work,
         })
     }
 
@@ -417,6 +479,10 @@ impl WgpuCircuit {
         &self.msm
     }
 
+    pub fn work(&self) -> Work {
+        self.work
+    }
+
     /// Stages 0 to 4 with stage 4's implementation chosen, for the test that runs both.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn compute_h_with(
@@ -568,16 +634,28 @@ fn retry_aborted<T>(
 }
 
 impl WgpuCircuit {
-    /// Stages 5 to 9, awaited. The real implementation; the `PreparedCircuit::msms` above
-    /// is `pollster::block_on` over this and the browser worker awaits it directly.
-    ///
-    /// Takes no lock, for the reason in [`Self::compute_h_async`]. The clock below still
-    /// starts after the caller's guard is acquired, which is the ordering the long comment
-    /// inside argues for.
+    /// Stages 5 to 9, awaited, under the circuit's own [`Work`]. The real implementation;
+    /// the `PreparedCircuit::msms` above is `pollster::block_on` over this.
     pub async fn msms_async(
         &self,
         witness: &[Fr],
         h: &HPoly,
+        t: &mut StageTimings,
+    ) -> Result<MsmOutputs, ProveError> {
+        self.msms_async_with(witness, h, self.work, t).await
+    }
+
+    /// Same, with the work mode chosen per call, which is how the browser worker asks for
+    /// it: one circuit serves both modes there.
+    ///
+    /// Takes no lock, for the reason in [`Self::compute_h_async`]. The clock below still
+    /// starts after the caller's guard is acquired, which is the ordering the long comment
+    /// inside argues for.
+    pub async fn msms_async_with(
+        &self,
+        witness: &[Fr],
+        h: &HPoly,
+        work: Work,
         t: &mut StageTimings,
     ) -> Result<MsmOutputs, ProveError> {
         self.check_witness(witness)?;
@@ -611,7 +689,15 @@ impl WgpuCircuit {
         let start = Instant::now();
 
         let private_from = self.pk.n_public + 1;
-        let (g_all, g_private) = general_counts(witness, private_from);
+        // Under constant work nothing on the host looks at a scalar's value either: the
+        // plans take `n`, and `None` is what says so.
+        let (g_all, g_private) = match work {
+            Work::Variable => {
+                let (all, private) = general_counts(witness, private_from);
+                (Some(all), Some(private))
+            }
+            Work::Constant => (None, None),
+        };
         let n_vars = self.pk.n_vars as u32;
         let l_len = self.l_bases.len() as u32;
         let domain = self.pk.domain_size as u32;
@@ -668,16 +754,17 @@ impl WgpuCircuit {
                         Group {
                             scalars: Source::Device {
                                 buf: w,
-                                general: Some(g_all),
+                                general: g_all,
                             },
                             scalar_off: 0,
                             n: n_vars,
                             jobs: &witness_jobs,
+                            work,
                         },
                         Group {
                             scalars: Source::Device {
                                 buf: w,
-                                general: Some(g_private),
+                                general: g_private,
                             },
                             // Section 8 covers the private wires only: witness[0] is the
                             // constant 1 and witness[1..=n_public] are the public inputs,
@@ -685,6 +772,7 @@ impl WgpuCircuit {
                             scalar_off: private_from as u32,
                             n: l_len,
                             jobs: &l_jobs,
+                            work,
                         },
                         Group {
                             scalars: Source::Device {
@@ -698,6 +786,7 @@ impl WgpuCircuit {
                             scalar_off: 0,
                             n: domain,
                             jobs: &h_jobs,
+                            work,
                         },
                     ],
                 )
@@ -717,18 +806,21 @@ impl WgpuCircuit {
                             scalar_off: 0,
                             n: n_vars,
                             jobs: &witness_jobs,
+                            work,
                         },
                         Group {
                             scalars: Source::Host(witness),
                             scalar_off: private_from as u32,
                             n: l_len,
                             jobs: &l_jobs,
+                            work,
                         },
                         Group {
                             scalars: Source::Host(host_h),
                             scalar_off: 0,
                             n: domain,
                             jobs: &h_jobs,
+                            work,
                         },
                     ],
                 )
@@ -830,6 +922,7 @@ impl WgpuCircuit {
 
         // Each job reads a different range of a different scalar source, and getting that
         // wrong would measure a different circuit rather than a smaller one.
+        let work = self.work;
         let group = match which {
             "l-g1" => Group {
                 scalars: Source::Device {
@@ -839,6 +932,7 @@ impl WgpuCircuit {
                 scalar_off: private_from as u32,
                 n: self.l_bases.len() as u32,
                 jobs: &jobs,
+                work,
             },
             "h-g1" => Group {
                 scalars: Source::Device {
@@ -848,6 +942,7 @@ impl WgpuCircuit {
                 scalar_off: 0,
                 n: self.pk.domain_size as u32,
                 jobs: &jobs,
+                work,
             },
             _ => Group {
                 scalars: Source::Device {
@@ -857,6 +952,7 @@ impl WgpuCircuit {
                 scalar_off: 0,
                 n: n_vars,
                 jobs: &jobs,
+                work,
             },
         };
 

@@ -15,7 +15,7 @@ use g16_core::{Backend, HPoly, ProveError, StageTimings};
 use g16_field::{Fr, One, Zero};
 use g16_wgpu::backend::WgpuProver;
 use g16_wgpu::{G1Bases, G2Bases, Group, Job, MontConvert, MsmResult, Source};
-use g16_wgpu::{LimitsProfile, WgpuBackend};
+use g16_wgpu::{LimitsProfile, WgpuBackend, Work};
 use g16_zkey::{wtns::Witness, ProvingKey, VerifyingKey};
 
 #[path = "gpulock/mod.rs"]
@@ -766,12 +766,14 @@ fn an_empty_group_dispatches_nothing_and_keeps_its_result_slots() {
                 scalar_off: 0,
                 n: n_vars,
                 jobs: &first,
+                work: Work::Variable,
             };
             let g_last = || Group {
                 scalars: Source::Host(&witness),
                 scalar_off: 0,
                 n: n_vars,
                 jobs: &last,
+                work: Work::Variable,
             };
 
             let want = pollster::block_on(batch.run(b, None, &[g_first(), g_last()])).expect("two");
@@ -787,6 +789,7 @@ fn an_empty_group_dispatches_nothing_and_keeps_its_result_slots() {
                         scalar_off: 0,
                         n: 0,
                         jobs: &empty,
+                        work: Work::Variable,
                     },
                     g_last(),
                 ],
@@ -1090,18 +1093,21 @@ fn a_group_cut_into_sub_msms_matches_the_cpu() {
                 scalar_off: 0,
                 n: n_vars,
                 jobs: &w_jobs,
+                work: Work::Variable,
             },
             Group {
                 scalars: Source::Host(&witness),
                 scalar_off: private_from as u32,
                 n: l_len,
                 jobs: &l_jobs,
+                work: Work::Variable,
             },
             Group {
                 scalars: Source::Host(&witness),
                 scalar_off: off,
                 n: tail,
                 jobs: &off_jobs,
+                work: Work::Variable,
             },
         ];
         let got =
@@ -1206,12 +1212,14 @@ fn a_point_stage_cut_into_one_window_per_submission_matches_the_cpu() {
                     scalar_off: 0,
                     n: n_vars,
                     jobs: &w_jobs,
+                    work: Work::Variable,
                 },
                 Group {
                     scalars: Source::Host(&witness),
                     scalar_off: private_from as u32,
                     n: l_len,
                     jobs: &l_jobs,
+                    work: Work::Variable,
                 },
             ];
             let before = b.submits();
@@ -1390,6 +1398,7 @@ fn where_the_msm_time_goes() {
             scalar_off: 0,
             n: n_vars,
             jobs: &w_jobs,
+            work: Work::Variable,
         };
         let l_group = || Group {
             scalars: Source::Device {
@@ -1399,6 +1408,7 @@ fn where_the_msm_time_goes() {
             scalar_off: private_from,
             n: l_len,
             jobs: &l_jobs,
+            work: Work::Variable,
         };
         let h_group = || Group {
             scalars: Source::Device {
@@ -1408,6 +1418,7 @@ fn where_the_msm_time_goes() {
             scalar_off: 0,
             n: domain,
             jobs: &h_jobs,
+            work: Work::Variable,
         };
 
         // Warm the pools and the pipelines before anything is timed.

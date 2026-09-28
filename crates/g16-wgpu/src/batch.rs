@@ -108,6 +108,14 @@
 //! the two disagreeing is a readback that decodes the wrong bytes with no error anywhere. In
 //! steady state the plans are equal on every proof of one circuit and the pool never
 //! allocates.
+//!
+//! # Constant work
+//!
+//! A [`Group`] under [`Work::Constant`] plans every piece for its whole length, so the
+//! window, the pieces, the slabs, every buffer and every dispatch follow the key; the digit
+//! kernels skip nothing, the ones pass is off and the merge is the fixed fold tree. What
+//! that costs and what it leaves to occupancy is on [`Work`]. The submission cut and the
+//! retry are the same, and so is everything about the readback.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -118,7 +126,7 @@ use g16_gpu_layout::{as_bytes, Packed, PackedG1Affine, PackedG2Affine, LIMBS};
 
 use crate::device::{bad, WgpuBackend};
 use crate::gen::points as wgsl;
-use crate::msm::{pack_scalars, storage_buffer, DigitBuffers, DigitPlan, MsmDigits};
+use crate::msm::{pack_scalars, storage_buffer, DigitBuffers, DigitPlan, MsmDigits, Work};
 use crate::params::ParamRing;
 use crate::points::{MsmPointsG1, MsmPointsG2, PointBuffers, PointPlan};
 use crate::readback::{is_aborted, Readback};
@@ -532,6 +540,9 @@ pub struct Group<'a> {
     /// Scalars in range, which is also the base count each job reads.
     pub n: u32,
     pub jobs: &'a [Job<'a>],
+    /// Whether the sort and every job over it may size themselves from the scalar values.
+    /// Under [`Work::Constant`] the `general` count of a [`Source::Device`] is ignored.
+    pub work: Work,
 }
 
 /// One `fr_mont_to_std` dispatch, run before anything else in the encoder.
@@ -830,7 +841,7 @@ impl MsmBatch {
                     sorted[pj.pi] = true;
                     us += sort_us(&p.dplan);
                 }
-                if k + 1 == pj.slabs.len() {
+                if k + 1 == pj.slabs.len() && pj.pplan.ones_groups() > 0 {
                     // The ones pass walks every scalar once.
                     us += SORT_NS * f64::from(p.dplan.n()) / 1000.0;
                 }
@@ -1268,12 +1279,15 @@ impl MsmBatch {
         if g.n == 0 {
             return Ok(Vec::new());
         }
-        let general = match &g.scalars {
-            Source::Device { general, .. } => *general,
+        let general = match (&g.scalars, g.work) {
+            // Constant work plans for the range's length whatever the buffer knows about
+            // its contents: every scalar reaches the buckets, in every window.
+            (_, Work::Constant) => None,
+            (Source::Device { general, .. }, Work::Variable) => *general,
             // Not available at plan time: this runs before the upload, so `pack_scalars`
             // has not walked these scalars yet. `None` means `n`, which is the overestimate
             // `Source::Device`'s `general` documents as the safe direction.
-            Source::Host(_) => None,
+            (Source::Host(_), Work::Variable) => None,
         };
         let mut cap = g.n;
         loop {
@@ -1288,7 +1302,8 @@ impl MsmBatch {
                 let n = hi - lo;
                 // A piece never has more general scalars than the whole range, and never
                 // more than its own length.
-                let dplan = DigitPlan::new(n, g.scalar_off + lo, general.map(|x| x.min(n)))?;
+                let dplan =
+                    DigitPlan::with_work(n, g.scalar_off + lo, general.map(|x| x.min(n)), g.work)?;
                 if !self.fits(&dplan, g.jobs, limit)? {
                     fits = false;
                     break;
