@@ -717,7 +717,10 @@ impl MsmBatch {
     /// writes is read by anything before it. It can be run again because each of its parts
     /// is complete from its own first write: the conversion is a pure map, a sort zeroes its
     /// counters first, a window slab clears its buckets first, and the reduction and the
-    /// ones pass only read what the slabs left. Once the attempts are spent the error is a
+    /// ones pass only read what the slabs left. The uploads the refused submission carried
+    /// are queued again first, because a kill has been seen to take them with it (BUG-33),
+    /// and the first submission's are the parameter ring every later one reads through.
+    /// Once the attempts are spent the error is a
     /// `ProveError::Device`, which `g16 prove`'s fallback proves past. The stage timing the
     /// caller keeps includes the attempts that were lost.
     ///
@@ -1154,6 +1157,23 @@ impl MsmBatch {
                     Err(e) if is_aborted(&e) && attempt < attempts => {
                         wait_before_retry(si + 1, subs.len(), &e, attempt, attempts);
                         attempt += 1;
+                        // A kill can take the refused submission's queued uploads with
+                        // it, and the first submission's carry the whole parameter ring
+                        // and every host scalar vector (BUG-33: a first submission of a
+                        // fresh circuit lost its key that way, 4 times in 13). Queued again
+                        // so the retry reads what it was planned over; the epoch is
+                        // re-queued by `Seal::dispatch` above.
+                        ring.flush(backend);
+                        for (gi, g) in groups.iter().enumerate() {
+                            if let (Source::Host(xs), Some(k)) = (&g.scalars, upload_at[gi]) {
+                                let (words, _) = pack_scalars(xs);
+                                backend.queue().write_buffer(
+                                    &sc.uploads[k],
+                                    0,
+                                    bytemuck::cast_slice(&words),
+                                );
+                            }
+                        }
                     }
                     r => break r?,
                 }

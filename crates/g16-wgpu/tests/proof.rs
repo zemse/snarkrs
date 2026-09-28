@@ -455,6 +455,57 @@ fn a_submission_cut_short_at_every_dispatch_is_retried_exactly() {
     }
 }
 
+/// BUG-33's fix: the key's uploads land in a sealed submission of their own inside
+/// `prepare`, and one the GPU cut short is uploaded again rather than left as the cut copy
+/// while the first proof's own retry re-uploads only its witness. `REFUSE_NEXT` refuses the
+/// first close after it is set, which is that submission's, so `prepare` has to make a
+/// second one and the proof on the re-uploaded key has to be the clean one bit for bit.
+#[test]
+fn a_key_upload_the_gpu_cut_short_is_uploaded_again() {
+    let _one_at_a_time = exclusive();
+    let device = device();
+    for_each_artifact("a_key_upload_the_gpu_cut_short_is_uploaded_again", |a| {
+        let witness = a.witness();
+        let (r, s) = (Fr::from(7u64), Fr::from(11u64));
+        let mut t = StageTimings::default();
+        let before = device.submits();
+        let clean = prover().prepare(a.key()).expect("prepare");
+        assert_eq!(
+            device.submits() - before,
+            1,
+            "{}: prepare is one sealed submission",
+            a.name
+        );
+        let want = prove_with_blinders(clean.as_ref(), &witness, r, s, &mut t).expect("clean");
+
+        g16_wgpu::REFUSE_NEXT.store(1, std::sync::atomic::Ordering::Relaxed);
+        let before = device.submits();
+        let circuit = prover().prepare(a.key());
+        let left = g16_wgpu::REFUSE_NEXT.swap(0, std::sync::atomic::Ordering::Relaxed);
+        let circuit = circuit.unwrap_or_else(|e| {
+            panic!(
+                "{}: prepare did not recover from a refused key upload: {e}",
+                a.name
+            )
+        });
+        assert_eq!(left, 0, "{}: the key upload never closed", a.name);
+        assert_eq!(
+            device.submits() - before,
+            2,
+            "{}: a refused key upload is one more submission",
+            a.name
+        );
+        let got = prove_with_blinders(circuit.as_ref(), &witness, r, s, &mut t).expect("proof");
+        assert_eq!(
+            (got.a, got.b, got.c),
+            (want.a, want.b, want.c),
+            "{}: the proof on the re-uploaded key differs",
+            a.name
+        );
+        verify(&a.vkey(), &public_of(&witness, circuit.n_public()), &got).expect("verify");
+    });
+}
+
 // ---------------------------------------------------------------------------
 // 2. The contract: `&self`, from several threads
 // ---------------------------------------------------------------------------

@@ -162,7 +162,6 @@ pub struct Seal {
     /// Where the blit after the pass copies that, for the host to map.
     map: wgpu::Buffer,
     bind: wgpu::BindGroup,
-    epoch: AtomicU32,
     /// The epoch [`Self::dispatch`] wrote and [`Self::close`] has not yet taken, or 0.
     armed: AtomicU32,
 }
@@ -181,6 +180,11 @@ pub struct Sealed {
 pub struct SealKernel {
     bgl: wgpu::BindGroupLayout,
     pipeline: wgpu::ComputePipeline,
+    /// The last epoch any seal on this device took. One counter for the device rather
+    /// than one per seal, so no two submissions ever carry the same token: a fresh seal's
+    /// buffers can land on memory a dropped seal's left behind, and a per-seal counter
+    /// starting at 1 would accept that word.
+    epoch: AtomicU32,
 }
 
 const SEAL_WGSL: &str = "
@@ -216,7 +220,11 @@ impl SealKernel {
             compilation_options: Default::default(),
             cache: None,
         });
-        Self { bgl, pipeline }
+        Self {
+            bgl,
+            pipeline,
+            epoch: AtomicU32::new(0),
+        }
     }
 }
 
@@ -254,7 +262,6 @@ impl Seal {
             dst,
             map,
             bind,
-            epoch: AtomicU32::new(0),
             armed: AtomicU32::new(0),
         })
     }
@@ -265,9 +272,10 @@ impl Seal {
     /// pass ends.
     pub fn dispatch(&self, backend: &WgpuBackend, pass: &mut wgpu::ComputePass<'_>) {
         // Never 0, which is what a fresh buffer holds.
-        let mut epoch = self.epoch.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        let counter = &backend.seal_kernel().epoch;
+        let mut epoch = counter.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
         if epoch == 0 {
-            epoch = self.epoch.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+            epoch = counter.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
         }
         backend
             .queue()

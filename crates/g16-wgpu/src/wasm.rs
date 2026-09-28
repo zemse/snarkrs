@@ -511,6 +511,9 @@ pub async fn prepare() -> Result<String, JsError> {
         })
         .await
         .map_err(js)?;
+    // The key's uploads land under their own seal, so a refusal is the key's and not the
+    // first proof's. One attempt: the browser has no thread to back off on.
+    circuit.key_landed().await.map_err(js)?;
     let total_us = t0.elapsed().as_micros() as u64;
     let cost = circuit.prepare_cost();
     let base_bytes = circuit.base_bytes();
@@ -992,6 +995,7 @@ async fn prove_cold_inner(device: Arc<WgpuBackend>, msm: Arc<MsmBatch>) -> Resul
         })
         .await
         .map_err(js)?;
+    circuit.key_landed().await.map_err(js)?;
     extra.push_str(&format!(
         r#","prepare_us":{}"#,
         t0.elapsed().as_micros() as u64

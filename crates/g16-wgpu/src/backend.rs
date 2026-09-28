@@ -58,6 +58,7 @@ use g16_zkey::ProvingKey;
 
 use crate::batch::{G1Bases, G2Bases, Group, Job, MontConvert, MsmBatch, Source};
 use crate::device::{bad, WgpuBackend};
+use crate::readback::Seal;
 use crate::stages::{HStages, WgpuHandle};
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -168,11 +169,19 @@ impl Backend for WgpuProver {
     }
 
     fn prepare(&self, pk: ProvingKey) -> Result<Box<dyn PreparedCircuit>, ProveError> {
-        Ok(Box::new(WgpuCircuit::new(
-            Arc::clone(&self.device),
-            Arc::clone(&self.msm),
-            pk,
-        )?))
+        let _gpu = self.device.exclusive();
+        let mut circuit = WgpuCircuit::new(Arc::clone(&self.device), Arc::clone(&self.msm), pk)?;
+        // The key lands in a sealed submission of its own, and one the GPU cut short is
+        // uploaded again: see `WgpuCircuit::key_landed`.
+        let mut first = true;
+        retry_aborted("the key upload", &mut StageTimings::default(), |_| {
+            if !first {
+                circuit.reupload()?;
+            }
+            first = false;
+            pollster::block_on(circuit.key_landed())
+        })?;
+        Ok(Box::new(circuit))
     }
 }
 
@@ -240,21 +249,51 @@ impl WgpuCircuit {
             )));
         }
 
+        let (stages, bases, cost) = Self::upload(&device, &pk)?;
+        Ok(Self {
+            pk,
+            device,
+            msm,
+            stages,
+            a_bases: bases.0,
+            b_g1_bases: bases.1,
+            b_g2_bases: bases.2,
+            l_bases: bases.3,
+            h_bases: bases.4,
+            cost,
+        })
+    }
+
+    /// The device-resident half of a circuit: stages 0 to 4's modules and tables, then the
+    /// five base vectors. The uploads are queued here and land with the next submission;
+    /// [`Self::key_landed`] is that submission.
+    #[allow(clippy::type_complexity)]
+    fn upload(
+        device: &WgpuBackend,
+        pk: &ProvingKey,
+    ) -> Result<
+        (
+            HStages,
+            (G1Bases, G1Bases, G2Bases, G1Bases, G1Bases),
+            CircuitCost,
+        ),
+        ProveError,
+    > {
         let t_all = Instant::now();
         // Stages 0 to 4, including the three shader modules. This also validates the key the
         // way the CPU backend does (power-of-two domain, CSR row count, every signal index
         // below n_vars), so a bad key is an error here rather than an out-of-range GPU read
         // later.
         let t0 = Instant::now();
-        let stages = HStages::new(&device, &pk)?;
+        let stages = HStages::new(device, pk)?;
         let stages_us = t0.elapsed().as_micros() as u64;
 
         let t1 = Instant::now();
-        let a_bases = G1Bases::upload(&device, &pk.a_query)?;
-        let b_g1_bases = G1Bases::upload(&device, &pk.b_g1_query)?;
-        let b_g2_bases = G2Bases::upload(&device, &pk.b_g2_query)?;
-        let l_bases = G1Bases::upload(&device, &pk.l_query)?;
-        let h_bases = G1Bases::upload(&device, &pk.h_query)?;
+        let a_bases = G1Bases::upload(device, &pk.a_query)?;
+        let b_g1_bases = G1Bases::upload(device, &pk.b_g1_query)?;
+        let b_g2_bases = G2Bases::upload(device, &pk.b_g2_query)?;
+        let l_bases = G1Bases::upload(device, &pk.l_query)?;
+        let h_bases = G1Bases::upload(device, &pk.h_query)?;
         let bases_us = t1.elapsed().as_micros() as u64;
 
         let cost = CircuitCost {
@@ -265,7 +304,7 @@ impl WgpuCircuit {
         if std::env::var_os("G16_WGPU_PREPARE").is_some() {
             eprintln!(
                 "wgpu prepare: stages {} us, bases {} us ({} MB), total {} us (domain {}, \
-                 n_vars {n_vars})",
+                 n_vars {})",
                 cost.stages_us,
                 cost.bases_us,
                 (a_bases.bytes()
@@ -276,21 +315,66 @@ impl WgpuCircuit {
                     / 1_000_000,
                 cost.total_us,
                 pk.domain_size,
+                pk.n_vars,
             );
         }
-
-        Ok(Self {
-            pk,
-            device,
-            msm,
+        Ok((
             stages,
-            a_bases,
-            b_g1_bases,
-            b_g2_bases,
-            l_bases,
-            h_bases,
+            (a_bases, b_g1_bases, b_g2_bases, l_bases, h_bases),
             cost,
-        })
+        ))
+    }
+
+    /// Submits the key's queued uploads under a [`Seal`] and refuses a submission the GPU
+    /// cut short, as `ProveError::Device` with [`crate::readback::is_aborted`] true.
+    ///
+    /// # Why the key needs a submission of its own
+    ///
+    /// `queue.write_buffer` only queues a copy, and wgpu flushes every queued copy at the
+    /// head of the next submission. Without this, the next submission is the first proof's
+    /// stages 0 to 4, so that submission carries 112 MB of key (`railgun-13x01`) in front
+    /// of its pass, and a kill anywhere in it leaves the token missing and the retry
+    /// re-uploading the witness and the parameters and nothing else: the key stays as the
+    /// cut copy left it, every later token is present, and the proof is wrong. In about
+    /// 900 `g16 prove` calls under load, each a fresh process, all 3 whose first submission
+    /// was refused proved wrong (BUG-33), while 30 stage 0-4 refusals in one process with
+    /// the key long resident retried exactly; `tests/abort_probe.rs` over 1,200 fresh
+    /// circuits under the same load had 14 first submissions refused, and the 4 that then
+    /// proved wrong had `H` zero at every entry and all five MSMs wrong, which is a gather
+    /// over a CSR and MSMs over bases the cut copy never delivered. The epoch's copy is
+    /// the last one queued, so a blit encoder cut anywhere before it leaves the token
+    /// missing and this refuses it; [`WgpuProver::prepare`] then uploads the key again.
+    pub async fn key_landed(&self) -> Result<(), ProveError> {
+        let seal = Seal::new(&self.device, "g16 key upload")?;
+        let mut enc =
+            self.device
+                .device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("g16 key upload"),
+                });
+        let sealed = seal.close(&self.device, &mut enc);
+        self.device.submit([enc.finish()]);
+        self.device.wait_for_submitted_work().await?;
+        if let Some(e) = self.device.take_error() {
+            return Err(self
+                .device
+                .fault(format!("device error uploading the key: {e}")));
+        }
+        seal.verify(sealed).await
+    }
+
+    /// Queues the key's uploads again, into fresh buffers, after [`Self::key_landed`]
+    /// refused them.
+    pub fn reupload(&mut self) -> Result<(), ProveError> {
+        let (stages, bases, cost) = Self::upload(&self.device, &self.pk)?;
+        self.stages = stages;
+        self.a_bases = bases.0;
+        self.b_g1_bases = bases.1;
+        self.b_g2_bases = bases.2;
+        self.l_bases = bases.3;
+        self.h_bases = bases.4;
+        self.cost = cost;
+        Ok(())
     }
 
     /// What [`WgpuProver::prepare`] cost for this key.

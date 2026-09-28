@@ -107,6 +107,12 @@ fn stages_0_to_4_retried_after_a_real_abort_are_exact() {
             eprintln!("iter {i}: no H after {ran} tries");
             continue;
         };
+        // `ONLY_ABORTED`: skip the MSMs and the checks on an iteration nothing was retried
+        // in, so a sweep for rare first-submission aborts spends its time on `prepare`.
+        if attempts == 1 && std::env::var_os("ONLY_ABORTED").is_some() {
+            eprintln!("iter {i}: compute_h ran {ran} times, no retry; skipped");
+            continue;
+        }
         // Which entries a wrong H gets wrong says what left them: a half-run transform
         // wrongs a structured subset, a kernel that never ran leaves zeros.
         let got_h = circuit.h_to_host(&h).expect("a wgpu H reads back");
