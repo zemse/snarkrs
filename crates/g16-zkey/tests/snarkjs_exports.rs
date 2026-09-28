@@ -1,0 +1,148 @@
+//! The export commands this crate backs, diffed byte for byte against snarkjs itself.
+//!
+//! Every test runs snarkjs and our function on the same input and compares the whole
+//! output: the JSON file, or the text printed to stdout and stderr. A format has no
+//! partial credit, since whatever consumes the file compares it the same way.
+//!
+//! snarkjs is `$SNARKJS` when set, either an executable or a `cli.js` to run under node,
+//! and `snarkjs` on `PATH` otherwise. The reference is 0.7.6; the test prints which
+//! version it ran against. Everything skips with a message when snarkjs or the artifacts
+//! under `bench/artifacts` are absent, so a fresh clone does not report false green.
+
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+use g16_zkey::export_json::{wtns_export_json, zkey_export_json};
+
+/// Small enough that snarkjs finishes each in a second or two.
+const VARIANTS: [&str; 2] = ["tiny_mul", "js_1x1_d8"];
+
+fn artifacts_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/artifacts")
+}
+
+fn snarkjs() -> Command {
+    match std::env::var("SNARKJS") {
+        Ok(p) if p.ends_with(".js") => {
+            let mut c = Command::new("node");
+            c.arg(p);
+            c
+        }
+        Ok(p) => Command::new(p),
+        Err(_) => Command::new("snarkjs"),
+    }
+}
+
+/// Whether snarkjs runs at all, printing its version or the skip.
+fn have_snarkjs(test: &str) -> bool {
+    match snarkjs().arg("--version").output() {
+        Ok(o) => {
+            let banner = String::from_utf8_lossy(&o.stdout);
+            eprintln!("{test}: {}", banner.lines().next().unwrap_or("snarkjs"));
+            true
+        }
+        Err(_) => {
+            eprintln!("SKIPPED {test}: snarkjs not found");
+            false
+        }
+    }
+}
+
+/// The variants present, or a skip message and nothing.
+fn variants(test: &str) -> Vec<PathBuf> {
+    let dirs: Vec<PathBuf> = VARIANTS
+        .iter()
+        .map(|v| artifacts_root().join(v))
+        .filter(|d| d.join("circuit.zkey").is_file())
+        .collect();
+    if dirs.is_empty() {
+        eprintln!("SKIPPED {test}: no artifacts under bench/artifacts");
+    }
+    dirs
+}
+
+fn scratch(test: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("g16-zkey-{test}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn run(cmd: &mut Command) -> Output {
+    cmd.output()
+        .unwrap_or_else(|e| panic!("failed to run {cmd:?}: {e}"))
+}
+
+/// First differing byte, with context, so a mismatch in a megabyte of JSON is readable.
+fn assert_same(what: &str, ours: &[u8], theirs: &[u8]) {
+    if ours == theirs {
+        return;
+    }
+    let at = ours
+        .iter()
+        .zip(theirs)
+        .position(|(a, b)| a != b)
+        .unwrap_or(ours.len().min(theirs.len()));
+    let ctx = |b: &[u8]| {
+        String::from_utf8_lossy(&b[at.saturating_sub(80)..(at + 80).min(b.len())]).into_owned()
+    };
+    panic!(
+        "{what}: differs at byte {at} ({} vs {} bytes)\n--- ours\n{}\n--- snarkjs\n{}",
+        ours.len(),
+        theirs.len(),
+        ctx(ours),
+        ctx(theirs)
+    );
+}
+
+#[test]
+fn zkey_export_json_matches_snarkjs() {
+    if !have_snarkjs("zkey_export_json_matches_snarkjs") {
+        return;
+    }
+    let out = scratch("zkey-json");
+    for dir in variants("zkey_export_json_matches_snarkjs") {
+        let theirs = out.join("snarkjs.json");
+        let o = run(snarkjs().args([
+            "zkey".as_ref(),
+            "export".as_ref(),
+            "json".as_ref(),
+            dir.join("circuit.zkey").as_os_str(),
+            theirs.as_os_str(),
+        ]));
+        assert!(o.status.success(), "snarkjs failed: {o:?}");
+        let mut ours = Vec::new();
+        zkey_export_json(&dir.join("circuit.zkey"), &mut ours).unwrap();
+        assert_same(
+            &format!("{} zkey export json", dir.display()),
+            &ours,
+            &std::fs::read(&theirs).unwrap(),
+        );
+    }
+}
+
+#[test]
+fn wtns_export_json_matches_snarkjs() {
+    if !have_snarkjs("wtns_export_json_matches_snarkjs") {
+        return;
+    }
+    let out = scratch("wtns-json");
+    for dir in variants("wtns_export_json_matches_snarkjs") {
+        let theirs = out.join("snarkjs.json");
+        let o = run(snarkjs().args([
+            "wtns".as_ref(),
+            "export".as_ref(),
+            "json".as_ref(),
+            dir.join("circuit.wtns").as_os_str(),
+            theirs.as_os_str(),
+        ]));
+        assert!(o.status.success(), "snarkjs failed: {o:?}");
+        let mut ours = Vec::new();
+        wtns_export_json(&dir.join("circuit.wtns"), &mut ours).unwrap();
+        assert_same(
+            &format!("{} wtns export json", dir.display()),
+            &ours,
+            &std::fs::read(&theirs).unwrap(),
+        );
+    }
+}
