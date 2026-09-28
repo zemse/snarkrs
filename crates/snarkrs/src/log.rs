@@ -99,6 +99,32 @@ pub fn error(msg: impl Display) {
     write(Level::Error, &msg.to_string());
 }
 
+/// Printed after a witness is computed: the file round trip is what a Rust caller skips.
+pub const WITNESS_TIP: &str = "for faster witness generation, rewrite it in optimised Rust and \
+use snarkrs as a library:\n     pass the witness from memory to g16_core::prove::prove, which \
+takes &[Fr], and skip writing\n     and re-reading the .wtns. See \"witness from memory\" in \
+README.md. SNARKRS_NO_TIPS=1 hides this.";
+
+/// A tip for whoever is at the terminal. On stderr, so stdout stays exactly snarkjs', and
+/// off when `SNARKRS_NO_TIPS` is set to anything but `0` or nothing.
+pub fn tip(msg: &str) {
+    if std::env::var_os("SNARKRS_NO_TIPS").is_some_and(|v| !v.is_empty() && v != "0") {
+        return;
+    }
+    let err = std::io::stderr();
+    let colour = err.is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    let label = if colour {
+        "\x1b[36;1mtip:\x1b[0m"
+    } else {
+        "tip:"
+    };
+    let _ = writeln!(err.lock(), "{label} {msg}");
+}
+
+pub fn tip_witness() {
+    tip(WITNESS_TIP);
+}
+
 /// `misc.formatHash`: the title, then four tab-indented rows of four big-endian 32-bit
 /// words. Every ceremony hash snarkjs prints goes through it, and a contributor copies the
 /// result into a public attestation, so the layout is part of the interface.

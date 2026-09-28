@@ -1349,6 +1349,7 @@ fn run_wtns(cmd: WtnsCmd) -> Result<u8> {
                 return Ok(witness_failed(&e));
             }
             log::debug(format!("wrote {}", witness.display()));
+            log::tip_witness();
         }
         WtnsCmd::Debug {
             wasm,
@@ -1404,7 +1405,10 @@ fn run_fullprove(
         public,
         opts,
     ) {
-        Ok(()) => Ok(0),
+        Ok(()) => {
+            log::tip_witness();
+            Ok(0)
+        }
         Err(e) => match e.downcast_ref::<WitnessError>() {
             Some(we) => Ok(witness_failed(we)),
             None => Err(e),

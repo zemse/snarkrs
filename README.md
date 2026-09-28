@@ -126,6 +126,30 @@ snarkrs g16p circuit.zkey circuit.wtns proof.json public.json --backend metal
 snarkjs groth16 verify verification_key.json public.json proof.json    # OK!
 ```
 
+### witnesses
+
+`wtns calculate` and `groth16 fullprove` take circom's `circuit_js/circuit.wasm` or the
+native binary `circom --c` builds. The file's first bytes decide which, not its name:
+
+```sh
+snarkrs wtns calculate circuit_js/circuit.wasm input.json witness.wtns
+snarkrs wtns calculate circuit_cpp/circuit input.json witness.wtns   # circuit.dat beside it
+snarkrs groth16 fullprove input.json circuit_js/circuit.wasm circuit_final.zkey \
+        proof.json public.json [--backend cpu|wgpu|metal|cuda] [...groth16 prove's options]
+```
+
+The wasm runs in wasmtime, reads `input.json` the way snarkjs does, prints the circuit's
+`log()` lines and its errors the way snarkjs does, and writes the same `.wtns` byte for
+byte. `fullprove` keeps that witness in memory. A native binary runs as a subprocess and
+`fullprove` hands it a private temp file that is zeroed and deleted once read. `wtns debug`
+is wasm only. `--no-default-features --features cpu,wgpu` builds without the
+`witness-wasm` feature: no wasmtime, native binaries only.
+
+On Apple Silicon the C++ from `circom --c` does not build as it comes: `fr.cpp` passes
+`uint64_t*` where GMP takes `mp_limb_t*`, which is `unsigned long` there, and `main.cpp`
+includes `nlohmann/json.hpp`, which the generated Makefile never points at. `--no_asm`
+leaves out `fr.asm` and the nasm it needs.
+
 `--stage-timings` prints where the time went, which is the fastest way to find out whether
 a circuit is MSM-bound or transform-bound:
 
@@ -154,6 +178,32 @@ where it runs; nothing else in the snippet changes, which is the point of the tr
 The blinders come from the OS CSPRNG. There is no seed override on this path on purpose: a
 reused `(r, s)` across two proofs of different witnesses leaks the witness, so the
 deterministic entry point stays test-only.
+
+### witness from memory
+
+`prove` takes the witness as `&[Fr]`, so it never has to be a file:
+
+```rust
+use g16_core::{prove::prove, Backend, StageTimings};
+use g16_witness::{Input, WitnessCalculator};
+use g16_zkey::ProvingKey;
+
+let pk = ProvingKey::load(std::path::Path::new("circuit.zkey"))?;
+let circuit = g16_metal::MetalBackend::new()?.prepare(pk)?;
+
+// compile the wasm once, then one witness per input
+let calc = WitnessCalculator::from_file(std::path::Path::new("circuit_js/circuit.wasm"))?;
+let w = calc.calculate(&Input::from_json_str(r#"{"a": "3", "b": "11"}"#)?)?;
+
+let mut t = StageTimings::default();
+let proof = prove(circuit.as_ref(), &w, &mut ark_std::rand::thread_rng(), &mut t)?;
+```
+
+`w` is just `1`, the public signals, then the other wires in circom's order (the second
+column of the `.sym` file). Anything that computes it can feed `prove`, so the fastest
+witness generator is one written in optimised Rust for your circuit, with no wasm and no
+`.wtns` written and read back in between. `snarkrs` prints a tip saying so on stderr after
+`wtns calculate` and `fullprove`; `SNARKRS_NO_TIPS=1` turns it off.
 
 ## what it checks
 

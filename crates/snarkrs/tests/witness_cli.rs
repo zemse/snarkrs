@@ -162,9 +162,11 @@ component main {public [a]} = T();
     }
 }
 
-/// Defaults and bytes, and stdout is snarkjs'.
+const TIP: &str = "tip: for faster witness generation";
+
+/// Defaults, bytes, and the tip: on stderr, silenced by the variable, stdout unchanged.
 #[test]
-fn wtns_calculate_writes_snarkjs_bytes() {
+fn wtns_calculate_writes_snarkjs_bytes_and_tips_on_stderr() {
     let Some(tiny) = tiny_mul() else { return };
     let dir = scratch("calc");
     std::fs::copy(
@@ -180,6 +182,9 @@ fn wtns_calculate_writes_snarkjs_bytes() {
     expect(&o, 0, "wtns calculate");
     assert_eq!(std::fs::read(dir.join("witness.wtns")).unwrap(), want);
     assert_eq!(out(&o), "", "stdout is snarkjs': nothing");
+    assert!(err(&o).starts_with(TIP), "{}", err(&o));
+    assert!(err(&o).contains("witness from memory"), "{}", err(&o));
+    assert!(err(&o).lines().count() <= 3, "{}", err(&o));
 
     let o = snarkrs_env(
         &dir,
@@ -277,6 +282,7 @@ fn fullprove_from_wasm_verifies_and_writes_no_witness() {
     let o = snarkrs_env(&dir, &line, &[("TMPDIR", &tmp)]);
     expect(&o, 0, &line);
     assert_eq!(out(&o), "");
+    assert!(err(&o).starts_with(TIP), "{}", err(&o));
     assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 0, "temp dir");
     let mut names: Vec<String> = std::fs::read_dir(&dir)
         .unwrap()
@@ -316,6 +322,7 @@ fn fullprove_from_wasm_verifies_and_writes_no_witness() {
         "{}",
         out(&o)
     );
+    assert!(!err(&o).contains(TIP));
     assert!(!dir.join("p2.json").exists());
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -351,6 +358,7 @@ fn native_binaries_work_where_the_wasm_did() {
     let line = format!("wc circuit {} w.wtns", input.display());
     let o = snarkrs(&dir, &line);
     expect(&o, 0, &line);
+    assert!(err(&o).starts_with(TIP), "{}", err(&o));
     assert_eq!(
         std::fs::read(dir.join("w.wtns")).unwrap(),
         std::fs::read(tiny.join("circuit.wtns")).unwrap()
@@ -364,6 +372,7 @@ fn native_binaries_work_where_the_wasm_did() {
     );
     let o = snarkrs_env(&dir, &line, &[("TMPDIR", &tmp)]);
     expect(&o, 0, &line);
+    assert!(err(&o).starts_with(TIP), "{}", err(&o));
     assert_eq!(
         std::fs::read_dir(&tmp).unwrap().count(),
         0,
@@ -434,6 +443,7 @@ fn a_native_failure_forwards_its_stderr() {
     expect(&o, 1, "wc");
     assert!(err_less_tip(&o).contains("Only 0 out of 2"), "{}", err(&o));
     assert!(out(&o).contains("killed by SIGABRT"), "{}", out(&o));
+    assert!(!err(&o).contains(TIP));
     assert!(!dir.join("w.wtns").exists());
     std::fs::remove_dir_all(&dir).ok();
 }
