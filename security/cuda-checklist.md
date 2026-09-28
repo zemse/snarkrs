@@ -18,13 +18,13 @@ not CSPRNGs. A proof with predictable blinders verifies under our verifier, unde
 and under rapidsnark, so no oracle catches it.
 
 **Requirement.** `r` and `s` stay on the host, drawn from the `RngCore + CryptoRng` that
-`g16_core::prove` already owns. The backend trait never asks for randomness:
-`PreparedCircuit` (`g16-core/src/lib.rs:146-165`) exposes `compute_h` and `msms` and
+`snarkrs_groth16::prove` already owns. The backend trait never asks for randomness:
+`PreparedCircuit` (`crates/groth16/src/lib.rs:146-165`) exposes `compute_h` and `msms` and
 nothing else. Do not link cuRAND into the proving path. Do not add a `--seed` flag to the
 CLI; use `prove_with_blinders` for reproducible debugging, as the Metal integration tests
-do (`crates/g16-metal/tests/audit_metal_vs_cpu.rs:113`).
+do (`crates/metal/tests/audit_metal_vs_cpu.rs:113`).
 
-**Test.** `grep -rn 'curand\|rand' crates/g16-cuda/src/` returns nothing in the proving
+**Test.** `grep -rn 'curand\|rand' crates/cuda/src/` returns nothing in the proving
 path. Prove the same witness twice through `prove()` and assert `A`, `B` and `C` all
 differ, then assert both verify.
 
@@ -41,7 +41,7 @@ the smallest artifact we ship exercises the path. zkmopro's packer has exactly t
 
 **Requirement.** Read the arkworks `infinity` flag at the host pack, never re-derive it
 from coordinates on the device. Copy `PackedG1Affine::from_affine`
-(`g16-metal/src/layout.rs:338-351`, rationale at `layout.rs:141-157`). Keep the all-zero
+(`crates/metal/src/layout.rs:338-351`, rationale at `layout.rs:141-157`). Keep the all-zero
 sentinel convention and keep the assertion that `(0,0)` is not on the curve
 (`layout.rs:580,598`). The device must test for infinity **before** any negation for a
 signed digit, or preserve `f_neg(sentinel) == sentinel` deliberately: Metal's sign flip at
@@ -195,7 +195,7 @@ CUDA backend is typically an error code that is easy to `unwrap`.
 
 **Requirement.** Enforce `domain_size <= 1 << Fr::TWO_ADICITY` and cross-check the section
 9 length **before** any device allocation. Never size a `cudaMalloc` from a header field
-that has not been cross-checked against a section length. This is a `g16-zkey` fix that the
+that has not been cross-checked against a section length. This is a `snarkrs-formats` fix that the
 CUDA lane depends on rather than owns; until it lands, do not allocate device memory from
 `domain_size` on an untrusted key.
 
@@ -214,12 +214,12 @@ one process hands the previous proof's witness-derived points to the next caller
 device VRAM is a longer-lived and less observable store than Apple's unified pages.
 
 **Requirement.** Keep the invariant that `ProvingKey` owns every byte and the mapping dies
-at the end of `load()` (`g16-zkey/src/lib.rs:101`). If zero-copy upload is wanted, copy the
+at the end of `load()` (`crates/formats/src/lib.rs:101`). If zero-copy upload is wanted, copy the
 section into pinned host memory first and upload from there. `cudaMemsetAsync` on release,
 not on acquire, so the cost is off the critical path; memset pinned host buffers before
 `cudaFreeHost`. Do not stash the H buffer on the circuit struct: `HPoly::Device` carries the
 handle through the *value* so a `&self` circuit stays safe for concurrent proofs. Copy
-`HHandle`'s ownership shape (`g16-metal/src/stages.rs:757-826`).
+`HHandle`'s ownership shape (`crates/metal/src/stages.rs:757-826`).
 
 **Test.** Truncate a key file mid-load in a loop and confirm the crash window is bounded by
 `load()` and does not extend into proving. Allocate, free, reallocate and read back, and
@@ -260,7 +260,7 @@ assertion against the CPU reference, which will otherwise fail spuriously.
 `prove_with_blinders(cpu, w, r, s)` and `prove_with_blinders(cuda, w, r, s)` must serialise
 to the **same compressed bytes** on all six artifacts, and independent blinders must produce
 **different** bytes, so the test cannot pass on a backend that ignores its inputs. The Metal
-version is `metal_and_cpu_agree_on_every_variant` in `crates/g16-cli/tests/campaign.rs`.
+version is `metal_and_cpu_agree_on_every_variant` in `crates/cli/tests/campaign.rs`.
 Then `snarkjs groth16 verify` and rapidsnark on the output.
 
 ---

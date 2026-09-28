@@ -90,7 +90,7 @@ rsh "$IP" "set -e; mkdir -p ~/g16/bench/artifacts
   curl -sS -o /tmp/a.tgz '$(presign artifacts.tgz)'; tar xzf /tmp/a.tgz -C ~/g16/bench/artifacts" 2>&1 | tail -2 | tee -a "$LOG"
 
 say "building our prover"
-rsh "$IP" 'source ~/.cargo/env; cd ~/g16 && cargo build --release -p snarkrs 2>&1 | tail -2' 2>&1 | tee -a "$LOG"
+rsh "$IP" 'source ~/.cargo/env; cd ~/g16 && cargo build --release -p snarkrs-cli 2>&1 | tail -2' 2>&1 | tee -a "$LOG"
 
 say "building rapidsnark twice: USE_ASM=YES and USE_ASM=NO"
 rsh "$IP" 'set -e; source ~/.cargo/env; cd ~/g16

@@ -1,0 +1,1836 @@
+//! Stages 5 to 9, back half: the five point kernels of one curve, their buffers, and the
+//! host tail.
+//!
+//! [`crate::gen::points`] is the WGSL and carries the algorithm. This file owns the shapes:
+//! how big a bucket array is, where the spill slots live, how many `ones` groups to run, and
+//! the Horner combination the device deliberately does not do.
+//!
+//! # One implementation, two groups
+//!
+//! [`MsmPointsG1`] and [`MsmPointsG2`] are two instantiations of [`MsmPoints`], not two
+//! copies of it. The only things that differ are the WGSL the generator emits, the byte
+//! strides that come with it, and the arkworks projective type the readback decodes into,
+//! which is what [`PointCurve`] carries. Four of a proof's five MSMs are G1 (A, B-G1, L and
+//! H) and one is G2, so a bug fixed in one place is a bug fixed for all five.
+//!
+//! # What the device does and what the host does
+//!
+//! On the device: bucket accumulation over fixed-length slices, the spill merge, the
+//! per-window reduction and the sum of the bases whose scalar is 1. On the host: the Horner
+//! combination of `n_windows` points and the sum of at most 64 `ones` partials, so
+//! `n_windows - 1 + ones_groups` additions, at most 148 against tens of millions on the
+//! device. It is where ZPrize, heliax and `snarkrs-metal` all independently left the window tail,
+//! for the same reason: compiling a shader containing `add_points` at the tail costs more
+//! than the readback plus the additions.
+//!
+//! # One readback, and G2's 256-byte point makes it free
+//!
+//! `msm_reduce_*` writes `n_windows` points and `msm_ones_*` writes `ones_groups` points, and
+//! both go into **one** buffer, so the whole result of an MSM is one `copy_buffer_to_buffer`
+//! and one `mapAsync`. One MSM is therefore `n_windows + ones_groups` points: `n_windows` is
+//! `ceil(RECODE_BITS / c)` and so at most 85 at the narrowest `c`
+//! [`crate::msm::window_size`] searches, and `ones_groups_for` clamps at 64. Over four G1
+//! jobs and one G2 that is 112 KiB, against the 64 KiB per-proof ceiling design §3 puts on
+//! the readback. Measured, every artifact in the repo is well inside 64 KiB except
+//! `keccak256` at 86 KiB and `tiny_mul` at 65.5 KiB;
+//! `tests/proof.rs::a_whole_proof_submits_once_for_h_then_per_msm_slab_and_the_readback_is_bounded`
+//! prints the table and asserts the derived ceiling rather than the design's constant.
+//!
+//! The two bindings are windows into that one buffer at different offsets, and a storage
+//! binding offset must be a multiple of `minStorageBufferOffsetAlignment`, which is **256** in
+//! every browser and never improves. An `Xyzz<Fq2>` is exactly 256 bytes, so
+//! `n_windows * 256` is aligned for free. It is not free for G1, whose point is 128 bytes, so
+//! [`PointBuffers::new`] rounds the offset up rather than relying on the coincidence.
+//!
+//! # Nothing here trusts a buffer to be the right size
+//!
+//! WebGPU returns zero for an out-of-range storage read and drops an out-of-range storage
+//! write, both silently, so a short bucket array is a wrong point and not an error. Every
+//! bind function checks every buffer against the plan it was built from, and
+//! `tests/msm_g1.rs` and `tests/msm_g2.rs` pre-fill every output with a sentinel and assert
+//! the slack survives.
+
+use std::marker::PhantomData;
+use std::ops::Range;
+
+use ark_ff::AdditiveGroup;
+use snarkrs_field::{AffineRepr, CurveGroup, Fq, Fq2, G1Projective, G2Projective, Zero};
+use snarkrs_gpu_layout::{PackedFq, PackedFq2, LIMBS};
+use snarkrs_groth16::{json, ProveError};
+
+use crate::device::{bad, WgpuBackend};
+use crate::gather::storage_entry;
+use crate::gen::field::Variant;
+use crate::gen::msm::BIND_PARAMS;
+use crate::gen::points as wgsl;
+use crate::msm::{storage_buffer, DigitPlan, MsmParams, Work};
+use crate::params::ParamRing;
+use crate::pipelines::Kernels;
+
+/// `u32` words in one `Xyzz<Fq>`: four `Fq` of eight limbs, 128 bytes.
+const XYZZ_G1_WORDS: usize = 4 * LIMBS;
+/// `u32` words in one `Xyzz<Fq2>`: four `Fq2` of two `Fq` of eight limbs, 256 bytes.
+const XYZZ_G2_WORDS: usize = 4 * 2 * LIMBS;
+
+/// A storage binding offset must be a multiple of this, in every browser, at every tier,
+/// forever. The design calls it physics.
+const BINDING_ALIGN: u64 = 256;
+
+// ---------------------------------------------------------------------------
+// Slice length and ones groups
+// ---------------------------------------------------------------------------
+
+// The slice length lives on `gen::points::Curve`, because it is measured per curve and a
+// plan that took one curve's constant against another curve's module would be a silently
+// wrong point rather than an error. `Curve::slice_len` carries both sweeps.
+
+/// Workgroups in `msm_ones_*`: enough that a 2^18-long witness gives each thread about sixty
+/// scalars to scan, few enough that the host adds a few dozen points.
+///
+/// Capped at 64 because every group is a point in the readback and a point the host adds
+/// serially, and floored at 1 because a dispatch of zero workgroups writes nothing and the
+/// host would then read a stale slot. Zero under [`Work::Constant`], whose digit kernels
+/// recode a 1 like any other scalar: the pass is not dispatched, has no window in the
+/// results buffer and is never read.
+fn ones_groups_for(n: u32, tg: u32, work: Work) -> u32 {
+    match work {
+        Work::Constant => 0,
+        Work::Variable => n.div_ceil(tg * 64).clamp(1, 64),
+    }
+}
+
+/// Spill slots one thread of `msm_fold_*` takes per level: the constant-work merge, whose
+/// shape follows the key rather than which buckets the digits landed in.
+///
+/// `snarkrs-metal` swept 4, 8, 16 and 32 at 2^18 and 8 tied 4 with two fewer levels. Here
+/// `tests/constant_work.rs::constant_work_phase_occupancy` under `G16_WGPU_MSM_FOLD` read
+/// the G1 fold at 2^18 as 24.0 to 26.9 ms over six levels of 8 and 26.8 to 28.3 over four
+/// of 16, and the G2 fold at 103 either way, so 8 stays. The override must be at least 4,
+/// so every level shrinks the slot count: at 2 or 3 a level of `m` slots can emit `m`
+/// again and the tree never ends.
+const FOLD_LEN: u32 = 8;
+
+fn fold_len() -> u32 {
+    std::env::var("G16_WGPU_MSM_FOLD")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|v| *v >= 4)
+        .unwrap_or(FOLD_LEN)
+}
+
+/// Workgroups the reduce's dispatch grows towards by splitting each window across several.
+///
+/// One workgroup per window is 20 workgroups at c = 13 on a device of 38 cores, each
+/// thread a dependent chain of 64 full additions and then a seven-level tree: latency, not
+/// work. `tests/msm_trace.rs` read the reduce of a 2^19 piece at 11.7 ms in G1 and 57 in
+/// G2 (161 before `fq2_mul` went through one call site), flat in `n` from 2^18 up, and a
+/// 2^22 proof at the floor runs 36 of them. `snarkrs-metal`'s `reduce_groups` is the same
+/// split. Each window's buckets are cut into `reduce_groups` contiguous chunks, a
+/// workgroup each, every thread's segment indexed from the window's first bucket so the
+/// `P + lo * Q` identity holds, and the host adds a window's partials before its Horner
+/// step. Swept on that piece under `G16_WGPU_MSM_RG`, milliseconds per reduce:
+///
+/// ```text
+/// groups per window      1      2      4      8     16     32
+/// msm_reduce_g1       11.8    8.2    6.8   11.2   17.0   25.7
+/// msm_reduce_g2       54.6   32.9   22.3   31.6   39.7   58.6
+/// ```
+///
+/// Both curves bottom at 4, which is 80 workgroups, about two per core, and both climb
+/// from there: every extra group costs each of its threads the `pt_mul_small` by its
+/// segment's start and the host one addition, so past the point where the cores are busy
+/// more groups is more tax. A target in threads (Metal's 8,192) puts the G2 reduce at 8
+/// and the G1 at 4 here, because their widths differ; the target is therefore in
+/// workgroups, which is what the measurement is about. Groups double until the next
+/// doubling would pass this many or leave a thread under [`REDUCE_MIN_SEGMENT`] buckets,
+/// so a small key (c = 8, 128 buckets) stays at one group. The whole 2^22 stage at the
+/// floor: 5,035 ms at 1 group, 4,593 at 4. `G16_WGPU_MSM_RG` forces the count.
+const REDUCE_TARGET_GROUPS: u32 = 128;
+
+/// Buckets a reduce thread keeps at least, whatever the group count. The table above
+/// bottoms at 8 buckets a thread over G1 (then 128 threads a workgroup) and 16 over G2,
+/// and both climb one halving later, where the `pt_mul_small` by the segment's start is
+/// most of what a thread does. Metal floors at 2.
+const REDUCE_MIN_SEGMENT: u32 = 8;
+
+/// Workgroups per window in `msm_reduce_*` for a plan of `n_windows` by `n_buckets` at
+/// `tg` threads a workgroup. Public so the readback ceiling in `tests/proof.rs` can be
+/// derived from it rather than retyped.
+pub fn reduce_groups_for(n_windows: u32, n_buckets: u32, tg: u32) -> u32 {
+    if let Some(g) = std::env::var("G16_WGPU_MSM_RG")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|g| *g > 0)
+    {
+        return g.min(n_buckets.max(1));
+    }
+    let mut g = 1u32;
+    while n_buckets / (2 * g) >= REDUCE_MIN_SEGMENT * tg
+        && n_windows * 2 * g <= REDUCE_TARGET_GROUPS
+    {
+        g *= 2;
+    }
+    g
+}
+
+// ---------------------------------------------------------------------------
+// The shape of one MSM's point stages
+// ---------------------------------------------------------------------------
+
+/// Everything the point kernels need that the [`DigitPlan`] does not already say.
+///
+/// Derived once from the digit plan and the base offset, so the five kernels, the five
+/// allocations and the host tail cannot disagree about `slices` in particular, which appears
+/// in the segmented pass's thread count, the spill array's length and the merge's slot
+/// arithmetic. Getting it wrong in one of the three is a silently wrong point.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PointPlan {
+    base_off: u32,
+    slice_len: u32,
+    slices: u32,
+    ones_groups: u32,
+    tg: u32,
+    /// Slots per `msm_fold_*` thread under [`Work::Constant`], 0 under [`Work::Variable`],
+    /// whose merge is `msm_merge_*`. On the plan so a pooled scratch built at one fold
+    /// length is not reused at another.
+    fold_len: u32,
+    /// Workgroups per window in the reduce, [`reduce_groups_for`]. On the plan for the
+    /// same reason as `fold_len`: it sizes the results buffer.
+    reduce_groups: u32,
+}
+
+impl PointPlan {
+    /// Plans the point stages for `digits`, reading bases from `base_off`, at `curve`'s
+    /// measured slice length.
+    ///
+    /// `tg` is the reduction workgroup size, which sets `ones_groups`. It must be the `tg` the
+    /// module was generated at; [`MsmPoints::plan_points`] passes its own and its own curve,
+    /// so a caller who goes through the module cannot get either pair wrong.
+    pub fn new(
+        digits: &DigitPlan,
+        base_off: u32,
+        tg: u32,
+        curve: wgsl::Curve,
+    ) -> Result<Self, ProveError> {
+        Self::with_slice_len(digits, base_off, tg, curve.slice_len)
+    }
+
+    /// Same, at a forced slice length. For the sweeps in `tests/msm_g1.rs`.
+    pub fn with_slice_len(
+        digits: &DigitPlan,
+        base_off: u32,
+        tg: u32,
+        slice_len: u32,
+    ) -> Result<Self, ProveError> {
+        if slice_len == 0 {
+            return Err(bad(
+                "slice_len 0 would give every thread no work and no bound",
+            ));
+        }
+        if tg == 0 {
+            return Err(bad("a reduction workgroup of 0 threads is not a thing"));
+        }
+        // At least one slice per window even when the window is empty: the segmented pass
+        // tags its spill slots before it tests for an empty window, and a window with no
+        // slices would leave the merge reading whatever the pool last put there.
+        let slices = digits.cap().div_ceil(slice_len).max(1);
+        // The spill array is indexed by `2 * (w * slices + k)`, so this product has to fit a
+        // u32 before anything downstream can size a buffer from it.
+        let slots = u64::from(digits.n_windows()) * u64::from(slices) * 2;
+        if slots > u64::from(u32::MAX) {
+            return Err(bad(format!(
+                "{} windows x {slices} slices x 2 spill slots overflows a u32 index; \
+                 slice_len {slice_len} is too small for a cap of {}",
+                digits.n_windows(),
+                digits.cap()
+            )));
+        }
+        Ok(Self {
+            base_off,
+            slice_len,
+            slices,
+            ones_groups: ones_groups_for(digits.n(), tg, digits.work()),
+            tg,
+            fold_len: match digits.work() {
+                Work::Constant => fold_len(),
+                Work::Variable => 0,
+            },
+            reduce_groups: reduce_groups_for(digits.n_windows(), digits.n_buckets(), tg),
+        })
+    }
+
+    pub fn base_off(&self) -> u32 {
+        self.base_off
+    }
+    pub fn slice_len(&self) -> u32 {
+        self.slice_len
+    }
+    pub fn slices(&self) -> u32 {
+        self.slices
+    }
+    pub fn ones_groups(&self) -> u32 {
+        self.ones_groups
+    }
+    pub fn tg(&self) -> u32 {
+        self.tg
+    }
+    pub fn fold_len(&self) -> u32 {
+        self.fold_len
+    }
+    pub fn reduce_groups(&self) -> u32 {
+        self.reduce_groups
+    }
+
+    /// Points `msm_reduce_*` writes: one partial per window per group.
+    pub fn sum_points(&self, digits: &DigitPlan) -> u32 {
+        digits.n_windows() * self.reduce_groups
+    }
+
+    /// The constant-work merge's levels, as (spill slots per window in, groups per window
+    /// out), from the segmented pass's two slots per slice down to one group; empty on a
+    /// variable plan, which merges with `msm_merge_*`. A function of `slices` and the fold
+    /// length alone, so the same tree runs on every witness.
+    pub fn fold_levels(&self) -> Vec<(u32, u32)> {
+        if self.fold_len == 0 {
+            return Vec::new();
+        }
+        let mut levels = Vec::new();
+        let mut m = 2 * self.slices;
+        loop {
+            let groups = m.div_ceil(self.fold_len);
+            levels.push((m, groups));
+            if groups == 1 {
+                return levels;
+            }
+            m = 2 * groups;
+        }
+    }
+
+    /// Slots in each of the fold's two output buffers: two per group of the first level,
+    /// which is the widest output any level has. Zero on a variable plan.
+    pub fn fold_slots(&self, digits: &DigitPlan) -> u32 {
+        match self.fold_levels().first() {
+            Some(&(_, groups)) => 2 * digits.n_windows() * groups,
+            None => 0,
+        }
+    }
+
+    /// Threads the segmented pass dispatches: one per slice per window.
+    pub fn seg_threads(&self, digits: &DigitPlan) -> u32 {
+        digits.n_windows() * self.slices
+    }
+
+    /// Spill slots: two per slice per window, because at most one run of a slice continues
+    /// backwards and at most one continues forwards.
+    pub fn spill_slots(&self, digits: &DigitPlan) -> u32 {
+        2 * self.seg_threads(digits)
+    }
+
+    /// Byte offset of the `ones` partials inside the results buffer: the window partials,
+    /// rounded up to the storage binding alignment. See the module docs for why G1 needs
+    /// the rounding and G2 gets it for free.
+    pub fn ones_offset(&self, digits: &DigitPlan, curve: wgsl::Curve) -> u64 {
+        let sums = u64::from(self.sum_points(digits)) * curve.point_bytes;
+        sums.div_ceil(BINDING_ALIGN) * BINDING_ALIGN
+    }
+
+    /// Bytes the host reads back for one MSM of this shape: the window sums, the padding
+    /// and the `ones` partials.
+    pub fn results_bytes(&self, digits: &DigitPlan, curve: wgsl::Curve) -> u64 {
+        self.ones_offset(digits, curve) + u64::from(self.ones_groups) * curve.point_bytes
+    }
+
+    /// The largest storage binding [`PointBuffers::new`] would make for this plan, in bytes.
+    /// The bucket array or the spill points, depending on `c`: at c = 13 over 2^19 general
+    /// scalars the G2 buckets are 21 MB and the spill points 42 MB.
+    pub fn largest_binding(&self, digits: &DigitPlan, curve: wgsl::Curve) -> u64 {
+        let pt = curve.point_bytes;
+        let rows = u64::from(digits.rows());
+        let slots = u64::from(self.spill_slots(digits));
+        (rows * pt)
+            .max(slots * pt)
+            .max(slots * 4)
+            .max(self.results_bytes(digits, curve))
+    }
+
+    /// The full parameter block, digit fields and point fields together.
+    ///
+    /// `n` is the element count the *dispatching* kernel's guard uses, and `lo` is where this
+    /// dispatch starts. Only `msm_ones_*` reads `n`; the other four compute their own domain
+    /// from `n_windows`, `n_buckets` and `slices`, exactly as the Metal originals do.
+    pub fn params(&self, digits: &DigitPlan, lo: u32) -> MsmParams {
+        MsmParams {
+            base_off: self.base_off,
+            ones_groups: self.ones_groups,
+            slice_len: self.slice_len,
+            slices: self.slices,
+            reduce_groups: self.reduce_groups,
+            ..digits.params(digits.n(), lo)
+        }
+    }
+
+    /// The same block with the window count lowered to `windows`, so a clear, segmented,
+    /// merge or fold dispatch that starts at `lo` stops at the end of window `windows - 1`:
+    /// all four guard on `n_windows * n_buckets`, `n_windows * slices` or `n_windows *
+    /// fold_groups` and read nothing else from it. What lets one point stage be encoded as
+    /// several window slabs ([`MsmPoints::plan_slabs`]) with no kernel knowing.
+    pub fn params_to_window(&self, digits: &DigitPlan, lo: u32, windows: u32) -> MsmParams {
+        MsmParams {
+            n_windows: windows,
+            ..self.params(digits, lo)
+        }
+    }
+
+    /// [`Self::params_to_window`] for level `level` of the fold, which is `(m_in, groups)`
+    /// of [`Self::fold_levels`].
+    fn params_fold(
+        &self,
+        digits: &DigitPlan,
+        lo: u32,
+        windows: u32,
+        level: (u32, u32),
+    ) -> MsmParams {
+        MsmParams {
+            fold_in: level.0,
+            fold_groups: level.1,
+            fold_len: self.fold_len,
+            ..self.params_to_window(digits, lo, windows)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Buffers
+// ---------------------------------------------------------------------------
+
+/// A debug label carrying the curve, so a validation error or a capture names the right one
+/// of the two MSM families.
+fn label(curve: wgsl::Curve, what: &str) -> String {
+    format!("g16 msm {what} {}", curve.suffix)
+}
+
+/// The four device allocations one MSM's point stages need, six under [`Work::Constant`].
+///
+/// `results` is one buffer holding both outputs, because that makes the whole readback one
+/// copy. See the module docs for why the offset is aligned rather than assumed aligned.
+pub struct PointBuffers {
+    pub buckets: wgpu::Buffer,
+    pub spill_pts: wgpu::Buffer,
+    pub spill_rows: wgpu::Buffer,
+    pub results: wgpu::Buffer,
+    /// The other half of the constant-work fold's ping-pong, sized for its first level's
+    /// output; the spill buffers are the first half. `None` on a variable plan.
+    pub fold: Option<(wgpu::Buffer, wgpu::Buffer)>,
+    /// Byte offset of the `ones` partials inside [`Self::results`].
+    ones_off: u64,
+    ones_groups: u32,
+}
+
+impl PointBuffers {
+    /// Allocates for `(digits, points)`, plus `slack` extra elements on every output.
+    ///
+    /// `slack` exists for one reason and it is a test: every output here is exactly the size
+    /// the kernel should write, and WebGPU drops an out-of-range storage write in silence, so
+    /// without slack an over-run is *unobservable*. `tests/msm_g1.rs` and `tests/msm_g2.rs`
+    /// allocate it and check it survives; the prover passes 0.
+    pub fn new(
+        backend: &WgpuBackend,
+        digits: &DigitPlan,
+        points: &PointPlan,
+        slack: u32,
+        curve: wgsl::Curve,
+    ) -> Result<Self, ProveError> {
+        let pt = curve.point_bytes;
+        let rows = u64::from(digits.rows() + slack);
+        let slots = u64::from(points.spill_slots(digits) + slack);
+        let ones_groups = points.ones_groups;
+
+        // The one error a caller can hit that is about the curve rather than about being
+        // greedy: G2's 256-byte accumulators halve the window width the floor's storage
+        // binding allows. c = 16 is 16 x 32768 x 256 = 134.2 MB against a 128 MiB binding,
+        // where the same c over G1 is 67.1 MB and fits with room to spare.
+        let bucket_bytes = rows * pt;
+        let limit = backend.granted_limits().max_storage_buffer_binding_size;
+        if bucket_bytes > limit {
+            return Err(bad(format!(
+                "a {} window x {} bucket array of {pt}-byte {} accumulators is {bucket_bytes} \
+                 bytes, over the {limit} byte storage binding limit. c = {} is too wide for \
+                 this curve; {}.",
+                digits.n_windows(),
+                digits.n_buckets(),
+                curve.pt,
+                digits.c(),
+                curve.headroom
+            )));
+        }
+
+        let ones_off = points.ones_offset(digits, curve);
+        let results_bytes = ones_off + u64::from(ones_groups + slack) * pt;
+        let fold_slots = u64::from(points.fold_slots(digits));
+        let fold = if fold_slots == 0 {
+            None
+        } else {
+            let fold_slots = fold_slots + u64::from(slack);
+            Some((
+                storage_buffer(backend, &label(curve, "fold points"), fold_slots * pt)?,
+                storage_buffer(backend, &label(curve, "fold rows"), fold_slots * 4)?,
+            ))
+        };
+
+        Ok(Self {
+            buckets: storage_buffer(backend, &label(curve, "buckets"), bucket_bytes)?,
+            spill_pts: storage_buffer(backend, &label(curve, "spill points"), slots * pt)?,
+            spill_rows: storage_buffer(backend, &label(curve, "spill rows"), slots * 4)?,
+            results: storage_buffer(backend, &label(curve, "results"), results_bytes)?,
+            fold,
+            ones_off,
+            ones_groups,
+        })
+    }
+
+    /// Total device bytes, for a report.
+    pub fn bytes(&self) -> u64 {
+        self.buckets.size()
+            + self.spill_pts.size()
+            + self.spill_rows.size()
+            + self.results.size()
+            + self.fold.as_ref().map_or(0, |(p, r)| p.size() + r.size())
+    }
+
+    /// Byte offset of the `ones` partials inside [`Self::results`].
+    pub fn ones_offset(&self) -> u64 {
+        self.ones_off
+    }
+
+    /// Bytes the host has to read back: both outputs, in one range starting at zero.
+    pub fn results_bytes(&self, curve: wgsl::Curve) -> u64 {
+        self.ones_off + u64::from(self.ones_groups) * curve.point_bytes
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The pipelines
+// ---------------------------------------------------------------------------
+
+/// Which BN254 group an [`MsmPoints`] is over: the WGSL shape, and the arkworks type the
+/// readback decodes into.
+///
+/// A trait rather than a runtime enum because [`MsmPoints::combine`] has to *return* the
+/// right projective type. A runtime curve field would make that `Result<Either<..>>` at every
+/// call site in the prover, and the whole point of one implementation is that the prover's
+/// four G1 MSMs and its one G2 MSM read identically.
+pub trait PointCurve {
+    /// The generated WGSL's shape and this curve's measured constants.
+    const WGSL: wgsl::Curve;
+    /// The arkworks projective type one window sum decodes into.
+    type Projective: AdditiveGroup;
+    /// One `Xyzz<F>` as the kernel wrote it to a projective point, with no field inversion.
+    fn from_xyzz_bytes(raw: &[u8]) -> Result<Self::Projective, ProveError>;
+    /// One window sum rendered for the [`WINDOW_DEBUG`] log: whether its affine form is on
+    /// the curve, then the coordinates in decimal, the rendering `snarkrs_groth16::trace` uses.
+    fn debug_point(p: &Self::Projective) -> String;
+}
+
+/// BN254's G1: the A, B-G1, L and H MSMs, four of a proof's five.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum G1Curve {}
+
+/// BN254's G2: the B-G2 MSM, one of a proof's five and the expensive one per point.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum G2Curve {}
+
+impl PointCurve for G1Curve {
+    const WGSL: wgsl::Curve = wgsl::G1;
+    type Projective = G1Projective;
+    fn from_xyzz_bytes(raw: &[u8]) -> Result<G1Projective, ProveError> {
+        xyzz_g1_from_bytes(raw)
+    }
+    fn debug_point(p: &G1Projective) -> String {
+        let a = p.into_affine();
+        let tag = if a.is_on_curve() { "on " } else { "OFF" };
+        match a.xy() {
+            Some((x, y)) => format!("{tag} {} {}", json::dec(x), json::dec(y)),
+            None => format!("{tag} infinity"),
+        }
+    }
+}
+
+impl PointCurve for G2Curve {
+    const WGSL: wgsl::Curve = wgsl::G2;
+    type Projective = G2Projective;
+    fn from_xyzz_bytes(raw: &[u8]) -> Result<G2Projective, ProveError> {
+        xyzz_g2_from_bytes(raw)
+    }
+    fn debug_point(p: &G2Projective) -> String {
+        let a = p.into_affine();
+        let tag = if a.is_on_curve() { "on " } else { "OFF" };
+        match a.xy() {
+            Some((x, y)) => format!(
+                "{tag} {} {} {} {}",
+                json::dec(x.c0),
+                json::dec(x.c1),
+                json::dec(y.c0),
+                json::dec(y.c1)
+            ),
+            None => format!("{tag} infinity"),
+        }
+    }
+}
+
+/// One curve's seven point entry points, their bind group layouts and their pipelines.
+///
+/// One shader module, six pipeline layouts (the two reduces share one), one bind group
+/// layout per layout. One module because U8 measured the split and it costs 17% cold for
+/// five entry points of the same shape; one layout per entry point because giving them all
+/// the union of their bindings would put every kernel at the widest one's set of six and
+/// make the count meaningless as a check against the browser floor's eight.
+pub struct MsmPoints<C: PointCurve> {
+    kernels: Kernels,
+    curve: wgsl::Curve,
+    /// The seven entry point names, `msm_clear_g1` and so on, built once from the suffix.
+    /// Owned rather than `&'static str` because they are derived from the curve and not
+    /// written out, which is what stopped the generator being G2-only.
+    names: [String; 7],
+    wg: wgsl::Workgroups,
+    workgroups_per_dispatch: u32,
+    bgl_clear: wgpu::BindGroupLayout,
+    bgl_segmented: wgpu::BindGroupLayout,
+    bgl_merge: wgpu::BindGroupLayout,
+    bgl_reduce: wgpu::BindGroupLayout,
+    bgl_ones: wgpu::BindGroupLayout,
+    bgl_fold: wgpu::BindGroupLayout,
+    _layouts: Vec<wgpu::PipelineLayout>,
+    source_len: usize,
+    _curve: PhantomData<C>,
+}
+
+/// The G1 point stages: the A, B-G1, L and H MSMs.
+pub type MsmPointsG1 = MsmPoints<G1Curve>;
+/// The G2 point stages: the B-G2 MSM.
+pub type MsmPointsG2 = MsmPoints<G2Curve>;
+
+/// Indices into [`MsmPoints::names`], in dispatch order.
+const CLEAR: usize = 0;
+const SEGMENTED: usize = 1;
+const MERGE: usize = 2;
+const REDUCE: usize = 3;
+const ONES: usize = 4;
+const FOLD: usize = 5;
+const REDUCE_CONSTANT: usize = 6;
+
+/// Overrides the reduction width for every curve, or 0 to use each curve's measured one.
+///
+/// A knob rather than a constant because the shipped width is a measurement taken on one
+/// class of GPU and it does not travel. An iPhone 15 Pro loses its WebGPU device inside the
+/// G2 MSM alone, on the smallest circuit in the ladder, while all four G1 MSMs and stages 0
+/// to 4 complete; the shipped G2 reduction holds `array<Pt, 64>` at 256 bytes a point, which
+/// is exactly the 16384 byte workgroup storage that device grants, with nothing spare.
+///
+/// A global rather than a parameter because the browser has no environment to read and the
+/// pipelines are built long before any query string reaches this crate. Set through
+/// `set_reduce_tg` in the wasm bindings.
+pub static REDUCE_TG_OVERRIDE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Stop a point MSM after the nth kernel, or 0 to run all five. 1 is clear, 2 segmented,
+/// 3 merge, 4 reduce, 5 ones. See [`MsmPoints::encode`] for why: they share one pass, so a
+/// lost device names none of them.
+pub static STOP_AFTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Record every window sum and `ones` partial that [`MsmPoints::combine`] folds, or 0 to
+/// record nothing. Drained by [`window_log_take`]; the wasm trace entry point appends the
+/// lines to the trace text, where the diff tools treat them as ordinary rows.
+///
+/// The iPhone above still computes the G2 MSM wrong under every knob so far: `?tg=1` leaves
+/// no `workgroupBarrier` in the module, `?split=2` submits every dispatch on the spot,
+/// `?upto=4` excludes `ones` and `?mergebody=1` excludes `merge`, and the answer still
+/// varies between runs. The wrong point is not on the curve, so a coordinate is being
+/// corrupted rather than a contribution lost. Nothing in the trace looks between the bucket
+/// array and the final point, and that is the gap this fills: one corrupt window against all
+/// of them corrupt is the difference between a stray write and a broken kernel.
+pub static WINDOW_DEBUG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Lines recorded under [`WINDOW_DEBUG`]. A `Mutex` rather than a cell because the native
+/// tests prove from several threads; the browser has one and never contends.
+static WINDOW_LOG: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Appends to the [`WINDOW_DEBUG`] log. `batch.rs` writes it after each `combine`.
+pub(crate) fn window_log(text: &str) {
+    WINDOW_LOG
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push_str(text);
+}
+
+/// Takes everything recorded since the last take. The trace entry point drains this once
+/// per run, so one run's lines cannot leak into the next one's text.
+pub fn window_log_take() -> String {
+    std::mem::take(&mut *WINDOW_LOG.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+impl<C: PointCurve> MsmPoints<C> {
+    /// Compiles at this curve's measured shape and this device's workgroup-per-dimension
+    /// limit.
+    pub fn new(backend: &WgpuBackend) -> Result<Self, ProveError> {
+        let mut max_wg = backend
+            .granted_limits()
+            .max_compute_workgroups_per_dimension;
+        // `G16_WGPU_MSM_DISPATCH_WG` caps the workgroups one dispatch holds, so a point
+        // stage's long kernels run as several shorter dispatches in the same pass. A
+        // diagnostic for BUG-32, where the question was whether macOS's interactivity kill
+        // is triggered by a long dispatch or a long command buffer.
+        if let Some(cap) = std::env::var("G16_WGPU_MSM_DISPATCH_WG")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|c| *c > 0)
+        {
+            max_wg = max_wg.min(cap);
+        }
+        let mut wg = C::WGSL.wg;
+        // Clamped to what the curve can hold, so an override cannot ask for a workgroup
+        // array larger than the floor guarantees and turn a diagnostic into a build failure.
+        let forced = REDUCE_TG_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+        if forced > 0 {
+            wg.tg = forced.min(C::WGSL.max_tg());
+        }
+        Self::with_shape(backend, wg, max_wg)
+    }
+
+    /// Same, with the workgroup sizes and the per-dispatch workgroup cap forced.
+    ///
+    /// Public for the tests that cannot be written otherwise: the workgroup sweep, the `tg`
+    /// sweep that made [`wgsl::Workgroups::tg`]'s table, and the multi-dispatch path, which no
+    /// artifact reaches because one dispatch covers 8.4M rows at 128 threads. A code path no
+    /// test can reach is a code path that ships untested.
+    pub fn with_shape(
+        backend: &WgpuBackend,
+        wg: wgsl::Workgroups,
+        workgroups_per_dispatch: u32,
+    ) -> Result<Self, ProveError> {
+        let curve = C::WGSL;
+        let limits = backend.granted_limits();
+        // The browser floor, not the granted limit; see `WgpuBackend::ceiling_invocations`.
+        let max_inv = backend.ceiling_invocations();
+        for (name, n) in [
+            ("clear", wg.clear),
+            ("segmented", wg.segmented),
+            ("merge", wg.merge),
+            ("tg", wg.tg),
+        ] {
+            if n == 0 || n > max_inv {
+                return Err(bad(format!(
+                    "{name} workgroup size {n} is outside 1..={max_inv}"
+                )));
+            }
+        }
+        let max_wg = limits.max_compute_workgroups_per_dimension;
+        if workgroups_per_dispatch == 0 || workgroups_per_dispatch > max_wg {
+            return Err(bad(format!(
+                "workgroups_per_dispatch {workgroups_per_dispatch} is outside 1..={max_wg}"
+            )));
+        }
+        // The check the accumulator width makes interesting: `array<Pt, tg>` at 256 bytes a
+        // point over G2 and 128 over G1, so the same tg costs the two curves different
+        // budgets and G1 can afford twice the reduction width. Reported here against the
+        // *granted* limit and by the generator against the floor, which are 32768 and 16384
+        // on this adapter, so a `Raised` device would otherwise pass this and then panic
+        // inside the generator.
+        let shared = curve.workgroup_bytes(wg.tg);
+        let ceiling = backend.ceiling_workgroup_bytes();
+        if shared > ceiling {
+            return Err(bad(format!(
+                "{} at {} threads holds {shared} bytes of workgroup storage, over the \
+                 {ceiling} byte ceiling (the smaller of this device's {} and the browser \
+                 floor's {})",
+                curve.entry_reduce(),
+                wg.tg,
+                limits.max_compute_workgroup_storage_size,
+                wgsl::FLOOR_WORKGROUP_BYTES
+            )));
+        }
+
+        let device = backend.device();
+        let mk_bgl = |label: &str, entries: &[wgpu::BindGroupLayoutEntry]| {
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some(label),
+                entries,
+            })
+        };
+        let names = curve.entries();
+        let bgl_clear = mk_bgl(&names[CLEAR], &Self::clear_entries());
+        let bgl_segmented = mk_bgl(&names[SEGMENTED], &Self::segmented_entries());
+        let bgl_merge = mk_bgl(&names[MERGE], &Self::merge_entries());
+        let bgl_reduce = mk_bgl(&names[REDUCE], &Self::reduce_entries());
+        let bgl_ones = mk_bgl(&names[ONES], &Self::ones_entries());
+        let bgl_fold = mk_bgl(&names[FOLD], &Self::fold_entries());
+
+        let mk_layout = |label: &str, bgl: &wgpu::BindGroupLayout| {
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(label),
+                bind_group_layouts: &[Some(bgl)],
+                immediate_size: 0,
+            })
+        };
+        let l_clear = mk_layout(&names[CLEAR], &bgl_clear);
+        let l_segmented = mk_layout(&names[SEGMENTED], &bgl_segmented);
+        let l_merge = mk_layout(&names[MERGE], &bgl_merge);
+        let l_reduce = mk_layout(&names[REDUCE], &bgl_reduce);
+        let l_ones = mk_layout(&names[ONES], &bgl_ones);
+        let l_fold = mk_layout(&names[FOLD], &bgl_fold);
+
+        let src = wgsl::points_module_at(Variant::default(), curve, wg);
+        let source_len = src.len();
+        let kernels = Kernels::build_with_layouts(
+            backend,
+            &format!("msm_points_{}", curve.suffix),
+            &src,
+            &[
+                (names[CLEAR].as_str(), &l_clear),
+                (names[SEGMENTED].as_str(), &l_segmented),
+                (names[MERGE].as_str(), &l_merge),
+                (names[REDUCE].as_str(), &l_reduce),
+                (names[ONES].as_str(), &l_ones),
+                (names[FOLD].as_str(), &l_fold),
+                (names[REDUCE_CONSTANT].as_str(), &l_reduce),
+            ],
+        )?;
+
+        Ok(Self {
+            kernels,
+            curve,
+            names,
+            wg,
+            workgroups_per_dispatch,
+            bgl_clear,
+            bgl_segmented,
+            bgl_merge,
+            bgl_reduce,
+            bgl_ones,
+            bgl_fold,
+            _layouts: vec![l_clear, l_segmented, l_merge, l_reduce, l_ones, l_fold],
+            source_len,
+            _curve: PhantomData,
+        })
+    }
+
+    // ---- bind group layouts, as data, so a test can count what the device enforces ----
+
+    /// This curve's one shader module. Public for the same reason as
+    /// [`crate::msm::MsmDigits::modules`].
+    pub fn kernels(&self) -> &Kernels {
+        &self.kernels
+    }
+
+    pub fn clear_entries() -> [wgpu::BindGroupLayoutEntry; 2] {
+        [
+            ParamRing::layout_entry(BIND_PARAMS),
+            storage_entry(wgsl::BIND_BUCKETS, false),
+        ]
+    }
+    pub fn segmented_entries() -> [wgpu::BindGroupLayoutEntry; 7] {
+        [
+            ParamRing::layout_entry(BIND_PARAMS),
+            storage_entry(wgsl::BIND_ENTRIES, true),
+            storage_entry(wgsl::BIND_BASES, true),
+            storage_entry(wgsl::BIND_CURSOR, true),
+            storage_entry(wgsl::BIND_BUCKETS, false),
+            storage_entry(wgsl::BIND_SPILL_PTS, false),
+            storage_entry(wgsl::BIND_SPILL_ROWS, false),
+        ]
+    }
+    /// Five, and the two spill bindings are declared writable although the kernel only reads
+    /// them: one WGSL declaration serves both entry points and its access mode is fixed at
+    /// module scope, so the layout has to match the declaration and not the use.
+    pub fn merge_entries() -> [wgpu::BindGroupLayoutEntry; 6] {
+        [
+            ParamRing::layout_entry(BIND_PARAMS),
+            storage_entry(wgsl::BIND_BUCKETS, false),
+            storage_entry(wgsl::BIND_SPILL_PTS, false),
+            storage_entry(wgsl::BIND_SPILL_ROWS, false),
+            storage_entry(wgsl::BIND_COUNTS, true),
+            storage_entry(wgsl::BIND_CURSOR, true),
+        ]
+    }
+    pub fn reduce_entries() -> [wgpu::BindGroupLayoutEntry; 3] {
+        [
+            ParamRing::layout_entry(BIND_PARAMS),
+            storage_entry(wgsl::BIND_BUCKETS, false),
+            storage_entry(wgsl::BIND_WSUMS, false),
+        ]
+    }
+    pub fn ones_entries() -> [wgpu::BindGroupLayoutEntry; 4] {
+        [
+            ParamRing::layout_entry(BIND_PARAMS),
+            storage_entry(wgsl::BIND_SCALARS, true),
+            storage_entry(wgsl::BIND_BASES, true),
+            storage_entry(wgsl::BIND_ONES, false),
+        ]
+    }
+    /// Five: the level's input through the spill bindings, its output through the fold
+    /// ones, and the buckets. The spill pair is writable for the reason on
+    /// [`Self::merge_entries`].
+    pub fn fold_entries() -> [wgpu::BindGroupLayoutEntry; 6] {
+        [
+            ParamRing::layout_entry(BIND_PARAMS),
+            storage_entry(wgsl::BIND_BUCKETS, false),
+            storage_entry(wgsl::BIND_SPILL_PTS, false),
+            storage_entry(wgsl::BIND_SPILL_ROWS, false),
+            storage_entry(wgsl::BIND_FOLD_PTS, false),
+            storage_entry(wgsl::BIND_FOLD_ROWS, false),
+        ]
+    }
+
+    /// Storage buffers each entry point's pipeline layout declares, counted from the lists
+    /// above rather than from a duplicate. All seven must be at most 8, the browser floor.
+    ///
+    /// Curve-independent by construction: the bindings are the same thirteen resources over
+    /// either group, only their element type changes. It is still reported per instantiation
+    /// so a test names the entry point it is talking about.
+    pub fn storage_buffer_counts() -> [(String, u32); 7] {
+        fn count(entries: &[wgpu::BindGroupLayoutEntry]) -> u32 {
+            entries
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e.ty,
+                        wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { .. },
+                            ..
+                        }
+                    )
+                })
+                .count() as u32
+        }
+        [
+            (C::WGSL.entry_clear(), count(&Self::clear_entries())),
+            (C::WGSL.entry_segmented(), count(&Self::segmented_entries())),
+            (C::WGSL.entry_merge(), count(&Self::merge_entries())),
+            (C::WGSL.entry_reduce(), count(&Self::reduce_entries())),
+            (C::WGSL.entry_ones(), count(&Self::ones_entries())),
+            (C::WGSL.entry_fold(), count(&Self::fold_entries())),
+            (
+                C::WGSL.entry_reduce_constant(),
+                count(&Self::reduce_entries()),
+            ),
+        ]
+    }
+
+    // ---- bind groups ----
+
+    fn bind(
+        &self,
+        backend: &WgpuBackend,
+        label: &str,
+        bgl: &wgpu::BindGroupLayout,
+        ring: &ParamRing,
+        res: Vec<(u32, wgpu::BindingResource<'_>)>,
+    ) -> wgpu::BindGroup {
+        let mut entries = Vec::with_capacity(res.len() + 1);
+        entries.push(wgpu::BindGroupEntry {
+            binding: BIND_PARAMS,
+            resource: wgpu::BindingResource::Buffer(ring.binding()),
+        });
+        for (binding, resource) in res {
+            entries.push(wgpu::BindGroupEntry { binding, resource });
+        }
+        backend
+            .device()
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout: bgl,
+                entries: &entries,
+            })
+    }
+
+    /// The five bind groups one MSM dispatches through, every buffer length checked.
+    ///
+    /// One function rather than five, because the checks are the interesting part and a
+    /// caller that can build four of five bind groups is a caller that can forget the fifth.
+    /// That is also why it takes nine arguments: splitting it to satisfy the lint would put
+    /// the length checks somewhere a caller can skip.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bind_all(
+        &self,
+        backend: &WgpuBackend,
+        ring: &ParamRing,
+        digits: &DigitPlan,
+        points: &PointPlan,
+        scalars: &wgpu::Buffer,
+        bases: &wgpu::Buffer,
+        sort: &crate::msm::DigitBuffers,
+        bufs: &PointBuffers,
+    ) -> Result<PointBinds, ProveError> {
+        if points.tg != self.wg.tg {
+            return Err(bad(format!(
+                "this plan was built for a {}-thread reduction and the module was generated \
+                 at {}; ones_groups would not match the stride the kernel walks",
+                points.tg, self.wg.tg
+            )));
+        }
+        let pt = self.curve.point_bytes;
+        let need = |what: &str, buf: &wgpu::Buffer, want: u64| -> Result<(), ProveError> {
+            if buf.size() < want {
+                return Err(bad(format!(
+                    "{what} is {} bytes, this plan needs {want}",
+                    buf.size()
+                )));
+            }
+            Ok(())
+        };
+        let rows = u64::from(digits.rows());
+        let slots = u64::from(points.spill_slots(digits));
+        need("the bucket array", &bufs.buckets, rows * pt)?;
+        need("the spill point array", &bufs.spill_pts, slots * pt)?;
+        need("the spill row array", &bufs.spill_rows, slots * 4)?;
+        let fold_slots = u64::from(points.fold_slots(digits));
+        let fold = match (&bufs.fold, fold_slots) {
+            (None, 0) => None,
+            (Some((fp, fr)), n) if n > 0 => {
+                need("the fold point array", fp, n * pt)?;
+                need("the fold row array", fr, n * 4)?;
+                Some((fp, fr))
+            }
+            _ => {
+                return Err(bad(
+                    "this plan and these buffers disagree about whether the merge is a fold",
+                ))
+            }
+        };
+        need(
+            "the entry array",
+            &sort.entries,
+            u64::from(digits.entries()) * 8,
+        )?;
+        need("the counts array", &sort.counts, rows * 4)?;
+        need("the cursor array", &sort.cursor, rows * 4)?;
+        need(
+            "the results buffer",
+            &bufs.results,
+            bufs.results_bytes(self.curve),
+        )?;
+        // The base range this MSM reads. `msm_ones_g2` walks base_off .. base_off + n and the
+        // segmented pass reads base_off + (entry >> 1), whose largest value is base_off + n - 1
+        // because msm_scatter stores the index within this MSM.
+        let base_end = u64::from(points.base_off) + u64::from(digits.n());
+        need("the base vector", bases, base_end * self.curve.base_bytes)?;
+        need(
+            "the scalar buffer",
+            scalars,
+            u64::from(digits.scalar_off() + digits.n()) * (LIMBS as u64) * 4,
+        )?;
+
+        fn whole(b: &wgpu::Buffer) -> wgpu::BindingResource<'_> {
+            b.as_entire_binding()
+        }
+        fn window(b: &wgpu::Buffer, off: u64, len: u64) -> wgpu::BindingResource<'_> {
+            wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: b,
+                offset: off,
+                size: std::num::NonZeroU64::new(len),
+            })
+        }
+
+        Ok(PointBinds {
+            clear: self.bind(
+                backend,
+                &self.names[CLEAR],
+                &self.bgl_clear,
+                ring,
+                vec![(wgsl::BIND_BUCKETS, whole(&bufs.buckets))],
+            ),
+            segmented: self.bind(
+                backend,
+                &self.names[SEGMENTED],
+                &self.bgl_segmented,
+                ring,
+                vec![
+                    (wgsl::BIND_ENTRIES, whole(&sort.entries)),
+                    (wgsl::BIND_BASES, whole(bases)),
+                    (wgsl::BIND_CURSOR, whole(&sort.cursor)),
+                    (wgsl::BIND_BUCKETS, whole(&bufs.buckets)),
+                    (wgsl::BIND_SPILL_PTS, whole(&bufs.spill_pts)),
+                    (wgsl::BIND_SPILL_ROWS, whole(&bufs.spill_rows)),
+                ],
+            ),
+            merge: self.bind(
+                backend,
+                &self.names[MERGE],
+                &self.bgl_merge,
+                ring,
+                vec![
+                    (wgsl::BIND_BUCKETS, whole(&bufs.buckets)),
+                    (wgsl::BIND_SPILL_PTS, whole(&bufs.spill_pts)),
+                    (wgsl::BIND_SPILL_ROWS, whole(&bufs.spill_rows)),
+                    (wgsl::BIND_COUNTS, whole(&sort.counts)),
+                    (wgsl::BIND_CURSOR, whole(&sort.cursor)),
+                ],
+            ),
+            // Two windows into one buffer. The kernel indexes each from zero, so the offsets
+            // are what keep the two outputs apart, and they are 256-byte aligned by
+            // construction. See the module docs.
+            reduce: self.bind(
+                backend,
+                &self.names[REDUCE],
+                &self.bgl_reduce,
+                ring,
+                vec![
+                    (wgsl::BIND_BUCKETS, whole(&bufs.buckets)),
+                    (
+                        wgsl::BIND_WSUMS,
+                        window(&bufs.results, 0, u64::from(points.sum_points(digits)) * pt),
+                    ),
+                ],
+            ),
+            // None under constant work: the pass is not dispatched and its window would be
+            // an empty binding, which WebGPU refuses.
+            ones: (points.ones_groups > 0).then(|| {
+                self.bind(
+                    backend,
+                    &self.names[ONES],
+                    &self.bgl_ones,
+                    ring,
+                    vec![
+                        (wgsl::BIND_SCALARS, whole(scalars)),
+                        (wgsl::BIND_BASES, whole(bases)),
+                        (
+                            wgsl::BIND_ONES,
+                            window(
+                                &bufs.results,
+                                bufs.ones_off,
+                                u64::from(points.ones_groups) * pt,
+                            ),
+                        ),
+                    ],
+                )
+            }),
+            // The fold's two levels of binding: even levels read the spill pair and write
+            // the fold pair, odd levels the other way round, through the same two pairs of
+            // binding numbers.
+            fold: fold.map(|(fp, fr)| {
+                let spill = (&bufs.spill_pts, &bufs.spill_rows);
+                [(spill, (fp, fr)), ((fp, fr), spill)].map(|(src, dst)| {
+                    self.bind(
+                        backend,
+                        &self.names[FOLD],
+                        &self.bgl_fold,
+                        ring,
+                        vec![
+                            (wgsl::BIND_BUCKETS, whole(&bufs.buckets)),
+                            (wgsl::BIND_SPILL_PTS, whole(src.0)),
+                            (wgsl::BIND_SPILL_ROWS, whole(src.1)),
+                            (wgsl::BIND_FOLD_PTS, whole(dst.0)),
+                            (wgsl::BIND_FOLD_ROWS, whole(dst.1)),
+                        ],
+                    )
+                })
+            }),
+        })
+    }
+
+    // ---- parameter blocks ----
+
+    /// The point plan for this module: this curve's measured slice length and this module's
+    /// reduction width, so the two things [`PointPlan`] cannot check for itself come from the
+    /// module that will run it.
+    pub fn plan_points(&self, digits: &DigitPlan, base_off: u32) -> Result<PointPlan, ProveError> {
+        PointPlan::new(digits, base_off, self.wg.tg, self.curve)
+    }
+
+    fn dispatches(&self, n: u32, wg: u32) -> u32 {
+        n.div_ceil(wg * self.workgroups_per_dispatch).max(1)
+    }
+
+    fn span(&self, wg: u32) -> u32 {
+        wg * self.workgroups_per_dispatch
+    }
+
+    /// Parameter blocks for the whole point stage, in dispatch order, as one slab.
+    ///
+    /// Separate from [`Self::encode`] because design §3 writes every parameter block for the
+    /// whole proof in one `write_buffer` before encoding starts, so the pushes have to happen
+    /// before the compute pass exists.
+    pub fn plan(
+        &self,
+        digits: &DigitPlan,
+        points: &PointPlan,
+        ring: &mut ParamRing,
+    ) -> Result<PointOffsets, ProveError> {
+        self.plan_slabs(
+            digits,
+            points,
+            ring,
+            std::slice::from_ref(&(0..digits.n_windows())),
+        )
+    }
+
+    /// Same, with the clear, segmented pass and merge cut into one slab per range of
+    /// `slabs`, which must be contiguous, in order, and cover `0..n_windows` exactly. The
+    /// reduction and the ones pass are planned once, for after the last slab. A
+    /// constant-work plan's merge is its fold levels, each a dispatch of its own per slab.
+    pub fn plan_slabs(
+        &self,
+        digits: &DigitPlan,
+        points: &PointPlan,
+        ring: &mut ParamRing,
+        slabs: &[Range<u32>],
+    ) -> Result<PointOffsets, ProveError> {
+        let mut next = 0u32;
+        let mut out = Vec::with_capacity(slabs.len());
+        let levels = points.fold_levels();
+        for s in slabs {
+            if s.start != next || s.end <= s.start {
+                return Err(bad(format!(
+                    "window slab {}..{} does not follow window {next}",
+                    s.start, s.end
+                )));
+            }
+            next = s.end;
+            let nb = digits.n_buckets();
+            let mut fold = Vec::with_capacity(levels.len());
+            for &level in &levels {
+                let span = self.span(self.wg.merge);
+                let (lo, hi) = (s.start * level.1, s.end * level.1);
+                let mut offsets =
+                    Vec::with_capacity(self.dispatches(hi - lo, self.wg.merge) as usize);
+                let mut at = lo;
+                loop {
+                    offsets.push(ring.push(&points.params_fold(digits, at, s.end, level))?);
+                    at = at.saturating_add(span);
+                    if at >= hi {
+                        break;
+                    }
+                }
+                fold.push(FoldLevel {
+                    groups: level.1,
+                    offsets,
+                });
+            }
+            out.push(SlabOffsets {
+                windows: s.clone(),
+                clear: self.push_range(
+                    ring,
+                    digits,
+                    points,
+                    s.start * nb,
+                    s.end * nb,
+                    s.end,
+                    self.wg.clear,
+                )?,
+                segmented: self.push_range(
+                    ring,
+                    digits,
+                    points,
+                    s.start * points.slices,
+                    s.end * points.slices,
+                    s.end,
+                    self.wg.segmented,
+                )?,
+                merge: if levels.is_empty() {
+                    self.push_range(
+                        ring,
+                        digits,
+                        points,
+                        s.start * nb,
+                        s.end * nb,
+                        s.end,
+                        self.wg.merge,
+                    )?
+                } else {
+                    Vec::new()
+                },
+                fold,
+            });
+        }
+        if next != digits.n_windows() {
+            return Err(bad(format!(
+                "the window slabs end at window {next} of {}",
+                digits.n_windows()
+            )));
+        }
+        Ok(PointOffsets {
+            slabs: out,
+            // One workgroup per window and group, and per ones group, always one dispatch:
+            // `sum_points` is a few hundred at most and ones_groups at most 64, against a
+            // 65535 limit.
+            reduce: ring.push(&points.params(digits, 0))?,
+            ones: ring.push(&points.params(digits, 0))?,
+        })
+    }
+
+    /// One block per dispatch over elements `lo..hi`, each guarded at window `windows`.
+    #[allow(clippy::too_many_arguments)]
+    fn push_range(
+        &self,
+        ring: &mut ParamRing,
+        digits: &DigitPlan,
+        points: &PointPlan,
+        lo: u32,
+        hi: u32,
+        windows: u32,
+        wg: u32,
+    ) -> Result<Vec<u32>, ProveError> {
+        let span = self.span(wg);
+        let mut offsets = Vec::with_capacity(self.dispatches(hi - lo, wg) as usize);
+        let mut at = lo;
+        loop {
+            offsets.push(ring.push(&points.params_to_window(digits, at, windows))?);
+            at = at.saturating_add(span);
+            if at >= hi {
+                break;
+            }
+        }
+        Ok(offsets)
+    }
+
+    /// Ring slots the point stage consumes for this plan, which is also its dispatch count.
+    /// Five at every shape any artifact reaches.
+    pub fn slots(&self, digits: &DigitPlan, points: &PointPlan) -> u32 {
+        self.slots_slabs(
+            digits,
+            points,
+            std::slice::from_ref(&(0..digits.n_windows())),
+        )
+    }
+
+    /// Same, for a point stage encoded in window slabs. Each slab's clear, segmented pass
+    /// and merge cover its own rows, so the count is the same for one slab or for many
+    /// unless a slab boundary splits a dispatch.
+    pub fn slots_slabs(&self, digits: &DigitPlan, points: &PointPlan, slabs: &[Range<u32>]) -> u32 {
+        let mut n = 2;
+        let levels = points.fold_levels();
+        for s in slabs {
+            let rows = (s.end - s.start) * digits.n_buckets();
+            let threads = (s.end - s.start) * points.slices;
+            n += self.dispatches(rows, self.wg.clear) + self.dispatches(threads, self.wg.segmented);
+            if levels.is_empty() {
+                n += self.dispatches(rows, self.wg.merge);
+            }
+            for &(_, groups) in &levels {
+                n += self.dispatches((s.end - s.start) * groups, self.wg.merge);
+            }
+        }
+        n
+    }
+
+    // ---- encoding ----
+
+    /// All five dispatches into one pass, in order.
+    ///
+    /// WebGPU orders dispatches inside a compute pass and makes each one's writes visible to
+    /// the next with no explicit barrier, which is what lets clear, segmented, merge, reduce
+    /// and ones share a pass with the counting sort that feeds them. Metal needs an explicit
+    /// `memoryBarrier` for the same thing.
+    pub fn encode(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        digits: &DigitPlan,
+        points: &PointPlan,
+        binds: &PointBinds,
+        offsets: &PointOffsets,
+    ) -> Result<(), ProveError> {
+        for k in 0..offsets.slabs.len() {
+            self.encode_slab(pass, digits, points, binds, offsets, k)?;
+        }
+        self.encode_tail(pass, digits, points, binds, offsets)
+    }
+
+    /// The bisection gate `encode` and its halves share, and normally not one: `stop` is 0
+    /// unless something has set it. The five kernels share one pass, so when the device
+    /// dies there is nothing to say which of them killed it. Encoding a prefix and stopping
+    /// produces a wrong answer on purpose; the only question it answers is whether the GPU
+    /// is still alive, which is the question when it is not.
+    fn run_kernel(n: u32) -> bool {
+        let stop = STOP_AFTER.load(std::sync::atomic::Ordering::Relaxed);
+        stop == 0 || n <= stop
+    }
+
+    /// Slab `k` of the point stage: the clear, segmented pass and merge of its windows.
+    /// Complete on its own from the clear, so a submission holding one slab can be run
+    /// again from the start if the GPU cuts it short (`crate::batch`), and independent of
+    /// every other slab: each touches only its own windows' rows and spill slots.
+    pub fn encode_slab(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        digits: &DigitPlan,
+        points: &PointPlan,
+        binds: &PointBinds,
+        offsets: &PointOffsets,
+        k: usize,
+    ) -> Result<(), ProveError> {
+        let slab = offsets.slabs.get(k).ok_or_else(|| {
+            bad(format!(
+                "slab {k} of a point stage planned in {} slabs",
+                offsets.slabs.len()
+            ))
+        })?;
+        self.clear_slab(pass, digits, binds, slab)?;
+        if !Self::run_kernel(2) {
+            return Ok(());
+        }
+        self.segmented_slab(pass, points, binds, slab)?;
+        if !Self::run_kernel(3) {
+            return Ok(());
+        }
+        self.merge_slab(pass, digits, binds, slab)
+    }
+
+    /// The reduction and the ones pass, over every window, after the last slab.
+    pub fn encode_tail(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        digits: &DigitPlan,
+        points: &PointPlan,
+        binds: &PointBinds,
+        offsets: &PointOffsets,
+    ) -> Result<(), ProveError> {
+        if !Self::run_kernel(4) {
+            return Ok(());
+        }
+        self.encode_reduce(pass, digits, points, binds, offsets)?;
+        if !Self::run_kernel(5) {
+            return Ok(());
+        }
+        self.encode_ones(pass, points, binds, offsets)
+    }
+
+    /// The five separately, so a test can run four of them and look at what the fourth wrote.
+    /// Reading the bucket array after the merge is the only way to tell a correct segmented
+    /// pass from a wrong one whose spills the merge happens to undo. Each covers every slab.
+    pub fn encode_clear(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        digits: &DigitPlan,
+        binds: &PointBinds,
+        offsets: &PointOffsets,
+    ) -> Result<(), ProveError> {
+        for slab in &offsets.slabs {
+            self.clear_slab(pass, digits, binds, slab)?;
+        }
+        Ok(())
+    }
+
+    pub fn encode_segmented(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        points: &PointPlan,
+        binds: &PointBinds,
+        offsets: &PointOffsets,
+    ) -> Result<(), ProveError> {
+        for slab in &offsets.slabs {
+            self.segmented_slab(pass, points, binds, slab)?;
+        }
+        Ok(())
+    }
+
+    pub fn encode_merge(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        digits: &DigitPlan,
+        binds: &PointBinds,
+        offsets: &PointOffsets,
+    ) -> Result<(), ProveError> {
+        for slab in &offsets.slabs {
+            self.merge_slab(pass, digits, binds, slab)?;
+        }
+        Ok(())
+    }
+
+    fn clear_slab(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        digits: &DigitPlan,
+        binds: &PointBinds,
+        slab: &SlabOffsets,
+    ) -> Result<(), ProveError> {
+        self.encode_range(
+            pass,
+            &self.names[CLEAR],
+            &binds.clear,
+            (slab.windows.end - slab.windows.start) * digits.n_buckets(),
+            self.wg.clear,
+            &slab.clear,
+        )
+    }
+
+    fn segmented_slab(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        points: &PointPlan,
+        binds: &PointBinds,
+        slab: &SlabOffsets,
+    ) -> Result<(), ProveError> {
+        self.encode_range(
+            pass,
+            &self.names[SEGMENTED],
+            &binds.segmented,
+            (slab.windows.end - slab.windows.start) * points.slices,
+            self.wg.segmented,
+            &slab.segmented,
+        )
+    }
+
+    /// The merge of one slab: `msm_merge_*` over its rows, or under constant work every
+    /// level of `msm_fold_*` over its windows, in order. The compute pass orders the levels
+    /// and makes each one's writes visible to the next, so the ping-pong needs no barrier.
+    fn merge_slab(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        digits: &DigitPlan,
+        binds: &PointBinds,
+        slab: &SlabOffsets,
+    ) -> Result<(), ProveError> {
+        let windows = slab.windows.end - slab.windows.start;
+        if slab.fold.is_empty() {
+            return self.encode_range(
+                pass,
+                &self.names[MERGE],
+                &binds.merge,
+                windows * digits.n_buckets(),
+                self.wg.merge,
+                &slab.merge,
+            );
+        }
+        let fold = binds
+            .fold
+            .as_ref()
+            .ok_or_else(|| bad("a fold plan was bound without its fold buffers"))?;
+        for (k, level) in slab.fold.iter().enumerate() {
+            self.encode_range(
+                pass,
+                &self.names[FOLD],
+                &fold[k % 2],
+                windows * level.groups,
+                self.wg.merge,
+                &level.offsets,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// `reduce_groups` workgroups per window: `msm_reduce_*`, or `msm_reduce_constant_*`
+    /// for a plan with dummy rows, over the same bind group.
+    pub fn encode_reduce(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        digits: &DigitPlan,
+        points: &PointPlan,
+        binds: &PointBinds,
+        offsets: &PointOffsets,
+    ) -> Result<(), ProveError> {
+        let which = if digits.dummy_rows() > 0 {
+            REDUCE_CONSTANT
+        } else {
+            REDUCE
+        };
+        pass.set_pipeline(self.kernels.get(&self.names[which])?);
+        pass.set_bind_group(0, &binds.reduce, &[offsets.reduce]);
+        crate::readback::dispatch(pass, points.sum_points(digits));
+        Ok(())
+    }
+
+    /// One workgroup per ones group, and nothing under constant work, which has none.
+    pub fn encode_ones(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        points: &PointPlan,
+        binds: &PointBinds,
+        offsets: &PointOffsets,
+    ) -> Result<(), ProveError> {
+        let Some(ones) = &binds.ones else {
+            if points.ones_groups == 0 {
+                return Ok(());
+            }
+            return Err(bad(
+                "a plan with ones groups was bound without its ones pass",
+            ));
+        };
+        pass.set_pipeline(self.kernels.get(&self.names[ONES])?);
+        pass.set_bind_group(0, ones, &[offsets.ones]);
+        crate::readback::dispatch(pass, points.ones_groups);
+        Ok(())
+    }
+
+    fn encode_range(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        what: &str,
+        bind: &wgpu::BindGroup,
+        n: u32,
+        wg: u32,
+        offsets: &[u32],
+    ) -> Result<(), ProveError> {
+        let want = self.dispatches(n, wg) as usize;
+        if offsets.len() != want {
+            return Err(bad(format!(
+                "{what} over {n} elements needs {want} dispatches, got {} parameter offsets",
+                offsets.len()
+            )));
+        }
+        pass.set_pipeline(self.kernels.get(what)?);
+        let span = self.span(wg);
+        let mut lo = 0u32;
+        for &off in offsets {
+            let hi = lo.saturating_add(span).min(n);
+            pass.set_bind_group(0, bind, &[off]);
+            crate::readback::dispatch(pass, hi.saturating_sub(lo).div_ceil(wg).max(1));
+            lo = hi;
+        }
+        Ok(())
+    }
+
+    // ---- the host tail ----
+
+    /// The Horner combination of the window sums plus the `ones` partials.
+    ///
+    /// `raw` is [`PointBuffers::results`] read back whole, so this is `n_windows` groups of
+    /// `reduce_groups` partials followed by padding followed by `ones_groups` points. A
+    /// window's partials add to its sum, then high window to low, `c` doublings between
+    /// each, which is the same order `snarkrs-msm` uses on the CPU, so the two agree bit for
+    /// bit and not merely up to the group law.
+    pub fn combine(
+        &self,
+        raw: &[u8],
+        digits: &DigitPlan,
+        points: &PointPlan,
+        bufs: &PointBuffers,
+    ) -> Result<C::Projective, ProveError> {
+        let pt = self.curve.point_bytes as usize;
+        let want = bufs.results_bytes(self.curve) as usize;
+        if raw.len() < want {
+            return Err(bad(format!(
+                "the readback is {} bytes, {} windows x {} groups plus {} ones groups need \
+                 {want}",
+                raw.len(),
+                digits.n_windows(),
+                points.reduce_groups,
+                points.ones_groups
+            )));
+        }
+        let at =
+            |i: usize| -> Result<C::Projective, ProveError> { C::from_xyzz_bytes(&raw[i..i + pt]) };
+        let groups = points.reduce_groups as usize;
+        let window = |k: usize| -> Result<C::Projective, ProveError> {
+            let mut sum = at(k * groups * pt)?;
+            for g in 1..groups {
+                sum += at((k * groups + g) * pt)?;
+            }
+            Ok(sum)
+        };
+        let last = digits.n_windows() as usize - 1;
+        let mut acc = window(last)?;
+        for k in (0..last).rev() {
+            for _ in 0..digits.c() {
+                acc.double_in_place();
+            }
+            acc += window(k)?;
+        }
+        let ones = bufs.ones_off as usize;
+        for g in 0..points.ones_groups as usize {
+            acc += at(ones + g * pt)?;
+        }
+        Ok(acc)
+    }
+
+    /// The same readback [`combine`](Self::combine) folds, one line per window sum and
+    /// `ones` partial, for the [`WINDOW_DEBUG`] log.
+    ///
+    /// Affine and decimal, the discipline `snarkrs_groth16::trace` uses for the five MSM outputs:
+    /// the buckets accumulate in XYZZ through an atomically built scatter, so the projective
+    /// coordinates are not stable even between two correct runs, and affine is the only form
+    /// two machines can be held to. The on-curve flag is the sharper signal, because the
+    /// wrong `msm_b_g2` this exists for is off the curve, which correct group arithmetic
+    /// over curve points cannot produce.
+    ///
+    /// Runs after `combine` over the same slice, so its length check has already passed.
+    pub fn debug_windows(
+        &self,
+        label: &str,
+        raw: &[u8],
+        digits: &DigitPlan,
+        points: &PointPlan,
+        bufs: &PointBuffers,
+    ) -> Result<String, ProveError> {
+        let pt = self.curve.point_bytes as usize;
+        let mut out = String::new();
+        let groups = points.reduce_groups as usize;
+        for k in 0..digits.n_windows() as usize {
+            for g in 0..groups {
+                let i = k * groups + g;
+                let p = C::from_xyzz_bytes(&raw[i * pt..(i + 1) * pt])?;
+                out.push_str(&format!(
+                    "{:<16} {}\n",
+                    format!("{label}_w{k:02}g{g}"),
+                    C::debug_point(&p)
+                ));
+            }
+        }
+        let ones = bufs.ones_off as usize;
+        for g in 0..points.ones_groups as usize {
+            let p = C::from_xyzz_bytes(&raw[ones + g * pt..ones + (g + 1) * pt])?;
+            out.push_str(&format!(
+                "{:<16} {}\n",
+                format!("{label}_o{g:02}"),
+                C::debug_point(&p)
+            ));
+        }
+        Ok(out)
+    }
+
+    // ---- reporting ----
+
+    pub fn workgroups(&self) -> wgsl::Workgroups {
+        self.wg
+    }
+
+    pub fn curve(&self) -> wgsl::Curve {
+        self.curve
+    }
+
+    /// Generated WGSL, in bytes.
+    pub fn source_len(&self) -> usize {
+        self.source_len
+    }
+
+    pub fn cost(&self) -> crate::pipelines::PrepareCost {
+        self.kernels.cost()
+    }
+
+    pub fn summary(&self) -> String {
+        self.kernels.summary()
+    }
+}
+
+/// The bind groups one MSM's point stages dispatch through: five on a variable plan, and
+/// on a constant-work one the fold's two levels of binding in place of the ones pass.
+pub struct PointBinds {
+    pub clear: wgpu::BindGroup,
+    pub segmented: wgpu::BindGroup,
+    pub merge: wgpu::BindGroup,
+    pub reduce: wgpu::BindGroup,
+    /// `None` under constant work, which dispatches no ones pass.
+    pub ones: Option<wgpu::BindGroup>,
+    /// Even and odd fold levels, which read and write the spill and fold pairs the other
+    /// way round. `None` on a variable plan.
+    pub fold: Option<[wgpu::BindGroup; 2]>,
+}
+
+/// One level of a constant-work merge inside a slab: how many groups per window it
+/// dispatches, and one offset per dispatch.
+#[derive(Clone, Debug, Default)]
+pub struct FoldLevel {
+    pub groups: u32,
+    pub offsets: Vec<u32>,
+}
+
+/// Dynamic offsets for one window slab of a point stage: the clear, the segmented pass and
+/// the merge over the windows in `windows`, one offset per dispatch. `merge` is the
+/// per-bucket kernel's and `fold` the constant-work tree's; a slab has one or the other.
+#[derive(Clone, Debug, Default)]
+pub struct SlabOffsets {
+    pub windows: Range<u32>,
+    pub clear: Vec<u32>,
+    pub segmented: Vec<u32>,
+    pub merge: Vec<u32>,
+    pub fold: Vec<FoldLevel>,
+}
+
+/// Dynamic offsets for one point stage: its window slabs, then the reduction and the ones
+/// pass, which run once over every window after the last slab. One slab covering every
+/// window is the stage as [`MsmPoints::plan`] lays it out.
+#[derive(Clone, Debug, Default)]
+pub struct PointOffsets {
+    pub slabs: Vec<SlabOffsets>,
+    pub reduce: u32,
+    pub ones: u32,
+}
+
+impl PointOffsets {
+    pub fn total(&self) -> usize {
+        self.slabs
+            .iter()
+            .map(|s| {
+                s.clear.len()
+                    + s.segmented.len()
+                    + s.merge.len()
+                    + s.fold.iter().map(|l| l.offsets.len()).sum::<usize>()
+            })
+            .sum::<usize>()
+            + 2
+    }
+}
+
+// ---------------------------------------------------------------------------
+// XYZZ to arkworks, with no field inversion
+// ---------------------------------------------------------------------------
+
+/// Limb group `j` of a flattened point: eight little-endian `u32` starting at word `8 * j`.
+///
+/// Exactly `snarkrs_gpu_layout::PackedFq`, which is what makes these decoders the inverse of the
+/// packing the bases went out in rather than a second opinion about the wire format.
+fn limb_at(raw: &[u8], j: usize) -> PackedFq {
+    let mut v = [0u32; LIMBS];
+    for (k, word) in v.iter_mut().enumerate() {
+        let at = (j * LIMBS + k) * 4;
+        *word = u32::from_le_bytes([raw[at], raw[at + 1], raw[at + 2], raw[at + 3]]);
+    }
+    PackedFq { v }
+}
+
+/// One `Xyzz<Fq>` as the kernel wrote it, 128 bytes, to a projective point.
+///
+/// # Why there is no inversion
+///
+/// XYZZ carries the invariant `ZZ^3 = ZZZ^2`, so setting the Jacobian `Z = ZZZ` gives
+/// `Z^2 = ZZ^3` and the point `(X * ZZ^2, Y * ZZ^3, ZZZ)` has `x = X*ZZ^2 / ZZ^3 = X/ZZ` and
+/// `y = Y*ZZ^3 / ZZZ^3 = Y/ZZZ`, which is exactly the XYZZ point. Four multiplications
+/// against two inversions through affine, and there are `n_windows + ones_groups` of these
+/// per MSM, at most 149.
+///
+/// `new_unchecked` is deliberate. These come back from a kernel that was handed on-curve
+/// inputs, and re-checking the curve equation on every window sum would cost a subgroup check
+/// per point for no information: a bug in the kernel shows up as a wrong MSM, which every
+/// test here compares against the CPU Pippenger.
+pub fn xyzz_g1_from_bytes(raw: &[u8]) -> Result<G1Projective, ProveError> {
+    if raw.len() < XYZZ_G1_WORDS * 4 {
+        return Err(bad(format!(
+            "an Xyzz<Fq> is {} bytes and this slice is {}",
+            XYZZ_G1_WORDS * 4,
+            raw.len()
+        )));
+    }
+    // x, y, zz, zzz, each eight little-endian u32 of Montgomery Fq.
+    let coord = |i: usize| -> Fq { limb_at(raw, i).to_fq() };
+    let (x, y, zz, zzz) = (coord(0), coord(1), coord(2), coord(3));
+    if zz.is_zero() {
+        return Ok(G1Projective::zero());
+    }
+    let zz2 = zz * zz;
+    Ok(G1Projective::new_unchecked(x * zz2, y * zz2 * zz, zzz))
+}
+
+/// One `Xyzz<Fq2>` as the kernel wrote it, 256 bytes, to a projective point.
+///
+/// See [`xyzz_g1_from_bytes`] for why there is no inversion here and no curve check; the only
+/// difference is that each coordinate is two `Fq` rather than one.
+pub fn xyzz_g2_from_bytes(raw: &[u8]) -> Result<G2Projective, ProveError> {
+    if raw.len() < XYZZ_G2_WORDS * 4 {
+        return Err(bad(format!(
+            "an Xyzz<Fq2> is {} bytes and this slice is {}",
+            XYZZ_G2_WORDS * 4,
+            raw.len()
+        )));
+    }
+    // The flattened 32-word point is x.c0, x.c1, y.c0, y.c1, zz.c0, zz.c1, zzz.c0, zzz.c1.
+    let coord = |i: usize| -> Fq2 {
+        PackedFq2 {
+            c0: limb_at(raw, i * 2),
+            c1: limb_at(raw, i * 2 + 1),
+        }
+        .to_fq2()
+    };
+    let (x, y, zz, zzz) = (coord(0), coord(1), coord(2), coord(3));
+    if zz.is_zero() {
+        return Ok(G2Projective::zero());
+    }
+    let zz2 = zz * zz;
+    Ok(G2Projective::new_unchecked(x * zz2, y * zz2 * zz, zzz))
+}

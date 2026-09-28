@@ -1,0 +1,582 @@
+//! Device handle and runtime kernel compilation.
+//!
+//! Mirrors `snarkrs-metal`'s use of `newLibraryWithSource`: the kernel sources are `include_str!`
+//! into the binary and compiled by NVRTC for the GPU that is actually present. The
+//! alternative, compiling `.cu` files with `nvcc` in a `build.rs`, would mean the build host
+//! needs a CUDA toolkit and the resulting binary carries a fixed set of architectures. This
+//! way `cargo build --features cuda` works on a laptop with no CUDA at all, and the binary
+//! runs on whatever card it finds.
+
+use std::sync::{Arc, OnceLock};
+
+use cudarc::driver::sys::CUresult;
+use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream, DriverError};
+use snarkrs_groth16::ProveError;
+
+#[derive(Debug, thiserror::Error)]
+pub enum CudaError {
+    #[error("no CUDA device: {0}")]
+    NoDevice(String),
+    #[error("CUDA driver error: {0}")]
+    Driver(#[from] cudarc::driver::DriverError),
+    #[error("NVRTC failed to compile {unit}: {log}")]
+    Compile { unit: &'static str, log: String },
+    #[error("unsupported compute capability {0}.{1}; this backend needs at least 7.0 (Volta)")]
+    UnsupportedArch(i32, i32),
+    #[error("{0}")]
+    Other(String),
+}
+
+impl From<CudaError> for ProveError {
+    fn from(e: CudaError) -> Self {
+        let reason = e.to_string();
+        match e {
+            CudaError::Driver(d) => fault(reason, d),
+            _ => ProveError::Backend {
+                backend: "cuda",
+                reason,
+            },
+        }
+    }
+}
+
+/// A driver failure as a [`ProveError`]: [`ProveError::Device`] when [`is_device_fault`]
+/// says the device failed, [`ProveError::Backend`] when this crate misused the driver.
+pub(crate) fn fault(reason: String, e: DriverError) -> ProveError {
+    if is_device_fault(e.0) {
+        ProveError::Device {
+            backend: "cuda",
+            reason,
+        }
+    } else {
+        ProveError::Backend {
+            backend: "cuda",
+            reason,
+        }
+    }
+}
+
+/// Whether `code` says the device failed, rather than that this crate passed the driver
+/// something it rejects every time. The quotes are from the driver API's `CUresult` docs.
+///
+/// Every kernel exception is here, although a bug in a kernel raises the same codes: a
+/// hardware fault surfaces as one too (`LAUNCH_FAILED`'s "less common cases can be system
+/// specific"), and nothing on the host tells the two apart. A kernel bug then costs one
+/// failed retry and a CPU proof, as a kernel bug that yields a wrong proof already does
+/// through the self-verify.
+///
+/// The codes the docs call sticky ("leaves the process in an inconsistent state and any
+/// further CUDA work will return the same error") poison the context for the life of the
+/// process, so a retry on the same circuit fails at its first driver call and the proof goes
+/// to the CPU.
+pub(crate) fn is_device_fault(code: CUresult) -> bool {
+    use CUresult::*;
+    matches!(
+        code,
+        // "unable to allocate enough memory": another process holding the card's memory,
+        // or a key too big for it, which the CPU proves either way. Not sticky.
+        CUDA_ERROR_OUT_OF_MEMORY
+            // "unavailable at the current time": an exclusive-process card in use.
+            | CUDA_ERROR_DEVICE_UNAVAILABLE
+            // Hardware: "uncorrectable ECC error", "uncorrectable NVLink error", and an
+            // error the GPU's error containment caught. Sticky.
+            | CUDA_ERROR_ECC_UNCORRECTABLE
+            | CUDA_ERROR_NVLINK_UNCORRECTABLE
+            | CUDA_ERROR_CONTAINED
+            // The display watchdog killed a kernel, the twin of the interactivity kill
+            // snarkrs-metal's cb.rs retries. Sticky.
+            | CUDA_ERROR_LAUNCH_TIMEOUT
+            // Kernel exceptions, all sticky. The kernels carry no device assert, so
+            // `ASSERT` cannot come from this crate's code.
+            | CUDA_ERROR_ILLEGAL_ADDRESS
+            | CUDA_ERROR_ASSERT
+            | CUDA_ERROR_HARDWARE_STACK_ERROR
+            | CUDA_ERROR_ILLEGAL_INSTRUCTION
+            | CUDA_ERROR_MISALIGNED_ADDRESS
+            | CUDA_ERROR_INVALID_ADDRESS_SPACE
+            | CUDA_ERROR_INVALID_PC
+            | CUDA_ERROR_LAUNCH_FAILED
+            // Daemons: "the system is not yet ready to start any CUDA work", and every MPS
+            // failure, which is the MPS server's state and not this process's.
+            | CUDA_ERROR_SYSTEM_NOT_READY
+            | CUDA_ERROR_MPS_CONNECTION_FAILED
+            | CUDA_ERROR_MPS_RPC_FAILURE
+            | CUDA_ERROR_MPS_SERVER_NOT_READY
+            | CUDA_ERROR_MPS_MAX_CLIENTS_REACHED
+            | CUDA_ERROR_MPS_MAX_CONNECTIONS_REACHED
+            | CUDA_ERROR_MPS_CLIENT_TERMINATED
+            // "the wait operation has timed out", and an external device's async error.
+            | CUDA_ERROR_TIMEOUT
+            | CUDA_ERROR_EXTERNAL_DEVICE
+            // "an unknown internal error": the driver's own state, not this call's.
+            | CUDA_ERROR_UNKNOWN
+    )
+}
+
+/// An open CUDA context plus its default stream.
+pub struct Cuda {
+    ctx: Arc<CudaContext>,
+    stream: Arc<CudaStream>,
+    arch: &'static str,
+    name: String,
+    cc: (i32, i32),
+    sm_count: i32,
+}
+
+impl Cuda {
+    /// Opens a context on `ordinal`, or says why it could not.
+    ///
+    /// The one reason this can fail without the driver having said so is a missing
+    /// `libcuda`, which `cudarc` reports by panicking; see [`libcuda_loadable`]. Once that
+    /// has answered, everything here has a real driver behind it and a real error channel.
+    pub fn new(ordinal: usize) -> Result<Self, CudaError> {
+        let t_open = std::time::Instant::now();
+        libcuda_loadable()?;
+        let ctx = CudaContext::new(ordinal).map_err(|e| CudaError::NoDevice(e.to_string()))?;
+        let stream = ctx.default_stream();
+        let cc = ctx.compute_capability()?;
+        let arch = arch_flag(cc)?;
+        let name = ctx.name()?;
+        let sm_count = ctx.attribute(
+            cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+        )?;
+        // Context creation is a fixed per-process cost the FFT numbers say is worth
+        // knowing: on a box without nvidia-persistenced it includes bringing the whole
+        // GPU up, which is seconds, not milliseconds.
+        if time_enabled() {
+            eprintln!(
+                "snarkrs-cuda time: open context {:.1} ms ({name}, cc {}.{})",
+                t_open.elapsed().as_secs_f64() * 1e3,
+                cc.0,
+                cc.1
+            );
+        }
+        Ok(Self {
+            ctx,
+            stream,
+            arch,
+            name,
+            cc,
+            sm_count,
+        })
+    }
+
+    pub fn context(&self) -> &Arc<CudaContext> {
+        &self.ctx
+    }
+
+    pub fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
+    }
+
+    pub fn device_name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn compute_capability(&self) -> (i32, i32) {
+        self.cc
+    }
+
+    /// Streaming multiprocessor count. The CUDA analogue of the Metal backend's core
+    /// count, and the number a dispatch has to fill before the card is busy at all.
+    pub fn sm_count(&self) -> i32 {
+        self.sm_count
+    }
+
+    /// Compile one translation unit and load it, going through the on-disk PTX cache.
+    ///
+    /// `--use_fast_math` is deliberately NOT passed. There is not a single floating point
+    /// operation in any of these kernels, so it could only change integer codegen for the
+    /// worse, and a flag that relaxes numerical guarantees has no business anywhere near
+    /// a proof system.
+    ///
+    /// # Why there is a cache at all, with the numbers
+    ///
+    /// Getting the MSM kernels onto a T4 for the first time costs roughly **270 to 300
+    /// seconds**. It is worth being precise about where that goes, because the obvious
+    /// summary is wrong in both directions.
+    ///
+    /// There are two expensive stages, not one:
+    ///
+    /// | stage | cold | warm |
+    /// |---|---:|---:|
+    /// | NVRTC, source to PTX | 113.6 s | 0.18 s |
+    /// | driver JIT, PTX to SASS, inside `cuModuleLoad` | about 175 s | 0.12 s |
+    ///
+    /// Both figures were measured on the same T4, and the NVRTC one is corroborated
+    /// offline: `nvcc -arch=compute_75 -ptx` on the identical source takes 108 s and emits
+    /// byte-identical PTX. The stages unit, for contrast, is 1.3 s.
+    ///
+    /// **`~/.nv/ComputeCache` caches both stages, not just the JIT.** Deleting it and
+    /// recompiling reproduces the 113.6 s NVRTC figure; the next run is 0.18 s. That is the
+    /// single most important fact here, and it is why a cold-start number for any CUDA
+    /// prover taken on a machine that has run it before is measuring a cache hit. On a
+    /// fresh CI runner with no persistent `$HOME`, every run is cold.
+    ///
+    /// **So what does this cache buy, honestly.** It covers the NVRTC stage only. With
+    /// `~/.nv` warm it saves nothing measurable: 0.30 s either way, verified by running
+    /// with `G16_CUDA_NO_CACHE=1`. With `~/.nv` cold it removes 113 s of the 283 and leaves
+    /// the 175 s of driver JIT on the table. That half is cacheable too and this does not do
+    /// it yet: `cuLinkCreate_v2` / `cuLinkAddData_v2(CU_JIT_INPUT_PTX)` / `cuLinkComplete`
+    /// hand back the assembled cubin in host memory, and `Ptx::from_binary` plus
+    /// `load_module` already take one. What it costs is the key, because a cubin is not
+    /// forward compatible the way PTX is: the key would have to grow the exact SM and the
+    /// driver version. Filed as OPT-24.
+    ///
+    /// So this is a real but partial win, and it is the reason to keep it rather than a
+    /// reason to have built it: the driver's cache is a fixed-size LRU shared by every CUDA
+    /// process on the machine (`CUDA_CACHE_MAXSIZE`, one gigabyte by default), a 30 MB entry
+    /// in it is evictable by unrelated work, and an entry that survives here is one that
+    /// cannot be evicted by someone else's job.
+    ///
+    /// Two ways to shrink the generated code were measured and neither is worth taking:
+    ///
+    /// * Removing every `#pragma unroll` changes nothing: 109.7 s against 108.0 s.
+    /// * Demoting `__forceinline__` to `__inline__` cuts NVRTC to 25.7 s and the PTX from
+    ///   787,873 lines to 235,000, and is a **trap**. The smaller PTX leaves 4 functions out
+    ///   of line with 350 call sites, and the driver JIT then takes **29.6 s** on a warm
+    ///   `~/.nv` where the fully inlined version takes **120 ms**. Inlined PTX is
+    ///   straight-line code the JIT merely assembles; PTX with calls makes it redo the
+    ///   interprocedural work. Total cost is worse and the generated code is worse, so
+    ///   `__forceinline__` stays.
+    ///
+    /// A cache miss is never an error. A corrupt, truncated or unreadable entry falls
+    /// through to a real compile, and a cache directory that cannot be written is ignored.
+    /// `G16_CUDA_NO_CACHE=1` bypasses only *this* cache; measuring a genuine cold compile
+    /// also needs `~/.nv` cleared, and `CUDA_CACHE_DISABLE=1` disables only the driver's.
+    pub fn compile(&self, unit: &'static str, src: &str) -> Result<Arc<CudaModule>, CudaError> {
+        let key = cache_key(src, self.arch);
+        let path = cache_path(unit, &key);
+
+        if let Some(p) = path.as_ref().filter(|_| !cache_disabled()) {
+            if let Ok(cached) = std::fs::read_to_string(p) {
+                // Only a non-empty entry that ends the way NVRTC ends one is trusted. The
+                // write below is atomic, so a torn file should be impossible; this is here
+                // because "should be impossible" and "is impossible" differ on a machine
+                // that lost power mid-write, and the failure mode of a truncated PTX is a
+                // confusing driver error rather than a clean miss.
+                if cached.len() > 64 && cached.contains(".visible .entry") {
+                    let bytes = cached.len();
+                    let t_load = std::time::Instant::now();
+                    if let Ok(m) = self.ctx.load_module(cudarc::nvrtc::Ptx::from_src(cached)) {
+                        // With a warm ~/.nv this is a load of already-JITted SASS; with
+                        // a cold one it is the full PTX-to-SASS pass, which is where the
+                        // startup seconds hide.
+                        if time_enabled() {
+                            eprintln!(
+                                "snarkrs-cuda time: unit {unit}: ptx cache hit ({bytes} bytes), \
+                                 load_module {:.1} ms",
+                                t_load.elapsed().as_secs_f64() * 1e3
+                            );
+                        }
+                        return Ok(m);
+                    }
+                }
+            }
+        }
+
+        let opts = cudarc::nvrtc::CompileOptions {
+            arch: Some(self.arch),
+            // C++17 for the `if constexpr` ladder choice in `fft.cu`. Nothing else: no
+            // warning flag would be visible anyway, because `compile_ptx_with_opts`
+            // discards the program log on a successful compile.
+            options: vec!["--std=c++17".into()],
+            ..Default::default()
+        };
+        let t_nvrtc = std::time::Instant::now();
+        let ptx =
+            cudarc::nvrtc::compile_ptx_with_opts(src, opts).map_err(|e| CudaError::Compile {
+                unit,
+                log: compile_log(e),
+            })?;
+        let nvrtc_ms = t_nvrtc.elapsed().as_secs_f64() * 1e3;
+
+        if let Some(p) = path.as_ref().filter(|_| !cache_disabled()) {
+            let text = ptx.to_src();
+            if let Some(dir) = p.parent() {
+                let _ = std::fs::create_dir_all(dir);
+                // Write to a unique temporary and rename, so two provers racing on the same
+                // cache entry cannot leave a half-written file for a third to read. Rename
+                // is atomic within a filesystem, and both paths are in the same directory.
+                let tmp = dir.join(format!(
+                    "{}.{}.tmp",
+                    p.file_name().unwrap().to_string_lossy(),
+                    std::process::id()
+                ));
+                if std::fs::write(&tmp, &text).is_ok() && std::fs::rename(&tmp, p).is_err() {
+                    let _ = std::fs::remove_file(&tmp);
+                }
+            }
+        }
+
+        let t_load = std::time::Instant::now();
+        let module = self.ctx.load_module(ptx)?;
+        if time_enabled() {
+            eprintln!(
+                "snarkrs-cuda time: unit {unit}: nvrtc {nvrtc_ms:.1} ms, load_module {:.1} ms",
+                t_load.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        Ok(module)
+    }
+
+    /// Compile and pull out a named set of kernels in one go.
+    pub fn functions(
+        &self,
+        unit: &'static str,
+        src: &str,
+        names: &[&str],
+    ) -> Result<Vec<CudaFunction>, CudaError> {
+        let module = self.compile(unit, src)?;
+        names
+            .iter()
+            .map(|n| module.load_function(n).map_err(CudaError::from))
+            .collect()
+    }
+}
+
+/// The NVRTC diagnostic with its line breaks intact.
+///
+/// `CompileError`'s `Display` is `write!(f, "{self:?}")` and the log inside it is a
+/// `CString`, so `to_string` escapes every newline and a multi-line diagnostic arrives as
+/// one long `\n`-separated line. Given what a compile costs to reach on a real card, the
+/// one error worth reading should not have to be unescaped by hand first.
+fn compile_log(e: cudarc::nvrtc::CompileError) -> String {
+    match e {
+        cudarc::nvrtc::CompileError::CompileError { log, .. } => log.to_string_lossy().into_owned(),
+        other => other.to_string(),
+    }
+}
+
+/// Whether `libcuda` can be loaded at all, probed once for the whole process.
+///
+/// # This returns `Err` where `cudarc` panics
+///
+/// With the `dynamic-loading` feature, `cudarc` resolves `libcuda` lazily on first use and
+/// **unwraps** the `dlopen`. On a machine with no NVIDIA driver at all, which is every
+/// macOS host in this workspace, the first driver call therefore aborts the process instead
+/// of returning the error its signature promises. That defeats the whole skip-if-no-device
+/// pattern the test suites are written around, so the unwind is caught here and turned back
+/// into a [`CudaError`]. The default hook would also print a panic message and a backtrace
+/// for something that is not a crash, so it is silenced across the probe.
+///
+/// # Why once, and not around each open
+///
+/// The panic hook is a single process-global slot with no lock of its own, so a take/set
+/// pair is only safe if no other thread is in one at the same time. Two threads that
+/// interleave can each restore the *other's* no-op and leave the process silent for good,
+/// and this crate has the threads to do it: `backend`'s two open tests both reach here and
+/// libtest runs them concurrently. `OnceLock::get_or_init` blocks the second caller and
+/// runs the swap exactly once, and every later open reads the stored answer.
+///
+/// [`CudaContext::device_count`] is the cheapest call that goes through the loader: `cuInit`
+/// and `cuDeviceGetCount`, no context and no device bring-up. Whether it then reports a
+/// driver error is not this function's business, because the library loaded and answered;
+/// `CudaContext::new` surfaces whatever is actually wrong through its own error channel.
+fn libcuda_loadable() -> Result<(), CudaError> {
+    static PROBE: OnceLock<Option<String>> = OnceLock::new();
+    let failure = PROBE.get_or_init(|| {
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let probed = std::panic::catch_unwind(CudaContext::device_count);
+        std::panic::set_hook(hook);
+        probed.err().map(|payload| {
+            payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "panic with a non-string payload".to_string())
+        })
+    });
+    match failure {
+        None => Ok(()),
+        Some(what) => Err(CudaError::NoDevice(format!(
+            "the CUDA driver library could not be loaded: {what}"
+        ))),
+    }
+}
+
+fn cache_disabled() -> bool {
+    std::env::var_os("G16_CUDA_NO_CACHE").is_some_and(|v| v != "0")
+}
+
+/// `G16_CUDA_TIME=1` prints the fixed per-process costs (context open, compile, module
+/// load) to stderr. This is the breakdown of the flat seconds a `ptau prepare` pays
+/// before the first kernel runs, which at small powers is most of the command.
+pub(crate) fn time_enabled() -> bool {
+    std::env::var("G16_CUDA_TIME").as_deref() == Ok("1")
+}
+
+/// FNV-1a over the source and the architecture.
+///
+/// Written out rather than using `DefaultHasher` because that is explicitly not stable
+/// across Rust releases, and a hash that changes under the reader's feet turns the cache
+/// into a directory that only ever grows. FNV is not cryptographic and does not need to be:
+/// the cache is per user, and the worst case for a collision is loading kernels that do not
+/// match the source, which the `.visible .entry` check does not catch. That risk is
+/// accepted because the input is this crate's own `include_str!` sources, not attacker
+/// input, and a 128-bit FNV over them will not collide by accident.
+fn cache_key(src: &str, arch: &str) -> String {
+    let mut lo: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut hi: u64 = 0x9e37_79b9_7f4a_7c15;
+    for b in src.as_bytes().iter().chain(b"|").chain(arch.as_bytes()) {
+        lo ^= u64::from(*b);
+        lo = lo.wrapping_mul(0x0000_0100_0000_01b3);
+        hi = hi.rotate_left(7) ^ lo;
+        hi = hi.wrapping_mul(0x8864_3f65_ef0d_9b1d);
+    }
+    format!("{lo:016x}{hi:016x}")
+}
+
+/// `$G16_CUDA_CACHE`, else `$XDG_CACHE_HOME/snarkrs-cuda`, else `$HOME/.cache/snarkrs-cuda`.
+/// `None` when none of those can be determined, which disables caching rather than
+/// guessing at a writable directory.
+fn cache_path(unit: &str, key: &str) -> Option<std::path::PathBuf> {
+    let dir = std::env::var_os("G16_CUDA_CACHE")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("XDG_CACHE_HOME")
+                .map(|c| std::path::PathBuf::from(c).join("snarkrs-cuda"))
+        })
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|h| std::path::PathBuf::from(h).join(".cache/snarkrs-cuda"))
+        })?;
+    Some(dir.join(format!("{unit}-{key}.ptx")))
+}
+
+/// Map a compute capability to the NVRTC `--gpu-architecture` value.
+///
+/// `compute_XY` rather than `sm_XY` on purpose: NVRTC emits PTX, and the driver JIT
+/// specialises it for the exact chip at load time. Asking for `sm_XY` would produce a
+/// cubin pinned to one architecture for no benefit here.
+///
+/// Unknown newer capabilities fall back to the highest entry this table knows rather than
+/// failing, because PTX for an older architecture is forward compatible through the JIT.
+/// The floor is 7.0: below that there is no independent thread scheduling, and the MSM
+/// kernels' warp-level reductions would need rewriting.
+fn arch_flag(cc: (i32, i32)) -> Result<&'static str, CudaError> {
+    Ok(match cc {
+        (7, 0) => "compute_70",
+        (7, 2) => "compute_72",
+        (7, 5) => "compute_75", // Turing, the T4 this was developed against
+        (8, 0) => "compute_80", // Ampere, A100
+        (8, 6) => "compute_86", // Ampere, A10G / RTX 30xx
+        (8, 7) => "compute_87",
+        (8, 9) => "compute_89", // Ada, L4 / L40S / RTX 40xx
+        (9, 0) => "compute_90", // Hopper
+        (major, minor) if major > 9 || (major == 9 && minor > 0) => "compute_90",
+        (major, minor) => return Err(CudaError::UnsupportedArch(major, minor)),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arch_flags_cover_the_cards_this_will_meet() {
+        assert_eq!(arch_flag((7, 5)).unwrap(), "compute_75");
+        assert_eq!(arch_flag((8, 6)).unwrap(), "compute_86");
+        assert_eq!(arch_flag((8, 9)).unwrap(), "compute_89");
+        // Forward compatibility: a card newer than this table still gets usable PTX.
+        assert_eq!(arch_flag((10, 0)).unwrap(), "compute_90");
+        assert_eq!(arch_flag((12, 3)).unwrap(), "compute_90");
+        // And anything older than Volta is refused rather than silently miscompiled.
+        assert!(arch_flag((6, 1)).is_err());
+        assert!(arch_flag((5, 0)).is_err());
+    }
+
+    /// The mapping `g16 prove --fallback` retries on, checked code by code so it runs on a
+    /// host with no card.
+    #[test]
+    fn device_faults_are_retried_and_misuse_is_not() {
+        use CUresult::*;
+        for code in [
+            CUDA_ERROR_OUT_OF_MEMORY,
+            CUDA_ERROR_DEVICE_UNAVAILABLE,
+            CUDA_ERROR_ECC_UNCORRECTABLE,
+            CUDA_ERROR_NVLINK_UNCORRECTABLE,
+            CUDA_ERROR_CONTAINED,
+            CUDA_ERROR_LAUNCH_TIMEOUT,
+            CUDA_ERROR_ILLEGAL_ADDRESS,
+            CUDA_ERROR_ASSERT,
+            CUDA_ERROR_HARDWARE_STACK_ERROR,
+            CUDA_ERROR_ILLEGAL_INSTRUCTION,
+            CUDA_ERROR_MISALIGNED_ADDRESS,
+            CUDA_ERROR_INVALID_ADDRESS_SPACE,
+            CUDA_ERROR_INVALID_PC,
+            CUDA_ERROR_LAUNCH_FAILED,
+            CUDA_ERROR_SYSTEM_NOT_READY,
+            CUDA_ERROR_MPS_CONNECTION_FAILED,
+            CUDA_ERROR_MPS_RPC_FAILURE,
+            CUDA_ERROR_MPS_SERVER_NOT_READY,
+            CUDA_ERROR_MPS_MAX_CLIENTS_REACHED,
+            CUDA_ERROR_MPS_MAX_CONNECTIONS_REACHED,
+            CUDA_ERROR_MPS_CLIENT_TERMINATED,
+            CUDA_ERROR_TIMEOUT,
+            CUDA_ERROR_EXTERNAL_DEVICE,
+            CUDA_ERROR_UNKNOWN,
+        ] {
+            let e = fault("op".into(), DriverError(code));
+            assert!(e.is_device_fault(), "{code:?} gave {e}");
+        }
+        // Launch geometry, bad arguments and handles, a missing kernel, a context this
+        // crate destroyed: each fails the same way on a second attempt.
+        for code in [
+            CUDA_ERROR_INVALID_VALUE,
+            CUDA_ERROR_NOT_INITIALIZED,
+            CUDA_ERROR_INVALID_DEVICE,
+            CUDA_ERROR_INVALID_IMAGE,
+            CUDA_ERROR_INVALID_CONTEXT,
+            CUDA_ERROR_INVALID_PTX,
+            CUDA_ERROR_INVALID_HANDLE,
+            CUDA_ERROR_NOT_FOUND,
+            CUDA_ERROR_NOT_READY,
+            CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES,
+            CUDA_ERROR_CONTEXT_IS_DESTROYED,
+            CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE,
+            CUDA_ERROR_NOT_SUPPORTED,
+        ] {
+            let e = fault("op".into(), DriverError(code));
+            assert!(
+                matches!(
+                    e,
+                    ProveError::Backend {
+                        backend: "cuda",
+                        ..
+                    }
+                ),
+                "{code:?} gave {e}"
+            );
+        }
+    }
+
+    /// The rest of [`CudaError`] is this crate's or the host's, never the device's. Its
+    /// `Driver` arm is [`fault`], untested here because formatting a `DriverError` asks
+    /// `libcuda` for the message, and a host without one panics in `cudarc`.
+    #[test]
+    fn other_cuda_errors_are_not_device_faults() {
+        for e in [
+            CudaError::NoDevice("none".into()),
+            CudaError::Compile {
+                unit: "msm",
+                log: "error".into(),
+            },
+            CudaError::UnsupportedArch(6, 1),
+            CudaError::Other("other".into()),
+        ] {
+            let e = ProveError::from(e);
+            assert!(
+                matches!(
+                    e,
+                    ProveError::Backend {
+                        backend: "cuda",
+                        ..
+                    }
+                ),
+                "{e}"
+            );
+        }
+    }
+}

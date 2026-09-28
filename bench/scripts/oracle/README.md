@@ -11,9 +11,9 @@ wrong Z convention apart from a wrong l_query offset, and two of those can cance
 
 Consumed by, respectively:
 
-    crates/g16-core/tests/h_matches_snarkjs.rs
-    crates/g16-core/tests/msms_match_snarkjs.rs
-    crates/g16-core/tests/ntt_matches_ffjavascript.rs
+    crates/groth16/tests/h_matches_snarkjs.rs
+    crates/groth16/tests/msms_match_snarkjs.rs
+    crates/groth16/tests/ntt_matches_ffjavascript.rs
 
 Each test skips loudly when its fixture is absent.
 

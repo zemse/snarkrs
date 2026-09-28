@@ -20,13 +20,13 @@ command -v wasm-opt  >/dev/null || { echo "wasm-opt is not installed (brew insta
 want="$(awk '/^name = "wasm-bindgen"$/{getline; gsub(/[",]/,""); print $3; exit}' "$root/Cargo.lock")"
 echo "wasm-bindgen in Cargo.lock: $want"
 
-# wasm-pack's own wasm-opt is off in crates/g16-wasm/Cargo.toml so the size before
+# wasm-pack's own wasm-opt is off in crates/web/Cargo.toml so the size before
 # optimisation survives to be measured.
-( cd "$root" && wasm-pack build crates/g16-wasm --target web --release \
+( cd "$root" && wasm-pack build crates/web --target web --release \
     --out-dir pkg --out-name g16_wasm )
 
-raw="$root/target/wasm32-unknown-unknown/release/g16_wasm.wasm"
-bg="$root/crates/g16-wasm/pkg/g16_wasm_bg.wasm"
+raw="$root/target/wasm32-unknown-unknown/release/snarkrs_web.wasm"
+bg="$root/crates/web/pkg/g16_wasm_bg.wasm"
 
 # rustc stamps the wasm-bindgen version into the schema section of its output and the CLI
 # refuses to run against a section it does not understand. Comparing that stamp against
@@ -46,7 +46,7 @@ mv "$bg.opt" "$bg"
 after="$(wc -c < "$bg")"
 
 rm -rf "$here/../static/pkg"
-cp -R "$root/crates/g16-wasm/pkg" "$here/../static/pkg"
+cp -R "$root/crates/web/pkg" "$here/../static/pkg"
 # wasm-pack writes a package.json into its output. Left in static/ it is a public file that
 # claims this directory is an npm package, which it is not.
 rm -f "$here/../static/pkg/package.json" "$here/../static/pkg/.gitignore" "$here/../static/pkg/README.md"

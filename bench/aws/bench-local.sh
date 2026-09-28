@@ -24,7 +24,7 @@ BACKENDS="${G16_LOCAL_BACKENDS:-cpu metal}"
 FEATURES="--features metal"
 
 echo "==> building"
-cargo build --release -p snarkrs $FEATURES 2>&1 | tail -2
+cargo build --release -p snarkrs-cli $FEATURES 2>&1 | tail -2
 
 echo "==> correctness gate"
 # Run once, keep the output, decide from it. Running the suite twice -- once to show and

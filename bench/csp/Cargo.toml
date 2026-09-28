@@ -3,19 +3,19 @@
 # on, and its build clones and builds witnesscalc from source. Keeping it out means
 # `cargo build --release` at the repo root is unaffected by any of that.
 [package]
-name = "g16-csp"
+name = "snarkrs-csp"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
-g16-core  = { path = "../../crates/g16-core" }
-g16-zkey  = { path = "../../crates/g16-zkey" }
-g16-field = { path = "../../crates/g16-field" }
-g16-ceremony = { path = "../../crates/g16-ceremony" }
-g16-metal = { path = "../../crates/g16-metal", optional = true }
-g16-cuda  = { path = "../../crates/g16-cuda", optional = true }
+snarkrs-groth16  = { path = "../../crates/groth16" }
+snarkrs-formats  = { path = "../../crates/formats" }
+snarkrs-field = { path = "../../crates/field" }
+snarkrs-ceremony = { path = "../../crates/ceremony" }
+snarkrs-metal = { path = "../../crates/metal", optional = true }
+snarkrs-cuda  = { path = "../../crates/cuda", optional = true }
 
 witnesscalc-adapter = "0.1"
 
@@ -42,23 +42,23 @@ witnesscalc-adapter = "0.1"
 
 [features]
 default = []
-metal = ["dep:g16-metal"]
-cuda = ["dep:g16-cuda", "g16-cuda/cuda"]
+metal = ["dep:snarkrs-metal"]
+cuda = ["dep:snarkrs-cuda", "snarkrs-cuda/cuda"]
 
 [[bin]]
-name = "g16-csp"
+name = "snarkrs-csp"
 path = "src/bin/main.rs"
 
 # Separate binary so that a peak-RSS sample is one process that does one proof and exits,
 # which is what `/usr/bin/time -l` can actually measure. Anything the driver does before
 # or after would land in the same maxrss.
 [[bin]]
-name = "g16-csp-mem"
+name = "snarkrs-csp-mem"
 path = "src/bin/mem.rs"
 
 # Witness generation on its own, so a profile of it is not also a profile of the prover.
 [[bin]]
-name = "g16-csp-wit"
+name = "snarkrs-csp-wit"
 path = "src/bin/wit.rs"
 
 [profile.release]

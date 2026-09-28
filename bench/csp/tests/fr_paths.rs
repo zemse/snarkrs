@@ -61,7 +61,7 @@ fn verdict(out: &str) -> &str {
 #[test]
 fn short_and_long_forms_agree_on_every_consumer() {
     let Some(w) = witnesscalc() else { return };
-    let dir = std::env::temp_dir().join("g16-csp-fr-paths");
+    let dir = std::env::temp_dir().join("snarkrs-csp-fr-paths");
     std::fs::create_dir_all(&dir).unwrap();
 
     let bin = dir.join("positive");
@@ -77,7 +77,7 @@ fn short_and_long_forms_agree_on_every_consumer() {
 #[test]
 fn negative_shorts_do_not_agree_and_that_is_why_they_are_excluded() {
     let Some(w) = witnesscalc() else { return };
-    let dir = std::env::temp_dir().join("g16-csp-fr-paths");
+    let dir = std::env::temp_dir().join("snarkrs-csp-fr-paths");
     std::fs::create_dir_all(&dir).unwrap();
 
     let bin = dir.join("negative");

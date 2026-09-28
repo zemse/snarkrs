@@ -1,0 +1,547 @@
+//! The CPU backend: composes `snarkrs-ntt` and `snarkrs-msm` into stages 0-9.
+
+// Not `std::time`: `Instant::now()` compiles for wasm32-unknown-unknown and then panics at
+// run time, and this backend is on the browser's path too. It is the single-threaded wasm CPU
+// row in ../../../webgpu-trial, which exists to separate what the GPU contributes from what
+// snarkjs' 12 workers do. web-time is a re-export of `std::time` on every other target, so no
+// native number changes.
+use web_time::Instant;
+
+use crate::{Backend, HPoly, MsmOutputs, PreparedCircuit, ProveError, StageTimings};
+use rayon::prelude::*;
+use snarkrs_field::*;
+use snarkrs_formats::ProvingKey;
+use snarkrs_msm::{CpuMsm, MsmBackend};
+use snarkrs_ntt::CpuNtt;
+
+/// No pool size of its own: the NTT and MSM crates both size their task counts against
+/// the global rayon pool, so a knob here would describe a pool nobody uses. Set
+/// `RAYON_NUM_THREADS` or build a `ThreadPoolBuilder` instead.
+#[derive(Default)]
+pub struct CpuBackend {
+    constant_work: bool,
+}
+
+impl CpuBackend {
+    pub fn new() -> Self {
+        Self {
+            constant_work: false,
+        }
+    }
+
+    /// MSMs whose cost follows the key and not the witness, so proving time does not reveal
+    /// how many witness entries are zero or one. From 2.5% slower on a dense circuit to 4x
+    /// on a bit-heavy one; see `snarkrs_msm::CpuMsm::constant_work`.
+    pub fn constant_work() -> Self {
+        Self {
+            constant_work: true,
+        }
+    }
+}
+
+impl Backend for CpuBackend {
+    fn name(&self) -> &'static str {
+        "cpu"
+    }
+    fn prepare(&self, pk: ProvingKey) -> Result<Box<dyn PreparedCircuit>, ProveError> {
+        let mut circuit = CpuCircuit::new(pk)?;
+        circuit.msm.constant_work = self.constant_work;
+        Ok(Box::new(circuit))
+    }
+}
+
+pub struct CpuCircuit {
+    pk: ProvingKey,
+    domain: Domain,
+    /// snarkjs' `inc`: a primitive `2 * domain_size`-th root of unity. See
+    /// [`CpuCircuit::new`] for why this and not `domain.coset_gen`.
+    coset_shift: Fr,
+    /// One instance for the life of the circuit: the twiddle cache is per instance, and
+    /// a fresh one would rebuild the size/2 table on every one of the six transforms.
+    ntt: CpuNtt,
+    msm: CpuMsm,
+}
+
+impl CpuCircuit {
+    /// Public alongside [`CpuCircuit::gather`], and for the same reason: a GPU backend
+    /// testing one stage in isolation needs the CPU circuit as a concrete type, and
+    /// `Backend::prepare` hands back a `Box<dyn PreparedCircuit>` that has no stage 0 on it.
+    /// A prover still goes through `prepare`.
+    pub fn new(pk: ProvingKey) -> Result<Self, ProveError> {
+        let bad = |reason: String| ProveError::Backend {
+            backend: "cpu",
+            reason,
+        };
+
+        let domain = Domain::new(pk.domain_size).map_err(|e| bad(e.to_string()))?;
+        // The CSR rows are indexed by evaluation point, so a domain that rounded up would
+        // silently shorten every gather. Better to refuse the key than to prove garbage.
+        if domain.size != pk.domain_size {
+            return Err(bad(format!(
+                "domain size {} is not a power of two",
+                pk.domain_size
+            )));
+        }
+
+        // Why a 2n-th root of unity rather than `domain.coset_gen` (= Fr::GENERATOR):
+        // snarkjs evaluates A, B and C on the *odd* points of the 2n-th roots of unity,
+        // `inc = Fr.w[power+1]` in groth16_prove.js, and section 9 of the zkey holds the
+        // Lagrange basis of that same 2n domain restricted to its odd indices (see
+        // `writeHs` in zkey_new.js, which takes `sTauG1[2i+1]`). The bases are tied to
+        // that specific point set, so any other coset would pair evaluations against the
+        // wrong Lagrange polynomials. `Domain::new(2n).group_gen` squares to
+        // `domain.group_gen` by construction, which is exactly the relation
+        // `Fr.w[power] == inc^2` that makes evaluation index i land on `inc^(2i+1)`.
+        let coset_shift = Domain::new(
+            domain
+                .size
+                .checked_mul(2)
+                .ok_or_else(|| bad("domain size overflows".into()))?,
+        )
+        .map_err(|e| bad(format!("no 2n-th root of unity: {e}")))?
+        .group_gen;
+
+        for (m, name) in [(0usize, "A"), (1, "B")] {
+            let row_ptr = &pk.coeffs.row_ptr[m];
+            if row_ptr.len() != domain.size + 1 {
+                return Err(bad(format!(
+                    "matrix {name} has {} rows, domain size is {}",
+                    row_ptr.len().saturating_sub(1),
+                    domain.size
+                )));
+            }
+            // A decreasing pair makes `lo..hi` in `gather` an empty range, so that row
+            // would accumulate `Fr::zero()` with no panic and no error, and the proof that
+            // came out would fail `snarkjs groth16 verify` with nothing in any log. The
+            // same two loops belong in every backend's prepare path (`CsrHost::build` is
+            // snarkrs-wgpu's copy), and this backend is the oracle the other three are diffed
+            // against, so it must not be the one copy that proves garbage quietly.
+            for c in 1..row_ptr.len() {
+                if row_ptr[c] < row_ptr[c - 1] {
+                    return Err(bad(format!(
+                        "matrix {name} row_ptr is not monotone at row {}: {} then {}",
+                        c - 1,
+                        row_ptr[c - 1],
+                        row_ptr[c]
+                    )));
+                }
+            }
+            let total = row_ptr[row_ptr.len() - 1] as usize;
+            if total != pk.coeffs.signal[m].len() || total != pk.coeffs.value[m].len() {
+                return Err(bad(format!(
+                    "matrix {name} row_ptr ends at {total} but has {} signals and {} values",
+                    pk.coeffs.signal[m].len(),
+                    pk.coeffs.value[m].len()
+                )));
+            }
+            // Paid once per key, not per proof, and it turns a would-be panic deep inside
+            // the parallel gather into an error at load time.
+            if pk.coeffs.signal[m].iter().any(|&s| s as usize >= pk.n_vars) {
+                return Err(bad(format!(
+                    "matrix {name} references a signal beyond n_vars {}",
+                    pk.n_vars
+                )));
+            }
+        }
+
+        // `msms` slices the private witness as `witness[n_public + 1..]`, which past
+        // `n_vars` is a panic and not an error, and the workspace release profile's
+        // `panic = "abort"` turns that into a SIGABRT that takes every other in-flight
+        // proof with it. The three GPU backends refuse such a key in their own `new`;
+        // so does this one.
+        if pk.n_vars.checked_sub(pk.n_public + 1).is_none() {
+            return Err(bad(format!(
+                "n_public {} exceeds n_vars {}",
+                pk.n_public, pk.n_vars
+            )));
+        }
+
+        Ok(Self {
+            pk,
+            domain,
+            coset_shift,
+            ntt: CpuNtt::new(),
+            msm: CpuMsm::new(),
+        })
+    }
+
+    /// Stage 0 for one matrix: `out[c] = sum over CSR row c of value * witness[signal]`.
+    ///
+    /// A gather rather than snarkjs' scatter. The CSR sort in `snarkrs-formats` is what buys
+    /// this: rows are disjoint, so the loop is embarrassingly parallel with no atomics.
+    ///
+    /// Public because it is the oracle every GPU backend's stage 0 is checked against, and
+    /// `compute_h` folds stages 0 to 4 together so it cannot serve as one. A backend that
+    /// only compares the final `H` can pass with a gather that is wrong and a transform
+    /// that is wrong in the opposite direction, which is not a hypothetical: the two are
+    /// developed in separate units here.
+    ///
+    /// # Panics
+    ///
+    /// If `m` is not 0 (A) or 1 (B). There are only two matrices in a zkey: snarkjs filters
+    /// the C matrix out of section 4 before writing it, which is why stage 0 computes C
+    /// rather than gathering it.
+    pub fn gather(&self, m: usize, witness: &[Fr]) -> Vec<Fr> {
+        assert!(m < 2, "matrix index {m}: a zkey holds only A and B");
+        let row_ptr = &self.pk.coeffs.row_ptr[m];
+        let signal = &self.pk.coeffs.signal[m];
+        let value = &self.pk.coeffs.value[m];
+
+        (0..self.domain.size)
+            .into_par_iter()
+            .map(|c| {
+                let lo = row_ptr[c] as usize;
+                let hi = row_ptr[c + 1] as usize;
+                let mut acc = Fr::zero();
+                for k in lo..hi {
+                    // Most witness values on the profiled circuits are bits (an audit of
+                    // matrix A found only 27,776 of its 225,290 nonzeros touch a witness
+                    // value that is neither 0 nor 1), and a limb compare is far cheaper
+                    // than the Montgomery multiply it skips. Exact either way: adding
+                    // zero and multiplying by one are both bit-identical to the slow
+                    // path.
+                    let w = witness[signal[k] as usize];
+                    if w.is_zero() {
+                        continue;
+                    }
+                    if w.is_one() {
+                        acc += value[k];
+                    } else {
+                        acc += value[k] * w;
+                    }
+                }
+                acc
+            })
+            .collect()
+    }
+
+    fn check_witness(&self, witness: &[Fr]) -> Result<(), ProveError> {
+        if witness.len() != self.pk.n_vars {
+            return Err(ProveError::WitnessLength {
+                got: witness.len(),
+                want: self.pk.n_vars,
+            });
+        }
+        Ok(())
+    }
+}
+
+impl PreparedCircuit for CpuCircuit {
+    fn backend_name(&self) -> &'static str {
+        "cpu"
+    }
+    fn n_vars(&self) -> usize {
+        self.pk.n_vars
+    }
+    fn n_public(&self) -> usize {
+        self.pk.n_public
+    }
+    fn domain_size(&self) -> usize {
+        self.domain.size
+    }
+    fn key(&self) -> &ProvingKey {
+        &self.pk
+    }
+
+    fn compute_h(&self, witness: &[Fr], t: &mut StageTimings) -> Result<HPoly, ProveError> {
+        self.check_witness(witness)?;
+
+        // Stage 0. There is no C matrix in the zkey: snarkjs' buildABC1 fills C by
+        // multiplying the A and B evaluations pointwise, which is exact because the R1CS
+        // constraint *is* a*b = c, so on the domain the C evaluations are that product.
+        let start = Instant::now();
+        let (mut a, mut b) = stage!(
+            "s0 gather A and B (concurrent)",
+            rayon::join(|| self.gather(0, witness), || self.gather(1, witness))
+        );
+        let mut c: Vec<Fr> = stage!(
+            "s0 build C = A*B pointwise",
+            a.par_iter()
+                .zip(b.par_iter())
+                .map(|(x, y)| *x * y)
+                .collect()
+        );
+        t.gather_us += start.elapsed().as_micros() as u64;
+
+        // Stages 1-3, three vectors through iNTT -> coset shift -> NTT, concurrently.
+        // The previous shape ran them one after another on the grounds that each
+        // transform is already internally parallel and the three would fight for the
+        // pool. Measured, that claim was wrong: one transform only scales 6.1-6.8x on
+        // 12 cores, so sequential left a third of the machine idle, and running the
+        // three at once takes stages 1-3 from 12.4 to 10.2 ms at 2^16 and from 23.9 to
+        // 20.6 at 2^17 (csp warm medians, same session).
+        //
+        // The bit-reversed forms rather than `CpuNtt::ntt`: a decimation-in-frequency
+        // inverse hands its output to a decimation-in-time forward with both permutations
+        // cancelled, and the shift stage between them indexes its cached table in the
+        // same order. Only the intermediate order changes; the stage 3 output is
+        // identical to the bit, and the iNTT's 1/n rides the shift table for free.
+        //
+        // The three windows below overlap, like the MSM annotations. `ntt_us` takes the
+        // whole wall-clock window, coset shift included, so from here `pointwise_us`
+        // covers stage 4 only.
+        let start = Instant::now();
+        self.ntt
+            .prepare_intt_coset_ntt(&self.domain, self.coset_shift);
+        let pipeline = |v: &mut [Fr]| self.ntt.intt_coset_ntt(&self.domain, v, self.coset_shift);
+        rayon::join(
+            || stage!("s1-3 A: iNTT, coset, NTT", pipeline(&mut a)),
+            || {
+                rayon::join(
+                    || stage!("s1-3 B: iNTT, coset, NTT", pipeline(&mut b)),
+                    || stage!("s1-3 C: iNTT, coset, NTT", pipeline(&mut c)),
+                )
+            },
+        );
+        t.ntt_us += start.elapsed().as_micros() as u64;
+
+        // Stage 4. No division by Z. snarkjs' `joinABC` computes exactly `a*b - c` and
+        // feeds it straight to the H multiexp, because the Z division is folded into the
+        // section 9 bases at setup: they are the odd Lagrange polynomials of the 2n
+        // domain, and P = A*B - C vanishes on the even points (those are the constraint
+        // rows), so `sum_i P(inc^(2i+1)) * hExps[i]` already equals `[P(tau)]_1`, which
+        // is `[H(tau) * Z(tau)]_1`. Dividing here as well would double-count the Z.
+        let start = Instant::now();
+        // In place into `a`: a fourth `collect` here would spend most of the stage on
+        // allocation and first-touch page faults, not on the n multiplies it exists for.
+        stage!(
+            "s4 H = A*B - C",
+            a.par_iter_mut()
+                .zip(b.par_iter())
+                .zip(c.par_iter())
+                .for_each(|((x, y), z)| *x = *x * y - z)
+        );
+        t.pointwise_us += start.elapsed().as_micros() as u64;
+
+        // `b` and `c` are witness images too. `a` is now `H` and is zeroed when that drops.
+        crate::scrub(&mut b);
+        crate::scrub(&mut c);
+        Ok(HPoly::Host(a))
+    }
+
+    fn msms(
+        &self,
+        witness: &[Fr],
+        h: &HPoly,
+        t: &mut StageTimings,
+    ) -> Result<MsmOutputs, ProveError> {
+        self.check_witness(witness)?;
+        // The CPU backend has nowhere else to keep H, so a device handle here can only
+        // have come from another backend and there is nothing sane to do with it.
+        let h = h.to_host().ok_or_else(|| ProveError::Backend {
+            backend: "cpu",
+            reason: "compute_h output came from another backend".to_string(),
+        })?;
+        if h.len() != self.domain.size {
+            return Err(ProveError::Backend {
+                backend: "cpu",
+                reason: format!(
+                    "h has {} entries, domain size is {}",
+                    h.len(),
+                    self.domain.size
+                ),
+            });
+        }
+
+        // The base vectors are checked here and not in `new` the way the GPU backends do
+        // it, because this circuit is also the stage 0-4 oracle those backends are diffed
+        // against and the tests that use it that way carry keys with no bases at all (see
+        // `synthetic_key` in snarkrs-wgpu's stages test). Four length compares per proof is
+        // nothing, and without them a short query reaches `snarkrs-msm`'s deliberate hard
+        // `assert_eq!`, which under `panic = "abort"` is a SIGABRT rather than the
+        // `ProveError::Backend` every other backend returns.
+        for (name, got) in [
+            ("a_query", self.pk.a_query.len()),
+            ("b_g1_query", self.pk.b_g1_query.len()),
+            ("b_g2_query", self.pk.b_g2_query.len()),
+        ] {
+            if got != self.pk.n_vars {
+                return Err(ProveError::Backend {
+                    backend: "cpu",
+                    reason: format!("{name} has {got} bases, n_vars is {}", self.pk.n_vars),
+                });
+            }
+        }
+        if self.pk.h_query.len() != self.domain.size {
+            return Err(ProveError::Backend {
+                backend: "cpu",
+                reason: format!(
+                    "h_query has {} bases, domain size is {}",
+                    self.pk.h_query.len(),
+                    self.domain.size
+                ),
+            });
+        }
+
+        // Section 8 covers the private wires only: witness[0] is the constant 1 and
+        // witness[1..=n_public] are the public inputs, both of which the verifier folds
+        // into L_bar through IC instead.
+        let l_scalars = &witness[self.pk.n_public + 1..];
+        if l_scalars.len() != self.pk.l_query.len() {
+            return Err(ProveError::Backend {
+                backend: "cpu",
+                reason: format!(
+                    "l_query has {} bases, private witness is {} long",
+                    self.pk.l_query.len(),
+                    l_scalars.len()
+                ),
+            });
+        }
+
+        let start = Instant::now();
+        // The five MSMs overlap through nested joins. Not because four of them are cheap:
+        // only 1.80% of witness scalars are 0 or 1 on the two largest circuits, 4.12% at
+        // the sparsest point on the ladder, so none of them drains early
+        // (bench/results/profiling/). The nesting is worth 1.01x at 140,261 constraints
+        // and 1.77x at 2, and it lifts occupancy on a pool that otherwise idles: a proof
+        // measures 9.41 busy cores out of 12. `examples/msm_shape.rs` times them one at a
+        // time.
+        let ((a_g1, b_g2), ((b_g1, l_g1), h_g1)) = rayon::join(
+            || {
+                rayon::join(
+                    || stage!("s5 MSM A -> G1", self.msm.msm_g1(&self.pk.a_query, witness)),
+                    || {
+                        stage!(
+                            "s6 MSM B -> G2",
+                            self.msm.msm_g2(&self.pk.b_g2_query, witness)
+                        )
+                    },
+                )
+            },
+            || {
+                rayon::join(
+                    || {
+                        rayon::join(
+                            || {
+                                stage!(
+                                    "s7 MSM B -> G1",
+                                    self.msm.msm_g1(&self.pk.b_g1_query, witness)
+                                )
+                            },
+                            || {
+                                stage!(
+                                    "s8 MSM L -> G1",
+                                    self.msm.msm_g1(&self.pk.l_query, l_scalars)
+                                )
+                            },
+                        )
+                    },
+                    // Every one of the `domain_size` bases is used. The "only n-1 are
+                    // nonzero" rule belongs to the coefficient-form convention; in
+                    // snarkjs' evaluation form all n entries are generically nonzero.
+                    || stage!("s9 MSM H -> G1", self.msm.msm_g1(&self.pk.h_query, h)),
+                )
+            },
+        );
+        t.msm_us += start.elapsed().as_micros() as u64;
+
+        Ok(MsmOutputs {
+            a_g1,
+            b_g2,
+            b_g1,
+            l_g1,
+            h_g1,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tiny_key() -> Option<ProvingKey> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../bench/artifacts/tiny_mul/circuit.zkey");
+        if !path.is_file() {
+            eprintln!("SKIPPED: no tiny_mul artifact");
+            return None;
+        }
+        Some(ProvingKey::load(&path).unwrap())
+    }
+
+    #[test]
+    fn rejects_a_domain_that_would_round_up() {
+        for size in [0, 3, 3072] {
+            let Some(mut pk) = tiny_key() else { return };
+            pk.domain_size = size;
+            let Err(err) = CpuCircuit::new(pk) else {
+                panic!("accepted domain size {size}");
+            };
+            assert!(err.to_string().contains("not a power of two"), "{err}");
+        }
+    }
+
+    /// `gather` reads a decreasing pair as an empty range, so this key would have produced
+    /// a silently zeroed row rather than any kind of failure. Every GPU backend rejects it,
+    /// and the reference must not be quieter than the things it is the reference for.
+    #[test]
+    fn rejects_a_non_monotone_row_ptr() {
+        let Some(mut pk) = tiny_key() else { return };
+        let rp = &mut pk.coeffs.row_ptr[0];
+        // Lift the start of a nonempty row above its end. Touching a row start rather than
+        // a row end leaves the last entry alone, so this fails the monotonicity check and
+        // not the nonzero-count one.
+        let c = (1..rp.len())
+            .find(|&c| rp[c] > rp[c - 1])
+            .expect("matrix A has no nonzeros");
+        rp[c - 1] = rp[c] + 1;
+        let Err(err) = CpuCircuit::new(pk) else {
+            panic!("accepted a non-monotone row_ptr");
+        };
+        assert!(err.to_string().contains("not monotone"), "{err}");
+    }
+
+    /// The private witness is `witness[n_public + 1..]`, and under the release profile's
+    /// `panic = "abort"` a key that makes that slice out of range kills the process
+    /// instead of returning.
+    #[test]
+    fn rejects_a_key_with_more_public_inputs_than_wires() {
+        let Some(mut pk) = tiny_key() else { return };
+        pk.n_public = pk.n_vars;
+        let Err(err) = CpuCircuit::new(pk) else {
+            panic!("accepted n_public == n_vars");
+        };
+        assert!(err.to_string().contains("exceeds n_vars"), "{err}");
+    }
+
+    #[test]
+    fn gather_bit_shortcuts_match_multiplication() {
+        let Some(pk) = tiny_key() else { return };
+        let circuit = CpuCircuit::new(pk).unwrap();
+        let mut rng = ark_std::test_rng();
+        for value in [Fr::zero(), Fr::one(), -Fr::one(), Fr::rand(&mut rng)] {
+            let witness = vec![value; circuit.n_vars()];
+            for m in 0..2 {
+                let coeffs = &circuit.pk.coeffs;
+                let want: Vec<Fr> = coeffs.row_ptr[m]
+                    .windows(2)
+                    .map(|row| {
+                        (row[0] as usize..row[1] as usize)
+                            .map(|k| coeffs.value[m][k] * witness[coeffs.signal[m][k] as usize])
+                            .sum()
+                    })
+                    .collect();
+                assert_eq!(circuit.gather(m, &witness), want);
+            }
+        }
+    }
+
+    /// The coset the prover evaluates on is fixed by the zkey's section 9 bases, so these
+    /// two identities are a contract with snarkjs, not an implementation detail:
+    /// `shift^2` must be the domain's own generator (so evaluation index `i` lands on
+    /// `shift^(2i+1)`) and `shift^n` must be -1 (so the coset is the *odd* half of the
+    /// 2n-th roots of unity, which is the half section 9 was built from).
+    #[test]
+    fn the_coset_shift_is_the_odd_half_of_the_2n_th_roots() {
+        for log_n in 0..12u32 {
+            let n = 1usize << log_n;
+            let domain = Domain::new(n).unwrap();
+            let shift = Domain::new(2 * n).unwrap().group_gen;
+            assert_eq!(shift * shift, domain.group_gen, "n = {n}");
+            assert_eq!(shift.pow([n as u64]), -Fr::one(), "n = {n}");
+            // And therefore the coset misses the domain entirely, which is what makes
+            // A*B - C nonzero on it.
+            assert_ne!(shift.pow([n as u64]), Fr::one(), "n = {n}");
+        }
+    }
+}

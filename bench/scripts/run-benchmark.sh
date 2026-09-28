@@ -235,9 +235,9 @@ if [ "${NO_BUILD:-0}" = "1" ]; then
 else
   log "building"
   if [ -n "$FEATURES" ]; then
-    ( cd "$HERE" && cargo build --release -p snarkrs --features "$FEATURES" )
+    ( cd "$HERE" && cargo build --release -p snarkrs-cli --features "$FEATURES" )
   else
-    ( cd "$HERE" && cargo build --release -p snarkrs )
+    ( cd "$HERE" && cargo build --release -p snarkrs-cli )
   fi
 fi
 

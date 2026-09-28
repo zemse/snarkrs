@@ -1,4 +1,4 @@
-//! `g16-csp-wit`: time witness generation on its own, nothing else.
+//! `snarkrs-csp-wit`: time witness generation on its own, nothing else.
 //!
 //! The bench binary reports witness generation as one number inside a proof. This one
 //! runs only that call, so a sampling profiler attributing time inside the linked
@@ -9,7 +9,7 @@
 
 use anyhow::{ensure, Result};
 use clap::Parser;
-use g16_csp::{circuits, inputs, Target, Variant};
+use snarkrs_csp::{circuits, inputs, Target, Variant};
 use std::time::{Duration, Instant};
 
 #[derive(Parser)]

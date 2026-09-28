@@ -156,13 +156,13 @@ a circuit is MSM-bound or transform-bound:
 ## using it as a library
 
 ```rust
-use g16_core::{prove::prove, verify::verify, Backend, StageTimings};
-use g16_zkey::{wtns::Witness, ProvingKey};
+use snarkrs_groth16::{prove::prove, verify::verify, Backend, StageTimings};
+use snarkrs_formats::{wtns::Witness, ProvingKey};
 
 // warm pk once for repeated proving the same circuit
 let pk = ProvingKey::load(std::path::Path::new("circuit.zkey"))?;
 let n_public = pk.n_public;
-let circuit = g16_metal::MetalBackend::new()?.prepare(pk)?;
+let circuit = snarkrs_metal::MetalBackend::new()?.prepare(pk)?;
 
 let w = Witness::load(std::path::Path::new("circuit.wtns"))?.0;
 let mut t = StageTimings::default();
@@ -172,7 +172,7 @@ let public = &w[1..=n_public];
 verify(&circuit.key().vk, public, &proof)?;
 ```
 
-Swap `MetalBackend` for `g16_core::cpu::CpuBackend` or `g16_cuda::CudaBackend` to change
+Swap `MetalBackend` for `snarkrs_groth16::cpu::CpuBackend` or `snarkrs_cuda::CudaBackend` to change
 where it runs; nothing else in the snippet changes, which is the point of the trait.
 
 The blinders come from the OS CSPRNG. There is no seed override on this path on purpose: a
@@ -184,12 +184,12 @@ deterministic entry point stays test-only.
 `prove` takes the witness as `&[Fr]`, so it never has to be a file:
 
 ```rust
-use g16_core::{prove::prove, Backend, StageTimings};
-use g16_witness::{Input, WitnessCalculator};
-use g16_zkey::ProvingKey;
+use snarkrs_groth16::{prove::prove, Backend, StageTimings};
+use snarkrs_witness::{Input, WitnessCalculator};
+use snarkrs_formats::ProvingKey;
 
 let pk = ProvingKey::load(std::path::Path::new("circuit.zkey"))?;
-let circuit = g16_metal::MetalBackend::new()?.prepare(pk)?;
+let circuit = snarkrs_metal::MetalBackend::new()?.prepare(pk)?;
 
 // compile the wasm once, then one witness per input
 let calc = WitnessCalculator::from_file(std::path::Path::new("circuit_js/circuit.wasm"))?;

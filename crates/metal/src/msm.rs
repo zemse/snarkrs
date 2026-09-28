@@ -1,0 +1,3888 @@
+//! Stages 5-9: the five Pippenger multi-scalar multiplications, on the GPU.
+//!
+//! The algorithm and every decision behind it are documented at the top of
+//! `src/shaders/msm.metal`, which is the half of this module that does the work. In
+//! summary: a counting sort by bucket index built from 32-bit atomics on plain counters,
+//! so no bucket is ever written by two threads; a segmented accumulation that gives every
+//! thread a fixed-length slice of the sorted entries, so per-thread work is uniform even
+//! when one bucket holds a tenth of the input; and a threadgroup reduction that hands the
+//! host one point per window.
+//!
+//! What this file owns is the shape of the submission, and that is where the Apple
+//! silicon result actually lives. Measured on this M2 Max during the scouting phase, a
+//! command buffer costs 0.16 ms to commit and wait on, and does not get cheaper with
+//! less work in it, while an extra dispatch encoded into an already-open command buffer
+//! costs 2 to 3 us. That is a factor of about 60. Both Metal MSM implementations we read
+//! submit one command buffer per stage, four or more per MSM; at this prover's domain
+//! sizes that alone would cost more than the arithmetic. [`MetalMsm::msm_batch`]
+//! therefore encodes every job it is handed into ONE command buffer with ONE
+//! `wait_until_completed`, and reads back a few hundred points at the end. The proving
+//! path hands it all five MSMs below a 2^17 domain; at and above it `MetalCircuit`
+//! splits them into two batches so the witness four can run while `compute_h` is still
+//! on the other queue (see `backend::overlap_pays`).
+//!
+//! # What is on the GPU and what is not
+//!
+//! On the GPU: the scalar classification and signed-digit recoding, the counting sort,
+//! bucket accumulation for both G1 and G2, the bucket merge, the per-window reduction,
+//! and the sum of the bases whose scalar is 1. G2 is not a CPU fallback; `Fq` and `Fq2`
+//! are implemented in MSL in this crate because the field prelude only covers `Fr`.
+//!
+//! On the host: packing the scalars into standard form, choosing the window width, the
+//! Horner combination of `n_windows` points per MSM, and the sum of the per-threadgroup
+//! partials. That is a few hundred curve additions per proof against tens of millions on
+//! the device, and it is the same place zkonduit's Metal MSM leaves its window tail, for
+//! the same reason: the serial part is small enough that moving it costs more in
+//! dispatches than it saves.
+//!
+//! # Measured, on this M2 Max
+//!
+//! Stages 5-9 only, warm, medians of nine. Bases upload is `prepare` work and is outside
+//! both timed regions; host scalar packing is per-proof work and is inside the GPU's.
+//!
+//! | artifact | constraints | CPU ms | GPU ms | speedup |
+//! |---|---|---|---|---|
+//! | `tiny_mul` | 2 | 0.26 | 2.5 | **0.10x** |
+//! | `js_1x1_d8` | 3,359 | 17.9 | 17.5 | 1.02x |
+//! | `js_2x2_d16` | 10,153 | 48.8 | 25.4 | 1.9x |
+//! | `js_2x2_d32` | 17,929 | 83.4 | 30.4 | 2.7x |
+//! | `js_8x8_d32` | 70,357 | 284 | 76 | 3.7x |
+//! | `js_16x16_d32` | 140,261 | 533 | 127 | 4.2x |
+//!
+//! The crossover sits at roughly 3,400 constraints, and below it the GPU loses badly:
+//! at `tiny_mul` the whole batch is dispatch and submission cost, ten times what the
+//! CPU needs to do the arithmetic. That is a real result and the reason
+//! [`MetalMsm::msm_batch`] exists in the shape it does rather than as five calls.
+//!
+//! Two caveats on the speedups, both structural. Stages 5-9 are 76 to 82% of CPU proving
+//! time, so 4.2x here is not 4.2x on a proof; and the CPU side of the comparison is our
+//! own Pippenger, which is itself 11 to 19% behind rapidsnark.
+
+use std::collections::HashMap;
+use std::ops::Range;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+use ark_ff::{AdditiveGroup, One, Zero};
+use metal::objc::{msg_send, sel, sel_impl};
+use metal::{
+    Buffer, CommandBufferRef, CommandQueueRef, CompileOptions, ComputeCommandEncoderRef,
+    ComputePipelineState, Device, MTLDispatchType, MTLSize,
+};
+
+use snarkrs_field::{Fr, G1Affine, G1Projective, G2Affine, G2Projective};
+use snarkrs_groth16::ProveError;
+
+use crate::kernels::{FR_MSL, MSM_MSL, SEAL_MSL};
+use crate::layout::{Packed, PackedFq, PackedFq2, PackedG1Affine, PackedG2Affine, PackedScalar};
+
+fn err(reason: impl Into<String>) -> ProveError {
+    ProveError::Backend {
+        backend: "metal",
+        reason: reason.into(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Window sizing
+// ---------------------------------------------------------------------------
+
+/// Bits the signed recoding is laid out over: 254 for BN254's `Fr`, plus one so the
+/// carry out of the top window is provably zero.
+const RECODE_BITS: usize = 255;
+const _: () = assert!(RECODE_BITS == snarkrs_msm::RECODE_BITS);
+
+/// Caps the bucket array at 2^15 points per window.
+const MAX_WINDOW: u32 = 16;
+
+/// Whether an MSM's cost may depend on the scalar values. The Metal twin of
+/// `snarkrs_msm`'s, decided per scalar upload so a plan built over the buffer inherits it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Work {
+    /// No scalar is classified or skipped: every one of the `n` scalars emits one entry
+    /// per window, a zero digit into one of [`DUMMY_ROWS`] rows behind the real buckets
+    /// that nothing reads, and the window is priced for `n` scalars over the full 255
+    /// bits. The window width, every buffer, every dispatch and the number of mixed
+    /// additions then follow the key (`n`, and which bases are at infinity) and not the
+    /// witness.
+    ///
+    /// That closes the channel of "Remote Side-Channel Attacks on Anonymous
+    /// Transactions" (USENIX Security 2020), which recovered Zcash witness sparsity from
+    /// proving time. The merge is the fixed tree of `msm_fold_*` rather than a walk per
+    /// bucket, and the fold and the reduce add with the complete formulas (`Proj` in
+    /// msm.metal), so an empty bucket or slot costs what a full one does. It is not
+    /// constant time in the strict sense: bucket occupancy still follows the digit
+    /// values, so the atomics' contention and the accumulation's run count stay data
+    /// dependent, as in every Pippenger; see
+    /// [`MetalBackend::constant_work`](crate::MetalBackend::constant_work) for what that
+    /// leaves.
+    ///
+    /// What it costs is what the zeros and ones were saving, so it is priced per
+    /// circuit in `MetalBackend::constant_work`: about a fifth on a dense witness, 4-6x
+    /// on a bit-heavy one.
+    Constant,
+    /// Zero scalars are dropped, one scalars go to the ones gather, the window is sized
+    /// for the rest over the bits they actually use. Running time, buffer sizes and the
+    /// dispatch geometry then follow how many witness entries are zero or one.
+    Variable,
+}
+
+/// Dummy rows per window under [`Work::Constant`]. A power of two, so a thread's row is
+/// its index masked; several rather than one only so the zero digits' atomics spread
+/// over that many addresses instead of serialising on one.
+const DUMMY_ROWS: usize = 64;
+const _: () = assert!(DUMMY_ROWS.is_power_of_two());
+
+/// Mixed additions, G1-weighted, that one command buffer of a split batch may hold in
+/// its accumulation piece: about 14 ms at `MADD_US`, the size of a transform buffer.
+/// See [`Submission`].
+const SPLIT_BUDGET: usize = 1 << 22;
+
+/// Threads per threadgroup in the reduction and the ones kernel. Must equal `REDUCE_TG`
+/// in `msm.metal`, which sizes the threadgroup array; the dispatch may use fewer if the
+/// pipeline reports a lower maximum, and the kernel reads the real count at runtime.
+const REDUCE_TG: usize = 64;
+
+/// Threadgroup array size of the prefix-sum kernel. Same contract as [`REDUCE_TG`].
+const SCAN_TG: usize = 256;
+
+/// Threads per threadgroup in the wide merge. Same contract as [`REDUCE_TG`].
+const MERGE_TG: usize = 64;
+
+/// The spill slot sentinel. Must equal `MSM_NO_ROW` in `msm.metal`: a slot holding it
+/// spilled nothing, and the host-tail combine skips it the way `msm_merge_*` does.
+const MSM_NO_ROW: u32 = u32::MAX;
+
+/// Entries one thread of the segmented accumulation owns.
+///
+/// Accumulation costs `SLICE_LEN` mixed additions per thread and the merge costs
+/// `max_bucket_count / SLICE_LEN` full additions for the fattest bucket, so the balance
+/// point is near the square root of the worst occupancy, which is a few hundred on these
+/// artifacts. 64 sits under that on purpose: it also keeps the thread count high enough
+/// to fill the machine at the smaller domains, where there are only a few thousand
+/// slices to begin with. Override with `G16_METAL_MSM_L` to sweep it.
+const SLICE_LEN: usize = 64;
+
+fn slice_len() -> usize {
+    std::env::var("G16_METAL_MSM_L")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(SLICE_LEN)
+}
+
+/// Slice length the segmented accumulation actually dispatches with, per plan.
+///
+/// [`SLICE_LEN`] balances accumulation against merge for a plan big enough to fill the
+/// machine, and it is the constant the window cost model was fitted with, so
+/// [`window_size`] keeps reading it. But a witness plan has a few hundred general
+/// scalars: at 64 entries a slice that is ~500 threads, each a *dependent* chain of 64
+/// mixed additions, on a device that wants thousands of threads before it can hide any
+/// latency. Occupancy binds long before the merge does, so small plans trade slice
+/// length for threads until the dispatch reaches [`SEG_TARGET_THREADS`]. Measured on
+/// the csp artifacts: the witness plans' bucket half drops 2x in G1 and G2 both, and a
+/// plan at H's size keeps slice 64 and does not move.
+const SEG_TARGET_THREADS: usize = 4096;
+
+fn slice_len_for(n_windows: usize, cap: usize) -> usize {
+    let forced = std::env::var("G16_METAL_MSM_L")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0);
+    if let Some(l) = forced {
+        return l;
+    }
+    let mut l = SLICE_LEN;
+    while l > 8 && n_windows * cap.div_ceil(l) < SEG_TARGET_THREADS {
+        l /= 2;
+    }
+    l
+}
+
+/// Threadgroups per window in the reduce, chosen the same way [`slice_len_for`] chooses
+/// its slice length: by occupancy, not by work.
+///
+/// One threadgroup per window was fine at c=8, where 32 windows of 128 buckets keep the
+/// segments short. At c=13 it is 20 threadgroups of [`REDUCE_TG`] threads on a device
+/// with more cores than threadgroups, each thread a dependent chain of 128 full
+/// additions, and it measured 3.96 ms *flat between 2^16 and 2^17*: cost that does not
+/// scale with the input is latency, not work. Splitting each window across groups costs
+/// one `pt_mul_small` per thread (the segment identity already carries the window-global
+/// bucket offset) plus `reduce_groups - 1` host-side additions per window, both noise.
+/// Groups double until the dispatch reaches [`REDUCE_TARGET_THREADS`], floored so every
+/// thread keeps at least two buckets per group. One bucket per thread is where the split
+/// stops paying: at c=8 it halves 128 buckets into a lane each, and the fixed
+/// `pt_mul_small` every lane owes then outweighs the segment it saves. Counting the
+/// shader's segment loop, `pt_mul_small` and the threadgroup tree for a full window gives
+/// 8,251 G1 field products at one group against 13,809 at two, and the mid-ladder
+/// circuits measure the difference: `js_1x1_d8` 7.24 ms against 7.57, `js_2x2_d16` 12.88
+/// against 13.16, `railgun-01x01` 18.46 against 18.81, `tornado` 24.85 against 25.07. The target is higher than the
+/// accumulation's because a reduce thread pays a fixed `pt_mul_small` on top of its
+/// segment, so past the sweet spot more threads mean more of that tax: at c=13 on the
+/// csp artifacts the sweep read 2.52 ms at 4 groups, 2.06 at 8, 2.48 at 16, 3.68 at 32.
+/// Override with `G16_METAL_MSM_RG` to sweep it.
+const REDUCE_TARGET_THREADS: usize = 8192;
+
+fn reduce_groups_for(n_windows: usize, n_buckets: usize) -> usize {
+    let forced = std::env::var("G16_METAL_MSM_RG")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0);
+    if let Some(g) = forced {
+        return g.min(n_buckets.max(1));
+    }
+    let mut g = 1;
+    while n_buckets / (2 * g) >= 2 * REDUCE_TG && n_windows * g * REDUCE_TG < REDUCE_TARGET_THREADS
+    {
+        g *= 2;
+    }
+    g
+}
+
+/// Buckets at or below which a one-window plan skips the GPU merge and reduce and
+/// finishes in [`Outputs::combine`] instead.
+///
+/// A one-window witness plan on the csp keccak circuits has 256 buckets holding a few
+/// hundred entries, and its reduce dispatches `reduce_groups * REDUCE_TG` threads, 128
+/// on a device with 4,864 ALUs, each a dependent chain of point additions capped by a
+/// `pt_mul_small` and a six-level threadgroup tree. That is latency, not work: the G2
+/// reduce measured 2.96 ms against a 0.014 ms arithmetic floor, and sweeping
+/// `G16_METAL_MSM_RG` moved it only to 2.20, because no group count fixes a dispatch
+/// two threadgroups wide. The host does the same 2 * 256 additions plus the spill fold
+/// in well under half a millisecond inside the rayon combine, where the module already
+/// sums the per-threadgroup partials and runs the Horner. 256 is the largest shape
+/// measured; a one-window plan can in principle carry up to 2^15 buckets, and 2 * 2^15
+/// host additions would cost more than the dispatch it replaces.
+///
+/// Measured in production at keccak_128: the witness batch's device time drops from
+/// 8.33 ms to 2.58 on the driver clock, and the warm minima move by -0.3 there, -0.1
+/// at keccak_256 and -0.5 at keccak_512, with sha256 and the whole ladder flat. The
+/// wall win is a tenth of the device win because the removed dispatches were latency,
+/// not throughput: the second queue's arbitration was already filling their idle lanes
+/// with transform and H work, so most of what they cost was borne off the critical
+/// path. What the change buys beyond the milliseconds is headroom: those 5.7 ms stop
+/// competing with the transforms the moment anything else on the device gets faster.
+const HOST_TAIL_MAX_BUCKETS: usize = 256;
+
+/// Expected slice span of a top-window bucket at or above which its merge moves to
+/// `msm_merge_wide_*`, one threadgroup per bucket instead of one thread.
+///
+/// `msm_merge_*` walks a bucket's slice range serially, so a top-window bucket whose
+/// run spans dozens of slices holds the whole merge dispatch open in a single lane.
+/// The wide kernel strides the range across [`MERGE_TG`] threads and folds a tree.
+/// Below the threshold the serial walk is already two or three dependent additions and
+/// a threadgroup would only add barriers.
+///
+/// Measured on the csp keccak circuits with overlap off, driver clock: the H merge
+/// phase drops from 0.85 to 0.65 ms at 2^17 (span 16) and from 1.57 to 0.78 ms at 2^18
+/// (span 32); at 2^19 the top window is full (c=15 spends all 15 top bits), the span
+/// estimate is below one and the wide path stays off. Warm medians move by the same
+/// amounts, -0.35 and -0.85 ms, because the H MSM is the critical path. Override with
+/// `G16_METAL_MSM_WIDE` to sweep it; 0 disables the wide path.
+const MERGE_WIDE_MIN_SPAN: usize = 4;
+
+fn merge_wide_min_span() -> usize {
+    std::env::var("G16_METAL_MSM_WIDE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(MERGE_WIDE_MIN_SPAN)
+}
+
+/// Spill slots one thread of `msm_fold_*` takes per level: the constant-work merge,
+/// whose shape follows the key rather than which buckets the digits landed in.
+///
+/// Swept at 2^18 (c=13, 8192 slices a window), merge phase on a dense witness, G1/G2:
+/// 4 slots 0.96/3.60 ms over seven levels, 8 0.98/3.88 over five, 16 1.17/4.66, 32
+/// 1.57/7.03; the longer the group the longer each thread's dependent chain. 8 ties 4
+/// with two fewer barriers. Override with `G16_METAL_MSM_FOLD` (at least 4, so every
+/// level shrinks the slot count).
+const FOLD_LEN: usize = 8;
+
+fn fold_len() -> usize {
+    std::env::var("G16_METAL_MSM_FOLD")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v >= 4)
+        .unwrap_or(FOLD_LEN)
+}
+
+/// Bucket rows at or above which the scatter's windows split into two serial
+/// dispatches.
+///
+/// Every scatter store lands on the cache line holding its bucket run's tail, so the
+/// kernel keeps one line per row live: 128 bytes times the row count. The c=13 H plans
+/// hold 81,920 rows, 10.5 MB, and their scattered stores cost 0.07 ms over 2.6 M
+/// entries; the c=15 plan holds 278,528 rows, 35.6 MB against a cache shared with the
+/// scalar stream, and pays 0.58 ms over 8.9 M entries, 2.4x more per entry. Halving
+/// the live set by dispatching the windows in two serial halves measured 0.88 to
+/// 0.62 ms at that shape (three halves tied, four lost), while the c=13 shapes lost
+/// 0.01 ms to the second scalar read, so the split starts where they end. Override
+/// with `G16_METAL_MSM_SCATTER_SPLIT`; 0 keeps every plan in one dispatch.
+const SCATTER_SPLIT_ROWS: usize = 131072;
+
+fn scatter_split_rows() -> usize {
+    match std::env::var("G16_METAL_MSM_SCATTER_SPLIT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        Some(0) => usize::MAX,
+        Some(rows) => rows,
+        None => SCATTER_SPLIT_ROWS,
+    }
+}
+
+/// A job whose scalar range is a suffix of another job's in the same batch rides that
+/// job's digit pipeline when the prefix it skips is at most `1 / SHARE_MAX_SKIP` of the
+/// wider range.
+///
+/// The L MSM reads the witness past its public inputs, a few entries short of what A and
+/// B read, and its own plan was a second counting sort over the same digits: at 2^22 an
+/// entry array of about 420 MB and a count, scan and scatter. Riding the wider plan, its
+/// accumulation steps over the skipped points' entries, a load and a branch each, and its
+/// window, buckets and spill follow the wider range. Both costs grow with the prefix,
+/// hence the bound; the proving path skips `n_public + 1` of `n_vars`. Which entries
+/// are skipped follows the digits of the constant wire and the public inputs, so under
+/// [`Work::Constant`] the branch reveals nothing the verifier does not hold.
+const SHARE_MAX_SKIP: usize = 8;
+
+/// Where the plan of each `(buffer, scalar_off, n)` job starts. Two jobs share a digit
+/// pipeline when they read the same scalars over the same range, or when one's range is
+/// a suffix of the other's that skips at most `1 / SHARE_MAX_SKIP` of it.
+fn plan_starts(jobs: &[(usize, usize, usize)]) -> Vec<usize> {
+    // The lowest start of every range that ends at the same scalar of the same buffer.
+    let mut lowest: HashMap<(usize, usize), usize> = HashMap::new();
+    for &(id, soff, n) in jobs {
+        let lo = lowest.entry((id, soff + n)).or_insert(soff);
+        *lo = (*lo).min(soff);
+    }
+    jobs.iter()
+        .map(|&(id, soff, n)| {
+            let end = soff + n;
+            let lo = lowest[&(id, end)];
+            if (soff - lo) * SHARE_MAX_SKIP <= end - lo {
+                lo
+            } else {
+                soff
+            }
+        })
+        .collect()
+}
+
+/// `G16_METAL_MSM_LEGACY_ACC=1` swaps the segmented accumulation for the simple
+/// one-thread-per-bucket kernel. Kept only so the load-imbalance claim in
+/// `shaders/msm.metal` can be reproduced rather than taken on trust.
+fn legacy_accumulate() -> bool {
+    std::env::var("G16_METAL_MSM_LEGACY_ACC").as_deref() == Ok("1")
+}
+
+/// Window width for `m` scalars that actually reach the buckets.
+///
+/// `m` is the general-scalar count, not the input length. That distinction matters
+/// enormously: a 140k-long witness with 2k general scalars is a 2k problem, and sizing
+/// the window for 140k would allocate 16384 buckets per window and spend half a million
+/// point additions reducing buckets that 34k additions filled.
+///
+/// # Why this is not the CPU's cost model
+///
+/// The CPU minimises `W * (m + 3 * 2^(c-1))`: windows times bucket fills plus the
+/// running-sum reduction. On the GPU that model picks the wrong `c`, and the measurements
+/// say so loudly. On `js_8x8_d32`'s A MSM, forcing each width in turn gave
+/// c=11 23.9 ms, c=12 16.3, **c=13 9.5**, c=14 21.4, c=15 20.0. That is not a smooth
+/// curve with a shallow optimum, it is a 2.3x swing between neighbours, and the CPU
+/// model cannot see it because it has no term for the thing causing it.
+///
+/// The cause is the top window. The digits are laid out over `RECODE_BITS` bits in `W`
+/// windows of `c`, and `W * c` overshoots `RECODE_BITS` by up to `c - 1` bits, so the
+/// top window has only `RECODE_BITS - (W-1)*c` meaningful bits and its digits crowd into
+/// `2^(top_bits - 1)` buckets instead of `2^(c-1)`. At c=11 that is TWO buckets holding
+/// half the scalars each. On the CPU this costs nothing, because a serial bucket loop
+/// only cares about the total. On the GPU it is the critical path: those buckets' runs
+/// span thousands of slices, and `msm_merge_*` walks a bucket's slice range in one
+/// thread while the rest of the machine waits.
+///
+/// # The three terms, and where their constants come from
+///
+/// Fitted to this M2 Max by measuring five window widths on two artifacts and solving
+/// for the coefficients, then checked against the eight measurements not used in the fit
+/// (largest error 8%):
+///
+/// * `MADD_US` per bucket fill: `W * m` mixed additions.
+/// * `ROW_US` per bucket: `W * 2^(c-1)` buckets, each cleared, merged, and passed twice
+///   through the running-sum reduction.
+/// * `MERGE_US` per merge iteration on the fattest bucket, which is the serial term. It
+///   is 8300x the cost of a bucket fill because it happens in one lane with the rest of
+///   the device idle, which is exactly why it dominates when the top window degenerates.
+///
+/// `ROW_US` was refitted after [`reduce_groups_for`] landed, because most of what it
+/// priced was the old one-threadgroup-per-window reduce sitting idle: 2.06 ms over
+/// 81,920 rows is 0.025 us, down from 0.058. That refit is what moves H from c=8 to
+/// c=13 at 2^16, which does 37% fewer bucket fills and measured 6.16 ms against 7.36.
+/// Checked against a c sweep of {8, 10, 12, 13, 14, 16} on both csp artifacts: the
+/// model ranks c=13 first at both sizes, as the sweep does, and its largest absolute
+/// error (c=16, where the reduce's per-bucket cost keeps falling with bucket count) is
+/// on a width 78% off the winner.
+///
+/// Override with `G16_METAL_MSM_C` to sweep it.
+pub fn window_size(m: usize) -> u32 {
+    window_size_for(m, RECODE_BITS)
+}
+
+/// [`window_size`] with the recoding laid out over `recode_bits` instead of the full
+/// 255. A plan whose scalars are provably short (see [`ScalarBuf::bits_in`]) prices its
+/// windows over the bits it will actually dispatch, so the `windows * m` term stops
+/// charging for digit rows that hold nothing: at sha256_128 the four witness plans use
+/// 8 of the 51 windows a full-width layout would emit at c = 5.
+///
+/// A layout is at least one bit wide; 0 is read as 1.
+pub fn window_size_for(m: usize, recode_bits: usize) -> u32 {
+    if let Ok(v) = std::env::var("G16_METAL_MSM_C") {
+        if let Ok(c) = v.parse::<u32>() {
+            return c.clamp(2, MAX_WINDOW);
+        }
+    }
+    // `w - 1` in the loop below underflows at zero bits. `Plan::new` cannot get there,
+    // since it prices `bits_in + 1`, but this is public and its callers pick their own
+    // width.
+    let recode_bits = recode_bits.max(1);
+    /// One mixed addition in the segmented accumulation, microseconds.
+    const MADD_US: f64 = 0.00324;
+    /// One bucket's share of the clear, merge and reduction kernels, microseconds.
+    ///
+    /// Refit from 0.025 after the wide merge and the scan reduce cut what a row
+    /// costs, against production warm medians rather than isolated phases: the
+    /// anchors are c=10 winning tornado's plans at m about 33k (24.5 ms against 26.4
+    /// at the old c=8 and 30.2 at c=13), c=12 winning sha256's H at m=65,536 (its
+    /// minima read 9.9-10.0 against 10.2 at c=13, and c=10 loses at 10.4-10.7),
+    /// c=12 winning js_8x8_d32's witness plans at m about 69k by 2.5 ms, and c=13
+    /// and c=15 keeping the csp H jobs at 2^17/2^18 and 2^19. 0.022 holds every one
+    /// of those with at least 70 us of modelled margin; 0.025 tips the 65k H to
+    /// c=10, which is measured slower there.
+    const ROW_US: f64 = 0.022;
+    /// One iteration of the merge loop on the busiest bucket, microseconds. Serial.
+    const MERGE_US: f64 = 27.0;
+    /// The wide merge's floor, microseconds: its dispatch plus one threadgroup's
+    /// stride-and-tree. Bracketed rather than fitted: subtracting the spill half of
+    /// the measured merge phase leaves 60 to 160 us across the two csp sizes that
+    /// engage it, and no ranking above or below flips anywhere in that range. With
+    /// the wide path priced, forcing the once-pathological widths confirms the
+    /// model: at 2^17 c=12/13/14 measure 10.0/9.1/10.0 ms on the H job (they read
+    /// 27.5/11.2/27.8 before the wide merge), and at 2^19 c=15 keeps winning at
+    /// 27.3 against 29.5/29.8, so the blow-ups the serial term guarded against are
+    /// gone rather than merely repriced.
+    const WIDE_US: f64 = 100.0;
+
+    let slice = slice_len() as f64;
+    let mut best = 3;
+    let mut best_cost = f64::MAX;
+    for c in 3..=MAX_WINDOW {
+        let cu = c as usize;
+        let w = recode_bits.div_ceil(cu);
+        // Bits the top window actually reaches, hence how many of its buckets are live.
+        let top_bits = recode_bits - (w - 1) * cu;
+        let top_buckets = (1u64 << (top_bits.min(cu) - 1)) as f64;
+        let fattest = m as f64 / top_buckets;
+
+        // The serial walk only prices spans the wide merge leaves alone; past the
+        // threshold the fattest bucket costs one threadgroup's strided pass instead.
+        let span = fattest / slice;
+        let fat = if span >= MERGE_WIDE_MIN_SPAN as f64 {
+            WIDE_US + MERGE_US * span / MERGE_TG as f64
+        } else {
+            MERGE_US * span
+        };
+        let cost = MADD_US * (w * m) as f64 + ROW_US * (w << (cu - 1)) as f64 + fat;
+        if cost < best_cost {
+            best_cost = cost;
+            best = c;
+        }
+    }
+    best
+}
+
+// ---------------------------------------------------------------------------
+// Device-side structs
+// ---------------------------------------------------------------------------
+
+/// Mirrors `struct MsmParams` in `msm.metal`. All counts, no pointers, passed by
+/// `setBytes` so it never needs a buffer.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct MsmParams {
+    n: u32,
+    c: u32,
+    n_windows: u32,
+    n_buckets: u32,
+    cap: u32,
+    scalar_off: u32,
+    base_off: u32,
+    ones_groups: u32,
+    slice_len: u32,
+    slices: u32,
+    reduce_groups: u32,
+    merge_wide_base: u32,
+    merge_wide_rows: u32,
+    separate_ones: u32,
+    dummy_rows: u32,
+    seg_first: u32,
+    skip: u32,
+}
+
+/// A G1 point in extended Jacobian coordinates, as the kernels write it: 128 bytes,
+/// `x`, `y`, `zz`, `zzz`, with `x/zz` and `y/zzz` the affine coordinates.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PackedXyzzG1 {
+    pub x: PackedFq,
+    pub y: PackedFq,
+    pub zz: PackedFq,
+    pub zzz: PackedFq,
+}
+
+/// The G2 twin, 256 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PackedXyzzG2 {
+    pub x: PackedFq2,
+    pub y: PackedFq2,
+    pub zz: PackedFq2,
+    pub zzz: PackedFq2,
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<MsmParams>() == 68);
+    assert!(core::mem::size_of::<PackedXyzzG1>() == 128);
+    assert!(core::mem::size_of::<PackedXyzzG2>() == 256);
+};
+
+unsafe impl Packed for PackedXyzzG1 {}
+unsafe impl Packed for PackedXyzzG2 {}
+
+/// XYZZ to arkworks' Jacobian, with no field inversion.
+///
+/// XYZZ carries the invariant `ZZ^3 = ZZZ^2`, so setting the Jacobian `Z = ZZZ` gives
+/// `Z^2 = ZZ^3` and the point `(X * ZZ^2, Y * ZZ^3, ZZZ)` has
+/// `x = X*ZZ^2 / ZZ^3 = X/ZZ` and `y = Y*ZZ^3 / ZZZ^3 = Y/ZZZ`, which is exactly the
+/// XYZZ point. Three multiplications, versus two inversions if this went through affine,
+/// and there are hundreds of these per proof.
+impl PackedXyzzG1 {
+    pub fn to_projective(&self) -> G1Projective {
+        let zz = self.zz.to_fq();
+        if zz.is_zero() {
+            return G1Projective::zero();
+        }
+        let x = self.x.to_fq();
+        let y = self.y.to_fq();
+        let zzz = self.zzz.to_fq();
+        let zz2 = zz * zz;
+        G1Projective::new_unchecked(x * zz2, y * zz2 * zz, zzz)
+    }
+}
+
+impl PackedXyzzG2 {
+    pub fn to_projective(&self) -> G2Projective {
+        let zz = self.zz.to_fq2();
+        if zz.is_zero() {
+            return G2Projective::zero();
+        }
+        let x = self.x.to_fq2();
+        let y = self.y.to_fq2();
+        let zzz = self.zzz.to_fq2();
+        let zz2 = zz * zz;
+        G2Projective::new_unchecked(x * zz2, y * zz2 * zz, zzz)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Resident inputs
+// ---------------------------------------------------------------------------
+
+/// A base vector, repacked and resident on the device. Built once per key in
+/// `prepare`; the whole point of the `Backend` contract's stage grouping is that this
+/// never happens per proof.
+///
+/// `inf` remembers which bases are the point at infinity. A zkey is full of them: the B
+/// queries of the csp keys are 61% infinity, because a wire that appears in no B
+/// constraint still owns a slot. An infinity base contributes nothing whatever its
+/// scalar, so the ones gather (see [`Outputs::alloc`]) drops those indices on the host
+/// instead of paying a device load and a dead branch per point per proof.
+pub struct G1Bases {
+    buf: Buffer,
+    len: usize,
+    inf: Vec<bool>,
+}
+
+pub struct G2Bases {
+    buf: Buffer,
+    len: usize,
+    inf: Vec<bool>,
+}
+
+impl G1Bases {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl G2Bases {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+/// Chunk width of the classification pass in [`MetalMsm::upload_scalars`], and hence
+/// the granularity of [`ScalarBuf::bits_in`].
+const CLASSIFY_CHUNK: usize = 4096;
+
+/// Bit length of a packed standard-form scalar: one past the highest set bit, 0 for 0.
+fn scalar_bits(v: &[u32; 8]) -> u32 {
+    match v.iter().rposition(|w| *w != 0) {
+        Some(i) => i as u32 * 32 + 32 - v[i].leading_zeros(),
+        None => 0,
+    }
+}
+
+/// Scalars in **standard** form (see `layout`'s module docs for why not Montgomery),
+/// resident on the device.
+///
+/// `general_prefix[i]` is how many of the first `i` scalars are neither 0 nor 1. It is
+/// built during the pack, which already walks every scalar, so it is free, and it is
+/// what lets [`MetalMsm::msm_batch`] size the window and the entry array for the work
+/// that actually reaches the buckets rather than for the input length. A witness is
+/// typically over 99% zeros and ones, so the difference is two orders of magnitude.
+pub struct ScalarBuf {
+    buf: Buffer,
+    len: usize,
+    general_prefix: Option<Vec<u32>>,
+    /// Ascending indices of the scalars that are exactly 1, from the same
+    /// classification pass. Host-only: what reaches the device is the per-job gather
+    /// list [`Outputs::alloc`] filters from it, since which of these indices matter
+    /// also depends on the job's bases. `None` when the buffer was never classified.
+    ones_idx: Option<Vec<u32>>,
+    /// Per-[`CLASSIFY_CHUNK`] maximum scalar bit length, from the same pass. This is
+    /// what lets a plan drop its empty high windows: a scalar of `b` bits recodes
+    /// exactly in `ceil((b + 1) / c)` signed windows, and on the csp circuits the
+    /// witness values are mostly 32-bit words, so 43 of the 51 windows a full-width
+    /// layout emits at c = 5 hold nothing. `None` when the buffer was never classified.
+    chunk_bits: Option<Vec<u32>>,
+    /// Under [`Work::Constant`] a plan over this buffer ignores the three fields above
+    /// even if they are set, and prices itself for `n` scalars over the full width.
+    work: Work,
+    /// Somewhere a plan over the whole buffer may put its digit entries instead of the
+    /// pool. See [`Lent`].
+    lent: Option<Lent>,
+}
+
+impl ScalarBuf {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// This buffer with `lent` offered to the plan that covers all of it.
+    pub(crate) fn with_lent(mut self, lent: Option<Lent>) -> Self {
+        self.lent = lent;
+        self
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// General scalars in `range`, or the whole range's length when the buffer came from
+    /// the device and was never classified on the host. Overestimating is safe: it only
+    /// oversizes the entry array and the window.
+    fn general_in(&self, range: &Range<usize>) -> usize {
+        match &self.general_prefix {
+            Some(p) => (p[range.end] - p[range.start]) as usize,
+            None => range.len(),
+        }
+    }
+
+    /// Maximum scalar bit length in `range`, rounded out to classification chunks, or
+    /// the field's full width when the buffer came from the device and was never
+    /// classified. Overestimating is safe for the same reason as [`Self::general_in`]:
+    /// the extra windows' digits are all zero, so they only cost empty bucket rows.
+    fn bits_in(&self, range: &Range<usize>) -> usize {
+        match &self.chunk_bits {
+            Some(b) => {
+                let lo = range.start / CLASSIFY_CHUNK;
+                let hi = range.end.div_ceil(CLASSIFY_CHUNK).min(b.len());
+                b[lo..hi].iter().copied().max().unwrap_or(0) as usize
+            }
+            None => RECODE_BITS - 1,
+        }
+    }
+}
+
+/// Device memory its owner lends a plan for the digit entries, and gets back when this is
+/// dropped.
+///
+/// Stage 4's scratch lends H's plan the four domain vectors, which nothing reads once
+/// `compute_h` has returned. At 2^22 that is the 537 MB entry array the pool would
+/// otherwise hold beside them. The owner zeroes it with the rest of its scratch; nothing
+/// here goes into the pool.
+pub(crate) struct Lent {
+    buf: Buffer,
+    busy: Arc<AtomicBool>,
+}
+
+impl Lent {
+    /// `buf`, unless `busy` says another `Lent` over it is still alive: two MSMs over one
+    /// H at once must not scatter into the same entries.
+    pub(crate) fn claim(buf: &Buffer, busy: &Arc<AtomicBool>) -> Option<Self> {
+        if busy.swap(true, Ordering::Acquire) {
+            return None;
+        }
+        Some(Self {
+            buf: buf.clone(),
+            busy: Arc::clone(busy),
+        })
+    }
+}
+
+impl Drop for Lent {
+    fn drop(&mut self) {
+        self.busy.store(false, Ordering::Release);
+    }
+}
+
+/// Bytes of digit entries a plan over `n` unclassified scalars takes, which is what
+/// [`Plan::alloc`] asks for over a device-resident H. Stage 4 sizes the buffer it lends
+/// with this; a lent buffer that turns out smaller is not used, so a disagreement costs
+/// the saving and nothing else.
+pub(crate) fn dense_entries_bytes(n: usize) -> usize {
+    let c = window_size_for(n, RECODE_BITS);
+    RECODE_BITS.div_ceil(c as usize) * n.max(1) * 8
+}
+
+// ---------------------------------------------------------------------------
+// Jobs
+// ---------------------------------------------------------------------------
+
+/// One MSM. `scalar_off` and `base_off` exist so the L MSM, whose scalars are the
+/// private suffix of the witness, can share the witness buffer with the A and B MSMs
+/// instead of uploading a second copy.
+pub struct JobG1<'a> {
+    pub bases: &'a G1Bases,
+    pub base_off: usize,
+    pub scalars: &'a ScalarBuf,
+    pub scalar_off: usize,
+    pub n: usize,
+}
+
+pub struct JobG2<'a> {
+    pub bases: &'a G2Bases,
+    pub base_off: usize,
+    pub scalars: &'a ScalarBuf,
+    pub scalar_off: usize,
+    pub n: usize,
+}
+
+pub enum Job<'a> {
+    G1(JobG1<'a>),
+    G2(JobG2<'a>),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum MsmResult {
+    G1(G1Projective),
+    G2(G2Projective),
+}
+
+impl MsmResult {
+    pub fn g1(self) -> Result<G1Projective, ProveError> {
+        match self {
+            MsmResult::G1(p) => Ok(p),
+            MsmResult::G2(_) => Err(err("expected a G1 MSM result, got G2")),
+        }
+    }
+    pub fn g2(self) -> Result<G2Projective, ProveError> {
+        match self {
+            MsmResult::G2(p) => Ok(p),
+            MsmResult::G1(_) => Err(err("expected a G2 MSM result, got G1")),
+        }
+    }
+
+    /// Whether the point satisfies the curve equation. The partial sums come back as
+    /// XYZZ words that `to_projective` takes on trust, and the addition formulas are
+    /// rational maps, so one partial sum that is not a curve point (a buffer the GPU
+    /// reported written but did not write, BUG-28) leaves the whole sum off the curve
+    /// with all but negligible probability. One inversion per job.
+    fn on_curve(&self) -> bool {
+        use snarkrs_field::CurveGroup;
+        match self {
+            MsmResult::G1(p) => p.into_affine().is_on_curve(),
+            MsmResult::G2(p) => p.into_affine().is_on_curve(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pipelines
+// ---------------------------------------------------------------------------
+
+struct Pipelines {
+    zero_u32: ComputePipelineState,
+    mont_to_std: ComputePipelineState,
+    count: ComputePipelineState,
+    scan: ComputePipelineState,
+    scatter: ComputePipelineState,
+    clear_g1: ComputePipelineState,
+    clear_g2: ComputePipelineState,
+    accumulate_g1: ComputePipelineState,
+    accumulate_g2: ComputePipelineState,
+    segmented_g1: ComputePipelineState,
+    segmented_g2: ComputePipelineState,
+    merge_g1: ComputePipelineState,
+    merge_g2: ComputePipelineState,
+    merge_wide_g1: ComputePipelineState,
+    merge_wide_g2: ComputePipelineState,
+    fold_g1: ComputePipelineState,
+    fold_g2: ComputePipelineState,
+    reduce_g1: ComputePipelineState,
+    reduce_g2: ComputePipelineState,
+    /// The reduce on the constant-work point operations, for plans with dummy rows;
+    /// see `pt_add_constant` in msm.metal.
+    reduce_constant_g1: ComputePipelineState,
+    reduce_constant_g2: ComputePipelineState,
+    ones_g1: ComputePipelineState,
+    ones_g2: ComputePipelineState,
+    ones_idx_g1: ComputePipelineState,
+    ones_idx_g2: ComputePipelineState,
+}
+
+/// Scratch buffers, kept between calls.
+///
+/// Two measured facts make this worth the code. A `memcpy` into a freshly allocated
+/// shared buffer runs at 15.2 GB/s against 54.8 GB/s into one that has already been
+/// touched, because the first write to every page faults it in; and the same first-touch
+/// cost applies to a kernel's first write. Allocating the counting-sort scratch on every
+/// proof would pay that every time, so buffers go back to the pool instead.
+struct Pool {
+    device: Device,
+    free: Mutex<Vec<Buffer>>,
+}
+
+impl Pool {
+    /// The lock is taken back from a poisoned mutex rather than panicked on, the same as
+    /// `stages::HResident`'s pool: the vector holds plain buffer handles, so a panic
+    /// while it was held leaves nothing half-updated for the next caller to trip over.
+    fn take(&self, bytes: usize) -> Result<Buffer, ProveError> {
+        let bytes = bytes.max(4);
+        let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
+        // Smallest buffer that fits, so a single huge allocation cannot be handed out
+        // for every small request and then be unavailable for the one that needs it.
+        let mut best: Option<usize> = None;
+        for (i, b) in free.iter().enumerate() {
+            if (b.length() as usize) >= bytes {
+                match best {
+                    Some(j) if free[j].length() <= b.length() => {}
+                    _ => best = Some(i),
+                }
+            }
+        }
+        if let Some(i) = best {
+            return Ok(free.swap_remove(i));
+        }
+        drop(free);
+        crate::alloc::shared(&self.device, bytes)
+    }
+
+    fn give(&self, bufs: Vec<Buffer>) {
+        // Every one of these held the witness's digits, buckets or partial sums. Zeroed
+        // here, outside the lock, rather than on `take`, so what sits in the pool between
+        // proofs is zeros. A zeroed page stays resident, so the first-touch cost the pool
+        // exists to avoid is not paid again.
+        for b in &bufs {
+            crate::alloc::scrub(b);
+        }
+        let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
+        free.extend(bufs);
+        // Unbounded reuse would keep every shape any circuit ever asked for. This is a
+        // cache, not an arena.
+        if free.len() > 48 {
+            free.sort_by_key(|b| std::cmp::Reverse(b.length()));
+            free.truncate(48);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The backend object
+// ---------------------------------------------------------------------------
+
+pub struct MetalMsm {
+    device: Device,
+    queue: crate::cb::Queue,
+    pipelines: Pipelines,
+    /// The completion token every command buffer here ends with.
+    seal: crate::cb::Seal,
+    pool: Pool,
+}
+
+impl MetalMsm {
+    /// Picks the system default device and compiles every MSM kernel from source.
+    ///
+    /// This is the expensive call: runtime MSL compilation of this library measured
+    /// around 60 ms during scouting, plus pipeline construction. It must happen once, in
+    /// `prepare`, and never on a proving path. A prover that constructs this per proof
+    /// is measuring the Metal compiler.
+    pub fn new() -> Result<Self, ProveError> {
+        let device = Device::system_default()
+            .ok_or_else(|| err("no Metal device; this machine cannot run the metal backend"))?;
+        Self::with_device(device)
+    }
+
+    pub fn with_device(device: Device) -> Result<Self, ProveError> {
+        // One translation unit: the field prelude followed by this file. There is no
+        // include path for a runtime-compiled source string, so the concatenation is the
+        // include, and the prelude's header guard is what makes it safe.
+        let source = format!("{FR_MSL}\n{MSM_MSL}\n{SEAL_MSL}\n");
+        let opts = CompileOptions::new();
+        let library = device
+            .new_library_with_source(&source, &opts)
+            .map_err(|e| err(format!("MSL compilation failed: {e}")))?;
+
+        let pso = |name: &str| -> Result<ComputePipelineState, ProveError> {
+            let f = library
+                .get_function(name, None)
+                .map_err(|e| err(format!("kernel {name} not found: {e}")))?;
+            device
+                .new_compute_pipeline_state_with_function(&f)
+                .map_err(|e| err(format!("pipeline {name}: {e}")))
+        };
+
+        let pipelines = Pipelines {
+            zero_u32: pso("zero_u32")?,
+            mont_to_std: pso("fr_mont_to_std")?,
+            count: pso("msm_count")?,
+            scan: pso("msm_scan")?,
+            scatter: pso("msm_scatter")?,
+            clear_g1: pso("msm_clear_g1")?,
+            clear_g2: pso("msm_clear_g2")?,
+            accumulate_g1: pso("msm_accumulate_g1")?,
+            accumulate_g2: pso("msm_accumulate_g2")?,
+            segmented_g1: pso("msm_segmented_g1")?,
+            segmented_g2: pso("msm_segmented_g2")?,
+            merge_g1: pso("msm_merge_g1")?,
+            merge_g2: pso("msm_merge_g2")?,
+            merge_wide_g1: pso("msm_merge_wide_g1")?,
+            merge_wide_g2: pso("msm_merge_wide_g2")?,
+            fold_g1: pso("msm_fold_g1")?,
+            fold_g2: pso("msm_fold_g2")?,
+            reduce_g1: pso("msm_reduce_g1")?,
+            reduce_g2: pso("msm_reduce_g2")?,
+            reduce_constant_g1: pso("msm_reduce_constant_g1")?,
+            reduce_constant_g2: pso("msm_reduce_constant_g2")?,
+            ones_g1: pso("msm_ones_g1")?,
+            ones_g2: pso("msm_ones_g2")?,
+            ones_idx_g1: pso("msm_ones_idx_g1")?,
+            ones_idx_g2: pso("msm_ones_idx_g2")?,
+        };
+        let seal = crate::cb::Seal::new(&device, &library)?;
+
+        let queue = crate::cb::Queue::new(&device);
+        Ok(Self {
+            pool: Pool {
+                device: device.clone(),
+                free: Mutex::new(Vec::new()),
+            },
+            device,
+            queue,
+            pipelines,
+            seal,
+        })
+    }
+
+    /// The reduce a plan dispatches: the constant-work kernel for a plan with dummy
+    /// rows, the plain one otherwise.
+    fn reduce_pso(&self, is_g2: bool, plan: &Plan<'_>) -> &ComputePipelineState {
+        match (is_g2, plan.dummy_rows > 0) {
+            (false, false) => &self.pipelines.reduce_g1,
+            (false, true) => &self.pipelines.reduce_constant_g1,
+            (true, false) => &self.pipelines.reduce_g2,
+            (true, true) => &self.pipelines.reduce_constant_g2,
+        }
+    }
+
+    /// Threads per threadgroup the reduce actually dispatches with. [`Outputs::combine`]
+    /// recomputes the G1 kernel's simdgroup slots from it, so the two must agree.
+    fn reduce_tg(&self, is_g2: bool, plan: &Plan<'_>) -> usize {
+        REDUCE_TG
+            .min(
+                self.reduce_pso(is_g2, plan)
+                    .max_total_threads_per_threadgroup() as usize,
+            )
+            .max(1)
+    }
+
+    fn reduce_layout(&self, plan: &Plan<'_>) -> ReduceLayout {
+        ReduceLayout::new(
+            plan.n_buckets,
+            plan.reduce_groups,
+            self.reduce_tg(false, plan),
+            self.reduce_pso(false, plan).thread_execution_width() as usize,
+        )
+    }
+
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    /// `items` packed by `pack` straight into a shared buffer. Packing into a `Vec` and
+    /// copying that in held a third copy of the section at the peak of `prepare`.
+    fn packed_buffer<S, T: Packed>(
+        &self,
+        items: &[S],
+        pack: fn(&[S], &mut [T]),
+    ) -> Result<Buffer, ProveError> {
+        if items.is_empty() {
+            return crate::alloc::shared(&self.device, 4);
+        }
+        let buf = crate::alloc::shared(&self.device, items.len() * core::mem::size_of::<T>())?;
+        // SAFETY: the buffer was just allocated with room for `items.len()` packed values
+        // and nothing has been encoded against it, so no dispatch can be reading it.
+        let dst = unsafe { core::slice::from_raw_parts_mut(buf.contents().cast(), items.len()) };
+        pack(items, dst);
+        Ok(buf)
+    }
+
+    /// Repacks and uploads a G1 base vector. `ark_ec::G1Affine` is 72 bytes on this
+    /// arkworks and carries an infinity flag, so a byte cast would hand the GPU a 72-byte
+    /// stride where the shader reads 64. [`PackedG1Affine::from_affine`] reads the flag
+    /// and maps infinity onto the all-zero encoding the kernels test for.
+    pub fn upload_g1_bases(&self, bases: &[G1Affine]) -> Result<G1Bases, ProveError> {
+        Ok(G1Bases {
+            buf: self.packed_buffer(bases, PackedG1Affine::pack_into)?,
+            len: bases.len(),
+            inf: bases.iter().map(|b| b.infinity).collect(),
+        })
+    }
+
+    pub fn upload_g2_bases(&self, bases: &[G2Affine]) -> Result<G2Bases, ProveError> {
+        Ok(G2Bases {
+            buf: self.packed_buffer(bases, PackedG2Affine::pack_into)?,
+            len: bases.len(),
+            inf: bases.iter().map(|b| b.infinity).collect(),
+        })
+    }
+
+    /// Packs scalars into standard form and uploads them, classifying as it goes.
+    ///
+    /// One pass, and the classification it produces is what keeps the zero and one
+    /// scalars out of Pippenger entirely.
+    ///
+    /// This is per-proof work on the MSM stage's critical path, and `from_fr` is a full
+    /// Montgomery reduction per scalar, so the pass is chunked over the thread pool and
+    /// writes straight into the Metal buffer rather than through an intermediate `Vec`.
+    /// Each chunk counts its own generals and builds its stretch of the prefix locally;
+    /// a serial fix-up then shifts every stretch by the chunks before it, which is one
+    /// add per scalar against the reduction the parallel pass just paid.
+    pub fn upload_scalars(&self, scalars: &[Fr]) -> Result<ScalarBuf, ProveError> {
+        self.upload_scalars_with(scalars, Work::Variable)
+    }
+
+    /// [`Self::upload_scalars`] with the work mode chosen. [`Work::Constant`] packs and
+    /// nothing else: no prefix, no ones list, no bit bound, so nothing on the host
+    /// depends on a scalar's value and the plan built over the buffer cannot either.
+    pub fn upload_scalars_with(&self, scalars: &[Fr], work: Work) -> Result<ScalarBuf, ProveError> {
+        use rayon::prelude::*;
+
+        let n = scalars.len();
+        let bytes = n.max(1) * core::mem::size_of::<PackedScalar>();
+        let buf = crate::alloc::shared(&self.device, bytes)?;
+        if n > 0 && work == Work::Constant {
+            // SAFETY: as below.
+            let slots: &mut [PackedScalar] =
+                unsafe { core::slice::from_raw_parts_mut(buf.contents().cast(), n) };
+            slots
+                .par_chunks_mut(CLASSIFY_CHUNK)
+                .zip_eq(scalars.par_chunks(CLASSIFY_CHUNK))
+                .for_each(|(dst, src)| {
+                    for (d, s) in dst.iter_mut().zip(src) {
+                        *d = PackedScalar::from_fr(s);
+                    }
+                });
+        }
+        if work == Work::Constant {
+            return Ok(ScalarBuf {
+                buf,
+                len: n,
+                general_prefix: None,
+                ones_idx: None,
+                chunk_bits: None,
+                work,
+                lent: None,
+            });
+        }
+        let mut prefix = vec![0u32; n + 1];
+        let mut ones_idx = Vec::new();
+        let mut chunk_bits = Vec::new();
+        if n > 0 {
+            // SAFETY: the buffer was just allocated with room for `n` packed scalars
+            // and nothing has been encoded against it, so no dispatch can be reading it.
+            let slots: &mut [PackedScalar] =
+                unsafe { core::slice::from_raw_parts_mut(buf.contents().cast(), n) };
+            let parts: Vec<(u32, Vec<u32>, u32)> = slots
+                .par_chunks_mut(CLASSIFY_CHUNK)
+                .zip_eq(scalars.par_chunks(CLASSIFY_CHUNK))
+                .zip_eq(prefix[1..].par_chunks_mut(CLASSIFY_CHUNK))
+                .enumerate()
+                .map(|(ci, ((dst, src), pre))| {
+                    let mut general = 0u32;
+                    let mut ones = Vec::new();
+                    let mut bits = 0u32;
+                    for (i, ((d, s), p)) in dst.iter_mut().zip(src).zip(pre.iter_mut()).enumerate()
+                    {
+                        if s.is_one() {
+                            ones.push((ci * CLASSIFY_CHUNK + i) as u32);
+                        } else if !s.is_zero() {
+                            general += 1;
+                        }
+                        *p = general;
+                        *d = PackedScalar::from_fr(s);
+                        bits = bits.max(scalar_bits(&d.v));
+                    }
+                    (general, ones, bits)
+                })
+                .collect();
+            let mut off = 0u32;
+            for (chunk, (total, ones, bits)) in prefix[1..].chunks_mut(CLASSIFY_CHUNK).zip(&parts) {
+                if off > 0 {
+                    for p in chunk {
+                        *p += off;
+                    }
+                }
+                off += total;
+                ones_idx.extend_from_slice(ones);
+                chunk_bits.push(*bits);
+            }
+        }
+        Ok(ScalarBuf {
+            buf,
+            len: n,
+            general_prefix: Some(prefix),
+            ones_idx: Some(ones_idx),
+            chunk_bits: Some(chunk_bits),
+            work,
+            lent: None,
+        })
+    }
+
+    /// Converts a device-resident Montgomery `Fr` buffer (what the NTT leaves behind for
+    /// stage 9) into standard-form scalars, in its own command buffer.
+    ///
+    /// No host classification is possible without reading the values back, so this
+    /// buffer reports every scalar as general. That is exactly right for `H`, whose
+    /// evaluations are dense, and it is why this is a separate entry point rather than
+    /// the default.
+    pub fn scalars_from_device_mont(
+        &self,
+        mont: &Buffer,
+        len: usize,
+    ) -> Result<ScalarBuf, ProveError> {
+        let out = crate::alloc::shared(&self.device, len.max(1) * 32)?;
+        // Reads `mont`, which nothing here writes, so a killed attempt re-runs whole.
+        crate::cb::with_retry(&self.queue, |queue| {
+            let context = "stage 9 scalar conversion (mont_to_std)";
+            let cb = crate::cb::command_buffer(queue);
+            let enc = cb.new_compute_command_encoder();
+            enc.set_label(context);
+            enc.set_compute_pipeline_state(&self.pipelines.mont_to_std);
+            enc.set_buffer(0, Some(mont), 0);
+            enc.set_buffer(1, Some(&out), 0);
+            let n = len as u32;
+            enc.set_bytes(2, 4, (&n as *const u32).cast());
+            dispatch_1d(enc, &self.pipelines.mont_to_std, len, 64);
+            let token = self.seal.encode(enc);
+            enc.end_encoding();
+            cb.commit();
+            self.seal.wait(cb, token, context)
+        })?;
+        Ok(ScalarBuf {
+            buf: out,
+            len,
+            general_prefix: None,
+            ones_idx: None,
+            chunk_bits: None,
+            work: Work::Variable,
+            lent: None,
+        })
+    }
+
+    /// Wraps a device-resident buffer that already holds **standard-form** scalars
+    /// (`layout::PackedScalar`), without dispatching anything.
+    ///
+    /// Stage 4 writes H in both forms precisely so stage 9 can read the standard copy
+    /// directly; going through [`Self::scalars_from_device_mont`] instead re-runs
+    /// `fr_mont_to_std` over the whole domain in an extra command buffer, duplicating
+    /// work the pointwise kernel already did.
+    ///
+    /// The clone retains the `MTLBuffer`, but the *contents* stay owned by whoever
+    /// allocated them (for H, the pooled stage scratch). The caller must keep the
+    /// producing handle alive until every MSM reading this buffer has completed, or a
+    /// recycled scratch could overwrite the scalars mid-flight. The proving path does:
+    /// `MetalCircuit::msms` borrows the `HPoly` for its whole duration.
+    ///
+    /// Like the Montgomery entry point, no host classification is possible without a
+    /// readback, so every scalar reports as general. Right for H, whose evaluations are
+    /// dense.
+    pub fn scalars_from_device_std(&self, std: &Buffer, len: usize) -> ScalarBuf {
+        self.scalars_from_device_std_with(std, len, Work::Variable)
+    }
+
+    /// [`Self::scalars_from_device_std`] with the work mode chosen. Unclassified either
+    /// way; what [`Work::Constant`] changes for H is that its kernels stop skipping the
+    /// zero scalars and zero digits.
+    pub fn scalars_from_device_std_with(&self, std: &Buffer, len: usize, work: Work) -> ScalarBuf {
+        ScalarBuf {
+            buf: std.clone(),
+            len,
+            general_prefix: None,
+            ones_idx: None,
+            chunk_bits: None,
+            work,
+            lent: None,
+        }
+    }
+
+    /// One MSM on its own command buffer. Convenience for tests; the proving path should
+    /// call [`Self::msm_batch`], because five separate command buffers cost five times
+    /// the 0.16 ms submission floor.
+    ///
+    /// A length mismatch is an error, not a shorter MSM: `snarkrs_msm::MsmBackend` requires a
+    /// backend to treat it as a malformed key, because the prefix is a valid-looking point
+    /// for the wrong proof.
+    pub fn msm_g1(&self, bases: &G1Bases, scalars: &ScalarBuf) -> Result<G1Projective, ProveError> {
+        if bases.len != scalars.len {
+            return Err(err(format!(
+                "msm over G1: {} bases against {} scalars",
+                bases.len, scalars.len
+            )));
+        }
+        let n = bases.len;
+        let out = self.msm_batch(&[Job::G1(JobG1 {
+            bases,
+            base_off: 0,
+            scalars,
+            scalar_off: 0,
+            n,
+        })])?;
+        out[0].g1()
+    }
+
+    pub fn msm_g2(&self, bases: &G2Bases, scalars: &ScalarBuf) -> Result<G2Projective, ProveError> {
+        if bases.len != scalars.len {
+            return Err(err(format!(
+                "msm over G2: {} bases against {} scalars",
+                bases.len, scalars.len
+            )));
+        }
+        let n = bases.len;
+        let out = self.msm_batch(&[Job::G2(JobG2 {
+            bases,
+            base_off: 0,
+            scalars,
+            scalar_off: 0,
+            n,
+        })])?;
+        out[0].g2()
+    }
+
+    /// Every MSM in one command buffer, one `wait_until_completed`, one readback.
+    ///
+    /// Jobs that share a scalar buffer, offset and length share their digit pipeline:
+    /// the A, B-in-G2 and B-in-G1 MSMs all run over the whole witness, so the counting
+    /// sort runs once for the three of them and only the point stages are repeated. L
+    /// reads the witness past its public prefix and rides the same plan (see
+    /// [`SHARE_MAX_SKIP`]). A plan costs four dispatches (`zero`, `count`, `scan`,
+    /// `scatter`), so collapsing the five proving jobs to two plans removes twelve of
+    /// the twenty and, more to the point, three of the four witness scatters' memory
+    /// traffic. A bucket array past `SCATTER_SPLIT_ROWS` splits the scatter in two,
+    /// which scales both counts.
+    pub fn msm_batch<'a>(&self, jobs: &[Job<'a>]) -> Result<Vec<MsmResult>, ProveError> {
+        if jobs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // ---- plan ----
+        let mut plans: Vec<Plan<'a>> = Vec::new();
+        let mut by_key: HashMap<(usize, usize, usize), usize> = HashMap::new();
+        let mut job_plan = Vec::with_capacity(jobs.len());
+        let mut job_skip = Vec::with_capacity(jobs.len());
+
+        let mut ranges = Vec::with_capacity(jobs.len());
+        for job in jobs {
+            let (sbuf, soff, n, bases_len, boff) = match job {
+                Job::G1(j) => (j.scalars, j.scalar_off, j.n, j.bases.len, j.base_off),
+                Job::G2(j) => (j.scalars, j.scalar_off, j.n, j.bases.len, j.base_off),
+            };
+            if soff + n > sbuf.len {
+                return Err(err(format!(
+                    "scalar range {}..{} exceeds the {} scalars uploaded",
+                    soff,
+                    soff + n,
+                    sbuf.len
+                )));
+            }
+            if boff + n > bases_len {
+                return Err(err(format!(
+                    "base range {}..{} exceeds the {} bases uploaded",
+                    boff,
+                    boff + n,
+                    bases_len
+                )));
+            }
+            // Identity of the uploaded vector, not of its contents.
+            ranges.push((sbuf, sbuf as *const ScalarBuf as usize, soff, n));
+        }
+        let keys: Vec<_> = ranges
+            .iter()
+            .map(|&(_, id, soff, n)| (id, soff, n))
+            .collect();
+        for (&(sbuf, id, soff, n), start) in ranges.iter().zip(plan_starts(&keys)) {
+            let key = (id, start, soff + n - start);
+            let idx = match by_key.get(&key) {
+                Some(&i) => i,
+                None => {
+                    let i = plans.len();
+                    plans.push(Plan::new(sbuf, start, soff + n - start));
+                    by_key.insert(key, i);
+                    i
+                }
+            };
+            job_plan.push(idx);
+            job_skip.push(soff - start);
+        }
+
+        // ---- allocate ----
+        let mut scratch: Vec<Buffer> = Vec::new();
+        for p in &mut plans {
+            p.alloc(&self.pool, &mut scratch)?;
+        }
+        let mut outs: Vec<Outputs> = Vec::with_capacity(jobs.len());
+        for job in jobs {
+            let i = outs.len();
+            outs.push(Outputs::alloc(
+                self,
+                &mut scratch,
+                job,
+                &plans[job_plan[i]],
+                job_skip[i],
+            )?);
+        }
+
+        // ---- combine ----
+        //
+        // Independent per job, and each one is a serial Horner plus a partial sum, so
+        // the five jobs split over the thread pool rather than queueing behind B_g2's
+        // G2 arithmetic. A result off the curve is a device fault, not an answer: the
+        // batch that produced it is re-run whole by the retry below, as a killed one is.
+        let combine = || -> Result<Vec<MsmResult>, ProveError> {
+            use rayon::prelude::*;
+            let results: Vec<MsmResult> = outs
+                .par_iter()
+                .enumerate()
+                .map(|(i, out)| out.combine(self, &plans[job_plan[i]]))
+                .collect();
+            if let Some(i) = results.iter().position(|r| !r.on_curve()) {
+                return Err(ProveError::Device {
+                    backend: "metal",
+                    reason: format!(
+                        "MSM batch: job {i}'s sum is not a point on the curve: a partial \
+                         sum read back is not one the GPU wrote"
+                    ),
+                });
+            }
+            Ok(results)
+        };
+
+        // ---- encode, once ----
+        //
+        // `G16_METAL_MSM_PHASES=1` splits the single command buffer into one per digit
+        // pipeline and one per point pipeline, waiting on each, and prints wall times to
+        // stderr. Strictly a measurement aid: it adds one ~0.15 ms submission floor per
+        // piece, so the sum reads slightly worse than the production path it explains.
+        let results = if std::env::var_os("G16_METAL_MSM_PHASES").is_some() {
+            let detail = std::env::var("G16_METAL_MSM_PHASES")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(1);
+            let queue = self.queue.get();
+            let run = |label: String,
+                       f: &mut dyn FnMut(&ComputeCommandEncoderRef)|
+             -> Result<(), ProveError> {
+                let t = std::time::Instant::now();
+                let cb = crate::cb::command_buffer(&queue);
+                let enc = cb.new_compute_command_encoder();
+                enc.set_label(&label);
+                f(enc);
+                let token = self.seal.encode(enc);
+                enc.end_encoding();
+                cb.commit();
+                // The production path below checks status and token; this one must too.
+                // A timing read off a faulted command buffer is not a slow result, it is
+                // a measurement of how long the GPU took to fail, reported as if it were
+                // work. This path exists to explain timings, so a wrong one is worse here
+                // than anywhere.
+                self.seal.wait(cb, token, "MSM phase")?;
+                eprintln!(
+                    "[msm-phase] {label}: {:.2} ms",
+                    t.elapsed().as_secs_f64() * 1e3
+                );
+                Ok(())
+            };
+            for (pi, p) in plans.iter().enumerate() {
+                let shape = format!(
+                    "plan{pi} n={} cap={} c={} w={}",
+                    p.n, p.cap, p.c, p.n_windows
+                );
+                if detail >= 3 {
+                    // Separate the contended atomics from the prefix scan's serial
+                    // barrier chain. Every line pays its own submission floor.
+                    run(format!("zero    {shape}"), &mut |enc| {
+                        p.encode_zero(self, enc)
+                    })?;
+                    run(format!("count   {shape}"), &mut |enc| {
+                        p.encode_count(self, enc)
+                    })?;
+                    run(format!("scan    {shape}"), &mut |enc| {
+                        p.encode_scan(self, enc)
+                    })?;
+                    run(format!("scatter {shape}"), &mut |enc| {
+                        p.encode_scatter(self, enc)
+                    })?;
+                } else {
+                    run(format!("digits {shape}"), &mut |enc| p.encode(self, enc))?;
+                }
+            }
+            // `G16_METAL_MSM_PHASES=2` goes one level finer and times the four bucket
+            // stages one command buffer each. Same caveat, four more submission floors.
+            let fine = detail >= 2;
+            for (i, (job, out)) in jobs.iter().zip(&outs).enumerate() {
+                let p = &plans[job_plan[i]];
+                let kind = if out.is_g2 { "g2" } else { "g1" };
+                if fine {
+                    run(
+                        format!("clear   job{i} {kind} rows={}", p.n_windows * p.n_buckets),
+                        &mut |enc| out.encode_clear(self, enc, job, p),
+                    )?;
+                    run(
+                        format!("accum   job{i} {kind} slices={}", p.n_windows * p.slices),
+                        &mut |enc| out.encode_accumulate(self, enc, job, p),
+                    )?;
+                    run(
+                        format!("merge   job{i} {kind} rows={}", p.n_windows * p.n_buckets),
+                        &mut |enc| out.encode_merge(self, enc, job, p),
+                    )?;
+                    run(
+                        format!("reduce  job{i} {kind} w={}", p.n_windows),
+                        &mut |enc| out.encode_reduce(self, enc, job, p),
+                    )?;
+                } else {
+                    run(
+                        format!("buckets job{i} {kind} n={} cap={} c={}", p.n, p.cap, p.c),
+                        &mut |enc| out.encode_buckets(self, enc, job, p),
+                    )?;
+                }
+                run(
+                    format!("ones    job{i} {kind} n={} groups={}", p.n, out.ones_groups),
+                    &mut |enc| out.encode_ones(self, enc, job, p),
+                )?;
+            }
+            combine()?
+        } else {
+            // A concurrent encoder, staged. The default serial encoder barriers every
+            // dispatch against the previous one, so the 37 dispatches ran strictly one
+            // at a time and the per-phase GPU times summed exactly to the batch total:
+            // zero overlap. But most of these dispatches are independent, and the small
+            // ones are latency chains that leave nearly the whole device idle: the four
+            // witness MSMs' accumulations and ones scans are a few thousand threads
+            // each, while H's accumulation is throughput-bound and can absorb them.
+            //
+            // Grouping by stage keeps the hazards trivial to state: every dispatch of
+            // one phase is independent of every other dispatch of that phase (disjoint
+            // outputs; shared inputs are read-only), and each phase reads only what
+            // earlier phases wrote, so one full barrier between phases is both
+            // necessary and sufficient. metal-rs 0.29 does not bind
+            // memoryBarrierWithScope:, so it is called the way `cb` reads the
+            // unbound timing properties.
+            //
+            // The ones scans have no dependency at all (scalars and bases in, own
+            // buffer out) and are encoded into the accumulation phase, the widest one.
+            //
+            // A constant-work batch goes out split (see `Submission`): the same
+            // phases, one command buffer each, and the accumulation in pieces.
+            let split = plans.iter().any(|p| p.dummy_rows > 0);
+            let encode = |sub: &mut Submission<'_>| -> Result<(), ProveError> {
+                for p in &plans {
+                    p.encode_zero(self, sub.enc());
+                }
+                for (i, (job, out)) in jobs.iter().zip(&outs).enumerate() {
+                    out.encode_clear(self, sub.enc(), job, &plans[job_plan[i]]);
+                }
+                sub.phase()?;
+                for p in &plans {
+                    p.encode_count(self, sub.enc());
+                }
+                sub.phase()?;
+                for p in &plans {
+                    p.encode_scan(self, sub.enc());
+                }
+                sub.phase()?;
+                // A split plan's second part must not overlap its first inside this
+                // concurrent encoder, so it goes behind a barrier of its own. The witness
+                // plans never split and ride entirely in the first wave.
+                for p in &plans {
+                    p.encode_scatter_part(self, sub.enc(), 0);
+                }
+                if plans.iter().any(|p| p.scatter_parts > 1) {
+                    sub.phase()?;
+                    for p in &plans {
+                        p.encode_scatter_part(self, sub.enc(), 1);
+                    }
+                }
+                sub.phase()?;
+                for (i, (job, out)) in jobs.iter().zip(&outs).enumerate() {
+                    let plan = &plans[job_plan[i]];
+                    out.encode_ones(self, sub.enc(), job, plan);
+                    if !split {
+                        out.encode_accumulate(self, sub.enc(), job, plan);
+                        continue;
+                    }
+                    // Whole windows per piece, as many as the budget holds, each in a
+                    // command buffer of its own.
+                    let per_window = plan.cap * if out.is_g2 { 3 } else { 1 };
+                    let step = (SPLIT_BUDGET / per_window.max(1)).clamp(1, plan.n_windows);
+                    for lo in (0..plan.n_windows).step_by(step) {
+                        let hi = (lo + step).min(plan.n_windows);
+                        out.encode_accumulate_slices(
+                            self,
+                            sub.enc(),
+                            job,
+                            plan,
+                            lo * plan.slices,
+                            (hi - lo) * plan.slices,
+                        );
+                        sub.close()?;
+                    }
+                }
+                sub.phase()?;
+                // One merge level of every job at a time, a barrier between levels. The
+                // constant-work fold of a G2 job is 3.9 ms at 2^18, all levels, so they
+                // share one command buffer even when the batch is split.
+                for level in 0.. {
+                    let mut more = false;
+                    for (i, (job, out)) in jobs.iter().zip(&outs).enumerate() {
+                        more |= out.encode_merge_level(
+                            self,
+                            sub.enc(),
+                            job,
+                            &plans[job_plan[i]],
+                            level,
+                        );
+                    }
+                    if !more {
+                        break;
+                    }
+                    barrier(sub.enc());
+                }
+                sub.phase()?;
+                for (i, (job, out)) in jobs.iter().zip(&outs).enumerate() {
+                    out.encode_reduce(self, sub.enc(), job, &plans[job_plan[i]]);
+                }
+                sub.wait("MSM batch")
+            };
+            // Before this check the combine reinterpreted pooled buffers regardless of
+            // whether the GPU had actually written them, so a fault returned the
+            // previous proof's window sums with an Ok. Split or not, the whole batch is
+            // re-encoded from its zeroing dispatches, so a retry reads nothing
+            // half-written.
+            crate::cb::with_retry(&self.queue, |queue| {
+                encode(&mut Submission::new(self, queue, split))?;
+                combine()
+            })?
+        };
+
+        // Buffers go home. Anything the plan and the outputs still reference is dead
+        // now: `wait_until_completed` returned, so the GPU is finished with all of it.
+        drop(plans);
+        drop(outs);
+        self.pool.give(scratch);
+
+        Ok(results)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A digit pipeline: everything that depends only on the scalars.
+// ---------------------------------------------------------------------------
+
+struct Plan<'a> {
+    n: usize,
+    scalar_off: usize,
+    c: u32,
+    n_windows: usize,
+    n_buckets: usize,
+    cap: usize,
+    slice_len: usize,
+    slices: usize,
+    reduce_groups: usize,
+    /// Top-window rows the wide merge owns; 0 keeps everything on `msm_merge_*`.
+    merge_wide_rows: usize,
+    /// Serial window-range dispatches of the scatter; 2 caps the live tail-line set
+    /// on row-heavy plans (see [`SCATTER_SPLIT_ROWS`]), 1 everywhere else.
+    scatter_parts: usize,
+    host_tail: bool,
+    /// Classified inputs have an exact ones gather. Unclassified inputs instead
+    /// recode 1 into bucket zero, so an H plan needs no separate full-buffer scan.
+    separate_ones: bool,
+    /// [`DUMMY_ROWS`] under [`Work::Constant`], 0 otherwise. The dummy rows follow the
+    /// real bucket rows in `counts`, `cursor` and the bucket array, and only the digit
+    /// pipeline and the accumulation ever address them.
+    dummy_rows: usize,
+    scalars: &'a Buffer,
+    /// Where the entries go if it is big enough; the pool otherwise.
+    lent: Option<&'a Buffer>,
+    counts: Option<Buffer>,
+    cursor: Option<Buffer>,
+    entries: Option<Buffer>,
+}
+
+impl<'a> Plan<'a> {
+    fn new(scalars: &'a ScalarBuf, scalar_off: usize, n: usize) -> Self {
+        let range = scalar_off..scalar_off + n;
+        let constant = scalars.work == Work::Constant;
+        // Constant work plans for the range's length whatever the buffer knows about
+        // its contents: every scalar reaches the buckets, in every window.
+        let general = if constant {
+            n
+        } else {
+            scalars.general_in(&range)
+        };
+        // One bit past the range's longest scalar, for the signed carry: a scalar of
+        // `b` bits recodes exactly in `ceil((b + 1) / c)` windows, with zero carry out
+        // of the top one. Windows above that hold no digit on any scalar in the range,
+        // so planning them would only clear, merge and reduce empty rows. H's scalars
+        // are device-resident and unclassified, so `bits_in` keeps its full bound.
+        let recode_bits = if constant {
+            RECODE_BITS
+        } else {
+            (scalars.bits_in(&range) + 1).min(RECODE_BITS)
+        };
+        let c = window_size_for(general, recode_bits);
+        let n_windows = recode_bits.div_ceil(c as usize);
+        let n_buckets = 1usize << (c - 1);
+        let cap = general.max(1);
+        let slice_len = slice_len_for(n_windows, cap);
+        // Live buckets of the top window, whose short bit range concentrates the
+        // digits. When their expected run span clears the wide threshold, their merge
+        // moves to `msm_merge_wide_*` and `msm_merge_*` skips them.
+        let top_bits = recode_bits - (n_windows - 1) * c as usize;
+        let top_buckets = 1usize << (top_bits.min(c as usize) - 1);
+        let wide_span = merge_wide_min_span();
+        let merge_wide_rows = if wide_span > 0 && general / top_buckets / slice_len >= wide_span {
+            top_buckets
+        } else {
+            0
+        };
+        Self {
+            n,
+            scalar_off,
+            c,
+            n_windows,
+            n_buckets,
+            // Classified inputs emit only general scalars. Unclassified inputs use n
+            // as their bound, including any ones they recode into buckets. Each emits
+            // at most one entry per window. `max(1)` avoids a zero-length Metal buffer.
+            cap,
+            slice_len,
+            slices: cap.div_ceil(slice_len).max(1),
+            reduce_groups: reduce_groups_for(n_windows, n_buckets),
+            merge_wide_rows,
+            scatter_parts: if n_windows > 1 && n_windows * n_buckets >= scatter_split_rows() {
+                2
+            } else {
+                1
+            },
+            // A constant plan spans 255 bits, so it never has one window; stated so the
+            // host-tail fold, which indexes the real buckets by spill row, cannot meet a
+            // dummy row.
+            host_tail: !constant && n_windows == 1 && n_buckets <= HOST_TAIL_MAX_BUCKETS,
+            separate_ones: !constant
+                && (scalars.ones_idx.is_some()
+                    || std::env::var("G16_METAL_MSM_ROUTE_ONES").as_deref() == Ok("0")),
+            dummy_rows: if constant { DUMMY_ROWS } else { 0 },
+            scalars: &scalars.buf,
+            // Whole-buffer plans only. Two jobs over the same range share one plan, so
+            // this is at most one plan per buffer.
+            lent: scalars
+                .lent
+                .as_ref()
+                .filter(|_| scalar_off == 0 && n == scalars.len)
+                .map(|l| &l.buf),
+            counts: None,
+            cursor: None,
+            entries: None,
+        }
+    }
+
+    /// The constant-work merge's levels, as (spill slots per window in, groups per
+    /// window), from the accumulation's two slots per slice down to one group; empty on
+    /// every other plan, which merges with `msm_merge_*`.
+    fn fold_levels(&self) -> Vec<(usize, usize)> {
+        if self.dummy_rows == 0 || legacy_accumulate() {
+            return Vec::new();
+        }
+        let len = fold_len();
+        let mut levels = Vec::new();
+        let mut m = 2 * self.slices;
+        loop {
+            let groups = m.div_ceil(len);
+            levels.push((m, groups));
+            if groups == 1 {
+                return levels;
+            }
+            m = 2 * groups;
+        }
+    }
+
+    /// Spill slots the segmented accumulation writes per slice. One holds the run a slice
+    /// starts with, which may continue an earlier slice's bucket; every later run starts
+    /// in the slice and goes straight to its bucket. The constant-work fold overwrites
+    /// the buckets it writes, so there the slice's last run takes a second slot instead.
+    ///
+    /// A second slot on every plan was 67 MB of the H plan's scratch at 2^21 (c=16,
+    /// 32,768 slices a window, 128 bytes a point).
+    fn spill_per_slice(&self) -> usize {
+        if self.dummy_rows > 0 {
+            2
+        } else {
+            1
+        }
+    }
+
+    /// Rows in `counts`, `cursor` and the bucket array: the real buckets of every window,
+    /// then every window's dummy rows.
+    fn rows(&self) -> usize {
+        self.n_windows * (self.n_buckets + self.dummy_rows)
+    }
+
+    fn params(&self) -> MsmParams {
+        MsmParams {
+            n: self.n as u32,
+            c: self.c,
+            n_windows: self.n_windows as u32,
+            n_buckets: self.n_buckets as u32,
+            cap: self.cap as u32,
+            scalar_off: self.scalar_off as u32,
+            base_off: 0,
+            ones_groups: 0,
+            slice_len: self.slice_len as u32,
+            slices: self.slices as u32,
+            reduce_groups: self.reduce_groups as u32,
+            merge_wide_base: ((self.n_windows - 1) * self.n_buckets) as u32,
+            merge_wide_rows: self.merge_wide_rows as u32,
+            separate_ones: self.separate_ones as u32,
+            dummy_rows: self.dummy_rows as u32,
+            seg_first: 0,
+            skip: 0,
+        }
+    }
+
+    fn alloc(&mut self, pool: &Pool, keep: &mut Vec<Buffer>) -> Result<(), ProveError> {
+        let rows = self.rows();
+        let counts = pool.take(rows * 4)?;
+        let cursor = pool.take(rows * 4)?;
+        // 8 bytes an entry: the bucket row travels with the point index so the
+        // segmented accumulation can find run boundaries without recomputing digits.
+        let bytes = self.n_windows * self.cap * 8;
+        let entries = match self.lent.filter(|b| b.length() as usize >= bytes) {
+            // Not kept: it goes back to its owner, not into the pool.
+            Some(b) => b.clone(),
+            None => {
+                let e = pool.take(bytes)?;
+                keep.push(e.clone());
+                e
+            }
+        };
+        keep.push(counts.clone());
+        keep.push(cursor.clone());
+        self.counts = Some(counts);
+        self.cursor = Some(cursor);
+        self.entries = Some(entries);
+        Ok(())
+    }
+
+    fn encode(&self, msm: &MetalMsm, enc: &ComputeCommandEncoderRef) {
+        self.encode_zero(msm, enc);
+        self.encode_count(msm, enc);
+        self.encode_scan(msm, enc);
+        self.encode_scatter(msm, enc);
+    }
+
+    /// The counters must start at zero, and unlike the bucket array (whose kernel
+    /// writes rather than accumulates) they cannot rely on a fresh allocation, since
+    /// the pool hands back used buffers.
+    fn encode_zero(&self, msm: &MetalMsm, enc: &ComputeCommandEncoderRef) {
+        let rows = self.rows();
+        enc.set_compute_pipeline_state(&msm.pipelines.zero_u32);
+        enc.set_buffer(
+            0,
+            Some(self.counts.as_ref().expect("plan not allocated")),
+            0,
+        );
+        let len = rows as u32;
+        enc.set_bytes(1, 4, (&len as *const u32).cast());
+        dispatch_1d(enc, &msm.pipelines.zero_u32, rows, 256);
+    }
+
+    fn encode_count(&self, msm: &MetalMsm, enc: &ComputeCommandEncoderRef) {
+        let p = self.params();
+        enc.set_compute_pipeline_state(&msm.pipelines.count);
+        enc.set_buffer(0, Some(self.scalars), 0);
+        enc.set_buffer(
+            1,
+            Some(self.counts.as_ref().expect("plan not allocated")),
+            0,
+        );
+        set_params(enc, 2, &p);
+        dispatch_1d(enc, &msm.pipelines.count, self.n, 64);
+    }
+
+    fn encode_scan(&self, msm: &MetalMsm, enc: &ComputeCommandEncoderRef) {
+        let p = self.params();
+        enc.set_compute_pipeline_state(&msm.pipelines.scan);
+        enc.set_buffer(
+            0,
+            Some(self.counts.as_ref().expect("plan not allocated")),
+            0,
+        );
+        enc.set_buffer(
+            1,
+            Some(self.cursor.as_ref().expect("plan not allocated")),
+            0,
+        );
+        set_params(enc, 2, &p);
+        let scan_tg = SCAN_TG.min(msm.pipelines.scan.max_total_threads_per_threadgroup() as usize);
+        crate::cb::dispatch_thread_groups(
+            enc,
+            MTLSize::new(self.n_windows as u64, 1, 1),
+            MTLSize::new(scan_tg as u64, 1, 1),
+        );
+    }
+
+    /// The scatter, or the `part`-th of its window-range dispatches. The parts write
+    /// disjoint rows, so no barrier is *required* between them; the caller inserts one
+    /// anyway, because running them serially is the entire point of the split.
+    fn encode_scatter_part(&self, msm: &MetalMsm, enc: &ComputeCommandEncoderRef, part: usize) {
+        if part >= self.scatter_parts {
+            return;
+        }
+        let step = self.n_windows.div_ceil(self.scatter_parts);
+        let lo = part * step;
+        let hi = (lo + step).min(self.n_windows);
+        let p = self.params();
+        enc.set_compute_pipeline_state(&msm.pipelines.scatter);
+        enc.set_buffer(0, Some(self.scalars), 0);
+        enc.set_buffer(
+            1,
+            Some(self.cursor.as_ref().expect("plan not allocated")),
+            0,
+        );
+        enc.set_buffer(
+            2,
+            Some(self.entries.as_ref().expect("plan not allocated")),
+            0,
+        );
+        set_params(enc, 3, &p);
+        let span = [lo as u32, hi as u32];
+        enc.set_bytes(4, 8, span.as_ptr().cast());
+        dispatch_1d(enc, &msm.pipelines.scatter, self.n, 64);
+    }
+
+    fn encode_scatter(&self, msm: &MetalMsm, enc: &ComputeCommandEncoderRef) {
+        for part in 0..self.scatter_parts {
+            self.encode_scatter_part(msm, enc, part);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A single MSM's point stages and its readback.
+// ---------------------------------------------------------------------------
+
+struct Outputs {
+    buckets: Buffer,
+    spill_pts: Buffer,
+    spill_rows: Buffer,
+    window_sums: Buffer,
+    ones: Buffer,
+    ones_groups: usize,
+    /// Base indices of the live one-scalar contributions, when the host classified the
+    /// scalars: `msm_ones_idx_*` gathers exactly these. `None` falls back to the
+    /// `msm_ones_*` scan over all `n` scalars, which is the only option for a
+    /// device-resident buffer.
+    ones_idx: Option<(Buffer, usize)>,
+    /// The second half of the constant-work merge's ping-pong, sized for its first
+    /// level's output; the spill buffers are the other half. `None` off that path.
+    fold: Option<(Buffer, Buffer)>,
+    base_off: usize,
+    /// Leading scalars of the plan's range this job does not cover, when it rides a wider
+    /// job's plan (see [`SHARE_MAX_SKIP`]); 0 otherwise.
+    skip: usize,
+    is_g2: bool,
+}
+
+/// Threadgroups in the ones kernel.
+///
+/// The scan is a *dependent* chain: each thread's accumulator waits on its previous
+/// mixed addition, and about every other scalar of a bit-decomposition witness is a
+/// one, so a thread's chain is as long as its stretch of the input. The first shape of
+/// this function handed each thread 64 scalars regardless of `n`, which is 832 threads
+/// at 2^16 on a device with 4,864 ALUs: the four witness MSMs' ones scans were flat in
+/// `n` because they were latency chains at a sixth of occupancy. Eight scalars per
+/// thread puts thousands of threads in flight; the price is that the host sums up to
+/// 256 partials per MSM instead of 64, which is still under 0.1 ms. Swept via
+/// `G16_METAL_MSM_ONES_SPT`: 4 and 8 tie, 16 and up climb back toward the old shape.
+fn ones_groups_for(n: usize) -> usize {
+    let spt = std::env::var("G16_METAL_MSM_ONES_SPT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(8);
+    n.div_ceil(REDUCE_TG * spt).clamp(1, 256)
+}
+
+impl Outputs {
+    fn alloc(
+        msm: &MetalMsm,
+        keep: &mut Vec<Buffer>,
+        job: &Job<'_>,
+        plan: &Plan<'_>,
+        skip: usize,
+    ) -> Result<Self, ProveError> {
+        let pool = &msm.pool;
+        let (is_g2, base_off, point_bytes, scalar_off, n, sbuf, inf) = match job {
+            Job::G1(j) => (
+                false,
+                j.base_off,
+                core::mem::size_of::<PackedXyzzG1>(),
+                j.scalar_off,
+                j.n,
+                j.scalars,
+                &j.bases.inf,
+            ),
+            Job::G2(j) => (
+                true,
+                j.base_off,
+                core::mem::size_of::<PackedXyzzG2>(),
+                j.scalar_off,
+                j.n,
+                j.scalars,
+                &j.bases.inf,
+            ),
+        };
+
+        // A classified scalar buffer turns the ones scan into a gather. The buffer's
+        // one-indices are sorted, so the job's range is a subrange; mapping each index
+        // to its base and dropping the bases at infinity happens here, once per proof,
+        // because it is exactly what the kernel would otherwise discover point by
+        // point. On the csp B queries, 61% of the bases are infinity, and this is
+        // where their scalars stop costing anything. A constant-work plan has no ones
+        // path at all, whatever the buffer knows.
+        let ones_idx = match sbuf.ones_idx.as_ref().filter(|_| plan.dummy_rows == 0) {
+            Some(idx) => {
+                let lo = idx.partition_point(|&e| (e as usize) < scalar_off);
+                let hi = idx.partition_point(|&e| (e as usize) < scalar_off + n);
+                let gather: Vec<u32> = idx[lo..hi]
+                    .iter()
+                    .map(|&e| (base_off + (e as usize - scalar_off)) as u32)
+                    .filter(|&b| !inf[b as usize])
+                    .collect();
+                let buf = pool.take(gather.len() * 4)?;
+                if !gather.is_empty() {
+                    // SAFETY: the pooled buffer holds at least `gather.len()` u32s and
+                    // the batch that could read it has not been committed yet.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            gather.as_ptr(),
+                            buf.contents().cast::<u32>(),
+                            gather.len(),
+                        );
+                    }
+                }
+                Some((buf, gather.len()))
+            }
+            None => None,
+        };
+        let ones_groups = match &ones_idx {
+            Some((_, count)) => ones_groups_for(*count),
+            None if plan.separate_ones => ones_groups_for(n),
+            None => 0,
+        };
+        // The dummy rows are written by the accumulation like any interior run, and
+        // never read; the clear covers the real rows only.
+        let buckets = pool.take(plan.rows() * point_bytes)?;
+        // At most one run of a slice continues backwards, into a bucket an earlier slice
+        // owns. See [`Plan::spill_per_slice`] for the second slot.
+        let spill_slots = plan.spill_per_slice() * plan.n_windows * plan.slices;
+        let spill_pts = pool.take(spill_slots * point_bytes)?;
+        let spill_rows = pool.take(spill_slots * 4)?;
+        let fold = match plan.fold_levels().first() {
+            Some(&(_, groups)) => {
+                let slots = 2 * plan.n_windows * groups;
+                let pts = pool.take(slots * point_bytes)?;
+                let rows = pool.take(slots * 4)?;
+                keep.push(pts.clone());
+                keep.push(rows.clone());
+                Some((pts, rows))
+            }
+            None => None,
+        };
+        // The G1 reduce writes a pair per simdgroup. Query this pipeline's width:
+        // at width 16 a 64-thread group writes eight points, not four.
+        let sums_per_group = if is_g2 {
+            1
+        } else {
+            2 * msm.reduce_layout(plan).simdgroups
+        };
+        let window_sums =
+            pool.take(plan.n_windows * plan.reduce_groups * sums_per_group * point_bytes)?;
+        let ones = pool.take(ones_groups * point_bytes)?;
+        keep.push(buckets.clone());
+        keep.push(spill_pts.clone());
+        keep.push(spill_rows.clone());
+        keep.push(window_sums.clone());
+        keep.push(ones.clone());
+        if let Some((buf, _)) = &ones_idx {
+            keep.push(buf.clone());
+        }
+        Ok(Self {
+            buckets,
+            spill_pts,
+            spill_rows,
+            window_sums,
+            ones,
+            ones_groups,
+            ones_idx,
+            fold,
+            base_off,
+            skip,
+            is_g2,
+        })
+    }
+
+    /// The Pippenger half: clear, segmented accumulation, merge, reduce. Split from
+    /// [`Self::encode_ones`] so phase mode can time the bucket machinery and the ones
+    /// scan separately. The production path in [`MetalMsm::msm_batch`] does not call
+    /// this: it encodes the individual stages itself, grouped across jobs, so that
+    /// independent dispatches share a concurrent phase.
+    fn encode_buckets(
+        &self,
+        msm: &MetalMsm,
+        enc: &ComputeCommandEncoderRef,
+        job: &Job<'_>,
+        plan: &Plan<'_>,
+    ) {
+        self.encode_clear(msm, enc, job, plan);
+        self.encode_accumulate(msm, enc, job, plan);
+        self.encode_merge(msm, enc, job, plan);
+        self.encode_reduce(msm, enc, job, plan);
+    }
+
+    fn params_for(&self, plan: &Plan<'_>) -> MsmParams {
+        let mut p = plan.params();
+        p.base_off = self.base_off as u32;
+        p.ones_groups = self.ones_groups as u32;
+        p.skip = self.skip as u32;
+        p
+    }
+
+    /// A bucket that no slice writes directly has to read as the identity. Dispatched on
+    /// the legacy accumulation too, although that one writes every row: skipping it there
+    /// made the legacy path correct only while that kernel stays unconditional, and the
+    /// clear is about 0.1 ms.
+    fn encode_clear(
+        &self,
+        msm: &MetalMsm,
+        enc: &ComputeCommandEncoderRef,
+        job: &Job<'_>,
+        plan: &Plan<'_>,
+    ) {
+        let p = self.params_for(plan);
+        let clear_pso = match job {
+            Job::G1(_) => &msm.pipelines.clear_g1,
+            Job::G2(_) => &msm.pipelines.clear_g2,
+        };
+        enc.set_compute_pipeline_state(clear_pso);
+        enc.set_buffer(0, Some(&self.buckets), 0);
+        set_params(enc, 1, &p);
+        dispatch_1d(enc, clear_pso, plan.n_windows * plan.n_buckets, 256);
+    }
+
+    fn encode_accumulate(
+        &self,
+        msm: &MetalMsm,
+        enc: &ComputeCommandEncoderRef,
+        job: &Job<'_>,
+        plan: &Plan<'_>,
+    ) {
+        self.encode_accumulate_slices(msm, enc, job, plan, 0, plan.n_windows * plan.slices);
+    }
+
+    /// The accumulation over `count` slices from global slice `first`, so a split
+    /// submission can hand out whole windows a command buffer at a time. The legacy
+    /// kernel owns rows, not slices, and ignores the range.
+    fn encode_accumulate_slices(
+        &self,
+        msm: &MetalMsm,
+        enc: &ComputeCommandEncoderRef,
+        job: &Job<'_>,
+        plan: &Plan<'_>,
+        first: usize,
+        count: usize,
+    ) {
+        let mut p = self.params_for(plan);
+        p.seg_first = first as u32;
+        let rows = plan.n_windows * plan.n_buckets;
+        if legacy_accumulate() {
+            let (acc_pso, bases) = match job {
+                Job::G1(j) => (&msm.pipelines.accumulate_g1, &j.bases.buf),
+                Job::G2(j) => (&msm.pipelines.accumulate_g2, &j.bases.buf),
+            };
+            enc.set_compute_pipeline_state(acc_pso);
+            enc.set_buffer(0, Some(plan.entries.as_ref().unwrap()), 0);
+            enc.set_buffer(1, Some(bases), 0);
+            enc.set_buffer(2, Some(plan.counts.as_ref().unwrap()), 0);
+            enc.set_buffer(3, Some(plan.cursor.as_ref().unwrap()), 0);
+            enc.set_buffer(4, Some(&self.buckets), 0);
+            set_params(enc, 5, &p);
+            dispatch_1d(enc, acc_pso, rows, 64);
+        } else {
+            let (seg_pso, bases) = match job {
+                Job::G1(j) => (&msm.pipelines.segmented_g1, &j.bases.buf),
+                Job::G2(j) => (&msm.pipelines.segmented_g2, &j.bases.buf),
+            };
+            enc.set_compute_pipeline_state(seg_pso);
+            enc.set_buffer(0, Some(plan.entries.as_ref().unwrap()), 0);
+            enc.set_buffer(1, Some(bases), 0);
+            enc.set_buffer(2, Some(plan.cursor.as_ref().unwrap()), 0);
+            enc.set_buffer(3, Some(&self.buckets), 0);
+            enc.set_buffer(4, Some(&self.spill_pts), 0);
+            enc.set_buffer(5, Some(&self.spill_rows), 0);
+            set_params(enc, 6, &p);
+            dispatch_1d(enc, seg_pso, count, 64);
+        }
+    }
+
+    /// Every level of the merge, with a barrier between levels. The production path
+    /// calls [`Self::encode_merge_level`] instead, one level of every job at a time.
+    fn encode_merge(
+        &self,
+        msm: &MetalMsm,
+        enc: &ComputeCommandEncoderRef,
+        job: &Job<'_>,
+        plan: &Plan<'_>,
+    ) {
+        let mut level = 0;
+        while self.encode_merge_level(msm, enc, job, plan, level) {
+            barrier(enc);
+            level += 1;
+        }
+    }
+
+    /// Level `level` of the merge; true when another follows and reads what this one
+    /// wrote. A constant-work plan folds its spill slots through
+    /// [`Plan::fold_levels`], ping-ponging between the spill buffers and `fold`;
+    /// every other plan merges in one level.
+    fn encode_merge_level(
+        &self,
+        msm: &MetalMsm,
+        enc: &ComputeCommandEncoderRef,
+        job: &Job<'_>,
+        plan: &Plan<'_>,
+        level: usize,
+    ) -> bool {
+        let levels = plan.fold_levels();
+        if let Some(&(m_in, groups)) = levels.get(level) {
+            let (fold_pts, fold_rows) = self.fold.as_ref().expect("a fold plan has its buffers");
+            let spill = (&self.spill_pts, &self.spill_rows);
+            let (src, dst) = if level.is_multiple_of(2) {
+                (spill, (fold_pts, fold_rows))
+            } else {
+                ((fold_pts, fold_rows), spill)
+            };
+            let last = level + 1 == levels.len();
+            let f: [u32; 4] = [m_in as u32, groups as u32, fold_len() as u32, last as u32];
+            let pso = match job {
+                Job::G1(_) => &msm.pipelines.fold_g1,
+                Job::G2(_) => &msm.pipelines.fold_g2,
+            };
+            enc.set_compute_pipeline_state(pso);
+            enc.set_buffer(0, Some(src.0), 0);
+            enc.set_buffer(1, Some(src.1), 0);
+            enc.set_buffer(2, Some(dst.0), 0);
+            enc.set_buffer(3, Some(dst.1), 0);
+            enc.set_buffer(4, Some(&self.buckets), 0);
+            set_params(enc, 5, &self.params_for(plan));
+            enc.set_bytes(6, 16, f.as_ptr().cast());
+            dispatch_1d(enc, pso, plan.n_windows * groups, 64);
+            return !last;
+        }
+        if level > 0 || legacy_accumulate() || plan.host_tail {
+            return false;
+        }
+        let p = self.params_for(plan);
+        let merge_pso = match job {
+            Job::G1(_) => &msm.pipelines.merge_g1,
+            Job::G2(_) => &msm.pipelines.merge_g2,
+        };
+        enc.set_compute_pipeline_state(merge_pso);
+        enc.set_buffer(0, Some(&self.buckets), 0);
+        enc.set_buffer(1, Some(&self.spill_pts), 0);
+        enc.set_buffer(2, Some(&self.spill_rows), 0);
+        enc.set_buffer(3, Some(plan.counts.as_ref().unwrap()), 0);
+        enc.set_buffer(4, Some(plan.cursor.as_ref().unwrap()), 0);
+        set_params(enc, 5, &p);
+        dispatch_1d(enc, merge_pso, plan.n_windows * plan.n_buckets, 64);
+
+        // The top window's fat buckets, one threadgroup each. Disjoint rows from the
+        // dispatch above and the same read-only inputs, so the two share a phase.
+        if plan.merge_wide_rows > 0 {
+            let wide_pso = match job {
+                Job::G1(_) => &msm.pipelines.merge_wide_g1,
+                Job::G2(_) => &msm.pipelines.merge_wide_g2,
+            };
+            enc.set_compute_pipeline_state(wide_pso);
+            enc.set_buffer(0, Some(&self.buckets), 0);
+            enc.set_buffer(1, Some(&self.spill_pts), 0);
+            enc.set_buffer(2, Some(&self.spill_rows), 0);
+            enc.set_buffer(3, Some(plan.counts.as_ref().unwrap()), 0);
+            enc.set_buffer(4, Some(plan.cursor.as_ref().unwrap()), 0);
+            set_params(enc, 5, &p);
+            let tg = MERGE_TG.min(wide_pso.max_total_threads_per_threadgroup() as usize);
+            crate::cb::dispatch_thread_groups(
+                enc,
+                MTLSize::new(plan.merge_wide_rows as u64, 1, 1),
+                MTLSize::new(tg as u64, 1, 1),
+            );
+        }
+        false
+    }
+
+    fn encode_reduce(
+        &self,
+        msm: &MetalMsm,
+        enc: &ComputeCommandEncoderRef,
+        job: &Job<'_>,
+        plan: &Plan<'_>,
+    ) {
+        if plan.host_tail {
+            return;
+        }
+        let p = self.params_for(plan);
+        let is_g2 = matches!(job, Job::G2(_));
+        enc.set_compute_pipeline_state(msm.reduce_pso(is_g2, plan));
+        enc.set_buffer(0, Some(&self.buckets), 0);
+        enc.set_buffer(1, Some(&self.window_sums), 0);
+        set_params(enc, 2, &p);
+        let tg = msm.reduce_tg(is_g2, plan);
+        crate::cb::dispatch_thread_groups(
+            enc,
+            MTLSize::new((plan.n_windows * plan.reduce_groups) as u64, 1, 1),
+            MTLSize::new(tg as u64, 1, 1),
+        );
+    }
+
+    /// The scalar-of-1 half: one dispatch. Independent of the digit pipeline and of
+    /// every bucket stage. With a gather list it is `msm_ones_idx_*` over exactly the
+    /// live contributions. Unclassified scalars normally route ones into the buckets;
+    /// the measurement override restores the `msm_ones_*` scan over all n scalars.
+    fn encode_ones(
+        &self,
+        msm: &MetalMsm,
+        enc: &ComputeCommandEncoderRef,
+        job: &Job<'_>,
+        plan: &Plan<'_>,
+    ) {
+        // H's empty ones scan measured 0.23/0.22/0.27 ms at 2^17/2^18/2^19,
+        // including the isolated submission floor. Recode ones into the buckets
+        // when there is no host classification; the entry capacity already bounds n.
+        // G16_METAL_MSM_ROUTE_ONES=0 restores the scan for an end-to-end comparison.
+        if !plan.separate_ones {
+            return;
+        }
+        let mut p = self.params_for(plan);
+        if let Some((idx, count)) = &self.ones_idx {
+            let (pso, bases) = match job {
+                Job::G1(j) => (&msm.pipelines.ones_idx_g1, &j.bases.buf),
+                Job::G2(j) => (&msm.pipelines.ones_idx_g2, &j.bases.buf),
+            };
+            // The gather kernel reads its length from `n`; the plan's other counts do
+            // not apply to it.
+            p.n = *count as u32;
+            enc.set_compute_pipeline_state(pso);
+            enc.set_buffer(0, Some(idx), 0);
+            enc.set_buffer(1, Some(bases), 0);
+            enc.set_buffer(2, Some(&self.ones), 0);
+            set_params(enc, 3, &p);
+            let tg = REDUCE_TG.min(pso.max_total_threads_per_threadgroup() as usize);
+            crate::cb::dispatch_thread_groups(
+                enc,
+                MTLSize::new(self.ones_groups as u64, 1, 1),
+                MTLSize::new(tg as u64, 1, 1),
+            );
+            return;
+        }
+        let (ones_pso, bases) = match job {
+            Job::G1(j) => (&msm.pipelines.ones_g1, &j.bases.buf),
+            Job::G2(j) => (&msm.pipelines.ones_g2, &j.bases.buf),
+        };
+        // The scan walks the job's own range, not the plan's.
+        p.n = (plan.n - self.skip) as u32;
+        p.scalar_off = (plan.scalar_off + self.skip) as u32;
+        enc.set_compute_pipeline_state(ones_pso);
+        enc.set_buffer(0, Some(plan.scalars), 0);
+        enc.set_buffer(1, Some(bases), 0);
+        enc.set_buffer(2, Some(&self.ones), 0);
+        set_params(enc, 3, &p);
+        let tg = REDUCE_TG.min(ones_pso.max_total_threads_per_threadgroup() as usize);
+        crate::cb::dispatch_thread_groups(
+            enc,
+            MTLSize::new(self.ones_groups as u64, 1, 1),
+            MTLSize::new(tg as u64, 1, 1),
+        );
+    }
+
+    fn combine(&self, msm: &MetalMsm, plan: &Plan<'_>) -> MsmResult {
+        let rg = plan.reduce_groups;
+        if self.is_g2 {
+            // SAFETY: `alloc` sized `ones` at `ones_groups` points and the ones scan
+            // wrote one per group. Every read in this function is off the batch
+            // `msm_batch` has already waited on, so the writes have landed.
+            let o: &[PackedXyzzG2] = unsafe { read_back(&self.ones, self.ones_groups) };
+            if plan.host_tail {
+                // The GPU stopped after the accumulation; see [`HOST_TAIL_MAX_BUCKETS`].
+                // Fold the spilled runs into the buckets, then the reverse running sum
+                // gives sum_j (j+1) B_j, the whole window in a one-window plan.
+                //
+                // SAFETY: the bucket array holds `n_windows * n_buckets` points, and
+                // `host_tail` implies a single window, so `n_buckets` is all of it.
+                let b: &[PackedXyzzG2] = unsafe { read_back(&self.buckets, plan.n_buckets) };
+                let mut buckets: Vec<G2Projective> = b.iter().map(|x| x.to_projective()).collect();
+                if !legacy_accumulate() {
+                    let slots = plan.spill_per_slice() * plan.slices;
+                    // SAFETY: both spill arrays hold `spill_per_slice * n_windows *
+                    // slices` slots and the single window again makes `slots` the whole
+                    // of each. The accumulation writes every slot, sentinel row included.
+                    let rows: &[u32] = unsafe { read_back(&self.spill_rows, slots) };
+                    let pts: &[PackedXyzzG2] = unsafe { read_back(&self.spill_pts, slots) };
+                    for (r, pt) in rows.iter().zip(pts) {
+                        if *r != MSM_NO_ROW {
+                            buckets[*r as usize] += pt.to_projective();
+                        }
+                    }
+                }
+                let mut run = G2Projective::zero();
+                let mut acc = G2Projective::zero();
+                for b in buckets.iter().rev() {
+                    run += b;
+                    if !run.is_zero() {
+                        acc += &run;
+                    }
+                }
+                for x in o {
+                    acc += x.to_projective();
+                }
+                return MsmResult::G2(acc);
+            }
+            // SAFETY: the G2 reduce writes one point per (window, group), which is the
+            // `sums_per_group = 1` `alloc` sized `window_sums` with.
+            let w: &[PackedXyzzG2] = unsafe { read_back(&self.window_sums, plan.n_windows * rg) };
+            // Each window's `reduce_groups` partials fold first, then the Horner.
+            let sum_w = |k: usize| {
+                let mut s = w[k * rg].to_projective();
+                for x in &w[k * rg + 1..(k + 1) * rg] {
+                    s += x.to_projective();
+                }
+                s
+            };
+            let mut acc = sum_w(plan.n_windows - 1);
+            for k in (0..plan.n_windows - 1).rev() {
+                for _ in 0..plan.c {
+                    acc.double_in_place();
+                }
+                acc += sum_w(k);
+            }
+            for x in o {
+                acc += x.to_projective();
+            }
+            MsmResult::G2(acc)
+        } else {
+            // SAFETY: as in the G2 arm — `ones_groups` points, written by the completed
+            // batch.
+            let o: &[PackedXyzzG1] = unsafe { read_back(&self.ones, self.ones_groups) };
+            if plan.host_tail {
+                // Same shape as the G2 arm above, and the same lengths hold for the same
+                // reason: `host_tail` implies one window.
+                // SAFETY: `n_buckets` is the whole one-window bucket array.
+                let b: &[PackedXyzzG1] = unsafe { read_back(&self.buckets, plan.n_buckets) };
+                let mut buckets: Vec<G1Projective> = b.iter().map(|x| x.to_projective()).collect();
+                if !legacy_accumulate() {
+                    let slots = plan.spill_per_slice() * plan.slices;
+                    // SAFETY: `slots` is the whole of each one-window spill array.
+                    let rows: &[u32] = unsafe { read_back(&self.spill_rows, slots) };
+                    let pts: &[PackedXyzzG1] = unsafe { read_back(&self.spill_pts, slots) };
+                    for (r, pt) in rows.iter().zip(pts) {
+                        if *r != MSM_NO_ROW {
+                            buckets[*r as usize] += pt.to_projective();
+                        }
+                    }
+                }
+                let mut run = G1Projective::zero();
+                let mut acc = G1Projective::zero();
+                for b in buckets.iter().rev() {
+                    run += b;
+                    if !run.is_zero() {
+                        acc += &run;
+                    }
+                }
+                for x in o {
+                    acc += x.to_projective();
+                }
+                return MsmResult::G1(acc);
+            }
+            // The G1 reduce hands back a (partial, weight) PAIR per simdgroup; slot s
+            // of a window carries the buckets based at `(s/sgs)*chunk + (s%sgs)*stride`
+            // (see msm_reduce_scan_impl). The bases step uniformly whenever the chunk
+            // splits evenly over the threadgroup, as the large unforced shapes do, and
+            // then the weighted term folds to suffix additions plus one small multiple
+            // per window. Small chunks and overrides that break the stride pay one
+            // multiple per slot instead. The fold tripled in additions against the old
+            // one-point-per-group readback, so the windows fold on the thread pool
+            // before the serial Horner, which keeps the same window order as the CPU
+            // backend so the audit can compare affine.
+            let layout = msm.reduce_layout(plan);
+            let slots = layout.slots;
+            // SAFETY: `alloc` sized `window_sums` at `n_windows * reduce_groups *
+            // sums_per_group` points with `sums_per_group = 2 * simdgroups`, from this
+            // same `ReduceLayout`; `slots` is `reduce_groups * simdgroups`, so
+            // `n_windows * slots * 2` is exactly what it allocated and the reduce wrote.
+            let w: &[PackedXyzzG1] =
+                unsafe { read_back(&self.window_sums, plan.n_windows * slots * 2) };
+            let sum_w = |k: usize| layout.fold(&w[k * slots * 2..(k + 1) * slots * 2]);
+            let sums: Vec<G1Projective> = {
+                use rayon::prelude::*;
+                (0..plan.n_windows).into_par_iter().map(sum_w).collect()
+            };
+            let mut acc = sums[plan.n_windows - 1];
+            for k in (0..plan.n_windows - 1).rev() {
+                for _ in 0..plan.c {
+                    acc.double_in_place();
+                }
+                acc += sums[k];
+            }
+            for x in o {
+                acc += x.to_projective();
+            }
+            MsmResult::G1(acc)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Encoding helpers
+// ---------------------------------------------------------------------------
+
+/// How a batch reaches the device: one command buffer with a memory barrier between
+/// phases, or split, one command buffer per phase with the accumulation cut into
+/// pieces of at most [`SPLIT_BUDGET`] mixed additions.
+///
+/// macOS kills a command buffer that holds the GPU too long while the display wants it
+/// (`ImpactingInteractivity`; `fft.rs` measured 350 ms buffers losing five runs in six
+/// and 200 ms ones none). A variable-time batch keeps one buffer, the shape its 0.16 ms
+/// submission floor was measured against, although at 2^22 (js_384x384_d32) that buffer
+/// is 1.2 s of GPU time: under two 2^22 proof loops beside two wgpu ones it was killed
+/// about once in four proofs, and cut into pieces of at most 130 ms about once in two
+/// (62 kills in 137 proofs against 40 in 159), since every piece can be killed and a
+/// kill re-runs the whole batch; in neither did the MSM spend all eight attempts. A
+/// constant-work batch goes out split: its four witness jobs are each the size of H's,
+/// 1.5 s on anon-aadhaar in one buffer, and that buffer was killed the first time
+/// another batch shared the device. Split, each piece is committed and waited on before
+/// the next is encoded, the way the ceremony FFT submits: committing them back to back
+/// and waiting at the end kept the queue deep enough that the transforms of a proof
+/// sharing the device were killed instead. The wait stands in for the barrier, and the
+/// cost is one round trip per piece, about 0.16 ms.
+///
+/// Every command buffer ends with its completion token behind a barrier (the encoder is
+/// concurrent, so without one the token's thread could land before the reduce it vouches
+/// for had finished), and every wait checks it.
+struct Submission<'q> {
+    queue: &'q CommandQueueRef,
+    seal: &'q crate::cb::Seal,
+    split: bool,
+    cbs: Vec<(&'q CommandBufferRef, crate::cb::Token)>,
+    enc: Option<&'q ComputeCommandEncoderRef>,
+}
+
+impl<'q> Submission<'q> {
+    fn new(msm: &'q MetalMsm, queue: &'q CommandQueueRef, split: bool) -> Self {
+        Self {
+            queue,
+            seal: &msm.seal,
+            split,
+            cbs: Vec::new(),
+            enc: None,
+        }
+    }
+
+    /// The open encoder, opening a command buffer if none is.
+    fn enc(&mut self) -> &'q ComputeCommandEncoderRef {
+        if let Some(enc) = self.enc {
+            return enc;
+        }
+        let cb = crate::cb::command_buffer(self.queue);
+        let enc = cb.compute_command_encoder_with_dispatch_type(MTLDispatchType::Concurrent);
+        enc.set_label(if self.split {
+            "MSM batch piece"
+        } else {
+            "MSM batch"
+        });
+        self.enc = Some(enc);
+        // The token is taken here rather than at `close` so the pair is pushed together;
+        // the dispatch that writes it is encoded last, in `close`.
+        self.cbs.push((cb, self.seal.next()));
+        enc
+    }
+
+    /// Everything encoded after this reads what came before.
+    fn phase(&mut self) -> Result<(), ProveError> {
+        if self.split {
+            return self.close();
+        }
+        barrier(self.enc());
+        Ok(())
+    }
+
+    /// Seals and commits the open command buffer, if any, and in split mode waits for
+    /// it. The next `enc` opens a fresh one.
+    fn close(&mut self) -> Result<(), ProveError> {
+        let Some(enc) = self.enc.take() else {
+            return Ok(());
+        };
+        let (cb, token) = *self
+            .cbs
+            .last()
+            .expect("an open encoder has a command buffer");
+        barrier(enc);
+        self.seal.encode_token(enc, token);
+        enc.end_encoding();
+        cb.commit();
+        if self.split {
+            self.seal.wait(cb, token, "MSM batch piece")?;
+        }
+        Ok(())
+    }
+
+    /// Waits on every command buffer, in submission order, so the first failure
+    /// reported is the first that happened.
+    fn wait(&mut self, context: &str) -> Result<(), ProveError> {
+        self.close()?;
+        for (cb, token) in &self.cbs {
+            self.seal.wait(cb, *token, context)?;
+        }
+        Ok(())
+    }
+}
+
+/// Everything encoded after this on a concurrent encoder reads what came before.
+fn barrier(enc: &ComputeCommandEncoderRef) {
+    // SAFETY: `ComputeCommandEncoderRef` is `objc::Message`, and
+    // memoryBarrierWithScope: is a documented MTLComputeCommandEncoder method taking
+    // MTLBarrierScope; MTLBarrierScopeBuffers is 1 << 0. metal-rs 0.29 does not bind
+    // it, so it is called the way `cb` reads the unbound timing properties.
+    unsafe {
+        let () = msg_send![enc, memoryBarrierWithScope: 1u64];
+    }
+}
+
+/// The G1 shader and readback must use the same SIMD width, including partial groups.
+/// Kept independent of the device so the weighting identity can be checked on the CPU.
+struct ReduceLayout {
+    simdgroups: usize,
+    slots: usize,
+    chunk: usize,
+    stride: usize,
+}
+
+impl ReduceLayout {
+    fn new(buckets: usize, groups: usize, threads: usize, width: usize) -> Self {
+        let simdgroups = threads.div_ceil(width);
+        let chunk = buckets.div_ceil(groups);
+        Self {
+            simdgroups,
+            slots: groups * simdgroups,
+            chunk,
+            stride: width * chunk.div_ceil(threads),
+        }
+    }
+
+    fn fold(&self, pairs: &[PackedXyzzG1]) -> G1Projective {
+        assert_eq!(pairs.len(), 2 * self.slots);
+        if self.chunk == self.simdgroups * self.stride {
+            let mut c = G1Projective::zero();
+            let mut suff = G1Projective::zero();
+            let mut t = G1Projective::zero();
+            for s in (0..self.slots).rev() {
+                c += pairs[2 * s].to_projective();
+                suff += pairs[2 * s + 1].to_projective();
+                if s >= 1 {
+                    t += &suff;
+                }
+            }
+            c + mul_u64(t, self.stride as u64)
+        } else {
+            let mut c = G1Projective::zero();
+            for s in 0..self.slots {
+                let base = (s / self.simdgroups) * self.chunk + (s % self.simdgroups) * self.stride;
+                c += pairs[2 * s].to_projective();
+                c += mul_u64(pairs[2 * s + 1].to_projective(), base as u64);
+            }
+            c
+        }
+    }
+}
+
+/// `k * p` by MSB-first double-and-add. `k` is a bucket base, a few thousand at most,
+/// and this runs a handful of times per window inside the combine.
+fn mul_u64(p: G1Projective, k: u64) -> G1Projective {
+    let mut acc = G1Projective::zero();
+    if k == 0 || p.is_zero() {
+        return acc;
+    }
+    for i in (0..64 - k.leading_zeros()).rev() {
+        acc.double_in_place();
+        if (k >> i) & 1 == 1 {
+            acc += &p;
+        }
+    }
+    acc
+}
+
+fn set_params(enc: &ComputeCommandEncoderRef, index: u64, p: &MsmParams) {
+    enc.set_bytes(
+        index,
+        core::mem::size_of::<MsmParams>() as u64,
+        (p as *const MsmParams).cast(),
+    );
+}
+
+/// Threadgroup size is a preference clamped by what the pipeline will actually accept.
+///
+/// Never hardcode 1024: a kernel carrying one CIOS Montgomery multiply already reports
+/// 896 on this device from register pressure alone, and the XYZZ mixed-addition kernel
+/// measured 512. Both reference implementations query the pipeline; so does this.
+fn dispatch_1d(
+    enc: &ComputeCommandEncoderRef,
+    pso: &ComputePipelineState,
+    n: usize,
+    prefer: usize,
+) {
+    if n == 0 {
+        return;
+    }
+    let tg = prefer
+        .min(pso.max_total_threads_per_threadgroup() as usize)
+        .max(1);
+    crate::cb::dispatch_threads(
+        enc,
+        MTLSize::new(n as u64, 1, 1),
+        MTLSize::new(tg as u64, 1, 1),
+    );
+}
+
+/// # Safety
+///
+/// The buffer must hold at least `len` `T`s written by a completed command buffer, and
+/// `T` must be a `Packed` type, so every bit pattern is valid.
+unsafe fn read_back<T: Packed>(buf: &Buffer, len: usize) -> &[T] {
+    core::slice::from_raw_parts(buf.contents().cast::<T>(), len)
+}
+
+#[cfg(test)]
+#[path = "msm_cpu_tests.rs"]
+mod cpu_tests;
+
+#[cfg(test)]
+#[path = "msm_gpu_probes.rs"]
+mod gpu_probes;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::as_bytes;
+    use snarkrs_field::CurveGroup;
+    use snarkrs_formats::{wtns::Witness, ProvingKey};
+    use snarkrs_groth16::{cpu::CpuBackend, Backend, StageTimings};
+    use std::path::PathBuf;
+
+    /// `name` is relative to `bench/artifacts`, so the grouped sets are reached as
+    /// `csp/keccak_128` rather than being unreachable from a flat name.
+    fn artifact(name: &str) -> Option<PathBuf> {
+        let d = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../bench/artifacts")
+            .join(name);
+        if d.join("circuit.zkey").exists() && d.join("circuit.wtns").exists() {
+            Some(d)
+        } else {
+            None
+        }
+    }
+
+    /// The same drift guard for the two threadgroup sizes, which had none.
+    ///
+    /// `REDUCE_TG` and `SCAN_TG` are the *array* sizes of the `threadgroup` scratch in
+    /// `msm_reduce_*`, `msm_ones_*` and `msm_scan`, and the host dispatches that many
+    /// threads. Raising either one on the Rust side alone makes every thread above the
+    /// MSL array's length index out of bounds in threadgroup memory: no compile error,
+    /// no Metal validation error, just wrong points. Measured, not assumed. Setting
+    /// `REDUCE_TG` to 128 with the MSL left at 64 leaves H bit-exact and turns all five
+    /// MSM outputs wrong, so the proof stops verifying with nothing to point at.
+    #[test]
+    fn msl_declares_the_same_threadgroup_sizes() {
+        for (name, want) in [
+            ("REDUCE_TG", REDUCE_TG),
+            ("SCAN_TG", SCAN_TG),
+            ("MERGE_TG", MERGE_TG),
+        ] {
+            let line = format!("#define {name} {want}");
+            assert!(
+                MSM_MSL.contains(&line),
+                "shaders/msm.metal does not contain the line:\n{line}\n\
+                 The host dispatches {want} threads and the MSL sizes its threadgroup \
+                 array from its own #define; if they disagree the reduction writes out \
+                 of bounds and the MSM answers are silently wrong."
+            );
+        }
+    }
+
+    /// The spill sentinel lives in two languages too. If the MSL value moved, the
+    /// host-tail combine would fold garbage slots or drop real ones, silently.
+    #[test]
+    fn msl_declares_the_same_spill_sentinel() {
+        assert!(
+            MSM_MSL.contains("constant uint MSM_NO_ROW = 0xffffffffu;"),
+            "shaders/msm.metal no longer defines MSM_NO_ROW as 0xffffffff; \
+             `Outputs::combine`'s host-tail spill fold tests against the same value \
+             and must be changed with it."
+        );
+        assert_eq!(MSM_NO_ROW, u32::MAX);
+    }
+
+    /// Stage 4 sizes the buffer it lends H's plan with `dense_entries_bytes`. If that
+    /// drifted below what `Plan::alloc` asks for, the loan would be refused on every proof
+    /// and the entries would come from the pool again, which nothing else would notice.
+    #[test]
+    fn a_lent_buffer_fits_the_dense_plan_it_is_lent_to() {
+        let m = MetalMsm::new().expect("Metal device");
+        let std = crate::alloc::shared(&m.device, 4).unwrap();
+        for log_n in 0..=26 {
+            let n = 1usize << log_n;
+            for work in [Work::Variable, Work::Constant] {
+                let h = m.scalars_from_device_std_with(&std, n, work);
+                let plan = Plan::new(&h, 0, n);
+                assert_eq!(
+                    plan.n_windows * plan.cap * 8,
+                    dense_entries_bytes(n),
+                    "2^{log_n} {work:?}"
+                );
+            }
+        }
+    }
+
+    /// The drift guard, same shape as `layout::tests::msl_declares_the_same_constants`:
+    /// the Fq modulus and `N0` live in two languages and must be edited together.
+    #[test]
+    fn msl_declares_the_same_fq_constants() {
+        let want_n = format!(
+            "constant uint FQ_N[8] = {{ {} }};",
+            crate::layout::FQ_MODULUS
+                .iter()
+                .map(|l| format!("0x{l:08x}u"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        assert!(
+            MSM_MSL.contains(&want_n),
+            "shaders/msm.metal does not contain the line:\n{want_n}"
+        );
+        let want_n0 = format!("constant uint FQ_N0 = 0x{:08x}u;", crate::layout::FQ_N0);
+        assert!(
+            MSM_MSL.contains(&want_n0),
+            "shaders/msm.metal does not contain the line:\n{want_n0}"
+        );
+        // 3b of the G2 twist, the constant of the complete formulas' constant-work
+        // reduce, in Montgomery form as the shader holds every Fq.
+        use ark_ec::short_weierstrass::SWCurveConfig;
+        let b3 =
+            <snarkrs_field::g2::Config as SWCurveConfig>::COEFF_B * snarkrs_field::Fq2::from(3u64);
+        let packed = PackedFq2::from_fq2(&b3);
+        for (name, limbs) in [("C0", packed.c0.v), ("C1", packed.c1.v)] {
+            let want = format!(
+                "constant uint FQ2_G2_B3_{name}[8] = {{ {} }};",
+                limbs
+                    .iter()
+                    .map(|l| format!("0x{l:08x}u"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            assert!(
+                MSM_MSL.contains(&want),
+                "shaders/msm.metal does not contain the line:\n{want}"
+            );
+        }
+    }
+
+    /// The MSL must compile and every kernel must produce a pipeline. Separate from the
+    /// arithmetic tests so a compile error is reported as a compile error.
+    #[test]
+    fn the_library_compiles_and_every_kernel_has_a_pipeline() {
+        let m = MetalMsm::new().expect("Metal device");
+        // Occupancy is a measured property, not an assumption. Print it so a change in
+        // register pressure shows up in the test log rather than as a mystery slowdown.
+        eprintln!(
+            "max threads/threadgroup: count {} scatter {} accumulate_g1 {} accumulate_g2 {} \
+             reduce_g1 {} reduce_g2 {} (simd width {})",
+            m.pipelines.count.max_total_threads_per_threadgroup(),
+            m.pipelines.scatter.max_total_threads_per_threadgroup(),
+            m.pipelines
+                .accumulate_g1
+                .max_total_threads_per_threadgroup(),
+            m.pipelines
+                .accumulate_g2
+                .max_total_threads_per_threadgroup(),
+            m.pipelines.reduce_g1.max_total_threads_per_threadgroup(),
+            m.pipelines.reduce_g2.max_total_threads_per_threadgroup(),
+            m.pipelines.count.thread_execution_width(),
+        );
+        assert!(m.pipelines.reduce_g2.max_total_threads_per_threadgroup() >= 1);
+    }
+
+    /// A handful of scalars against a naive sum, before anything the size of a real
+    /// circuit. This is the test that isolates the point arithmetic: if the digit
+    /// recoding or `madd` is wrong, it fails here rather than 140,000 points later.
+    #[test]
+    fn small_g1_msm_matches_a_naive_sum() {
+        use snarkrs_field::PrimeGroup;
+        let m = MetalMsm::new().expect("Metal device");
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut next = || {
+            seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = seed;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        for n in [1usize, 2, 3, 31, 32, 33, 257, 1000] {
+            let mut bases = Vec::with_capacity(n);
+            let mut scalars = Vec::with_capacity(n);
+            let mut cur = G1Projective::generator();
+            for i in 0..n {
+                cur += G1Projective::generator();
+                bases.push(cur.into_affine());
+                // Deliberately dense in the two special cases, which is what a witness
+                // looks like and what the kernels take a different path for.
+                scalars.push(match i % 4 {
+                    0 => Fr::zero(),
+                    1 => Fr::one(),
+                    _ => {
+                        let mut b = [0u8; 32];
+                        for c in b.chunks_mut(8) {
+                            c.copy_from_slice(&next().to_le_bytes());
+                        }
+                        <Fr as snarkrs_field::PrimeField>::from_le_bytes_mod_order(&b)
+                    }
+                });
+            }
+            let want = bases
+                .iter()
+                .zip(&scalars)
+                .fold(G1Projective::zero(), |a, (b, s)| a + *b * s);
+            let db = m.upload_g1_bases(&bases).expect("upload bases");
+            let ds = m.upload_scalars(&scalars).expect("upload scalars");
+            let got = m.msm_g1(&db, &ds).unwrap();
+            assert_eq!(got.into_affine(), want.into_affine(), "n = {n}");
+        }
+    }
+
+    /// The three exceptional cases in `pt_madd`, reached on purpose rather than by the luck
+    /// of the scatter order.
+    ///
+    /// One base with one scalar, repeated, puts every copy in the same bucket of every
+    /// window, so the second addition into a bucket is `P + P` and has to double. Its
+    /// negation with the same scalar lands in the same buckets and has to cancel to the
+    /// identity, and the next copy has to restart from it. Bases at infinity with nonzero
+    /// scalars ride along and have to be skipped. The runs are long enough to cross
+    /// accumulation slices, so the spill and merge path sees the same cases.
+    #[test]
+    fn doubling_cancellation_and_infinity_inside_one_bucket_match_a_naive_sum() {
+        use snarkrs_field::PrimeGroup;
+        let m = MetalMsm::new().expect("Metal device");
+        let s = Fr::from(0x1234_5678_9abc_def1u64) * Fr::from(0x0fed_cba9_8765_4321u64);
+        for n in [2usize, 3, 64, 3001] {
+            let p1 = (G1Projective::generator() * Fr::from(7u64)).into_affine();
+            let p2 = (G2Projective::generator() * Fr::from(7u64)).into_affine();
+            let pattern = |i: usize| i % 5;
+            let g1: Vec<G1Affine> = (0..n)
+                .map(|i| match pattern(i) {
+                    0 | 1 => p1,
+                    2 => -p1,
+                    3 => G1Affine::identity(),
+                    _ => p1,
+                })
+                .collect();
+            let g2: Vec<G2Affine> = (0..n)
+                .map(|i| match pattern(i) {
+                    0 | 1 => p2,
+                    2 => -p2,
+                    3 => G2Affine::identity(),
+                    _ => p2,
+                })
+                .collect();
+            let scalars = vec![s; n];
+
+            let want1 = g1.iter().fold(G1Projective::zero(), |a, b| a + *b * s);
+            let want2 = g2.iter().fold(G2Projective::zero(), |a, b| a + *b * s);
+            let ds = m.upload_scalars(&scalars).expect("upload scalars");
+            let got1 = m.msm_g1(&m.upload_g1_bases(&g1).unwrap(), &ds).unwrap();
+            let got2 = m.msm_g2(&m.upload_g2_bases(&g2).unwrap(), &ds).unwrap();
+            assert_eq!(got1.into_affine(), want1.into_affine(), "G1, n = {n}");
+            assert_eq!(got2.into_affine(), want2.into_affine(), "G2, n = {n}");
+        }
+    }
+
+    /// `snarkrs_msm::MsmBackend` forbids reducing to the shorter side: the prefix sum is a
+    /// valid group element for a key that is wrong, and this is the `setup` path that
+    /// writes `.zkey` files. `MetalMsmBackend` panics through this error.
+    #[test]
+    fn a_length_mismatch_is_an_error_not_a_shorter_msm() {
+        use snarkrs_field::PrimeGroup;
+        let m = MetalMsm::new().expect("Metal device");
+        let bases: Vec<G1Affine> = (0..8)
+            .map(|i| (G1Projective::generator() * Fr::from(i as u64 + 1)).into_affine())
+            .collect();
+        let scalars: Vec<Fr> = (0..5).map(|i| Fr::from(i as u64 + 1)).collect();
+        let db = m.upload_g1_bases(&bases).expect("upload bases");
+        let ds = m.upload_scalars(&scalars).expect("upload scalars");
+        let e = m.msm_g1(&db, &ds).expect_err("8 bases against 5 scalars");
+        let text = e.to_string();
+        assert!(text.contains('8') && text.contains('5'), "{text}");
+    }
+
+    #[test]
+    fn a_length_mismatch_is_an_error_not_a_shorter_msm_g2() {
+        use snarkrs_field::PrimeGroup;
+        let m = MetalMsm::new().expect("Metal device");
+        let bases: Vec<G2Affine> = (0..4)
+            .map(|i| (G2Projective::generator() * Fr::from(i as u64 + 1)).into_affine())
+            .collect();
+        let scalars: Vec<Fr> = (0..9).map(|i| Fr::from(i as u64 + 1)).collect();
+        let db = m.upload_g2_bases(&bases).expect("upload bases");
+        let ds = m.upload_scalars(&scalars).expect("upload scalars");
+        let e = m.msm_g2(&db, &ds).expect_err("4 bases against 9 scalars");
+        let text = e.to_string();
+        assert!(text.contains('4') && text.contains('9'), "{text}");
+    }
+
+    #[test]
+    fn small_g2_msm_matches_a_naive_sum() {
+        use snarkrs_field::PrimeGroup;
+        let m = MetalMsm::new().expect("Metal device");
+        let n = 200usize;
+        let mut bases = Vec::with_capacity(n);
+        let mut scalars = Vec::with_capacity(n);
+        let mut cur = G2Projective::generator();
+        for i in 0..n {
+            cur += G2Projective::generator();
+            bases.push(cur.into_affine());
+            scalars.push(Fr::from((i as u64) * 7919 + 3));
+        }
+        scalars[0] = Fr::zero();
+        scalars[1] = Fr::one();
+        let want = bases
+            .iter()
+            .zip(&scalars)
+            .fold(G2Projective::zero(), |a, (b, s)| a + *b * s);
+        let db = m.upload_g2_bases(&bases).expect("upload bases");
+        let ds = m.upload_scalars(&scalars).expect("upload scalars");
+        let got = m.msm_g2(&db, &ds).unwrap();
+        assert_eq!(got.into_affine(), want.into_affine());
+    }
+
+    /// The host tail, which nothing else in the default suite reaches.
+    ///
+    /// Past [`HOST_TAIL_MAX_BUCKETS`] a one-window plan stops after the accumulation and
+    /// [`Outputs::combine`] folds the spilled runs into the buckets itself, then walks a
+    /// reverse running sum. That is a different final answer, not a different schedule,
+    /// and it needs scalars short enough to recode in a single window, which none of the
+    /// js artifacts produce. The plan shape is asserted as well as the answer, because a
+    /// refit of the window model that moved `c` off 9 here would otherwise leave this
+    /// quietly testing the GPU reduce instead.
+    #[test]
+    fn a_one_window_plan_finishes_on_the_host_and_matches_a_naive_sum() {
+        use snarkrs_field::PrimeGroup;
+        let m = MetalMsm::new().expect("Metal device");
+        let n = 1000usize;
+        let mut g1 = Vec::with_capacity(n);
+        let mut g2 = Vec::with_capacity(n);
+        let mut scalars = Vec::with_capacity(n);
+        let mut c1 = G1Projective::generator();
+        let mut c2 = G2Projective::generator();
+        for i in 0..n {
+            c1 += G1Projective::generator();
+            c2 += G2Projective::generator();
+            g1.push(c1.into_affine());
+            g2.push(c2.into_affine());
+            // Under 2^8, so the plan lays the recoding over nine bits and spends them in
+            // one window. The cycle also carries zeros and ones, which keeps the ones
+            // gather and the spill fold on the path together.
+            scalars.push(Fr::from((i % 200) as u64));
+        }
+        let ds = m.upload_scalars(&scalars).expect("upload scalars");
+        let plan = Plan::new(&ds, 0, n);
+        assert!(
+            plan.host_tail,
+            "c = {} over {} windows of {} buckets is not the host-tail shape",
+            plan.c, plan.n_windows, plan.n_buckets
+        );
+
+        let b1 = m.upload_g1_bases(&g1).expect("upload bases");
+        let b2 = m.upload_g2_bases(&g2).expect("upload bases");
+        let want1 = g1
+            .iter()
+            .zip(&scalars)
+            .fold(G1Projective::zero(), |a, (b, s)| a + *b * s);
+        let want2 = g2
+            .iter()
+            .zip(&scalars)
+            .fold(G2Projective::zero(), |a, (b, s)| a + *b * s);
+        let got1 = m.msm_g1(&b1, &ds).unwrap();
+        let got2 = m.msm_g2(&b2, &ds).unwrap();
+        assert_eq!(got1.into_affine(), want1.into_affine());
+        assert_eq!(got2.into_affine(), want2.into_affine());
+    }
+
+    /// The device entry point cannot assume H never contains a one. Exercise both
+    /// groups and reuse the scratch across zero, one, and mixed scalar vectors.
+    #[test]
+    fn unclassified_ones_and_zeros_match_both_cpu_groups() {
+        use snarkrs_field::PrimeGroup;
+        let m = MetalMsm::new().expect("Metal device");
+        let n = 65;
+        let g1: Vec<_> = (0..n)
+            .map(|i| (G1Projective::generator() * Fr::from((i + 1) as u64)).into_affine())
+            .collect();
+        let g2: Vec<_> = (0..n)
+            .map(|i| (G2Projective::generator() * Fr::from((i + 1) as u64)).into_affine())
+            .collect();
+        let b1 = m.upload_g1_bases(&g1).expect("upload bases");
+        let b2 = m.upload_g2_bases(&g2).expect("upload bases");
+        for kind in [0, 1, 2, 0] {
+            let scalars: Vec<_> = (0..n)
+                .map(|i| match kind {
+                    0 => Fr::zero(),
+                    1 => Fr::one(),
+                    _ => Fr::from((i % 5) as u64),
+                })
+                .collect();
+            let uploaded = m.upload_scalars(&scalars).expect("upload scalars");
+            let device = m.scalars_from_device_std(&uploaded.buf, n);
+            let want1 = g1
+                .iter()
+                .zip(&scalars)
+                .fold(G1Projective::zero(), |a, (b, s)| a + *b * s);
+            let want2 = g2
+                .iter()
+                .zip(&scalars)
+                .fold(G2Projective::zero(), |a, (b, s)| a + *b * s);
+            assert_eq!(
+                m.msm_g1(&b1, &device).unwrap().into_affine(),
+                want1.into_affine()
+            );
+            assert_eq!(
+                m.msm_g2(&b2, &device).unwrap().into_affine(),
+                want2.into_affine()
+            );
+        }
+    }
+
+    /// Bases with every seventh at infinity, for the constant-work tests: the finite
+    /// mask is the one thing the key is allowed to decide.
+    fn bases_with_infinity(n: usize) -> (Vec<G1Affine>, Vec<G2Affine>) {
+        use snarkrs_field::PrimeGroup;
+        let g1 = (0..n)
+            .map(|i| {
+                if i % 7 == 3 {
+                    G1Affine::identity()
+                } else {
+                    (G1Projective::generator() * Fr::from(i as u64 + 1)).into_affine()
+                }
+            })
+            .collect();
+        let g2 = (0..n)
+            .map(|i| {
+                if i % 7 == 3 {
+                    G2Affine::identity()
+                } else {
+                    (G2Projective::generator() * Fr::from(i as u64 + 1)).into_affine()
+                }
+            })
+            .collect();
+        (g1, g2)
+    }
+
+    /// Scalar vectors of every sparsity the witness path meets: dense random, all
+    /// zeros, all ones, bits with a few generals, and small values.
+    fn scalars_of_every_sparsity(n: usize) -> Vec<(&'static str, Vec<Fr>)> {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let random: Vec<Fr> = (0..n)
+            .map(|_| {
+                let mut b = [0u8; 32];
+                for c in b.chunks_mut(8) {
+                    c.copy_from_slice(&next().to_le_bytes());
+                }
+                <Fr as snarkrs_field::PrimeField>::from_le_bytes_mod_order(&b)
+            })
+            .collect();
+        vec![
+            ("random", random),
+            ("zeros", vec![Fr::zero(); n]),
+            ("ones", vec![Fr::one(); n]),
+            (
+                "bits and a few generals",
+                (0..n)
+                    .map(|i| {
+                        if i % 97 == 5 {
+                            -Fr::from(i as u64 * 7919 + 3)
+                        } else {
+                            Fr::from((i % 2) as u64)
+                        }
+                    })
+                    .collect(),
+            ),
+            ("small", (0..n).map(|i| Fr::from((i % 5) as u64)).collect()),
+        ]
+    }
+
+    /// `Work::Constant` against the CPU MSM and the variable path, in both groups, on
+    /// every sparsity, over a range that crosses classification chunks and slices,
+    /// plus a job that reads an offset subrange the way the L MSM does.
+    #[test]
+    fn constant_work_matches_the_cpu_on_every_sparsity() {
+        use snarkrs_msm::MsmBackend;
+        let m = MetalMsm::new().expect("Metal device");
+        let cpu = snarkrs_msm::CpuMsm::new();
+        let n = 3 * CLASSIFY_CHUNK + 7;
+        let (g1, g2) = bases_with_infinity(n);
+        let b1 = m.upload_g1_bases(&g1).expect("upload bases");
+        let b2 = m.upload_g2_bases(&g2).expect("upload bases");
+        let off = 5;
+        for (label, scalars) in scalars_of_every_sparsity(n) {
+            let constant = m
+                .upload_scalars_with(&scalars, Work::Constant)
+                .expect("upload scalars");
+            let variable = m.upload_scalars(&scalars).expect("upload scalars");
+            let want1 = cpu.msm_g1(&g1, &scalars).into_affine();
+            let want2 = cpu.msm_g2(&g2, &scalars).into_affine();
+            assert_eq!(
+                m.msm_g1(&b1, &constant).unwrap().into_affine(),
+                want1,
+                "{label}: G1"
+            );
+            assert_eq!(
+                m.msm_g2(&b2, &constant).unwrap().into_affine(),
+                want2,
+                "{label}: G2"
+            );
+            assert_eq!(
+                m.msm_g1(&b1, &variable).unwrap().into_affine(),
+                want1,
+                "{label}: G1, variable"
+            );
+            let got = m
+                .msm_batch(&[Job::G1(JobG1 {
+                    bases: &b1,
+                    base_off: off,
+                    scalars: &constant,
+                    scalar_off: off,
+                    n: n - off,
+                })])
+                .unwrap();
+            assert_eq!(
+                got[0].g1().unwrap().into_affine(),
+                cpu.msm_g1(&g1[off..], &scalars[off..]).into_affine(),
+                "{label}: G1 over an offset range"
+            );
+        }
+    }
+
+    /// A suffix job riding a wider job's plan, the way L rides A and B's, in both work
+    /// modes and both groups, on every sparsity: listed before the job it rides, over
+    /// bases of its own and over the wider job's bases at an offset.
+    #[test]
+    fn a_suffix_sharing_the_wider_plan_matches_the_cpu() {
+        use snarkrs_msm::MsmBackend;
+        let m = MetalMsm::new().expect("Metal device");
+        let cpu = snarkrs_msm::CpuMsm::new();
+        let n = 3 * CLASSIFY_CHUNK + 7;
+        let off = 5;
+        let (g1, g2) = bases_with_infinity(n);
+        let b1 = m.upload_g1_bases(&g1).expect("upload bases");
+        let b2 = m.upload_g2_bases(&g2).expect("upload bases");
+        let l1 = m.upload_g1_bases(&g1[off..]).expect("upload bases");
+        for (label, scalars) in scalars_of_every_sparsity(n) {
+            let want_full = cpu.msm_g1(&g1, &scalars).into_affine();
+            let want1 = cpu.msm_g1(&g1[off..], &scalars[off..]).into_affine();
+            let want2 = cpu.msm_g2(&g2[off..], &scalars[off..]).into_affine();
+            for work in [Work::Constant, Work::Variable] {
+                let s = m
+                    .upload_scalars_with(&scalars, work)
+                    .expect("upload scalars");
+                let got = m
+                    .msm_batch(&[
+                        Job::G1(JobG1 {
+                            bases: &l1,
+                            base_off: 0,
+                            scalars: &s,
+                            scalar_off: off,
+                            n: n - off,
+                        }),
+                        Job::G1(JobG1 {
+                            bases: &b1,
+                            base_off: 0,
+                            scalars: &s,
+                            scalar_off: 0,
+                            n,
+                        }),
+                        Job::G2(JobG2 {
+                            bases: &b2,
+                            base_off: off,
+                            scalars: &s,
+                            scalar_off: off,
+                            n: n - off,
+                        }),
+                    ])
+                    .unwrap();
+                assert_eq!(
+                    got[0].g1().unwrap().into_affine(),
+                    want1,
+                    "{label} {work:?}: L"
+                );
+                assert_eq!(
+                    got[1].g1().unwrap().into_affine(),
+                    want_full,
+                    "{label} {work:?}: A"
+                );
+                assert_eq!(
+                    got[2].g2().unwrap().into_affine(),
+                    want2,
+                    "{label} {work:?}: G2"
+                );
+            }
+        }
+    }
+
+    /// `Work::Constant`'s promise, checked where it is decided: a plan over a witness
+    /// of bits and a plan over a dense one have the same shape, allocate the same bytes,
+    /// dispatch the same threads, and fill every window's entry region exactly. The
+    /// variable path over the same two witnesses is shown to differ, so the check is
+    /// known to bite.
+    #[test]
+    fn constant_work_geometry_ignores_the_witness() {
+        let m = MetalMsm::new().expect("Metal device");
+        let n = 2 * CLASSIFY_CHUNK + 5;
+        let (g1, _) = bases_with_infinity(n);
+        let b1 = m.upload_g1_bases(&g1).expect("upload bases");
+        let sparse: Vec<Fr> = (0..n).map(|i| Fr::from((i % 2) as u64)).collect();
+        let dense: Vec<Fr> = (0..n).map(|i| -Fr::from(i as u64 * 7919 + 3)).collect();
+
+        // Everything a dispatch or an allocation is sized from, the merge tree included.
+        let shape = |p: &Plan<'_>| {
+            vec![
+                p.n,
+                p.c as usize,
+                p.n_windows,
+                p.n_buckets,
+                p.cap,
+                p.slice_len,
+                p.slices,
+                p.reduce_groups,
+                p.merge_wide_rows,
+                p.scatter_parts,
+                p.host_tail as usize,
+                p.separate_ones as usize,
+                p.dummy_rows,
+                p.rows(),
+            ]
+            .into_iter()
+            .chain(p.fold_levels().into_iter().flat_map(|(m, g)| [m, g]))
+            .collect::<Vec<_>>()
+        };
+        let mut seen = Vec::new();
+        for scalars in [&sparse, &dense] {
+            let s = m
+                .upload_scalars_with(scalars, Work::Constant)
+                .expect("upload scalars");
+            let mut plan = Plan::new(&s, 0, n);
+            let mut keep = Vec::new();
+            plan.alloc(&m.pool, &mut keep).expect("plan scratch");
+            let job = Job::G1(JobG1 {
+                bases: &b1,
+                base_off: 0,
+                scalars: &s,
+                scalar_off: 0,
+                n,
+            });
+            let out = Outputs::alloc(&m, &mut keep, &job, &plan, 0).expect("outputs");
+            assert_eq!(out.ones_groups, 0);
+            assert!(out.ones_idx.is_none());
+            let bytes: Vec<u64> = keep.iter().map(|b| b.length()).collect();
+
+            // The digit pipeline, then the histogram it built: every scalar is in
+            // every window exactly once, in a real row or a dummy one.
+            let queue = m.queue.get();
+            let cb = queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            plan.encode(&m, enc);
+            enc.end_encoding();
+            cb.commit();
+            crate::cb::wait_ok(cb, "constant-work digits").unwrap();
+            // SAFETY: `alloc` sized both at `rows()` u32s and the batch has completed.
+            let counts: &[u32] = unsafe { read_back(plan.counts.as_ref().unwrap(), plan.rows()) };
+            let cursor: &[u32] = unsafe { read_back(plan.cursor.as_ref().unwrap(), plan.rows()) };
+            let real = plan.n_windows * plan.n_buckets;
+            let mut in_real = 0usize;
+            for w in 0..plan.n_windows {
+                let real_w: u32 = counts[w * plan.n_buckets..(w + 1) * plan.n_buckets]
+                    .iter()
+                    .sum();
+                let dummy_w: u32 = counts[real + w * DUMMY_ROWS..real + (w + 1) * DUMMY_ROWS]
+                    .iter()
+                    .sum();
+                assert_eq!(real_w as usize + dummy_w as usize, n, "window {w}");
+                assert_eq!(
+                    cursor[real + (w + 1) * DUMMY_ROWS - 1] as usize,
+                    (w + 1) * n,
+                    "window {w}'s region is not full"
+                );
+                in_real += real_w as usize;
+            }
+            seen.push((shape(&plan), bytes, in_real));
+            drop(plan);
+            drop(out);
+            m.pool.give(keep);
+        }
+        assert_eq!(seen[0].0, seen[1].0, "plan shape follows the witness");
+        assert_eq!(seen[0].1, seen[1].1, "allocation follows the witness");
+        // What did change is where the entries went, which is the one thing Pippenger
+        // cannot hide.
+        assert_ne!(seen[0].2, seen[1].2);
+
+        let sparse_v = m.upload_scalars(&sparse).expect("upload scalars");
+        let dense_v = m.upload_scalars(&dense).expect("upload scalars");
+        assert_ne!(
+            shape(&Plan::new(&sparse_v, 0, n)),
+            shape(&Plan::new(&dense_v, 0, n)),
+            "the variable path should size its plan from the witness"
+        );
+    }
+
+    /// The path stage 9 will actually take once the NTT keeps `H` on the device: a
+    /// Montgomery `Fr` buffer converted in place rather than packed on the host.
+    ///
+    /// This is the asymmetry that silently costs a factor of R if it is got wrong, so it
+    /// is checked against the host-packed path on the same values.
+    #[test]
+    fn device_resident_montgomery_scalars_agree_with_host_packing() {
+        use snarkrs_field::PrimeGroup;
+        let m = MetalMsm::new().expect("Metal device");
+        let n = 512usize;
+        let mut bases = Vec::with_capacity(n);
+        let mut scalars = Vec::with_capacity(n);
+        let mut cur = G1Projective::generator();
+        for i in 0..n {
+            cur += G1Projective::generator();
+            bases.push(cur.into_affine());
+            scalars.push(Fr::from((i as u64) * 104_729 + 17));
+        }
+        let packed = crate::layout::PackedFr::pack_slice(&scalars);
+        let bytes = as_bytes(&packed);
+        let mont =
+            crate::alloc::shared_with_data(&m.device, bytes.as_ptr().cast(), bytes.len()).unwrap();
+
+        let db = m.upload_g1_bases(&bases).expect("upload bases");
+        let from_host = m
+            .msm_g1(&db, &m.upload_scalars(&scalars).expect("upload scalars"))
+            .unwrap();
+        let from_device = m
+            .msm_g1(&db, &m.scalars_from_device_mont(&mont, n).unwrap())
+            .unwrap();
+        let want = bases
+            .iter()
+            .zip(&scalars)
+            .fold(G1Projective::zero(), |a, (b, s)| a + *b * s);
+        assert_eq!(from_host.into_affine(), want.into_affine());
+        assert_eq!(from_device.into_affine(), want.into_affine());
+    }
+
+    /// The real test: all five MSMs of an actual circuit, GPU against the CPU backend,
+    /// on identical inputs. Points must be exactly equal after normalisation.
+    fn five_msms_against_cpu(name: &str) {
+        let Some(dir) = artifact(name) else {
+            eprintln!("{name}: artifact missing, skipped");
+            return;
+        };
+        let pk = ProvingKey::load(&dir.join("circuit.zkey")).expect("zkey");
+        let witness = Witness::load(&dir.join("circuit.wtns")).expect("wtns").0;
+
+        let circuit = CpuBackend::new().prepare(pk).expect("prepare");
+        let mut t = StageTimings::default();
+        let h = circuit.compute_h(&witness, &mut t).expect("compute_h");
+        let cpu = circuit.msms(&witness, &h, &mut t).expect("cpu msms");
+        let h_scalars = h.to_host().expect("cpu H is on the host");
+        let pk = circuit.key();
+        let n_public = circuit.n_public();
+
+        let m = MetalMsm::new().expect("Metal device");
+        let a_bases = m.upload_g1_bases(&pk.a_query).expect("upload bases");
+        let b1_bases = m.upload_g1_bases(&pk.b_g1_query).expect("upload bases");
+        let b2_bases = m.upload_g2_bases(&pk.b_g2_query).expect("upload bases");
+        let l_bases = m.upload_g1_bases(&pk.l_query).expect("upload bases");
+        let h_bases = m.upload_g1_bases(&pk.h_query).expect("upload bases");
+        let w_scalars = m.upload_scalars(&witness).expect("upload scalars");
+        let h_dev = m.upload_scalars(h_scalars).expect("upload scalars");
+
+        let n = witness.len();
+        let l_off = n_public + 1;
+        let jobs = vec![
+            Job::G1(JobG1 {
+                bases: &a_bases,
+                base_off: 0,
+                scalars: &w_scalars,
+                scalar_off: 0,
+                n,
+            }),
+            Job::G2(JobG2 {
+                bases: &b2_bases,
+                base_off: 0,
+                scalars: &w_scalars,
+                scalar_off: 0,
+                n,
+            }),
+            Job::G1(JobG1 {
+                bases: &b1_bases,
+                base_off: 0,
+                scalars: &w_scalars,
+                scalar_off: 0,
+                n,
+            }),
+            Job::G1(JobG1 {
+                bases: &l_bases,
+                base_off: 0,
+                scalars: &w_scalars,
+                scalar_off: l_off,
+                n: pk.l_query.len(),
+            }),
+            Job::G1(JobG1 {
+                bases: &h_bases,
+                base_off: 0,
+                scalars: &h_dev,
+                scalar_off: 0,
+                n: h_scalars.len(),
+            }),
+        ];
+        let got = m.msm_batch(&jobs).expect("gpu msms");
+
+        assert_eq!(
+            got[0].g1().unwrap().into_affine(),
+            cpu.a_g1.into_affine(),
+            "{name}: stage 5, MSM A -> G1"
+        );
+        assert_eq!(
+            got[1].g2().unwrap().into_affine(),
+            cpu.b_g2.into_affine(),
+            "{name}: stage 6, MSM B -> G2"
+        );
+        assert_eq!(
+            got[2].g1().unwrap().into_affine(),
+            cpu.b_g1.into_affine(),
+            "{name}: stage 7, MSM B -> G1"
+        );
+        assert_eq!(
+            got[3].g1().unwrap().into_affine(),
+            cpu.l_g1.into_affine(),
+            "{name}: stage 8, MSM L -> G1"
+        );
+        assert_eq!(
+            got[4].g1().unwrap().into_affine(),
+            cpu.h_g1.into_affine(),
+            "{name}: stage 9, MSM H -> G1"
+        );
+    }
+
+    #[test]
+    fn five_msms_match_cpu_on_tiny_mul() {
+        five_msms_against_cpu("tiny_mul");
+    }
+
+    #[test]
+    fn five_msms_match_cpu_on_js_1x1_d8() {
+        five_msms_against_cpu("js_1x1_d8");
+    }
+
+    /// GPU against CPU on wall clock, warm, for the same five MSMs.
+    ///
+    /// Not a check, a measurement. Bases upload is `prepare` work and sits outside the
+    /// timed region on both sides; scalar packing and upload is per-proof work and sits
+    /// inside the GPU's. Run with
+    /// `cargo test -p snarkrs-metal --release measure_against_cpu -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "measurement, not a check"]
+    fn measure_against_cpu() {
+        use std::time::Instant;
+        let reps = 9;
+        let t_start = Instant::now();
+        let m = MetalMsm::new().expect("Metal device");
+        let compile_ms = t_start.elapsed().as_secs_f64() * 1e3;
+        println!("MSL compile + all pipelines: {compile_ms:.1} ms (once per process)");
+        println!(
+            "{:<14} {:>8} {:>8} {:>7} {:>8} {:>9} {:>9} {:>9} {:>8}",
+            "artifact",
+            "n_vars",
+            "domain",
+            "gen%",
+            "c(wit/H)",
+            "cpu ms",
+            "gpu ms",
+            "gpu-nosc",
+            "upload"
+        );
+
+        for name in [
+            "tiny_mul",
+            "js_1x1_d8",
+            "js_2x2_d16",
+            "js_2x2_d32",
+            "js_8x8_d32",
+            "js_16x16_d32",
+        ] {
+            let Some(dir) = artifact(name) else {
+                continue;
+            };
+            let pk = ProvingKey::load(&dir.join("circuit.zkey")).expect("zkey");
+            let witness = Witness::load(&dir.join("circuit.wtns")).expect("wtns").0;
+            let circuit = CpuBackend::new().prepare(pk).expect("prepare");
+            let mut t = StageTimings::default();
+            let h = circuit.compute_h(&witness, &mut t).expect("compute_h");
+            let h_scalars = h.to_host().unwrap().to_vec();
+            let pk = circuit.key();
+            let n = witness.len();
+            let l_off = circuit.n_public() + 1;
+
+            let t0 = Instant::now();
+            let a_bases = m.upload_g1_bases(&pk.a_query).expect("upload bases");
+            let b1_bases = m.upload_g1_bases(&pk.b_g1_query).expect("upload bases");
+            let b2_bases = m.upload_g2_bases(&pk.b_g2_query).expect("upload bases");
+            let l_bases = m.upload_g1_bases(&pk.l_query).expect("upload bases");
+            let h_bases = m.upload_g1_bases(&pk.h_query).expect("upload bases");
+            let upload_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+            let general = {
+                let s = m.upload_scalars(&witness).expect("upload scalars");
+                s.general_in(&(0..n))
+            };
+
+            let mut cpu = Vec::new();
+            let mut gpu = Vec::new();
+            let mut gpu_nosc = Vec::new();
+            for r in 0..reps + 1 {
+                let t0 = Instant::now();
+                let mut tt = StageTimings::default();
+                let _ = circuit.msms(&witness, &h, &mut tt).unwrap();
+                let cpu_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+                let t0 = Instant::now();
+                let w_scalars = m.upload_scalars(&witness).expect("upload scalars");
+                let h_dev = m.upload_scalars(&h_scalars).expect("upload scalars");
+                let pack_ms = t0.elapsed().as_secs_f64() * 1e3;
+                let t1 = Instant::now();
+                let jobs = vec![
+                    Job::G1(JobG1 {
+                        bases: &a_bases,
+                        base_off: 0,
+                        scalars: &w_scalars,
+                        scalar_off: 0,
+                        n,
+                    }),
+                    Job::G2(JobG2 {
+                        bases: &b2_bases,
+                        base_off: 0,
+                        scalars: &w_scalars,
+                        scalar_off: 0,
+                        n,
+                    }),
+                    Job::G1(JobG1 {
+                        bases: &b1_bases,
+                        base_off: 0,
+                        scalars: &w_scalars,
+                        scalar_off: 0,
+                        n,
+                    }),
+                    Job::G1(JobG1 {
+                        bases: &l_bases,
+                        base_off: 0,
+                        scalars: &w_scalars,
+                        scalar_off: l_off,
+                        n: pk.l_query.len(),
+                    }),
+                    Job::G1(JobG1 {
+                        bases: &h_bases,
+                        base_off: 0,
+                        scalars: &h_dev,
+                        scalar_off: 0,
+                        n: h_scalars.len(),
+                    }),
+                ];
+                let _ = m.msm_batch(&jobs).unwrap();
+                let dev_ms = t1.elapsed().as_secs_f64() * 1e3;
+                // Drop the first round: it pays first-touch page faults on every scratch
+                // buffer, which is exactly the cold cost the pool exists to pay once.
+                if r > 0 {
+                    cpu.push(cpu_ms);
+                    gpu.push(pack_ms + dev_ms);
+                    gpu_nosc.push(dev_ms);
+                }
+            }
+            let med = |v: &mut Vec<f64>| {
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[v.len() / 2]
+            };
+            let c_wit = window_size(general);
+            let c_h = window_size(h_scalars.len());
+            println!(
+                "{:<14} {:>8} {:>8} {:>6.1}% {:>4}/{:<3} {:>9.2} {:>9.2} {:>9.2} {:>8.2}",
+                name,
+                n,
+                circuit.domain_size(),
+                100.0 * general as f64 / n as f64,
+                c_wit,
+                c_h,
+                med(&mut cpu),
+                med(&mut gpu),
+                med(&mut gpu_nosc),
+                upload_ms,
+            );
+        }
+    }
+
+    /// Per-MSM wall clock plus the bucket-occupancy histogram behind the kernel choice.
+    ///
+    /// The shipped accumulation hands every thread a fixed-length slice of the sorted
+    /// entries, so per-thread work is uniform whatever the histogram says, and the spill
+    /// slots plus `msm_merge_*` exist to stitch back together the runs a fat bucket
+    /// spreads over several slices. The max-to-average ratio printed here is what that
+    /// machinery is paid for: `G16_METAL_MSM_LEGACY_ACC=1` gives one thread one bucket
+    /// instead, and then the dispatch finishes when the fattest bucket does.
+    #[test]
+    #[ignore = "measurement, not a check"]
+    fn measure_per_msm() {
+        use std::time::Instant;
+        let m = MetalMsm::new().expect("Metal device");
+        for name in ["js_2x2_d16", "js_2x2_d32", "js_8x8_d32", "js_16x16_d32"] {
+            let Some(dir) = artifact(name) else { continue };
+            let pk = ProvingKey::load(&dir.join("circuit.zkey")).expect("zkey");
+            let witness = Witness::load(&dir.join("circuit.wtns")).expect("wtns").0;
+            let circuit = CpuBackend::new().prepare(pk).expect("prepare");
+            let mut t = StageTimings::default();
+            let h = circuit.compute_h(&witness, &mut t).expect("compute_h");
+            let h_scalars = h.to_host().unwrap().to_vec();
+            let pk = circuit.key();
+            let n = witness.len();
+            let l_off = circuit.n_public() + 1;
+
+            let a_bases = m.upload_g1_bases(&pk.a_query).expect("upload bases");
+            let b2_bases = m.upload_g2_bases(&pk.b_g2_query).expect("upload bases");
+            let l_bases = m.upload_g1_bases(&pk.l_query).expect("upload bases");
+            let h_bases = m.upload_g1_bases(&pk.h_query).expect("upload bases");
+            let w_scalars = m.upload_scalars(&witness).expect("upload scalars");
+            let h_dev = m.upload_scalars(&h_scalars).expect("upload scalars");
+
+            println!("--- {name}");
+            for (label, scalars_slice, job) in [
+                ("A  G1", &witness[..] as &[Fr], 0usize),
+                ("B  G2", &witness[..], 1),
+                ("L  G1", &witness[l_off..], 2),
+                ("H  G1", &h_scalars[..], 3),
+            ] {
+                let (nn, soff) = match job {
+                    2 => (pk.l_query.len(), l_off),
+                    3 => (h_scalars.len(), 0),
+                    _ => (n, 0),
+                };
+                let sbuf = if job == 3 { &h_dev } else { &w_scalars };
+                let jobs = match job {
+                    1 => vec![Job::G2(JobG2 {
+                        bases: &b2_bases,
+                        base_off: 0,
+                        scalars: sbuf,
+                        scalar_off: soff,
+                        n: nn,
+                    })],
+                    2 => vec![Job::G1(JobG1 {
+                        bases: &l_bases,
+                        base_off: 0,
+                        scalars: sbuf,
+                        scalar_off: soff,
+                        n: nn,
+                    })],
+                    3 => vec![Job::G1(JobG1 {
+                        bases: &h_bases,
+                        base_off: 0,
+                        scalars: sbuf,
+                        scalar_off: soff,
+                        n: nn,
+                    })],
+                    _ => vec![Job::G1(JobG1 {
+                        bases: &a_bases,
+                        base_off: 0,
+                        scalars: sbuf,
+                        scalar_off: soff,
+                        n: nn,
+                    })],
+                };
+                let _ = m.msm_batch(&jobs).unwrap();
+                let mut best = f64::MAX;
+                for _ in 0..5 {
+                    let t0 = Instant::now();
+                    let _ = m.msm_batch(&jobs).unwrap();
+                    best = best.min(t0.elapsed().as_secs_f64() * 1e3);
+                }
+
+                // Host-side replica of the kernel's recoding, for the histogram only.
+                let general = scalars_slice
+                    .iter()
+                    .filter(|s| !(s.is_zero() || s.is_one()))
+                    .count();
+                let c = window_size(general);
+                let nw = RECODE_BITS.div_ceil(c as usize);
+                let nb = 1usize << (c - 1);
+                let mut counts = vec![0u32; nw * nb];
+                for s in scalars_slice {
+                    if s.is_zero() || s.is_one() {
+                        continue;
+                    }
+                    let big = <Fr as snarkrs_field::PrimeField>::into_bigint(*s);
+                    let limbs: &[u64] = big.as_ref();
+                    for w in 0..nw {
+                        let (mag, _) = host_signed_digit(limbs, w, c);
+                        if mag != 0 {
+                            counts[w * nb + (mag - 1) as usize] += 1;
+                        }
+                    }
+                }
+                let maxb = counts.iter().copied().max().unwrap_or(0);
+                let total: u64 = counts.iter().map(|&x| x as u64).sum();
+                let avg = total as f64 / (nw * nb) as f64;
+                println!(
+                    "{label}  n {:>7}  gen {:>7}  c {:>2}  W {:>2}  buckets {:>6}  \
+                     entries {:>9}  avg/bucket {:>7.2}  max {:>7}  ratio {:>6.0}x  {:>8.2} ms",
+                    nn,
+                    general,
+                    c,
+                    nw,
+                    nb,
+                    total,
+                    avg,
+                    maxb,
+                    maxb as f64 / avg.max(1e-9),
+                    best
+                );
+            }
+        }
+    }
+
+    /// The CPU-side twin of `sc_signed_digit`, used only by the histogram above.
+    fn host_signed_digit(limbs: &[u64], i: usize, c: u32) -> (u32, bool) {
+        let read = |off: usize, width: u32| -> u64 {
+            let idx = off / 64;
+            if idx >= limbs.len() {
+                return 0;
+            }
+            let sh = off % 64;
+            let mut buf = limbs[idx] >> sh;
+            if sh + width as usize > 64 && idx + 1 < limbs.len() {
+                buf |= limbs[idx + 1] << (64 - sh);
+            }
+            buf & ((1u64 << width) - 1)
+        };
+        let off = i * c as usize;
+        let b = read(off, c);
+        let carry = if off == 0 { 0 } else { read(off - 1, 1) };
+        if (b >> (c - 1)) & 1 == 1 {
+            let mag = (1u64 << c) - b - carry;
+            (mag as u32, mag != 0)
+        } else {
+            ((b + carry) as u32, false)
+        }
+    }
+
+    /// The larger artifacts. Slow in a debug build, so they are opt-in; run with
+    /// `cargo test -p snarkrs-metal --release -- --ignored`.
+    #[test]
+    #[ignore = "minutes on the CPU oracle side"]
+    fn five_msms_match_cpu_on_every_artifact() {
+        for name in [
+            "js_2x2_d16",
+            "js_2x2_d32",
+            "js_8x8_d32",
+            "js_16x16_d32",
+            // The csp set, a level down and therefore missed by every flat name. It is
+            // where the witness plans are one window wide and the H plans reach c = 15,
+            // so it is the only set that covers the host tail and the split scatter.
+            "csp/sha256_128",
+            "csp/sha256_256",
+            "csp/keccak_128",
+            "csp/keccak_256",
+            "csp/keccak_512",
+        ] {
+            five_msms_against_cpu(name);
+        }
+    }
+}
+
+#[cfg(test)]
+mod thread_safety {
+    /// `PreparedCircuit` must be `Send + Sync`, so anything the Metal backend stores on
+    /// one has to be too. Checked rather than assumed: `metal-rs` declares its handles
+    /// `Send + Sync`, and MTLDevice, MTLBuffer, MTLComputePipelineState and
+    /// MTLCommandQueue are documented thread-safe. Command buffers and encoders are not,
+    /// and none of them outlive a `msm_batch` call.
+    const fn assert_send_sync<T: Send + Sync>() {}
+    const _: () = {
+        assert_send_sync::<super::MetalMsm>();
+        assert_send_sync::<super::G1Bases>();
+        assert_send_sync::<super::G2Bases>();
+        assert_send_sync::<super::ScalarBuf>();
+    };
+}

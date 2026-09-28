@@ -3,7 +3,7 @@
 //! `witnesscalc_adapter::witness!(name)` declares an extern `name_witness(&str) ->
 //! Result<Vec<u8>>` against the static library `build.rs` compiled from `name.cpp`. The
 //! bytes it returns are a `.wtns` file, byte for byte what `snarkjs wtns calculate`
-//! writes, which is why [`g16_zkey::wtns::Witness::from_bytes`] can take them unchanged.
+//! writes, which is why [`snarkrs_formats::wtns::Witness::from_bytes`] can take them unchanged.
 
 use crate::{Target, Variant};
 use anyhow::{anyhow, Result};

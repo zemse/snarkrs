@@ -13,7 +13,7 @@
   spelling, and at four or more sites returns garbage that differs on every run; running the
   three-site kernel has also been seen to lose the device outright. No barrier, no workgroup
   storage, no atomics, one thread per workgroup: nothing here is allowed to race. Needs <code>g2.wgsl</code> beside it:
-  <code>cargo run -p g16-wgpu --example dump_points_wgsl g2 &gt; web/static/dbg/g2.wgsl</code>.
+  <code>cargo run -p snarkrs-wgpu --example dump_points_wgsl g2 &gt; web/static/dbg/g2.wgsl</code>.
 </p>
 <p><button id="go" style="font:16px system-ui;padding:.6rem 1.2rem">run</button></p>
 <pre id="out">idle; or call __run(windows = 8, buckets = 256)</pre>

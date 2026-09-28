@@ -13,7 +13,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$HERE"
 
-CSP_BIN="bench/csp/target/release/g16-csp"
+CSP_BIN="bench/csp/target/release/snarkrs-csp"
 OUT="bench/results/csp/metrics"
 REPS=10
 MEM_REPS=10
@@ -40,7 +40,7 @@ if [ -z "$BACKENDS" ]; then
   case "$FEATURES" in *cuda*)  BACKENDS="$BACKENDS cuda"  ;; esac
 fi
 
-echo "=== building g16-csp (features: $FEATURES) ==="
+echo "=== building snarkrs-csp (features: $FEATURES) ==="
 ( cd bench/csp && cargo build --release ${FEATURES:+--features "$FEATURES"} )
 
 for backend in $BACKENDS; do

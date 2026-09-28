@@ -3,7 +3,7 @@
 //! <https://ethproofs.org/csp-benchmarks> publishes six numbers per circuit: proving time,
 //! verification time, peak memory, proof size, preprocessing size and constraint count.
 //! The published `circom` row is circom + witnesscalc + rapidsnark. This crate keeps the
-//! first two and swaps the third for `g16-core`, so the difference between our row and
+//! first two and swaps the third for `snarkrs-groth16`, so the difference between our row and
 //! theirs is the prover and nothing else.
 //!
 //! Three things about the upstream protocol are easy to get wrong and change the answer
@@ -176,15 +176,15 @@ impl Prover {
 
 /// Refuses rather than falling back. A row that silently measured the CPU while labelled
 /// `metal` is worse than no row.
-pub fn make_backend(kind: Backend) -> anyhow::Result<Box<dyn g16_core::Backend>> {
+pub fn make_backend(kind: Backend) -> anyhow::Result<Box<dyn snarkrs_groth16::Backend>> {
     match kind {
-        Backend::Cpu => Ok(Box::new(g16_core::cpu::CpuBackend::new())),
+        Backend::Cpu => Ok(Box::new(snarkrs_groth16::cpu::CpuBackend::new())),
         #[cfg(feature = "metal")]
-        Backend::Metal => Ok(Box::new(g16_metal::MetalBackend::new()?)),
+        Backend::Metal => Ok(Box::new(snarkrs_metal::MetalBackend::new()?)),
         #[cfg(not(feature = "metal"))]
         Backend::Metal => anyhow::bail!("built without the `metal` feature"),
         #[cfg(feature = "cuda")]
-        Backend::Cuda => Ok(Box::new(g16_cuda::CudaBackend::new()?)),
+        Backend::Cuda => Ok(Box::new(snarkrs_cuda::CudaBackend::new()?)),
         #[cfg(not(feature = "cuda"))]
         Backend::Cuda => anyhow::bail!("built without the `cuda` feature"),
     }

@@ -4,7 +4,7 @@ Four audits and three adversarial test suites, run against the tree at commit `e
 on an Apple M2 Max, macOS 26.6. Raw notes are in `security/notes/`: four `audit-*.md`
 files (our code) and four `research-*.md` files (prior art, CVEs, and the theory the
 audits are measured against). The test suites are
-`crates/g16-cli/tests/{campaign,verifier_negative,edge_witness}.rs`.
+`crates/cli/tests/{campaign,verifier_negative,edge_witness}.rs`.
 
 Nothing in this report is a fix. The audits were report-only and the test lanes added
 test files only. The findings below are as audited, and their file and line references are
@@ -50,7 +50,7 @@ to that tree; the table that follows says what has landed since.
 points; this one needs none. Shift the L base of one private wire by `E` and every load
 check passes, yet `C` moves by exactly `w * E`, which whoever holds that key's trapdoor can
 read back by computing the honest `C` from `A` and `B`. Run, not reasoned:
-`g16-core::prove::tests::a_shifted_l_query_leaks_through_c_and_only_the_checked_prove_stops_it`.
+`snarkrs-groth16::prove::tests::a_shifted_l_query_leaks_through_c_and_only_the_checked_prove_stops_it`.
 The defence is the self-verify that `prove` now runs by default: with `delta` nonzero in both
 groups `A` and `B` are uniform, so a proof that verifies under a fixed key has `C` determined
 by `A`, `B` and the statement. What is left is one bit per call, whether that check passed,
@@ -80,14 +80,14 @@ scalar buffers and the NTT vectors are still bound whole, and are exactly 128 Mi
 
 Four dimensions, each read line by line and then attacked.
 
-**Untrusted inputs** (`g16-zkey`). Every line of `binfile.rs`, `lib.rs` and `wtns.rs`
+**Untrusted inputs** (`snarkrs-formats`). Every line of `binfile.rs`, `lib.rs` and `wtns.rs`
 read. Then **60 crafted mutants** of `bench/artifacts/tiny_mul/circuit.zkey` and
 `circuit.wtns` plus two live timing races against the 94 MB `js_16x16_d32` key, all run
 through the release binary (then `g16`, now `snarkrs`). Executed, not reasoned: the 34 GB allocation, the SIGBUS,
 the SIGABRT, and the zero-knowledge break all have run output behind them.
 
-**Verifier soundness** (`g16-core/src/verify.rs`, `g16-cli/src/json.rs`, the vkey reader
-in `g16-zkey`). A probe binary outside the repo linked against the real crates and run
+**Verifier soundness** (`crates/groth16/src/verify.rs`, `crates/cli/src/json.rs`, the vkey reader
+in `snarkrs-formats`). A probe binary outside the repo linked against the real crates and run
 against the real `js_2x2_d16` artifact. Re-randomisation, non-canonical encodings, the
 infinity cases and the degenerate-key case were all executed. A genuine order-10069 twist
 point was constructed to test the G2 subgroup check rather than assuming it works.
@@ -186,7 +186,7 @@ the vendor's own recommendation, volatile zero stores plus a barrier at kernel e
 five kernels, with cost in the noise.
 
 **6. `[L]` Witness-dependent MSM cost, and we serialise the measurement.**
-`g16-msm/src/lib.rs:187,191` skip zero and one scalars; the survivor count `m` sizes the
+`crates/msm/src/lib.rs:187,191` skip zero and one scalars; the survivor count `m` sizes the
 window, the digit arrays and the Pippenger decision. Metal reproduces it: `msm.rs:594-608`
 builds a witness-derived bitmap and `:788-792` sizes the GPU allocation and dispatch grid
 from it. This is the Zcash channel from USENIX Security 2020 (correlation 0.57 over 4,000
@@ -196,13 +196,13 @@ Sapling proofs), except we also print `msm_us` at `main.rs:126` and write it to 
 Calibrated by measurement on our own `.wtns` files: general scalars are 83.3% for
 `tiny_mul`, then 95.9%, 97.2%, 98.2%, 98.2%, 98.2% up to `js_16x16_d32`. So the channel is
 narrow on these circuits and enormous on the bit-decomposition circuits the optimisation
-targets. Note that `g16-msm/src/lib.rs:12-13` claims "over 99% of witness scalars are 0 or
+targets. Note that `crates/msm/src/lib.rs:12-13` claims "over 99% of witness scalars are 0 or
 1", which is true of no artifact we ship, and the module docs justify the fast path at
 about 5.1x while dropping it costs under 2% on these same artifacts. Those two numbers
 should be reconciled.
 
 Status: **documented, not mitigated** (commit `e04b9af` added the threat-model note to
-`g16-msm`). The timing channel is an accepted risk. Serialising `msm_us` into artifacts an
+`snarkrs-msm`). The timing channel is an accepted risk. Serialising `msm_us` into artifacts an
 operator might publish is **open** and is the cheap half of the fix.
 
 ### Medium
@@ -231,7 +231,7 @@ times, then reported as `ProveError::Device`.
 Metal: a command buffer's `Completed` status is not proof that its dispatches ran. After a GPU
 hang and recovery on the M2 Max the driver returned `Completed` with a nil error for buffers none
 of whose encoders executed (3 in 300 during one episode). Every proving submission now ends with
-a completion token checked by the host (`cb::Seal`, `bec5863`), the same defence g16-wgpu has.
+a completion token checked by the host (`cb::Seal`, `bec5863`), the same defence snarkrs-wgpu has.
 Most of the "wrong with token present" results reported during recovery episodes were retry
 exhaustion misread: the audit's panics are `compute_h`'s error after four attempts in one
 episode. Over 8,574 concurrent results beside metal and wgpu proof loops, through two hang and
@@ -264,7 +264,7 @@ are about 2^254 accepted encodings of every proof before any group-level malleab
 VERIFIED: five random `z` gave five distinct accepted encodings of one point. Worse, when
 `z == 0` the reader returns at `json.rs:134-135` and `:159-160` **before** parsing `x` and
 `y`, so `["<p>","<p>","0"]` and even `[{"lol":1},[1,2,3],"0"]` are accepted. Our own vkey
-reader forbids exactly this (`g16-zkey/src/lib.rs:418,447` require `z` to be 1 or `[1,0]`).
+reader forbids exactly this (`crates/formats/src/lib.rs:418,447` require `z` to be 1 or `[1,0]`).
 Status: **open**. Fix: parse `x` and `y` before the zero test, require `z == 1` and
 `z == [1,0]`, delete the now-dead Jacobian branch.
 
@@ -401,7 +401,7 @@ than the docs: `Cargo.lock` pins rand 0.8.8, `ark_std::rand` is `pub use rand`, 
 `ChaCha12Core` reseeded from `OsRng` every 64 KiB, `impl CryptoRng for ThreadRng` is
 present, and fork protection is real via `libc::pthread_atfork`. The feature wiring fails
 to compile rather than silently downgrading. The one hand-rolled RNG in the tree
-(`g16-msm/tests/field_cpu_throughput.rs:41`) does not implement `CryptoRng`.
+(`crates/msm/tests/field_cpu_throughput.rs:41`) does not implement `CryptoRng`.
 
 **No RNG reuse in the bench loops.** `bench.rs:163,211` take one `thread_rng()` outside the
 rep loop and pass `&mut rng`, which is the correct pattern because `ThreadRng` is an `Rc`
@@ -423,7 +423,7 @@ that is correct, since BN254 G1 has cofactor 1; keep the call in case the curve 
 `verify.rs:42-49` VERIFIED in both directions. Coordinates at or above the modulus are
 rejected rather than reduced (`json.rs:40-42`), which is what defeats the `s + r` public
 signal substitution. There is no `q - y` negation bug: `-proof.a` uses arkworks' flag-based
-`Neg`. The vkey JSON reader (`g16-zkey/src/lib.rs:326-377`) is the strict one, and
+`Neg`. The vkey JSON reader (`crates/formats/src/lib.rs:326-377`) is the strict one, and
 `json.rs` should be raised to it rather than the reverse.
 
 **The zkey container layer is genuinely solid.** Every length reaching a slice is
@@ -530,7 +530,7 @@ state.
 
 **Do not try to fix this with a uniqueness or canonicalisation check.** The attacker picks
 `z`, so such a check only starts rejecting honest proofs. The property is pinned by
-`malleated_proof_still_verifies` in `crates/g16-cli/tests/verifier_negative.rs` and
+`malleated_proof_still_verifies` in `crates/cli/tests/verifier_negative.rs` and
 documented on `Proof` and `verify`, precisely so that it reads as intentional rather than as
 a bug someone should go and repair.
 

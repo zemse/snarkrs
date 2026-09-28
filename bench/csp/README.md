@@ -24,7 +24,7 @@ To write `input.json`, `circuit.wtns`, `vkey.json` and `public.json` next to eac
 that `snarkrs bench` and the backend audit tests can use the same circuits:
 
 ```sh
-bench/csp/target/release/g16-csp artifacts
+bench/csp/target/release/snarkrs-csp artifacts
 ```
 
 ## What the protocol actually measures

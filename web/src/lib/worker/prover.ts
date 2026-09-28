@@ -168,7 +168,7 @@ const handlers: Record<string, (a: Args, emit: (p: unknown) => void) => Promise<
     await mod.default({ module_or_path: `${pkgBase}/g16_wasm_bg.wasm${v}` });
     mod.start();
     // Before create_prover, which is where the pipelines are compiled. See `set_reduce_tg`
-    // in crates/g16-wgpu/src/wasm.rs.
+    // in crates/wgpu/src/wasm.rs.
     if (typeof reduceTg === 'number' && reduceTg > 0) mod.set_reduce_tg(reduceTg);
     if (typeof msmC === 'number' && msmC > 0) mod.set_msm_c(msmC);
     if (typeof upto === 'number' && upto > 0) mod.set_msm_stop_after(upto);
@@ -259,7 +259,7 @@ const handlers: Record<string, (a: Args, emit: (p: unknown) => void) => Promise<
     return { ...r, wallMs: performance.now() - t0 };
   },
 
-  /// Stages 0 to 4 and stop. See `prove_h_only` in crates/g16-wgpu/src/wasm.rs: it splits a
+  /// Stages 0 to 4 and stop. See `prove_h_only` in crates/wgpu/src/wasm.rs: it splits a
   /// proof in half so a device lost part way through one can be blamed on a half.
   async prove_h_only() {
     const t0 = performance.now();
@@ -276,7 +276,7 @@ const handlers: Record<string, (a: Args, emit: (p: unknown) => void) => Promise<
     return { ...r, wallMs: performance.now() - t0 };
   },
 
-  /// One deterministic GPU trace. See `prove_trace` in crates/g16-wgpu/src/wasm.rs: the
+  /// One deterministic GPU trace. See `prove_trace` in crates/wgpu/src/wasm.rs: the
   /// blinders are fixed, so what comes back is diffable against another machine's and is not
   /// a proof anybody may publish.
   async trace() {
@@ -300,7 +300,7 @@ const handlers: Record<string, (a: Args, emit: (p: unknown) => void) => Promise<
 
   /// The GPU known-answer battery, plus whatever the browser's WGSL compiler said about the
   /// modules the prover already built. Only run when the page asks for it; see
-  /// crates/g16-wgpu/src/selftest.rs for what each check is for.
+  /// crates/wgpu/src/selftest.rs for what each check is for.
   async selftest() {
     return {
       checks: JSON.parse(await w().selftest()),

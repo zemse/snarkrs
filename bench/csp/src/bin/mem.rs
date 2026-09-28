@@ -7,8 +7,8 @@
 
 use anyhow::Result;
 use clap::Parser;
-use g16_csp::{circuits, inputs, Backend, Target, Variant};
-use g16_zkey::{wtns::Witness, ProvingKey};
+use snarkrs_csp::{circuits, inputs, Backend, Target, Variant};
+use snarkrs_formats::{wtns::Witness, ProvingKey};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -26,7 +26,7 @@ struct Args {
 fn main() -> Result<()> {
     // The published peak is this process's, so it runs the way `snarkrs groth16 prove`
     // does.
-    g16_core::malloc::reexec_without_large_cache();
+    snarkrs_groth16::malloc::reexec_without_large_cache();
     let args = Args::parse();
     let v = Variant {
         target: args.target,
@@ -36,12 +36,12 @@ fn main() -> Result<()> {
     let wtns = circuits::witness(v, inputs::json(v.target, v.input_size))?;
     let pk = ProvingKey::load(&v.zkey(&args.artifacts))?;
     let witness = Witness::from_bytes(wtns)?.0;
-    let circuit = g16_csp::make_backend(args.backend)?.prepare(pk)?;
-    let proof = g16_core::prove::prove(
+    let circuit = snarkrs_csp::make_backend(args.backend)?.prepare(pk)?;
+    let proof = snarkrs_groth16::prove::prove(
         circuit.as_ref(),
         &witness,
         &mut ark_std::rand::thread_rng(),
-        &mut g16_core::StageTimings::default(),
+        &mut snarkrs_groth16::StageTimings::default(),
     )?;
     std::hint::black_box(&proof);
     Ok(())

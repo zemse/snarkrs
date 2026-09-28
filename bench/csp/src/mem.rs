@@ -3,7 +3,7 @@
 //! Not `getrusage` from inside the prover: `ru_maxrss` is a high-water mark for the whole
 //! process, so a reading taken in-process includes whatever the benchmark driver was
 //! holding, and on this driver that is every earlier variant's parsed key. The number has
-//! to come from a process that does one proof and exits, which is `g16-csp-mem`.
+//! to come from a process that does one proof and exits, which is `snarkrs-csp-mem`.
 //!
 //! Upstream averages ten samples rather than taking the maximum. That is theirs to
 //! justify; we copy it so the two columns mean the same thing.

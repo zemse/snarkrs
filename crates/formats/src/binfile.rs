@@ -1,0 +1,564 @@
+//! The iden3 "binfile" container shared by `.zkey`, `.wtns`, `.ptau` and `.r1cs`, plus the
+//! field and point decoders every section needs. Only the 4-byte magic and the version
+//! differ between the four, which is why [`BinFile::open`] takes the magic as a parameter
+//! rather than hardcoding `zkey`.
+//!
+//! Layout (`@iden3/binfileutils`): 4 magic bytes, u32 version, u32 nSections, then a flat
+//! run of `u32 sectionId, u64 sectionLength, payload`. Ids are neither ordered nor unique,
+//! so the only safe read is to scan the whole chain once and index it.
+//!
+//! # Montgomery, the part that silently corrupts proofs
+//!
+//! snarkjs mixes three different encodings of a field element in one file, and picking
+//! the wrong one produces a proof that fails to verify with no other symptom:
+//!
+//! * **Curve coordinates** (sections 2, 3, 5-9) go through ffjavascript's `toRprLEM`,
+//!   which dumps the internal Montgomery limbs verbatim. Stored integer is `x*R mod q`.
+//!   Decoded with [`fq`], which installs the limbs as-is via `new_unchecked`.
+//! * **Section 4 coefficients** are written as `toRprLE(Fr.mul(v, R2))`, that is
+//!   `fromMontgomery(v*R * R^2*R) = v*R^2`. **Double** Montgomery, not single. Decoded
+//!   with [`fr_double_montgomery`]. snarkjs' own reader confirms this by multiplying by
+//!   `R^-2` (`readFr2` in `zkey_utils.js`), and its prover confirms it a second way: it
+//!   feeds the raw bytes to a Montgomery `mul` against a *normal-form* witness, so the
+//!   two conversions cancel to one.
+//! * **Witness values** (`.wtns` section 2) are plain little-endian integers. snarkjs
+//!   reads them straight into `publicSignals` with `Scalar.fromRprLE` and hands the same
+//!   bytes to a multiexp that consumes normal-form scalars. Decoded with [`fr_normal`].
+
+use ark_ff::BigInt;
+use rayon::prelude::*;
+use snarkrs_field::*;
+
+use crate::ZkeyError;
+
+pub const FQ_BYTES: usize = 32;
+pub const G1_BYTES: usize = FQ_BYTES * 2;
+pub const G2_BYTES: usize = FQ_BYTES * 4;
+pub const FR_BYTES: usize = 32;
+
+/// Where a binfile's bytes live. Both variants deref to `&[u8]`, so nothing below this
+/// type, and no decoder in `lib.rs` or `wtns.rs`, knows which one it got.
+///
+/// The split exists because the browser has no filesystem to map.
+/// `wasm32-unknown-unknown` has no `open(2)`, so `File::open` there fails at runtime for
+/// every path there is: a zkey arrives over `fetch` and is written into linear memory,
+/// and an owned `Vec<u8>` is the only backing that can exist on that target.
+///
+/// `Mapped` stays the native default and is not a micro-optimisation: `js_16x16_d32`'s
+/// zkey is 94.4 MB (`bench/artifacts/manifest.csv`) and mmap keeps it out of the process
+/// entirely, paged in on demand by the sections we actually read.
+pub enum Backing {
+    #[cfg(not(target_family = "wasm"))]
+    Mapped(memmap2::Mmap),
+    Owned(Vec<u8>),
+}
+
+impl core::ops::Deref for Backing {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            #[cfg(not(target_family = "wasm"))]
+            Backing::Mapped(m) => m,
+            Backing::Owned(v) => v,
+        }
+    }
+}
+
+/// One entry of the section chain. `len` is what the file will hand out, which for an
+/// intact file is exactly the declared length; see [`Scan::Lenient`] for the other case.
+#[derive(Clone, Copy, Debug)]
+pub struct Section {
+    pub id: u32,
+    /// Offset of the payload, one byte past the 12-byte entry header.
+    pub start: usize,
+    pub len: usize,
+}
+
+/// How far a short file gets to go before the scan gives up.
+///
+/// `Strict` is what every proving-path reader wants and is the only behaviour that existed
+/// before: a declared length that runs past EOF is a hard error, because a zkey whose tail
+/// is missing cannot prove anything and failing at open beats failing inside an MSM.
+///
+/// `Lenient` exists for `g16 ptau info`, which has to *report* a truncated download rather
+/// than refuse to look at it. It clamps the offending section to the bytes that are
+/// actually there, records the shortfall in [`BinFile::truncation`] and stops. binfileutils
+/// has no such mode; this one is ours.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Scan {
+    Strict,
+    Lenient,
+}
+
+/// Where a lenient scan ran out of file.
+#[derive(Clone, Copy, Debug)]
+pub struct Truncation {
+    /// The section whose payload is short, or `None` when the chain was cut inside a
+    /// 12-byte entry header and there is no id to name.
+    pub section: Option<u32>,
+    pub declared: u64,
+    pub present: u64,
+}
+
+/// A binfile with its section chain indexed.
+pub struct BinFile {
+    data: Backing,
+    /// Entries in file order. A handful of them, so a linear scan beats a map and keeps
+    /// duplicate ids addressable.
+    sections: Vec<Section>,
+    /// `nSections` as the header claims, which `Lenient` may not have reached.
+    declared_sections: usize,
+    truncation: Option<Truncation>,
+}
+
+impl BinFile {
+    /// Zero an owned backing. For a file whose bytes are secret, the `.wtns`, once they have
+    /// been decoded. A mapped file is the file on disk, so there is no second copy to scrub.
+    // On wasm32 `Owned` is the only variant, so the pattern cannot fail there.
+    #[allow(irrefutable_let_patterns)]
+    pub fn scrub(&mut self) {
+        if let Backing::Owned(v) = &mut self.data {
+            zeroize::Zeroize::zeroize(v);
+        }
+    }
+}
+
+impl BinFile {
+    /// Map the file and index it. Native only, because there is no filesystem to map on
+    /// wasm; the browser path is [`BinFile::from_bytes`].
+    #[cfg(not(target_family = "wasm"))]
+    pub fn open(
+        path: &std::path::Path,
+        magic: &[u8; 4],
+        max_version: u32,
+    ) -> Result<Self, ZkeyError> {
+        Self::open_with(path, magic, max_version, Scan::Strict)
+    }
+
+    /// [`BinFile::open`] with the scan mode spelled out.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn open_with(
+        path: &std::path::Path,
+        magic: &[u8; 4],
+        max_version: u32,
+        scan: Scan,
+    ) -> Result<Self, ZkeyError> {
+        let file = std::fs::File::open(path)?;
+        // Safety: we only ever hand out shared slices of the mapping, and the mapping
+        // outlives them. A concurrent truncation of the file would be UB, which is the
+        // standard and unavoidable caveat of mmap on any key file.
+        let map = unsafe { memmap2::Mmap::map(&file)? };
+        Self::index(Backing::Mapped(map), magic, max_version, scan)
+    }
+
+    /// Index a binfile already in memory. Takes the `Vec` by value rather than a slice
+    /// because the wasm caller has just written a 94 MB zkey into linear memory and a
+    /// borrow would force it to keep a second owner alive for the life of the key; the
+    /// whole point of the byte path is that the file exists exactly once.
+    pub fn from_bytes(
+        bytes: Vec<u8>,
+        magic: &[u8; 4],
+        max_version: u32,
+    ) -> Result<Self, ZkeyError> {
+        Self::index(Backing::Owned(bytes), magic, max_version, Scan::Strict)
+    }
+
+    /// [`BinFile::from_bytes`] with the scan mode spelled out.
+    pub fn from_bytes_with(
+        bytes: Vec<u8>,
+        magic: &[u8; 4],
+        max_version: u32,
+        scan: Scan,
+    ) -> Result<Self, ZkeyError> {
+        Self::index(Backing::Owned(bytes), magic, max_version, scan)
+    }
+
+    /// Header check plus the one scan of the section chain, shared by both constructors so
+    /// the mmap path and the byte path cannot drift apart on a bounds check. Every one of
+    /// them is load-bearing: the header is attacker-controlled, and the offsets recorded
+    /// here are the only thing standing between a lying section length and a panic inside
+    /// `unique_section`.
+    fn index(
+        data: Backing,
+        magic: &[u8; 4],
+        max_version: u32,
+        scan: Scan,
+    ) -> Result<Self, ZkeyError> {
+        if data.len() < 12 {
+            return Err(ZkeyError::TooShort(data.len()));
+        }
+        let got: [u8; 4] = data[0..4].try_into().expect("slice is 4 bytes");
+        if &got != magic {
+            return Err(ZkeyError::BadMagic(got));
+        }
+        let version = u32_at(&data, 4);
+        if version > max_version {
+            return Err(ZkeyError::Malformed {
+                section: 0,
+                reason: format!("version {version} exceeds supported {max_version}"),
+            });
+        }
+        let n_sections = u32_at(&data, 8) as usize;
+
+        // Bounded by the file: a lying `nSections` of 2^32-1 would otherwise reserve 96 GB
+        // before the loop reads a byte. Twelve is the smallest an entry can be.
+        let mut sections = Vec::with_capacity(n_sections.min(data.len() / 12));
+        let mut truncation = None;
+        let mut pos = 12usize;
+        for i in 0..n_sections {
+            if pos + 12 > data.len() {
+                if scan == Scan::Lenient {
+                    truncation = Some(Truncation {
+                        section: None,
+                        declared: 12,
+                        present: (data.len() - pos.min(data.len())) as u64,
+                    });
+                    break;
+                }
+                return Err(ZkeyError::Malformed {
+                    section: 0,
+                    reason: format!("section header {i} runs past end of file"),
+                });
+            }
+            let id = u32_at(&data, pos);
+            let len = u64_at(&data, pos + 4) as usize;
+            pos += 12;
+            let end = pos.checked_add(len).ok_or_else(|| ZkeyError::Malformed {
+                section: id,
+                reason: "section length overflows".into(),
+            })?;
+            if end > data.len() {
+                if scan == Scan::Lenient {
+                    let present = data.len() - pos;
+                    sections.push(Section {
+                        id,
+                        start: pos,
+                        len: present,
+                    });
+                    truncation = Some(Truncation {
+                        section: Some(id),
+                        declared: len as u64,
+                        present: present as u64,
+                    });
+                    break;
+                }
+                return Err(ZkeyError::Malformed {
+                    section: id,
+                    reason: format!("length {len} runs past end of file"),
+                });
+            }
+            sections.push(Section {
+                id,
+                start: pos,
+                len,
+            });
+            pos = end;
+        }
+
+        Ok(Self {
+            data,
+            sections,
+            declared_sections: n_sections,
+            truncation,
+        })
+    }
+
+    /// Every entry of the section chain, in file order, duplicates included.
+    pub fn sections(&self) -> &[Section] {
+        &self.sections
+    }
+
+    /// `nSections` as the header declares it. `createBinFile` writes this before any
+    /// section exists and never revises it (`binfileutils.js:46`), so it is a claim about
+    /// the file rather than a fact derived from it, and `sections().len()` can be smaller.
+    pub fn declared_sections(&self) -> usize {
+        self.declared_sections
+    }
+
+    /// Where a [`Scan::Lenient`] index ran out of file, `None` when the chain is intact.
+    pub fn truncation(&self) -> Option<Truncation> {
+        self.truncation
+    }
+
+    /// Total bytes of the file, so a caller can check the chain ends exactly at EOF.
+    pub fn total_len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// The whole file. Needed by readers that must address bytes outside any section,
+    /// which is not a hypothetical: `zkey_new.js:517` reads one G1 point past the end of
+    /// ptau section 2 and folds it into `csHash`.
+    pub fn bytes(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// The one section with this id. Duplicates are a format error for every section we
+    /// read, so rejecting them here beats silently taking the first.
+    pub fn unique_section(&self, id: u32) -> Result<&[u8], ZkeyError> {
+        let mut found = None;
+        for &Section {
+            id: sid,
+            start,
+            len,
+        } in &self.sections
+        {
+            if sid == id {
+                if found.is_some() {
+                    return Err(ZkeyError::Malformed {
+                        section: id,
+                        reason: "duplicated section".into(),
+                    });
+                }
+                found = Some(&self.data[start..start + len]);
+            }
+        }
+        found.ok_or(ZkeyError::MissingSection(id))
+    }
+}
+
+/// A forward-only reader over one section, so the header parse reads like the spec.
+pub struct Cursor<'a> {
+    data: &'a [u8],
+    pos: usize,
+    section: u32,
+}
+
+impl<'a> Cursor<'a> {
+    pub fn new(data: &'a [u8], section: u32) -> Self {
+        Self {
+            data,
+            pos: 0,
+            section,
+        }
+    }
+
+    pub fn take(&mut self, n: usize) -> Result<&'a [u8], ZkeyError> {
+        let end = self.pos.checked_add(n).ok_or_else(|| self.short(n))?;
+        if end > self.data.len() {
+            return Err(self.short(n));
+        }
+        let out = &self.data[self.pos..end];
+        self.pos = end;
+        Ok(out)
+    }
+
+    pub fn u8(&mut self) -> Result<u8, ZkeyError> {
+        Ok(self.take(1)?[0])
+    }
+
+    pub fn u32(&mut self) -> Result<u32, ZkeyError> {
+        Ok(u32_at(self.take(4)?, 0))
+    }
+
+    pub fn u64(&mut self) -> Result<u64, ZkeyError> {
+        Ok(u64_at(self.take(8)?, 0))
+    }
+
+    pub fn remaining(&self) -> usize {
+        self.data.len() - self.pos
+    }
+
+    fn short(&self, want: usize) -> ZkeyError {
+        ZkeyError::Malformed {
+            section: self.section,
+            reason: format!(
+                "wanted {want} bytes at offset {}, only {} left",
+                self.pos,
+                self.data.len().saturating_sub(self.pos)
+            ),
+        }
+    }
+}
+
+fn u32_at(b: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes(b[off..off + 4].try_into().expect("slice is 4 bytes"))
+}
+
+fn u64_at(b: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes(b[off..off + 8].try_into().expect("slice is 8 bytes"))
+}
+
+/// 32 little-endian bytes as a 4-limb bigint, no reduction and no Montgomery conversion.
+///
+/// # Panics
+///
+/// Panics unless `b` is at least [`FQ_BYTES`] long.
+pub fn bigint(b: &[u8]) -> BigInt<4> {
+    let mut limbs = [0u64; 4];
+    for (i, limb) in limbs.iter_mut().enumerate() {
+        *limb = u64_at(b, i * 8);
+    }
+    BigInt::new(limbs)
+}
+
+/// A base-field coordinate as snarkjs stores it: the Montgomery limbs verbatim.
+///
+/// Limbs at or above `q` are rejected rather than installed. arkworks holds the invariant
+/// that an element's stored `BigInt` is below the modulus, and its arithmetic is written
+/// to exploit it: `add_assign` is one `add_with_carry` followed by at most one
+/// `subtract_modulus`, so two limb sets in the range `[q, 2^256)` sum past 256 bits, drop
+/// the carry and land on a value that is not even congruent mod `q`. Installing 32
+/// unchecked bytes therefore corrupts everything downstream including `is_on_curve`, which
+/// is the gate meant to refuse the point in the first place. snarkjs never writes such a
+/// coordinate, so nothing legitimate is lost. The one place in this workspace that must
+/// reproduce wasmcurves' wrapping on out-of-range limbs is `snarkrs-ceremony`'s `noncanonical`
+/// module, which is deliberately not built on this decoder.
+///
+/// # Panics
+///
+/// Panics unless `b` is at least [`FQ_BYTES`] long.
+pub fn fq(b: &[u8]) -> Result<Fq, ZkeyError> {
+    let limbs = bigint(b);
+    if limbs >= Fq::MODULUS {
+        return Err(ZkeyError::NonCanonical("base field"));
+    }
+    Ok(Fq::new_unchecked(limbs))
+}
+
+/// A scalar stored in ordinary (non-Montgomery) form. Rejects a value at or above the
+/// modulus rather than reducing it, because a witness that needs reducing is a bug
+/// upstream, not something to paper over.
+pub fn fr_normal(b: &[u8], section: u32) -> Result<Fr, ZkeyError> {
+    Fr::from_bigint(bigint(b)).ok_or_else(|| ZkeyError::Malformed {
+        section,
+        reason: "field element is not below the scalar modulus".into(),
+    })
+}
+
+/// A section-4 coefficient: the stored integer is `v * R^2`, so one `new_unchecked`
+/// (which divides by `R` by reinterpreting the limbs) leaves `v * R`, and multiplying by
+/// the element whose value is `R^-1` finishes the job.
+///
+/// Range-checked for the same reason as [`fq`]: `new_unchecked` on limbs at or above `r`
+/// breaks the invariant arkworks' arithmetic assumes, and the multiply below is the first
+/// operation to observe it.
+///
+/// # Panics
+///
+/// Panics unless `b` is at least [`FR_BYTES`] long.
+pub fn fr_double_montgomery(b: &[u8], r_inv: &Fr) -> Result<Fr, ZkeyError> {
+    let limbs = bigint(b);
+    if limbs >= Fr::MODULUS {
+        return Err(ZkeyError::NonCanonical("scalar field"));
+    }
+    Ok(Fr::new_unchecked(limbs) * r_inv)
+}
+
+/// The element whose *value* is `R^-1 mod r`: limbs `1` reinterpreted as Montgomery.
+pub fn r_inv() -> Fr {
+    Fr::new_unchecked(BigInt::new([1, 0, 0, 0]))
+}
+
+/// snarkjs writes the point at infinity as the affine pair `(0, 0)`, which is not on the
+/// curve. Every other decoder in the pipeline would then reject or, worse, silently
+/// mangle it, so the mapping has to happen here.
+///
+/// # Panics
+///
+/// Panics unless `b` is at least [`G1_BYTES`] long.
+pub fn g1(b: &[u8]) -> Result<G1Affine, ZkeyError> {
+    let x = fq(&b[..FQ_BYTES])?;
+    let y = fq(&b[FQ_BYTES..G1_BYTES])?;
+    Ok(if x.is_zero() && y.is_zero() {
+        G1Affine::identity()
+    } else {
+        G1Affine::new_unchecked(x, y)
+    })
+}
+
+/// `Fq2` components are stored `c0` then `c1`, matching the `[[x0, x1], ...]` order in
+/// `verification_key.json`.
+///
+/// # Panics
+///
+/// Panics unless `b` is at least [`G2_BYTES`] long.
+pub fn g2(b: &[u8]) -> Result<G2Affine, ZkeyError> {
+    let x = Fq2::new(fq(&b[..FQ_BYTES])?, fq(&b[FQ_BYTES..2 * FQ_BYTES])?);
+    let y = Fq2::new(
+        fq(&b[2 * FQ_BYTES..3 * FQ_BYTES])?,
+        fq(&b[3 * FQ_BYTES..G2_BYTES])?,
+    );
+    Ok(if x.is_zero() && y.is_zero() {
+        G2Affine::identity()
+    } else {
+        G2Affine::new_unchecked(x, y)
+    })
+}
+
+/// Checks a section holds exactly `n` records of `stride` bytes. Getting this wrong is
+/// how an off-by-one in one section quietly shifts every later one.
+pub fn expect_records(data: &[u8], n: usize, stride: usize, section: u32) -> Result<(), ZkeyError> {
+    // `n` is a header field, so the product is attacker-controlled. A 64-bit `usize`
+    // cannot overflow it, but this crate is also built for wasm32, where a wrapped `want`
+    // of 0 would make the one length gate every section goes through pass vacuously.
+    let want = n.checked_mul(stride).ok_or_else(|| ZkeyError::Malformed {
+        section,
+        reason: format!("{n} records of {stride} bytes overflows usize"),
+    })?;
+    if data.len() != want {
+        return Err(ZkeyError::Malformed {
+            section,
+            reason: format!(
+                "expected {n} records of {stride} bytes ({want}), got {}",
+                data.len()
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Decodes fixed-size records in parallel, straight into the one vector that is returned.
+///
+/// Not `collect::<Result<Vec<_>, _>>()`, for the reason given at [`collect_records`].
+pub fn decode_records<T, E, F>(
+    data: &[u8],
+    stride: usize,
+    fallback: T,
+    decode: F,
+) -> Result<Vec<T>, E>
+where
+    T: Copy + Send + Sync,
+    E: Send,
+    F: Fn(usize, &[u8]) -> Result<T, E> + Sync,
+{
+    collect_records(
+        data.par_chunks_exact(stride)
+            .enumerate()
+            .map(|(i, b)| decode(i, b)),
+        fallback,
+    )
+}
+
+/// Collects fallible items from an indexed parallel iterator into one vector.
+///
+/// Not `collect::<Result<Vec<_>, _>>()`: rayon cannot index a fallible collect, so it
+/// builds a linked list of per-task vectors and then copies them into the result. On
+/// anon-aadhaar's 631 MB key that was 1.8 GB of short-lived allocations, and macOS malloc
+/// kept 181 MB of those pages dirty for the rest of the process. Here an item that fails
+/// is written as `fallback`, which keeps the collect indexed, and the error returned is the
+/// one from the lowest failing item.
+pub fn collect_records<I, T, E>(items: I, fallback: T) -> Result<Vec<T>, E>
+where
+    I: IndexedParallelIterator<Item = Result<T, E>>,
+    T: Copy + Send + Sync,
+    E: Send,
+{
+    let first_err = std::sync::Mutex::new(None::<(usize, E)>);
+    let out = items
+        .enumerate()
+        .map(|(i, r)| {
+            r.unwrap_or_else(|e| {
+                let mut slot = first_err.lock().unwrap_or_else(|p| p.into_inner());
+                if slot.as_ref().is_none_or(|(j, _)| i < *j) {
+                    *slot = Some((i, e));
+                }
+                fallback
+            })
+        })
+        .collect();
+    match first_err.into_inner().unwrap_or_else(|p| p.into_inner()) {
+        None => Ok(out),
+        Some((_, e)) => Err(e),
+    }
+}

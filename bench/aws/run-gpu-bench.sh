@@ -30,11 +30,11 @@ rsync -az -e "ssh -i $KEY -o StrictHostKeyChecking=no" \
   "$HERE/" "$HOST:~/g16/"
 
 echo "==> building with cuda"
-"${SSH[@]}" 'source ~/.cargo/env; cd ~/g16 && cargo build --release -p snarkrs --features cuda 2>&1 | tail -2'
+"${SSH[@]}" 'source ~/.cargo/env; cd ~/g16 && cargo build --release -p snarkrs-cli --features cuda 2>&1 | tail -2'
 
 if [ "${2:-}" = "--first-compile" ]; then
   echo "==> measuring a genuine first compile (clearing both caches)"
-  "${SSH[@]}" 'source ~/.cargo/env; cd ~/g16 && rm -rf ~/.cache/g16-cuda ~/.nv && \
+  "${SSH[@]}" 'source ~/.cargo/env; cd ~/g16 && rm -rf ~/.cache/snarkrs-cuda ~/.nv && \
     /usr/bin/time -f "FIRST COMPILE + first proof: %e s" \
     ./target/release/snarkrs groth16 prove bench/artifacts/tiny_mul/circuit.zkey \
       bench/artifacts/tiny_mul/circuit.wtns /tmp/fc.json \

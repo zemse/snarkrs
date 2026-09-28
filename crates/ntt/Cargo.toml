@@ -1,0 +1,10 @@
+[package]
+name = "snarkrs-ntt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+snarkrs-field.workspace = true
+ark-ff.workspace = true
+rayon.workspace = true

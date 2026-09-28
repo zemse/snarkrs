@@ -186,7 +186,7 @@ rsh "$IP" 'source ~/.cargo/env
 # carried on past a build that had failed to compile libc.
 say "building (release${FEATURES:+, cuda})"
 BUILD_T0=$(date +%s)
-if ! rsh "$IP" "set -o pipefail; source ~/.cargo/env; cd ~/g16 && cargo build --release -p snarkrs $FEATURES" > "$OUT/build.log" 2>&1; then
+if ! rsh "$IP" "set -o pipefail; source ~/.cargo/env; cd ~/g16 && cargo build --release -p snarkrs-cli $FEATURES" > "$OUT/build.log" 2>&1; then
   say "BUILD FAILED after $(( $(date +%s) - BUILD_T0 ))s:"
   tail -25 "$OUT/build.log" | tee -a "$LOG"
   exit 1
@@ -222,7 +222,7 @@ FIRST_COMPILE_S=""
 if [ -n "$GPU" ] && [ "$FIRST_COMPILE" = 1 ]; then
   say "measuring a genuine first kernel compile (both caches cleared)"
   FIRST_COMPILE_S="$(rsh "$IP" 'source ~/.cargo/env; cd ~/g16
-    rm -rf ~/.cache/g16-cuda ~/.nv
+    rm -rf ~/.cache/snarkrs-cuda ~/.nv
     s=$(date +%s.%N)
     ./target/release/snarkrs groth16 prove bench/artifacts/tiny_mul/circuit.zkey \
       bench/artifacts/tiny_mul/circuit.wtns /tmp/fc.json \
@@ -235,7 +235,7 @@ if [ -n "$GPU" ]; then
   # WARNING: this is NOT the cold kernel build unless the gate was skipped.
   #
   # The intent was to time the first CUDA run on a fresh box, where ~/.nv/ComputeCache and
-  # ~/.cache/g16-cuda are both empty and the run pays NVRTC source-to-PTX plus the driver's
+  # ~/.cache/snarkrs-cuda are both empty and the run pays NVRTC source-to-PTX plus the driver's
   # PTX-to-SASS JIT. But the correctness gate above runs the CUDA test suite first, and that
   # populates ~/.nv itself. Measured on g4dn.2xlarge: this step reported 3 s, against the
   # 113 s + 175 s the same card needs from genuinely cold caches.

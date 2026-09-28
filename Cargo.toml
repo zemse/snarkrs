@@ -1,20 +1,20 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/g16-field",
-    "crates/g16-zkey",
-    "crates/g16-ntt",
-    "crates/g16-msm",
-    "crates/g16-core",
-    "crates/g16-ceremony",
-    "crates/g16-gpu-layout",
-    "crates/g16-gpu-kernels",
-    "crates/g16-metal",
-    "crates/g16-cuda",
-    "crates/g16-wgpu",
-    "crates/g16-wasm",
-    "crates/g16-witness",
-    "crates/snarkrs",
+    "crates/field",
+    "crates/formats",
+    "crates/ntt",
+    "crates/msm",
+    "crates/groth16",
+    "crates/ceremony",
+    "crates/gpu-layout",
+    "crates/gpu-kernels",
+    "crates/metal",
+    "crates/cuda",
+    "crates/wgpu",
+    "crates/web",
+    "crates/witness",
+    "crates/cli",
 ]
 # Its own workspace: it links a C++ witness generator and pulls rand, sha3 and
 # witnesscalc-adapter, and none of that belongs in a `cargo build` of the prover.
@@ -32,7 +32,7 @@ repository = "https://github.com/zemse/gpu-snark"
 ark-bn254    = { version = "0.5", default-features = false, features = ["curve"] }
 # No `asm` here on purpose. A workspace dependency table cannot be target gated, and
 # ark-ff's assembly is x86_64 only, so declaring it here made the manifest claim an
-# optimisation that aarch64 and wasm32 never had. g16-field re-declares it under
+# optimisation that aarch64 and wasm32 never had. snarkrs-field re-declares it under
 # `cfg(target_arch = "x86_64")` and the read-this-first caveat lives there.
 #
 # Two things to keep in mind, and the second is measured rather than assumed. On aarch64
@@ -72,19 +72,19 @@ dhat         = "0.3"
 hotpath      = "0.23"
 criterion    = { version = "0.8", features = ["html_reports"] }
 
-g16-field = { path = "crates/g16-field" }
-g16-zkey  = { path = "crates/g16-zkey" }
-g16-ntt   = { path = "crates/g16-ntt" }
-g16-msm   = { path = "crates/g16-msm" }
-g16-core  = { path = "crates/g16-core" }
-g16-ceremony = { path = "crates/g16-ceremony" }
-g16-gpu-layout = { path = "crates/g16-gpu-layout" }
-g16-gpu-kernels = { path = "crates/g16-gpu-kernels" }
-g16-metal = { path = "crates/g16-metal" }
-g16-cuda  = { path = "crates/g16-cuda" }
-g16-wgpu  = { path = "crates/g16-wgpu" }
-g16-wasm  = { path = "crates/g16-wasm" }
-g16-witness = { path = "crates/g16-witness", default-features = false }
+snarkrs-field = { path = "crates/field" }
+snarkrs-formats  = { path = "crates/formats" }
+snarkrs-ntt   = { path = "crates/ntt" }
+snarkrs-msm   = { path = "crates/msm" }
+snarkrs-groth16  = { path = "crates/groth16" }
+snarkrs-ceremony = { path = "crates/ceremony" }
+snarkrs-gpu-layout = { path = "crates/gpu-layout" }
+snarkrs-gpu-kernels = { path = "crates/gpu-kernels" }
+snarkrs-metal = { path = "crates/metal" }
+snarkrs-cuda  = { path = "crates/cuda" }
+snarkrs-wgpu  = { path = "crates/wgpu" }
+snarkrs-web  = { path = "crates/web" }
+snarkrs-witness = { path = "crates/witness", default-features = false }
 
 [profile.release]
 opt-level = 3

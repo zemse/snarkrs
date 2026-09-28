@@ -1,8 +1,8 @@
-//! `g16-csp`: run the ethproofs client-side-proving benchmark against this prover.
+//! `snarkrs-csp`: run the ethproofs client-side-proving benchmark against this prover.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use g16_csp::{run, Backend, Prover, Target, Variant};
+use snarkrs_csp::{run, Backend, Prover, Target, Variant};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -40,10 +40,10 @@ struct BenchArgs {
     reps: usize,
     #[arg(long, default_value = "bench/results/csp/metrics")]
     out_dir: PathBuf,
-    /// Peak-RSS samples per variant, each a fresh `g16-csp-mem` process. 0 skips it.
+    /// Peak-RSS samples per variant, each a fresh `snarkrs-csp-mem` process. 0 skips it.
     #[arg(long, default_value_t = 10)]
     mem_reps: usize,
-    /// Override the single-shot prover. Defaults to `g16-csp-mem` beside this binary.
+    /// Override the single-shot prover. Defaults to `snarkrs-csp-mem` beside this binary.
     #[arg(long)]
     mem_bin: Option<PathBuf>,
     /// Restrict to one target. Default: all of them.
@@ -88,7 +88,7 @@ fn bench(a: BenchArgs) -> Result<()> {
         None => std::env::current_exe()?
             .parent()
             .ok_or_else(|| anyhow::anyhow!("no directory for the running binary"))?
-            .join("g16-csp-mem"),
+            .join("snarkrs-csp-mem"),
     };
     anyhow::ensure!(
         a.mem_reps == 0 || a.rapidsnark.is_some() || mem_bin.is_file(),
@@ -151,18 +151,18 @@ fn artifacts(a: ArtifactArgs) -> Result<()> {
             println!("skip  {:<16} no circuit.zkey", v.name());
             continue;
         }
-        let input_json = g16_csp::inputs::json(v.target, v.input_size);
-        let wtns = g16_csp::circuits::witness(v, input_json.clone())?;
-        let pk = g16_zkey::ProvingKey::load(&zkey)?;
-        let witness = g16_zkey::wtns::Witness::from_bytes(wtns.clone())?.0;
+        let input_json = snarkrs_csp::inputs::json(v.target, v.input_size);
+        let wtns = snarkrs_csp::circuits::witness(v, input_json.clone())?;
+        let pk = snarkrs_formats::ProvingKey::load(&zkey)?;
+        let witness = snarkrs_formats::wtns::Witness::from_bytes(wtns.clone())?.0;
         let public = &witness[1..=pk.n_public];
 
         std::fs::write(dir.join("input.json"), &input_json)?;
         std::fs::write(dir.join("circuit.wtns"), &wtns)?;
-        g16_ceremony::vkey::export_verification_key(&zkey, &dir.join("vkey.json"))?;
+        snarkrs_ceremony::vkey::export_verification_key(&zkey, &dir.join("vkey.json"))?;
         std::fs::write(
             dir.join("public.json"),
-            g16_core::json::public_to_string(public),
+            snarkrs_groth16::json::public_to_string(public),
         )?;
         println!(
             "ok    {:<16} {} constraints, witness {} bytes",
@@ -185,7 +185,7 @@ fn list(a: ArtifactArgs) -> Result<()> {
             println!("{:<16} {:>12} {:>14}", v.name(), "-", "missing");
             continue;
         };
-        let pk = g16_zkey::ProvingKey::load(&zkey)?;
+        let pk = snarkrs_formats::ProvingKey::load(&zkey)?;
         println!(
             "{:<16} {:>12} {:>14}",
             v.name(),

@@ -1,0 +1,1192 @@
+//! Pippenger multi-scalar multiplication over BN254 G1 and G2.
+//!
+//! Five MSMs dominate the proof (~53% of a fast CPU prover's wall clock at 151K
+//! constraints, ~70% of a slow one's), so this is the crate that decides whether the
+//! project is worth anything.
+//!
+//! Two properties matter beyond raw speed, both because the witness is the scalar vector
+//! for four of the five MSMs:
+//!   * a scalar of 0 must cost nothing beyond the digit scan,
+//!   * a scalar of 1 must cost exactly one mixed addition, not a full bucket round trip.
+//!
+//! How much those paths matter is circuit-shaped, and an earlier version of this comment
+//! overclaimed it: "in bit-decomposition-heavy circuits over 99% of witness scalars are
+//! 0 or 1". Measured on the benchmark ladder (round-4 profiling), 0/1 scalars are 1.80%
+//! of the witness on the two largest circuits and 4.12% at the sparsest point, worth
+//! about 1.02x, not the 5x once asserted. The paths stay because they are nearly free
+//! and a genuinely bit-heavy circuit still benefits, but on this ladder the MSMs are
+//! dense and the bucket loop is the whole game. What IS a measured, structural win on
+//! every key measured so far: a large fraction of the B query bases are the point at
+//! infinity, and the prescan drops them before they cost a single window visit. The
+//! figures are on `prescan`.
+
+use ark_ec::short_weierstrass::{Affine, Projective, SWCurveConfig};
+use ark_ff::{AdditiveGroup, One, PrimeField, Zero};
+use rayon::prelude::*;
+
+use snarkrs_field::{Fr, G1Affine, G1Projective, G2Affine, G2Projective};
+
+pub mod accel;
+pub mod xyzz;
+use snarkrs_field::raw::RawField;
+use xyzz::{to_projective, RawCurve, Xyzz};
+
+pub use accel::{AccelError, GroupFft, KeyScale};
+
+/// A backend for the five MSMs the proof is made of.
+///
+/// `bases` and `scalars` must be the same length, and a backend has to treat a mismatch as
+/// a malformed key rather than as a short input: reducing to the shorter prefix returns a
+/// valid-looking group element for a proof that is wrong. The CPU path asserts on it (see
+/// `pippenger`) and every other backend is expected to be just as loud.
+///
+/// An empty input is the identity. A base at infinity contributes nothing whatever its
+/// scalar, which is a live path and not a defensive one: most of a B query can be
+/// infinity. See `prescan` for the measurements.
+pub trait MsmBackend: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn msm_g1(&self, bases: &[G1Affine], scalars: &[Fr]) -> G1Projective;
+    fn msm_g2(&self, bases: &[G2Affine], scalars: &[Fr]) -> G2Projective;
+}
+
+/// Bits in the scalar field modulus: 254 for BN254's Fr.
+pub const SCALAR_BITS: usize = Fr::MODULUS_BIT_SIZE as usize;
+
+/// Signed recoding carries one bit past the top of the scalar, so the digit array is
+/// laid out over `SCALAR_BITS + 1` bits. See `signed_digit` for why that kills the
+/// final carry rather than just hiding it.
+///
+/// Public because every GPU backend retypes it in its own shader language and asserts
+/// against this one; a copy one below it is wrong only for scalars above `2^((nw-1)*c)`,
+/// which a random test with small scalars never reaches.
+pub const RECODE_BITS: usize = SCALAR_BITS + 1;
+
+/// Caps the bucket array at 2^15 XYZZ points, 4 MiB of G1 (8 MiB of G2) per in-flight
+/// task. A window this wide takes the batch-affine fill instead, which holds 2 MiB of
+/// affine G1 plus a 4 MiB XYZZ side array it only allocates once a bucket contends. Past
+/// this the cost model's gain is under 5% and the memset starts to hurt.
+const MAX_WINDOW: u32 = 16;
+
+/// Prescan granularity. Small enough to balance, large enough that the two output vectors
+/// are worth appending rather than merging element by element.
+const SCAN_CHUNK: usize = 1 << 12;
+
+/// A point chunk must be at least this many times the bucket count to be worth splitting
+/// off: every extra chunk pays another full bucket reduction, `2 * 2^(c-1)` Jacobian adds,
+/// so at 16x the reduction overhead of the split stays under a fifth of the chunk's work.
+const CHUNK_BUCKET_RATIO: usize = 16;
+
+/// Entries per shared inversion in the batch-affine fill. Conflicts (a second point for
+/// a bucket that already has a pending addition) grow as `BATCH^2 / n_buckets` while the
+/// inversion amortises as `1 / BATCH`; at 1024 over the 4096 buckets H uses, ~12% of
+/// points conflict (nearly all rescued by the retry pass, see [`BatchFill`]) and the
+/// shared inversion costs well under one Fq product per point.
+const BATCH: usize = 1024;
+
+/// The batch-affine fill only runs with at least this many buckets. Two reasons: the
+/// busy map caps a round at one pending addition per bucket, so `BATCH` must sit below
+/// the bucket count or the flush trigger starves, and a window this narrow means a small
+/// `m`, where the fill is not the cost that matters. On this ladder the split lands
+/// where the arithmetic wants it: the dense H MSM (c = 13) batches, the sparse witness
+/// MSMs (c = 7) keep the XYZZ fill.
+const BATCH_MIN_BUCKETS: usize = 2 * BATCH;
+
+/// Window size for `n` points. Pippenger's cost is minimised near `ln(n)`; sppark uses
+/// `min(floor(lg2(1.5n)) - 8, 18)` floored at 10 on GPU, but the CPU optimum is smaller
+/// because there is no bucket-sort machinery to amortise.
+///
+/// Rather than fit a closed form, minimise the cost model directly: `ceil(255/c)` windows,
+/// each doing `n` mixed additions into buckets plus `2 * 2^(c-1)` full Jacobian additions
+/// in the running-sum reduction. Signed digits are what put `2^(c-1)` there instead of
+/// `2^c`, which is worth roughly one extra bit of window. The weight of 3 on the bucket
+/// term is `2 * 1.5`: a full add is about 1.5 mixed adds (add-2007-bl is 11M+5S, the mixed
+/// madd-2007-bl is 7M+4S). The one
+/// extra bucket `signed_digit` needs is left out of the model, it moves nothing.
+pub fn window_size(n: usize) -> u32 {
+    let mut best = 3;
+    let mut best_cost = u128::MAX;
+    for c in 3..=MAX_WINDOW {
+        let windows = RECODE_BITS.div_ceil(c as usize) as u128;
+        let cost = windows * (n as u128 + 3 * (1u128 << (c - 1)));
+        if cost < best_cost {
+            best_cost = cost;
+            best = c;
+        }
+    }
+    best
+}
+
+pub struct CpuMsm {
+    pub threads: usize,
+    /// Send every scalar through the bucket loop, so the cost follows the key and not the
+    /// witness. Off by default because of what it costs; see [`Work`].
+    pub constant_work: bool,
+}
+
+impl CpuMsm {
+    pub fn new() -> Self {
+        Self {
+            threads: rayon::current_num_threads(),
+            constant_work: false,
+        }
+    }
+
+    /// [`CpuMsm::new`] with `constant_work` on.
+    pub fn constant_work() -> Self {
+        Self {
+            constant_work: true,
+            ..Self::new()
+        }
+    }
+
+    fn work(&self) -> Work {
+        if self.constant_work {
+            Work::Constant
+        } else {
+            Work::Variable
+        }
+    }
+}
+
+/// Whether the MSM's cost may depend on the scalar values.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Work {
+    /// Every scalar whose base is not the point at infinity goes through the bucket loop,
+    /// and a zero digit costs a mixed addition into a bucket nobody reads. Which bases are
+    /// at infinity is fixed by the key, so the scalar count, the window width, every
+    /// allocation and the number of additions depend on the key and not on the witness.
+    ///
+    /// That closes the channel of "Remote Side-Channel Attacks on Anonymous Transactions"
+    /// (USENIX Security 2020), which recovered Zcash witness sparsity from proving time. It
+    /// is not constant time in the strict sense: the batched fill's conflict rounds and the
+    /// order of bucket hits still depend on the digit values, as in every Pippenger.
+    ///
+    /// What it costs is what the witness's zeros and ones were saving, so it is priced per
+    /// circuit. Warm CPU proofs on the M2 Max, 15 reps, three alternating rounds against the
+    /// variable-time path: js_16x16_d32 399-404 ms against 390-392 (+2.5%), keccak256
+    /// 520-534 against 161-162 (3.3x), rsa2048 668-700 against 169-170 (about 4x). The
+    /// earlier "under 2%" held for the dense circuits only.
+    Constant,
+    /// Zero scalars are dropped, one scalars cost one addition in total, and the window is
+    /// sized for the rest. Running time, allocation size and the number of Montgomery
+    /// reductions then follow how many witness entries are zero or one.
+    Variable,
+}
+
+impl Default for CpuMsm {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MsmBackend for CpuMsm {
+    fn name(&self) -> &'static str {
+        "cpu"
+    }
+    fn msm_g1(&self, bases: &[G1Affine], scalars: &[Fr]) -> G1Projective {
+        pippenger(bases, scalars, self.threads, self.work())
+    }
+    fn msm_g2(&self, bases: &[G2Affine], scalars: &[Fr]) -> G2Projective {
+        pippenger(bases, scalars, self.threads, self.work())
+    }
+}
+
+/// Reads `width` (< 64) bits out of a little-endian limb array starting at `bit_offset`.
+/// Reads past the end of the array as zero, which is what makes the top window of a
+/// 254-bit scalar cheap instead of a special case.
+#[inline]
+fn read_bits(limbs: &[u64], bit_offset: usize, width: u32) -> u64 {
+    debug_assert!(width < 64);
+    let idx = bit_offset / 64;
+    if idx >= limbs.len() {
+        return 0;
+    }
+    let shift = bit_offset % 64;
+    let mut buf = limbs[idx] >> shift;
+    if shift + width as usize > 64 && idx + 1 < limbs.len() {
+        // The branch condition forces `shift > 64 - width >= 1`, so the `64 - shift`
+        // shift is in range.
+        buf |= limbs[idx + 1] << (64 - shift);
+    }
+    buf & ((1u64 << width) - 1)
+}
+
+/// Digit `i` of the width-`c` signed recoding of `limbs`, in `[-2^(c-1), 2^(c-1)]`.
+///
+/// The textbook recoding threads a carry left to right, which would serialise the windows
+/// or force a materialised digit array (arkworks materialises `W` i64 per scalar, 136 MB
+/// at 2^20 points). This one has no carry chain at all. Split each raw window
+/// `b_i = (k >> i*c) & mask` on its own, independently of its neighbours:
+///
+/// ```text
+///   e_i = [b_i >= 2^(c-1)]          d_i = b_i - e_i * 2^c
+///   k = sum_i b_i 2^(i c) = sum_i d_i 2^(i c) + sum_i e_i 2^((i+1) c)
+/// ```
+///
+/// so window `i` owes `d_i` plus the `e_(i-1)` handed up by its right neighbour, and
+/// `e_(i-1)` is just bit `i*c - 1` of the scalar. Every digit is a pure function of the
+/// scalar and the window index, so the windows stay independent and nothing is stored.
+///
+/// The price is that the digit reaches `+2^(c-1)`, so there is one bucket more than the
+/// `2^(c-1)` a ripple recoding needs. One bucket against a serialised recoding is not a
+/// close call.
+///
+/// The carry out of the top window is `e_(W-1) = [b_(W-1) >= 2^(c-1)]`, and it must be
+/// zero or the top digits are simply lost. It is: `k < 2^254` and the digits are laid out
+/// over `RECODE_BITS = 255` bits, so `W*c >= 255` and `b_(W-1) < 2^(254 - (W-1)c) <= 2^(c-1)`.
+#[inline]
+fn signed_digit(limbs: &[u64], i: usize, c: u32) -> i64 {
+    let offset = i * c as usize;
+    let b = read_bits(limbs, offset, c);
+    // Borrow 2^c when the raw window is in the top half; the neighbour to the right pays
+    // it back through its own top bit, which is the bit immediately below this window.
+    let d = b as i64 - (((b >> (c - 1)) as i64) << c);
+    let carry_in = if offset == 0 {
+        0
+    } else {
+        read_bits(limbs, offset - 1, 1) as i64
+    };
+    d + carry_in
+}
+
+/// Scalars split into the three classes that matter, with the two cheap classes already
+/// paid for: `ones_sum` holds one mixed addition per scalar equal to 1, zeros are gone,
+/// and only `idx`/`bigints` reach the bucket loop. `idx[k]` is the base that `bigints[k]`
+/// multiplies, so the bucket loop walks both vectors in order and hits the bases through
+/// one indirection.
+struct Prescan<P: SWCurveConfig> {
+    /// `u32` to halve the footprint of a witness-length vector; a key with more than
+    /// `2^32` bases is not representable and is asserted against in `prescan`.
+    idx: Vec<u32>,
+    bigints: Vec<<Fr as PrimeField>::BigInt>,
+    ones_sum: Projective<P>,
+}
+
+/// Splits the scalars into zero / one / general, once, before any window runs.
+///
+/// `into_bigint` is a Montgomery reduction; calling it per window instead of per scalar is
+/// the classic way to make an MSM twice as slow. It is called here and nowhere else, and
+/// not at all for a scalar that turns out to be 0 or 1.
+///
+/// # This is a deliberate privacy for performance trade, and it is not free
+///
+/// Skipping zero and one scalars makes the running time, the number of Montgomery
+/// reductions, and the length of `idx` and `bigints` all functions of how many witness
+/// entries are zero or one. That is witness-dependent, and it is observable: as wall clock,
+/// as allocation size in RSS, and on a GPU backend as dispatch size, because the kernel
+/// launch geometry is derived from the general-scalar count.
+///
+/// This is not a hypothetical. It is the same optimisation exploited in "Remote
+/// Side-Channel Attacks on Anonymous Transactions" (USENIX Security 2020), which recovered
+/// information about Zcash shielded transactions by timing the prover. The measured effect
+/// there was a correlation between proving time and the sparsity of the witness.
+///
+/// It is the default because every production Groth16 prover does it and because on a
+/// bit-heavy circuit it is most of the MSM: the constant-work path costs 2.5% on the dense
+/// js_16x16_d32 (0/1 scalars are 1.8% of its witness) but 3.3x on keccak256 and about 4x on
+/// rsa2048. So by default **this prover is not constant time with respect to the witness**,
+/// and a deployment where an attacker can measure proving time or memory must either turn
+/// on [`CpuMsm::constant_work`] (`g16 prove --constant-work`) or treat the channel as part
+/// of its threat model. Zero-knowledge is a property of the proof, not of the process that
+/// produced it.
+///
+/// [`Work::Constant`] processes every scalar through the general path and gives up both
+/// fast paths and the compaction.
+fn prescan<P: RawCurve>(bases: &[Affine<P>], scalars: &[Fr], n: usize, work: Work) -> Prescan<P>
+where
+    P::BaseField: Send + Sync,
+{
+    debug_assert!(n <= u32::MAX as usize);
+    let run = |lo: usize, hi: usize| {
+        let mut idx = Vec::new();
+        let mut bigints = Vec::new();
+        let mut ones_sum = Xyzz::<P::RF>::ZERO;
+        for i in lo..hi {
+            let s = &scalars[i];
+            if work == Work::Variable && s.is_zero() {
+                // No bucket touched, no Montgomery reduction, no base read.
+                continue;
+            }
+            // A base at infinity contributes nothing whatever its scalar. This is not a
+            // rare key quirk: 34% of the B query bases are the point at infinity on
+            // every circuit in the benchmark ladder, and 61% on the csp keys (see
+            // `snarkrs-metal::msm`), because a wire that appears in no B-side linear
+            // combination still owns a slot. Letting them through would cost a madd
+            // call per window each. Filtering here also lets the bucket loop's madd
+            // skip its own infinity test entirely.
+            if bases[i].infinity {
+                continue;
+            }
+            if work == Work::Variable && s.is_one() {
+                // One mixed addition, total, for the whole scalar. Through the raw
+                // XYZZ madd, not ark's Jacobian one: on a bit-heavy witness this loop
+                // runs tens of thousands of times per MSM, and the branchy ark madd
+                // was profiled at 247 ns against the raw path's multiply floor.
+                let (x, y) = P::raw_xy(&bases[i]);
+                ones_sum.madd(x, y);
+                continue;
+            }
+            idx.push(i as u32);
+            bigints.push(s.into_bigint());
+        }
+        Prescan {
+            idx,
+            bigints,
+            ones_sum: to_projective(&ones_sum),
+        }
+    };
+
+    // The scan is O(n) with a Montgomery reduction in it, so at prover sizes it is a big
+    // enough serial fraction to be worth splitting.
+    if n < 4 * SCAN_CHUNK {
+        return run(0, n);
+    }
+    let chunks = n.div_ceil(SCAN_CHUNK);
+    let parts: Vec<Prescan<P>> = (0..chunks)
+        .into_par_iter()
+        .map(|ci| run(ci * SCAN_CHUNK, ((ci + 1) * SCAN_CHUNK).min(n)))
+        .collect();
+
+    let total: usize = parts.iter().map(|p| p.idx.len()).sum();
+    let mut out = Prescan {
+        idx: Vec::with_capacity(total),
+        bigints: Vec::with_capacity(total),
+        ones_sum: Projective::<P>::zero(),
+    };
+    for p in parts {
+        out.idx.extend_from_slice(&p.idx);
+        out.bigints.extend_from_slice(&p.bigints);
+        out.ones_sum += &p.ones_sum;
+    }
+    out
+}
+
+/// Bucket accumulation and reduction for one window over one contiguous slice of the
+/// prescanned scalars. Returns `sum_j j * B_j` for that slice.
+///
+/// The buckets are XYZZ over the branch-free raw field layer (`crate::xyzz`), not ark
+/// Jacobian. Two reasons, both measured: madd-2008-s is 8M + 2S against ark's Jacobian
+/// madd at 7M + 4S, and `ark-ff` ends every field operation in a compare-and-branch
+/// reduction that profiling showed costs a G1 mixed add 247 ns against its 148 ns
+/// multiply floor. This loop is 15.5 million additions per 140k-constraint proof; it is
+/// the single hottest loop in the CPU prover and the reason `snarkrs_field::raw` exists.
+///
+/// The conversion back to ark happens once per chunk, multiplication-only.
+fn window_chunk<P: RawCurve>(
+    bases: &[Affine<P>],
+    scan: &Prescan<P>,
+    range: core::ops::Range<usize>,
+    window: usize,
+    c: u32,
+    work: Work,
+) -> Projective<P> {
+    // `d` is in [-2^(c-1), 2^(c-1)], so `2^(c-1)` buckets is tight.
+    let n_buckets = 1usize << (c - 1);
+    let mut buckets = vec![Xyzz::<P::RF>::ZERO; n_buckets];
+    // Where a zero digit's addition goes under `Work::Constant`. Never read into the
+    // result; `black_box` below keeps the additions from being optimised out.
+    let mut dummy = Xyzz::<P::RF>::ZERO;
+    for k in range {
+        let d = signed_digit(scan.bigints[k].as_ref(), window, c);
+        // Never infinity: prescan filtered those, so raw_xy is total here.
+        let (x, y) = P::raw_xy(&bases[scan.idx[k] as usize]);
+        // The zero digit must not touch a real bucket. It is not a rare case: a random
+        // scalar hits it about once every 2^(c-1) windows, and a small witness value like
+        // 2 or 7 is zero in every window but the lowest.
+        if d == 0 {
+            if work == Work::Constant {
+                dummy.madd(x, y);
+            }
+            continue;
+        }
+        if d > 0 {
+            buckets[(d - 1) as usize].madd(x, y);
+        } else {
+            // Subtraction negates y and does a mixed add, which is the entire reason
+            // signed digits are worth the recoding: half the buckets, same cost.
+            buckets[(-d - 1) as usize].madd(x, y.neg());
+        }
+    }
+
+    // Running sum: sum_j j*B_j in 2 * 2^(c-1) additions rather than sum_j j additions,
+    // in XYZZ (add-2008-s, 12M + 2S, against ark's Jacobian add at 11M + 5S plus the
+    // branchy reductions).
+    let mut running = Xyzz::<P::RF>::ZERO;
+    let mut total = Xyzz::<P::RF>::ZERO;
+    for b in buckets.iter().rev() {
+        running.add_assign(b);
+        total.add_assign(&running);
+    }
+    core::hint::black_box(&dummy);
+    to_projective(&total)
+}
+
+/// Affine buckets filled by batched affine additions sharing one field inversion
+/// (Montgomery's trick). An affine addition with its inverse in hand is 2M + 1S, and the
+/// inversion machinery costs 3M per entry, so a bucket visit is 5M + 1S against the XYZZ
+/// madd's 8M + 2S; the buckets are also half the size, 64 against 128 bytes of G1.
+///
+/// The scheduling constraint is that one round may hold at most one pending addition per
+/// bucket, because every entry snapshots its bucket at flush time. `busy` enforces it: a
+/// second point for a busy bucket waits in `retry` and is rescheduled as soon as a flush
+/// clears the round, and a third (two retries sharing one bucket) drops to the lazily
+/// allocated XYZZ `side` buckets. That last hop is what bounds the degenerate case of a
+/// whole chunk landing in one bucket (equal scalars over equal bases) at one madd per
+/// point instead of a one-entry flush per point.
+struct BatchFill<P: RawCurve> {
+    bx: Vec<P::RF>,
+    by: Vec<P::RF>,
+    /// Bucket holds a point. Set by the first point, cleared again by a cancellation.
+    occupied: Vec<bool>,
+    /// Bucket has a pending addition in the current round.
+    busy: Vec<bool>,
+    /// The current round: bucket index and the point to add, sign already applied.
+    pending: Vec<(u32, P::RF, P::RF)>,
+    /// Conflicts waiting for the next flush.
+    retry: Vec<(u32, P::RF, P::RF)>,
+    /// XYZZ escape hatch for buckets too contended for the round machinery.
+    side: Option<SideBuckets<P::RF>>,
+    dens: Vec<P::RF>,
+    prefix: Vec<P::RF>,
+    ops: Vec<Op>,
+}
+
+/// The XYZZ buckets [`BatchFill`] falls back to, stored only for the buckets that needed
+/// one. A dense array of every bucket was allocated per window chunk the first time any
+/// bucket contended, which on the benchmark ladder is nearly every chunk: 2 MiB of G1 or
+/// 4 MiB of G2 each, 84 MiB of churn per `js_16x16_d32` proof and 21 MiB at its peak, for
+/// a handful of buckets. The slot map is 4 bytes a bucket.
+struct SideBuckets<F> {
+    /// Index into `points` per bucket; 0 is the shared zero, so an untouched bucket
+    /// reads as the identity without a branch.
+    slot: Vec<u32>,
+    points: Vec<Xyzz<F>>,
+}
+
+impl<F: RawField> SideBuckets<F> {
+    fn new(n_buckets: usize) -> Self {
+        SideBuckets {
+            slot: vec![0; n_buckets],
+            points: vec![Xyzz::ZERO],
+        }
+    }
+
+    fn entry(&mut self, b: usize) -> &mut Xyzz<F> {
+        if self.slot[b] == 0 {
+            self.slot[b] = self.points.len() as u32;
+            self.points.push(Xyzz::ZERO);
+        }
+        &mut self.points[self.slot[b] as usize]
+    }
+}
+
+impl<F> core::ops::Index<usize> for SideBuckets<F> {
+    type Output = Xyzz<F>;
+
+    fn index(&self, b: usize) -> &Xyzz<F> {
+        &self.points[self.slot[b] as usize]
+    }
+}
+
+/// What one pending entry turned out to be, decided before the shared inversion and
+/// replayed after it.
+#[derive(Clone, Copy)]
+enum Op {
+    Add,
+    Dbl,
+    Cancel,
+}
+
+impl<P: RawCurve> BatchFill<P> {
+    fn new(n_buckets: usize) -> Self {
+        // Retries rescheduled after a flush ride on top of the trigger threshold, so
+        // the round vectors get headroom past BATCH.
+        let cap = BATCH + BATCH / 2;
+        BatchFill {
+            bx: vec![P::RF::ZERO; n_buckets],
+            by: vec![P::RF::ZERO; n_buckets],
+            occupied: vec![false; n_buckets],
+            busy: vec![false; n_buckets],
+            pending: Vec::with_capacity(cap),
+            retry: Vec::new(),
+            side: None,
+            dens: Vec::with_capacity(cap),
+            prefix: Vec::with_capacity(cap),
+            ops: Vec::with_capacity(cap),
+        }
+    }
+
+    /// `bucket b += (x, y)`, eventually. Free when the bucket is empty, one pending
+    /// entry when it is quiet, a retry when it is contended.
+    fn insert(&mut self, b: usize, x: P::RF, y: P::RF) {
+        if !self.occupied[b] {
+            self.bx[b] = x;
+            self.by[b] = y;
+            self.occupied[b] = true;
+            return;
+        }
+        if self.busy[b] {
+            self.retry.push((b as u32, x, y));
+            // Also a flush trigger: with degenerate digits it is the conflicts, not
+            // the pending entries, that accumulate, and this bounds them.
+            if self.retry.len() >= BATCH {
+                self.flush();
+                self.reschedule();
+            }
+            return;
+        }
+        self.busy[b] = true;
+        self.pending.push((b as u32, x, y));
+        if self.pending.len() >= BATCH {
+            self.flush();
+            self.reschedule();
+        }
+    }
+
+    /// Second chance for conflicts after a flush cleared the busy map. A retry that
+    /// conflicts again shares its bucket with another retry and drops to the side
+    /// buckets rather than looping.
+    fn reschedule(&mut self) {
+        while let Some((b, x, y)) = self.retry.pop() {
+            let b = b as usize;
+            if !self.occupied[b] {
+                self.bx[b] = x;
+                self.by[b] = y;
+                self.occupied[b] = true;
+            } else if self.busy[b] {
+                self.side
+                    .get_or_insert_with(|| SideBuckets::new(self.bx.len()))
+                    .entry(b)
+                    .madd(x, y);
+            } else {
+                self.busy[b] = true;
+                self.pending.push((b as u32, x, y));
+            }
+        }
+    }
+
+    /// One shared-inversion round: decide each entry's case, batch-invert the
+    /// denominators with Montgomery's trick, apply. The case split runs before the
+    /// product so a zero never reaches the inversion: a cancellation contributes ONE,
+    /// and the doubling denominator `2y` is nonzero because the odd-order BN254 groups
+    /// have no 2-torsion.
+    fn flush(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        self.dens.clear();
+        self.prefix.clear();
+        self.ops.clear();
+        let mut acc = P::RF::ONE;
+        for &(b, px, py) in &self.pending {
+            let b = b as usize;
+            let dx = px.sub(self.bx[b]);
+            let (op, den) = if !dx.is_zero() {
+                (Op::Add, dx)
+            } else if py == self.by[b] {
+                (Op::Dbl, self.by[b].double())
+            } else {
+                // Same x, different y: the negative. The bucket empties.
+                (Op::Cancel, P::RF::ONE)
+            };
+            self.ops.push(op);
+            self.dens.push(den);
+            self.prefix.push(acc);
+            acc = acc.mul(den);
+        }
+        let mut inv = P::raw_inv(acc);
+        for i in (0..self.pending.len()).rev() {
+            let (b, px, py) = self.pending[i];
+            let b = b as usize;
+            let d_inv = inv.mul(self.prefix[i]);
+            inv = inv.mul(self.dens[i]);
+            match self.ops[i] {
+                Op::Add => {
+                    let lambda = py.sub(self.by[b]).mul(d_inv);
+                    let x3 = lambda.sqr().sub(self.bx[b]).sub(px);
+                    self.by[b] = lambda.mul(self.bx[b].sub(x3)).sub(self.by[b]);
+                    self.bx[b] = x3;
+                }
+                Op::Dbl => {
+                    let xx = self.bx[b].sqr();
+                    let lambda = xx.double().add(xx).mul(d_inv);
+                    let x3 = lambda.sqr().sub(self.bx[b].double());
+                    self.by[b] = lambda.mul(self.bx[b].sub(x3)).sub(self.by[b]);
+                    self.bx[b] = x3;
+                }
+                Op::Cancel => self.occupied[b] = false,
+            }
+            self.busy[b] = false;
+        }
+        self.pending.clear();
+    }
+
+    /// Flush the stragglers, then reduce. Two flushes settle everything: after the
+    /// first, a retry either schedules cleanly or drops to the side buckets in
+    /// [`Self::reschedule`].
+    fn finish(mut self) -> Projective<P> {
+        self.flush();
+        self.reschedule();
+        self.flush();
+
+        // The same running sum as [`window_chunk`], with the occupied buckets entering
+        // as mixed additions (8M + 2S against the XYZZ-bucket add's 12M + 2S) and the
+        // side buckets, when the chunk was degenerate enough to have any, folded in.
+        let mut running = Xyzz::<P::RF>::ZERO;
+        let mut total = Xyzz::<P::RF>::ZERO;
+        match &self.side {
+            Some(side) => {
+                for j in (0..self.bx.len()).rev() {
+                    if self.occupied[j] {
+                        running.madd(self.bx[j], self.by[j]);
+                    }
+                    if side.slot[j] != 0 {
+                        running.add_assign(&side[j]);
+                    }
+                    total.add_assign(&running);
+                }
+            }
+            None => {
+                for j in (0..self.bx.len()).rev() {
+                    if self.occupied[j] {
+                        running.madd(self.bx[j], self.by[j]);
+                    }
+                    total.add_assign(&running);
+                }
+            }
+        }
+        to_projective(&total)
+    }
+}
+
+/// [`window_chunk`] with the fill batched: affine buckets, additions applied in rounds
+/// that share one field inversion. See [`BatchFill`] for the machinery and the conflict
+/// story. Only worth it with buckets to spare; [`pippenger`] switches on
+/// [`BATCH_MIN_BUCKETS`].
+fn window_chunk_batch<P: RawCurve>(
+    bases: &[Affine<P>],
+    scan: &Prescan<P>,
+    range: core::ops::Range<usize>,
+    window: usize,
+    c: u32,
+    work: Work,
+) -> Projective<P> {
+    // `d` is in [-2^(c-1), 2^(c-1)], so `2^(c-1)` buckets is tight.
+    let n_buckets = 1usize << (c - 1);
+    let mut fill = BatchFill::<P>::new(n_buckets);
+    // See `window_chunk`. XYZZ rather than a batched slot: a zero scalar sends every one
+    // of its digits here, and one batched bucket that contended would push them all through
+    // the retry and side-bucket machinery instead.
+    let mut dummy = Xyzz::<P::RF>::ZERO;
+    for k in range {
+        let d = signed_digit(scan.bigints[k].as_ref(), window, c);
+        // Never infinity: prescan filtered those, so raw_xy is total here.
+        let (x, y) = P::raw_xy(&bases[scan.idx[k] as usize]);
+        if d == 0 {
+            if work == Work::Constant {
+                dummy.madd(x, y);
+            }
+            continue;
+        }
+        if d > 0 {
+            fill.insert((d - 1) as usize, x, y);
+        } else {
+            fill.insert((-d - 1) as usize, x, y.neg());
+        }
+    }
+    core::hint::black_box(&dummy);
+    fill.finish()
+}
+
+fn pippenger<P: RawCurve>(
+    bases: &[Affine<P>],
+    scalars: &[Fr],
+    threads: usize,
+    work: Work,
+) -> Projective<P>
+where
+    P::BaseField: Send + Sync,
+{
+    // A hard assert, not a debug one: a length mismatch is a malformed key and must
+    // fail in release too.
+    assert_eq!(
+        bases.len(),
+        scalars.len(),
+        "MSM length mismatch: {} bases, {} scalars",
+        bases.len(),
+        scalars.len()
+    );
+    let n = bases.len();
+    if n == 0 {
+        return Projective::zero();
+    }
+
+    let scan = prescan(bases, scalars, n, work);
+    let m = scan.idx.len();
+    // Nothing reached the general path: every scalar was 0 or 1, or its base was
+    // infinity. Skip Pippenger rather than allocate W bucket arrays for nothing.
+    if m == 0 {
+        return scan.ones_sum;
+    }
+
+    // The window is sized for the work that actually reaches the buckets, not for the
+    // input length: a 2^20-long witness with 2^10 general scalars is a 2^10 problem.
+    let c = window_size(m);
+    let n_windows = RECODE_BITS.div_ceil(c as usize);
+
+    // Windows are independent, so they are the first axis of parallelism, and at BN254
+    // sizes there are usually more of them (17 to 20) than there are cores. When there are
+    // not, split the point range too and give each chunk its own bucket array. Summing the
+    // per-chunk reduced sums is exact because the running-sum reduction is linear in the
+    // buckets, and it is far cheaper than merging bucket arrays. Splitting past what the
+    // pool can run at once is a pure loss: it buys no parallelism and pays another bucket
+    // reduction per chunk.
+    // Signed digits land in [-2^(c-1), 2^(c-1)] and index as `d - 1` when positive and
+    // `-d - 1` when negative, so the highest reachable index is 2^(c-1) - 1. Allocating
+    // 2^(c-1) + 1 left a bucket that is never written and still walked by the running-sum
+    // reduction, costing two Jacobian additions per window per point chunk.
+    let n_buckets = 1usize << (c - 1);
+    let point_chunks = threads
+        .max(1)
+        .div_ceil(n_windows)
+        .clamp(1, (m / (CHUNK_BUCKET_RATIO * n_buckets)).max(1));
+    let chunk_len = m.div_ceil(point_chunks);
+
+    let window_sums: Vec<Projective<P>> = (0..n_windows)
+        .into_par_iter()
+        .map(|w| {
+            (0..point_chunks)
+                .into_par_iter()
+                .map(|ci| {
+                    let lo = ci * chunk_len;
+                    let hi = ((ci + 1) * chunk_len).min(m);
+                    if lo >= hi {
+                        return Projective::zero();
+                    }
+                    // The wide windows batch their fill behind a shared inversion; the
+                    // narrow ones stay on the XYZZ fill, which has no round overhead
+                    // to amortise.
+                    if n_buckets >= BATCH_MIN_BUCKETS {
+                        window_chunk_batch(bases, &scan, lo..hi, w, c, work)
+                    } else {
+                        window_chunk(bases, &scan, lo..hi, w, c, work)
+                    }
+                })
+                .reduce(Projective::zero, |a, b| a + b)
+        })
+        .collect();
+
+    // Horner over the windows, high to low: c doublings between each.
+    let mut acc = window_sums[n_windows - 1];
+    for w in (0..n_windows - 1).rev() {
+        for _ in 0..c {
+            acc.double_in_place();
+        }
+        acc += &window_sums[w];
+    }
+    acc + scan.ones_sum
+}
+
+#[cfg(test)]
+mod batch_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ark_ec::{CurveGroup, VariableBaseMSM};
+    use ark_std::{rand::Rng, test_rng, UniformRand};
+    use snarkrs_field::Field;
+
+    /// Straight sum of scalar multiplications. Slow and obviously correct.
+    fn naive<P: SWCurveConfig<ScalarField = Fr>>(
+        bases: &[Affine<P>],
+        scalars: &[Fr],
+    ) -> Projective<P> {
+        bases
+            .iter()
+            .zip(scalars)
+            .fold(Projective::zero(), |acc, (b, s)| acc + *b * s)
+    }
+
+    /// Random points, one scalar multiplication each. Fine up to a few thousand.
+    fn rand_points<P: SWCurveConfig>(n: usize, rng: &mut impl Rng) -> Vec<Affine<P>>
+    where
+        Projective<P>: UniformRand,
+    {
+        let proj: Vec<Projective<P>> = (0..n).map(|_| Projective::<P>::rand(rng)).collect();
+        Projective::normalize_batch(&proj)
+    }
+
+    /// Bench-sized bases without paying for `n` scalar multiplications: walk an arithmetic
+    /// progression of points. Structure in the bases cannot help or hurt an MSM, which
+    /// only ever adds them.
+    fn walk_points<P: SWCurveConfig>(n: usize, rng: &mut impl Rng) -> Vec<Affine<P>>
+    where
+        Projective<P>: UniformRand,
+    {
+        let step = Projective::<P>::rand(rng);
+        let mut cur = Projective::<P>::rand(rng);
+        let mut proj = Vec::with_capacity(n);
+        for _ in 0..n {
+            proj.push(cur);
+            cur += &step;
+        }
+        Projective::normalize_batch(&proj)
+    }
+
+    fn rand_scalars(n: usize, rng: &mut impl Rng) -> Vec<Fr> {
+        (0..n).map(|_| Fr::rand(rng)).collect()
+    }
+
+    #[test]
+    fn window_size_is_in_range_and_grows() {
+        let mut prev = 0;
+        for log in 0..24 {
+            let c = window_size(1 << log);
+            assert!((3..=MAX_WINDOW).contains(&c), "n = 2^{log} gave c = {c}");
+            assert!(c >= prev, "window size went backwards at 2^{log}");
+            prev = c;
+        }
+        assert_eq!(window_size(0), 3);
+        // Sanity against the hand-worked optimum of the same cost model.
+        assert_eq!(window_size(1 << 16), 13);
+        assert_eq!(window_size(1 << 18), 15);
+    }
+
+    #[test]
+    fn signed_digits_reconstruct_the_scalar() {
+        let mut rng = test_rng();
+        let mut cases = vec![
+            Fr::zero(),
+            Fr::one(),
+            -Fr::one(),
+            Fr::from(2u64),
+            Fr::from(u64::MAX),
+        ];
+        cases.extend(rand_scalars(32, &mut rng));
+
+        for k in cases {
+            let big = k.into_bigint();
+            let limbs = big.as_ref();
+            for c in 3..=MAX_WINDOW {
+                let n_windows = RECODE_BITS.div_ceil(c as usize);
+                let half = 1i64 << (c - 1);
+                // Rebuild the scalar from its digits, high window first.
+                let mut acc = Fr::zero();
+                let two_pow_c = Fr::from(2u64).pow([c as u64]);
+                for w in (0..n_windows).rev() {
+                    let d = signed_digit(limbs, w, c);
+                    assert!(
+                        (-half..=half).contains(&d),
+                        "digit {d} out of range for c = {c}"
+                    );
+                    acc *= two_pow_c;
+                    acc += if d >= 0 {
+                        Fr::from(d as u64)
+                    } else {
+                        -Fr::from((-d) as u64)
+                    };
+                }
+                assert_eq!(acc, k, "recoding lost the scalar at c = {c}");
+            }
+        }
+    }
+
+    #[test]
+    fn matches_naive_g1() {
+        let mut rng = test_rng();
+        let msm = CpuMsm::new();
+        for n in [1usize, 2, 7, 100, 1000] {
+            let bases: Vec<G1Affine> = rand_points(n, &mut rng);
+            let scalars = rand_scalars(n, &mut rng);
+            assert_eq!(
+                msm.msm_g1(&bases, &scalars),
+                naive(&bases, &scalars),
+                "G1 n = {n}"
+            );
+        }
+    }
+
+    #[test]
+    fn matches_naive_g2() {
+        let mut rng = test_rng();
+        let msm = CpuMsm::new();
+        for n in [1usize, 2, 7, 100, 1000] {
+            let bases: Vec<G2Affine> = rand_points(n, &mut rng);
+            let scalars = rand_scalars(n, &mut rng);
+            assert_eq!(
+                msm.msm_g2(&bases, &scalars),
+                naive(&bases, &scalars),
+                "G2 n = {n}"
+            );
+        }
+    }
+
+    #[test]
+    fn matches_arkworks_g1() {
+        let mut rng = test_rng();
+        let n = 1 << 13;
+        let bases: Vec<G1Affine> = walk_points(n, &mut rng);
+        let scalars = rand_scalars(n, &mut rng);
+        let want = G1Projective::msm(&bases, &scalars).unwrap();
+        assert_eq!(CpuMsm::new().msm_g1(&bases, &scalars), want);
+    }
+
+    #[test]
+    fn matches_arkworks_g2() {
+        let mut rng = test_rng();
+        let n = 1 << 12;
+        let bases: Vec<G2Affine> = walk_points(n, &mut rng);
+        let scalars = rand_scalars(n, &mut rng);
+        let want = G2Projective::msm(&bases, &scalars).unwrap();
+        assert_eq!(CpuMsm::new().msm_g2(&bases, &scalars), want);
+    }
+
+    #[test]
+    fn empty_input_is_identity() {
+        let msm = CpuMsm::new();
+        assert!(msm.msm_g1(&[], &[]).is_zero());
+        assert!(msm.msm_g2(&[], &[]).is_zero());
+    }
+
+    #[test]
+    fn all_zero_scalars_is_identity() {
+        let mut rng = test_rng();
+        let msm = CpuMsm::new();
+        let n = 257;
+        let g1: Vec<G1Affine> = rand_points(n, &mut rng);
+        let g2: Vec<G2Affine> = rand_points(n, &mut rng);
+        let zeros = vec![Fr::zero(); n];
+        assert!(msm.msm_g1(&g1, &zeros).is_zero());
+        assert!(msm.msm_g2(&g2, &zeros).is_zero());
+    }
+
+    #[test]
+    fn all_one_scalars_is_the_plain_sum() {
+        let mut rng = test_rng();
+        let msm = CpuMsm::new();
+        let n = 257;
+        let ones = vec![Fr::one(); n];
+
+        let g1: Vec<G1Affine> = rand_points(n, &mut rng);
+        let want1 = g1.iter().fold(G1Projective::zero(), |a, p| a + p);
+        assert_eq!(msm.msm_g1(&g1, &ones), want1);
+
+        let g2: Vec<G2Affine> = rand_points(n, &mut rng);
+        let want2 = g2.iter().fold(G2Projective::zero(), |a, p| a + p);
+        assert_eq!(msm.msm_g2(&g2, &ones), want2);
+    }
+
+    #[test]
+    fn single_point() {
+        let mut rng = test_rng();
+        let msm = CpuMsm::new();
+        for s in [Fr::zero(), Fr::one(), -Fr::one(), Fr::rand(&mut rng)] {
+            let g1: Vec<G1Affine> = rand_points(1, &mut rng);
+            assert_eq!(msm.msm_g1(&g1, &[s]), g1[0] * s);
+            let g2: Vec<G2Affine> = rand_points(1, &mut rng);
+            assert_eq!(msm.msm_g2(&g2, &[s]), g2[0] * s);
+        }
+    }
+
+    /// The scalar mix a real witness actually has: mostly 0 and 1, a few edge values,
+    /// and enough general scalars to keep the bucket path live.
+    fn witness_like_scalars(n: usize, rng: &mut impl Rng) -> Vec<Fr> {
+        let mut s: Vec<Fr> = (0..n)
+            .map(|i| match i % 8 {
+                0..=4 => Fr::zero(),
+                5 | 6 => Fr::one(),
+                _ => Fr::rand(rng),
+            })
+            .collect();
+        // r - 1 is the largest scalar there is, and the one that stresses the top window.
+        s[0] = -Fr::one();
+        s[1] = Fr::from(2u64);
+        s[2] = Fr::zero();
+        s[3] = Fr::one();
+        // Fits in one limb, so every window above the lowest handful is zero.
+        s[4] = Fr::from(u64::MAX);
+        s
+    }
+
+    #[test]
+    fn special_scalars_mixed_in() {
+        let mut rng = test_rng();
+        let msm = CpuMsm::new();
+        let n = 500;
+        let g1: Vec<G1Affine> = rand_points(n, &mut rng);
+        let s = witness_like_scalars(n, &mut rng);
+        assert_eq!(msm.msm_g1(&g1, &s), naive(&g1, &s));
+
+        let g2: Vec<G2Affine> = rand_points(n, &mut rng);
+        assert_eq!(msm.msm_g2(&g2, &s), naive(&g2, &s));
+    }
+
+    #[test]
+    fn points_at_infinity_in_the_bases() {
+        let mut rng = test_rng();
+        let msm = CpuMsm::new();
+        let n = 200;
+
+        let mut g1: Vec<G1Affine> = rand_points(n, &mut rng);
+        for i in (0..n).step_by(7) {
+            g1[i] = G1Affine::identity();
+        }
+        let s = rand_scalars(n, &mut rng);
+        assert_eq!(msm.msm_g1(&g1, &s), naive(&g1, &s));
+        // Also with the 0/1 fast paths landing on infinity.
+        let sw = witness_like_scalars(n, &mut rng);
+        assert_eq!(msm.msm_g1(&g1, &sw), naive(&g1, &sw));
+
+        let mut g2: Vec<G2Affine> = rand_points(n, &mut rng);
+        for i in (0..n).step_by(5) {
+            g2[i] = G2Affine::identity();
+        }
+        assert_eq!(msm.msm_g2(&g2, &s), naive(&g2, &s));
+        assert_eq!(msm.msm_g2(&g2, &sw), naive(&g2, &sw));
+
+        // Every base at infinity is still identity, whatever the scalars are.
+        let all_inf = vec![G1Affine::identity(); n];
+        assert!(msm.msm_g1(&all_inf, &s).is_zero());
+    }
+
+    /// Drives the batch-affine fill against the XYZZ fill window by window, at windows
+    /// narrow enough that every scheduling path fires: direct sets, pending rounds,
+    /// retries, and the side buckets.
+    fn batch_fill_case<P: RawCurve>(bases: &[Affine<P>], scalars: &[Fr]) {
+        let scan = Prescan::<P> {
+            idx: (0..bases.len() as u32).collect(),
+            bigints: scalars.iter().map(|s| s.into_bigint()).collect(),
+            ones_sum: Projective::zero(),
+        };
+        for c in [5u32, 8] {
+            for w in 0..RECODE_BITS.div_ceil(c as usize) {
+                assert_eq!(
+                    window_chunk_batch(bases, &scan, 0..bases.len(), w, c, Work::Constant),
+                    window_chunk(bases, &scan, 0..bases.len(), w, c, Work::Constant),
+                    "window {w} at c = {c}"
+                );
+            }
+        }
+    }
+
+    /// A base set with duplicates (the flush's doubling case) and cancelling pairs (its
+    /// cancellation case), under shared scalars so they meet in the same buckets.
+    #[test]
+    fn batch_fill_matches_the_xyzz_fill() {
+        let mut rng = test_rng();
+        let n = 600;
+        let mut g1: Vec<G1Affine> = rand_points(n, &mut rng);
+        let mut s = rand_scalars(n, &mut rng);
+        for i in 0..n / 4 {
+            // One point under one scalar: every window funnels into a single bucket,
+            // which is the contention the retry queue and side buckets exist for.
+            g1[i] = g1[0];
+            s[i] = s[0];
+        }
+        for i in n / 4..n / 2 {
+            // Cancelling pairs: the same base negated, under one scalar, meets its
+            // partner in every bucket it touches.
+            g1[i] = if i % 2 == 0 { g1[n / 4] } else { -g1[n / 4] };
+            s[i] = s[n / 4];
+        }
+        s[n - 1] = Fr::zero();
+        batch_fill_case::<snarkrs_field::g1::Config>(&g1, &s);
+
+        let mut g2: Vec<G2Affine> = rand_points(n / 2, &mut rng);
+        for i in 0..n / 8 {
+            g2[i] = if i % 2 == 0 { g2[0] } else { -g2[0] };
+            s[i] = s[1];
+        }
+        batch_fill_case::<snarkrs_field::g2::Config>(&g2, &s[..n / 2]);
+    }
+
+    /// 2^15 points is where [`window_size`] first picks a window wide enough (c = 12,
+    /// 2048 buckets) for the batch-affine fill to engage through the public API; every
+    /// smaller test in this file runs the XYZZ fill.
+    #[test]
+    fn matches_arkworks_g1_through_the_batch_fill() {
+        let mut rng = test_rng();
+        let n = 1usize << 15;
+        assert!(
+            (1usize << (window_size(n) - 1)) >= BATCH_MIN_BUCKETS,
+            "2^15 no longer reaches the batch fill; move this test"
+        );
+        let bases: Vec<G1Affine> = walk_points(n, &mut rng);
+        let scalars = rand_scalars(n, &mut rng);
+        let want = G1Projective::msm(&bases, &scalars).unwrap();
+        assert_eq!(CpuMsm::new().msm_g1(&bases, &scalars), want);
+    }
+
+    /// One base, one scalar value, 2^15 copies: every point of every window lands in
+    /// the same bucket, so the whole MSM runs down the retry and side-bucket path.
+    #[test]
+    fn batch_fill_survives_a_single_hot_bucket() {
+        let mut rng = test_rng();
+        let n = 1usize << 15;
+        let p: Vec<G1Affine> = rand_points(1, &mut rng);
+        let s = Fr::rand(&mut rng);
+        let want = p[0] * (s * Fr::from(n as u64));
+        assert_eq!(CpuMsm::new().msm_g1(&vec![p[0]; n], &vec![s; n]), want);
+    }
+
+    /// `cargo test -p snarkrs-msm --release -- --ignored --nocapture bench`
+    ///
+    /// Best of three, because this runs on a shared machine and the mean of a contended
+    /// run measures the other tenants.
+    #[test]
+    #[ignore = "benchmark, meaningless in a debug build"]
+    fn bench_against_arkworks() {
+        use std::time::Instant;
+        let mut rng = test_rng();
+        let msm = CpuMsm::new();
+        let serial = CpuMsm {
+            threads: 1,
+            ..CpuMsm::new()
+        };
+        let one_thread = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+
+        let best = |f: &mut dyn FnMut() -> f64| (0..3).map(|_| f()).fold(f64::MAX, f64::min);
+        println!("rayon threads: {}", msm.threads);
+
+        for log in [16u32, 18] {
+            let n = 1usize << log;
+            let bases: Vec<G1Affine> = walk_points(n, &mut rng);
+            let scalars = rand_scalars(n, &mut rng);
+            let mut ours_out = G1Projective::zero();
+            let mut ours_1t_out = G1Projective::zero();
+            let mut ark_out = G1Projective::zero();
+
+            let ours_ms = best(&mut || {
+                let t = Instant::now();
+                ours_out = msm.msm_g1(&bases, &scalars);
+                t.elapsed().as_secs_f64() * 1e3
+            });
+            let ours_1t_ms = best(&mut || {
+                let t = Instant::now();
+                ours_1t_out = one_thread.install(|| serial.msm_g1(&bases, &scalars));
+                t.elapsed().as_secs_f64() * 1e3
+            });
+            let ark_ms = best(&mut || {
+                let t = Instant::now();
+                ark_out = G1Projective::msm(&bases, &scalars).unwrap();
+                t.elapsed().as_secs_f64() * 1e3
+            });
+
+            assert_eq!(ours_out, ark_out);
+            assert_eq!(ours_1t_out, ark_out);
+            println!(
+                "2^{log} G1  c={:2}  ours {:8.2} ms  ours(1 thread) {:9.2} ms  arkworks(1 thread, no rayon feature) {:9.2} ms  ratio {:.2}x mt, {:.2}x st",
+                window_size(n),
+                ours_ms,
+                ours_1t_ms,
+                ark_ms,
+                ark_ms / ours_ms,
+                ark_ms / ours_1t_ms,
+            );
+        }
+    }
+}

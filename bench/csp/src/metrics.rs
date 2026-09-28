@@ -118,7 +118,7 @@ pub struct Breakdown {
     /// verifier actually costs; the row's `verify_duration` is dominated by the key read
     /// upstream's API forces.
     pub verify_vkey_ms: f64,
-    /// `g16-core`'s own stage split of the proving call, microseconds, means.
+    /// `snarkrs-groth16`'s own stage split of the proving call, microseconds, means.
     pub gather_us: u64,
     pub ntt_us: u64,
     pub pointwise_us: u64,

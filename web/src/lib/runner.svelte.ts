@@ -126,7 +126,7 @@ export class Run {
   ///   half five ways. `a-g1`, `b-g2`, `b-g1`, `l-g1` and `h-g1` are the five.
   private readonly stages = new URLSearchParams(q()).get('stages') ?? '';
   /// `?tg=32` forces the MSM reduction width instead of using each curve's measured one.
-  /// See `REDUCE_TG_OVERRIDE` in crates/g16-wgpu/src/points.rs: the shipped G2 width holds
+  /// See `REDUCE_TG_OVERRIDE` in crates/wgpu/src/points.rs: the shipped G2 width holds
   /// exactly the workgroup storage an iPhone grants, with nothing spare.
   private readonly reduceTg = param('tg', 0);
   /// `?c=8` forces the MSM window width instead of computing it from the scalar count.
@@ -136,7 +136,7 @@ export class Run {
   private readonly upto = param('upto', 0);
   /// `?trace=1` proves each circuit once on the GPU and once on the CPU with stage 10's
   /// blinders pinned, and prints both traces instead of a timing. Neither is a proof anybody
-  /// may publish and neither is a measurement; see `g16_core::trace`.
+  /// may publish and neither is a measurement; see `snarkrs_groth16::trace`.
   ///
   /// This is the tool for a device that completes a proof and gets it rejected. `diff` the
   /// GPU block against `snarkrs trace --backend cpu` on a laptop and the first row that differs
@@ -144,19 +144,19 @@ export class Run {
   /// all: every browser on iOS is WebKit, so there is no second engine there to ask.
   private readonly traceMode = new URLSearchParams(q()).get('trace') === '1';
   /// `?mergebody=1` replaces the merge kernel with an immediate return, so the dispatch
-  /// happens and none of its code runs. See `MERGE_BODY` in crates/g16-wgpu/src/gen/points.rs.
+  /// happens and none of its code runs. See `MERGE_BODY` in crates/wgpu/src/gen/points.rs.
   private readonly mergeBody = param('mergebody', 0);
   /// `?windows=1` records every MSM window sum and `ones` partial into the trace text, each
   /// as affine coordinates plus an on-curve flag. See `WINDOW_DEBUG` in
-  /// crates/g16-wgpu/src/points.rs: the wrong `msm_b_g2` is off the curve, and this says
+  /// crates/wgpu/src/points.rs: the wrong `msm_b_g2` is off the curve, and this says
   /// which window put it there.
   private readonly windowDebug = param('windows', 0);
   /// `?reducebody=1` restores the reduce kernel's pre-fix per-thread body, the one that makes
   /// every G2 window sum wrong on an iPhone. See `REDUCE_BODY` in
-  /// crates/g16-wgpu/src/gen/points.rs. Read it through `?windows=1`, comparing two machines.
+  /// crates/wgpu/src/gen/points.rs. Read it through `?windows=1`, comparing two machines.
   private readonly reduceBody = param('reducebody', 0);
   /// `?mulsmall=1` restores pt_mul_small's two-call-site spelling, the one that loses an
-  /// iPhone's device. See `MUL_SMALL_BODY` in crates/g16-wgpu/src/gen/points.rs.
+  /// iPhone's device. See `MUL_SMALL_BODY` in crates/wgpu/src/gen/points.rs.
   private readonly mulSmallBody = param('mulsmall', 0);
   /// Where the artifacts come from. In dev this is the Vite proxy, which exists so a
   /// checkout with no AWS access still runs the whole benchmark; in a build it is the bucket

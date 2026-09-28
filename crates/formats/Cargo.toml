@@ -1,0 +1,24 @@
+[package]
+name = "snarkrs-formats"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Scrubs an owned `.wtns` buffer once it is decoded. Already in the tree through ark-ff;
+# declared because this crate calls it.
+zeroize = "1.9"
+snarkrs-field.workspace = true
+ark-ff.workspace = true
+ark-ec.workspace = true
+thiserror.workspace = true
+serde_json.workspace = true
+num-bigint.workspace = true
+rayon.workspace = true
+
+# mmap is the native-only backing for `BinFile`. memmap2 0.9.11 does build for
+# wasm32-unknown-unknown, so this table is not working around a broken build; it keeps a
+# filesystem API out of a target that has no filesystem, where every call would fail at
+# runtime instead of at compile time.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+memmap2.workspace = true

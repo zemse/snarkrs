@@ -3,9 +3,9 @@
 #
 # This is run-gpu-bench.sh with the build moved off the instance. The M2 Max cross-compiles
 # the CUDA CLI to x86_64 linux in about 32 seconds via cargo-zigbuild, and the binary is
-# shipped instead of the source. That is possible only because g16-cuda uses cudarc with
+# shipped instead of the source. That is possible only because snarkrs-cuda uses cudarc with
 # `dynamic-loading`, so libcuda and libnvrtc are dlopened at run time rather than linked:
-# nothing about the build needs a driver, a toolkit, or a GPU. See crates/g16-cuda/Cargo.toml.
+# nothing about the build needs a driver, a toolkit, or a GPU. See crates/cuda/Cargo.toml.
 #
 # What that buys, in order of how much it matters:
 #   * The instance's billed lifetime no longer includes a fat-LTO release build.
@@ -38,7 +38,7 @@ TARGET="x86_64-unknown-linux-gnu.2.31"
 BIN="$HERE/target/x86_64-unknown-linux-gnu/release/snarkrs"
 
 echo "==> cross-compiling for $TARGET on this machine"
-( cd "$HERE" && cargo zigbuild --release -p snarkrs --features cuda --target "$TARGET" )
+( cd "$HERE" && cargo zigbuild --release -p snarkrs-cli --features cuda --target "$TARGET" )
 file "$BIN" | grep -q 'ELF 64-bit.*x86-64' || { echo "not an x86-64 ELF, refusing to ship"; exit 1; }
 echo "    $(ls -lh "$BIN" | awk '{print $5}')  $(cd "$HERE" && git rev-parse --short HEAD)"
 

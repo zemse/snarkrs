@@ -583,165 +583,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "g16-ceremony"
-version = "0.1.0"
-dependencies = [
- "ark-bn254",
- "ark-ec",
- "ark-ff",
- "ark-serialize",
- "blake2",
- "byteorder",
- "g16-field",
- "g16-msm",
- "g16-ntt",
- "g16-zkey",
- "memmap2",
- "rand_chacha",
- "rayon",
- "serde_json",
- "sha2",
- "thiserror",
-]
-
-[[package]]
-name = "g16-core"
-version = "0.1.0"
-dependencies = [
- "ark-bn254",
- "ark-ec",
- "ark-ff",
- "ark-serialize",
- "ark-std",
- "g16-field",
- "g16-msm",
- "g16-ntt",
- "g16-zkey",
- "num-bigint",
- "rayon",
- "serde",
- "serde_json",
- "thiserror",
- "web-time",
-]
-
-[[package]]
-name = "g16-csp"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "ark-std",
- "clap",
- "g16-ceremony",
- "g16-core",
- "g16-cuda",
- "g16-field",
- "g16-metal",
- "g16-zkey",
- "k256",
- "num-bigint",
- "rand",
- "serde",
- "serde_json",
- "sha2",
- "sha3",
- "witnesscalc-adapter",
-]
-
-[[package]]
-name = "g16-cuda"
-version = "0.1.0"
-dependencies = [
- "ark-ec",
- "ark-ff",
- "cudarc",
- "g16-core",
- "g16-field",
- "g16-gpu-kernels",
- "g16-gpu-layout",
- "g16-msm",
- "g16-zkey",
- "rayon",
- "thiserror",
-]
-
-[[package]]
-name = "g16-field"
-version = "0.1.0"
-dependencies = [
- "ark-bn254",
- "ark-ec",
- "ark-ff",
- "ark-serialize",
- "ark-std",
- "thiserror",
-]
-
-[[package]]
-name = "g16-gpu-kernels"
-version = "0.1.0"
-
-[[package]]
-name = "g16-gpu-layout"
-version = "0.1.0"
-dependencies = [
- "ark-ec",
- "ark-ff",
- "g16-field",
- "rayon",
-]
-
-[[package]]
-name = "g16-metal"
-version = "0.1.0"
-dependencies = [
- "ark-ec",
- "ark-ff",
- "g16-core",
- "g16-field",
- "g16-gpu-layout",
- "g16-msm",
- "g16-zkey",
- "metal",
- "rayon",
- "thiserror",
-]
-
-[[package]]
-name = "g16-msm"
-version = "0.1.0"
-dependencies = [
- "ark-ec",
- "ark-ff",
- "g16-field",
- "rayon",
- "thiserror",
-]
-
-[[package]]
-name = "g16-ntt"
-version = "0.1.0"
-dependencies = [
- "ark-ff",
- "g16-field",
- "rayon",
-]
-
-[[package]]
-name = "g16-zkey"
-version = "0.1.0"
-dependencies = [
- "ark-ec",
- "ark-ff",
- "g16-field",
- "memmap2",
- "num-bigint",
- "rayon",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1171,6 +1012,167 @@ name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
+
+[[package]]
+name = "snarkrs-ceremony"
+version = "0.1.0"
+dependencies = [
+ "ark-bn254",
+ "ark-ec",
+ "ark-ff",
+ "ark-serialize",
+ "blake2",
+ "byteorder",
+ "memmap2",
+ "rand_chacha",
+ "rayon",
+ "serde_json",
+ "sha2",
+ "snarkrs-field",
+ "snarkrs-formats",
+ "snarkrs-msm",
+ "snarkrs-ntt",
+ "thiserror",
+ "zeroize",
+]
+
+[[package]]
+name = "snarkrs-csp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ark-std",
+ "clap",
+ "k256",
+ "num-bigint",
+ "rand",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sha3",
+ "snarkrs-ceremony",
+ "snarkrs-cuda",
+ "snarkrs-field",
+ "snarkrs-formats",
+ "snarkrs-groth16",
+ "snarkrs-metal",
+ "witnesscalc-adapter",
+]
+
+[[package]]
+name = "snarkrs-cuda"
+version = "0.1.0"
+dependencies = [
+ "ark-ec",
+ "ark-ff",
+ "cudarc",
+ "rayon",
+ "snarkrs-field",
+ "snarkrs-formats",
+ "snarkrs-gpu-kernels",
+ "snarkrs-gpu-layout",
+ "snarkrs-groth16",
+ "snarkrs-msm",
+ "thiserror",
+]
+
+[[package]]
+name = "snarkrs-field"
+version = "0.1.0"
+dependencies = [
+ "ark-bn254",
+ "ark-ec",
+ "ark-ff",
+ "ark-serialize",
+ "ark-std",
+ "thiserror",
+]
+
+[[package]]
+name = "snarkrs-formats"
+version = "0.1.0"
+dependencies = [
+ "ark-ec",
+ "ark-ff",
+ "memmap2",
+ "num-bigint",
+ "rayon",
+ "serde_json",
+ "snarkrs-field",
+ "thiserror",
+ "zeroize",
+]
+
+[[package]]
+name = "snarkrs-gpu-kernels"
+version = "0.1.0"
+
+[[package]]
+name = "snarkrs-gpu-layout"
+version = "0.1.0"
+dependencies = [
+ "ark-ec",
+ "ark-ff",
+ "rayon",
+ "snarkrs-field",
+]
+
+[[package]]
+name = "snarkrs-groth16"
+version = "0.1.0"
+dependencies = [
+ "ark-bn254",
+ "ark-ec",
+ "ark-ff",
+ "ark-serialize",
+ "ark-std",
+ "num-bigint",
+ "rayon",
+ "serde",
+ "serde_json",
+ "snarkrs-field",
+ "snarkrs-formats",
+ "snarkrs-msm",
+ "snarkrs-ntt",
+ "thiserror",
+ "web-time",
+]
+
+[[package]]
+name = "snarkrs-metal"
+version = "0.1.0"
+dependencies = [
+ "ark-ec",
+ "ark-ff",
+ "metal",
+ "rayon",
+ "snarkrs-field",
+ "snarkrs-formats",
+ "snarkrs-gpu-layout",
+ "snarkrs-groth16",
+ "snarkrs-msm",
+ "thiserror",
+]
+
+[[package]]
+name = "snarkrs-msm"
+version = "0.1.0"
+dependencies = [
+ "ark-ec",
+ "ark-ff",
+ "rayon",
+ "snarkrs-field",
+ "thiserror",
+]
+
+[[package]]
+name = "snarkrs-ntt"
+version = "0.1.0"
+dependencies = [
+ "ark-ff",
+ "rayon",
+ "snarkrs-field",
+]
 
 [[package]]
 name = "spki"

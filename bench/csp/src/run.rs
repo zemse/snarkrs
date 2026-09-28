@@ -13,9 +13,9 @@
 use crate::metrics::{Breakdown, Metrics, Properties};
 use crate::{circuits, inputs, metrics, Prover, Variant};
 use anyhow::{Context, Result};
-use g16_core::{prove::prove, verify::verify, StageTimings};
-use g16_field::Fr;
-use g16_zkey::{wtns::Witness, ProvingKey};
+use snarkrs_field::Fr;
+use snarkrs_formats::{wtns::Witness, ProvingKey};
+use snarkrs_groth16::{prove::prove, verify::verify, StageTimings};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -82,7 +82,7 @@ fn proof_iteration(
     input_json: String,
     zkey: &Path,
     prover: &Prover,
-) -> Result<(Split, g16_core::Proof, Vec<Fr>)> {
+) -> Result<(Split, snarkrs_groth16::Proof, Vec<Fr>)> {
     let mut split = Split::default();
 
     let t = Instant::now();
@@ -148,8 +148,10 @@ fn proof_iteration(
                 String::from_utf8_lossy(&out.stderr)
             );
 
-            let proof = g16_core::json::proof_from_str(&std::fs::read_to_string(&proof_path)?)?;
-            let public = g16_core::json::public_from_str(&std::fs::read_to_string(&public_path)?)?;
+            let proof =
+                snarkrs_groth16::json::proof_from_str(&std::fs::read_to_string(&proof_path)?)?;
+            let public =
+                snarkrs_groth16::json::public_from_str(&std::fs::read_to_string(&public_path)?)?;
             std::fs::remove_dir_all(&dir).ok();
             Ok((split, proof, public))
         }
@@ -159,8 +161,11 @@ fn proof_iteration(
 /// A private directory under the system temp dir, named for the variant so two runs of
 /// different variants cannot collide and a leftover is obvious.
 fn tempdir(variant: Variant) -> Result<std::path::PathBuf> {
-    let dir =
-        std::env::temp_dir().join(format!("g16-csp-{}-{}", variant.name(), std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "snarkrs-csp-{}-{}",
+        variant.name(),
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
@@ -191,8 +196,8 @@ pub fn variant(variant: Variant, cfg: &Config) -> Result<(Metrics, Breakdown)> {
     verify(&pk.vk, &public, &proof)
         .with_context(|| format!("{}: our own verifier rejected the proof", variant.name()))?;
     let n_constraints = num_constraints(&pk);
-    let proof_size = g16_core::json::proof_to_string(&proof).len()
-        + g16_core::json::public_to_string(&public).len();
+    let proof_size = snarkrs_groth16::json::proof_to_string(&proof).len()
+        + snarkrs_groth16::json::public_to_string(&public).len();
     drop(pk);
 
     let mut splits = Vec::with_capacity(cfg.reps);
@@ -236,7 +241,7 @@ pub fn variant(variant: Variant, cfg: &Config) -> Result<(Metrics, Breakdown)> {
         proof_size,
         preprocessing_size: variant.preprocessing_size(cfg.artifacts, cfg.witness_src)? as usize,
         num_constraints: n_constraints,
-        // rapidsnark's peak is not ours to measure through `g16-csp-mem`, which links
+        // rapidsnark's peak is not ours to measure through `snarkrs-csp-mem`, which links
         // our prover. Left at the collector's 0 marker rather than reported as a number
         // that came from the wrong process.
         peak_memory: match (&cfg.prover, cfg.mem_reps) {

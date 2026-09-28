@@ -1,11 +1,11 @@
 # Groth16 speed test
 
 One page, one button. It downloads real proving keys from the artifact bucket smallest-first,
-proves each circuit on the GPU through `crates/g16-wgpu` compiled to wasm, proves the same
+proves each circuit on the GPU through `crates/wgpu` compiled to wasm, proves the same
 circuit with snarkjs, makes each prover verify the other's proof, and shows the ratio.
 
     npm install
-    npm run wasm      # builds crates/g16-wasm into static/pkg
+    npm run wasm      # builds crates/web into static/pkg
     npm run dev       # http://localhost:5173
 
 `npm run build` writes a fully static `build/` directory. There is no server side.
