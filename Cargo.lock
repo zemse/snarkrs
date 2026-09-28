@@ -2349,6 +2349,7 @@ dependencies = [
  "g16-metal",
  "g16-msm",
  "g16-wgpu",
+ "g16-witness",
  "g16-zkey",
  "hex",
  "libc",

@@ -51,6 +51,8 @@ serde.workspace = true
 serde_json.workspace = true
 num-bigint.workspace = true
 hex.workspace = true
+# The native witness binary runner always; the wasm calculator behind `witness-wasm`.
+g16-witness.workspace = true
 
 [dev-dependencies]
 # `prove_with_blinders`, for the tests that compare proofs bit for bit at pinned blinders.
@@ -63,7 +65,7 @@ g16-core = { workspace = true, features = ["deterministic-blinders"] }
 # Rust, builds on macOS, Linux and Windows, and needs nothing installed. A machine with no
 # GPU still builds the binary and gets an error from `--backend wgpu` at run time rather than
 # a binary that cannot ask.
-default = ["cpu", "wgpu"]
+default = ["cpu", "wgpu", "witness-wasm"]
 cpu = []
 wgpu = ["dep:g16-wgpu"]
 metal = ["dep:g16-metal"]
@@ -72,6 +74,10 @@ metal = ["dep:g16-metal"]
 # forwarding the feature the crate compiles to an empty shell and `CudaBackend` is
 # "configured out", which rustc reports as a missing item rather than a missing feature.
 cuda = ["dep:g16-cuda", "g16-cuda/cuda"]
+# `wtns calculate` and `fullprove` on circom's circuit.wasm, through wasmtime. On by default
+# because that is what snarkjs users have; off, the release binary is about 5 MB smaller
+# and runs only circom's native witness binaries.
+witness-wasm = ["g16-witness/wasm"]
 # Heap profiling. Off by default and optional, so `cargo build --release` neither links
 # dhat nor builds the binary that would install its allocator.
 dhat-heap = ["dep:dhat"]

@@ -180,13 +180,13 @@ pub const COMMANDS: &[Command] = &[
             "calculatewitness -ws|wasm:circuit.wasm -i|input:input.json -wt|witness:witness.wtns",
         ],
         description: "Caclculate specific witness of a circuit given an input",
-        support: Later,
+        support: Yes,
     },
     Command {
         cmd: "wtns debug [circuit.wasm] [input.json] [witness.wtns] [circuit.sym]",
         alias: &["wd"],
         description: "Calculate the witness with debug info.",
-        support: Later,
+        support: Yes,
     },
     Command {
         cmd: "wtns export json [witness.wtns] [witnes.json]",
@@ -287,7 +287,7 @@ pub const COMMANDS: &[Command] = &[
         cmd: "groth16 fullprove [input.json] [circuit_final.wasm] [circuit_final.zkey] [proof.json] [public.json]",
         alias: &["g16f", "g16i"],
         description: "Generates a zk Proof from input",
-        support: Later,
+        support: Yes,
     },
     Command {
         cmd: "groth16 verify [verification_key.json] [public.json] [proof.json]",
@@ -370,12 +370,16 @@ pub const EXTRAS: &[(&str, &str)] = &[
 /// `key=value`, as in snarkjs.
 pub const VALUE_OPTIONS: &[&str] = &["backend", "self-verify", "fallback", "vkey"];
 
-/// snarkjs' short option names (`-verbose|v`, `-entropy|e`, `-name|n`) and `-h`.
+/// snarkjs' short option names (`-verbose|v`, `-entropy|e`, `-name|n`, and `wtns debug`'s
+/// `-get|g`, `-set|s`, `-trigger|t`) and `-h`.
 fn long_name(key: &str) -> &str {
     match key {
         "v" => "verbose",
         "e" => "entropy",
         "n" => "name",
+        "g" => "get",
+        "s" => "set",
+        "t" => "trigger",
         "h" => "help",
         "V" => "version",
         other => other,
@@ -600,6 +604,11 @@ mod tests {
             ("zkib a m b", "zkey import bellman a m b"),
             ("zkesv", "zkey export solidityverifier"),
             ("generateverifier", "zkey export solidityverifier"),
+            ("wc c.wasm i.json", "wtns calculate c.wasm i.json"),
+            ("calculatewitness", "wtns calculate"),
+            ("wd", "wtns debug"),
+            ("g16f i.json c.wasm", "groth16 fullprove i.json c.wasm"),
+            ("g16i", "groth16 fullprove"),
         ] {
             assert_eq!(clap(alias).join(" "), words, "{alias}");
         }
@@ -625,6 +634,10 @@ mod tests {
             "powersoftau contribute a b --entropy=x=y --name=first"
         );
         assert_eq!(clap("g16p -h"), ["groth16", "prove", "--help"]);
+        assert_eq!(
+            clap("wd -g -set --t").join(" "),
+            "wtns debug --get --set --trigger"
+        );
     }
 
     #[test]

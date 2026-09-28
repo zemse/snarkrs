@@ -84,7 +84,7 @@ g16-metal = { path = "crates/g16-metal" }
 g16-cuda  = { path = "crates/g16-cuda" }
 g16-wgpu  = { path = "crates/g16-wgpu" }
 g16-wasm  = { path = "crates/g16-wasm" }
-g16-witness = { path = "crates/g16-witness" }
+g16-witness = { path = "crates/g16-witness", default-features = false }
 
 [profile.release]
 opt-level = 3

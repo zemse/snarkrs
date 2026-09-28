@@ -13,7 +13,12 @@
 //!   snarkrs groth16 setup [circuit.r1cs] [powersoftau.ptau] [circuit_0000.zkey]   (g16s)
 //!   snarkrs groth16 prove [circuit_final.zkey] [witness.wtns] [proof.json] [public.json]
 //!                                                                          (g16p)
+//!   snarkrs groth16 fullprove [input.json] [circuit.wasm] [circuit_final.zkey] [proof.json]
+//!                                                  [public.json]           (g16f)
 //!   snarkrs groth16 verify [verification_key.json] [public.json] [proof.json]     (g16v)
+//!   snarkrs wtns calculate [circuit.wasm] [input.json] [witness.wtns]      (wc)
+//!   snarkrs wtns debug [circuit.wasm] [input.json] [witness.wtns] [circuit.sym] [-g] [-s] [-t]
+//!                                                                          (wd)
 //!   snarkrs zkey contribute <in.zkey> <out.zkey> [-e=TEXT] [-n=NAME]       (zkc)
 //!   snarkrs zkey beacon <in.zkey> <out.zkey> <hashHex> <iterExp>           (zkb)
 //!   snarkrs zkey verify r1cs [circuit.r1cs] [powersoftau.ptau] [circuit_final.zkey] (zkv)
@@ -33,7 +38,7 @@
 //!
 //! The snarkjs commands take snarkjs' words, aliases, positionals, defaults and options;
 //! `cli.rs` turns that line into one clap parses, and has the table. Our own options sit on
-//! top as `--` flags: `groth16 prove` takes `--backend cpu|wgpu|metal|cuda`,
+//! top as `--` flags: `groth16 prove` and `fullprove` take `--backend cpu|wgpu|metal|cuda`,
 //! `--stage-timings`, `--self-verify true|false`, `--vkey vkey.json`, `--fallback` and
 //! `--constant-work`, and the ceremony commands take `--backend cpu|metal`.
 //!
@@ -71,7 +76,11 @@ use g16_core::{
     verify::{verify, VerifyError},
     StageTimings,
 };
+use g16_field::Fr;
 use g16_msm::{CpuMsm, GroupFft, KeyScale, MsmBackend};
+#[cfg(feature = "witness-wasm")]
+use g16_witness::Input;
+use g16_witness::{native, WitnessError};
 use g16_zkey::{wtns::Witness, ProvingKey, VerifyingKey};
 use snarkrs::{
     bench,
@@ -113,6 +122,11 @@ enum Cmd {
     Zkey {
         #[command(subcommand)]
         cmd: ZkeyCmd,
+    },
+    /// Witnesses: circuit + input -> witness.wtns.
+    Wtns {
+        #[command(subcommand)]
+        cmd: WtnsCmd,
     },
     /// iden3 binary files.
     File {
@@ -287,6 +301,38 @@ enum PrepareCmd {
     },
 }
 
+/// `groth16 prove`'s options of ours, which `fullprove` takes too.
+#[derive(clap::Args)]
+struct ProveOpts {
+    #[arg(long, value_enum, default_value_t = BackendKind::Cpu)]
+    backend: BackendKind,
+    /// Print the per-stage split of the proving time.
+    #[arg(long)]
+    stage_timings: bool,
+    /// Verify the proof before writing it, and fail rather than emit one that does not
+    /// verify. On by default; the cost is under 3% of a proof.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    self_verify: bool,
+    /// The circuit's verification_key.json, from a source independent of the zkey.
+    /// Checked against the zkey's public-input count before proving, and the proof is
+    /// verified against it before anything is written.
+    #[arg(long, value_name = "FILE")]
+    vkey: Option<PathBuf>,
+    /// When a GPU proof fails its self-verify or the device faults, prove once more on
+    /// the same backend and then on the CPU, reporting each failure. A logic bug fails
+    /// the same way every time; a transient accelerator fault does not. No effect with
+    /// --self-verify false or --backend cpu.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    fallback: bool,
+    /// MSMs whose cost follows the key and not the witness, so proving time does not
+    /// reveal how many witness entries are zero or one (the timing channel USENIX
+    /// Security 2020 used on Zcash). From 2.5% (cpu), 26% (metal) or 55% (wgpu) slower
+    /// on a dense circuit to 4x (cpu), 6x (metal) or 10x (wgpu) on a bit-heavy one. cpu,
+    /// metal and wgpu backends.
+    #[arg(long)]
+    constant_work: bool,
+}
+
 #[derive(Subcommand)]
 enum Groth16Cmd {
     /// Phase-2 setup: circuit + prepared powers of tau -> an initial zkey.
@@ -313,36 +359,32 @@ enum Groth16Cmd {
         proof: PathBuf,
         #[arg(default_value = "public.json")]
         public: PathBuf,
-        #[arg(long, value_enum, default_value_t = BackendKind::Cpu)]
-        backend: BackendKind,
-        /// Print the per-stage split of the proving time.
-        #[arg(long)]
-        stage_timings: bool,
-        /// Verify the proof before writing it, and fail rather than emit one that does not
-        /// verify. On by default; the cost is under 3% of a proof.
-        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-        self_verify: bool,
-        /// The circuit's verification_key.json, from a source independent of the zkey.
-        /// Checked against the zkey's public-input count before proving, and the proof is
-        /// verified against it before anything is written.
-        #[arg(long, value_name = "FILE")]
-        vkey: Option<PathBuf>,
-        /// When a GPU proof fails its self-verify or the device faults, prove once more on
-        /// the same backend and then on the CPU, reporting each failure. A logic bug fails
-        /// the same way every time; a transient accelerator fault does not. No effect with
-        /// --self-verify false or --backend cpu.
-        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-        fallback: bool,
-        /// MSMs whose cost follows the key and not the witness, so proving time does not
-        /// reveal how many witness entries are zero or one (the timing channel USENIX
-        /// Security 2020 used on Zcash). From 2.5% (cpu), 26% (metal) or 55% (wgpu) slower
-        /// on a dense circuit to 4x (cpu), 6x (metal) or 10x (wgpu) on a bit-heavy one. cpu,
-        /// metal and wgpu backends.
-        #[arg(long)]
-        constant_work: bool,
+        #[command(flatten)]
+        opts: ProveOpts,
         /// snarkjs' `-protocol`, which its groth16 prove accepts and never reads.
         #[arg(long, hide = true, require_equals = true, num_args = 0..=1)]
         protocol: Option<String>,
+    },
+    /// Compute the witness and prove it: input.json + witness generator + zkey ->
+    /// proof.json and public.json.
+    ///
+    /// The generator is circom's circuit.wasm or the native binary `circom --c` builds,
+    /// told apart by content. With the wasm the witness never touches the disk.
+    Fullprove {
+        #[arg(default_value = "input.json")]
+        input: PathBuf,
+        /// snarkjs' usage line says circuit_final.wasm; the code it runs defaults to
+        /// circuit.wasm, and so does this.
+        #[arg(default_value = "circuit.wasm")]
+        wasm: PathBuf,
+        #[arg(default_value = "circuit_final.zkey")]
+        zkey: PathBuf,
+        #[arg(default_value = "proof.json")]
+        proof: PathBuf,
+        #[arg(default_value = "public.json")]
+        public: PathBuf,
+        #[command(flatten)]
+        opts: ProveOpts,
     },
     /// Verify a proof against snarkjs' verification_key.json.
     Verify {
@@ -482,6 +524,43 @@ enum ZkeyExportCmd {
 }
 
 #[derive(Subcommand)]
+enum WtnsCmd {
+    /// Compute the witness for an input, byte for byte the file snarkjs writes.
+    ///
+    /// The generator is circom's circuit.wasm, or the native binary `circom --c` builds
+    /// (with its .dat beside it), told apart by content and not by name.
+    Calculate {
+        #[arg(default_value = "circuit.wasm")]
+        wasm: PathBuf,
+        #[arg(default_value = "input.json")]
+        input: PathBuf,
+        #[arg(default_value = "witness.wtns")]
+        witness: PathBuf,
+    },
+    /// Compute the witness with the module's own sanity checks on. Wasm only.
+    Debug {
+        #[arg(default_value = "circuit.wasm")]
+        wasm: PathBuf,
+        #[arg(default_value = "input.json")]
+        input: PathBuf,
+        #[arg(default_value = "witness.wtns")]
+        witness: PathBuf,
+        /// Defaults to the wasm's name with its extension changed to `.sym`.
+        sym: Option<PathBuf>,
+        /// Log every signal read. circom 2 modules have no hook for it, so, as in snarkjs,
+        /// this prints nothing for them. `-g`.
+        #[arg(long)]
+        get: bool,
+        /// Log every signal write. As `--get`. `-s`.
+        #[arg(long)]
+        set: bool,
+        /// Log every component start and finish. As `--get`. `-t`.
+        #[arg(long)]
+        trigger: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum FileCmd {
     /// Report the header, every section's declared and present size, and the contribution
     /// count.
@@ -559,6 +638,7 @@ fn run(cmd: Cmd) -> Result<u8> {
         Cmd::Powersoftau { cmd } => run_ptau(cmd),
         Cmd::Groth16 { cmd } => run_groth16(cmd),
         Cmd::Zkey { cmd } => run_zkey(cmd),
+        Cmd::Wtns { cmd } => run_wtns(cmd),
         Cmd::File {
             cmd: FileCmd::Info { file },
         } => {
@@ -961,26 +1041,17 @@ fn run_groth16(cmd: Groth16Cmd) -> Result<u8> {
             witness,
             proof,
             public,
-            backend,
-            stage_timings,
-            self_verify,
-            vkey,
-            fallback,
-            constant_work,
+            opts,
             protocol: _,
-        } => run_prove(
-            &zkey,
-            &witness,
-            &proof,
-            &public,
-            backend,
-            stage_timings,
-            self_verify,
-            vkey.as_deref(),
-            fallback,
-            constant_work,
-        )
-        .map(|()| 0),
+        } => run_prove(&zkey, WitnessFrom::File(&witness), &proof, &public, &opts).map(|()| 0),
+        Groth16Cmd::Fullprove {
+            input,
+            wasm,
+            zkey,
+            proof,
+            public,
+            opts,
+        } => run_fullprove(&input, &wasm, &zkey, &proof, &public, &opts),
         Groth16Cmd::Verify {
             vkey,
             public,
@@ -1219,18 +1290,161 @@ fn run_file_info(file: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A witness that could not be computed is reported the way snarkjs reports it: its error
+/// class and message on an ERROR line, and exit 1.
+fn witness_failed(e: &WitnessError) -> u8 {
+    log::error(e.snarkjs_line());
+    1
+}
+
+/// The witness for `input`, in memory, from either kind of generator.
+fn generate_witness(generator: &Path, input: &Path) -> Result<Vec<Fr>, WitnessError> {
+    // snarkjs reads the input before it opens the wasm, so a missing input is reported
+    // first.
+    let text = g16_witness::read_file(input)?;
+    match native::detect(generator)? {
+        native::Kind::Wasm => wasm_witness(generator, &text, false),
+        native::Kind::Native => native::calculate(generator, input, None),
+    }
+}
+
+#[cfg(feature = "witness-wasm")]
+fn wasm_witness(wasm: &Path, input: &[u8], sanity_check: bool) -> Result<Vec<Fr>, WitnessError> {
+    let input = Input::from_json_str(&String::from_utf8_lossy(input))?;
+    let calc = g16_witness::WitnessCalculator::from_file(wasm)?;
+    match sanity_check {
+        true => calc.calculate_sanity_checked(&input),
+        false => calc.calculate(&input),
+    }
+}
+
+#[cfg(not(feature = "witness-wasm"))]
+fn wasm_witness(wasm: &Path, _: &[u8], _: bool) -> Result<Vec<Fr>, WitnessError> {
+    Err(WitnessError::Unsupported(format!(
+        "{} is a wasm witness calculator, and this snarkrs was built without the \
+         `witness-wasm` feature. Pass the native binary circom --c builds, or rebuild with \
+         `cargo build --release --features witness-wasm`.",
+        wasm.display()
+    )))
+}
+
+fn run_wtns(cmd: WtnsCmd) -> Result<u8> {
+    match cmd {
+        WtnsCmd::Calculate {
+            wasm,
+            input,
+            witness,
+        } => {
+            let done =
+                g16_witness::read_file(&input).and_then(|text| match native::detect(&wasm)? {
+                    native::Kind::Wasm => {
+                        let mut w = wasm_witness(&wasm, &text, false)?;
+                        let r = g16_witness::write_wtns(&witness, &w);
+                        g16_core::scrub(&mut w);
+                        r
+                    }
+                    native::Kind::Native => native::calculate_to_file(&wasm, &input, &witness),
+                });
+            if let Err(e) = done {
+                return Ok(witness_failed(&e));
+            }
+            log::debug(format!("wrote {}", witness.display()));
+        }
+        WtnsCmd::Debug {
+            wasm,
+            input,
+            witness,
+            sym,
+            get: _,
+            set: _,
+            trigger: _,
+        } => {
+            let sym = sym.unwrap_or_else(|| cli::change_ext(&wasm.to_string_lossy(), "sym").into());
+            let done = g16_witness::read_file(&input).and_then(|text| {
+                if native::detect(&wasm)? == native::Kind::Native {
+                    return Err(WitnessError::Unsupported(format!(
+                        "wtns debug runs the wasm witness calculator only, and {} is a native \
+                         binary. Use wtns calculate with it, or pass circuit.wasm",
+                        wasm.display()
+                    )));
+                }
+                // snarkjs loads the symbols whatever the flags, so a missing .sym fails here
+                // too. A circom 2 module calls none of the hooks that would print them.
+                g16_witness::read_file(&sym)?;
+                let mut w = wasm_witness(&wasm, &text, true)?;
+                let r = g16_witness::write_wtns(&witness, &w);
+                g16_core::scrub(&mut w);
+                r
+            });
+            if let Err(e) = done {
+                return Ok(witness_failed(&e));
+            }
+            log::debug(format!("wrote {}", witness.display()));
+        }
+    }
+    Ok(0)
+}
+
+/// `groth16 fullprove`: `prove`, with the witness computed here instead of read from a file.
+/// From the wasm it stays in memory; a native binary writes it to a private temp file that
+/// is zeroed and removed before the key is even loaded.
+fn run_fullprove(
+    input: &Path,
+    generator: &Path,
+    zkey: &Path,
+    proof: &Path,
+    public: &Path,
+    opts: &ProveOpts,
+) -> Result<u8> {
+    let generate = || generate_witness(generator, input).map_err(anyhow::Error::from);
+    match run_prove(
+        zkey,
+        WitnessFrom::Generate(Box::new(generate)),
+        proof,
+        public,
+        opts,
+    ) {
+        Ok(()) => Ok(0),
+        Err(e) => match e.downcast_ref::<WitnessError>() {
+            Some(we) => Ok(witness_failed(we)),
+            None => Err(e),
+        },
+    }
+}
+
+/// Where `run_prove` gets its witness.
+enum WitnessFrom<'a> {
+    /// A `.wtns`, as `groth16 prove` takes it.
+    File(&'a Path),
+    /// Computed in this process, as `groth16 fullprove` does. Called once the process can
+    /// no longer dump core, and before the key is loaded, so a bad input fails fast.
+    Generate(Box<dyn FnOnce() -> Result<Vec<Fr>> + 'a>),
+}
+
+/// A witness that is zeroed when it drops, on the error paths as well.
+struct Scrubbed(Vec<Fr>);
+
+impl Drop for Scrubbed {
+    fn drop(&mut self) {
+        g16_core::scrub(&mut self.0);
+    }
+}
+
 fn run_prove(
-    zkey: &std::path::Path,
-    witness: &std::path::Path,
-    proof_out: &std::path::Path,
-    public_out: &std::path::Path,
-    backend: BackendKind,
-    stage_timings: bool,
-    self_verify: bool,
-    vkey: Option<&std::path::Path>,
-    fallback: bool,
-    constant_work: bool,
+    zkey: &Path,
+    witness: WitnessFrom,
+    proof_out: &Path,
+    public_out: &Path,
+    opts: &ProveOpts,
 ) -> Result<()> {
+    let ProveOpts {
+        backend,
+        stage_timings,
+        self_verify,
+        ref vkey,
+        fallback,
+        constant_work,
+    } = *opts;
     // Before the key is read: a backend this binary cannot run, or one that cannot keep
     // --constant-work's promise, is refused without the load.
     let backend_of = |kind| {
@@ -1245,6 +1459,10 @@ fn run_prove(
     // runs no destructor, so nothing below gets to scrub it, and a core file would write it
     // to disk.
     no_core_dumps();
+    let (generated, witness) = match witness {
+        WitnessFrom::File(path) => (None, Some(path)),
+        WitnessFrom::Generate(generate) => (Some(Scrubbed(generate()?)), None),
+    };
     let pk = ProvingKey::load(zkey).with_context(|| format!("loading {}", zkey.display()))?;
     let n_public = pk.n_public;
     // `n_public` comes from the zkey and decides how much of the witness is written to
@@ -1252,6 +1470,7 @@ fn run_prove(
     // with it, so self-verify cannot tell. An independent vkey can: its IC has exactly one
     // point per public input plus the constant wire.
     let vk = vkey
+        .as_deref()
         .map(|path| {
             VerifyingKey::from_json(path).with_context(|| format!("loading {}", path.display()))
         })
@@ -1277,9 +1496,27 @@ fn run_prove(
             pk.n_vars - 1
         ),
     }
-    let mut w = Witness::load(witness)
-        .with_context(|| format!("loading {}", witness.display()))?
-        .0;
+    let owned = match (generated, witness) {
+        (Some(w), _) => {
+            // A generator built from another circuit, which a .wtns cannot be checked for
+            // until the prover trips over it.
+            anyhow::ensure!(
+                w.0.len() == pk.n_vars,
+                "the witness generator produced {} wires and the zkey has {}: they are not \
+                 the same circuit",
+                w.0.len(),
+                pk.n_vars
+            );
+            w
+        }
+        (None, Some(path)) => Scrubbed(
+            Witness::load(path)
+                .with_context(|| format!("loading {}", path.display()))?
+                .0,
+        ),
+        (None, None) => unreachable!("a witness is either a file or generated"),
+    };
+    let w: &[Fr] = &owned.0;
     // Checked here, not at the slice below, so a witness that does not match the key costs
     // the load and nothing else. On a large circuit the proof is tens of seconds.
     anyhow::ensure!(
@@ -1306,7 +1543,7 @@ fn run_prove(
         let attempt = if fallback {
             snarkrs::fallback::prove_with_fallback(
                 circuit.as_ref(),
-                &w,
+                w,
                 &mut rng,
                 &mut t,
                 || {
@@ -1335,7 +1572,7 @@ fn run_prove(
                 },
             )
         } else {
-            prove(circuit.as_ref(), &w, &mut rng, &mut t).map_err(Into::into)
+            prove(circuit.as_ref(), w, &mut rng, &mut t).map_err(Into::into)
         };
         attempt.map_err(|e| {
             e.context(
@@ -1343,7 +1580,7 @@ fn run_prove(
             )
         })?
     } else {
-        prove_unchecked(circuit.as_ref(), &w, &mut rng, &mut t)?
+        prove_unchecked(circuit.as_ref(), w, &mut rng, &mut t)?
     };
     let elapsed = started.elapsed();
 
@@ -1362,9 +1599,9 @@ fn run_prove(
 
     json::write_proof(proof_out, &proof)?;
     json::write_public(public_out, public)?;
-    // Written out, so the in-memory copy has nothing left to do. The backend's own scratch
-    // (H, stage 0's B and C) is zeroed by `g16-core` as it drops.
-    g16_core::scrub(&mut w);
+    // Written out, so the in-memory copy has nothing left to do. `Scrubbed` zeroes it as
+    // it drops, and the backend's own scratch (H, stage 0's B and C) is zeroed by
+    // `g16-core` as it drops.
 
     if stage_timings {
         let total = elapsed.as_micros() as u64;
