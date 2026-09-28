@@ -1,11 +1,13 @@
-//! Witness generation for circom circuits: the wasm calculator snarkjs runs.
+//! Witness generation for circom circuits: the wasm calculator snarkjs runs, and the
+//! native C++ binary circom can emit instead.
 //!
 //! - [`WitnessCalculator`] (feature `wasm`, on by default) runs `circuit.wasm` on wasmtime
 //!   the way circom_runtime 0.1.28 runs it under snarkjs 0.7.6: the same input reading
 //!   ([`Input`]), the same error messages, `log()` printed the same way, and a `.wtns` that
 //!   is byte for byte the file `snarkjs wtns calculate` writes.
+//! - [`native`] runs a circom `--c` binary as a subprocess and reads back what it wrote.
 //!
-//! The result is `w = (1, public..., private...)` as `Vec<Fr>`, which is what
+//! Either way the result is `w = (1, public..., private...)` as `Vec<Fr>`, which is what
 //! `g16_core::prove::prove` takes. Handing it over in memory skips the `.wtns` file
 //! entirely.
 //!
@@ -16,6 +18,7 @@
 // Only the wasm calculator reads input JSON; a native binary reads its own.
 #[cfg_attr(not(feature = "wasm"), allow(dead_code))]
 mod input;
+pub mod native;
 #[cfg(feature = "wasm")]
 mod wasm;
 
@@ -72,9 +75,12 @@ pub enum WitnessError {
     /// A module snarkrs does not run: circom 1, another field, or not circom at all.
     #[error("{0}")]
     Unsupported(String),
-    /// A witness the module produced that is not a witness.
+    /// A witness the module or the binary produced that is not a witness.
     #[error("{0}")]
     Malformed(String),
+    /// A native witness binary that could not run or did not finish.
+    #[error("{0}")]
+    Native(String),
     #[error("{context}: {source}")]
     Io {
         context: String,
