@@ -734,7 +734,7 @@ impl Bench {
                             .encode_merge(pass, &self.dplan, &bind, &poff)
                             .expect("encode"),
                         Stage::Reduction => {
-                            p.encode_reduce(pass, &self.dplan, &bind, &poff)
+                            p.encode_reduce(pass, &self.dplan, &pplan, &bind, &poff)
                                 .expect("encode");
                             p.encode_ones(pass, &pplan, &bind, &poff).expect("encode");
                         }
@@ -1048,7 +1048,7 @@ fn the_point_plan_derives_its_shape_once() {
     assert_eq!(params.slice_len, p.slice_len());
     assert_eq!(params.slices, p.slices());
     assert_eq!(params.ones_groups, p.ones_groups());
-    assert_eq!(std::mem::size_of_val(&params), 64);
+    assert_eq!(std::mem::size_of_val(&params), 80);
 
     // And a caller that mixes a plan built for one reduction width with a module built for
     // another is refused, because ones_groups would not match the stride the kernel walks.

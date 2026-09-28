@@ -366,7 +366,7 @@ macro_rules! run_msm_words {
 /// and its multiples, and the odd numbers around each, because every one of those is a place
 /// a `<=` can be a `<`. The widths span the whole range `DigitPlan` accepts: `c = 2` gives 2
 /// buckets and 128 windows, `c = 16` gives 32,768 buckets and 16, and the reduction's
-/// segment arithmetic (`ceil(n_buckets / tg)` with `tg = 128`) is a different shape at each
+/// segment arithmetic (`ceil(n_buckets / tg)` with `tg = 64`) is a different shape at each
 /// end.
 #[test]
 fn the_g1_msm_equals_a_naive_sum_of_scalar_multiples() {

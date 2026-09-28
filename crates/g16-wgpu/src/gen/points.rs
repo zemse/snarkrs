@@ -174,7 +174,7 @@ pub const G1: Curve = Curve {
         clear: 256,
         segmented: 128,
         merge: 256,
-        tg: 128,
+        tg: 64,
     },
     headroom: "no BN254 group has a narrower accumulator than this one, so the only way \
                down is a narrower window",
@@ -430,43 +430,37 @@ pub struct Workgroups {
     pub segmented: u32,
     pub merge: u32,
     /// Threads in `msm_reduce_*` and `msm_ones_*`, which is also the length of the
-    /// `array<Pt, tg>` both hold in workgroup storage. **This is the one size the two curves
-    /// do not agree on, and the byte budget is why.**
+    /// `array<Pt, tg>` both hold in workgroup storage.
     ///
     /// An `Xyzz<Fq>` is 128 bytes and an `Xyzz<Fq2>` is 256, so the widest reduction
     /// `maxComputeWorkgroupStorageSize`'s 16384-byte floor allows is 128 threads over G1 and
-    /// 64 over G2. Both curves want the widest one they can have.
+    /// 64 over G2.
     ///
     /// `the_g1_reduction_threadgroup_is_measured` and `the_reduction_threadgroup_is_measured`,
     /// 32,768 general scalars at `c = 12`, medians of five release runs, microseconds for
-    /// `msm_reduce_*` plus `msm_ones_*`:
+    /// `msm_reduce_*` plus `msm_ones_*`, with one workgroup per window as first measured
+    /// (G2 then still inlined three `fq_mul` copies, see `gen::field::FQ2_OPS`), and with the
+    /// window split, each size at the group count `crate::points::reduce_groups_for` picks:
     ///
     /// ```text
-    /// tg     G1 shared B    G1 us      G2 shared B     G2 us
-    ///  8            1024  139054.7            2048  466285.4
-    /// 16            2048   71507.1            4096  239764.4
-    /// 32            4096   45057.1            8192  140261.5
-    /// 64            8192   25286.5           16384   81319.6
-    /// 128          16384   17891.5               -         -
+    /// tg     G1 one group   G1 split    G2 one group   G2 split
+    ///  8        139054.7     18392.6        466285.4    56974.0
+    /// 16         71507.1     10410.1        239764.4    32169.6
+    /// 32         45057.1      6668.6        140261.5    20286.1
+    /// 64         25286.5      4554.2         81319.6    16525.7
+    /// 128        17891.5      6812.4               -          -
     /// ```
     ///
-    /// **Every doubling of `tg` is worth 40% to 50%, all the way to the limit.** Design §4
-    /// argues the other way, that `tg = 32` keeps two workgroups resident per core where the
-    /// widest keeps one, and that occupancy is worth more than the tree; the measurement says
-    /// it is worth 2.5x less. The reason is that `tg` is not only the tree width, it is also
-    /// the divisor on each thread's serial segment: at half the threads every thread reduces
-    /// twice as many buckets one after another, and that term dominates everything else in
-    /// the kernel. This is the third time the design's workgroup-storage reasoning has been
-    /// measured in this crate and the third time it did not survive.
-    ///
-    /// Both curves therefore ship a reduction that sits at **exactly** the floor's whole
-    /// workgroup allocation with zero headroom, which is uncomfortable and is the trade the
-    /// numbers force: one more byte of workgroup storage in either reduction, on any platform
-    /// that charges for anything the generator does not count, and the pipeline fails to
-    /// create in a browser rather than running slowly. The alternative costs 41% over G1 and
-    /// 63% over G2 of a kernel that is a quarter of the point stage. `tests/wgsl_static.rs`
-    /// audits both modules at this width on every run, and U14 has to re-measure in Chrome,
-    /// where the array is charged by Tint and not by naga.
+    /// With one workgroup per window every doubling was worth 40% to 50%, because `tg` was
+    /// also the divisor on each thread's serial segment, and both curves shipped at exactly
+    /// the floor. With the window split across workgroups the segment is set by the group
+    /// count instead, and a narrower workgroup gets more groups: at `c = 12` G1 runs 2
+    /// groups of 128 or 4 of 64, and 64 wins by 50%. On the 2^22 key at `c = 13` both get 4
+    /// groups and 64 reads the same reduce and half the `ones` (`tests/msm_trace.rs`, 357
+    /// against 353 ms of reduce and 39 against 71 of ones over the stage). G1 ships 64, half
+    /// the floor; G2 still sits at exactly the floor. `tests/wgsl_static.rs` audits both
+    /// modules at this width on every run, and U14 has to re-measure in Chrome, where the
+    /// array is charged by Tint and not by naga.
     pub tg: u32,
 }
 
@@ -1824,7 +1818,7 @@ fn entry_reduce(c: Curve, tg: u32, constant: bool) -> String {
         }}
     }}
     workgroupBarrier();
-    if (tid == 0u) {{ WSUMS[w] = {store}{shared}[0]); }}"
+    if (tid == 0u) {{ WSUMS[wid.x] = {store}{shared}[0]); }}"
     );
     let about = if constant {
         format!(
@@ -1839,13 +1833,14 @@ fn entry_reduce(c: Curve, tg: u32, constant: bool) -> String {
         )
     } else {
         format!(
-            "// Collapse one window's 2^(c-1) buckets to one point. One workgroup per window.
+            "// Collapse one window's 2^(c-1) buckets to P.reduce_groups partial sums, one
+// workgroup each (crate::points::reduce_groups_for).
 //
 // The window sum is sum_j (j+1) B_j. Split the buckets into one segment per thread at
 // [lo, hi). Inside a segment the reverse running sum gives P = sum_j (j - lo + 1) B_j and
 // Q = sum_j B_j in two additions per bucket, and the segment contributes P + lo * Q. The
 // per-thread results are then tree-reduced in workgroup memory, so the host reads back one
-// point per window and does nothing but the Horner combination.
+// point per window and group, and adds a window's partials before the Horner combination.
 //
 // The per-thread part is spelled as a state machine over a single pt_add call site rather
 // than as the loop, multiply and join it computes, because on an iPhone 15 Pro the direct
@@ -1871,10 +1866,19 @@ var<workgroup> {shared}: array<{ty}, {tg}>;
 @compute @workgroup_size({tg})
 fn {entry}(@builtin(workgroup_id) wid: vec3<u32>,
                   @builtin(local_invocation_index) tid: u32) {{
-    let w = wid.x;
-    let seg_len = (P.n_buckets + {tg}u - 1u) / {tg}u;
-    let lo = tid * seg_len;
-    let hi = min(lo + seg_len, P.n_buckets);
+    // Window w's buckets are cut into P.reduce_groups contiguous chunks, one workgroup
+    // each, and this thread's segment [lo, hi) is indexed from the window's first bucket,
+    // so phase B's multiply by lo gives P + lo * Q whatever the chunk. Group g of window w
+    // writes partial w * P.reduce_groups + g, and the host adds a window's partials before
+    // its Horner step.
+    let w = wid.x / P.reduce_groups;
+    let g = wid.x - w * P.reduce_groups;
+    let chunk = (P.n_buckets + P.reduce_groups - 1u) / P.reduce_groups;
+    let g_lo = g * chunk;
+    let g_hi = min(g_lo + chunk, P.n_buckets);
+    let seg_len = (chunk + {tg}u - 1u) / {tg}u;
+    let lo = g_lo + tid * seg_len;
+    let hi = min(lo + seg_len, g_hi);
 
 {mine}
 

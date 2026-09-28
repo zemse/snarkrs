@@ -424,17 +424,18 @@ fn fr_prelude(v: Variant) -> String {
 /// The `MsmParams` fields, shared verbatim by every module that dispatches part of an MSM,
 /// so the declarations cannot drift.
 ///
-/// **Sixteen `u32`, 64 bytes, and the last eight are the point stages'.** The digit kernels
-/// here ignore `base_off`, `ones_groups`, `slice_len`, `slices` and the four `fold_*`
-/// entirely; they are in this struct rather than in a second one because `g16-metal` has
-/// exactly one `MsmParams` covering both halves, because design §3 puts every parameter
-/// block for a proof in one uniform ring, and because two structs would be two host mirrors
-/// for `tests/wgsl_static.rs::every_uniform_parameter_struct_matches_its_host_mirror` to
-/// check and one more place for a field to be added on one side only.
+/// **Twenty `u32`, 80 bytes, and the last twelve are the point stages'.** The digit kernels
+/// here ignore `base_off`, `ones_groups`, `slice_len`, `slices`, the four `fold_*` and
+/// `reduce_groups` entirely; they are in this struct rather than in a second one because
+/// `g16-metal` has exactly one `MsmParams` covering both halves, because design §3 puts
+/// every parameter block for a proof in one uniform ring, and because two structs would be
+/// two host mirrors for
+/// `tests/wgsl_static.rs::every_uniform_parameter_struct_matches_its_host_mirror` to check
+/// and one more place for a field to be added on one side only.
 ///
-/// 64 is a multiple of the 16 WGSL rounds every uniform struct up to, so there is no
-/// invisible tail padding for `crate::msm::MsmParams` to disagree with, and it is well under
-/// the 256-byte ring slot.
+/// 80 is a multiple of the 16 WGSL rounds every uniform struct up to, so there is no
+/// invisible tail padding for `crate::msm::MsmParams` to disagree with (the three `pad`
+/// words are that rounding, written out), and it is well under the 256-byte ring slot.
 const PARAM_FIELDS: &str = "\
     // Elements this kernel's domain holds: scalars for count, scatter and the ones pass,\n\
     // words for zero_u32, field elements for fr_mont_to_std. The point kernels compute\n\
@@ -477,7 +478,13 @@ const PARAM_FIELDS: &str = "\
     // (1 on the last level), and slots per group. Zero for every other kernel.\n\
     fold_in: u32,\n\
     fold_groups: u32,\n\
-    fold_len: u32,\n";
+    fold_len: u32,\n\
+    // Workgroups msm_reduce_* runs per window, each over a contiguous chunk of the\n\
+    // window's buckets, writing partial w * reduce_groups + g. Zero for every other kernel.\n\
+    reduce_groups: u32,\n\
+    pad0: u32,\n\
+    pad1: u32,\n\
+    pad2: u32,\n";
 
 /// The parameter struct and its uniform binding. One copy per module, whichever module.
 ///

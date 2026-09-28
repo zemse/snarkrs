@@ -910,10 +910,30 @@ fn a_whole_proof_submits_once_for_h_then_per_msm_slab_and_the_readback_is_bounde
     const C_MAX: u32 = g16_wgpu::msm::MAX_WINDOW;
 
     let windows = u64::from(g16_wgpu::msm::RECODE_BITS.div_ceil(C_MIN));
-    let per_job = |pt: u64| (windows * pt).div_ceil(256) * 256 + MAX_ONES_GROUPS * pt;
+    // The reduce writes one partial per window per group, and the group count follows the
+    // window count and the curve's reduction width, so the most points a sub-MSM can read
+    // back is the largest `windows * groups` over every width the cost model can pick.
+    let sum_points = |curve: g16_wgpu::gen::points::Curve| -> u64 {
+        (C_MIN..=C_MAX)
+            .map(|c| {
+                let nw = g16_wgpu::msm::RECODE_BITS.div_ceil(c);
+                u64::from(nw)
+                    * u64::from(g16_wgpu::points::reduce_groups_for(
+                        nw,
+                        1 << (c - 1),
+                        curve.wg.tg,
+                    ))
+            })
+            .max()
+            .unwrap()
+    };
+    let per_job = |curve: g16_wgpu::gen::points::Curve| {
+        let pt = curve.point_bytes;
+        (sum_points(curve) * pt).div_ceil(256) * 256 + MAX_ONES_GROUPS * pt
+    };
     let ceiling = |g1: u32, g2: u32| {
-        u64::from(g1) * per_job(g16_wgpu::gen::points::G1.point_bytes)
-            + u64::from(g2) * per_job(g16_wgpu::gen::points::G2.point_bytes)
+        u64::from(g1) * per_job(g16_wgpu::gen::points::G1)
+            + u64::from(g2) * per_job(g16_wgpu::gen::points::G2)
     };
 
     let found = artifacts();
@@ -980,8 +1000,8 @@ fn a_whole_proof_submits_once_for_h_then_per_msm_slab_and_the_readback_is_bounde
         assert!(
             read > 0 && read <= ceiling,
             "{}: the MSM readback is {read} bytes, over the {ceiling} byte ceiling that \
-             {windows} windows at c = {C_MIN} and {MAX_ONES_GROUPS} ones groups allow over \
-             {g1} G1 and {g2} G2 sub-MSMs",
+             {windows} windows at c = {C_MIN}, the reduce's groups and {MAX_ONES_GROUPS} \
+             ones groups allow over {g1} G1 and {g2} G2 sub-MSMs",
             a.name
         );
         verify(&a.vkey(), &public_of(&witness, circuit.n_public()), &proof).expect("verify");

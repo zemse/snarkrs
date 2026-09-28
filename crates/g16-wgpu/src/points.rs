@@ -118,6 +118,61 @@ fn fold_len() -> u32 {
         .unwrap_or(FOLD_LEN)
 }
 
+/// Workgroups the reduce's dispatch grows towards by splitting each window across several.
+///
+/// One workgroup per window is 20 workgroups at c = 13 on a device of 38 cores, each
+/// thread a dependent chain of 64 full additions and then a seven-level tree: latency, not
+/// work. `tests/msm_trace.rs` read the reduce of a 2^19 piece at 11.7 ms in G1 and 57 in
+/// G2 (161 before `fq2_mul` went through one call site), flat in `n` from 2^18 up, and a
+/// 2^22 proof at the floor runs 36 of them. `g16-metal`'s `reduce_groups` is the same
+/// split. Each window's buckets are cut into `reduce_groups` contiguous chunks, a
+/// workgroup each, every thread's segment indexed from the window's first bucket so the
+/// `P + lo * Q` identity holds, and the host adds a window's partials before its Horner
+/// step. Swept on that piece under `G16_WGPU_MSM_RG`, milliseconds per reduce:
+///
+/// ```text
+/// groups per window      1      2      4      8     16     32
+/// msm_reduce_g1       11.8    8.2    6.8   11.2   17.0   25.7
+/// msm_reduce_g2       54.6   32.9   22.3   31.6   39.7   58.6
+/// ```
+///
+/// Both curves bottom at 4, which is 80 workgroups, about two per core, and both climb
+/// from there: every extra group costs each of its threads the `pt_mul_small` by its
+/// segment's start and the host one addition, so past the point where the cores are busy
+/// more groups is more tax. A target in threads (Metal's 8,192) puts the G2 reduce at 8
+/// and the G1 at 4 here, because their widths differ; the target is therefore in
+/// workgroups, which is what the measurement is about. Groups double until the next
+/// doubling would pass this many or leave a thread under [`REDUCE_MIN_SEGMENT`] buckets,
+/// so a small key (c = 8, 128 buckets) stays at one group. The whole 2^22 stage at the
+/// floor: 5,035 ms at 1 group, 4,593 at 4. `G16_WGPU_MSM_RG` forces the count.
+const REDUCE_TARGET_GROUPS: u32 = 128;
+
+/// Buckets a reduce thread keeps at least, whatever the group count. The table above
+/// bottoms at 8 buckets a thread over G1 (then 128 threads a workgroup) and 16 over G2,
+/// and both climb one halving later, where the `pt_mul_small` by the segment's start is
+/// most of what a thread does. Metal floors at 2.
+const REDUCE_MIN_SEGMENT: u32 = 8;
+
+/// Workgroups per window in `msm_reduce_*` for a plan of `n_windows` by `n_buckets` at
+/// `tg` threads a workgroup. Public so the readback ceiling in `tests/proof.rs` can be
+/// derived from it rather than retyped.
+pub fn reduce_groups_for(n_windows: u32, n_buckets: u32, tg: u32) -> u32 {
+    if let Some(g) = std::env::var("G16_WGPU_MSM_RG")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|g| *g > 0)
+    {
+        return g.min(n_buckets.max(1));
+    }
+    let mut g = 1u32;
+    while n_buckets / (2 * g) >= REDUCE_MIN_SEGMENT * tg
+        && n_windows * 2 * g <= REDUCE_TARGET_GROUPS
+    {
+        g *= 2;
+    }
+    g
+}
+
 // ---------------------------------------------------------------------------
 // The shape of one MSM's point stages
 // ---------------------------------------------------------------------------
@@ -139,6 +194,9 @@ pub struct PointPlan {
     /// whose merge is `msm_merge_*`. On the plan so a pooled scratch built at one fold
     /// length is not reused at another.
     fold_len: u32,
+    /// Workgroups per window in the reduce, [`reduce_groups_for`]. On the plan for the
+    /// same reason as `fold_len`: it sizes the results buffer.
+    reduce_groups: u32,
 }
 
 impl PointPlan {
@@ -197,6 +255,7 @@ impl PointPlan {
                 Work::Constant => fold_len(),
                 Work::Variable => 0,
             },
+            reduce_groups: reduce_groups_for(digits.n_windows(), digits.n_buckets(), tg),
         })
     }
 
@@ -217,6 +276,14 @@ impl PointPlan {
     }
     pub fn fold_len(&self) -> u32 {
         self.fold_len
+    }
+    pub fn reduce_groups(&self) -> u32 {
+        self.reduce_groups
+    }
+
+    /// Points `msm_reduce_*` writes: one partial per window per group.
+    pub fn sum_points(&self, digits: &DigitPlan) -> u32 {
+        digits.n_windows() * self.reduce_groups
     }
 
     /// The constant-work merge's levels, as (spill slots per window in, groups per window
@@ -259,11 +326,11 @@ impl PointPlan {
         2 * self.seg_threads(digits)
     }
 
-    /// Byte offset of the `ones` partials inside the results buffer: the window sums,
+    /// Byte offset of the `ones` partials inside the results buffer: the window partials,
     /// rounded up to the storage binding alignment. See the module docs for why G1 needs
     /// the rounding and G2 gets it for free.
     pub fn ones_offset(&self, digits: &DigitPlan, curve: wgsl::Curve) -> u64 {
-        let sums = u64::from(digits.n_windows()) * curve.point_bytes;
+        let sums = u64::from(self.sum_points(digits)) * curve.point_bytes;
         sums.div_ceil(BINDING_ALIGN) * BINDING_ALIGN
     }
 
@@ -297,6 +364,7 @@ impl PointPlan {
             ones_groups: self.ones_groups,
             slice_len: self.slice_len,
             slices: self.slices,
+            reduce_groups: self.reduce_groups,
             ..digits.params(digits.n(), lo)
         }
     }
@@ -1008,7 +1076,7 @@ impl<C: PointCurve> MsmPoints<C> {
                     (wgsl::BIND_BUCKETS, whole(&bufs.buckets)),
                     (
                         wgsl::BIND_WSUMS,
-                        window(&bufs.results, 0, u64::from(digits.n_windows()) * pt),
+                        window(&bufs.results, 0, u64::from(points.sum_points(digits)) * pt),
                     ),
                 ],
             ),
@@ -1180,8 +1248,9 @@ impl<C: PointCurve> MsmPoints<C> {
         }
         Ok(PointOffsets {
             slabs: out,
-            // One workgroup per window and per ones group, always one dispatch: n_windows is
-            // at most 128 and ones_groups at most 64, against a 65535 limit.
+            // One workgroup per window and group, and per ones group, always one dispatch:
+            // `sum_points` is a few hundred at most and ones_groups at most 64, against a
+            // 65535 limit.
             reduce: ring.push(&points.params(digits, 0))?,
             ones: ring.push(&points.params(digits, 0))?,
         })
@@ -1316,7 +1385,7 @@ impl<C: PointCurve> MsmPoints<C> {
         if !Self::run_kernel(4) {
             return Ok(());
         }
-        self.encode_reduce(pass, digits, binds, offsets)?;
+        self.encode_reduce(pass, digits, points, binds, offsets)?;
         if !Self::run_kernel(5) {
             return Ok(());
         }
@@ -1437,12 +1506,13 @@ impl<C: PointCurve> MsmPoints<C> {
         Ok(())
     }
 
-    /// One workgroup per window: `msm_reduce_*`, or `msm_reduce_constant_*` for a plan with
-    /// dummy rows, over the same bind group.
+    /// `reduce_groups` workgroups per window: `msm_reduce_*`, or `msm_reduce_constant_*`
+    /// for a plan with dummy rows, over the same bind group.
     pub fn encode_reduce(
         &self,
         pass: &mut wgpu::ComputePass<'_>,
         digits: &DigitPlan,
+        points: &PointPlan,
         binds: &PointBinds,
         offsets: &PointOffsets,
     ) -> Result<(), ProveError> {
@@ -1453,7 +1523,7 @@ impl<C: PointCurve> MsmPoints<C> {
         };
         pass.set_pipeline(self.kernels.get(&self.names[which])?);
         pass.set_bind_group(0, &binds.reduce, &[offsets.reduce]);
-        crate::readback::dispatch(pass, digits.n_windows());
+        crate::readback::dispatch(pass, points.sum_points(digits));
         Ok(())
     }
 
@@ -1511,10 +1581,11 @@ impl<C: PointCurve> MsmPoints<C> {
 
     /// The Horner combination of the window sums plus the `ones` partials.
     ///
-    /// `raw` is [`PointBuffers::results`] read back whole, so this is `n_windows` points
-    /// followed by padding followed by `ones_groups` points. High window to low, `c` doublings
-    /// between each, which is the same order `g16-msm` uses on the CPU, so the two agree bit
-    /// for bit and not merely up to the group law.
+    /// `raw` is [`PointBuffers::results`] read back whole, so this is `n_windows` groups of
+    /// `reduce_groups` partials followed by padding followed by `ones_groups` points. A
+    /// window's partials add to its sum, then high window to low, `c` doublings between
+    /// each, which is the same order `g16-msm` uses on the CPU, so the two agree bit for
+    /// bit and not merely up to the group law.
     pub fn combine(
         &self,
         raw: &[u8],
@@ -1526,21 +1597,31 @@ impl<C: PointCurve> MsmPoints<C> {
         let want = bufs.results_bytes(self.curve) as usize;
         if raw.len() < want {
             return Err(bad(format!(
-                "the readback is {} bytes, {} windows plus {} ones groups need {want}",
+                "the readback is {} bytes, {} windows x {} groups plus {} ones groups need \
+                 {want}",
                 raw.len(),
                 digits.n_windows(),
+                points.reduce_groups,
                 points.ones_groups
             )));
         }
         let at =
             |i: usize| -> Result<C::Projective, ProveError> { C::from_xyzz_bytes(&raw[i..i + pt]) };
+        let groups = points.reduce_groups as usize;
+        let window = |k: usize| -> Result<C::Projective, ProveError> {
+            let mut sum = at(k * groups * pt)?;
+            for g in 1..groups {
+                sum += at((k * groups + g) * pt)?;
+            }
+            Ok(sum)
+        };
         let last = digits.n_windows() as usize - 1;
-        let mut acc = at(last * pt)?;
+        let mut acc = window(last)?;
         for k in (0..last).rev() {
             for _ in 0..digits.c() {
                 acc.double_in_place();
             }
-            acc += at(k * pt)?;
+            acc += window(k)?;
         }
         let ones = bufs.ones_off as usize;
         for g in 0..points.ones_groups as usize {
@@ -1570,13 +1651,17 @@ impl<C: PointCurve> MsmPoints<C> {
     ) -> Result<String, ProveError> {
         let pt = self.curve.point_bytes as usize;
         let mut out = String::new();
+        let groups = points.reduce_groups as usize;
         for k in 0..digits.n_windows() as usize {
-            let p = C::from_xyzz_bytes(&raw[k * pt..(k + 1) * pt])?;
-            out.push_str(&format!(
-                "{:<16} {}\n",
-                format!("{label}_w{k:02}"),
-                C::debug_point(&p)
-            ));
+            for g in 0..groups {
+                let i = k * groups + g;
+                let p = C::from_xyzz_bytes(&raw[i * pt..(i + 1) * pt])?;
+                out.push_str(&format!(
+                    "{:<16} {}\n",
+                    format!("{label}_w{k:02}g{g}"),
+                    C::debug_point(&p)
+                ));
+            }
         }
         let ones = bufs.ones_off as usize;
         for g in 0..points.ones_groups as usize {

@@ -666,7 +666,7 @@ fn constant_work_phase_occupancy() {
                                 p.encode_segmented(pass, &pplan, &pbind, &poff).unwrap()
                             }),
                             timed(b, |pass| p.encode_merge(pass, &dplan, &pbind, &poff).unwrap()),
-                            timed(b, |pass| p.encode_reduce(pass, &dplan, &pbind, &poff).unwrap()),
+                            timed(b, |pass| p.encode_reduce(pass, &dplan, &pplan, &pbind, &poff).unwrap()),
                         ];
                         if rep >= 3 {
                             for (v, x) in t.iter_mut().zip(x) {

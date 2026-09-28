@@ -193,15 +193,15 @@ pub fn window_size(m: usize) -> u32 {
 // The parameter block
 // ---------------------------------------------------------------------------
 
-/// Mirrors `struct MsmParams` in [`crate::gen::msm`]. 64 bytes, which is already a multiple
-/// of the 16 WGSL rounds every uniform struct up to, so there is no invisible tail padding
-/// for the two declarations to disagree about.
+/// Mirrors `struct MsmParams` in [`crate::gen::msm`]. 80 bytes, a multiple of the 16 WGSL
+/// rounds every uniform struct up to, so there is no invisible tail padding for the two
+/// declarations to disagree about; the last three words are the padding, spelled out.
 ///
-/// The last eight fields are the point stages', and nothing in this file reads them but
-/// `dummy_rows`. They live here rather than in a second struct because `g16-metal` has one
-/// `MsmParams` covering both halves of an MSM, because design §3 puts every parameter block
-/// for a proof in one uniform ring, and because a second struct is a second host mirror to
-/// keep in step. See [`crate::points::PointPlan`], which fills them.
+/// The nine fields before the padding are the point stages', and nothing in this file
+/// reads them but `dummy_rows`. They live here rather than in a second struct because
+/// `g16-metal` has one `MsmParams` covering both halves of an MSM, because design §3 puts
+/// every parameter block for a proof in one uniform ring, and because a second struct is a
+/// second host mirror to keep in step. See [`crate::points::PointPlan`], which fills them.
 ///
 /// `ParamRing::push` cannot check the correspondence and nothing else will either: a
 /// mismatch reads plausible garbage with no validation error anywhere.
@@ -244,9 +244,15 @@ pub struct MsmParams {
     pub fold_groups: u32,
     /// Slots one group folds.
     pub fold_len: u32,
+    /// Workgroups `msm_reduce_*` runs per window, each over a contiguous chunk of its
+    /// buckets, writing one partial per group. Zero for every other kernel.
+    pub reduce_groups: u32,
+    pub pad0: u32,
+    pub pad1: u32,
+    pub pad2: u32,
 }
 
-const _: () = assert!(core::mem::size_of::<MsmParams>() == 64);
+const _: () = assert!(core::mem::size_of::<MsmParams>() == 80);
 
 // ---------------------------------------------------------------------------
 // One digit pipeline's shape
@@ -443,6 +449,10 @@ impl DigitPlan {
             fold_in: 0,
             fold_groups: 0,
             fold_len: 0,
+            reduce_groups: 0,
+            pad0: 0,
+            pad1: 0,
+            pad2: 0,
         }
     }
 }

@@ -604,7 +604,8 @@ fn the_ones_window_is_aligned_even_when_n_windows_is_odd() {
         let dplan = DigitPlan::with_c(64, 0, Some(64), c).expect("plan");
         let pplan = p.plan_points(&dplan, 0).expect("point plan");
         let bufs = PointBuffers::new(b, &dplan, &pplan, 0, p.curve()).expect("buffers");
-        let raw = u64::from(dplan.n_windows()) * wgsl::G1.point_bytes;
+        // One partial per window per reduce group, so the sums are `sum_points` long.
+        let raw = u64::from(pplan.sum_points(&dplan)) * wgsl::G1.point_bytes;
         let off = bufs.ones_offset();
         assert_eq!(
             off % 256,
@@ -927,7 +928,8 @@ fn the_g1_module_compiles_and_reports_what_it_cost() {
         "the G1 point module took {:.1} s to build",
         cost.compile_us as f64 / 1e6
     );
-    assert_eq!(cost.pipelines, 5);
+    // Seven since constant work: the five, the fold and the constant reduce.
+    assert_eq!(cost.pipelines, 7);
     assert_eq!(cost.modules, 1);
 }
 
@@ -1053,7 +1055,7 @@ impl Bench {
                             .encode_merge(pass, &self.dplan, &bind, &poff)
                             .expect("encode"),
                         Stage::Reduction => {
-                            p.encode_reduce(pass, &self.dplan, &bind, &poff)
+                            p.encode_reduce(pass, &self.dplan, &pplan, &bind, &poff)
                                 .expect("encode");
                             p.encode_ones(pass, &pplan, &bind, &poff).expect("encode");
                         }
@@ -1223,8 +1225,9 @@ fn the_g1_reduction_threadgroup_is_measured() {
     let curve = wgsl::G1;
 
     // Up to 128, where G2 stops at 64: `array<PtG1, 128>` is 16384 bytes, exactly the floor.
-    // Through `Bench::time_each`: timed one size after another, load landing on tg = 128
-    // alone once read it 0.4% behind 64, which it beats by 10% on a quiet GPU.
+    // Each size runs at the group count `reduce_groups_for` gives it, so a narrower one gets
+    // more groups per window: at c = 12, 2 groups of 128 against 4 of 64, and 64 wins by
+    // half. With one workgroup per window 128 beat 64 by 10%.
     println!(
         "32,768 general scalars, c = 12, reduce + ones only, medians of five interleaved \
          rounds, us"
@@ -1348,7 +1351,7 @@ fn the_point_plan_derives_its_shape_once() {
     assert_eq!(params.slice_len, p.slice_len());
     assert_eq!(params.slices, p.slices());
     assert_eq!(params.ones_groups, p.ones_groups());
-    assert_eq!(std::mem::size_of_val(&params), 64);
+    assert_eq!(std::mem::size_of_val(&params), 80);
 
     assert!(PointPlan::with_slice_len(&d, 0, 32, 0).is_err());
     assert!(PointPlan::new(&d, 0, 0, wgsl::G1).is_err());

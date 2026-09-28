@@ -652,7 +652,7 @@ fn probe_job<C: PointCurve>(
         p.encode_merge(pass, dplan, &pbind, &poff).unwrap()
     });
     ph.reduce = timed3(b, "reduce", |pass| {
-        p.encode_reduce(pass, dplan, &pbind, &poff).unwrap()
+        p.encode_reduce(pass, dplan, &pplan, &pbind, &poff).unwrap()
     });
     ph.ones = timed3(b, "ones", |pass| {
         p.encode_ones(pass, &pplan, &pbind, &poff).unwrap()

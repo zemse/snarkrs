@@ -997,6 +997,10 @@ fn every_uniform_parameter_struct_matches_its_host_mirror() {
                 "fold_in",
                 "fold_groups",
                 "fold_len",
+                "reduce_groups",
+                "pad0",
+                "pad1",
+                "pad2",
             ],
         ),
     ];
