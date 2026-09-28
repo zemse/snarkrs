@@ -98,6 +98,42 @@ pub fn submit_sealed(b: &WgpuBackend, what: &str, encode: impl Fn(&mut wgpu::Com
     }
 }
 
+/// [`submit_sealed`] for the sweeps: microseconds from submit to the end of the wait, of the
+/// attempt that ran to its end. An aborted pass is not an error in wgpu, so without the seal
+/// a sweep reads it as a fast one: the G2 workgroup sweep at 2^19 scalars once read 256
+/// threads at 133 ms against 64's 310, where sealed it reads 311 against 278.
+pub fn time_sealed(
+    b: &WgpuBackend,
+    what: &str,
+    encode: impl Fn(&mut wgpu::ComputePass<'_>),
+) -> f64 {
+    let seal = Seal::new(b, "msm bench seal").expect("seal");
+    for attempt in 1..=4 {
+        let mut enc = b.device().create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            encode(&mut pass);
+            seal.dispatch(b, &mut pass);
+        }
+        let sealed = seal.close(b, &mut enc);
+        let t = std::time::Instant::now();
+        b.submit([enc.finish()]);
+        b.device()
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        let us = t.elapsed().as_secs_f64() * 1e6;
+        assert!(b.take_error().is_none(), "device error during {what}");
+        match pollster::block_on(seal.verify(sealed)) {
+            Ok(()) => return us,
+            Err(e) if is_aborted(&e) && attempt < 4 => {
+                eprintln!("{what}: {e}; attempt {attempt} of 4");
+            }
+            Err(e) => panic!("{what}: {e}"),
+        }
+    }
+    unreachable!("the last attempt returns or panics")
+}
+
 // ---------------------------------------------------------------------------
 // Scalars
 // ---------------------------------------------------------------------------

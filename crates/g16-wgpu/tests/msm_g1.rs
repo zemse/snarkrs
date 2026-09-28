@@ -68,7 +68,7 @@ mod gpulock;
 
 use common::{
     argmin, exclusive, fill, general_count, general_scalars, median, read_bytes, read_words,
-    storage_words, submit_sealed, witness_shaped, SENTINEL,
+    storage_words, submit_sealed, time_sealed, witness_shaped, SENTINEL,
 };
 
 // ---------------------------------------------------------------------------
@@ -1013,9 +1013,7 @@ impl Bench {
             .expect("bind");
 
         let once = |n: u32| -> f64 {
-            let mut enc = b.device().create_command_encoder(&Default::default());
-            {
-                let mut pass = enc.begin_compute_pass(&Default::default());
+            time_sealed(b, "bench", |pass| {
                 // Setup, and only as much of it as the timed kernel needs. Giving every case
                 // the whole five-kernel stage and differencing a 4-microsecond kernel against
                 // it reports zero, which is what the first version of the G2 harness did to
@@ -1023,52 +1021,45 @@ impl Bench {
                 match what {
                     Stage::All | Stage::Accumulate | Stage::Clear | Stage::Segmented => {}
                     Stage::Merge => {
-                        p.encode_clear(&mut pass, &self.dplan, &bind, &poff)
+                        p.encode_clear(pass, &self.dplan, &bind, &poff)
                             .expect("encode");
-                        p.encode_segmented(&mut pass, &pplan, &bind, &poff)
+                        p.encode_segmented(pass, &pplan, &bind, &poff)
                             .expect("encode");
                     }
                     Stage::Reduction => p
-                        .encode(&mut pass, &self.dplan, &pplan, &bind, &poff)
+                        .encode(pass, &self.dplan, &pplan, &bind, &poff)
                         .expect("encode"),
                 }
                 for _ in 0..n {
                     match what {
                         Stage::All => p
-                            .encode(&mut pass, &self.dplan, &pplan, &bind, &poff)
+                            .encode(pass, &self.dplan, &pplan, &bind, &poff)
                             .expect("encode"),
                         Stage::Accumulate => {
-                            p.encode_clear(&mut pass, &self.dplan, &bind, &poff)
+                            p.encode_clear(pass, &self.dplan, &bind, &poff)
                                 .expect("encode");
-                            p.encode_segmented(&mut pass, &pplan, &bind, &poff)
+                            p.encode_segmented(pass, &pplan, &bind, &poff)
                                 .expect("encode");
-                            p.encode_merge(&mut pass, &self.dplan, &bind, &poff)
+                            p.encode_merge(pass, &self.dplan, &bind, &poff)
                                 .expect("encode");
                         }
                         Stage::Clear => p
-                            .encode_clear(&mut pass, &self.dplan, &bind, &poff)
+                            .encode_clear(pass, &self.dplan, &bind, &poff)
                             .expect("encode"),
                         Stage::Segmented => p
-                            .encode_segmented(&mut pass, &pplan, &bind, &poff)
+                            .encode_segmented(pass, &pplan, &bind, &poff)
                             .expect("encode"),
                         Stage::Merge => p
-                            .encode_merge(&mut pass, &self.dplan, &bind, &poff)
+                            .encode_merge(pass, &self.dplan, &bind, &poff)
                             .expect("encode"),
                         Stage::Reduction => {
-                            p.encode_reduce(&mut pass, &self.dplan, &bind, &poff)
+                            p.encode_reduce(pass, &self.dplan, &bind, &poff)
                                 .expect("encode");
-                            p.encode_ones(&mut pass, &pplan, &bind, &poff)
-                                .expect("encode");
+                            p.encode_ones(pass, &pplan, &bind, &poff).expect("encode");
                         }
                     }
                 }
-            }
-            let t = std::time::Instant::now();
-            b.submit([enc.finish()]);
-            b.device()
-                .poll(wgpu::PollType::wait_indefinitely())
-                .expect("poll");
-            t.elapsed().as_secs_f64() * 1e6
+            })
         };
         // Warm, then difference `reps` extra repetitions against zero extra.
         let _ = once(0);
