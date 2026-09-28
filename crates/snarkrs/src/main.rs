@@ -533,6 +533,16 @@ fn main() -> ExitCode {
         }
     };
     log::set_verbose(cli.verbose);
+    // One proof and exit, so there is nothing for the cache to be reused by. Not `bench`,
+    // whose warm loop is a long-lived prover and would fault its buffers in on every rep.
+    if matches!(
+        cli.cmd,
+        Cmd::Groth16 {
+            cmd: Groth16Cmd::Prove { .. }
+        }
+    ) {
+        g16_core::malloc::reexec_without_large_cache();
+    }
     match run(cli.cmd) {
         Ok(code) => ExitCode::from(code),
         Err(e) => {

@@ -24,6 +24,9 @@ struct Args {
 }
 
 fn main() -> Result<()> {
+    // The published peak is this process's, so it runs the way `snarkrs groth16 prove`
+    // does.
+    g16_core::malloc::reexec_without_large_cache();
     let args = Args::parse();
     let v = Variant {
         target: args.target,
