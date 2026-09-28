@@ -182,21 +182,29 @@ fn attempts() -> u32 {
 }
 
 /// Nanoseconds one (window, general scalar) entry costs in the segmented accumulation,
-/// per curve. Measured warm on this M2 Max: G1 5.8 ns at c = 13 (`js_384x384_d32`) to
-/// 8.8 ns at c = 8 (`js_16x16_d32`), G2 93 to 118 ns at the same two shapes. A budget, not
-/// a benchmark: it only has to put a slab within a factor of two of its measured time, and
-/// the 13x between the curves is what matters, not the 3x their arithmetic would predict.
+/// per curve. Measured warm on this M2 Max by `tests/msm_trace.rs` on `js_384x384_d32`:
+/// G1 5.7 ns at c = 15 over the whole key to 6.2 at c = 13 over a 2^19 piece, G2 24.5 to
+/// 26.5 at the same two shapes (and 30 for one G2 mixed addition on its own). A budget,
+/// not a benchmark: it only has to put a slab within a factor of two of its measured time.
+/// The 105 ns G2 carried before `fq2_mul` went through one call site cut every G2 window
+/// into a slab of its own at 2^22 and measured 4x over.
 fn entry_ns(curve: wgsl::Curve) -> f64 {
     if curve.suffix == wgsl::G2.suffix {
-        105.0
+        30.0
     } else {
         7.0
     }
 }
 
-/// Microseconds one bucket row costs in the clear, the merge and the reduction together.
-/// Measured as the fixed cost of a G1 sub-MSM at c = 13, 25 ms over 81,920 rows.
-const ROW_US: f64 = 0.3;
+/// Microseconds one bucket row costs in the clear, the merge and the reduction together,
+/// per curve. Measured on a 2^19 piece at c = 13, 81,920 rows: G1 25 ms, G2 85 ms.
+fn row_us(curve: wgsl::Curve) -> f64 {
+    if curve.suffix == wgsl::G2.suffix {
+        1.0
+    } else {
+        0.3
+    }
+}
 
 /// Nanoseconds one (window, scalar) costs in the counting sort. Measured on
 /// `anon-aadhaar`, whose 1.1M scalars are 92% zeros and ones: 39 ms of sort over 35M
@@ -207,7 +215,7 @@ const SORT_NS: f64 = 1.0;
 fn slab_us(curve: wgsl::Curve, dplan: &DigitPlan, windows: u32) -> f64 {
     f64::from(windows)
         * (entry_ns(curve) * f64::from(dplan.cap()) / 1000.0
-            + ROW_US * f64::from(dplan.n_buckets()))
+            + row_us(curve) * f64::from(dplan.n_buckets()))
 }
 
 /// Estimated GPU microseconds of one piece's counting sort.
@@ -1271,10 +1279,11 @@ impl MsmBatch {
     /// at c = 13 take 20, so a shorter piece can want a larger entry array.
     ///
     /// Never cut for [`SUBMISSION_US`]: a window is the finest slab there is, and a job whose
-    /// single window is over the budget (a dense 2^22 key's G2 job under `auto` limits, at
-    /// about 310 ms a window) runs one window per submission rather than paying a second
-    /// sort, clear, merge and reduction. Cutting it into two sub-MSMs instead measured 9.7 s
-    /// of MSM against 7.6 s in one.
+    /// single window is over the budget runs one window per submission rather than paying a
+    /// second sort, clear, merge and reduction. A dense 2^22 key's G2 job under `auto`
+    /// limits was that job at about 310 ms a window before `fq2_mul` went through one call
+    /// site (80 ms after), and cutting it into two sub-MSMs instead measured 9.7 s of MSM
+    /// against 7.6 s in one.
     fn pieces(&self, gi: usize, g: &Group<'_>, limit: u64) -> Result<Vec<Piece>, ProveError> {
         if g.n == 0 {
             return Ok(Vec::new());
