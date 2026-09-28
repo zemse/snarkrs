@@ -233,3 +233,164 @@ fn a_ceremony_and_a_proof_run_on_snarkjs_lines() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// snarkjs 0.7.6, named by `SNARKJS` because the one on PATH may be another version.
+fn snarkjs_bin() -> Option<String> {
+    let bin = std::env::var("SNARKJS").unwrap_or_else(|_| "snarkjs".to_owned());
+    let Ok(out) = Command::new(&bin).arg("--help").output() else {
+        eprintln!("SKIPPED: snarkjs is not installed");
+        return None;
+    };
+    if !String::from_utf8_lossy(&out.stdout).contains("snarkjs@0.7.6") {
+        eprintln!("SKIPPED: {bin} is not snarkjs 0.7.6; set SNARKJS");
+        return None;
+    }
+    Some(bin)
+}
+
+/// One line through snarkjs in `dir`: its exit code and its stdout with logplease's colours
+/// taken out. Stdout goes through a file, because snarkjs calls `process.exit` before a
+/// pipe has drained and a long log comes back cut short.
+fn snarkjs(bin: &str, dir: &Path, line: &str) -> (i32, String) {
+    let log = dir.join(".snarkjs.log");
+    let status = Command::new(bin)
+        .args(line.split_whitespace())
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .stdout(std::fs::File::create(&log).unwrap())
+        .stderr(Stdio::inherit())
+        .status()
+        .unwrap_or_else(|e| panic!("running snarkjs {line}: {e}"));
+    let out = std::fs::read_to_string(&log).unwrap();
+    (status.code().unwrap_or(-1), strip_colour(&out))
+}
+
+fn strip_colour(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+#[track_caller]
+fn same_bytes(dir: &Path, ours: &str, theirs: &str) {
+    let got = std::fs::read(dir.join(ours)).unwrap();
+    let want = std::fs::read(dir.join(theirs)).unwrap();
+    assert_eq!(got.len(), want.len(), "{ours} vs {theirs}: lengths");
+    if let Some(i) = (0..got.len()).find(|&i| got[i] != want[i]) {
+        panic!("{ours} vs {theirs}: first difference at byte {i}");
+    }
+}
+
+/// The first `n` log lines, hash rows included: the deterministic head of a log whose tail
+/// depends on the entropy.
+fn head(log: &str, n: usize) -> String {
+    let mut seen = 0;
+    log.lines()
+        .take_while(|l| {
+            if l.starts_with('[') {
+                seen += 1;
+            }
+            seen <= n
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A contribution made away from the ptau: export the challenge, contribute to it, import
+/// the response. Export and import are deterministic and are held to snarkjs' bytes and
+/// log; the contribution is random, so snarkjs has to accept what it produced.
+#[test]
+fn challenge_and_response_match_snarkjs() {
+    let Some(js) = snarkjs_bin() else {
+        return;
+    };
+    let dir = scratch("challenge");
+    let run = |line: &str| {
+        let o = snarkrs(&dir, line);
+        expect(&o, 0, line);
+        stdout(&o)
+    };
+    let js_run = |line: &str| {
+        let (code, out) = snarkjs(&js, &dir, line);
+        assert_eq!(code, 0, "snarkjs {line}: {out}");
+        out
+    };
+    run("ptn bn128 4 pot_0000.ptau");
+    run("ptc pot_0000.ptau pot_0001.ptau -e=one -n=First");
+
+    // `challenge` is the default name.
+    let ours = run("powersoftau export challenge pot_0001.ptau");
+    let theirs = js_run("powersoftau export challenge pot_0001.ptau challenge_js");
+    same_bytes(&dir, "challenge", "challenge_js");
+    assert_eq!(ours, theirs);
+    let ours = run("ptec pot_0000.ptau fresh.bin");
+    let theirs = js_run("ptec pot_0000.ptau fresh_js");
+    same_bytes(&dir, "fresh.bin", "fresh_js");
+    assert_eq!(ours, theirs);
+
+    // The response is named after the challenge by default. What it claims and what it
+    // answers are fixed by the challenge, so those two hashes match snarkjs'.
+    let ours = run("powersoftau challenge contribute bn128 challenge -e=two");
+    assert!(dir.join("challenge.response").is_file());
+    let theirs = js_run("ptcc bn128 challenge_js challenge_js.response -e=two");
+    assert_eq!(head(&ours, 2), head(&theirs, 2));
+    assert!(
+        ours.contains("[INFO]  snarkJS: Contribution Response Hash: \n\t\t"),
+        "{ours}"
+    );
+    run("ptcc bn128 fresh.bin -e=three");
+    assert!(dir.join("fresh.response").is_file());
+
+    // Import is deterministic given the response, with and without the points.
+    for flags in ["-n=Second", "-n=Second -nopoints -nocheck"] {
+        let tag = if flags.contains("nopoints") {
+            "_np"
+        } else {
+            ""
+        };
+        let ours = run(&format!(
+            "powersoftau import response pot_0001.ptau challenge.response pot_0002{tag}.ptau {flags}"
+        ));
+        let theirs = js_run(&format!(
+            "ptir pot_0001.ptau challenge.response js_0002{tag}.ptau {flags}"
+        ));
+        same_bytes(
+            &dir,
+            &format!("pot_0002{tag}.ptau"),
+            &format!("js_0002{tag}.ptau"),
+        );
+        assert_eq!(ours, theirs, "{flags}");
+    }
+    let out = js_run("ptv pot_0002.ptau");
+    assert!(out.contains("Powers of Tau Ok!"), "{out}");
+    // snarkjs' response imports here too, and snarkjs accepts the result.
+    run("ptir pot_0001.ptau challenge_js.response pot_0002b.ptau");
+    js_run("ptv pot_0002b.ptau");
+
+    // A response to another file's challenge is refused.
+    let line = "ptir pot_0000.ptau challenge.response never.ptau";
+    let o = snarkrs(&dir, line);
+    expect(&o, 1, line);
+    assert!(
+        stdout(&o).starts_with("[ERROR] snarkJS: Error: "),
+        "{}",
+        said(&o)
+    );
+    let line = "ptcc bls12381 challenge -e=x";
+    let o = snarkrs(&dir, line);
+    expect(&o, 1, line);
+    assert!(said(&o).contains("not supported"), "{}", said(&o));
+
+    std::fs::remove_dir_all(&dir).ok();
+}

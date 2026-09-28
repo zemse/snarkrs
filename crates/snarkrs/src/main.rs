@@ -5,6 +5,11 @@
 //!   snarkrs powersoftau beacon <in.ptau> <out.ptau> <hashHex> <iterExp>    (ptb)
 //!   snarkrs powersoftau prepare phase2 <in.ptau> <out.ptau>                (pt2)
 //!   snarkrs powersoftau verify <in.ptau>                                   (ptv)
+//!   snarkrs powersoftau export challenge <in.ptau> [challenge]            (ptec)
+//!   snarkrs powersoftau challenge contribute bn128 <challenge> [response] [-e=TEXT]
+//!                                                                          (ptcc)
+//!   snarkrs powersoftau import response <old.ptau> <response> <new.ptau> [-n=NAME]
+//!                                                  [-nopoints]             (ptir)
 //!   snarkrs groth16 setup [circuit.r1cs] [powersoftau.ptau] [circuit_0000.zkey]   (g16s)
 //!   snarkrs groth16 prove [circuit_final.zkey] [witness.wtns] [proof.json] [public.json]
 //!                                                                          (g16p)
@@ -43,8 +48,8 @@
 //! arguments and prints what came back.
 //!
 //! Their `--backend` is not `prove`'s. `prove` selects a whole `g16_core::Backend`; a
-//! ceremony command selects one primitive, and the six that have the flag are the six with
-//! a primitive worth moving. The bar every one of them is held to is that
+//! ceremony command selects one primitive, and the seven that have the flag are the seven
+//! with a primitive worth moving. The bar every one of them is held to is that
 //! `--backend cpu` and `--backend metal` write **byte-identical** files, which is what
 //! carries the snarkjs equivalence the CPU path already has.
 
@@ -54,8 +59,8 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use g16_ceremony::{
-    contribute as zkey_mpc, phase1, prepare, ptau as ptau_file, setup, vkey, CpuGroupFft,
-    CpuKeyScale,
+    challenge, contribute as zkey_mpc, phase1, prepare, ptau as ptau_file, setup, vkey,
+    CpuGroupFft, CpuKeyScale,
 };
 use g16_core::{
     prove::{prove, prove_trace, prove_unchecked},
@@ -204,6 +209,64 @@ enum PtauCmd {
     },
     /// Check the contribution chain and recompute the challenge hashes.
     Verify { ptau: PathBuf },
+    Export {
+        #[command(subcommand)]
+        cmd: PtauExportCmd,
+    },
+    Challenge {
+        #[command(subcommand)]
+        cmd: PtauChallengeCmd,
+    },
+    Import {
+        #[command(subcommand)]
+        cmd: PtauImportCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum PtauExportCmd {
+    /// Write the challenge for the next contribution: the last response hash and the
+    /// points, uncompressed. Deterministic, byte for byte snarkjs'.
+    Challenge {
+        ptau: PathBuf,
+        #[arg(default_value = "challenge")]
+        out: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum PtauChallengeCmd {
+    /// Contribute to a challenge file without the ptau, writing a response to import.
+    Contribute {
+        /// bn128 (also bn254, alt_bn128). bls12381 is not supported.
+        curve: String,
+        challenge: String,
+        /// Defaults to the challenge name with its extension changed to `.response`.
+        response: Option<PathBuf>,
+        #[command(flatten)]
+        entropy: Entropy,
+        #[command(flatten)]
+        backend: CeremonyBackend,
+    },
+}
+
+#[derive(Subcommand)]
+enum PtauImportCmd {
+    /// Import a response onto the ptau its challenge came from, as a new contribution.
+    Response {
+        ptau: PathBuf,
+        response: PathBuf,
+        out: PathBuf,
+        #[command(flatten)]
+        contributor: Contributor,
+        /// Write only the header and the contribution chain. A later import onto the file
+        /// works; nothing else that needs the points does. `-nopoints`.
+        #[arg(long)]
+        nopoints: bool,
+        /// Accepted and ignored, as in snarkjs 0.7.6, whose check is a TODO. `-nocheck`.
+        #[arg(long)]
+        nocheck: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -473,7 +536,7 @@ fn fft_backend(kind: BackendKind) -> Result<Box<dyn GroupFft>> {
     }
 }
 
-/// The batch apply-key behind the four contribute and beacon commands.
+/// The batch apply-key behind every contribute and beacon command.
 fn key_backend(kind: BackendKind) -> Result<Box<dyn KeyScale>> {
     match kind {
         BackendKind::Cpu => Ok(Box::new(CpuKeyScale)),
@@ -700,6 +763,88 @@ fn run_ptau(cmd: PtauCmd) -> Result<u8> {
                 );
             }
             log::info("Powers of Tau Ok!");
+        }
+        PtauCmd::Export {
+            cmd: PtauExportCmd::Challenge { ptau, out },
+        } => {
+            let report = challenge::export_challenge(&ptau, &out)
+                .with_context(|| format!("exporting from {}", ptau.display()))?;
+            log::info(log::format_hash(
+                &report.last_response_hash,
+                "Last Response Hash: ",
+            ));
+            log::info(log::format_hash(
+                &report.challenge_hash,
+                "New Challenge Hash: ",
+            ));
+            log::debug(format!("wrote {}", out.display()));
+        }
+        PtauCmd::Challenge {
+            cmd:
+                PtauChallengeCmd::Contribute {
+                    curve,
+                    challenge,
+                    response,
+                    entropy,
+                    backend,
+                },
+        } => {
+            cli::check_curve(&curve)?;
+            let response =
+                response.unwrap_or_else(|| cli::change_ext(&challenge, "response").into());
+            let key = key_backend(backend.backend)?;
+            let entropy = entropy_or_prompt(entropy.entropy)?;
+            let report = challenge::challenge_contribute(
+                Path::new(&challenge),
+                &response,
+                &entropy,
+                key.as_ref(),
+            )
+            .with_context(|| format!("contributing to {challenge}"))?;
+            log::debug(format!("Power to tau size: {}", report.power));
+            log::info(log::format_hash(
+                &report.claimed_previous_response,
+                "Claimed Previous Response Hash: ",
+            ));
+            log::info(log::format_hash(
+                &report.challenge_hash,
+                "Current Challenge Hash: ",
+            ));
+            log::info(log::format_hash(
+                &report.response_hash,
+                "Contribution Response Hash: ",
+            ));
+            log::debug(format!("wrote {}", response.display()));
+        }
+        PtauCmd::Import {
+            cmd:
+                PtauImportCmd::Response {
+                    ptau,
+                    response,
+                    out,
+                    contributor,
+                    nopoints,
+                    nocheck: _,
+                },
+        } => {
+            let report = challenge::import_response(
+                &ptau,
+                &response,
+                &out,
+                contributor.name.as_deref(),
+                !nopoints,
+            )
+            .with_context(|| format!("importing {}", response.display()))?;
+            // Without the points there is no next challenge to hash, only the `0xff`
+            // placeholder, and snarkjs prints no line for it.
+            if nopoints {
+                log::info(log::format_hash(
+                    &report.response_hash,
+                    "Contribution Response Hash imported: ",
+                ));
+            } else {
+                print_phase1(&report, &out);
+            }
         }
     }
     Ok(0)

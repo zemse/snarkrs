@@ -105,19 +105,19 @@ pub const COMMANDS: &[Command] = &[
         cmd: "powersoftau export challenge <powersoftau_0000.ptau> [challenge]",
         alias: &["ptec"],
         description: "Creates a challenge",
-        support: Later,
+        support: Yes,
     },
     Command {
         cmd: "powersoftau challenge contribute <curve> <challenge> [response]",
         alias: &["ptcc"],
         description: "Contribute to a challenge",
-        support: Later,
+        support: Yes,
     },
     Command {
         cmd: "powersoftau import response <powersoftau_old.ptau> <response> <<powersoftau_new.ptau>",
         alias: &["ptir"],
         description: "import a response to a ptau file",
-        support: Later,
+        support: Yes,
     },
     Command {
         cmd: "powersoftau beacon <old_powersoftau.ptau> <new_powersoftau.ptau> <beaconHash(Hex)> <numIterationsExp>",
@@ -528,6 +528,17 @@ pub fn check_curve(name: &str) -> anyhow::Result<()> {
     }
 }
 
+/// `changeExt` in cli.js, the default response name of the two challenge contributes: the
+/// text up to and including the last `.` anywhere in the name, then `ext`, or the whole name
+/// and `.ext` when there is no dot. The dot need not be in the file name, so `./challenge`
+/// becomes `.response`, as it does in snarkjs.
+pub fn change_ext(name: &str, ext: &str) -> String {
+    match name.rfind('.') {
+        Some(i) => format!("{}{ext}", &name[..=i]),
+        None => format!("{name}.{ext}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -581,6 +592,9 @@ mod tests {
             ("zkey verify init a b c", "zkey verify init a b c"),
             ("zkev", "zkey export verificationkey"),
             ("fi x.ptau", "file info x.ptau"),
+            ("ptec a", "powersoftau export challenge a"),
+            ("ptcc bn128 c", "powersoftau challenge contribute bn128 c"),
+            ("ptir a r b", "powersoftau import response a r b"),
         ] {
             assert_eq!(clap(alias).join(" "), words, "{alias}");
         }
@@ -659,6 +673,15 @@ mod tests {
         assert!(e.contains("not supported") && e.contains("BN254"), "{e}");
         let e = check_curve("secp256k1").unwrap_err().to_string();
         assert!(e.contains("Curve not supported"), "{e}");
+    }
+
+    #[test]
+    fn change_ext_is_snarkjs_text_surgery() {
+        assert_eq!(change_ext("challenge", "response"), "challenge.response");
+        assert_eq!(change_ext("ch_0003.bin", "response"), "ch_0003.response");
+        assert_eq!(change_ext("a.b.c", "response"), "a.b.response");
+        assert_eq!(change_ext("./challenge", "response"), ".response");
+        assert_eq!(change_ext("dir.d/challenge", "response"), "dir.response");
     }
 
     #[test]
