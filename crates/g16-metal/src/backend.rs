@@ -84,24 +84,28 @@ impl MetalBackend {
     /// are zero or one; see [`Work::Constant`].
     ///
     /// What stays witness dependent, on the device: which bucket a digit lands in, so
-    /// the atomics' contention and the identity shortcuts in the point additions. The
-    /// merge is a fixed tree (`msm_fold_*`), so its time moves only by those shortcuts:
-    /// at 2^18 a witness of bits against a dense one reads 0.94 against 0.98 ms in G1
-    /// and 3.71 against 3.88 in G2, where the per-bucket walk it replaced read 49
-    /// against 1 and 221 against 3. The reduce is the larger remainder: an empty bucket
-    /// adds for free, so the same pair reads 0.25 against 1.45 ms in G1 and 0.8 against
-    /// 9.7 in G2. On the host: the identity tests inside the combine's few hundred curve
-    /// additions, as on the CPU backend. Stages 0 to 4 were already fixed-shape; their
-    /// one value test, the gather's skip of the multiply for a 0 or 1 witness value, is
-    /// off (keccak256's gather 0.45 ms to 0.71, what a dense witness costs;
+    /// the atomics' contention in the digit pipeline, the run count of the accumulation
+    /// and of the fold (which points each thread stores, not how many additions it
+    /// makes), and the identity shortcuts in the accumulation's mixed additions. The
+    /// merge is a fixed tree (`msm_fold_*`) and it and the reduce add with the complete
+    /// formulas, so neither moves with the bucket contents: at 2^18 a witness of zeros,
+    /// one of bits and a dense one read 3.15, 3.16 and 3.17 ms for the fold in G1 and
+    /// 13.0, 13.0 and 13.3 in G2, and 1.81, 1.84 and 1.84 for the reduce in G1, 8.26,
+    /// 8.23 and 8.29 in G2, where the shortcut versions read 0.77, 0.96 and 1.03 (fold,
+    /// G1), 2.60, 3.78 and 3.86 (G2), 0.25, 0.25 and 1.47 (reduce, G1) and 0.83, 0.82
+    /// and 9.78 (G2). On the host: the identity tests inside the combine's few hundred
+    /// curve additions, as on the CPU backend. Stages 0 to 4 were already fixed-shape;
+    /// their one value test, the gather's skip of the multiply for a 0 or 1 witness
+    /// value, is off (keccak256's gather 0.45 ms to 0.71, what a dense witness costs;
     /// js_16x16_d32 unchanged at 1.56).
     ///
     /// Priced warm on the M2 Max, 15 reps, alternating rounds under the GPU lock,
-    /// medians against the variable path: js_16x16_d32 103 ms against 91 (+14%),
-    /// keccak256 130 against 27 (4.8x), rsa2048 117 against 35 (3.3x). The bit-heavy
-    /// circuits pay more than on the CPU because the variable witness plans there were
-    /// a few hundred scalars over a few windows, and each is now an MSM the size of
-    /// H's, one of them in G2.
+    /// medians against the variable path: js_16x16_d32 115 ms against 91 (+26%),
+    /// keccak256 156 against 27 (5.7x), rsa2048 130 against 35 (3.7x). The complete
+    /// formulas are 19%, 11% and 11% of that over the shortcut fold and reduce. The
+    /// bit-heavy circuits pay more than on the CPU because the variable witness plans
+    /// there were a few hundred scalars over a few windows, and each is now an MSM the
+    /// size of H's, one of them in G2.
     pub fn constant_work() -> Result<Self, ProveError> {
         let mut backend = Self::new()?;
         backend.work = Work::Constant;

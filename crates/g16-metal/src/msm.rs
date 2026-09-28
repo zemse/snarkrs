@@ -109,16 +109,17 @@ pub enum Work {
     /// That closes the channel of "Remote Side-Channel Attacks on Anonymous
     /// Transactions" (USENIX Security 2020), which recovered Zcash witness sparsity from
     /// proving time. The merge is the fixed tree of `msm_fold_*` rather than a walk per
-    /// bucket. It is not constant time in the strict sense: bucket occupancy still
-    /// follows the digit values, so the atomics' contention and the identity shortcuts
-    /// inside the point additions (an empty bucket or slot adds for free) stay data
+    /// bucket, and the fold and the reduce add with the complete formulas (`Proj` in
+    /// msm.metal), so an empty bucket or slot costs what a full one does. It is not
+    /// constant time in the strict sense: bucket occupancy still follows the digit
+    /// values, so the atomics' contention and the accumulation's run count stay data
     /// dependent, as in every Pippenger; see
     /// [`MetalBackend::constant_work`](crate::MetalBackend::constant_work) for what that
     /// leaves.
     ///
     /// What it costs is what the zeros and ones were saving, so it is priced per
-    /// circuit in `MetalBackend::constant_work`: about 14% on a dense witness, 4-5x on
-    /// a bit-heavy one.
+    /// circuit in `MetalBackend::constant_work`: about a fifth on a dense witness, 4-6x
+    /// on a bit-heavy one.
     Constant,
     /// Zero scalars are dropped, one scalars go to the ones gather, the window is sized
     /// for the rest over the bits they actually use. Running time, buffer sizes and the
@@ -793,6 +794,10 @@ struct Pipelines {
     fold_g2: ComputePipelineState,
     reduce_g1: ComputePipelineState,
     reduce_g2: ComputePipelineState,
+    /// The reduce on the constant-work point operations, for plans with dummy rows;
+    /// see `pt_add_constant` in msm.metal.
+    reduce_constant_g1: ComputePipelineState,
+    reduce_constant_g2: ComputePipelineState,
     ones_g1: ComputePipelineState,
     ones_g2: ComputePipelineState,
     ones_idx_g1: ComputePipelineState,
@@ -920,6 +925,8 @@ impl MetalMsm {
             fold_g2: pso("msm_fold_g2")?,
             reduce_g1: pso("msm_reduce_g1")?,
             reduce_g2: pso("msm_reduce_g2")?,
+            reduce_constant_g1: pso("msm_reduce_constant_g1")?,
+            reduce_constant_g2: pso("msm_reduce_constant_g2")?,
             ones_g1: pso("msm_ones_g1")?,
             ones_g2: pso("msm_ones_g2")?,
             ones_idx_g1: pso("msm_ones_idx_g1")?,
@@ -940,16 +947,25 @@ impl MetalMsm {
         })
     }
 
+    /// The reduce a plan dispatches: the constant-work kernel for a plan with dummy
+    /// rows, the plain one otherwise.
+    fn reduce_pso(&self, is_g2: bool, plan: &Plan<'_>) -> &ComputePipelineState {
+        match (is_g2, plan.dummy_rows > 0) {
+            (false, false) => &self.pipelines.reduce_g1,
+            (false, true) => &self.pipelines.reduce_constant_g1,
+            (true, false) => &self.pipelines.reduce_g2,
+            (true, true) => &self.pipelines.reduce_constant_g2,
+        }
+    }
+
     /// Threads per threadgroup the reduce actually dispatches with. [`Outputs::combine`]
     /// recomputes the G1 kernel's simdgroup slots from it, so the two must agree.
-    fn reduce_tg(&self, is_g2: bool) -> usize {
-        let pso = if is_g2 {
-            &self.pipelines.reduce_g2
-        } else {
-            &self.pipelines.reduce_g1
-        };
+    fn reduce_tg(&self, is_g2: bool, plan: &Plan<'_>) -> usize {
         REDUCE_TG
-            .min(pso.max_total_threads_per_threadgroup() as usize)
+            .min(
+                self.reduce_pso(is_g2, plan)
+                    .max_total_threads_per_threadgroup() as usize,
+            )
             .max(1)
     }
 
@@ -957,8 +973,8 @@ impl MetalMsm {
         ReduceLayout::new(
             plan.n_buckets,
             plan.reduce_groups,
-            self.reduce_tg(false),
-            self.pipelines.reduce_g1.thread_execution_width() as usize,
+            self.reduce_tg(false, plan),
+            self.reduce_pso(false, plan).thread_execution_width() as usize,
         )
     }
 
@@ -2161,15 +2177,12 @@ impl Outputs {
             return;
         }
         let p = self.params_for(plan);
-        let red_pso = match job {
-            Job::G1(_) => &msm.pipelines.reduce_g1,
-            Job::G2(_) => &msm.pipelines.reduce_g2,
-        };
-        enc.set_compute_pipeline_state(red_pso);
+        let is_g2 = matches!(job, Job::G2(_));
+        enc.set_compute_pipeline_state(msm.reduce_pso(is_g2, plan));
         enc.set_buffer(0, Some(&self.buckets), 0);
         enc.set_buffer(1, Some(&self.window_sums), 0);
         set_params(enc, 2, &p);
-        let tg = msm.reduce_tg(self.is_g2);
+        let tg = msm.reduce_tg(is_g2, plan);
         crate::cb::dispatch_thread_groups(
             enc,
             MTLSize::new((plan.n_windows * plan.reduce_groups) as u64, 1, 1),
@@ -2697,6 +2710,25 @@ mod tests {
             MSM_MSL.contains(&want_n0),
             "shaders/msm.metal does not contain the line:\n{want_n0}"
         );
+        // 3b of the G2 twist, the constant of the complete formulas' constant-work
+        // reduce, in Montgomery form as the shader holds every Fq.
+        use ark_ec::short_weierstrass::SWCurveConfig;
+        let b3 = <g16_field::g2::Config as SWCurveConfig>::COEFF_B * g16_field::Fq2::from(3u64);
+        let packed = PackedFq2::from_fq2(&b3);
+        for (name, limbs) in [("C0", packed.c0.v), ("C1", packed.c1.v)] {
+            let want = format!(
+                "constant uint FQ2_G2_B3_{name}[8] = {{ {} }};",
+                limbs
+                    .iter()
+                    .map(|l| format!("0x{l:08x}u"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            assert!(
+                MSM_MSL.contains(&want),
+                "shaders/msm.metal does not contain the line:\n{want}"
+            );
+        }
     }
 
     /// The MSL must compile and every kernel must produce a pipeline. Separate from the
