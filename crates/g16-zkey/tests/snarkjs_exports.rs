@@ -12,6 +12,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use g16_zkey::calldata::groth16_solidity_calldata;
 use g16_zkey::export_json::{wtns_export_json, zkey_export_json};
 
 /// Small enough that snarkjs finishes each in a second or two.
@@ -143,6 +144,33 @@ fn wtns_export_json_matches_snarkjs() {
             &format!("{} wtns export json", dir.display()),
             &ours,
             &std::fs::read(&theirs).unwrap(),
+        );
+    }
+}
+
+#[test]
+fn soliditycalldata_matches_snarkjs() {
+    if !have_snarkjs("soliditycalldata_matches_snarkjs") {
+        return;
+    }
+    for dir in variants("soliditycalldata_matches_snarkjs") {
+        let (public, proof) = (dir.join("public.json"), dir.join("proof.json"));
+        let o = run(snarkjs().args([
+            "zkey".as_ref(),
+            "export".as_ref(),
+            "soliditycalldata".as_ref(),
+            public.as_os_str(),
+            proof.as_os_str(),
+        ]));
+        assert!(o.status.success(), "snarkjs failed: {o:?}");
+        let read = |p: &Path| -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
+        };
+        let ours = groth16_solidity_calldata(&read(&proof), &read(&public)).unwrap() + "\n";
+        assert_same(
+            &format!("{} soliditycalldata", dir.display()),
+            ours.as_bytes(),
+            &o.stdout,
         );
     }
 }

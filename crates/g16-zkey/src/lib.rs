@@ -15,6 +15,7 @@
 //! each one was read out of the snarkjs source.
 
 pub mod binfile;
+pub mod calldata;
 #[cfg(not(target_family = "wasm"))]
 pub mod export_json;
 pub mod json_out;
