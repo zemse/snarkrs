@@ -31,8 +31,9 @@
 //! [`phase1`], [`prepare`], [`setup`], [`contribute`] and [`vkey`] are the commands.
 //! [`challenge`] and [`bellman`] are the two ways to contribute without the `.ptau` or
 //! `.zkey` in hand, and [`solidity`] writes the on-chain verifier.
-//! [`r1cs_export`] and [`wtns_check`] hold the commands that only inspect files, with
-//! [`sym`] for signal names and [`snarkjs_log`] for the logger lines they print.
+//! [`r1cs_export`], [`wtns_check`] and [`ptau_export`] hold the commands that inspect or
+//! reshape a finished file, with [`sym`] for signal names and [`snarkjs_log`] for the
+//! logger lines they print.
 
 pub mod accel;
 pub mod bellman;
@@ -41,6 +42,7 @@ pub mod contribute;
 pub mod phase1;
 pub mod prepare;
 pub mod ptau;
+pub mod ptau_export;
 pub mod r1cs;
 pub mod r1cs_export;
 pub mod setup;

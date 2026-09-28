@@ -14,12 +14,14 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use g16_ceremony::ptau::Ptau;
+use g16_ceremony::ptau_export::{ptau_convert, ptau_export_json, ptau_truncate, truncate_template};
 use g16_ceremony::r1cs::R1cs;
 use g16_ceremony::r1cs_export::{r1cs_export_json, r1cs_info, r1cs_print};
 use g16_ceremony::snarkjs_log::Logplease;
 use g16_ceremony::sym::Syms;
 use g16_ceremony::wtns_check::wtns_check;
-use g16_ceremony::CeremonyError;
+use g16_ceremony::{CeremonyError, CpuGroupFft};
 
 /// Small enough that snarkjs finishes each in a second or two.
 const VARIANTS: [&str; 2] = ["tiny_mul", "js_1x1_d8"];
@@ -379,4 +381,158 @@ fn wtns_check_refuses_another_curve_like_snarkjs() {
         theirs.contains(&format!("Error: {err}")),
         "snarkjs:\n{theirs}"
     );
+}
+
+/// A prepared power-4 ptau made by snarkjs itself, with one named contribution and one
+/// beacon whose hash is two bytes long, which is the only way a value shorter than 32
+/// bytes reaches the JSON exporter. Plus `bench/ptau/local_13.ptau` when it is there, the
+/// one file big enough for the every-10,000-points progress line.
+fn ptau_fixtures(test: &str, out: &Path) -> Vec<PathBuf> {
+    let p = |name: &str| out.join(name);
+    for args in [
+        vec![
+            "powersoftau",
+            "new",
+            "bn128",
+            "4",
+            p("p0.ptau").to_str().unwrap(),
+        ],
+        vec![
+            "powersoftau",
+            "contribute",
+            p("p0.ptau").to_str().unwrap(),
+            p("p1.ptau").to_str().unwrap(),
+            "--name=alice",
+            "-e=some entropy",
+        ],
+        vec![
+            "powersoftau",
+            "beacon",
+            p("p1.ptau").to_str().unwrap(),
+            p("p2.ptau").to_str().unwrap(),
+            "0a0b",
+            "10",
+            "-n=short beacon",
+        ],
+        vec![
+            "powersoftau",
+            "prepare",
+            "phase2",
+            p("p2.ptau").to_str().unwrap(),
+            p("tiny.ptau").to_str().unwrap(),
+        ],
+    ] {
+        let args: Vec<&std::ffi::OsStr> = args.iter().map(|a| a.as_ref()).collect();
+        snarkjs_ok(&args);
+    }
+    let mut files = vec![p("tiny.ptau")];
+    let local = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/ptau/local_13.ptau");
+    if local.is_file() {
+        files.push(local);
+    } else {
+        eprintln!("{test}: no bench/ptau/local_13.ptau, running the power-4 file only");
+    }
+    files
+}
+
+#[test]
+fn ptau_export_json_matches_snarkjs() {
+    if !have_snarkjs("ptau_export_json_matches_snarkjs") {
+        return;
+    }
+    let out = scratch("ptau-json");
+    for ptau in ptau_fixtures("ptau_export_json_matches_snarkjs", &out) {
+        let theirs = out.join("snarkjs.json");
+        let printed = snarkjs_ok(&[
+            "powersoftau".as_ref(),
+            "export".as_ref(),
+            "json".as_ref(),
+            ptau.as_os_str(),
+            theirs.as_os_str(),
+        ]);
+        let (mut ours, mut progress) = (Vec::new(), Vec::new());
+        ptau_export_json(&Ptau::open(&ptau).unwrap(), &mut ours, &mut progress).unwrap();
+        let what = format!("{} ptau export json", ptau.display());
+        assert_same(&what, &ours, &std::fs::read(&theirs).unwrap());
+        assert_same(&format!("{what} progress"), &progress, &printed);
+    }
+}
+
+/// Every file `truncate` writes, compared whole, for a fresh file and for a file that is
+/// itself a truncation (so its `ceremonyPower` differs from `power`).
+#[test]
+fn ptau_truncate_matches_snarkjs() {
+    if !have_snarkjs("ptau_truncate_matches_snarkjs") {
+        return;
+    }
+    let out = scratch("ptau-truncate");
+    let mut sources = ptau_fixtures("ptau_truncate_matches_snarkjs", &out);
+    // A power-3 truncation of the fixture, which snarkjs writes below.
+    sources.insert(1, out.join("theirs").join("tiny_03.ptau"));
+    for (k, src) in sources.iter().enumerate() {
+        let theirs_dir = out.join("theirs");
+        let ours_dir = out.join(format!("ours{k}"));
+        std::fs::create_dir_all(&theirs_dir).unwrap();
+        std::fs::create_dir_all(&ours_dir).unwrap();
+        let stem = src.file_stem().unwrap().to_str().unwrap();
+        // snarkjs names its output after its input, so give it a copy in its own dir.
+        let their_src = theirs_dir.join(format!("{stem}.ptau"));
+        if *src != their_src {
+            std::fs::copy(src, &their_src).unwrap();
+        }
+        snarkjs_ok(&[
+            "powersoftau".as_ref(),
+            "truncate".as_ref(),
+            their_src.as_os_str(),
+        ]);
+        let template = ours_dir.join(format!("{stem}.ptau"));
+        let template = truncate_template(template.to_str().unwrap());
+        let mut log = Vec::new();
+        let written = ptau_truncate(&Ptau::open(src).unwrap(), &template, &mut log).unwrap();
+        let power = Ptau::open(src).unwrap().power();
+        assert_eq!(written.len(), power as usize - 1);
+        for (p, ours) in (1..power).zip(&written) {
+            let name = format!("{stem}_{p:02}.ptau");
+            assert_eq!(ours, &ours_dir.join(&name));
+            assert_same(
+                &format!("{} truncate to {p}", src.display()),
+                &std::fs::read(ours).unwrap(),
+                &std::fs::read(theirs_dir.join(&name)).unwrap(),
+            );
+        }
+    }
+}
+
+/// `convert` on a current prepared file, which doubles section 12's last block exactly as
+/// snarkjs does, and on a truncated one, whose `ceremonyPower` it resets.
+#[test]
+fn ptau_convert_matches_snarkjs() {
+    if !have_snarkjs("ptau_convert_matches_snarkjs") {
+        return;
+    }
+    let out = scratch("ptau-convert");
+    let mut sources = ptau_fixtures("ptau_convert_matches_snarkjs", &out);
+    snarkjs_ok(&[
+        "powersoftau".as_ref(),
+        "truncate".as_ref(),
+        out.join("tiny.ptau").as_os_str(),
+    ]);
+    sources.push(out.join("tiny_03.ptau"));
+    for src in sources {
+        let theirs = out.join("snarkjs.ptau");
+        let ours = out.join("ours.ptau");
+        snarkjs_ok(&[
+            "powersoftau".as_ref(),
+            "convert".as_ref(),
+            src.as_os_str(),
+            theirs.as_os_str(),
+        ]);
+        let mut log = Vec::new();
+        ptau_convert(&Ptau::open(&src).unwrap(), &ours, &CpuGroupFft, &mut log).unwrap();
+        assert_same(
+            &format!("{} convert", src.display()),
+            &std::fs::read(&ours).unwrap(),
+            &std::fs::read(&theirs).unwrap(),
+        );
+    }
 }
