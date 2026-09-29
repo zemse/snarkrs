@@ -70,7 +70,7 @@ rand_chacha  = "0.3"
 # Measurement only. None of these are reachable from a release build: dhat and
 # hotpath sit behind cargo features that default off, criterion is a dev-dependency.
 dhat         = "0.3"
-hotpath      = "0.23"
+hotpath      = "0.26"
 criterion    = { version = "0.8", features = ["html_reports"] }
 
 snarkrs-field = { path = "crates/field" }

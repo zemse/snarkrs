@@ -2,6 +2,10 @@
 //!
 //! `cargo run --release -p snarkrs-groth16 --features hotpath --example hotpath_prove -- DIR [REPS]`
 //!
+//! With `--features hotpath-alloc` the same regions report bytes and allocation counts.
+//! Run that under `RAYON_NUM_THREADS=1`: hotpath counts per thread, so in a pool the
+//! allocations a stolen job makes land in no region.
+//!
 //! What this gives that the other two instruments do not:
 //!
 //!   * `StageTimings` reports five stage groups. It cannot say which of the three domain
@@ -23,6 +27,11 @@ use std::path::PathBuf;
 use snarkrs_field::{BigInteger, Fr, PrimeField};
 use snarkrs_formats::{wtns::Witness, ProvingKey};
 use snarkrs_groth16::{cpu::CpuBackend, prove::prove_with_blinders, Backend, StageTimings};
+
+// Only the alloc mode needs to see every allocation; the timing mode must not pay for it.
+#[cfg(feature = "hotpath-alloc")]
+#[global_allocator]
+static ALLOC: hotpath::CountingAllocator = hotpath::CountingAllocator::new();
 
 fn main() {
     let mut args = std::env::args().skip(1);
