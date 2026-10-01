@@ -11,6 +11,11 @@
 //! A missing is the wgpu lane's measurement that an abort ends only the encoder it lands
 //! on. Run it beside three proof loops to get kills.
 //!
+//! Each measured submission starts from two alternating, epoch-dependent residues. The
+//! host checks every output against CPU squaring as well as the markers and run counts:
+//! a full dispatch with a token can still leave wrong data. This is a diagnostic for this
+//! kernel, not a correctness guarantee for proving kernels or their completion tokens.
+//!
 //! `cargo run --release -p snarkrs-metal --example cb_seal_probe -- [--ms 100] [--n 200]
 //! [--no-encoder-status]`
 
@@ -26,7 +31,39 @@ mod probe {
         Buffer, CommandBufferRef, CommandQueue, CompileOptions, ComputeCommandEncoderRef,
         ComputePipelineState, Device, MTLCommandBufferStatus, MTLResourceOptions, MTLSize,
     };
+    use snarkrs_field::{Field, Fr};
     use snarkrs_metal::kernels::FR_MSL;
+    use snarkrs_metal::layout::PackedFr;
+
+    /// Fresh inputs and their CPU reference, computed before the timed submission.
+    fn prepare_data(data: &mut [PackedFr], epoch: u32, iters: u32) -> [PackedFr; 2] {
+        let inputs = [
+            Fr::from(2 * epoch as u64 + 2),
+            Fr::from(2 * epoch as u64 + 3),
+        ];
+        for (i, word) in data.iter_mut().enumerate() {
+            *word = PackedFr::from_fr(&inputs[i % 2]);
+        }
+        inputs.map(|mut x| {
+            for _ in 0..iters {
+                x.square_in_place();
+            }
+            PackedFr::from_fr(&x)
+        })
+    }
+
+    /// Number of wrong stores and the first one's index, including canonical wrong values.
+    fn wrong_data(data: &[PackedFr], expected: &[PackedFr; 2]) -> (usize, Option<usize>) {
+        let mut count = 0;
+        let mut first = None;
+        for (i, word) in data.iter().enumerate() {
+            if *word != expected[i % 2] {
+                count += 1;
+                first.get_or_insert(i);
+            }
+        }
+        (count, first)
+    }
 
     const PROBE_MSL: &str = r#"
 // Every thread leaves the epoch in its marker and bumps its run count once, so the host
@@ -266,6 +303,8 @@ kernel void seal(device uint* word [[buffer(0)]],
                 std::slice::from_raw_parts_mut(count.contents() as *mut u32, BUSY_THREADS),
             )
         };
+        markers.fill(0);
+        counts.fill(0);
 
         // Calibrate `iters` so one busy dispatch takes about `target_ms`. The best of
         // three, since the GPU may already be shared.
@@ -295,6 +334,7 @@ kernel void seal(device uint* word [[buffer(0)]],
         let mut completed_a_missing = 0usize;
         let mut sealed_but_partial = 0usize;
         let mut sealed_but_replayed = 0usize;
+        let mut sealed_but_wrong = 0usize;
         let mut error_b_present = 0usize;
         let mut errors = 0usize;
         for i in 0..n {
@@ -303,6 +343,15 @@ kernel void seal(device uint* word [[buffer(0)]],
             write_word(&word_b, 0);
             markers.fill(0);
             counts.fill(0);
+            // SAFETY: BUSY_THREADS packed residues in shared storage, with the previous
+            // command buffer finished and the next one not yet committed.
+            let expected = prepare_data(
+                unsafe {
+                    std::slice::from_raw_parts_mut(data.contents().cast::<PackedFr>(), BUSY_THREADS)
+                },
+                epoch,
+                iters,
+            );
             let cb = command_buffer(&gpu.queue, with_status);
             let enc = cb.new_compute_command_encoder();
             enc.set_label("busy+sealA");
@@ -324,20 +373,29 @@ kernel void seal(device uint* word [[buffer(0)]],
             let stale = markers.iter().filter(|&&m| m != epoch).count();
             let skipped = counts.iter().filter(|&&c| c == 0).count();
             let twice = counts.iter().filter(|&&c| c >= 2).count();
+            // SAFETY: the shared data buffer holds BUSY_THREADS packed residues, and
+            // the command buffer that wrote them has completed.
+            let (wrong, first_wrong) = wrong_data(
+                unsafe {
+                    std::slice::from_raw_parts(data.contents().cast::<PackedFr>(), BUSY_THREADS)
+                },
+                &expected,
+            );
             let busy = if stale == 0 && skipped == 0 && twice == 0 {
                 "full".to_string()
             } else {
                 format!("stale={stale} skipped={skipped} twice={twice}")
             };
             let key = format!(
-                "status={status:?} A={} B={} busy={busy}",
+                "status={status:?} A={} B={} busy={busy} wrong={wrong}",
                 if a { "ok" } else { "MISSING" },
                 if b { "ok" } else { "MISSING" }
             );
             *tally.entry(key.clone()).or_default() += 1;
             let anomaly = (status == MTLCommandBufferStatus::Completed && !(a && b))
                 || (status != MTLCommandBufferStatus::Completed)
-                || busy != "full";
+                || busy != "full"
+                || wrong > 0;
             if status == MTLCommandBufferStatus::Completed && !a {
                 completed_a_missing += 1;
             }
@@ -346,6 +404,9 @@ kernel void seal(device uint* word [[buffer(0)]],
             }
             if status == MTLCommandBufferStatus::Completed && a && twice > 0 {
                 sealed_but_replayed += 1;
+            }
+            if status == MTLCommandBufferStatus::Completed && a && wrong > 0 {
+                sealed_but_wrong += 1;
             }
             if status != MTLCommandBufferStatus::Completed {
                 errors += 1;
@@ -359,7 +420,7 @@ kernel void seal(device uint* word [[buffer(0)]],
                     .map(|(l, s)| format!("{l}:{}", state_name(s)))
                     .collect();
                 eprintln!(
-                    "[{i}] {key} wall {wall_ms:.1} ms error \"{}\" encoders [{}]",
+                    "[{i}] {key} first_wrong={first_wrong:?} wall {wall_ms:.1} ms error \"{}\" encoders [{}]",
                     error_text(cb),
                     enc_states.join(", ")
                 );
@@ -376,9 +437,91 @@ kernel void seal(device uint* word [[buffer(0)]],
         println!(
             "Completed with token A missing: {completed_a_missing}; Completed with token A \
              present but the busy dispatch partial: {sealed_but_partial}, run twice: \
-             {sealed_but_replayed}; not Completed: {errors}, of which token B (second \
+             {sealed_but_replayed}, wrong arithmetic: {sealed_but_wrong}; not Completed: \
+             {errors}, of which token B (second \
              encoder) present: {error_b_present}"
         );
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn canonical_wrong_stores_are_detected() {
+            let mut data = vec![PackedFr::ZERO; 8];
+            let expected = prepare_data(&mut data, 7, 3);
+            for (i, word) in data.iter_mut().enumerate() {
+                *word = expected[i % 2];
+            }
+            assert_eq!(wrong_data(&data, &expected), (0, None));
+            // Lost, crossed and replayed stores can all be canonical residues.
+            data[1] = PackedFr::from_fr(&Fr::from(17u64));
+            data[3] = expected[0];
+            data[5] = PackedFr::from_fr(&expected[1].to_fr().square());
+            assert_eq!(wrong_data(&data, &expected), (3, Some(1)));
+            let next = prepare_data(&mut data, 8, 3);
+            assert_ne!(expected, next);
+        }
+
+        /// One short dispatch, no overload or recovery: pins the CPU/GPU wire format
+        /// and demonstrates that current markers and counts alone miss a wrong store.
+        #[test]
+        fn sealed_arithmetic_matches_cpu_and_corruption_is_detected() {
+            metal::objc::rc::autoreleasepool(|| {
+                let gpu = Gpu::new();
+                let data = gpu.buffer(BUSY_THREADS * 32);
+                let marker = gpu.buffer(BUSY_THREADS * 4);
+                let count = gpu.buffer(BUSY_THREADS * 4);
+                let token = gpu.buffer(4);
+                let epoch = 11;
+                write_word(&token, 0);
+                // SAFETY: fresh shared buffers, no work in flight. Each is sized for
+                // BUSY_THREADS elements of its respective type.
+                let expected = unsafe {
+                    std::slice::from_raw_parts_mut(count.contents().cast::<u32>(), BUSY_THREADS)
+                        .fill(0);
+                    std::slice::from_raw_parts_mut(marker.contents().cast::<u32>(), BUSY_THREADS)
+                        .fill(0);
+                    prepare_data(
+                        std::slice::from_raw_parts_mut(
+                            data.contents().cast::<PackedFr>(),
+                            BUSY_THREADS,
+                        ),
+                        epoch,
+                        2,
+                    )
+                };
+                let cb = command_buffer(&gpu.queue, true);
+                let enc = cb.new_compute_command_encoder();
+                gpu.encode_busy(enc, &data, 2, &marker, &count, epoch);
+                gpu.encode_seal(enc, &token, epoch);
+                enc.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+                assert_eq!(cb.status(), MTLCommandBufferStatus::Completed);
+                assert_eq!(read_word(&token), epoch);
+                // SAFETY: correctly sized shared buffers, command buffer completed.
+                unsafe {
+                    let markers =
+                        std::slice::from_raw_parts(marker.contents().cast::<u32>(), BUSY_THREADS);
+                    let counts =
+                        std::slice::from_raw_parts(count.contents().cast::<u32>(), BUSY_THREADS);
+                    let words = std::slice::from_raw_parts_mut(
+                        data.contents().cast::<PackedFr>(),
+                        BUSY_THREADS,
+                    );
+                    assert!(markers.iter().all(|&m| m == epoch));
+                    assert!(counts.iter().all(|&c| c == 1));
+                    assert_eq!(wrong_data(words, &expected), (0, None));
+                    words[BUSY_THREADS - 1] = PackedFr::from_fr(&Fr::from(23u64));
+                    assert_eq!(wrong_data(words, &expected), (1, Some(BUSY_THREADS - 1)));
+                    assert_eq!(read_word(&token), epoch);
+                    assert!(markers.iter().all(|&m| m == epoch));
+                    assert!(counts.iter().all(|&c| c == 1));
+                }
+            });
+        }
     }
 }
 
