@@ -1098,6 +1098,85 @@ mod tests {
         Some(ProvingKey::load(&path).unwrap())
     }
 
+    /// Scratch shares the dead NTT vectors with H's entries, and only four idle sets
+    /// may stay resident. Check actual buffer lengths and reuse without dispatching.
+    #[test]
+    fn h_scratch_bytes_and_pool_lifetimes_are_bounded() {
+        let pk = tiny_key().expect("tiny_mul artifact");
+        let st = HStages::new().expect("Metal device");
+        for n in [256, 4096] {
+            let mut res = st.prepare(&pk).unwrap();
+            // Only the scratch allocator is exercised; no kernel reads these resized
+            // descriptors or the tiny key's unchanged coefficient tables.
+            res.domain = Domain::new(n).unwrap();
+            res.n_vars = n / 2;
+            let scalar_bytes = core::mem::size_of::<PackedFr>();
+            let vector_bytes = (4 * n * scalar_bytes).max(crate::msm::dense_entries_bytes(n));
+            let set_bytes = (res.n_vars + n) * scalar_bytes + vector_bytes;
+            let mut handles = Vec::new();
+            let mut addresses = std::collections::HashSet::new();
+            let mut live_bytes = 0;
+            for _ in 0..5 {
+                let sc = res.take_scratch(&st).unwrap();
+                assert_eq!(sc.witness.length() as usize, res.n_vars * scalar_bytes);
+                assert_eq!(sc.vectors.length() as usize, vector_bytes);
+                assert_eq!(sc.stride as usize, n * scalar_bytes);
+                assert_eq!(sc.h_std.length() as usize, n * scalar_bytes);
+                for b in [&sc.witness, &sc.vectors, &sc.h_std] {
+                    assert!(addresses.insert(b.contents() as usize));
+                    live_bytes += b.length() as usize;
+                    // SAFETY: this set is exclusively owned, shared, and has no GPU
+                    // submission in flight. Every byte belongs to its buffer.
+                    unsafe {
+                        core::ptr::write_bytes(b.contents() as *mut u8, 0xa5, b.length() as usize);
+                    }
+                }
+                handles.push(HHandle {
+                    scratch: Some(sc),
+                    pool: Arc::clone(&res.pool),
+                    len: n,
+                    lent: Arc::new(AtomicBool::new(false)),
+                });
+            }
+            assert_eq!(live_bytes, 5 * set_bytes);
+            assert!(res.pool.lock().unwrap().is_empty());
+            for h in handles {
+                let loan = h.lend_entries().expect("first loan");
+                assert!(h.lend_entries().is_none());
+                drop(loan);
+                drop(h.lend_entries().expect("returned loan"));
+                let buffers = [
+                    h.sc().witness.clone(),
+                    h.sc().vectors.clone(),
+                    h.sc().h_std.clone(),
+                ];
+                drop(h);
+                for b in buffers {
+                    // SAFETY: the handle has scrubbed and returned this set, no other
+                    // caller takes from the pool, and this clone keeps the buffer alive.
+                    let bytes = unsafe {
+                        core::slice::from_raw_parts(b.contents() as *const u8, b.length() as usize)
+                    };
+                    assert!(bytes.iter().all(|&v| v == 0));
+                }
+            }
+            let pool = res.pool.lock().unwrap();
+            assert_eq!(pool.len(), 4);
+            let retained_bytes: usize = pool
+                .iter()
+                .map(|s| s.witness.length() + s.vectors.length() + s.h_std.length())
+                .sum::<u64>() as usize;
+            assert_eq!(retained_bytes, 4 * set_bytes);
+            drop(pool);
+            let reused = res.take_scratch(&st).unwrap();
+            for b in [&reused.witness, &reused.vectors, &reused.h_std] {
+                assert!(addresses.contains(&(b.contents() as usize)));
+            }
+            assert_eq!(res.pool.lock().unwrap().len(), 3);
+            eprintln!("domain {n}: set {set_bytes} B, five live {live_bytes} B, idle pool {retained_bytes} B");
+        }
+    }
+
     /// `gather.metal` reads a decreasing pair as an empty range, so without this check the
     /// key would have produced a silently zeroed row. Mirrors `snarkrs_groth16::cpu`'s test.
     #[test]
