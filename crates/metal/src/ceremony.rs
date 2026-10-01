@@ -13,8 +13,7 @@
 
 use metal::objc::rc::autoreleasepool;
 use metal::{
-    Buffer, CommandQueue, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device,
-    MTLSize,
+    Buffer, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLSize,
 };
 use snarkrs_field::raw::{RawFq, RawFq2};
 use snarkrs_field::{
@@ -573,7 +572,7 @@ impl CerGroup for CerG2 {
 /// state, so one instance serves a whole run.
 pub struct CeremonyKernels {
     device: Device,
-    queue: CommandQueue,
+    queue: crate::cb::Queue,
     g1: GroupPipelines,
     g2: GroupPipelines,
     window_g1: u32,
@@ -624,7 +623,7 @@ impl CeremonyKernels {
 
         let g1 = group("g1")?;
         let g2 = group("g2")?;
-        let queue = device.new_command_queue();
+        let queue = crate::cb::Queue::new(&device);
         Ok(Self {
             device,
             queue,
@@ -759,17 +758,19 @@ impl CeremonyKernels {
                     ..Default::default()
                 };
 
-                let cb = self.queue.new_command_buffer();
-                let enc = cb.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(pso);
-                enc.set_buffer(0, Some(&in_buf), 0);
-                enc.set_buffer(1, Some(&sc_buf), 0);
-                enc.set_buffer(2, Some(&out_buf), 0);
-                set_params(enc, 3, &p);
-                dispatch_1d(enc, pso, n, 64);
-                enc.end_encoding();
-                cb.commit();
-                crate::cb::wait_ok(cb, "ceremony point scalar multiplication")?;
+                crate::cb::with_retry(&self.queue, |queue| {
+                    let cb = crate::cb::command_buffer(queue);
+                    let enc = cb.new_compute_command_encoder();
+                    enc.set_compute_pipeline_state(pso);
+                    enc.set_buffer(0, Some(&in_buf), 0);
+                    enc.set_buffer(1, Some(&sc_buf), 0);
+                    enc.set_buffer(2, Some(&out_buf), 0);
+                    set_params(enc, 3, &p);
+                    dispatch_1d(enc, pso, n, 64);
+                    enc.end_encoding();
+                    cb.commit();
+                    crate::cb::wait_ok(cb, "ceremony point scalar multiplication")
+                })?;
 
                 // SAFETY: the command buffer completed, and `n` points of this type is
                 // exactly what the kernel wrote.
@@ -883,38 +884,42 @@ impl CeremonyKernels {
             ..Default::default()
         };
 
-        let cb = self.queue.new_command_buffer();
-        let enc = cb.new_compute_command_encoder();
-        if let Some(pre) = pre {
-            pre(enc);
-        }
-        enc.set_compute_pipeline_state(&pipelines.affine_prefix);
-        enc.set_buffer(0, Some(pts), 0);
-        enc.set_buffer(1, Some(&prefix), 0);
-        enc.set_buffer(2, Some(&segprod), 0);
-        set_params(enc, 3, &p);
-        dispatch_1d(enc, &pipelines.affine_prefix, segments, 64);
-        enc.end_encoding();
-        cb.commit();
-        crate::cb::wait_ok(cb, "ceremony batch-to-affine, prefix pass")?;
+        crate::cb::with_retry(&self.queue, |queue| {
+            let cb = crate::cb::command_buffer(queue);
+            let enc = cb.new_compute_command_encoder();
+            if let Some(pre) = pre {
+                pre(enc);
+            }
+            enc.set_compute_pipeline_state(&pipelines.affine_prefix);
+            enc.set_buffer(0, Some(pts), 0);
+            enc.set_buffer(1, Some(&prefix), 0);
+            enc.set_buffer(2, Some(&segprod), 0);
+            set_params(enc, 3, &p);
+            dispatch_1d(enc, &pipelines.affine_prefix, segments, 64);
+            enc.end_encoding();
+            cb.commit();
+            crate::cb::wait_ok(cb, "ceremony batch-to-affine, prefix pass")
+        })?;
 
         // SAFETY: the command buffer completed and the prefix pass wrote one field
         // element per segment.
         let got: &[G::PackedField] = unsafe { cer_read_back(&segprod, segments) };
         let seeds = self.buffer(&build_seeds::<G>(got)?)?;
 
-        let cb = self.queue.new_command_buffer();
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pipelines.affine_finish);
-        enc.set_buffer(0, Some(pts), 0);
-        enc.set_buffer(1, Some(&prefix), 0);
-        enc.set_buffer(2, Some(&seeds), 0);
-        enc.set_buffer(3, Some(out), 0);
-        set_params(enc, 4, &p);
-        dispatch_1d(enc, &pipelines.affine_finish, segments, 64);
-        enc.end_encoding();
-        cb.commit();
-        crate::cb::wait_ok(cb, "ceremony batch-to-affine, finish pass")?;
+        crate::cb::with_retry(&self.queue, |queue| {
+            let cb = crate::cb::command_buffer(queue);
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&pipelines.affine_finish);
+            enc.set_buffer(0, Some(pts), 0);
+            enc.set_buffer(1, Some(&prefix), 0);
+            enc.set_buffer(2, Some(&seeds), 0);
+            enc.set_buffer(3, Some(out), 0);
+            set_params(enc, 4, &p);
+            dispatch_1d(enc, &pipelines.affine_finish, segments, 64);
+            enc.end_encoding();
+            cb.commit();
+            crate::cb::wait_ok(cb, "ceremony batch-to-affine, finish pass")
+        })?;
         Ok(())
     }
 }
@@ -1145,6 +1150,72 @@ mod tests {
         // artifact-gated tests in `msm.rs` skip.
         Device::system_default()?;
         Some(CeremonyKernels::new().expect("ceremony kernels"))
+    }
+
+    /// Each submission retries from its original inputs, including the ladder before
+    /// the prefix pass. An ignored queue is replaced before the successful attempt.
+    #[test]
+    fn ceremony_submissions_recover_from_refusals() {
+        use crate::cb::inject::{self, Fault};
+        let Some(k) = kernels() else { return };
+        let pts = vec![Xyzz::ZERO, scaled_g1(Fr::from(7u64), 3)];
+        let scalars = vec![Fr::from(0u64), Fr::from(11u64)];
+        let want: Vec<_> = pts
+            .iter()
+            .zip(&scalars)
+            .map(|(p, s)| point_times_fr(p, s))
+            .collect();
+        let want = batch_to_affine::<snarkrs_field::g1::Config>(&want);
+        for fault in [Fault::Status, Fault::Ignored] {
+            let queue = k.queue.get();
+            inject::arm_with(Some((0, fault)), false);
+            let got = k.point_mul_g1(&pts, &scalars).unwrap();
+            assert!(inject::fired());
+            assert_eq!(inject::calls(), 2);
+            assert_eq!(batch_to_affine::<snarkrs_field::g1::Config>(&got), want);
+            assert_eq!(
+                !std::ptr::eq(&*queue, &*k.queue.get()),
+                fault == Fault::Ignored
+            );
+            inject::arm(None);
+
+            for at in 0..2 {
+                let queue = k.queue.get();
+                inject::arm_with(Some((at, fault)), false);
+                let got = k.batch_to_affine_g1(&pts).unwrap();
+                assert!(inject::fired());
+                assert_eq!(inject::calls(), 3);
+                assert_eq!(got, batch_to_affine::<snarkrs_field::g1::Config>(&pts));
+                assert_eq!(
+                    !std::ptr::eq(&*queue, &*k.queue.get()),
+                    fault == Fault::Ignored
+                );
+                inject::arm(None);
+
+                let mut got = vec![G1Affine::identity(), G1Affine::generator()];
+                let first = Fr::from(13u64);
+                let inc = Fr::from(17u64);
+                let want = vec![
+                    G1Affine::identity(),
+                    (G1Affine::generator() * (first * inc)).into_affine(),
+                ];
+                inject::arm_with(Some((at, fault)), false);
+                k.apply_key_g1(&mut got, first, inc).unwrap();
+                assert!(inject::fired());
+                assert_eq!(inject::calls(), 3);
+                assert_eq!(got, want);
+                inject::arm(None);
+            }
+        }
+
+        inject::arm_with(Some((0, Fault::Ignored)), true);
+        assert!(matches!(
+            k.point_mul_g1(&pts, &scalars),
+            Err(ProveError::Device { .. })
+        ));
+        assert_eq!(inject::calls(), crate::cb::RETRIES);
+        inject::arm(None);
+        assert!(k.point_mul_g1(&pts, &scalars).is_ok());
     }
 
     #[test]

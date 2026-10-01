@@ -21,8 +21,7 @@
 
 use ark_ec::scalar_mul::glv::GLVConfig;
 use metal::{
-    Buffer, CommandQueue, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device,
-    MTLDispatchType,
+    Buffer, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLDispatchType,
 };
 use rayon::prelude::*;
 use snarkrs_field::raw::{RawFq, RawFq2};
@@ -86,12 +85,6 @@ const MIN_BLOCK: usize = 1 << 12;
 /// reports. Same preference the ceremony ladders use: the kernel is one long dependent
 /// chain per thread, so occupancy comes from the grid, not the group.
 const THREADGROUP: usize = 64;
-
-/// Attempts at one command buffer before giving up, counting the first submission. See
-/// [`FftKernels::dispatch_with_retry`]: a macOS interactivity kill is a scheduling event,
-/// not an arithmetic one, and a power-20 `ptau prepare` is seventeen minutes of work to
-/// throw away over one.
-const RETRIES: u32 = 4;
 
 /// Mirrors `struct FftParams` in `shaders/fft.metal`. Passed by `setBytes`, which copies
 /// at encode time, so a re-submitted command buffer carries its own values rather than
@@ -309,7 +302,7 @@ impl FftGroup for FftG2 {
 /// so one instance serves a whole `ptau prepare`.
 pub struct FftKernels {
     device: Device,
-    queue: CommandQueue,
+    queue: crate::cb::Queue,
     g1: FftPipelines,
     g2: FftPipelines,
     window_g1: u32,
@@ -357,7 +350,7 @@ impl FftKernels {
 
         let g1 = group("g1")?;
         let g2 = group("g2")?;
-        let queue = device.new_command_queue();
+        let queue = crate::cb::Queue::new(&device);
         Ok(Self {
             device,
             queue,
@@ -688,22 +681,12 @@ impl FftKernels {
         Ok(())
     }
 
-    /// One command buffer holding one round's worth of pieces, re-submitted unchanged if
-    /// it comes back anything but `Completed`.
-    ///
-    /// Retrying blind rather than on the interactivity error specifically: the error text
-    /// is not an API, and a fault that is genuinely the kernel's (an out-of-range index,
-    /// a lost device) fails all four attempts and is reported with the last message. The
-    /// backoff exists because the failure means something else wants the GPU, and coming
-    /// straight back with the same work is how a `ptau prepare` at power 20 loses a
-    /// seventeen-minute run to a window being dragged.
+    /// One round's pieces, re-submitted from unchanged source buffers on a refusal.
+    /// Destinations are disjoint from sources and every attempt is waited on before
+    /// the next one writes them; `cb::with_retry` also replaces an ignored queue.
     fn dispatch_with_retry(&self, batch: &[(&Pass, FftParams, usize)]) -> Result<(), ProveError> {
-        let mut err = None;
-        for attempt in 0..RETRIES {
-            if attempt > 0 {
-                std::thread::sleep(std::time::Duration::from_millis(200 << attempt));
-            }
-            let cb = self.queue.new_command_buffer();
+        crate::cb::with_retry(&self.queue, |queue| {
+            let cb = crate::cb::command_buffer(queue);
             // Concurrent rather than the serial default: the pieces touch disjoint
             // buffer pairs, or disjoint index ranges of one pair, so there is no hazard
             // for the implicit serial barrier to protect, and with the barrier in place
@@ -720,12 +703,8 @@ impl FftKernels {
             }
             enc.end_encoding();
             cb.commit();
-            match crate::cb::wait_ok(cb, "ceremony group inverse fft") {
-                Ok(()) => return Ok(()),
-                Err(e) => err = Some(e),
-            }
-        }
-        Err(err.expect("RETRIES is at least 1"))
+            crate::cb::wait_ok(cb, "ceremony group inverse fft")
+        })
     }
 
     fn scratch(&self, bytes: usize) -> Result<Buffer, ProveError> {
@@ -944,6 +923,49 @@ mod tests {
     fn same_g2(got: &[Xyzz<RawFq2>], want: &[Xyzz<RawFq2>]) -> bool {
         batch_to_affine::<snarkrs_field::g2::Config>(got)
             == batch_to_affine::<snarkrs_field::g2::Config>(want)
+    }
+
+    /// Every submission can be replayed without advancing the round's source buffers.
+    #[test]
+    fn fft_submissions_recover_from_refusals() {
+        use crate::cb::inject::{self, Fault};
+        let Some(k) = kernels() else { return };
+        let k = k.with_min_block(1);
+        let pts = block_g1(0x5eed_2900, 16);
+        let mut want = pts.clone();
+        CpuGroupFft.ifft_g1(&mut want).unwrap();
+        inject::arm(None);
+        let mut got = pts.clone();
+        k.ifft_g1(&mut got).unwrap();
+        let calls = inject::calls();
+        assert!(calls > 0);
+        for fault in [Fault::Status, Fault::Ignored] {
+            for at in 0..calls {
+                let queue = k.queue.get();
+                inject::arm_with(Some((at, fault)), false);
+                let mut got = pts.clone();
+                k.ifft_g1(&mut got).unwrap();
+                assert!(inject::fired());
+                assert_eq!(inject::calls(), calls + 1);
+                assert!(same_g1(&got, &want));
+                assert_eq!(
+                    !std::ptr::eq(&*queue, &*k.queue.get()),
+                    fault == Fault::Ignored
+                );
+                inject::arm(None);
+            }
+        }
+        inject::arm_with(Some((0, Fault::Ignored)), true);
+        let mut got = pts.clone();
+        assert!(matches!(
+            k.ifft_g1(&mut got),
+            Err(ProveError::Device { .. })
+        ));
+        assert_eq!(inject::calls(), crate::cb::RETRIES);
+        inject::arm(None);
+        let mut got = pts;
+        k.ifft_g1(&mut got).unwrap();
+        assert!(same_g1(&got, &want));
     }
 
     /// Every block size from 2^0 to 2^12, which is every size a ptau file below power 12

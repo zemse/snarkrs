@@ -196,6 +196,13 @@ pub(crate) fn wait_ok(cb: &CommandBufferRef, context: &str) -> Result<(), ProveE
             reason: format!("{context}: injected fault (status {status:?})"),
         });
     }
+    #[cfg(test)]
+    if inject::ignored_fires() {
+        return Err(ProveError::Device {
+            backend: "metal",
+            reason: format!("{context}: injected ErrorSubmissionsIgnored"),
+        });
+    }
     if status == MTLCommandBufferStatus::Completed {
         return Ok(());
     }
@@ -500,6 +507,8 @@ pub(crate) mod inject {
     pub(crate) enum Fault {
         /// `wait_ok` reports the buffer as not completed.
         Status,
+        /// `wait_ok` reports a queue refusal that requires renewal.
+        Ignored,
         /// The token `Seal::wait` reads does not match.
         Stale,
     }
@@ -617,6 +626,10 @@ pub(crate) mod inject {
         let n = CALLS.get();
         CALLS.set(n + 1);
         hits(n, Fault::Status)
+    }
+
+    pub(super) fn ignored_fires() -> bool {
+        hits(CALLS.get().wrapping_sub(1), Fault::Ignored)
     }
 
     /// For the `wait_ok` call just made, which `Seal::wait` follows at once.
