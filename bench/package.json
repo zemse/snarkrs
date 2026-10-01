@@ -1,2 +1,5 @@
 { "name": "g16-bench-artifacts", "private": true, "version": "0.0.0",
+  "scripts": {
+    "test": "python3 -m unittest discover -s scripts -p 'test_*.py' && python3 scripts/render_readme_table.py --dir results/machines --check-readme ../README.md"
+  },
   "dependencies": { "circomlib": "^2.0.5", "circomlibjs": "^0.1.7" } }

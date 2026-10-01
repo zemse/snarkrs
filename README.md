@@ -87,6 +87,12 @@ to reproduce the benchmarks you can use the script on machine of interest:
 bench/scripts/run-benchmark.sh --reps 10
 ```
 
+`npm --prefix bench test` checks these warm proving tables against
+`bench/results/machines/` and runs the table-check regressions, without running proofs.
+The separate trusted setup tables are not covered. Suspect runs cannot support a table;
+multiple records for one machine require an explicit source selection rather than silently
+picking a newer run.
+
 ## using it from the command line
 
 ```sh
