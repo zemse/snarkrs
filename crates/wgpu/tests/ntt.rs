@@ -58,6 +58,28 @@ fn floor() -> &'static WgpuBackend {
     })
 }
 
+#[test]
+fn floor_rejects_2_23_tables_before_allocation() {
+    let b = floor();
+    assert_eq!(
+        b.granted_limits().max_storage_buffer_binding_size,
+        128 << 20
+    );
+    match NttTables::new(b, 1 << 23) {
+        Err(snarkrs_groth16::ProveError::Backend { backend, reason }) => {
+            assert_eq!(backend, "wgpu");
+            assert_eq!(
+                reason,
+                "g16 ntt coset_pows wants 268435456 bytes, over the 134217728 byte storage binding limit"
+            );
+        }
+        Err(other) => panic!("expected a storage binding limit error, got {other:?}"),
+        Ok(_) => panic!("a 2^23 coset table cannot fit the Floor binding limit"),
+    }
+    let tables = NttTables::new(b, 1).expect("single-point padded tables still fit");
+    assert_eq!(tables.bytes(), 3 * 32);
+}
+
 /// The sentinel every device buffer starts as. All-ones is above the modulus, so it is not a
 /// value any correct transform can produce, and it is not the zero a bug would coincide with.
 const SENTINEL: u32 = 0xffff_ffff;

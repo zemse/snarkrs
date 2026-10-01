@@ -56,6 +56,27 @@ use crate::pipelines::Kernels;
 /// Bytes one `Fr` occupies on the device.
 const FR_BYTES: u64 = (LIMBS * 4) as u64;
 
+// The coset table is n elements, the largest of the three whole-buffer bindings.
+fn check_table_capacity(domain_size: usize, limits: &wgpu::Limits) -> Result<(), ProveError> {
+    let bytes = u64::try_from(domain_size.max(1))
+        .ok()
+        .and_then(|n| n.checked_mul(FR_BYTES))
+        .ok_or_else(|| bad("ntt table size overflows"))?;
+    if bytes > limits.max_buffer_size {
+        return Err(bad(format!(
+            "g16 ntt coset_pows wants {bytes} bytes, over the {} byte buffer limit",
+            limits.max_buffer_size
+        )));
+    }
+    if bytes > limits.max_storage_buffer_binding_size {
+        return Err(bad(format!(
+            "g16 ntt coset_pows wants {bytes} bytes, over the {} byte storage binding limit",
+            limits.max_storage_buffer_binding_size
+        )));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // The pass split
 // ---------------------------------------------------------------------------
@@ -206,6 +227,9 @@ impl NttTables {
         )
         .map_err(|e| bad(format!("no 2n-th root of unity: {e}")))?
         .group_gen;
+
+        // Reject the unchunked tables before building any host vectors or uploading twiddles.
+        check_table_capacity(domain.size, &backend.granted_limits())?;
 
         // A running product, one multiply per entry, rather than a square-and-multiply
         // ladder per index. At 2^18 that is 262,144 multiplies against about 4.7 million.
@@ -781,7 +805,7 @@ mod tests {
     #[test]
     fn pass_batches_partition_the_transform() {
         for max_fused in 1..=10u32 {
-            for log_n in 0..=20u32 {
+            for log_n in 0..=28u32 {
                 let bs = split_passes(log_n, max_fused);
                 assert!(!bs.is_empty(), "log_n {log_n} max {max_fused}: no batches");
                 let mut at = 0;
@@ -797,6 +821,58 @@ mod tests {
                 let hi = bs.iter().map(|b| b.k).max().unwrap();
                 assert!(hi - lo <= 1, "log_n {log_n} max {max_fused}: uneven split");
             }
+        }
+    }
+
+    #[test]
+    fn table_capacity_at_the_2_23_frontier() {
+        let floor = wgpu::Limits::default();
+        assert_eq!(floor.max_storage_buffer_binding_size, 128 << 20);
+        assert_eq!(floor.max_buffer_size, 256 << 20);
+        assert!(check_table_capacity(1 << 22, &floor).is_ok());
+        assert!(matches!(
+            check_table_capacity(1 << 23, &floor),
+            Err(ProveError::Backend {
+                backend: "wgpu",
+                ..
+            })
+        ));
+        let raised = wgpu::Limits {
+            max_storage_buffer_binding_size: 256 << 20,
+            ..floor
+        };
+        assert!(check_table_capacity(1 << 23, &raised).is_ok());
+        assert!(check_table_capacity(1 << 24, &raised).is_err());
+    }
+
+    #[test]
+    fn table_capacity_checks_buffer_limit_and_single_point_padding() {
+        let limits = wgpu::Limits {
+            max_buffer_size: FR_BYTES - 1,
+            ..wgpu::Limits::default()
+        };
+        assert!(check_table_capacity(1, &limits).is_err());
+        let limits = wgpu::Limits {
+            max_buffer_size: FR_BYTES,
+            ..limits
+        };
+        assert!(check_table_capacity(1, &limits).is_ok());
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn table_capacity_rejects_byte_count_overflow() {
+        let limits = wgpu::Limits {
+            max_buffer_size: u64::MAX,
+            max_storage_buffer_binding_size: u64::MAX,
+            ..wgpu::Limits::default()
+        };
+        match check_table_capacity(usize::MAX, &limits) {
+            Err(ProveError::Backend { backend, reason }) => {
+                assert_eq!(backend, "wgpu");
+                assert_eq!(reason, "ntt table size overflows");
+            }
+            other => panic!("expected a table size overflow, got {other:?}"),
         }
     }
 
