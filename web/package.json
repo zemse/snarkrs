@@ -7,6 +7,7 @@
     "dev": "vite dev",
     "build": "vite build",
     "preview": "vite preview",
+    "test:probes": "node --test scripts/reduce.test.mjs",
     "wasm": "./scripts/build-wasm.sh",
     "deploy": "./scripts/deploy.sh",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json"

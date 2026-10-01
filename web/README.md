@@ -125,6 +125,19 @@ starting point rather than a prediction: Keccak-256 has 1.7x the wires of a synt
 that takes three times as long, because the MSM skips zero digits and a bit-valued witness
 leaves most high windows empty.
 
+## Mobile probes
+
+`/dbg/reduce.html?auto=1&report=1` compares the direct and folded G2 reduce spellings.
+The dev server prints the report, including the browser's user agent and secure-context
+status. `MATCH` means byte-equal readbacks, not a CPU arithmetic check or a verified proof.
+`DIFFER` means unequal readbacks, `LOST` means observed device loss, `ERROR` means setup,
+compilation or dispatch failed, and `UNAVAILABLE` means no WebGPU or no adapter, with no
+kernels tested. The probe destroys its device after each run.
+
+`npm run test:probes` checks those reporting paths with mocked WebGPU in Node. It does not
+run shaders and is not evidence of iPhone or Android correctness. Real-device runs still
+need the generated shader beside the HTML and an HTTPS origin the phone can reach.
+
 ## Deploying
 
     npm run deploy        # build-wasm.sh, then vercel deploy --prod

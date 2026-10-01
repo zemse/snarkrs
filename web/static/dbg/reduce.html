@@ -65,14 +65,16 @@ fn repro_folded(@builtin(workgroup_id) wid: vec3<u32>) {
     }
   };
 
-  globalThis.__run = async (windows = 8, buckets = 256) => {
-    out.textContent = `running, ${windows} windows of ${buckets} buckets`;
-    const prelude = await (await fetch('./g2.wgsl')).text();
-    const dev = await (await navigator.gpu.requestAdapter()).requestDevice();
+  const run = async (dev, windows, buckets) => {
+    const response = await fetch('./g2.wgsl');
+    if (!response.ok) throw new Error(`g2.wgsl: HTTP ${response.status}`);
+    const prelude = await response.text();
     let lost = null;
     dev.lost.then((e) => { lost = `${e.reason}: ${e.message}`; });
     const mod = dev.createShaderModule({ code: prelude + EXTRA });
-    for (const m of (await mod.getCompilationInfo()).messages) log(`compile ${m.type}: ${m.message} @${m.lineNum}`);
+    const info = await mod.getCompilationInfo();
+    for (const m of info.messages) log(`compile ${m.type}: ${m.message} @${m.lineNum}`);
+    if (info.messages.some((m) => m.type === 'error')) throw new Error('WGSL compilation failed');
 
     // pt_add_g2 is pure field arithmetic plus branches on its own intermediates, so the
     // comparison holds for any inputs; the points need not be on the curve. Nonzero zz,
@@ -89,8 +91,8 @@ fn repro_folded(@builtin(workgroup_id) wid: vec3<u32>) {
     const bkts = dev.createBuffer({ size: words.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     dev.queue.writeBuffer(bkts, 0, words);
 
-    const one = async (entry) => {
-      const pipe = dev.createComputePipeline({ layout: 'auto', compute: { module: mod, entryPoint: entry } });
+    const dispatch = async (entry) => {
+      const pipe = await dev.createComputePipelineAsync({ layout: 'auto', compute: { module: mod, entryPoint: entry } });
       const wsums = dev.createBuffer({ size: windows * PT, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
       const bg = dev.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [
         { binding: 0, resource: { buffer: pbuf } },
@@ -109,6 +111,19 @@ fn repro_folded(@builtin(workgroup_id) wid: vec3<u32>) {
       return got;
     };
 
+    const one = async (entry) => {
+      dev.pushErrorScope('validation');
+      dev.pushErrorScope('internal');
+      let got, failure;
+      try { got = await dispatch(entry); } catch (e) { failure = e; }
+      const ierr = await dev.popErrorScope();
+      const verr = await dev.popErrorScope();
+      if (failure) throw failure;
+      if (ierr || verr) throw new Error((ierr ?? verr).message);
+      if (lost) throw new Error('device lost: ' + lost);
+      return got;
+    };
+
     // Folded first: on the phone under test the direct spelling can take the device
     // down with it, and the interesting comparison needs both outputs when both survive.
     let a, b;
@@ -119,8 +134,7 @@ fn repro_folded(@builtin(workgroup_id) wid: vec3<u32>) {
       await new Promise((r) => setTimeout(r, 800));
       log(`${b ? 'repro_direct' : 'repro_folded'} failed: ${e}`);
       log('device: ' + (lost ?? 'alive'));
-      await report(out.textContent);
-      return 'LOST';
+      return lost ? 'LOST' : 'ERROR';
     }
     let firstBad = -1, zeroA = true, zeroB = true;
     for (let i = 0; i < a.length; i++) {
@@ -131,14 +145,46 @@ fn repro_folded(@builtin(workgroup_id) wid: vec3<u32>) {
     if (zeroA !== zeroB) log(`all-zero output: direct ${zeroA}, folded ${zeroB}`);
     log(firstBad < 0 ? 'outputs MATCH' : `outputs DIFFER from word ${firstBad} (window ${Math.floor(firstBad / (PT / 4))})`);
     log('device: ' + (lost ?? 'alive'));
-    await report(out.textContent);
     return firstBad < 0 ? 'MATCH' : 'DIFFER';
+  };
+
+  globalThis.__run = async (windows = 8, buckets = 256) => {
+    out.textContent = `running, ${windows} windows of ${buckets} buckets`;
+    log(`platform: ${navigator.userAgent}; secure context: ${globalThis.isSecureContext}`);
+    let dev, verdict;
+    try {
+      if (!Number.isSafeInteger(windows) || windows < 1 || windows > 64 ||
+          !Number.isSafeInteger(buckets) || buckets < 1 || buckets > 256) {
+        throw new Error('expected 1..64 windows and 1..256 buckets');
+      }
+      if (!navigator.gpu) {
+        log('WebGPU unavailable; no kernels tested');
+        verdict = 'UNAVAILABLE';
+      } else {
+        const adapter = await navigator.gpu.requestAdapter();
+        if (!adapter) {
+          log('WebGPU adapter unavailable; no kernels tested');
+          verdict = 'UNAVAILABLE';
+        } else {
+          dev = await adapter.requestDevice();
+          verdict = await run(dev, windows, buckets);
+        }
+      }
+    } catch (e) {
+      log('failed: ' + e);
+      verdict = 'ERROR';
+    } finally {
+      dev?.destroy();
+    }
+    log('verdict: ' + verdict);
+    await report(out.textContent);
+    return verdict;
   };
 
   // A phone has no console unless a Mac is attached, and that is exactly the case this
   // page exists for. `?auto=1` needs not even the tap, for a phone opened by
   // `xcrun devicectl device process launch --payload-url`.
-  const go = () => __run().then((v) => log('verdict: ' + v), (e) => log('threw: ' + e));
+  const go = () => __run().catch((e) => log('threw: ' + e));
   document.getElementById('go').onclick = go;
   if (new URLSearchParams(location.search).get('auto') === '1') go();
 </script>
