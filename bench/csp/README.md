@@ -3,8 +3,9 @@
 [ethproofs.org/csp-benchmarks](https://ethproofs.org/csp-benchmarks) publishes six numbers
 per circuit for seventeen proving systems, measured quarterly on an AWS `mac2.metal`
 (Apple M1, 8 cores, 16 GB). One of those seventeen is `circom`, which is circom +
-witnesscalc + rapidsnark. This crate keeps the first two and swaps the third for this
-prover, so the only difference between our row and theirs is the prover.
+witnesscalc + rapidsnark. This crate keeps circom and witnesscalc and swaps rapidsnark
+for this prover. The measurement and witnesscalc changes below also matter when comparing
+rows; this is not an otherwise identical integration.
 
 Upstream: <https://github.com/ethereum/csp-benchmarks>.
 
@@ -45,21 +46,77 @@ of milliseconds for a pairing check that costs about one. Our row reports the sa
 the column means the same thing; the honest verifier cost is in `verify_vkey_ms` in the
 breakdown file.
 
-## Two deliberate deviations
+## Measurement differences to disclose
 
-**The sampling ramp.** Upstream drives criterion at `sample_size(10)` and publishes the
-mean point estimate, reaching it through a ramp of 1, 2, ... 10 iterations per sample plus a
-three second warm-up: 55 proofs for one number. At `keccak_2048`'s several seconds a proof
-that is most of an hour for one cell of a fifteen cell table. We keep the statistic, one
-warm-up then the mean of `--reps` timed iterations, and drop the ramp. Median, min and max
-go in the breakdown, because a mean of ten on a laptop is one background process away from
-being wrong and the spread is the only way to see it happen.
+**The sampling protocol.** Upstream sets criterion's `sample_size(10)` and publishes its
+mean point estimate. That is ten samples, not necessarily ten proofs or exactly 55:
+[Criterion's default sampling mode](https://docs.rs/criterion/latest/criterion/enum.SamplingMode.html)
+chooses linear or flat sampling based on the warm-up iteration time. We instead use one
+warm-up then the arithmetic mean of `--reps` timed iterations, without Criterion's
+warm-up or iteration selection. Median, min and max go in the breakdown. Record `--reps`
+and `--mem-reps` with any comparison; the estimator and sampling protocol are not identical.
 
 **The witness hand-off.** Upstream converts witnesscalc's `.wtns` buffer to `Vec<BigUint>`
 and back again, because that is the shape `circom-prover`'s API takes. We hand the buffer
 straight to `Witness::from_bytes`. The conversion is overhead rapidsnark's binding forced
 on them and a real integration would not pay it, so it is not reproduced; it is worth a few
 milliseconds at the sizes here.
+
+**The witness arithmetic.** `build.rs` patches witnesscalc's field arithmetic by default,
+including `Fr_mod`, `Fr_idiv` and `Fr_pow`. These are local changes, not an upstream
+witnesscalc baseline. `G16_CSP_STOCK_FR` skips patch application; use a clean witnesscalc
+build checkout for a stock baseline, since it does not undo an earlier patch there.
+Record the actual arithmetic mode of the binary that produced the row.
+
+**Validation is included.** The native prover uses checked key loading and checked
+`prove`, so point/key validation is inside `zkey_load_ms` and proof self-verification is
+inside `prove_ms`. The memory binary also uses checked `prove`. The driver separately
+verifies the warm-up proof before reporting timings; that is not an independent oracle.
+
+**The macOS allocator.** `snarkrs-csp-mem` attempts to re-exec with `MallocLargeCache=0`
+before generating the witness. An existing value of `MallocLargeCache` is respected, and
+an exec failure leaves the original process running. The timing driver does not set it.
+Record the effective setting for each run, not just the default intent: a library user
+embedding the prover does not get this memory-process policy automatically.
+`peak_memory` is the mean of whole-process maximum RSS samples from `/usr/bin/time`, not
+Metal buffer bytes or phase-local footprint. `--mem-reps 0` leaves a missing-measurement
+marker of zero, not a measured zero-byte peak.
+
+## Submission readiness
+
+The harness is for local comparisons, not a submission-ready row. In particular, the
+all-target commands above are expected to fail checked loading on the published unblinded
+poseidon keys recorded in the backlog. This is a source audit, not a fresh run of those
+keys. Historical end-to-end results do not establish current readiness.
+
+* **Poseidon key policy is unresolved.** The backlog records published poseidon keys with
+  `gamma_g2 == delta_g2`, which checked loading refuses because anyone can forge proofs
+  against them. There is no CSP benchmark opt-in today: timing, verification, artifacts,
+  list and memory paths all call `ProvingKey::load`. Do not replace those calls wholesale
+  with `load_unchecked`. A future exception must be explicit, confined to identified
+  benchmark artifacts, recorded with the results, and leave normal validated loading
+  unchanged. These keys are not suitable for production.
+* **Backend selection is explicit.** CPU and Metal are separate runs, with `feat: cpu`
+  or `feat: metal` and `backend: g16/cpu` or `backend: g16/metal` in the breakdown.
+  `make_backend` refuses unavailable backends rather than falling back. Small-circuit
+  CPU wins do not justify labelling a mixed CPU/Metal row as Metal. There is no automatic
+  fastest-backend selector; any combined submission needs an agreed per-cell policy and
+  actual backend labels.
+* **GPU metadata needs agreement.** The checked-out upstream schema's `acceleration`
+  enum has `precompile` and `inline`, not GPU backends. Our rows omit that field and use
+  `feat` for the backend. Do not put `metal` into `acceleration` or reuse a zkVM value to
+  imply GPU support. Agree GPU reporting with upstream before submitting; no schema
+  acceptance is established here.
+* **Independent verification is still manual.** There is no CSP snarkjs hook. The backlog
+  records manual acceptance for `poseidon_2`, `sha256_128` and `keccak_128` during bring-up,
+  not oracle coverage of all sixteen current variants. A future hook should check a fresh
+  proof against the published vkey, outside the timed region, and fail closed on verifier
+  errors. Exporting `vkey.json` from the zkey is not itself an independent proof check.
+* **Hardware and protocol need disclosure.** Keep the machine, revision, build features,
+  key release/checksums, witness arithmetic mode, sampling counts, validation policy and
+  effective allocator settings beside any submitted rows. Laptop results are not
+  `mac2.metal` results. AWS allocation, upstream schema changes and row submission need
+  separate approval; this harness does not establish those decisions.
 
 ## Circuits
 
