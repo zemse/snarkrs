@@ -3303,8 +3303,8 @@ mod tests {
         }
     }
 
-    /// `Work::Constant`'s promise, checked where it is decided: a plan over a witness
-    /// of bits and a plan over a dense one have the same shape, allocate the same bytes,
+    /// `Work::Constant`'s promise, checked where it is decided: plans over witnesses
+    /// of every sparsity have the same shape, allocate the same bytes,
     /// dispatch the same threads, and fill every window's entry region exactly. The
     /// variable path over the same two witnesses is shown to differ, so the check is
     /// known to bite.
@@ -3340,9 +3340,9 @@ mod tests {
             .collect::<Vec<_>>()
         };
         let mut seen = Vec::new();
-        for scalars in [&sparse, &dense] {
+        for (_, scalars) in scalars_of_every_sparsity(n) {
             let s = m
-                .upload_scalars_with(scalars, Work::Constant)
+                .upload_scalars_with(&scalars, Work::Constant)
                 .expect("upload scalars");
             let mut plan = Plan::new(&s, 0, n);
             let mut keep = Vec::new();
@@ -3393,8 +3393,10 @@ mod tests {
             drop(out);
             m.pool.give(keep);
         }
-        assert_eq!(seen[0].0, seen[1].0, "plan shape follows the witness");
-        assert_eq!(seen[0].1, seen[1].1, "allocation follows the witness");
+        for case in &seen[1..] {
+            assert_eq!(seen[0].0, case.0, "plan shape follows the witness");
+            assert_eq!(seen[0].1, case.1, "allocation follows the witness");
+        }
         // What did change is where the entries went, which is the one thing Pippenger
         // cannot hide.
         assert_ne!(seen[0].2, seen[1].2);

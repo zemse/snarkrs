@@ -237,7 +237,10 @@ The check in `prove` is also what stops a hostile zkey from reading the witness 
 proof, so a key from someone else should only ever meet `prove`, and should still be checked
 with `snarkrs zkey verify` against the circuit and the ptau. Proving time depends on how many
 witness entries are zero or one unless you pass `--constant-work` (cpu, metal and wgpu
-backends, 2.5% to about 10x slower depending on the circuit and backend). The audit and its
+backends, 2.5% to about 10x slower depending on the circuit and backend). This fixes the
+scalar-dependent MSM sizing and disables zero/one fast paths, not all witness-dependent
+work: GPU bucket occupancy, atomics contention and accumulation still depend on the
+witness. Constant-work is not constant-time; CUDA refuses this flag. The audit and its
 current status are in
 [`security/README.md`](security/README.md).
 

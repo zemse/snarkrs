@@ -1130,6 +1130,145 @@ mod tests {
         assert!(err.to_string().contains("row_ptr ends at"), "{err}");
     }
 
+    /// The production gather binding on ragged rows, including empty rows and repeated
+    /// signals, against a CPU dot product. A test-only multiply-site probe counts terms;
+    /// it checks the work shape, not the compiler's instructions or elapsed time.
+    #[test]
+    fn constant_work_gather_matches_cpu_and_visits_every_term() {
+        use ark_ec::AdditiveGroup;
+        let st = HStages::new().expect("Metal device");
+        let source = HStages::source();
+        let multiply = "fr_mul(value[k], w)";
+        assert_eq!(source.matches(multiply).count(), 1);
+        let probe_source = source.replace(multiply, "fr_one()");
+        let library = st
+            .device
+            .new_library_with_source(&probe_source, &CompileOptions::new())
+            .expect("multiply-site probe MSL");
+        let probe = HStages::new_with_library(
+            st.device.clone(),
+            crate::cb::Queue::new(&st.device),
+            library,
+        )
+        .expect("multiply-site probe pipelines");
+        let n = 8;
+        let rows = [
+            vec![0, 0, 1, 5, 5, 7, 8, 8, 11],
+            vec![0, 2, 2, 3, 7, 7, 8, 10, 11],
+        ];
+        let signals = [
+            vec![0, 1, 2, 1, 3, 4, 5, 6, 7, 0, 2],
+            vec![7, 0, 1, 2, 3, 2, 4, 5, 6, 7, 0],
+        ];
+        let values: [Vec<Fr>; 2] = std::array::from_fn(|m| {
+            (0..11)
+                .map(|i| match i % 4 {
+                    0 => Fr::ZERO,
+                    1 => Fr::ONE,
+                    2 => -Fr::ONE,
+                    _ => -Fr::from((i + m + 2) as u64),
+                })
+                .collect()
+        });
+        let domain = Domain::new(n).unwrap();
+        let res = HResident {
+            n_vars: n,
+            batches: split_passes(domain.log_size, st.max_fused),
+            row_ptr: std::array::from_fn(|m| st.buf_u32(&rows[m]).unwrap()),
+            signal: std::array::from_fn(|m| st.buf_u32(&signals[m]).unwrap()),
+            value: std::array::from_fn(|m| st.buf(&values[m]).unwrap()),
+            tw_fwd: st.buf(&domain.twiddles()).unwrap(),
+            tw_inv: st.buf(&domain.twiddles_inv()).unwrap(),
+            coset_pows: st.buf(&vec![Fr::ONE; n]).unwrap(),
+            domain,
+            pool: Arc::new(Mutex::new(Vec::new())),
+        };
+        let sc = res.take_scratch(&st).unwrap();
+        let cases = [
+            ("zeros", vec![Fr::ZERO; n]),
+            ("ones", vec![Fr::ONE; n]),
+            (
+                "mixed",
+                (0..n)
+                    .map(|i| match i % 3 {
+                        0 => Fr::ZERO,
+                        1 => Fr::ONE,
+                        _ => -Fr::from(i as u64 + 2),
+                    })
+                    .collect(),
+            ),
+            ("dense", (0..n).map(|i| -Fr::from(i as u64 + 2)).collect()),
+        ];
+        for (label, witness) in cases {
+            // SAFETY: scratch owns n packed witness elements and has no submission in flight.
+            let dst = unsafe {
+                core::slice::from_raw_parts_mut(sc.witness.contents() as *mut PackedFr, n)
+            };
+            PackedFr::pack_into(&witness, dst);
+            for work in [Work::Variable, Work::Constant] {
+                for (driver, counting) in [(&st, false), (&probe, true)] {
+                    let queue = driver.queue.get();
+                    let cb = crate::cb::command_buffer(&queue);
+                    let enc = cb.new_compute_command_encoder();
+                    res.encode_gather(driver, enc, &sc, n, work);
+                    let token = driver.seal.encode(enc);
+                    enc.end_encoding();
+                    cb.commit();
+                    driver.seal.wait(cb, token, "gather oracle").unwrap();
+                    let expected: [Vec<Fr>; 2] = std::array::from_fn(|m| {
+                        (0..n)
+                            .map(|r| {
+                                (rows[m][r]..rows[m][r + 1])
+                                    .map(|k| {
+                                        let k = k as usize;
+                                        let w = witness[signals[m][k] as usize];
+                                        if !counting {
+                                            values[m][k] * w
+                                        } else if work == Work::Constant {
+                                            Fr::ONE
+                                        } else if w == Fr::ZERO {
+                                            Fr::ZERO
+                                        } else if w == Fr::ONE {
+                                            values[m][k]
+                                        } else {
+                                            Fr::ONE
+                                        }
+                                    })
+                                    .sum()
+                            })
+                            .collect()
+                    });
+                    for (slot, want) in [
+                        (sc.a(), expected[0].clone()),
+                        (sc.b(), expected[1].clone()),
+                        (
+                            sc.c(),
+                            expected[0]
+                                .iter()
+                                .zip(&expected[1])
+                                .map(|(a, b)| *a * b)
+                                .collect(),
+                        ),
+                    ] {
+                        // SAFETY: each slot holds n PackedFr and the sealed submission completed.
+                        let got = unsafe {
+                            core::slice::from_raw_parts(
+                                (slot.0.contents() as *const u8).add(slot.1 as usize)
+                                    as *const PackedFr,
+                                n,
+                            )
+                        };
+                        assert_eq!(
+                            PackedFr::unpack_slice(got),
+                            want,
+                            "{label} {work:?} probe={counting}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// The gather alone, on one key, over witnesses of zeros, the circuit's own and dense
     /// random values, in both work modes: under `Work::Variable` the time follows how many
     /// witness values are 0 or 1, under `Work::Constant` it should not. `G16_PROBE_CIRCUIT`
