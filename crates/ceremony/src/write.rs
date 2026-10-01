@@ -204,23 +204,23 @@ impl BinFileWriter {
     /// A run of G1 points through one staging buffer. The point sections are the bulk of
     /// both file formats, so they are not written a `write_g1` at a time.
     pub fn write_g1_slice(&mut self, points: &[G1Affine]) -> Result<(), CeremonyError> {
-        let mut buf = Vec::with_capacity(POINT_BATCH.min(points.len().max(1)) * SG1);
-        for batch in points.chunks(POINT_BATCH) {
-            buf.clear();
-            for p in batch {
-                buf.extend_from_slice(&g1_lem(p));
-            }
-            self.write_bytes(&buf)?;
-        }
-        Ok(())
+        self.write_points(points, g1_lem)
     }
 
     pub fn write_g2_slice(&mut self, points: &[G2Affine]) -> Result<(), CeremonyError> {
-        let mut buf = Vec::with_capacity(POINT_BATCH.min(points.len().max(1)) * SG2);
+        self.write_points(points, g2_lem)
+    }
+
+    fn write_points<C, const N: usize>(
+        &mut self,
+        points: &[C],
+        enc: impl Fn(&C) -> [u8; N],
+    ) -> Result<(), CeremonyError> {
+        let mut buf = Vec::with_capacity(POINT_BATCH.min(points.len().max(1)) * N);
         for batch in points.chunks(POINT_BATCH) {
             buf.clear();
             for p in batch {
-                buf.extend_from_slice(&g2_lem(p));
+                buf.extend_from_slice(&enc(p));
             }
             self.write_bytes(&buf)?;
         }
@@ -232,30 +232,26 @@ impl BinFileWriter {
     /// `power`: no randomness, no timestamps, nothing derived from the challenge hash it
     /// returns.
     pub fn write_g1_repeated(&mut self, p: &G1Affine, n: usize) -> Result<(), CeremonyError> {
-        let one = g1_lem(p);
-        let mut buf = Vec::with_capacity(POINT_BATCH.min(n.max(1)) * SG1);
-        for _ in 0..POINT_BATCH.min(n.max(1)) {
-            buf.extend_from_slice(&one);
-        }
-        let mut left = n;
-        while left > 0 {
-            let take = left.min(POINT_BATCH);
-            self.write_bytes(&buf[..take * SG1])?;
-            left -= take;
-        }
-        Ok(())
+        self.write_repeated(&g1_lem(p), n)
     }
 
     pub fn write_g2_repeated(&mut self, p: &G2Affine, n: usize) -> Result<(), CeremonyError> {
-        let one = g2_lem(p);
-        let mut buf = Vec::with_capacity(POINT_BATCH.min(n.max(1)) * SG2);
+        self.write_repeated(&g2_lem(p), n)
+    }
+
+    fn write_repeated<const N: usize>(
+        &mut self,
+        one: &[u8; N],
+        n: usize,
+    ) -> Result<(), CeremonyError> {
+        let mut buf = Vec::with_capacity(POINT_BATCH.min(n.max(1)) * N);
         for _ in 0..POINT_BATCH.min(n.max(1)) {
-            buf.extend_from_slice(&one);
+            buf.extend_from_slice(one);
         }
         let mut left = n;
         while left > 0 {
             let take = left.min(POINT_BATCH);
-            self.write_bytes(&buf[..take * SG2])?;
+            self.write_bytes(&buf[..take * N])?;
             left -= take;
         }
         Ok(())

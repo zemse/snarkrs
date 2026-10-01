@@ -159,6 +159,73 @@ fn fill(r: &mut impl Read, buf: &mut [u8]) -> usize {
 }
 
 #[test]
+fn point_batches_match_individual_writes_at_buffer_boundaries() {
+    let dir = tmp_dir("point-batches");
+    let p1 = g1(3);
+    let p2 = g2(4);
+    for n in [
+        0,
+        1,
+        POINT_BATCH - 1,
+        POINT_BATCH,
+        POINT_BATCH + 1,
+        2 * POINT_BATCH + 1,
+    ] {
+        let path = dir.join(format!("{n}.zkey"));
+        let g1s: Vec<_> = (0..n)
+            .map(|i| if i % 2 == 0 { p1 } else { G1Affine::identity() })
+            .collect();
+        let g2s: Vec<_> = (0..n)
+            .map(|i| if i % 2 == 0 { p2 } else { G2Affine::identity() })
+            .collect();
+        let mut w = BinFileWriter::create(&path, ZKEY_MAGIC, 1, 4).unwrap();
+        w.start_section(1).unwrap();
+        w.write_g1_slice(&g1s).unwrap();
+        w.write_g2_slice(&g2s).unwrap();
+        assert_eq!(w.section_len(), (n * (SG1 + SG2)) as u64);
+        w.end_section().unwrap();
+
+        w.start_section(2).unwrap();
+        for p in &g1s {
+            w.write_g1(p).unwrap();
+        }
+        for p in &g2s {
+            w.write_g2(p).unwrap();
+        }
+        w.end_section().unwrap();
+
+        w.start_section(3).unwrap();
+        w.write_g1_repeated(&p1, n).unwrap();
+        w.write_g2_repeated(&p2, n).unwrap();
+        assert_eq!(w.section_len(), (n * (SG1 + SG2)) as u64);
+        w.end_section().unwrap();
+
+        w.start_section(4).unwrap();
+        for _ in 0..n {
+            w.write_g1(&p1).unwrap();
+        }
+        for _ in 0..n {
+            w.write_g2(&p2).unwrap();
+        }
+        w.end_section().unwrap();
+        w.finish().unwrap();
+
+        let f = BinFile::open(&path, ZKEY_MAGIC, ZKEY_MAX_VERSION).unwrap();
+        assert!(f.truncation().is_none());
+        let bodies: Vec<_> = f
+            .sections()
+            .iter()
+            .map(|s| &f.bytes()[s.start..s.start + s.len])
+            .collect();
+        assert_eq!(bodies[0], bodies[1], "slice, n={n}");
+        assert_eq!(bodies[2], bodies[3], "repeat, n={n}");
+        let last = f.sections().last().unwrap();
+        assert_eq!(last.start + last.len, f.total_len());
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn typed_writers_are_the_inverse_of_the_binfile_decoders() {
     let dir = tmp_dir("inverse");
     let path = dir.join("synthetic.zkey");
@@ -344,6 +411,11 @@ fn a_writer_that_miscounts_or_misnests_its_sections_is_refused() {
     assert!(w.end_section().is_err(), "end without start");
     // A payload byte outside a section would be read back as the next entry header.
     assert!(w.write_u32(7).is_err(), "write outside a section");
+    assert!(w.write_g1_slice(&[g1(1)]).is_err());
+    assert!(w.write_g2_slice(&[g2(1)]).is_err());
+    assert!(w.write_g1_repeated(&g1(1), 1).is_err());
+    assert!(w.write_g2_repeated(&g2(1), 1).is_err());
+    assert_eq!(w.section_len(), 0);
     w.finish().unwrap();
 
     let path = dir.join("unclosed.zkey");
