@@ -107,7 +107,7 @@ def make_verifier(rapidsnark_verify, g16, snarkjs):
             # rapidsnark's verifier prints its result on stderr, not stdout, so both
             # streams have to be checked. Reading only stdout makes every proof look bad.
             r = sh([rapidsnark_verify, vkey, public, proof])
-            return "Valid proof" in (r.stdout + r.stderr)
+            return r.returncode == 0 and "Valid proof" in (r.stdout + r.stderr)
         return f, "rapidsnark-verify"
     if g16 and os.path.exists(g16):
         def f(vkey, public, proof):

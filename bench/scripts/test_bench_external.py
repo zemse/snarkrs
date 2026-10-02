@@ -101,6 +101,20 @@ class ExternalVerification(unittest.TestCase):
         self.assertEqual(self.run_main(cold=False), 0)
         self.assertFalse(self.csv.exists())
 
+    def test_nonzero_oracle_exit_rejects_success_text(self):
+        original = self.sh
+
+        def sh(cmd):
+            result = original(cmd)
+            if cmd[0] == str(self.oracle):
+                result.returncode = 1
+            return result
+
+        with mock.patch.object(self, "sh", side_effect=sh):
+            self.assertEqual(self.run_main(), 0)
+        self.assertEqual(self.checks, ["cold", "final"])
+        self.assertFalse(self.csv.exists())
+
     def test_later_cold_failure_discards_batch_and_clears_stale_outputs(self):
         calls = 0
         original = self.sh
