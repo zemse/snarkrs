@@ -31,6 +31,10 @@
 
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
+mod common;
+
+use common::beacon_bytes;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
@@ -38,15 +42,6 @@ use std::time::Instant;
 use snarkrs_ceremony::{phase1, prepare, CpuGroupFft, CpuKeyScale};
 use snarkrs_field::{AffineRepr, G1Affine};
 use snarkrs_metal::MetalGroupFft;
-
-/// `01 02 .. 20`, the beacon the rest of the ceremony suite uses.
-const BEACON_HEX: &str = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
-
-fn beacon_bytes() -> Vec<u8> {
-    (0..BEACON_HEX.len() / 2)
-        .map(|i| u8::from_str_radix(&BEACON_HEX[i * 2..i * 2 + 2], 16).unwrap())
-        .collect()
-}
 
 fn tmp_dir(test: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("g16-prepare-metal-{test}-{}", std::process::id()));

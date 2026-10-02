@@ -35,6 +35,10 @@
 //! digest does not is an encoding or framing bug; a response hash that does not match is
 //! the point arithmetic or the RNG.
 
+mod common;
+
+use common::{beacon_bytes, BEACON_HEX};
+
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest as _, Sha256};
@@ -43,9 +47,6 @@ use snarkrs_ceremony::ptau::Ptau;
 use snarkrs_ceremony::transcript::{blake2b512, rng_from_entropy_with, Digest};
 use snarkrs_ceremony::{CeremonyError, ContributionKind, ContributionParams, CpuKeyScale};
 use snarkrs_field::AffineRepr;
-
-/// The beacon every case below uses, `01 02 .. 20`.
-const BEACON_HEX: &str = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
 
 /// The 64 bytes `powersoftau contribute` would have taken from the OS, pinned so the
 /// command becomes reproducible. `misc.js:186-190` reads them through
@@ -72,18 +73,8 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn unhex(s: &str) -> Vec<u8> {
-    (0..s.len() / 2)
-        .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap())
-        .collect()
-}
-
 fn digest_of(path: &Path) -> String {
     hex(&Sha256::digest(std::fs::read(path).unwrap()))
-}
-
-fn beacon_bytes() -> Vec<u8> {
-    unhex(BEACON_HEX)
 }
 
 /// The three hashes that identify one produced file, checked outermost last.

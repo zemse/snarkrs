@@ -20,6 +20,10 @@
 
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
+mod common;
+
+use common::beacon_bytes;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
@@ -29,15 +33,6 @@ use snarkrs_ceremony::{contribute, phase1};
 use snarkrs_ceremony::{ContributionParams, CpuKeyScale};
 use snarkrs_metal::MetalKeyScale;
 use snarkrs_msm::KeyScale;
-
-/// `01 02 .. 20`, the beacon the phase 1 and phase 2 suites already use.
-const BEACON_HEX: &str = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
-
-fn beacon_bytes() -> Vec<u8> {
-    (0..BEACON_HEX.len() / 2)
-        .map(|i| u8::from_str_radix(&BEACON_HEX[i * 2..i * 2 + 2], 16).unwrap())
-        .collect()
-}
 
 /// The 64 bytes a contribution would have taken from the OS, pinned so both backends draw
 /// the same delta. Same convention as `tests/phase1.rs`.

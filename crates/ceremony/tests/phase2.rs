@@ -14,6 +14,13 @@
 //! The snarkjs half needs `snarkjs` on `PATH`; without it the comparison tests skip with a
 //! message rather than reporting green.
 
+mod common;
+
+/// The beacon every comparison here uses. Any hex string would do; what matters is that
+/// both implementations get the same one, and that it is not the all-zero hash, which
+/// would hide a byte-order mistake in the SHA-256 chain.
+use common::{beacon_bytes, BEACON_HEX};
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -84,17 +91,7 @@ fn exported_vkey_is_byte_identical_to_snarkjs() {
     eprintln!("{} verification keys byte-identical", artifacts.len());
 }
 
-/// The beacon every comparison here uses. Any hex string would do; what matters is that
-/// both implementations get the same one, and that it is not the all-zero hash, which
-/// would hide a byte-order mistake in the SHA-256 chain.
-const BEACON_HEX: &str = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
 const BEACON_EXP: u8 = 10;
-
-fn beacon_bytes() -> Vec<u8> {
-    (0..BEACON_HEX.len() / 2)
-        .map(|i| u8::from_str_radix(&BEACON_HEX[i * 2..i * 2 + 2], 16).unwrap())
-        .collect()
-}
 
 /// snarkjs itself, when it is installed. `SNARKJS` overrides the binary name; a spawn is
 /// the only honest probe, since a shim on `PATH` can still fail to start.

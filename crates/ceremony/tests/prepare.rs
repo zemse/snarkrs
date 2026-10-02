@@ -21,6 +21,10 @@
 //! The unit tests in `src/prepare.rs` cover the one thing neither oracle can reach: the
 //! two-coset split at `bits == Fr::TWO_ADICITY + 1`, which only a power-28 file triggers.
 
+mod common;
+
+use common::beacon_bytes;
+
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -36,7 +40,6 @@ use snarkrs_field::{CurveGroup, FftField, Fr, G1Projective, One, PrimeField, Pri
 /// The beacon `tests/phase1.rs` pins its files against, `01 02 .. 20` at 2^12 iterations
 /// under the name "final beacon". Reused verbatim so the input to every case below is a
 /// file that test has already compared to snarkjs byte for byte.
-const BEACON_HEX: &str = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
 const BEACON_ITERATIONS: u8 = 12;
 const BEACON_NAME: &str = "final beacon";
 
@@ -79,12 +82,6 @@ fn hex(bytes: &[u8]) -> String {
 
 fn digest_of(path: &Path) -> String {
     hex(&Sha256::digest(std::fs::read(path).unwrap()))
-}
-
-fn beacon_bytes() -> Vec<u8> {
-    (0..BEACON_HEX.len() / 2)
-        .map(|i| u8::from_str_radix(&BEACON_HEX[i * 2..i * 2 + 2], 16).unwrap())
-        .collect()
 }
 
 fn bench_ptau(name: &str) -> Option<PathBuf> {
