@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Time the provers that are not ours: rapidsnark and snarkjs, on the same artifacts.
 
-Rows are written in the same schema `snarkrs bench --csv` emits, so one renderer reads every
-prover's numbers out of one directory without knowing which tool produced them. The only
-column that tells them apart is `prover`: `snarkrs bench` stamps `ours`, this stamps
-`rapidsnark` or `snarkjs`.
+Rows share the timing columns `snarkrs bench --csv` emits, so one renderer reads every
+prover's numbers out of one directory. The `prover` column distinguishes `ours` from
+`rapidsnark` or `snarkjs`. External rows also record verification scope and oracle.
 
 Cold and warm mean here exactly what they mean for our backend. Cold is one fresh process
 per proof, so the zkey parse is inside the timed region. Warm pays the parse once. That
@@ -21,15 +20,21 @@ Nothing here is required to exist. A missing rapidsnark binary or an uninstalled
 is a normal outcome on a fresh box, so this script skips that prover and still exits 0,
 letting the run that called it produce a table with that prover's column left blank.
 
-Every timing kept belongs to a proof that was verified first. If no verifier is available
-at all, the timings are discarded rather than recorded unverified, because a benchmark of
-a prover that is silently emitting garbage is worse than no benchmark.
+Cold timings are kept only after each proof passes verification. The warm wrapper emits
+only its final proof, so all its timings are kept after that one proof passes, not after
+independent checks of every repetition. `verified=yes` means this acceptance check passed;
+`verification_scope` is `each-proof` for cold and `final-proof-only` for warm. Every row
+records the selected `verification_oracle`. If no verifier is available, nothing is kept.
+
+These additive columns are optional for readers of historical CSVs: absent metadata means
+unknown provenance, not per-proof verification. Appending requires the current header;
+legacy or mismatched files are refused unchanged. Use a new CSV for new measurements.
 """
 import argparse, csv, os, platform, shutil, statistics, subprocess, sys, tempfile, time
 
 FIELDS = ["host", "os", "arch", "cores", "variant", "constraints", "prover", "backend",
           "mode", "rep", "ms", "prepare_ms", "gather_us", "ntt_us", "pointwise_us",
-          "msm_us", "assemble_us", "verified"]
+          "msm_us", "assemble_us", "verified", "verification_scope", "verification_oracle"]
 
 # Where a pnpm or npm install of snarkjs lands when its bin directory is not on the PATH
 # of a non-interactive shell, which is the usual case when this runs from a script.
@@ -167,6 +172,13 @@ def main():
     ap.add_argument("--skip-snarkjs", action="store_true")
     a = ap.parse_args()
 
+    if os.path.exists(a.csv) and os.path.getsize(a.csv):
+        with open(a.csv, newline="") as f:
+            if next(csv.reader(f), None) != FIELDS:
+                print("  external: CSV header differs (legacy or incompatible schema); "
+                      "use a new CSV, recording nothing", file=sys.stderr)
+                return 1
+
     d = os.path.join(a.artifacts, a.variant)
     zkey, wtns = os.path.join(d, "circuit.zkey"), os.path.join(d, "circuit.wtns")
     vkey = os.path.join(d, "vkey.json")
@@ -198,7 +210,9 @@ def main():
         for i, ms in enumerate(ms_list, 1):
             r = base_row()
             r.update(variant=a.variant, constraints=nc, prover=prover, backend="cpu",
-                     mode=mode, rep=i, ms=round(ms, 3), verified="yes")
+                     mode=mode, rep=i, ms=round(ms, 3), verified="yes",
+                     verification_scope="each-proof" if mode == "cold" else "final-proof-only",
+                     verification_oracle=oracle)
             rows.append(r)
 
     try:

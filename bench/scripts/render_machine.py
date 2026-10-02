@@ -135,7 +135,10 @@ def main():
         L.append(f"snarkjs gets {a.snarkjs_reps} reps instead of {a.reps}: it is wasm, and "
                  "a median over a few slow reps buys the same answer for a fraction of the "
                  "wall clock.")
-    L.append("Every proof behind every number was verified before the timing was kept.")
+    L.append("External cold timings require each proof to pass verification; rapidsnark warm "
+             "timings require only the final proof to pass, not every repetition.")
+    L.append("External CSV rows record verification_scope and verification_oracle when available. "
+             "verified=yes means the recorded scope passed; missing metadata is unknown provenance.")
     L.append("")
     L.append("Columns are the same on every machine. A blank cell is a comparison this box "
              "could not")
