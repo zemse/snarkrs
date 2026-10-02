@@ -15,6 +15,21 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$here/.."
 
+require_clean_repository() {
+  local status
+  status="$(git status --porcelain=v1 --untracked-files=all --ignore-submodules=none)" || {
+    echo "cannot check repository status; refusing to deploy" >&2
+    exit 1
+  }
+  [ -z "$status" ] || {
+    echo "repository is dirty; commit or remove changes before deploying" >&2
+    printf '%s\n' "$status" >&2
+    exit 1
+  }
+}
+
+require_clean_repository
+
 command -v vercel >/dev/null || { echo "vercel CLI is not installed (npm i -g vercel)" >&2; exit 1; }
 vercel whoami >/dev/null 2>&1 || { echo "not logged in: run 'vercel login'" >&2; exit 1; }
 
@@ -26,4 +41,5 @@ vercel whoami >/dev/null 2>&1 || { echo "not logged in: run 'vercel login'" >&2;
 
 # --prod so the deployment takes the project's domain. A bare `vercel` makes a preview URL
 # with a random slug, which is not the thing anyone means by "deploy the site".
+require_clean_repository
 exec vercel deploy --prod "$@"
