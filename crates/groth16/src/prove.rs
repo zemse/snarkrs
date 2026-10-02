@@ -349,6 +349,13 @@ fn assemble_from_terms(
 
 #[cfg(test)]
 mod tests {
+    mod resources {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test-support/resources.rs"
+        ));
+    }
+
     use super::*;
     use crate::cpu::CpuBackend;
     use crate::verify::{aggregate_public, verify, VerifyError};
@@ -373,10 +380,13 @@ mod tests {
         let mut out: Vec<Artifact> = entries
             .flatten()
             .map(|e| e.path())
+            .filter(|d| d.is_dir())
             .filter(|d| {
-                ["circuit.zkey", "circuit.wtns", "vkey.json", "public.json"]
-                    .iter()
-                    .all(|f| d.join(f).is_file())
+                resources::complete_files(
+                    d,
+                    &["circuit.zkey", "circuit.wtns", "vkey.json", "public.json"],
+                    "CPU prover artifacts",
+                )
             })
             .map(|dir| Artifact {
                 name: dir.file_name().unwrap().to_string_lossy().into_owned(),
@@ -393,7 +403,9 @@ mod tests {
     fn for_each_artifact(test: &str, f: impl Fn(&Artifact)) {
         let found = artifacts();
         if found.is_empty() {
-            eprintln!("SKIPPED {test}: no artifacts under bench/artifacts");
+            resources::skip(format_args!(
+                "{test}: no complete artifacts under bench/artifacts"
+            ));
             return;
         }
         for a in &found {
@@ -464,7 +476,10 @@ mod tests {
     fn verifier_accepts_snarkjs_own_proof() {
         for_each_artifact("verifier_accepts_snarkjs_own_proof", |a| {
             if !a.dir.join("proof.json").is_file() {
-                eprintln!("  no proof.json, skipping");
+                resources::skip(format_args!(
+                    "verifier_accepts_snarkjs_own_proof: missing {}",
+                    a.dir.join("proof.json").display()
+                ));
                 return;
             }
             let vk = VerifyingKey::from_json(&a.dir.join("vkey.json")).unwrap();
@@ -754,7 +769,7 @@ mod tests {
     fn a_shifted_l_query_leaks_through_c_and_only_the_checked_prove_stops_it() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/artifacts/js_1x1_d8");
         if !dir.join("circuit.zkey").is_file() {
-            eprintln!("SKIPPED shifted_l_query: no js_1x1_d8 under bench/artifacts");
+            resources::skip("shifted_l_query: missing bench/artifacts/js_1x1_d8/circuit.zkey");
             return;
         }
         let witness = Witness::load(&dir.join("circuit.wtns")).unwrap().0;

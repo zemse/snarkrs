@@ -14,6 +14,13 @@
 //! Lives in snarkrs-groth16 rather than snarkrs-ntt only because this crate already has the JSON and
 //! bigint dev dependencies the vectors need.
 
+mod resources {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-support/resources.rs"
+    ));
+}
+
 use snarkrs_field::{Domain, Fr};
 use snarkrs_ntt::{CpuNtt, Direction};
 use std::path::{Path, PathBuf};
@@ -26,11 +33,6 @@ fn vector_dir() -> Option<PathBuf> {
     d.is_dir().then_some(d)
 }
 
-/// Whether the fixtures are mandatory on this run rather than a bonus.
-fn vectors_required() -> bool {
-    std::env::var_os("G16_REQUIRE_VECTORS").is_some()
-}
-
 fn fr(s: &str) -> Fr {
     let n: num_bigint::BigUint = s.parse().unwrap();
     Fr::from(n)
@@ -38,13 +40,10 @@ fn fr(s: &str) -> Fr {
 
 #[test]
 fn forward_transform_matches_ffjavascript() {
-    let required = vectors_required();
     let Some(dir) = vector_dir() else {
-        assert!(
-            !required,
-            "G16_REQUIRE_VECTORS is set but bench/fft-vectors is missing"
+        resources::skip_vector(
+            "forward_transform_matches_ffjavascript: no bench/fft-vectors directory",
         );
-        eprintln!("SKIPPED: no bench/fft-vectors directory");
         return;
     };
     let ntt = CpuNtt::new();
@@ -52,11 +51,10 @@ fn forward_transform_matches_ffjavascript() {
     for log in [13u32, 14, 16] {
         let path = dir.join(format!("fft_{log}.json"));
         if !path.is_file() {
-            assert!(
-                !required,
-                "G16_REQUIRE_VECTORS is set but {} is missing",
+            resources::skip_vector(format_args!(
+                "forward_transform_matches_ffjavascript: missing {}",
                 path.display()
-            );
+            ));
             continue;
         }
         let v: serde_json::Value =

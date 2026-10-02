@@ -447,13 +447,20 @@ impl PreparedCircuit for CpuCircuit {
 
 #[cfg(test)]
 mod tests {
+    mod resources {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test-support/resources.rs"
+        ));
+    }
+
     use super::*;
 
     fn tiny_key() -> Option<ProvingKey> {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../bench/artifacts/tiny_mul/circuit.zkey");
         if !path.is_file() {
-            eprintln!("SKIPPED: no tiny_mul artifact");
+            resources::skip("CPU circuit tests: missing bench/artifacts/tiny_mul/circuit.zkey");
             return None;
         }
         Some(ProvingKey::load(&path).unwrap())

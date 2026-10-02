@@ -10,6 +10,13 @@
 //! skips. Set `G16_REQUIRE_VECTORS` to make that a failure instead: a test that reports
 //! `ok` having asserted nothing is worse than one that is absent.
 
+mod resources {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-support/resources.rs"
+    ));
+}
+
 use snarkrs_field::Fr;
 use snarkrs_formats::{wtns::Witness, ProvingKey};
 use snarkrs_groth16::{cpu::CpuBackend, Backend, StageTimings};
@@ -26,7 +33,14 @@ fn artifacts() -> Vec<(String, PathBuf)> {
     let mut out: Vec<(String, PathBuf)> = entries
         .flatten()
         .map(|e| e.path())
-        .filter(|d| d.join("h_expected.json").is_file() && d.join("circuit.zkey").is_file())
+        .filter(|d| d.is_dir())
+        .filter(|d| {
+            resources::complete_files(
+                d,
+                &["h_expected.json", "circuit.zkey", "circuit.wtns"],
+                "h_matches_snarkjs_element_by_element",
+            )
+        })
         .map(|d| (d.file_name().unwrap().to_string_lossy().into_owned(), d))
         .collect();
     out.sort();
@@ -37,11 +51,7 @@ fn artifacts() -> Vec<(String, PathBuf)> {
 fn h_matches_snarkjs_element_by_element() {
     let found = artifacts();
     if found.is_empty() {
-        assert!(
-            std::env::var_os("G16_REQUIRE_VECTORS").is_none(),
-            "G16_REQUIRE_VECTORS is set but no artifact carries h_expected.json"
-        );
-        eprintln!("SKIPPED: no artifact carries h_expected.json");
+        resources::skip_vector("h_matches_snarkjs_element_by_element: no complete artifact with h_expected.json under bench/artifacts");
         return;
     }
     for (name, dir) in found {

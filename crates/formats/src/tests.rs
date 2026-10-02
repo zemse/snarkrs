@@ -4,6 +4,13 @@
 //! second, independent source of the same numbers (snarkjs' decimal JSON) and, where a
 //! proof is available, against the pairing equation itself.
 
+mod resources {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-support/resources.rs"
+    ));
+}
+
 use super::*;
 use ark_ec::pairing::{Pairing, PairingOutput};
 use std::path::{Path, PathBuf};
@@ -256,10 +263,13 @@ fn artifacts() -> Vec<Artifact> {
     let mut out: Vec<Artifact> = entries
         .flatten()
         .map(|e| e.path())
+        .filter(|d| d.is_dir())
         .filter(|d| {
-            ["circuit.zkey", "circuit.wtns", "vkey.json", "public.json"]
-                .iter()
-                .all(|f| d.join(f).is_file())
+            resources::complete_files(
+                d,
+                &["circuit.zkey", "circuit.wtns", "vkey.json", "public.json"],
+                "formats artifacts",
+            )
         })
         .map(|dir| Artifact {
             name: dir.file_name().unwrap().to_string_lossy().into_owned(),
@@ -275,9 +285,7 @@ fn artifacts() -> Vec<Artifact> {
 fn for_each_artifact(test: &str, f: impl Fn(&Artifact)) {
     let found = artifacts();
     if found.is_empty() {
-        eprintln!(
-            "SKIPPED {test}: no artifacts under bench/artifacts (run bench/scripts/gen-artifacts.sh)"
-        );
+        resources::skip(format_args!("{test}: no complete artifacts under bench/artifacts (see bench/scripts/gen-artifacts.sh)"));
         return;
     }
     for a in &found {
@@ -466,7 +474,10 @@ fn snarkjs_reference_proof_verifies_under_the_parsed_key() {
     for_each_artifact("reference_proof", |a| {
         let proof_path = a.dir.join("proof.json");
         if !proof_path.is_file() {
-            eprintln!("  no proof.json for {}, skipping", a.name);
+            resources::skip(format_args!(
+                "formats pairing test: missing {}",
+                a.dir.join("proof.json").display()
+            ));
             return;
         }
         let vk = VerifyingKey::from_json(&a.dir.join("vkey.json")).unwrap();
@@ -702,7 +713,10 @@ fn a_vkey_claiming_an_impossible_npublic_is_refused() {
     for_each_artifact("a_vkey_claiming_an_impossible_npublic_is_refused", |a| {
         let genuine = a.dir.join("vkey.json");
         if !genuine.exists() {
-            eprintln!("  {}: no vkey.json, skipped", a.name);
+            resources::skip(format_args!(
+                "a_vkey_claiming_an_impossible_npublic_is_refused: missing {}",
+                genuine.display()
+            ));
             return;
         }
         // nPublic = u64::MAX is the wrap; nPublic = 0 against an empty IC is the same guard

@@ -9,6 +9,13 @@
 //! as does everything when snarkjs or the artifacts under `bench/artifacts` are absent, so
 //! a fresh clone does not report false green.
 
+mod resources {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-support/resources.rs"
+    ));
+}
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -43,14 +50,16 @@ fn have_snarkjs(test: &str) -> bool {
         Ok(o) if String::from_utf8_lossy(&o.stdout).starts_with("snarkjs@0.7.6") => true,
         Ok(o) => {
             let banner = String::from_utf8_lossy(&o.stdout);
-            eprintln!(
-                "SKIPPED {test}: found {}, need snarkjs@0.7.6 (point $SNARKJS at its cli.js)",
+            resources::skip(format_args!(
+                "{test}: found {}, need snarkjs@0.7.6 (point $SNARKJS at its cli.js)",
                 banner.lines().next().unwrap_or("an unknown snarkjs")
-            );
+            ));
             false
         }
         Err(_) => {
-            eprintln!("SKIPPED {test}: snarkjs not found");
+            resources::skip(format_args!(
+                "{test}: snarkjs not found; set SNARKJS to snarkjs 0.7.6"
+            ));
             false
         }
     }
@@ -58,13 +67,22 @@ fn have_snarkjs(test: &str) -> bool {
 
 /// The variants present, or a skip message and nothing.
 fn variants(test: &str) -> Vec<PathBuf> {
+    let files: &[&str] = match test {
+        "zkey_export_json_matches_snarkjs" => &["circuit.zkey"],
+        "wtns_export_json_matches_snarkjs" => &["circuit.zkey", "circuit.wtns"],
+        "soliditycalldata_matches_snarkjs" => &["circuit.zkey", "public.json", "proof.json"],
+        "file_info_matches_snarkjs" => &["circuit.zkey", "circuit.r1cs", "circuit.wtns"],
+        _ => panic!("unknown export test: {test}"),
+    };
     let dirs: Vec<PathBuf> = VARIANTS
         .iter()
         .map(|v| artifacts_root().join(v))
-        .filter(|d| d.join("circuit.zkey").is_file())
+        .filter(|d| resources::complete_files(d, files, test))
         .collect();
     if dirs.is_empty() {
-        eprintln!("SKIPPED {test}: no artifacts under bench/artifacts");
+        resources::skip(format_args!(
+            "{test}: no complete tiny_mul or js_1x1_d8 artifacts under bench/artifacts"
+        ));
     }
     dirs
 }
