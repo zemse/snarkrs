@@ -15,6 +15,91 @@ question with a different answer.
 python3 ../scripts/cost.py      # -> ../results/COST.md
 ```
 
+## Prebuilt NVIDIA runs with automatic stop
+
+```sh
+export G16_AWS_STOP_ROLE_ARN=arn:aws:iam::123456789012:role/g16-benchmark-stop
+bash bench/aws/run-gpu-bench-safe.sh 10
+G16_IDLE_MINUTES=120 G16_MAX_MINUTES=240 bash bench/aws/run-gpu-bench-safe.sh 10
+```
+
+Run these from the repository root. The safe runner builds locally with the existing
+cargo-zigbuild toolchain before launching a g4dn.xlarge. It uses the regional agent SSH
+key and agent-ssh security group, which must already exist and admit your current IP.
+The GPU AMI supplies the NVIDIA driver; no Rust compiler is installed on the instance.
+Override the type with G16_AWS_TYPE (an x86_64 GPU entry in machines.csv).
+An executable x86_64 Linux rapidsnark verifier is required before launch; set G16_VERIFY_BIN
+when bench/bin/rapidsnark-verify is a macOS binary. The runner ships this independent oracle
+and verifies the CUDA warmup before benchmarking. Add variant names after the repetition
+count to limit artifact transfers, for example `1 tiny_mul js_1x1_d8 sha256` for a smoke run.
+Set G16_ARTIFACT_ROOT to select a different local artifact directory, such as
+bench/artifacts/large. Selected variants are checked for missing runtime files before launch.
+Only runtime scripts, proving keys, witnesses, verification keys, public signals and metadata
+are uploaded; compiler worktrees, R1CS files and witness-generator builds stay local.
+Onion fixtures require complete stage-output lists and recorded SHA256 content digests.
+Older size/mtime-only fixtures must pass fresh local revalidation before manifest generation.
+Guest checksums are compared against those certified digests before any large proof runs.
+Without variant names it transfers the top-level collection, excluding large/ and csp/.
+
+Cold proofs are independently verified with rapidsnark. The first warm proof of each
+variant/backend is also independently verified through rapidsnark-oracle, using the CLI's
+foreign-verifier interface. Every warm proof still passes our own verifier. CSV rows record
+that independent warm verification covers the first proof, not every repetition. This adapter
+is not snarkjs, so its acceptance does not establish snarkjs encoding compatibility.
+Incomplete configurations make the comparison runner exit unsuccessfully while retaining
+partial results.
+
+The ordered onion_p21 through onion_p24 ladder uses run-onion-ladder.py. The positional
+repetition count selects cold repetitions; warm repetitions are five. Each domain first gets
+one CUDA proof checked by both verifiers before any repetitions. Host VmHWM, available RAM
+and sampled device memory are recorded. Less than 4 GiB available RAM or more than 90%
+device memory aborts the first-proof gate. Repeated configurations fail fast and retain
+completed CSV rows. The budget check assumes the default 180-minute hard cap and reserves
+ten minutes for retrieval; use that cap for this ladder. Its eightfold CPU allowance is an
+estimate, not a measured CPU runtime. A budget-risk rejection does not silently reduce counts.
+
+The opt-in test_aws_shutdown_live.py --execute checks a real Scheduler stop and installed
+guest timers on a small instance. --execute-guest runs only the guest checks on a new small
+instance. Test timers use runtime-only activation so subsequent test boots cannot inherit an
+expired short lease. Both modes stop and preserve the instance and EBS; neither terminates.
+These live tests are not executed by npm test.
+
+The runner downloads results into bench/results/aws-INSTANCE and stops the instance on
+success, failure or a handled interrupt. It confirms the stopped state rather than merely
+submitting a stop request. If the graceful-stop waiter times out, it requests a forced stop
+and confirms the state again. Forced shutdown can leave the retained guest filesystem in
+need of repair. Logs include the instance ID, region and source commit.
+
+The instance also checks a job lease every minute. The laptop renews it during transfers
+and execution; one hour without renewal stops the machine. This is orchestration idle,
+not CPU/GPU utilization, so a quiet stage is not mistaken for inactivity. A finished job
+has a five-minute results-recovery grace period even if the laptop disconnects. A separate
+three-hour hard cap stops a hung job despite continuing heartbeats. Both limits are
+configurable before launch; checks can run up to one minute after their threshold.
+
+Stopped instances retain EBS data and storage charges. Termination is a separate explicit
+cleanup decision after results are recovered. The guest shutdown policy is stop, not
+terminate. Guest timers cannot guarantee shutdown if the OS freezes or bootstrap never
+executes; local cleanup cannot survive SIGKILL or a lost laptop. The runner now requires an
+independent EventBridge Scheduler stop deadline. Caller identity and schedule-group access
+are checked before building. Immediately after launch it creates and reads back a one-time
+UTC forced-stop target before waiting for the instance or transferring artifacts. The target
+remains armed after local exits and auto-deletes after execution. Do not restart a stopped
+instance while that deadline remains armed. Schedule timing has one-minute precision.
+
+Set G16_AWS_STOP_ROLE_ARN to the administrator-provisioned execution role. Optional
+G16_AWS_SCHEDULER_GROUP defaults to default. See [deadline-iam.md](deadline-iam.md) for
+narrow caller permissions, role trust and required real firing tests. Missing configuration
+or preflight failure prevents launch; arming/read-back failure requests immediate cleanup.
+A background laptop watchdog also retries transient AWS failures and escalates stalled
+stops after 180 seconds. Its logs and schedule records are saved beside the instance results.
+There is still a launch-to-schedule creation window, and AWS control-plane outages remain
+outside these guarantees. If a stop cannot be confirmed, the runner fails and prints the
+instance ID for manual recovery.
+Do not use the old run-gpu-bench-prebuilt.sh for unattended launches.
+
+AWS behavior: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/Stop_Start.html.
+
 ## Nothing survives the sweep
 
 A GPU box left running over a weekend costs more than this entire exercise, so there are
