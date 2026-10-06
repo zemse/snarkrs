@@ -458,8 +458,9 @@ impl WgpuCircuit {
         &self.stages
     }
 
-    /// The retained key data, with the same contract as [`PreparedCircuit::key`]. Inherent
-    /// because that trait is native only and stage 11 in the browser needs it.
+    /// The retained key data, with the same contract as
+    /// [`snarkrs_groth16::PreparedCircuit::key`]. Inherent because that trait is native only
+    /// and stage 11 in the browser needs it.
     ///
     /// This backend also retains the bulk coefficients and queries for [`Self::reupload`];
     /// other backends may release them after upload.
