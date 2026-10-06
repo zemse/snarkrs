@@ -49,6 +49,9 @@ const POINT_BATCH: usize = 8192;
 ///
 /// This provides atomic visibility, not crash durability (no fsync) or arithmetic
 /// verification. It assumes a trusted output directory, not adversarial path replacement.
+/// Name separation covers case folding, canonical Unicode normalization and trailing
+/// dot/space trimming, which preserve ASCII decimal digits and their order. DOS 8.3,
+/// device aliases and other alternate-name namespaces are outside this guarantee.
 /// Rename replaces the directory entry, including a symlink, rather than its referent.
 /// Existing regular-file permissions are copied at commit; ownership, ACLs and hard-link
 /// identity are not preserved. New files and in-progress stages use mode 0600 on Unix
@@ -104,9 +107,15 @@ impl Stage {
     ) -> std::io::Result<Self> {
         use std::io::ErrorKind;
         use std::sync::atomic::Ordering;
+        let first_digit = excluded
+            .as_encoded_bytes()
+            .iter()
+            .find(|b| b.is_ascii_digit());
+        let tag = u8::from(first_digit == Some(&b'0'));
         for _ in 0..128 {
             let id = next.fetch_add(1, Ordering::Relaxed);
-            let name = format!(".snarkrs-stage-{}-{id}", std::process::id());
+            // The first ASCII digit differs even when the filesystem folds the prefix.
+            let name = format!(".snarkrs-stage-{tag}-{}-{id}", std::process::id());
             if std::ffi::OsStr::new(&name) == excluded {
                 continue;
             }
@@ -205,6 +214,74 @@ mod publication_tests {
         check_requested_destination(true);
     }
 
+    fn check_case_alias_destination(fail: bool) {
+        let dir = dir(if fail {
+            "case-alias-error"
+        } else {
+            "case-alias-success"
+        });
+        let old_name = format!(".snarkrs-stage-{}-0", std::process::id());
+        for alias in [
+            old_name.to_ascii_uppercase(),
+            old_name.replacen('k', "K", 1),
+            old_name.replacen('s', "ſ", 1),
+        ] {
+            let probe = dir.join(&old_name);
+            std::fs::write(&probe, b"probe").unwrap();
+            let aliases = dir.join(&alias).exists();
+            std::fs::remove_file(&probe).unwrap();
+            if !aliases {
+                eprintln!(
+                    "filesystem does not alias {alias:?} to {old_name:?}; skipping this alias"
+                );
+                continue;
+            }
+            eprintln!("verified filesystem alias: {alias:?}");
+            for parent in [dir.clone(), dir.join(".")] {
+                let out = parent.join(&alias);
+                assert!(!out.exists());
+                let result = staged_with_counter(&out, &AtomicU64::new(0), |stage| {
+                    assert!(
+                        !out.exists(),
+                        "case-equivalent stage is visible at destination"
+                    );
+                    std::fs::write(stage, b"complete output")?;
+                    assert!(!out.exists(), "output published before operation returned");
+                    if fail {
+                        return Err(snarkrs_msm::AccelError::device(
+                            "fake",
+                            "late operation",
+                            "injected failure",
+                        )
+                        .into());
+                    }
+                    Ok(7)
+                });
+                if fail {
+                    assert!(matches!(result, Err(CeremonyError::Accel(_))));
+                    assert!(!out.exists());
+                } else {
+                    assert_eq!(result.unwrap(), 7);
+                    assert_eq!(std::fs::read(&out).unwrap(), b"complete output");
+                    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+                    std::fs::remove_file(&out).unwrap();
+                }
+                assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "orphan stage");
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn case_alias_destination_stays_absent_until_success() {
+        check_case_alias_destination(false);
+    }
+
+    #[test]
+    fn case_alias_destination_stays_absent_on_failure() {
+        check_case_alias_destination(true);
+    }
+
     #[test]
     fn error_after_finish_preserves_destination_and_cleans_stage() {
         let dir = dir("error");
@@ -276,9 +353,52 @@ mod publication_tests {
     }
 
     #[test]
+    fn stage_discriminator_precedes_pid_and_counter() {
+        let dir = dir("discriminator");
+        for (excluded, tag) in [
+            ("output", 0),
+            ("file0", 1),
+            ("file1", 0),
+            ("file9", 0),
+            (".SNARKRS-STAGE-0-123-0", 1),
+            (".snarKrs-stage-1-123-0", 0),
+            (".ſnarkrs-stage-0-123-0. ", 1),
+            ("non-ASCII-０", 0),
+        ] {
+            let stage =
+                Stage::create(&dir, std::ffi::OsStr::new(excluded), &AtomicU64::new(0)).unwrap();
+            let expected = format!(".snarkrs-stage-{tag}-{}-0", std::process::id());
+            assert_eq!(
+                stage.path.as_ref().unwrap().file_name().unwrap(),
+                std::ffi::OsStr::new(&expected)
+            );
+            drop(stage);
+            assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stage_discriminator_accepts_non_utf8_exclusion() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = dir("discriminator-bytes");
+        let excluded = std::ffi::OsStr::from_bytes(&[0xff, b'0']);
+        let stage = Stage::create(&dir, excluded, &AtomicU64::new(0)).unwrap();
+        let expected = format!(".snarkrs-stage-1-{}-0", std::process::id());
+        assert_eq!(
+            stage.path.as_ref().unwrap().file_name().unwrap(),
+            std::ffi::OsStr::new(&expected)
+        );
+        drop(stage);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn collision_retry_never_removes_unowned_files_and_is_bounded() {
         let dir = dir("collision");
-        let collision = |id| dir.join(format!(".snarkrs-stage-{}-{id}", std::process::id()));
+        let collision = |id| dir.join(format!(".snarkrs-stage-0-{}-{id}", std::process::id()));
         std::fs::write(collision(0), b"unowned").unwrap();
         let next = AtomicU64::new(0);
         let excluded = std::ffi::OsStr::new("output");
