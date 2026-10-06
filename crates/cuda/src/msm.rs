@@ -139,6 +139,181 @@ const SCAN_TG: u32 = 256;
 /// is why the constant carries over unchanged. Sweep it with `G16_CUDA_MSM_L`.
 const SLICE_LEN: usize = 64;
 
+/// Whether scalar values may change the MSM schedule.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Work {
+    /// Classify zeros and ones and size the plan for the general scalars.
+    #[default]
+    Variable,
+    /// Port of Metal/WebGPU constant work: every scalar emits in every window,
+    /// zero digits accumulate into dummy rows, and a fixed complete-addition tree
+    /// folds spills. No separate ones pass or host classification is performed.
+    ///
+    /// This is not constant time. Atomic contention, bucket addresses, run boundaries,
+    /// mixed-add exceptions and host group arithmetic still depend on values.
+    Constant,
+}
+
+const DUMMY_ROWS: usize = 64;
+const FOLD_LEN: usize = 64;
+const _: () = assert!(DUMMY_ROWS.is_power_of_two() && FOLD_LEN > 2);
+
+/// Checked without allocating, before any kernel can index a scalar or point range.
+fn kernel_range(off: usize, n: usize, words: usize) -> Result<(), ProveError> {
+    let end = off
+        .checked_add(n)
+        .ok_or_else(|| bad("MSM range overflows"))?;
+    checked_words(end, words)?;
+    Ok(())
+}
+
+fn checked_words(items: usize, words: usize) -> Result<usize, ProveError> {
+    let len = items
+        .checked_mul(words)
+        .ok_or_else(|| bad("MSM allocation overflows"))?;
+    // Kernel offsets and products are u32, including scalar limb offsets.
+    if len > u32::MAX as usize
+        || len
+            .checked_mul(4)
+            .filter(|b| *b <= isize::MAX as usize)
+            .is_none()
+    {
+        return Err(bad("MSM allocation exceeds kernel indexing limits"));
+    }
+    Ok(len)
+}
+
+// Point kernels index typed points, not their u32 limbs. The record index must
+// fit u32; a G2 allocation may contain more than u32::MAX words.
+fn checked_point_words(points: usize, words: usize) -> Result<usize, ProveError> {
+    if points > u32::MAX as usize {
+        return Err(bad("MSM point slots exceed u32"));
+    }
+    let len = points
+        .checked_mul(words)
+        .ok_or_else(|| bad("MSM point allocation overflows"))?;
+    allocation_words(len)?;
+    Ok(len)
+}
+
+fn allocation_words(words: usize) -> Result<(), ProveError> {
+    words
+        .checked_mul(4)
+        .filter(|b| *b <= isize::MAX as usize)
+        .ok_or_else(|| bad("MSM allocation byte size overflows"))?;
+    Ok(())
+}
+
+/// Public-shape planning, independent of device handles and allocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Geometry {
+    n: usize,
+    scalar_off: usize,
+    c: u32,
+    n_windows: usize,
+    n_buckets: usize,
+    cap: usize,
+    slice_len: usize,
+    slices: usize,
+    dummy_rows: usize,
+}
+
+impl Geometry {
+    fn new(
+        n: usize,
+        scalar_off: usize,
+        general: usize,
+        c: u32,
+        slice_len: usize,
+        work: Work,
+    ) -> Result<Self, ProveError> {
+        if !(2..=MAX_WINDOW).contains(&c) || slice_len == 0 || slice_len > u32::MAX as usize {
+            return Err(bad("invalid MSM window or slice width"));
+        }
+        // The low bit holds the sign; the remaining 31 bits hold the point index.
+        if n > (1usize << 31) {
+            return Err(bad("MSM point index exceeds packed 31-bit range"));
+        }
+        kernel_range(scalar_off, n, SCALAR_WORDS)?;
+        let general = if work == Work::Constant { n } else { general };
+        if general > n {
+            return Err(bad("MSM general count exceeds scalar count"));
+        }
+        let cap = general.max(1);
+        let g = Self {
+            n,
+            scalar_off,
+            c,
+            n_windows: RECODE_BITS.div_ceil(c as usize),
+            n_buckets: 1usize << (c - 1),
+            cap,
+            slice_len,
+            slices: cap.div_ceil(slice_len),
+            dummy_rows: if work == Work::Constant {
+                DUMMY_ROWS
+            } else {
+                0
+            },
+        };
+        checked_words(g.rows(), G2_WORDS)?;
+        checked_words(
+            g.n_windows
+                .checked_mul(cap)
+                .ok_or_else(|| bad("MSM entries overflow"))?,
+            ENTRY_WORDS,
+        )?;
+        let slots = g
+            .n_windows
+            .checked_mul(g.slices)
+            .and_then(|v| v.checked_mul(2))
+            .ok_or_else(|| bad("MSM spill slots overflow"))?;
+        checked_point_words(slots, G2_WORDS)?;
+        checked_words(g.n_windows, G2_WORDS)?;
+        checked_words(g.slices, slice_len)?;
+        for level in g.fold_levels() {
+            checked_point_words(g.n_windows * level.groups as usize * 2, G2_WORDS)?;
+            checked_words(level.groups as usize, FOLD_LEN)?;
+        }
+        Ok(g)
+    }
+
+    fn rows(&self) -> usize {
+        self.n_windows * (self.n_buckets + self.dummy_rows)
+    }
+
+    fn spill_slots(&self) -> usize {
+        2 * self.n_windows * self.slices
+    }
+
+    fn fold_levels(&self) -> impl Iterator<Item = FoldParams> {
+        let mut slots = (self.dummy_rows != 0).then_some(2 * self.slices);
+        std::iter::from_fn(move || {
+            let m = slots?;
+            let groups = m.div_ceil(FOLD_LEN);
+            slots = (groups > 1).then_some(2 * groups);
+            Some(FoldParams {
+                slots: m as u32,
+                groups: groups as u32,
+                len: FOLD_LEN as u32,
+                last: (groups == 1) as u32,
+            })
+        })
+    }
+}
+
+/// Mirrors the Metal fold's uint4, passed by value to CUDA.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FoldParams {
+    slots: u32,
+    groups: u32,
+    len: u32,
+    last: u32,
+}
+
+// SAFETY: repr(C), four u32 fields with no padding or invalid bit patterns.
+unsafe impl DeviceRepr for FoldParams {}
+
 fn slice_len() -> usize {
     std::env::var("G16_CUDA_MSM_L")
         .ok()
@@ -271,10 +446,10 @@ fn ones_groups_for(n: usize) -> usize {
 // Device-side structs
 // ---------------------------------------------------------------------------
 
-/// Mirrors `struct MsmParams` in `kernels/msm.cu`: ten `u32`, 40 bytes, no padding on
+/// Mirrors `struct MsmParams` in `kernels/msm.cu`: eleven `u32`, 44 bytes, no padding on
 /// either side.
 ///
-/// Passed **by value**. The driver copies these 40 bytes into the kernel's parameter space
+/// Passed **by value**. The driver copies these 44 bytes into the kernel's parameter space
 /// verbatim, so the Rust layout has to match byte for byte; a field inserted on one side
 /// only is read as some other field's value, not as a type error.
 #[repr(C)]
@@ -290,11 +465,12 @@ struct MsmParams {
     ones_groups: u32,
     slice_len: u32,
     slices: u32,
+    dummy_rows: u32,
 }
 
 // SAFETY: `DeviceRepr` marks a type that may be handed to a kernel as a by-value argument.
-// `MsmParams` is `repr(C)`, is ten `u32` with no padding and no invalid bit patterns, and
-// its size is asserted below to be the 40 bytes the kernel's parameter slot expects.
+// `MsmParams` is `repr(C)`, is eleven `u32` with no padding and no invalid bit patterns, and
+// its size is asserted below to be the 44 bytes the kernel's parameter slot expects.
 unsafe impl DeviceRepr for MsmParams {}
 
 /// Mirrors `struct MsmEntry` in `kernels/msm.cu`, which is MSL's `uint2` in the twin. The
@@ -329,7 +505,8 @@ pub struct PackedXyzzG2 {
 }
 
 const _: () = {
-    assert!(core::mem::size_of::<MsmParams>() == 40);
+    assert!(core::mem::size_of::<MsmParams>() == 44);
+    assert!(core::mem::size_of::<FoldParams>() == 16);
     assert!(core::mem::size_of::<MsmEntry>() == 8);
     assert!(core::mem::size_of::<PackedXyzzG1>() == 128);
     assert!(core::mem::size_of::<PackedXyzzG2>() == 256);
@@ -386,6 +563,22 @@ const G1_WORDS: usize = core::mem::size_of::<PackedXyzzG1>() / 4;
 const G2_WORDS: usize = core::mem::size_of::<PackedXyzzG2>() / 4;
 const ENTRY_WORDS: usize = core::mem::size_of::<MsmEntry>() / 4;
 const SCALAR_WORDS: usize = core::mem::size_of::<PackedScalar>() / 4;
+
+pub(crate) fn scalar_prefix(scalars: &[Fr], work: Work) -> Option<Vec<u32>> {
+    if work == Work::Constant {
+        return None;
+    }
+    let mut prefix = Vec::with_capacity(scalars.len() + 1);
+    let mut general = 0;
+    prefix.push(0);
+    for s in scalars {
+        if !(s.is_zero() || s.is_one()) {
+            general += 1;
+        }
+        prefix.push(general);
+    }
+    Some(prefix)
+}
 
 // ---------------------------------------------------------------------------
 // Resident inputs
@@ -485,6 +678,7 @@ impl<'a> Scalars<'a> {
     /// evaluations are dense; for anything else it only oversizes the entry array and the
     /// window, which is safe in both directions.
     pub fn device_std(buf: &'a CudaSlice<u32>, len: usize) -> Result<Self, ProveError> {
+        kernel_range(0, len, SCALAR_WORDS)?;
         if buf.len() < len * SCALAR_WORDS {
             return Err(bad(format!(
                 "device scalar buffer holds {} words; {len} scalars need {}",
@@ -508,6 +702,7 @@ impl<'a> Scalars<'a> {
         len: usize,
         prefix: &'a [u32],
     ) -> Result<Self, ProveError> {
+        kernel_range(0, len, SCALAR_WORDS)?;
         if prefix.len() != len + 1 {
             return Err(bad(format!(
                 "general prefix holds {} entries; {len} scalars need {}",
@@ -689,6 +884,8 @@ struct Kernels {
     segmented_g2: Kernel,
     merge_g1: Kernel,
     merge_g2: Kernel,
+    fold_g1: Kernel,
+    fold_g2: Kernel,
     reduce_g1: Kernel,
     reduce_g2: Kernel,
     ones_g1: Kernel,
@@ -726,6 +923,7 @@ const POINT_BLOCK: u32 = 128;
 /// nothing at all. The header of `kernels/msm.cu` records the two candidate fixes, both of
 /// which are benchmarks rather than obvious wins.
 pub struct CudaMsm {
+    work: Work,
     ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
     /// Kept alive explicitly. `CudaFunction` holds an `Arc<CudaModule>` internally, so this
@@ -749,6 +947,12 @@ pub struct CudaMsm {
 }
 
 impl CudaMsm {
+    /// Opt in to the fixed schedule before uploading scalars or proving.
+    pub fn constant_work(mut self) -> Self {
+        self.work = Work::Constant;
+        self
+    }
+
     /// Compiles `kernels::unit_msm()` and uploads all five repacked base vectors.
     pub fn new(cuda: &Cuda, pk: &ProvingKey) -> Result<Self, ProveError> {
         Self::without_key(cuda)?.with_key(pk)
@@ -776,7 +980,7 @@ impl CudaMsm {
             .map_err(ProveError::from)
     }
 
-    /// Bind the seventeen kernel handles out of an already-compiled module. No bases yet.
+    /// Bind the nineteen kernel handles out of an already-compiled module. No bases yet.
     ///
     /// `module` must have come from [`Self::compile`] against this same [`Cuda`]. A module
     /// belongs to the context that loaded it, and a function pulled out of one context and
@@ -797,6 +1001,8 @@ impl CudaMsm {
             segmented_g2: Kernel::load(&module, "msm_segmented_g2")?,
             merge_g1: Kernel::load(&module, "msm_merge_g1")?,
             merge_g2: Kernel::load(&module, "msm_merge_g2")?,
+            fold_g1: Kernel::load(&module, "msm_fold_g1")?,
+            fold_g2: Kernel::load(&module, "msm_fold_g2")?,
             reduce_g1: Kernel::load(&module, "msm_reduce_g1")?,
             reduce_g2: Kernel::load(&module, "msm_reduce_g2")?,
             ones_g1: Kernel::load(&module, "msm_ones_g1")?,
@@ -807,6 +1013,7 @@ impl CudaMsm {
         let stream = cuda.stream().clone();
 
         Ok(Self {
+            work: Work::Variable,
             a: upload_g1(&stream, &[])?,
             b_g2: upload_g2(&stream, &[])?,
             b_g1: upload_g1(&stream, &[])?,
@@ -889,26 +1096,16 @@ impl CudaMsm {
         upload_g2(&self.stream, bases)
     }
 
-    /// Packs scalars into standard form and uploads them, classifying as it goes.
-    ///
-    /// One pass over the witness, and the classification it produces is what keeps the zero
-    /// and one scalars out of Pippenger entirely.
+    /// Packs scalars into standard form and uploads them. Variable work classifies
+    /// zeros and ones; constant work does not inspect either class.
     pub fn upload_scalars(&self, scalars: &[Fr]) -> Result<ScalarBuf, ProveError> {
-        let mut packed = Vec::with_capacity(scalars.len());
-        let mut prefix = Vec::with_capacity(scalars.len() + 1);
-        let mut general = 0u32;
-        prefix.push(0);
-        for s in scalars {
-            if !(s.is_zero() || s.is_one()) {
-                general += 1;
-            }
-            prefix.push(general);
-            packed.push(PackedScalar::from_fr(s));
-        }
+        kernel_range(0, scalars.len(), SCALAR_WORDS)?;
+        let prefix = scalar_prefix(scalars, self.work);
+        let packed = PackedScalar::pack_slice(scalars);
         Ok(ScalarBuf {
             buf: upload_words(&self.stream, as_words(&packed))?,
             len: scalars.len(),
-            general_prefix: Some(prefix),
+            general_prefix: prefix,
         })
     }
 
@@ -924,6 +1121,7 @@ impl CudaMsm {
         mont: &CudaSlice<u32>,
         len: usize,
     ) -> Result<ScalarBuf, ProveError> {
+        kernel_range(0, len, SCALAR_WORDS)?;
         if mont.len() < len * SCALAR_WORDS {
             return Err(bad(format!(
                 "Montgomery buffer holds {} words; {len} elements need {}",
@@ -960,6 +1158,7 @@ impl CudaMsm {
     /// bug impossible. The `max(1)` is because `cuMemAlloc` of zero bytes is documented to
     /// fail with `CUDA_ERROR_INVALID_VALUE`, and an empty MSM reaches here.
     fn zeros(&self, words: usize) -> Result<CudaSlice<u32>, ProveError> {
+        allocation_words(words)?;
         self.stream
             .alloc_zeros::<u32>(words.max(1))
             .map_err(|e| drv("allocate MSM scratch", e))
@@ -998,6 +1197,11 @@ impl CudaMsm {
                 Job::G2(j) => (j.scalars, j.scalar_off, j.n, j.bases.len, j.base_off),
             };
             validate_job_ranges(soff, n, scalars.len, boff, bases_len)?;
+            kernel_range(soff, n, SCALAR_WORDS)?;
+            kernel_range(boff, n, G2_WORDS)?;
+            if n > (1usize << 31) {
+                return Err(bad("MSM point index exceeds packed 31-bit range"));
+            }
         }
 
         // The start event is recorded before anything is allocated, because `zeros()`
@@ -1125,6 +1329,9 @@ impl CudaMsm {
             None
         };
         let w = match reused {
+            Some((buf, _)) if self.work == Work::Constant => {
+                Scalars::device_std(buf, witness.len())?
+            }
             Some((buf, prefix)) => Scalars::device_std_with_prefix(buf, witness.len(), prefix)?,
             None => w_owned.as_ref().expect("uploaded above").as_scalars(),
         };
@@ -1230,7 +1437,7 @@ impl CudaMsm {
     /// their own kernels write their own buckets.
     fn launch_digits(&self, p: &Plan<'_>) -> Result<(), ProveError> {
         let params = p.params();
-        let rows = p.n_windows * p.n_buckets;
+        let rows = p.rows();
 
         // `msm_count` accumulates onto the histogram with `atomicAdd`, so it must start at
         // zero. `zeros()` already memset the allocation; this is the explicit step the
@@ -1248,8 +1455,8 @@ impl CudaMsm {
         let mut lb = self.stream.launch_builder(&self.k.count.f);
         lb.arg(p.scalars).arg(&p.counts).arg(&params);
         // SAFETY: three parameters in order; the scalar range was bounds checked in
-        // `msm_batch`, every row the kernel can index is `w * n_buckets + (mag - 1)` with
-        // `mag <= n_buckets`, and `counts` holds `n_windows * n_buckets` words.
+        // `msm_batch`; real and dummy row indices are bounded by the checked geometry,
+        // and `counts` holds exactly `rows` words.
         unsafe { lb.launch(cfg) }.map_err(|e| drv("launch msm_count", e))?;
 
         // One block per window, and at most `SCAN_TG` threads because that is the length of
@@ -1259,7 +1466,7 @@ impl CudaMsm {
         lb.arg(&p.counts).arg(&p.cursor).arg(&params);
         // SAFETY: three parameters in order; the grid is exactly `n_windows` blocks, which
         // is what the kernel's `blockIdx.x` indexes, and both arrays hold
-        // `n_windows * n_buckets` words.
+        // `rows` words, including the constant-work dummy rows.
         unsafe { lb.launch(cfg) }.map_err(|e| drv("launch msm_scan", e))?;
 
         let cfg = self.k.scatter.cfg_1d(p.n, POINT_BLOCK);
@@ -1269,8 +1476,8 @@ impl CudaMsm {
             .arg(&p.entries)
             .arg(&params);
         // SAFETY: four parameters in order. `entries` holds `n_windows * cap` records and
-        // `cap` is an exact upper bound on the entries one window can emit: only general
-        // scalars emit at all, and each emits at most one per window.
+        // `cap` bounds each window: variable work emits at most one per general scalar,
+        // constant work emits exactly one per scalar, including zero digits.
         unsafe { lb.launch(cfg) }.map_err(|e| drv("launch msm_scatter", e))?;
 
         Ok(())
@@ -1303,8 +1510,9 @@ impl CudaMsm {
             ),
         };
 
-        let rows = p.n_windows * p.n_buckets;
-        if legacy_accumulate() {
+        let rows = p.rows();
+        // A legacy override never weakens a constant-work plan.
+        if p.dummy_rows == 0 && legacy_accumulate() {
             let cfg = acc.cfg_1d(rows, POINT_BLOCK);
             let mut lb = self.stream.launch_builder(&acc.f);
             lb.arg(&p.entries)
@@ -1341,23 +1549,48 @@ impl CudaMsm {
                 .arg(&out.spill_rows)
                 .arg(&params);
             // SAFETY: seven parameters in order; the spill arrays hold two slots per slice,
-            // which is the maximum one thread writes (at most one run continues backwards
-            // and at most one forwards), and both are fully written before any early return
-            // that could leave the merge reading them.
+            // which is the maximum one thread writes. Every row tag is initialized before
+            // an early return; unwritten point slots stay zero from allocation.
             unsafe { lb.launch(cfg) }.map_err(|e| drv("launch msm_segmented", e))?;
 
-            let cfg = merge.cfg_1d(rows, POINT_BLOCK);
-            let mut lb = self.stream.launch_builder(&merge.f);
-            lb.arg(&out.buckets)
-                .arg(&out.spill_pts)
-                .arg(&out.spill_rows)
-                .arg(&p.counts)
-                .arg(&p.cursor)
-                .arg(&params);
-            // SAFETY: six parameters in order; one thread owns one bucket row and only reads
-            // the spill slots of the slices its own run overlaps, which are inside the
-            // `2 * n_windows * slices` allocated.
-            unsafe { lb.launch(cfg) }.map_err(|e| drv("launch msm_merge", e))?;
+            if p.dummy_rows != 0 {
+                let fold = if out.is_g2 {
+                    &self.k.fold_g2
+                } else {
+                    &self.k.fold_g1
+                };
+                let mut in_pts = &out.spill_pts;
+                let mut in_rows = &out.spill_rows;
+                for level in &out.folds {
+                    let cfg = fold.cfg_1d(p.n_windows * level.params.groups as usize, POINT_BLOCK);
+                    let mut lb = self.stream.launch_builder(&fold.f);
+                    lb.arg(in_pts)
+                        .arg(in_rows)
+                        .arg(&level.pts)
+                        .arg(&level.rows)
+                        .arg(&out.buckets)
+                        .arg(&params)
+                        .arg(&level.params);
+                    // SAFETY: seven arguments match msm_fold_*; checked geometry sizes
+                    // the slot arrays and every level is ordered on the same stream.
+                    unsafe { lb.launch(cfg) }.map_err(|e| drv("launch msm_fold", e))?;
+                    in_pts = &level.pts;
+                    in_rows = &level.rows;
+                }
+            } else {
+                let cfg = merge.cfg_1d(rows, POINT_BLOCK);
+                let mut lb = self.stream.launch_builder(&merge.f);
+                lb.arg(&out.buckets)
+                    .arg(&out.spill_pts)
+                    .arg(&out.spill_rows)
+                    .arg(&p.counts)
+                    .arg(&p.cursor)
+                    .arg(&params);
+                // SAFETY: six parameters in order; one thread owns one bucket row and only reads
+                // the spill slots of the slices its own run overlaps, which are inside the
+                // `2 * n_windows * slices` allocated.
+                unsafe { lb.launch(cfg) }.map_err(|e| drv("launch msm_merge", e))?;
+            }
         }
 
         // One block per window, at most `REDUCE_TG` threads. See `REDUCE_TG`: a wider block
@@ -1369,15 +1602,18 @@ impl CudaMsm {
         // is what `blockIdx.x` indexes into `window_sums`.
         unsafe { lb.launch(cfg) }.map_err(|e| drv("launch msm_reduce", e))?;
 
-        // Not optional. `msm_count` and `msm_scatter` deliberately drop every scalar equal
-        // to 1, so without this kernel those terms are simply missing from the proof.
-        let cfg = ones.cfg_blocks(out.ones_groups, REDUCE_TG);
-        let mut lb = self.stream.launch_builder(&ones.f);
-        lb.arg(p.scalars).arg(bases).arg(&out.ones).arg(&params);
-        // SAFETY: four parameters in order; the grid is exactly `ones_groups` blocks, which
-        // is what `blockIdx.x` indexes into `ones`, and the grid-stride loop is bounded by
-        // `p.n`, itself bounds checked against both the scalar and the base vector.
-        unsafe { lb.launch(cfg) }.map_err(|e| drv("launch msm_ones", e))?;
+        // Constant work has no ones allocation, launch or readback.
+        if let Some(ones_out) = &out.ones {
+            // Not optional. `msm_count` and `msm_scatter` deliberately drop every scalar equal
+            // to 1, so without this kernel those terms are simply missing from the proof.
+            let cfg = ones.cfg_blocks(out.ones_groups, REDUCE_TG);
+            let mut lb = self.stream.launch_builder(&ones.f);
+            lb.arg(p.scalars).arg(bases).arg(ones_out).arg(&params);
+            // SAFETY: four parameters in order; the grid is exactly `ones_groups` blocks, which
+            // is what `blockIdx.x` indexes into `ones`, and the grid-stride loop is bounded by
+            // `p.n`, itself bounds checked against both the scalar and the base vector.
+            unsafe { lb.launch(cfg) }.map_err(|e| drv("launch msm_ones", e))?;
+        }
 
         Ok(())
     }
@@ -1388,18 +1624,18 @@ impl CudaMsm {
 // ---------------------------------------------------------------------------
 
 struct Plan<'a> {
-    n: usize,
-    scalar_off: usize,
-    c: u32,
-    n_windows: usize,
-    n_buckets: usize,
-    cap: usize,
-    slice_len: usize,
-    slices: usize,
+    geometry: Geometry,
     scalars: &'a CudaSlice<u32>,
     counts: CudaSlice<u32>,
     cursor: CudaSlice<u32>,
     entries: CudaSlice<u32>,
+}
+
+impl std::ops::Deref for Plan<'_> {
+    type Target = Geometry;
+    fn deref(&self) -> &Geometry {
+        &self.geometry
+    }
 }
 
 impl<'a> Plan<'a> {
@@ -1409,31 +1645,29 @@ impl<'a> Plan<'a> {
         scalar_off: usize,
         n: usize,
     ) -> Result<Self, ProveError> {
-        let range = scalar_off..scalar_off + n;
-        let general = scalars.general_in(&range);
-        let c = window_size(general);
-        let n_windows = RECODE_BITS.div_ceil(c as usize);
-        let n_buckets = 1usize << (c - 1);
-        // Only general scalars emit entries, and each emits at most one per window, so this
-        // bounds the scatter exactly rather than conservatively.
-        let cap = general.max(1);
-        let slice_len = slice_len();
-        let rows = n_windows * n_buckets;
-        Ok(Self {
+        kernel_range(scalar_off, n, SCALAR_WORDS)?;
+        let general = if msm.work == Work::Constant {
+            n
+        } else {
+            scalars.general_in(&(scalar_off..scalar_off + n))
+        };
+        let geometry = Geometry::new(
             n,
             scalar_off,
-            c,
-            n_windows,
-            n_buckets,
-            cap,
-            slice_len,
-            slices: cap.div_ceil(slice_len).max(1),
+            general,
+            window_size(general),
+            slice_len(),
+            msm.work,
+        )?;
+        Ok(Self {
+            counts: msm.zeros(geometry.rows())?,
+            cursor: msm.zeros(geometry.rows())?,
+            entries: msm.zeros(checked_words(
+                geometry.n_windows * geometry.cap,
+                ENTRY_WORDS,
+            )?)?,
+            geometry,
             scalars: scalars.buf,
-            counts: msm.zeros(rows)?,
-            cursor: msm.zeros(rows)?,
-            // 8 bytes an entry: the bucket row travels with the point index so the segmented
-            // accumulation can find run boundaries without recomputing digits.
-            entries: msm.zeros(n_windows * cap * ENTRY_WORDS)?,
         })
     }
 
@@ -1449,6 +1683,7 @@ impl<'a> Plan<'a> {
             ones_groups: 0,
             slice_len: self.slice_len as u32,
             slices: self.slices as u32,
+            dummy_rows: self.dummy_rows as u32,
         }
     }
 }
@@ -1457,12 +1692,19 @@ impl<'a> Plan<'a> {
 // A single MSM's point stages and its readback.
 // ---------------------------------------------------------------------------
 
+struct FoldScratch {
+    params: FoldParams,
+    pts: CudaSlice<u32>,
+    rows: CudaSlice<u32>,
+}
+
 struct Outputs {
     buckets: CudaSlice<u32>,
     spill_pts: CudaSlice<u32>,
     spill_rows: CudaSlice<u32>,
     window_sums: CudaSlice<u32>,
-    ones: CudaSlice<u32>,
+    ones: Option<CudaSlice<u32>>,
+    folds: Vec<FoldScratch>,
     ones_groups: usize,
     base_off: usize,
     is_g2: bool,
@@ -1474,17 +1716,35 @@ impl Outputs {
             Job::G1(j) => (false, j.base_off, G1_WORDS),
             Job::G2(j) => (true, j.base_off, G2_WORDS),
         };
-        let ones_groups = ones_groups_for(plan.n);
-        let rows = plan.n_windows * plan.n_buckets;
+        let ones_groups = if plan.dummy_rows == 0 {
+            ones_groups_for(plan.n)
+        } else {
+            0
+        };
+        let rows = plan.rows();
+        let mut folds = Vec::new();
+        for params in plan.fold_levels() {
+            let slots = 2 * plan.n_windows * params.groups as usize;
+            folds.push(FoldScratch {
+                params,
+                pts: msm.zeros(checked_point_words(slots, point_words)?)?,
+                rows: msm.zeros(slots)?,
+            });
+        }
         // Two spill slots per slice: at most one run of a slice continues backwards and at
         // most one continues forwards.
-        let spill_slots = 2 * plan.n_windows * plan.slices;
+        let spill_slots = plan.spill_slots();
         Ok(Self {
             buckets: msm.zeros(rows * point_words)?,
-            spill_pts: msm.zeros(spill_slots * point_words)?,
+            spill_pts: msm.zeros(checked_point_words(spill_slots, point_words)?)?,
             spill_rows: msm.zeros(spill_slots)?,
             window_sums: msm.zeros(plan.n_windows * point_words)?,
-            ones: msm.zeros(ones_groups * point_words)?,
+            ones: if ones_groups == 0 {
+                None
+            } else {
+                Some(msm.zeros(ones_groups * point_words)?)
+            },
+            folds,
             ones_groups,
             base_off,
             is_g2,
@@ -1500,7 +1760,10 @@ impl Outputs {
     /// the Metal twin and zkonduit's Metal MSM both stop.
     fn combine(&self, msm: &CudaMsm, plan: &Plan<'_>) -> Result<MsmResult, ProveError> {
         let w_words = download(&msm.stream, &self.window_sums)?;
-        let o_words = download(&msm.stream, &self.ones)?;
+        let o_words = match &self.ones {
+            Some(ones) => download(&msm.stream, ones)?,
+            None => Vec::new(),
+        };
         if self.is_g2 {
             let w = from_words::<PackedXyzzG2>(&w_words)
                 .ok_or_else(|| bad("G2 window sums are not a whole number of points"))?;
@@ -1566,6 +1829,7 @@ pub(crate) fn upload_words(
 }
 
 fn upload_g1(stream: &Arc<CudaStream>, bases: &[G1Affine]) -> Result<G1Bases, ProveError> {
+    kernel_range(0, bases.len(), core::mem::size_of::<PackedG1Affine>() / 4)?;
     let packed = PackedG1Affine::pack_slice(bases);
     Ok(G1Bases {
         buf: upload_words(stream, as_words(&packed))?,
@@ -1574,6 +1838,7 @@ fn upload_g1(stream: &Arc<CudaStream>, bases: &[G1Affine]) -> Result<G1Bases, Pr
 }
 
 fn upload_g2(stream: &Arc<CudaStream>, bases: &[G2Affine]) -> Result<G2Bases, ProveError> {
+    kernel_range(0, bases.len(), core::mem::size_of::<PackedG2Affine>() / 4)?;
     let packed = PackedG2Affine::pack_slice(bases);
     Ok(G2Bases {
         buf: upload_words(stream, as_words(&packed))?,
@@ -1627,6 +1892,437 @@ const _: () = {
 mod tests {
     use super::*;
     use snarkrs_gpu_layout::{FQ_MODULUS, FQ_N0};
+
+    #[test]
+    fn constant_geometry_ignores_classification() {
+        let n = 129;
+        let inputs = [
+            vec![Fr::zero(); n],
+            vec![Fr::one(); n],
+            (0..n).map(|i| Fr::from((i % 2) as u64)).collect(),
+            (0..n).map(|i| Fr::from((i == 64) as u64 * 7)).collect(),
+            (0..n).map(|i| Fr::from(i as u64 + 2)).collect(),
+            vec![-Fr::one(); n],
+        ];
+        let want = Geometry::new(n, 3, n, window_size(n), 64, Work::Constant).unwrap();
+        for values in inputs {
+            assert!(scalar_prefix(&values, Work::Constant).is_none());
+            let prefix = scalar_prefix(&values, Work::Variable).unwrap();
+            let general = values
+                .iter()
+                .filter(|s| !s.is_zero() && !s.is_one())
+                .count();
+            assert_eq!(prefix[n] as usize, general);
+            let got = Geometry::new(n, 3, general, window_size(n), 64, Work::Constant).unwrap();
+            assert_eq!(got, want);
+            assert_eq!(got.cap, n);
+            assert_eq!(got.n_windows, 255usize.div_ceil(got.c as usize));
+            let variable =
+                Geometry::new(n, 3, general, window_size(general), 64, Work::Variable).unwrap();
+            assert_eq!(variable.cap, general.max(1));
+            assert_eq!(variable.dummy_rows, 0);
+            assert_eq!(variable.fold_levels().count(), 0);
+        }
+        // Even unusable metadata cannot shrink a constant plan.
+        assert_eq!(
+            Geometry::new(n, 3, usize::MAX, window_size(n), 64, Work::Constant).unwrap(),
+            want
+        );
+    }
+
+    #[test]
+    fn checked_geometry_bounds_every_dummy_slice_and_fold() {
+        for n in [0, 1, 63, 64, 65, 2048, 2049, 65537, 1 << 18] {
+            for c in 2..=MAX_WINDOW {
+                for len in [1, 3, 64, 257] {
+                    let g = Geometry::new(n, 7, 0, c, len, Work::Constant).unwrap();
+                    assert!(g.slices * len >= g.cap);
+                    assert!((g.slices - 1) * len < g.cap);
+                    for w in 0..g.n_windows {
+                        let first = g.n_windows * g.n_buckets + w * g.dummy_rows;
+                        assert!(first >= g.n_windows * g.n_buckets);
+                        assert!(first + g.dummy_rows <= g.rows());
+                        for i in [0, 63, 64, n.saturating_sub(1)] {
+                            assert!(first + (i & (g.dummy_rows - 1)) < g.rows());
+                        }
+                    }
+                    let levels: Vec<_> = g.fold_levels().collect();
+                    assert!(!levels.is_empty());
+                    let mut slots = 2 * g.slices;
+                    for f in levels {
+                        assert_eq!(f.slots as usize, slots);
+                        assert_eq!(f.groups as usize, slots.div_ceil(FOLD_LEN));
+                        assert_eq!(f.len as usize, FOLD_LEN);
+                        assert_eq!(f.last != 0, f.groups == 1);
+                        assert!((f.groups as usize - 1) * FOLD_LEN < slots);
+                        assert!(f.groups as usize * FOLD_LEN >= slots);
+                        if f.last == 0 {
+                            assert!(2 * (f.groups as usize) < slots);
+                        }
+                        slots = 2 * f.groups as usize;
+                    }
+                    assert_eq!(slots, 2);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn geometry_rejects_overflow_before_allocating() {
+        for (n, off, c, len) in [
+            (usize::MAX, 0, 8, 64),
+            (1usize << 31, 0, 8, 64),
+            ((1usize << 31) + 1, 0, 8, 64),
+            (1, usize::MAX, 8, 64),
+            (1, u32::MAX as usize / 8, 8, 64),
+            (1, 0, 1, 64),
+            (1, 0, 17, 64),
+            (1, 0, 8, 0),
+            (u32::MAX as usize / 8, 0, 2, 1),
+        ] {
+            assert!(Geometry::new(n, off, n, c, len, Work::Constant).is_err());
+        }
+        assert!(checked_words(usize::MAX, 2).is_err());
+        assert!(checked_words(u32::MAX as usize, 2).is_err());
+        assert!(kernel_range(usize::MAX, 1, 1).is_err());
+        assert!(kernel_range(0, u32::MAX as usize / 8, 8).is_ok());
+        assert!(Geometry::new(10, 0, 11, 8, 64, Work::Variable).is_err());
+    }
+
+    #[test]
+    fn segmented_fixed_fold_preserves_every_run_including_dummy_rows() {
+        // Integer sums model the group law and expose dropped or duplicate spills.
+        // Every bucket must have exactly one final writer, including dummy buckets.
+        for n in [0, 1, 63, 64, 65, 2049, 4097, 65537] {
+            let g = Geometry::new(n, 0, 0, 3, 64, Work::Constant).unwrap();
+            for run_width in [1, 2, 17, 64, 65, n.max(1)] {
+                let mut entries: Vec<_> = (0..n)
+                    .map(|i| {
+                        let row = (i / run_width) % (g.n_buckets + g.dummy_rows);
+                        let row = if row < g.n_buckets {
+                            row
+                        } else {
+                            g.n_windows * g.n_buckets + row - g.n_buckets
+                        };
+                        (row, (i % 7) as i64 - 3)
+                    })
+                    .collect();
+                entries.sort_by_key(|e| e.0);
+                let mut want = HashMap::<usize, i64>::new();
+                for &(row, value) in &entries {
+                    *want.entry(row).or_default() += value;
+                }
+                let mut buckets = HashMap::new();
+                let mut input = vec![None; 2 * g.slices];
+                for (k, slice) in entries.chunks(g.slice_len).enumerate() {
+                    let mut runs = Vec::<(usize, i64)>::new();
+                    for &(row, value) in slice {
+                        match runs.last_mut() {
+                            Some((r, sum)) if *r == row => *sum += value,
+                            _ => runs.push((row, value)),
+                        }
+                    }
+                    for (i, &run) in runs.iter().enumerate() {
+                        if i == 0 {
+                            input[2 * k] = Some(run);
+                        } else if i + 1 == runs.len() {
+                            input[2 * k + 1] = Some(run);
+                        } else {
+                            assert!(buckets.insert(run.0, run.1).is_none());
+                        }
+                    }
+                }
+                for f in g.fold_levels() {
+                    assert_eq!(input.len(), f.slots as usize);
+                    let mut output = vec![None; 2 * f.groups as usize];
+                    for group in 0..f.groups as usize {
+                        let mut cur = None;
+                        let mut acc = 0;
+                        let mut first = true;
+                        for i in 0..f.len as usize {
+                            let slot = input.get(group * f.len as usize + i).copied().flatten();
+                            if let Some((row, _)) = slot {
+                                if cur != Some(row) {
+                                    if let Some(old) = cur {
+                                        if first && f.last == 0 {
+                                            output[2 * group] = Some((old, acc));
+                                        } else {
+                                            assert!(buckets.insert(old, acc).is_none());
+                                        }
+                                        first = false;
+                                    }
+                                    acc = 0;
+                                    cur = Some(row);
+                                }
+                            }
+                            // Every slot adds, including an empty/padded identity.
+                            acc += slot.map_or(0, |(_, value)| value);
+                        }
+                        if let Some(row) = cur {
+                            if f.last != 0 {
+                                assert!(buckets.insert(row, acc).is_none());
+                            } else {
+                                output[2 * group + usize::from(!first)] = Some((row, acc));
+                            }
+                        }
+                    }
+                    input = output;
+                }
+                assert_eq!(buckets, want, "n={n}, run_width={run_width}");
+            }
+        }
+    }
+
+    #[test]
+    fn parameter_abi_and_constant_routing_match_the_host() {
+        use core::mem::{offset_of, size_of};
+        assert_eq!(size_of::<MsmParams>(), 44);
+        assert_eq!(offset_of!(MsmParams, dummy_rows), 40);
+        assert_eq!(size_of::<FoldParams>(), 16);
+        assert_eq!(offset_of!(FoldParams, last), 12);
+        let src = kernels::MSM_CU;
+        let fields = src
+            .split("struct MsmParams {")
+            .nth(1)
+            .unwrap()
+            .split("};")
+            .next()
+            .unwrap();
+        let names: Vec<_> = fields
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("u32 "))
+            .map(|l| l.split(';').next().unwrap().trim())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "n",
+                "c",
+                "n_windows",
+                "n_buckets",
+                "cap",
+                "scalar_off",
+                "base_off",
+                "ones_groups",
+                "slice_len",
+                "slices",
+                "dummy_rows"
+            ]
+        );
+        assert!(src.contains("static_assert(sizeof(MsmParams) == 44"));
+        assert!(src.contains("static_assert(sizeof(FoldParams) == 16"));
+        let fold_fields = src
+            .split("struct FoldParams {")
+            .nth(1)
+            .unwrap()
+            .split("};")
+            .next()
+            .unwrap();
+        let fold_names: Vec<_> = fold_fields
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("u32 "))
+            .map(|l| l.split(';').next().unwrap().trim())
+            .collect();
+        assert_eq!(fold_names, ["slots", "groups", "len", "last"]);
+        assert_eq!(
+            src.matches("p.dummy_rows == 0u && (sc_is_zero(s) || sc_is_one(s))")
+                .count(),
+            2
+        );
+        assert_eq!(src.matches("row = msm_dummy_row(p, w, gid);").count(), 2);
+        assert!(src.contains("u32 used = cursor[last] - base;"));
+        assert!(src.contains("msm_reduce_impl<Fq, ProjG1>"));
+        assert!(src.contains("msm_reduce_impl<Fq2, ProjG2>"));
+        assert!(src.contains("for (u32 i = lo; i < lo + len; i++)"));
+    }
+
+    // Interpret the ported straight-line formula source over arkworks fields. This
+    // checks the actual expressions, not a second handwritten formula, but is not
+    // NVRTC compilation or device arithmetic validation.
+    fn formula_body<'a>(src: &'a str, signature: &str) -> &'a str {
+        src.split(signature)
+            .nth(1)
+            .unwrap()
+            .split('{')
+            .nth(1)
+            .unwrap()
+            .split("return r;")
+            .next()
+            .unwrap()
+    }
+
+    fn eval<F: ark_ff::Field>(expr: &str, vars: &HashMap<String, F>, b3: F) -> F {
+        let expr = expr.trim();
+        let Some((op, args)) = expr.split_once('(') else {
+            return vars[expr];
+        };
+        let args = args.strip_suffix(')').unwrap();
+        let mut depth = 0;
+        let comma = args.char_indices().find_map(|(i, ch)| {
+            match ch {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                ',' if depth == 0 => return Some(i),
+                _ => {}
+            }
+            None
+        });
+        let (a, b) = match comma {
+            Some(i) => (&args[..i], Some(&args[i + 1..])),
+            None => (args, None),
+        };
+        let a = eval(a, vars, b3);
+        match op {
+            "f_sqr" => a.square(),
+            "f_mul_b3" => a * b3,
+            "f_add" => a + eval(b.unwrap(), vars, b3),
+            "f_sub" => a - eval(b.unwrap(), vars, b3),
+            "f_mul" => a * eval(b.unwrap(), vars, b3),
+            _ => panic!("unexpected formula operation {op}"),
+        }
+    }
+
+    fn formula<F: ark_ff::Field>(signature: &str, points: &[(&str, [F; 3])], b3: F) -> [F; 3] {
+        let mut vars = HashMap::new();
+        for (name, coords) in points {
+            for (coord, value) in ["x", "y", "z"].into_iter().zip(coords) {
+                vars.insert(format!("{name}.{coord}"), *value);
+            }
+        }
+        for line in formula_body(kernels::MSM_CU, signature).lines() {
+            let line = line.split("//").next().unwrap().trim();
+            if let Some((name, rhs)) = line.split_once(" = ") {
+                let name = name.strip_prefix("F ").unwrap_or(name);
+                let value = eval(rhs.trim_end_matches(';'), &vars, b3);
+                vars.insert(name.into(), value);
+            }
+        }
+        [vars["r.x"], vars["r.y"], vars["r.z"]]
+    }
+
+    fn check_complete<C: ark_ec::short_weierstrass::SWCurveConfig>() {
+        use ark_ec::short_weierstrass::Affine;
+        use ark_ec::{AffineRepr, CurveGroup};
+        let gen = Affine::<C>::generator();
+        let points = [
+            Affine::<C>::zero(),
+            gen,
+            -gen,
+            (gen * C::ScalarField::from(2u64)).into_affine(),
+            (gen * C::ScalarField::from(13u64)).into_affine(),
+        ];
+        let b3 = C::COEFF_B * C::BaseField::from(3u64);
+        let homogeneous = |p: Affine<C>, scale: C::BaseField| {
+            if p.is_zero() {
+                [C::BaseField::ZERO, scale, C::BaseField::ZERO]
+            } else {
+                [p.x * scale, p.y * scale, scale]
+            }
+        };
+        let check = |p: [C::BaseField; 3], want: Affine<C>| {
+            if want.is_zero() {
+                assert!(p[0].is_zero() && p[2].is_zero() && !p[1].is_zero());
+            } else {
+                assert!(!p[2].is_zero());
+                assert_eq!(p[0], want.x * p[2]);
+                assert_eq!(p[1], want.y * p[2]);
+            }
+        };
+        for a in points {
+            for scale in [1, 7, 23] {
+                let aa = homogeneous(a, C::BaseField::from(scale));
+                check(
+                    formula("pt_dbl(Proj<F> p)", &[("p", aa)], b3),
+                    (a + a).into_affine(),
+                );
+                for b in points {
+                    let bb = homogeneous(b, C::BaseField::from(11u64));
+                    check(
+                        formula("pt_add(Proj<F> a, Proj<F> b)", &[("a", aa), ("b", bb)], b3),
+                        (a + b).into_affine(),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn complete_helpers_and_fixed_fold_are_mechanical_metal_ports() {
+        let metal = include_str!("../../metal/src/shaders/msm.metal");
+        let normalize = |s: &str| {
+            let s = s
+                .lines()
+                .map(|l| l.split("//").next().unwrap())
+                .collect::<Vec<_>>()
+                .join("\n");
+            s.replace("__device__ __forceinline__ ", "")
+                .replace("inline ", "")
+                .replace("__constant__", "constant")
+                .replace("u32", "uint")
+                .replace("31u - clz(k)", "msm_hibit(k)")
+                .replace(
+                    "select(b.v[i], a.v[i], take_a)",
+                    "(take_a ? a.v[i] : b.v[i])",
+                )
+                .replace("msm_min(", "min(")
+                .replace("f.slots", "f.x")
+                .replace("f.groups", "f.y")
+                .replace("f.len", "f.z")
+                .replace("f.last", "f.w")
+                .split_whitespace()
+                .collect::<String>()
+        };
+        let helpers = |s: &'static str| {
+            s.split("template <typename F>\nstruct Proj {")
+            .nth(1).unwrap().split("// ---------------------------------------------------------------------------").next().unwrap()
+        };
+        assert_eq!(
+            normalize(helpers(kernels::MSM_CU)),
+            normalize(helpers(metal))
+        );
+        let cuda_fold = kernels::MSM_CU
+            .split("u32 m_in = f.slots;")
+            .nth(1)
+            .unwrap()
+            .split("extern \"C\" __global__ void msm_fold_g1")
+            .next()
+            .unwrap();
+        let metal_fold = metal
+            .split("uint m_in = f.x;")
+            .nth(1)
+            .unwrap()
+            .split("kernel void msm_fold_g1")
+            .next()
+            .unwrap();
+        assert_eq!(normalize(cuda_fold), normalize(metal_fold));
+    }
+
+    #[test]
+    fn complete_formulas_match_arkworks_and_the_validated_metal_source() {
+        use ark_ec::short_weierstrass::SWCurveConfig;
+        use snarkrs_field::{g1, g2, Fq};
+        check_complete::<g1::Config>();
+        check_complete::<g2::Config>();
+        let b3 = g2::Config::COEFF_B * snarkrs_field::Fq2::from(3u64);
+        let packed = PackedFq2::from_fq2(&b3);
+        for (name, fq) in [("FQ2_G2_B3_C0", packed.c0), ("FQ2_G2_B3_C1", packed.c1)] {
+            let words = as_words(std::slice::from_ref(&fq));
+            let values = words
+                .iter()
+                .map(|w| format!("0x{w:08x}u"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            assert!(kernels::MSM_CU.contains(&format!("{name}[8] = {{ {values} }};")));
+        }
+        assert_eq!(g1::Config::COEFF_B * Fq::from(3u64), Fq::from(9u64));
+        let metal = include_str!("../../metal/src/shaders/msm.metal");
+        for signature in ["pt_add(Proj<F> a, Proj<F> b)", "pt_dbl(Proj<F> p)"] {
+            assert_eq!(
+                formula_body(kernels::MSM_CU, signature),
+                formula_body(metal, signature)
+            );
+        }
+    }
 
     #[test]
     fn job_ranges_reject_scalar_overflow() {
@@ -1756,6 +2452,8 @@ mod tests {
             "msm_segmented_g2",
             "msm_merge_g1",
             "msm_merge_g2",
+            "msm_fold_g1",
+            "msm_fold_g2",
             "msm_reduce_g1",
             "msm_reduce_g2",
             "msm_ones_g1",

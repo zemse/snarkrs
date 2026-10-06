@@ -51,21 +51,28 @@ pub fn make_backend(kind: BackendKind) -> Result<Box<dyn Backend>> {
     }
 }
 
-/// [`make_backend`] with MSMs whose cost follows the key and not the witness, behind
-/// `prove --constant-work`. Implemented for cpu, metal and wgpu; cuda is refused rather
-/// than ignored, because a backend that proved in variable time under this flag would read
-/// as a promise it did not keep.
+/// [`make_backend`] with fixed-work MSM scheduling behind `prove --constant-work`.
+/// This is not a constant-time guarantee; see each backend's work-mode contract.
 pub fn make_constant_work_backend(kind: BackendKind) -> Result<Box<dyn Backend>> {
     match kind {
         BackendKind::Cpu => Ok(Box::new(CpuBackend::constant_work())),
         BackendKind::Wgpu => wgpu_constant_work_backend(),
         BackendKind::Metal => metal_constant_work_backend(),
-        BackendKind::Cuda => anyhow::bail!(
-            "--constant-work is implemented for the cpu, metal and wgpu backends only; the {} \
-             MSMs still skip zero and one scalars",
-            kind.as_str()
-        ),
+        BackendKind::Cuda => cuda_constant_work_backend(),
     }
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_constant_work_backend() -> Result<Box<dyn Backend>> {
+    Ok(Box::new(
+        snarkrs_cuda::CudaBackend::constant_work()
+            .map_err(|e| anyhow::anyhow!("backend `cuda` is unavailable: {e}"))?,
+    ))
+}
+
+#[cfg(not(feature = "cuda"))]
+fn cuda_constant_work_backend() -> Result<Box<dyn Backend>> {
+    cuda_backend()
 }
 
 #[cfg(feature = "wgpu")]

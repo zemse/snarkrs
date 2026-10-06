@@ -253,6 +253,7 @@ type Pool = Arc<Mutex<Vec<Scratch>>>;
 /// warm/cold distinction: NVRTC compiling the stages unit and the key upload are both
 /// prepare-time costs and neither may be paid again per proof.
 pub struct CudaStages {
+    work: crate::msm::Work,
     ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
     /// Kept alive explicitly. `CudaFunction` holds an `Arc<CudaModule>` internally so this
@@ -294,6 +295,12 @@ pub struct CudaStages {
 }
 
 impl CudaStages {
+    /// Disable witness classification while preserving the reuse fingerprint.
+    pub fn constant_work(mut self) -> Self {
+        self.work = crate::msm::Work::Constant;
+        self
+    }
+
     /// Compiles `kernels::unit_stages()` and uploads everything witness independent.
     ///
     /// The compile is the expensive half: NVRTC over the gather plus NTT plus pointwise
@@ -422,6 +429,7 @@ impl CudaStages {
         let coset_pows = up_fr(&pows)?;
 
         Ok(Self {
+            work: crate::msm::Work::Variable,
             row_ptr,
             signal,
             value,
@@ -557,10 +565,10 @@ impl CudaStages {
             };
             PackedFr::pack_into(witness, dst);
         }
-        // Classify and fingerprint while the witness is hot in cache. The prefix is what
+        // Fingerprint, and classify only in variable work. The prefix is what
         // lets the MSM stage size its windows for the general scalars only; the fold is
         // what lets it prove the witness it was handed is the one this scratch holds.
-        let (witness_prefix, witness_fold) = classify_witness(witness);
+        let (witness_prefix, witness_fold) = witness_metadata(witness, self.work);
         let pack_us = start.elapsed().as_micros() as u64;
 
         let fused = std::env::var_os("G16_CUDA_UNFUSED").is_none();
@@ -951,30 +959,29 @@ fn elapsed_us(start: &CudaEvent, end: &CudaEvent) -> Result<u64, ProveError> {
 // The device-resident result
 // ---------------------------------------------------------------------------
 
-/// The general-scalar prefix counts and an order-dependent fold of the raw limbs, in that
-/// order.
+/// An order-dependent fold of the raw limbs, without scalar classification.
 ///
 /// The fold is an integrity tag, not a cryptographic hash: it exists to catch the caller
 /// handing `msms` a different witness than the one `compute_h` converted (an API misuse
 /// that would otherwise silently prove the wrong statement), and an accidental collision
 /// under random data is a 2^-64 event. An adversary who controls the witness controls
 /// both sides of the comparison anyway, so nothing is entrusted to it.
-fn classify_witness(witness: &[snarkrs_field::Fr]) -> (Vec<u32>, u64) {
-    use ark_ff::{One, Zero};
-    let mut prefix = Vec::with_capacity(witness.len() + 1);
-    let mut general = 0u32;
+fn witness_fingerprint(witness: &[Fr]) -> u64 {
     let mut fold = 0xcbf29ce484222325u64;
-    prefix.push(0);
     for s in witness {
-        if !(s.is_zero() || s.is_one()) {
-            general += 1;
-        }
-        prefix.push(general);
         for &l in &s.0 .0 {
             fold = (fold.rotate_left(5) ^ l).wrapping_mul(0x100000001b3);
         }
     }
-    (prefix, fold)
+    fold
+}
+
+fn witness_metadata(witness: &[Fr], work: crate::msm::Work) -> (Vec<u32>, u64) {
+    // Preserve witness_std_for's slice API. These bounds also safely size a
+    // variable MSM, whose ones pass scans independently of the prefix.
+    let prefix = crate::msm::scalar_prefix(witness, work)
+        .unwrap_or_else(|| (0..=witness.len() as u32).collect());
+    (prefix, witness_fingerprint(witness))
 }
 
 /// What [`snarkrs_groth16::HPoly::Device`] carries out of stage 4, under the tag [`TAG`].
@@ -992,7 +999,7 @@ pub struct HHandle {
     stream: Arc<CudaStream>,
     len: usize,
     /// `witness_prefix[i]` = how many of the first `i` witness scalars are neither 0 nor
-    /// 1, built during the `compute_h` pack. Consumed by [`Self::witness_std_for`].
+    /// 1, or the conservative bound `i` under constant work. Used by [`Self::witness_std_for`].
     witness_prefix: Vec<u32>,
     /// Order-dependent fold of the witness limbs, the cheap identity check behind
     /// [`Self::witness_std_for`].
@@ -1045,7 +1052,7 @@ impl HHandle {
         if witness.len() != self.n_vars {
             return None;
         }
-        let (_, fold) = classify_witness(witness);
+        let fold = witness_fingerprint(witness);
         if fold != self.witness_fold {
             return None;
         }
@@ -1098,6 +1105,42 @@ impl Drop for HHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn constant_metadata_preserves_fingerprint_without_classification() {
+        use crate::msm::Work;
+        let witness = [
+            Fr::from(0u64),
+            Fr::from(1u64),
+            Fr::from(2u64),
+            -Fr::from(1u64),
+        ];
+        let variable = witness_metadata(&witness, Work::Variable);
+        let constant = witness_metadata(&witness, Work::Constant);
+        assert_eq!(variable.0, [0, 0, 0, 1, 2]);
+        assert_eq!(constant.0, [0, 1, 2, 3, 4]);
+        assert!(crate::msm::scalar_prefix(&witness, Work::Constant).is_none());
+        let old_fold = witness
+            .iter()
+            .flat_map(|s| s.0 .0)
+            .fold(0xcbf29ce484222325u64, |fold, limb| {
+                (fold.rotate_left(5) ^ limb).wrapping_mul(0x100000001b3)
+            });
+        assert_eq!(variable.1, old_fold);
+        assert_eq!(constant.1, old_fold);
+        assert_eq!(witness_fingerprint(&[]), 0xcbf29ce484222325u64);
+        let mut changed = witness;
+        changed.swap(0, 1);
+        assert_ne!(witness_fingerprint(&changed), old_fold);
+        changed[3] += Fr::from(1u64);
+        assert_ne!(witness_fingerprint(&changed), old_fold);
+        // A conservative prefix never underallocates a variable job at an offset.
+        for lo in 0..=witness.len() {
+            for hi in lo..=witness.len() {
+                assert!(constant.0[hi] - constant.0[lo] >= variable.0[hi] - variable.0[lo]);
+            }
+        }
+    }
 
     /// The split must cover every pass exactly once, in order, with no batch wider than the
     /// shared-memory budget. Everything downstream indexes twiddles off `s0`, so an overlap

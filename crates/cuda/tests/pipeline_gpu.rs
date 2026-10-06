@@ -221,6 +221,82 @@ fn for_each(test: &str, f: impl Fn(&Fixture)) {
     }
 }
 
+/// Explicit NVIDIA gate: pinned proofs, witness reuse and resident H in constant work.
+#[test]
+#[ignore = "requires NVIDIA and circuit artifacts; no silent skip"]
+fn constant_work_proof_and_resident_h_match_cpu_and_variable() {
+    let dirs = artifact_dirs();
+    assert!(!dirs.is_empty(), "NVIDIA proof gate requires artifacts");
+    let variable = CudaBackend::new().expect("NVIDIA proof gate requires CUDA");
+    let cpu = CpuBackend::new();
+    let mut fixtures = Vec::new();
+    for (name, dir) in dirs {
+        let load = || ProvingKey::load(&dir.join("circuit.zkey")).unwrap();
+        let variable = variable.prepare(load()).unwrap();
+        let cpu = cpu.prepare(load()).unwrap();
+        fixtures.push((name, dir, variable, cpu));
+    }
+    let constant = variable.with_constant_work();
+    for (name, dir, variable, cpu) in fixtures {
+        let circuit = constant
+            .prepare(ProvingKey::load(&dir.join("circuit.zkey")).unwrap())
+            .unwrap();
+        let witness = Witness::load(&dir.join("circuit.wtns")).unwrap().0;
+        let vk = VerifyingKey::from_json(&dir.join("vkey.json")).unwrap();
+        let mut t = StageTimings::default();
+        let h = circuit.compute_h(&witness, &mut t).unwrap();
+        let handle = h
+            .device_handle::<HHandle>(TAG)
+            .expect("H must stay resident");
+        let (_, prefix) = handle
+            .witness_std_for(&witness)
+            .expect("same witness must reuse");
+        assert_eq!(prefix, (0..=witness.len() as u32).collect::<Vec<_>>());
+        let mut changed = witness.clone();
+        changed[0] += Fr::from(1u64);
+        assert!(handle.witness_std_for(&changed).is_none());
+        assert!(handle
+            .witness_std_for(&witness[..witness.len() - 1])
+            .is_none());
+        let want_h = cpu.compute_h(&witness, &mut t).unwrap();
+        let host_h = want_h.to_host().unwrap();
+        assert_eq!(handle.to_host().unwrap(), host_h, "{name}");
+        assert_eq!(handle.to_host_std().unwrap().unwrap(), host_h, "{name}");
+        let a = circuit.msms(&witness, &h, &mut t).unwrap();
+        let b = circuit.msms(&witness, &want_h, &mut t).unwrap();
+        // Constant-stage conservative prefix metadata must remain safe for a variable MSM.
+        let c = variable.msms(&witness, &h, &mut t).unwrap();
+        let d = cpu.msms(&witness, &want_h, &mut t).unwrap();
+        for got in [a, b, c] {
+            assert_eq!(got.a_g1, d.a_g1);
+            assert_eq!(got.b_g2, d.b_g2);
+            assert_eq!(got.b_g1, d.b_g1);
+            assert_eq!(got.l_g1, d.l_g1);
+            assert_eq!(got.h_g1, d.h_g1);
+        }
+        for (r, s) in [(0u64, 0u64), (31337, 4242)] {
+            let prove = |backend: &dyn PreparedCircuit| {
+                prove_with_blinders(
+                    backend,
+                    &witness,
+                    Fr::from(r),
+                    Fr::from(s),
+                    &mut StageTimings::default(),
+                )
+                .unwrap()
+            };
+            let want = prove(cpu.as_ref());
+            for backend in [circuit.as_ref(), variable.as_ref()] {
+                let got = prove(backend);
+                assert_eq!(got.a, want.a, "{name}");
+                assert_eq!(got.b, want.b, "{name}");
+                assert_eq!(got.c, want.c, "{name}");
+                verify(&vk, &witness[1..=circuit.n_public()], &got).unwrap();
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The proof
 // ---------------------------------------------------------------------------

@@ -48,6 +48,167 @@ use snarkrs_groth16::prove::prove_with_blinders;
 use snarkrs_groth16::verify::verify;
 use snarkrs_groth16::{Backend, PreparedCircuit, Proof, StageTimings};
 
+/// NVIDIA gate for the source port. An explicitly requested run must not silently skip.
+#[test]
+#[ignore = "requires NVIDIA NVRTC/PTX and device arithmetic validation"]
+fn constant_work_matches_cpu_and_variable_for_both_groups() {
+    use snarkrs_cuda::as_words;
+    use snarkrs_cuda::msm::Scalars;
+    use snarkrs_gpu_layout::{PackedFr, PackedScalar};
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let cuda = Cuda::new(0).expect("NVIDIA gate requires a usable device");
+    let module = CudaMsm::compile(&cuda).expect("NVRTC/PTX compilation");
+    let variable = CudaMsm::from_module(&cuda, module.clone()).unwrap();
+    let constant = CudaMsm::from_module(&cuda, module).unwrap().constant_work();
+    assert!(dirty_the_pool(&cuda) > 0);
+    let mut seed = 0x921bu64;
+    for n in [0, 1, 63, 64, 65, 4097] {
+        let g1 = G1Projective::generator().into_affine();
+        let g2 = G2Projective::generator().into_affine();
+        let b1: Vec<_> = (0..n + 3)
+            .map(|i| match i % 5 {
+                0 => G1Affine::identity(),
+                1 => -g1,
+                _ => g1,
+            })
+            .collect();
+        let b2: Vec<_> = (0..n + 3)
+            .map(|i| match i % 5 {
+                0 => G2Affine::identity(),
+                1 => -g2,
+                _ => g2,
+            })
+            .collect();
+        let db1 = constant.upload_g1_bases(&b1).unwrap();
+        let db2 = constant.upload_g2_bases(&b2).unwrap();
+        let patterns = [
+            vec![Fr::zero(); n],
+            vec![Fr::one(); n],
+            (0..n).map(|i| Fr::from((i % 2) as u64)).collect(),
+            (0..n)
+                .map(|i| if i % 64 == 0 { -Fr::one() } else { Fr::zero() })
+                .collect(),
+            (0..n).map(|_| rand_fr(&mut seed)).collect(),
+            vec![-Fr::one(); n],
+        ];
+        for values in patterns {
+            let want1 = naive_g1(&b1[3..], &values);
+            let want2 = naive_g2(&b2[3..], &values);
+            let mut padded = vec![Fr::from(19u64), Fr::from(23u64)];
+            padded.extend_from_slice(&values);
+            let classified = variable.upload_scalars(&padded).unwrap();
+            let unclassified = constant.upload_scalars(&padded).unwrap();
+            let std_words = PackedScalar::pack_slice(&padded);
+            let std = cuda.stream().clone_htod(as_words(&std_words)).unwrap();
+            let mont_words = PackedFr::pack_slice(&padded);
+            let mont = cuda.stream().clone_htod(as_words(&mont_words)).unwrap();
+            cuda.stream().synchronize().unwrap();
+            let converted = constant
+                .scalars_from_device_mont(&mont, padded.len())
+                .unwrap();
+            let stale_prefix = vec![0; padded.len() + 1];
+            for scalars in [
+                classified.as_scalars(),
+                unclassified.as_scalars(),
+                Scalars::device_std(&std, padded.len()).unwrap(),
+                converted.as_scalars(),
+                Scalars::device_std_with_prefix(&std, padded.len(), &stale_prefix).unwrap(),
+            ] {
+                let half = n / 2;
+                // The first three jobs share a plan across groups. The suffix is a
+                // distinct offset/length plan over the very same scalar handle.
+                let jobs = [
+                    Job::G1(JobG1 {
+                        bases: &db1,
+                        base_off: 3,
+                        scalars,
+                        scalar_off: 2,
+                        n,
+                    }),
+                    Job::G2(JobG2 {
+                        bases: &db2,
+                        base_off: 3,
+                        scalars,
+                        scalar_off: 2,
+                        n,
+                    }),
+                    Job::G1(JobG1 {
+                        bases: &db1,
+                        base_off: 3,
+                        scalars,
+                        scalar_off: 2,
+                        n,
+                    }),
+                    Job::G2(JobG2 {
+                        bases: &db2,
+                        base_off: 3 + half,
+                        scalars,
+                        scalar_off: 2 + half,
+                        n: n - half,
+                    }),
+                ];
+                let got = constant.msm_batch(&jobs).unwrap();
+                assert_eq!(got[0].g1().unwrap(), want1);
+                assert_eq!(got[1].g2().unwrap(), want2);
+                assert_eq!(got[2].g1().unwrap(), want1);
+                assert_eq!(
+                    got[3].g2().unwrap(),
+                    naive_g2(&b2[3 + half..], &values[half..])
+                );
+            }
+            let scalars = classified.as_scalars();
+            assert_eq!(
+                variable
+                    .msm(Job::G1(JobG1 {
+                        bases: &db1,
+                        base_off: 3,
+                        scalars,
+                        scalar_off: 2,
+                        n
+                    }))
+                    .unwrap()
+                    .g1()
+                    .unwrap(),
+                want1
+            );
+            assert_eq!(
+                variable
+                    .msm(Job::G2(JobG2 {
+                        bases: &db2,
+                        base_off: 3,
+                        scalars,
+                        scalar_off: 2,
+                        n
+                    }))
+                    .unwrap()
+                    .g2()
+                    .unwrap(),
+                want2
+            );
+        }
+    }
+    for scalars in [vec![Fr::one(); 65], vec![-Fr::one(); 65]] {
+        assert_eq!(
+            run_g1(&constant, &vec![G1Affine::identity(); 65], &scalars),
+            G1Projective::zero()
+        );
+        assert_eq!(
+            run_g2(&constant, &vec![G2Affine::identity(); 65], &scalars),
+            G2Projective::zero()
+        );
+    }
+    let g1 = G1Projective::generator().into_affine();
+    let g2 = G2Projective::generator().into_affine();
+    assert_eq!(
+        run_g1(&constant, &[g1, -g1], &[Fr::one(); 2]),
+        G1Projective::zero()
+    );
+    assert_eq!(
+        run_g2(&constant, &[g2, -g2], &[Fr::one(); 2]),
+        G2Projective::zero()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------

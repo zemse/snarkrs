@@ -62,7 +62,7 @@ use snarkrs_formats::ProvingKey;
 use snarkrs_groth16::{Backend, HPoly, MsmOutputs, PreparedCircuit, ProveError, StageTimings};
 
 use crate::context::Cuda;
-use crate::msm::CudaMsm;
+use crate::msm::{CudaMsm, Work};
 use crate::stages::{CudaStages, HHandle, TAG};
 
 fn bad(reason: impl Into<String>) -> ProveError {
@@ -93,6 +93,7 @@ pub struct PrepareCost {
 /// expensive, and [`Self::prepare`] shares them by handing each circuit an `Arc` of the
 /// same module rather than by duplicating anything.
 pub struct CudaBackend {
+    work: Work,
     cuda: Cuda,
     stages_module: Arc<CudaModule>,
     msm_module: Arc<CudaModule>,
@@ -100,6 +101,17 @@ pub struct CudaBackend {
 }
 
 impl CudaBackend {
+    /// Opt-in fixed-work proving, not constant time. See [`Work::Constant`].
+    pub fn constant_work() -> Result<Self, ProveError> {
+        Ok(Self::new()?.with_constant_work())
+    }
+
+    /// Select constant work for circuits prepared after this call.
+    pub fn with_constant_work(mut self) -> Self {
+        self.work = Work::Constant;
+        self
+    }
+
     /// Opens device 0, or the ordinal in `G16_CUDA_DEVICE`, and compiles every kernel.
     ///
     /// Fails on a machine with no usable NVIDIA device rather than falling back to the
@@ -146,6 +158,7 @@ impl CudaBackend {
         }
 
         Ok(Self {
+            work: Work::Variable,
             cuda,
             stages_module,
             msm_module,
@@ -274,6 +287,11 @@ impl CudaCircuit {
         // in-flight proof down with it.
         let t0 = Instant::now();
         let stages = CudaStages::from_module(&backend.cuda, backend.stages_module.clone(), &pk)?;
+        let stages = if backend.work == Work::Constant {
+            stages.constant_work()
+        } else {
+            stages
+        };
         let stages_us = t0.elapsed().as_micros() as u64;
 
         // Stages 5 to 9. Repacking, not casting: `ark_ec::G1Affine` is 72 bytes on this
@@ -281,6 +299,11 @@ impl CudaCircuit {
         // flag that the packed layout encodes as all-zero coordinates instead.
         let t1 = Instant::now();
         let msm = CudaMsm::from_module(&backend.cuda, backend.msm_module.clone())?.with_key(&pk)?;
+        let msm = if backend.work == Work::Constant {
+            msm.constant_work()
+        } else {
+            msm
+        };
         let bases_us = t1.elapsed().as_micros() as u64;
 
         let cost = PrepareCost {
