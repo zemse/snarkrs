@@ -7,6 +7,13 @@ mod guards;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use snarkrs_cli::json;
+use snarkrs_field::Fr;
+use snarkrs_formats::{wtns::Witness, ProvingKey, VerifyingKey};
+use snarkrs_groth16::prove::prove_unchecked;
+use snarkrs_groth16::verify::verify;
+use snarkrs_groth16::{Backend, Proof, ProveError, StageTimings};
+
 const REQUIRED: [&str; 1] = ["large/js_384x384_d32"];
 const DOMAIN: usize = 1 << 22;
 
@@ -21,6 +28,85 @@ fn text(o: &Output) -> String {
         String::from_utf8_lossy(&o.stdout),
         String::from_utf8_lossy(&o.stderr)
     )
+}
+
+fn proof_on_backend(
+    backend: &dyn Backend,
+    key: ProvingKey,
+    witness: &[Fr],
+    timings: &mut StageTimings,
+) -> Result<(Proof, Vec<Fr>), ProveError> {
+    let circuit = backend.prepare(key)?;
+    assert_eq!(circuit.backend_name(), backend.name());
+    let proof = prove_unchecked(
+        circuit.as_ref(),
+        witness,
+        &mut ark_std::rand::rngs::OsRng,
+        timings,
+    )?;
+    Ok((proof, witness[1..=circuit.n_public()].to_vec()))
+}
+
+#[test]
+fn proof_uses_the_supplied_backend_instance() {
+    use snarkrs_field::{G1Affine, G2Affine};
+    use snarkrs_formats::Coefficients;
+    use snarkrs_groth16::PreparedCircuit;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Inspected(AtomicUsize);
+    impl Backend for Inspected {
+        fn name(&self) -> &'static str {
+            "mock-inspected"
+        }
+        fn prepare(&self, _: ProvingKey) -> Result<Box<dyn PreparedCircuit>, ProveError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(ProveError::Backend {
+                backend: "mock-inspected",
+                reason: "inspected instance".into(),
+            })
+        }
+    }
+    let inspected = Inspected(AtomicUsize::new(0));
+    let other = Inspected(AtomicUsize::new(0));
+    let g1 = G1Affine::identity();
+    let g2 = G2Affine::identity();
+    let key = ProvingKey {
+        n_vars: 1,
+        n_public: 0,
+        domain_size: 1,
+        alpha_g1: g1,
+        beta_g1: g1,
+        beta_g2: g2,
+        delta_g1: g1,
+        delta_g2: g2,
+        a_query: vec![g1],
+        b_g1_query: vec![g1],
+        b_g2_query: vec![g2],
+        l_query: vec![],
+        h_query: vec![g1],
+        coeffs: Coefficients {
+            row_ptr: [vec![0, 0], vec![0, 0]],
+            signal: [vec![], vec![]],
+            value: [vec![], vec![]],
+        },
+        vk: VerifyingKey {
+            alpha_g1: g1,
+            beta_g2: g2,
+            gamma_g2: g2,
+            delta_g2: g2,
+            ic: vec![g1],
+        },
+    };
+    let result = proof_on_backend(
+        &inspected,
+        key,
+        &[Fr::from(1u64)],
+        &mut StageTimings::default(),
+    );
+    assert!(guards::validation_rejection(&result, "inspected instance"));
+    assert_eq!(inspected.0.load(Ordering::SeqCst), 1);
+    assert_eq!(other.0.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -72,98 +158,59 @@ fn every_backend_proves_the_large_artifacts() {
         "UNAVAILABLE: independent verifier preflight: {}",
         text(&preflight)
     );
-    #[cfg(feature = "wgpu")]
-    if s.backend == "wgpu" {
-        let p = snarkrs_wgpu::WgpuProver::new().expect("UNAVAILABLE: WGPU device preflight");
-        let d = p.device();
-        eprintln!(
-            "preflight_device={:?}\n{}\nauto_fallback={:?}",
-            d.adapter_info(),
-            d.limits_table(),
-            d.auto_fallback()
-        );
-        assert!(
-            matches!(
-                format!("{:?}", d.adapter_info().device_type).as_str(),
-                "DiscreteGpu" | "IntegratedGpu"
-            ),
-            "UNAVAILABLE: software/unknown adapter is not physical GPU evidence"
-        );
-        if s.profile == "auto" {
-            let caps = d.granted_limits();
-            assert!(
-                d.auto_fallback().is_none()
-                    && caps.max_buffer_size > 256 * 1024 * 1024
-                    && caps.max_storage_buffer_binding_size > 128 * 1024 * 1024,
-                "UNAVAILABLE: Auto fell back or did not raise capacity"
-            );
-        }
-    }
     let revision = run(Command::new("git").args(["rev-parse", "HEAD"]));
     assert!(revision.status.success());
-    eprintln!("revision={} backend={} work={} profile={} physical_device=unattested (retain CLI device diagnostics)", String::from_utf8_lossy(&revision.stdout).trim(), s.backend, s.work, s.profile);
+    eprintln!(
+        "revision={} backend={} work={} profile={}",
+        String::from_utf8_lossy(&revision.stdout).trim(),
+        s.backend,
+        s.work,
+        s.profile
+    );
+    let backend = guards::backend(s);
     let out = std::env::temp_dir().join(format!("snarkrs-large-{}", std::process::id()));
     std::fs::create_dir_all(&out).unwrap();
     let mut completed = 0;
     for name in REQUIRED {
         let dir = root.join(name);
-        let key = snarkrs_formats::ProvingKey::load(&dir.join("circuit.zkey")).unwrap();
+        let key = ProvingKey::load(&dir.join("circuit.zkey")).unwrap();
         assert_eq!(
             key.domain_size, DOMAIN,
             "UNAVAILABLE: unexpected required domain"
         );
-        drop(key);
-        let reference = snarkrs_cli::json::read_public(&dir.join("public.json")).unwrap();
-        let proof = out.join("proof.json");
-        let public = out.join("public.json");
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_snarkrs"));
-        cmd.args(["groth16", "prove"])
-            .arg(dir.join("circuit.zkey"))
-            .arg(dir.join("circuit.wtns"))
-            .arg(&proof)
-            .arg(&public)
-            .args([
-                "--backend",
-                s.backend,
-                "--fallback",
-                "false",
-                "--self-verify",
-                "false",
-                "--stage-timings",
-            ]);
-        if s.work == "constant" {
-            cmd.arg("--constant-work");
-        }
-        let o = run(&mut cmd);
-        eprintln!("fixture={name} domain={DOMAIN}:\n{}", text(&o));
-        assert!(
-            o.status.success(),
-            "proof failed (OOM/timeout/panic/device errors are NOT expected capacity refusals): {}",
-            text(&o)
-        );
-        assert_eq!(snarkrs_cli::json::read_public(&public).unwrap(), reference);
-        let o = run(Command::new(env!("CARGO_BIN_EXE_snarkrs"))
-            .args(["groth16", "verify"])
-            .arg(dir.join("vkey.json"))
-            .arg(&public)
-            .arg(&proof));
-        assert!(
-            o.status.success() && text(&o).contains("OK"),
-            "own verifier rejected: {}",
-            text(&o)
-        );
+        let witness = Witness::load(&dir.join("circuit.wtns")).unwrap().0;
+        let vk = VerifyingKey::from_json(&dir.join("vkey.json")).unwrap();
+        let reference = json::read_public(&dir.join("public.json")).unwrap();
+        let mut timings = StageTimings::default();
+        let (proof, public) = proof_on_backend(backend.as_ref(), key, &witness, &mut timings)
+            .expect(
+                "proof failed (OOM/timeout/panic/device errors are NOT expected capacity refusals)",
+            );
+        assert_eq!(public, reference);
+        let proof_path = out.join("proof.json");
+        let public_path = out.join("public.json");
+        json::write_proof(&proof_path, &proof).unwrap();
+        json::write_public(&public_path, &public).unwrap();
+        let serialized_public = json::read_public(&public_path).unwrap();
+        assert_eq!(serialized_public, reference);
+        verify(
+            &vk,
+            &serialized_public,
+            &json::read_proof(&proof_path).unwrap(),
+        )
+        .expect("own verifier rejected serialized proof");
         let o = run(Command::new(&verifier)
             .args(["groth16", "verify"])
             .arg(dir.join("vkey.json"))
-            .arg(&public)
-            .arg(&proof));
+            .arg(&public_path)
+            .arg(&proof_path));
         assert!(
             o.status.success() && text(&o).contains("OK!"),
             "independent verifier rejected: {}",
             text(&o)
         );
         completed += 1;
-        eprintln!("PASS fixture={name} domain={DOMAIN} proof+public+own+independent=accepted");
+        eprintln!("PASS fixture={name} domain={DOMAIN} same-inspected-instance+proof+public+own+independent=accepted timings={timings:?}");
     }
     std::fs::remove_dir_all(&out).unwrap();
     assert_eq!(completed, REQUIRED.len());

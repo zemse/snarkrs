@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use ark_ec::CurveGroup;
-use snarkrs_cli::{json, make_backend, make_constant_work_backend, BackendKind};
+use snarkrs_cli::{json, make_backend, BackendKind};
 use snarkrs_field::Fr;
 use snarkrs_formats::{wtns::Witness, ProvingKey, VerifyingKey};
 use snarkrs_groth16::prove::prove_with_blinders;
@@ -20,74 +20,6 @@ fn root() -> PathBuf {
     std::env::var_os("G16_CONFORMANCE_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/artifacts"))
-}
-
-fn backend(s: guards::Selection<'_>) -> Box<dyn Backend> {
-    #[cfg(feature = "wgpu")]
-    if s.backend == "wgpu" {
-        let p = if s.work == "constant" {
-            snarkrs_wgpu::WgpuProver::constant_work()
-        } else {
-            snarkrs_wgpu::WgpuProver::new()
-        }
-        .expect("UNAVAILABLE: WGPU device");
-        let d = p.device();
-        eprintln!(
-            "device={:?}\n{}\nauto_fallback={:?}",
-            d.adapter_info(),
-            d.limits_table(),
-            d.auto_fallback()
-        );
-        assert!(
-            matches!(
-                format!("{:?}", d.adapter_info().device_type).as_str(),
-                "DiscreteGpu" | "IntegratedGpu"
-            ),
-            "UNAVAILABLE: software/unknown adapter is not physical GPU evidence"
-        );
-        if s.profile == "auto" {
-            assert!(
-                d.auto_fallback().is_none(),
-                "UNAVAILABLE: Auto fell back to Floor"
-            );
-            let caps = d.granted_limits();
-            assert!(
-                caps.max_buffer_size > 256 * 1024 * 1024
-                    && caps.max_storage_buffer_binding_size > 128 * 1024 * 1024,
-                "UNAVAILABLE: Auto capacity does not exceed Floor"
-            );
-        }
-        return Box::new(p);
-    }
-    #[cfg(all(feature = "metal", target_os = "macos"))]
-    if s.backend == "metal" {
-        let p = if s.work == "constant" {
-            snarkrs_metal::MetalBackend::constant_work()
-        } else {
-            snarkrs_metal::MetalBackend::new()
-        }
-        .expect("UNAVAILABLE: Metal device");
-        eprintln!("device={}", p.device().name());
-        return Box::new(p);
-    }
-    let kind = match s.backend {
-        "cpu" => BackendKind::Cpu,
-        "metal" => BackendKind::Metal,
-        "wgpu" => BackendKind::Wgpu,
-        "cuda" => BackendKind::Cuda,
-        _ => unreachable!(),
-    };
-    let p = if s.work == "constant" {
-        make_constant_work_backend(kind)
-    } else {
-        make_backend(kind)
-    }
-    .expect("UNAVAILABLE: backend");
-    eprintln!(
-        "device={} (no device attestation exposed by factory)",
-        s.backend
-    );
-    p
 }
 
 fn independent(verifier: &Path, dir: &Path, proof: &Path, public: &Path) {
@@ -127,19 +59,32 @@ fn tiny_guards(b: &dyn Backend, c: &dyn PreparedCircuit, dir: &Path, w: &[Fr]) {
     for (name, mutate) in queries {
         let mut k = load();
         mutate(&mut k);
+        let expected = if name == "a_query" {
+            format!(
+                "a_query has {} bases, n_vars is {}",
+                k.a_query.len(),
+                k.n_vars
+            )
+        } else {
+            format!(
+                "h_query has {} bases, domain size is {}",
+                k.h_query.len(),
+                k.domain_size
+            )
+        };
         if b.name() == "cpu" {
             // CPU query shapes are checked at msms, not at the compute_h oracle boundary.
             let bad = b.prepare(k).expect("CPU stage-only prepare");
             let mut t = StageTimings::default();
             let h = bad.compute_h(w, &mut t).unwrap();
             assert!(
-                matches!(bad.msms(w, &h, &mut t), Err(ProveError::Backend { .. })),
-                "{name}: malformed query accepted by msms"
+                guards::validation_rejection(&bad.msms(w, &h, &mut t), &expected),
+                "{name}: expected deterministic input validation: {expected}"
             );
         } else {
             assert!(
-                b.prepare(k).is_err(),
-                "{name}: malformed query accepted by prepare"
+                guards::validation_rejection(&b.prepare(k), &expected),
+                "{name}: expected deterministic input validation: {expected}"
             );
         }
     }
@@ -160,7 +105,18 @@ fn tiny_guards(b: &dyn Backend, c: &dyn PreparedCircuit, dir: &Path, w: &[Fr]) {
     for (name, mutate) in mutations {
         let mut k = load();
         mutate(&mut k);
-        assert!(b.prepare(k).is_err(), "{name}: malformed key/CSR accepted");
+        let expected = if name == "n_public" {
+            format!("n_public {} exceeds n_vars {}", k.n_public, k.n_vars)
+        } else {
+            k.coeffs
+                .check_structure(k.domain_size, k.n_vars)
+                .expect_err("malformed CSR")
+                .to_string()
+        };
+        assert!(
+            guards::validation_rejection(&b.prepare(k), &expected),
+            "{name}: expected deterministic input validation: {expected}"
+        );
     }
     let mut t = StageTimings::default();
     for n in [0, 1, w.len() - 1, w.len() + 1] {
@@ -187,16 +143,35 @@ fn tiny_guards(b: &dyn Backend, c: &dyn PreparedCircuit, dir: &Path, w: &[Fr]) {
         prove_with_blinders(c, &bad, Fr::from(0u64), Fr::from(0u64), &mut t),
         Err(ProveError::ConstantWire)
     ));
+    let cpu = make_backend(BackendKind::Cpu)
+        .unwrap()
+        .prepare(load())
+        .unwrap();
+    let vk = VerifyingKey::from_json(&dir.join("vkey.json")).unwrap();
+    assert_eq!(c.n_public(), cpu.n_public());
+    let references = [(2u64, 3u64, 5u64), (7, 11, 13)].map(|(a, b, d)| {
+        let w = [1, a * b * d, a, b, d, a * b].map(Fr::from);
+        let public = w[1..=cpu.n_public()].to_vec();
+        let want = proof(cpu.as_ref(), &w, Fr::from(3u64), Fr::from(5u64));
+        verify(&vk, &public, &want).unwrap();
+        (w, public, want)
+    });
     std::thread::scope(|scope| {
-        let handles: Vec<_> = [(2u64, 3u64, 5u64), (7, 11, 13)]
+        let vk = &vk;
+        let handles: Vec<_> = references
             .into_iter()
-            .map(|(a, b, d)| {
+            .map(|(w, public, want)| {
                 scope.spawn(move || {
-                    let w = [1, a * b * d, a, b, d, a * b].map(Fr::from);
-                    let want = proof(c, &w, Fr::from(3u64), Fr::from(5u64));
-                    let got = proof(c, &w, Fr::from(3u64), Fr::from(5u64));
-                    assert_eq!((got.a, got.b, got.c), (want.a, want.b, want.c));
-                    verify(&c.key().vk, &w[1..=c.n_public()], &got).unwrap();
+                    assert_eq!(&w[1..=c.n_public()], public);
+                    for _ in 0..2 {
+                        let got = proof(c, &w, Fr::from(3u64), Fr::from(5u64));
+                        assert_eq!(
+                            (got.a, got.b, got.c),
+                            (want.a, want.b, want.c),
+                            "concurrent result differs from sequential CPU reference"
+                        );
+                        verify(vk, &public, &got).unwrap();
+                    }
                 })
             })
             .collect();
@@ -256,7 +231,7 @@ fn required_backend_conformance() {
         s.work,
         s.profile
     );
-    let b = backend(s);
+    let b = guards::backend(s);
     let cpu_backend = make_backend(BackendKind::Cpu).unwrap();
     let out = std::env::temp_dir().join(format!("snarkrs-conformance-{}", std::process::id()));
     std::fs::create_dir_all(&out).unwrap();
@@ -272,13 +247,18 @@ fn required_backend_conformance() {
         let mut t = StageTimings::default();
         let ch = cpu.compute_h(&w, &mut t).unwrap();
         let h = c.compute_h(&w, &mut t).unwrap();
+        assert!(guards::h_location(&ch, "cpu"), "{name}: CPU H must be Host");
+        assert!(
+            guards::h_location(&h, s.backend),
+            "{name}: H storage/tag does not match selected backend"
+        );
         let host = c.h_to_host(&h).expect("H readback");
         assert_eq!(host, cpu.h_to_host(&ch).unwrap(), "{name}: CPU H");
         let want = cpu.msms(&w, &ch, &mut t).unwrap();
         assert_eq!(
             c.msms(&w, &h, &mut t).unwrap(),
             want,
-            "{name}: all five resident MSMs"
+            "{name}: all five compute_h H MSMs"
         );
         assert_eq!(
             c.msms(&w, &HPoly::Host(host.clone()), &mut t).unwrap(),

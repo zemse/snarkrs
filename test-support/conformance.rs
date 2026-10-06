@@ -1,5 +1,93 @@
 use std::path::Path;
 
+use snarkrs_cli::{make_backend, make_constant_work_backend, BackendKind};
+use snarkrs_groth16::{Backend, HPoly, ProveError};
+
+pub fn backend(s: Selection<'_>) -> Box<dyn Backend> {
+    #[cfg(feature = "wgpu")]
+    if s.backend == "wgpu" {
+        assert_eq!(
+            std::env::var("G16_WGPU_LIMITS").as_deref(),
+            Ok(s.profile),
+            "UNAVAILABLE: WGPU request must match selection"
+        );
+        let p = if s.work == "constant" {
+            snarkrs_wgpu::WgpuProver::constant_work()
+        } else {
+            snarkrs_wgpu::WgpuProver::new()
+        }
+        .expect("UNAVAILABLE: WGPU device");
+        let d = p.device();
+        eprintln!(
+            "device={:?}\n{}\nauto_fallback={:?}",
+            d.adapter_info(),
+            d.limits_table(),
+            d.auto_fallback()
+        );
+        assert!(
+            matches!(
+                format!("{:?}", d.adapter_info().device_type).as_str(),
+                "DiscreteGpu" | "IntegratedGpu"
+            ),
+            "UNAVAILABLE: software/unknown adapter is not physical GPU evidence"
+        );
+        if s.profile == "auto" {
+            assert!(
+                d.auto_fallback().is_none(),
+                "UNAVAILABLE: Auto fell back to Floor"
+            );
+            let caps = d.granted_limits();
+            assert!(
+                caps.max_buffer_size > 256 * 1024 * 1024
+                    && caps.max_storage_buffer_binding_size > 128 * 1024 * 1024,
+                "UNAVAILABLE: Auto capacity does not exceed Floor"
+            );
+        }
+        return Box::new(p);
+    }
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    if s.backend == "metal" {
+        let p = if s.work == "constant" {
+            snarkrs_metal::MetalBackend::constant_work()
+        } else {
+            snarkrs_metal::MetalBackend::new()
+        }
+        .expect("UNAVAILABLE: Metal device");
+        eprintln!("device={}", p.device().name());
+        return Box::new(p);
+    }
+    let kind = match s.backend {
+        "cpu" => BackendKind::Cpu,
+        "metal" => BackendKind::Metal,
+        "wgpu" => BackendKind::Wgpu,
+        "cuda" => BackendKind::Cuda,
+        _ => unreachable!(),
+    };
+    let p = if s.work == "constant" {
+        make_constant_work_backend(kind)
+    } else {
+        make_backend(kind)
+    }
+    .expect("UNAVAILABLE: backend");
+    eprintln!(
+        "device={} (no device attestation exposed by factory)",
+        s.backend
+    );
+    p
+}
+
+pub fn h_location(h: &HPoly, backend: &str) -> bool {
+    match (backend, h) {
+        ("cpu", HPoly::Host(_)) => true,
+        ("metal" | "wgpu" | "cuda", HPoly::Device { tag, .. }) => *tag == backend,
+        _ => false,
+    }
+}
+
+pub fn validation_rejection<T>(result: &Result<T, ProveError>, expected: &str) -> bool {
+    matches!(result, Err(ProveError::Backend { reason, .. }) if reason == expected)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Selection<'a> {
     pub backend: &'a str,
@@ -60,6 +148,47 @@ pub fn files(dir: &Path, required: &[&str]) -> Result<(), &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn h_storage_and_tag_guards() {
+        let host = HPoly::Host(vec![]);
+        assert!(h_location(&host, "cpu"));
+        for backend in ["metal", "wgpu", "cuda"] {
+            assert!(!h_location(&host, backend));
+            let device = HPoly::Device {
+                tag: backend,
+                len: 0,
+                data: std::sync::Arc::new(()),
+            };
+            assert!(h_location(&device, backend));
+            assert!(!h_location(&device, "cpu"));
+            for other in ["metal", "wgpu", "cuda"] {
+                assert_eq!(h_location(&device, other), backend == other);
+            }
+        }
+    }
+
+    #[test]
+    fn device_fault_is_not_input_validation() {
+        let expected = "a_query has 5 bases, n_vars is 6";
+        let invalid: Result<(), ProveError> = Err(ProveError::Backend {
+            backend: "wgpu",
+            reason: expected.into(),
+        });
+        let fault: Result<(), ProveError> = Err(ProveError::Device {
+            backend: "wgpu",
+            reason: expected.into(),
+        });
+        let unrelated: Result<(), ProveError> = Err(ProveError::Backend {
+            backend: "wgpu",
+            reason: "device unavailable".into(),
+        });
+        assert!(validation_rejection(&invalid, expected));
+        assert!(fault.is_err());
+        assert!(!validation_rejection(&fault, expected));
+        assert!(!validation_rejection(&unrelated, expected));
+        assert!(!validation_rejection(&Ok(()), expected));
+    }
 
     #[test]
     fn selection_guards() {

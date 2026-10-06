@@ -82,15 +82,22 @@ G16_CONFORMANCE_BACKEND=cpu G16_CONFORMANCE_WORK=constant G16_CONFORMANCE_PROFIL
 ```
 
 The gate uses library APIs, with no fallback. It compares H and all five MSMs
-against CPU, resident H against host H, pinned proofs at zero/nonzero blinders,
-repeat proofs on a prepared circuit, and reference public signals. Both pinned
+against CPU, GPU-resident H against explicit host H, pinned proofs at zero/nonzero
+blinders, repeat proofs on a prepared circuit, and reference public signals.
+Before readback, CPU H must be `Host`; GPU H must be `Device` with the exact
+selected backend tag. CPU host H is not labelled resident. Both pinned
 proofs must pass our verifier and the independent process (successful exit and
 acceptance marker). Tiny also uses the independent H/MSM JSON vectors, malformed
 key/CSR guards, witness length and constant-wire guards, H length boundaries,
 and distinct valid witnesses on concurrent calls to one prepared circuit.
+The two concurrency references are computed sequentially on CPU before spawning
+workers. Each worker compares its selected-backend proofs and public statement
+to its own CPU reference at pinned blinders, then verifies against the fixture vkey.
 CPU query-shape rejection is checked at `msms`, where the CPU implementation
 validates bases; GPU query-shape rejection is checked at `prepare`. CSR/header
-rejection is checked at `prepare` for all backends.
+rejection is checked at `prepare` for all backends. Malformed keys must return
+`ProveError::Backend` with the exact input-validation reason; device faults and
+unrelated backend errors are not accepted as input-validation evidence.
 SHA uses a CPU stage oracle and independent proof verification only; there is
 no claim of an independent SHA stage oracle. Foreign device handles are not
 assumed invalid across circuits beyond the API contract.
@@ -129,10 +136,19 @@ result is unavailable coverage, not a pass.
 The `large` target requires exactly `large/js_384x384_d32`, domain `2^22`, its
 key/witness/vkey/reference public signals, and the same tiny verifier preflight.
 It uses one explicit selection and checks both verifiers, reference public
-signals, and exact completion (`1/1`). CLI proof processes always receive
-`--fallback false --self-verify false`. WGPU preflight logs/rejects software
-adapters and Auto fallback; retain child CLI diagnostics separately, because
-preflight is not attestation of the child's device.
+signals, and exact completion (`1/1`). The shared constructor inspects the actual
+backend instance's device and WGPU requested/granted limits, rejects software
+adapters and Auto fallback, then retains that same instance for `prepare` and
+`prove_unchecked`. There is no second proof process or backend construction.
+
+The direct API proof path has no fallback or self-verify retry. It replaces the
+CLI proof subprocess to bind the proof to the inspected instance. Proof/public
+JSON is still serialized, read back, checked against reference public signals,
+and verified by our library verifier against the independent fixture vkey and
+by the independent snarkjs process (successful exit and `OK!`). This preserves
+JSON interoperability and no-fallback proof coverage, but is not a CLI proof
+argument/dispatch roundtrip. The domain-1 mock test checks that the proof entry
+point calls only the supplied backend instance; it is not large-proof evidence.
 
 Large runs need separate coordinator approval for memory/time safety. Do not
 run automatically after the bounded gate. Once approved, an exact Floor command
@@ -155,7 +171,12 @@ limit error, not arbitrary OOM, timeout, panic, or device failure. Existing
 `check_onion_ready.py` may preflight resources but is not proof-success evidence.
 No fixture generation, network access, rentals, or new tooling are part of this gate.
 
-## PAR-F execution evidence
+## Original execution evidence (16be178, superseded assertions)
+
+These runs preceded the independent review. They did not establish GPU H storage,
+CPU-referenced concurrency, or deterministic malformed-key rejection. The large
+gate's discarded-device preflight did not attest its CLI child's device. No
+large proof was run. Follow-on validation below uses the corrected assertions.
 
 Tested the four-file worktree diff on base `201ad2bc3eaf2bca15fc27f57e35dee476b24934`
 before committing. Every matrix row completed `tiny_mul` (domain 8) and `sha256`
@@ -199,3 +220,38 @@ features plus `--features metal` build, which includes WGPU.
 - Large proof gate: NOT RUN, unavailable execution coverage pending separate
   coordinator memory/time approval. Physical NVIDIA and phones: unavailable,
   not launched. Held D gates and full hardware parity remain uncovered.
+
+## Independent review fix validation
+
+Tested the follow-on worktree diff on `16be178d148475dec15099b05ba3319191ecc002`
+before committing. No physical false-pass or large-domain failure was induced.
+The synthetic regression demonstrates that the old `is_err()` predicate accepts
+a device fault, while the new exact `Backend` validation guard rejects it.
+Synthetic host/wrong-tag H values are rejected for GPU jobs. The domain-1 mock
+observed exactly one `prepare` call on the supplied backend and none on the other
+instance; it stopped at the sentinel error, without proving or allocating a
+large circuit.
+
+- CPU guard/regression run: 9 passed, 0 failed, 2 proof gates explicitly ignored.
+  This includes H location/tag, device-fault rejection, and supplied-instance
+  regressions, plus the original selection and fixture guards.
+- Corrected bounded matrix: 8 jobs passed, 0 failed, 0 ignored. CPU and Metal
+  each ran variable/constant work; WGPU ran variable/constant at both Floor and
+  Auto. The six physical jobs ran serially on Apple M2 Max (WGPU IntegratedGpu,
+  Metal transport), using the default features plus `--features metal` build.
+- Every job completed exactly `2/2`: `tiny_mul` domain 8 and `sha256` domain
+  65536, totaling 16 fixture cases. GPU H was Device-tagged for its backend;
+  CPU H was Host. CPU H/all-five-MSM comparisons, independent tiny vectors,
+  zero/nonzero pinned proofs, public signals, both verifiers, sequential-CPU
+  concurrency references, and deterministic malformed-key rejection all passed.
+  SHA still has no independent stage oracle.
+- Floor requested/granted buffer/storage-binding caps were 268435456/134217728
+  bytes. Auto requested/granted caps were 4294967295/4294967292 bytes, with no
+  fallback; workgroup limits remained 16384 bytes and 256 invocations.
+- Both integration targets compiled with default features plus Metal/WGPU and
+  separately with CPU/CUDA, release/locked/offline with two jobs. CUDA remained
+  compile-only. No production, dependency, or lockfile changes were made.
+- Large same-instance proof gate: NOT RUN, pending separate approval. Its
+  compile and small-mock checks are not large proof-success evidence. No
+  NVIDIA, phone, benchmark, or large-memory jobs were launched. Full hardware
+  parity and held D gates remain uncovered.
