@@ -59,10 +59,19 @@ pub(crate) fn staged<T>(
     destination: &Path,
     operation: impl FnOnce(&Path) -> Result<T, CeremonyError>,
 ) -> Result<T, CeremonyError> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    staged_with_counter(destination, &NEXT, operation)
+}
+
+fn staged_with_counter<T>(
+    destination: &Path,
+    next: &std::sync::atomic::AtomicU64,
+    operation: impl FnOnce(&Path) -> Result<T, CeremonyError>,
+) -> Result<T, CeremonyError> {
     use std::io::ErrorKind;
-    if destination.file_name().is_none() {
+    let Some(file_name) = destination.file_name() else {
         return Err(std::io::Error::new(ErrorKind::InvalidInput, "output has no file name").into());
-    }
+    };
     let permissions = match std::fs::symlink_metadata(destination) {
         Ok(meta) => meta.is_file().then(|| meta.permissions()),
         Err(e) if e.kind() == ErrorKind::NotFound => None,
@@ -72,8 +81,7 @@ pub(crate) fn staged<T>(
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let mut stage = Stage::create(parent, &NEXT)?;
+    let mut stage = Stage::create(parent, file_name, next)?;
     let path = stage.path.as_ref().expect("uncommitted stage has a path");
     let result = operation(path)?;
     if let Some(permissions) = permissions {
@@ -89,12 +97,20 @@ struct Stage {
 }
 
 impl Stage {
-    fn create(parent: &Path, next: &std::sync::atomic::AtomicU64) -> std::io::Result<Self> {
+    fn create(
+        parent: &Path,
+        excluded: &std::ffi::OsStr,
+        next: &std::sync::atomic::AtomicU64,
+    ) -> std::io::Result<Self> {
         use std::io::ErrorKind;
         use std::sync::atomic::Ordering;
         for _ in 0..128 {
             let id = next.fetch_add(1, Ordering::Relaxed);
-            let path = parent.join(format!(".snarkrs-stage-{}-{id}", std::process::id()));
+            let name = format!(".snarkrs-stage-{}-{id}", std::process::id());
+            if std::ffi::OsStr::new(&name) == excluded {
+                continue;
+            }
+            let path = parent.join(name);
             let mut options = std::fs::OpenOptions::new();
             options.write(true).create_new(true);
             #[cfg(unix)]
@@ -136,6 +152,57 @@ mod publication_tests {
             std::env::temp_dir().join(format!("snarkrs-publication-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    fn check_requested_destination(fail: bool) {
+        let dir = dir(if fail {
+            "requested-error"
+        } else {
+            "requested-success"
+        });
+        let name = format!(".snarkrs-stage-{}-0", std::process::id());
+        for parent in [dir.clone(), dir.join(".")] {
+            let out = parent.join(&name);
+            assert!(!out.exists());
+            let result = staged_with_counter(&out, &AtomicU64::new(0), |stage| {
+                assert!(
+                    !out.exists(),
+                    "reserved stage is visible at the requested destination"
+                );
+                std::fs::write(stage, b"complete output")?;
+                assert!(!out.exists(), "output published before operation returned");
+                if fail {
+                    return Err(snarkrs_msm::AccelError::device(
+                        "fake",
+                        "late operation",
+                        "injected failure",
+                    )
+                    .into());
+                }
+                Ok(7)
+            });
+            if fail {
+                assert!(matches!(result, Err(CeremonyError::Accel(_))));
+                assert!(!out.exists());
+            } else {
+                assert_eq!(result.unwrap(), 7);
+                assert_eq!(std::fs::read(&out).unwrap(), b"complete output");
+                assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+                std::fs::remove_file(&out).unwrap();
+            }
+            assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "orphan stage");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn requested_destination_is_never_used_as_stage_on_success() {
+        check_requested_destination(false);
+    }
+
+    #[test]
+    fn requested_destination_is_never_used_as_stage_on_failure() {
+        check_requested_destination(true);
     }
 
     #[test]
@@ -214,7 +281,8 @@ mod publication_tests {
         let collision = |id| dir.join(format!(".snarkrs-stage-{}-{id}", std::process::id()));
         std::fs::write(collision(0), b"unowned").unwrap();
         let next = AtomicU64::new(0);
-        let stage = Stage::create(&dir, &next).unwrap();
+        let excluded = std::ffi::OsStr::new("output");
+        let stage = Stage::create(&dir, excluded, &next).unwrap();
         assert_eq!(stage.path.as_ref().unwrap(), &collision(1));
         drop(stage);
         assert_eq!(std::fs::read(collision(0)).unwrap(), b"unowned");
@@ -223,7 +291,7 @@ mod publication_tests {
             std::fs::write(collision(id), b"unowned").unwrap();
         }
         assert!(
-            matches!(Stage::create(&dir, &AtomicU64::new(0)), Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists)
+            matches!(Stage::create(&dir, excluded, &AtomicU64::new(0)), Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists)
         );
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 128);
         std::fs::remove_dir_all(dir).unwrap();
