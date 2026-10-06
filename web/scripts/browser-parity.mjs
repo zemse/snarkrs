@@ -6,7 +6,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
-import { createServer } from 'vite';
+import { createServer, mergeConfig } from 'vite';
 
 // Local correctness smoke, not a benchmark. Only the circuit catalogue is replaced with a
 // tiny fixture; the actual page, runner, worker, WASM and snarkjs execute without mocks.
@@ -18,9 +18,41 @@ const { values } = parseArgs({
   options: {
     assets: { type: 'string' }, fixtures: { type: 'string' },
     'wasm-revision': { type: 'string' }, out: { type: 'string' },
+    'test-server-config': { type: 'boolean', default: false },
     chrome: { type: 'string', default: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' }
   }
 });
+// Ignore checkout-local TLS settings: loopback HTTP is a secure context for WebGPU.
+const ownedServer = { host: '127.0.0.1', port: 0, open: false, https: false };
+if (values['test-server-config']) {
+  for (const https of [undefined, { cert: 'unused test certificate', key: 'unused test key' }]) {
+    const server = await createServer(mergeConfig(
+      { server: { https } },
+      {
+        root: web, configFile: false, server: ownedServer,
+        plugins: [{
+          name: 'http-readiness',
+          configureServer(server) {
+            server.middlewares.use('/__parity-ready', (_req, res) => res.end('ready'));
+          }
+        }]
+      }
+    ));
+    try {
+      assert.equal(server.config.server.https, false, 'inherited TLS must be disabled');
+      await server.listen();
+      const response = await fetch(`http://127.0.0.1:${server.httpServer.address().port}/__parity-ready`, {
+        signal: AbortSignal.timeout(10000), redirect: 'error'
+      });
+      assert.equal(response.status, 200);
+      assert.equal(await response.text(), 'ready');
+      console.log(`server config ${https ? 'with inherited TLS' : 'without TLS'}: HTTP readiness passed`);
+    } finally {
+      await server.close();
+    }
+  }
+  process.exit(0);
+}
 for (const key of ['assets', 'fixtures']) {
   assert.ok(values[key] && isAbsolute(values[key]), `--${key} must be an absolute path`);
 }
@@ -128,7 +160,7 @@ try {
   server = await createServer({
     root: web, configFile: join(web, 'vite.config.ts'),
     define: { 'import.meta.env.VITE_ARTIFACT_BASE': JSON.stringify('/__fixtures') },
-    server: { host: '127.0.0.1', port: 0, open: false },
+    server: ownedServer,
     plugins: [{
       name: 'tiny-parity-fixture', enforce: 'pre',
       resolveId(id) { if (id === '../pkg-version') return '\0parity-version'; },
@@ -169,9 +201,16 @@ try {
       }
     }]
   });
+  assert.equal(server.config.server.https, false, 'the smoke server must override inherited HTTPS');
   await server.listen();
   const origin = `http://127.0.0.1:${server.httpServer.address().port}`;
   evidence.origin = origin;
+  const readinessUrl = `${origin}/pkg/snarkrs_web.js?v=${version}`;
+  const readiness = await fetch(readinessUrl, { signal: AbortSignal.timeout(10000), redirect: 'error' });
+  assert.equal(readiness.status, 200, 'the owned server must answer over HTTP before Chrome starts');
+  const servedHash = sha256(Buffer.from(await readiness.arrayBuffer()));
+  assert.equal(servedHash, sha256(assets.get('/pkg/snarkrs_web.js')), 'HTTP must serve the fresh glue');
+  evidence.server = { https: server.config.server.https, readinessUrl, status: readiness.status, servedHash };
   chrome = spawn(values.chrome, [
     '--remote-debugging-port=0', `--user-data-dir=${join(out, 'chrome-profile')}`,
     '--no-first-run', '--no-default-browser-check', 'about:blank'
