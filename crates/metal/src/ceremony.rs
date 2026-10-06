@@ -24,7 +24,7 @@ use snarkrs_msm::xyzz::Xyzz;
 use snarkrs_msm::{AccelError, GroupFft, KeyScale, MsmBackend};
 
 use crate::fft::FftKernels;
-use crate::kernels::{CEREMONY_MSL, FR_MSL, MSM_MSL};
+use crate::kernels::{CEREMONY_MSL, FR_MSL, MSM_MSL, SEAL_MSL};
 use crate::layout::{
     as_bytes, Packed, PackedFq, PackedFq2, PackedFr, PackedG1Affine, PackedG2Affine, PackedScalar,
 };
@@ -591,6 +591,7 @@ impl CerGroup for CerG2 {
 pub struct CeremonyKernels {
     device: Device,
     queue: crate::cb::Queue,
+    seal: crate::cb::Seal,
     g1: GroupPipelines,
     g2: GroupPipelines,
     window_g1: u32,
@@ -609,7 +610,7 @@ impl CeremonyKernels {
         // One translation unit, in dependency order: the `Fr` prelude, then the point
         // arithmetic, then this file, which adds no curve math of its own. Each has its
         // own header guard, so the concatenation is the include.
-        let source = format!("{FR_MSL}\n{MSM_MSL}\n{CEREMONY_MSL}\n");
+        let source = format!("{FR_MSL}\n{MSM_MSL}\n{CEREMONY_MSL}\n{SEAL_MSL}\n");
         let opts = CompileOptions::new();
         let library = device
             .new_library_with_source(&source, &opts)
@@ -642,9 +643,11 @@ impl CeremonyKernels {
         let g1 = group("g1")?;
         let g2 = group("g2")?;
         let queue = crate::cb::Queue::new(&device);
+        let seal = crate::cb::Seal::new(&device, &library)?;
         Ok(Self {
             device,
             queue,
+            seal,
             g1,
             g2,
             window_g1: env_window("G16_METAL_CER_C_G1", WINDOW_G1),
@@ -711,6 +714,8 @@ impl CeremonyKernels {
     ///
     /// `inc == Fr::ONE` is the constant-scalar case both zkey commands use and it is not a
     /// separate kernel, only a flag that skips the per-thread exponentiation.
+    /// On error, completed host chunks remain scaled. Retries replay only the current
+    /// device chunk from its unchanged upload, never the partially updated host slice.
     pub fn apply_key_g1(
         &self,
         points: &mut [G1Affine],
@@ -785,9 +790,11 @@ impl CeremonyKernels {
                     enc.set_buffer(2, Some(&out_buf), 0);
                     set_params(enc, 3, &p);
                     dispatch_1d(enc, pso, n, 64);
+                    let token = self.seal.encode(enc);
                     enc.end_encoding();
                     cb.commit();
-                    crate::cb::wait_ok(cb, "ceremony point scalar multiplication")
+                    self.seal
+                        .wait(cb, token, "ceremony point scalar multiplication")
                 })?;
 
                 // SAFETY: the command buffer completed, and `n` points of this type is
@@ -914,9 +921,11 @@ impl CeremonyKernels {
             enc.set_buffer(2, Some(&segprod), 0);
             set_params(enc, 3, &p);
             dispatch_1d(enc, &pipelines.affine_prefix, segments, 64);
+            let token = self.seal.encode(enc);
             enc.end_encoding();
             cb.commit();
-            crate::cb::wait_ok(cb, "ceremony batch-to-affine, prefix pass")
+            self.seal
+                .wait(cb, token, "ceremony batch-to-affine, prefix pass")
         })?;
 
         // SAFETY: the command buffer completed and the prefix pass wrote one field
@@ -934,9 +943,11 @@ impl CeremonyKernels {
             enc.set_buffer(3, Some(out), 0);
             set_params(enc, 4, &p);
             dispatch_1d(enc, &pipelines.affine_finish, segments, 64);
+            let token = self.seal.encode(enc);
             enc.end_encoding();
             cb.commit();
-            crate::cb::wait_ok(cb, "ceremony batch-to-affine, finish pass")
+            self.seal
+                .wait(cb, token, "ceremony batch-to-affine, finish pass")
         })?;
         Ok(())
     }
@@ -1025,7 +1036,11 @@ pub(crate) fn dispatch_1d(
     let tg = prefer
         .min(pso.max_total_threads_per_threadgroup() as usize)
         .max(1);
-    enc.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(tg as u64, 1, 1));
+    crate::cb::dispatch_threads(
+        enc,
+        MTLSize::new(n as u64, 1, 1),
+        MTLSize::new(tg as u64, 1, 1),
+    );
 }
 
 /// # Safety
@@ -1202,6 +1217,96 @@ mod tests {
         // artifact-gated tests in `msm.rs` skip.
         Device::system_default()?;
         Some(CeremonyKernels::new().expect("ceremony kernels"))
+    }
+
+    fn check_sealed_ceremony<G: CerGroup>(
+        points: &[Xyzz<G::Raw>],
+        scalars: &[Fr],
+        normalize: fn(&[Xyzz<G::Raw>]) -> Vec<G::Affine>,
+        want_mul: &[G::Affine],
+    ) where
+        G::Affine: AffineRepr<ScalarField = Fr>,
+    {
+        use crate::cb::inject::check_replay;
+        let k = CeremonyKernels::new()
+            .expect("native Metal replay test requires a device")
+            .with_chunk(65);
+        check_replay(
+            &k.queue,
+            || k.point_mul::<G>(points, scalars).map(|p| normalize(&p)),
+            &want_mul.to_vec(),
+        );
+        let bases = normalize(points);
+        check_replay(&k.queue, || k.batch_to_affine::<G>(points), &bases);
+        let first = Fr::from(13u64);
+        let inc = Fr::from(17u64);
+        let mut scalar = first;
+        let want: Vec<_> = bases
+            .iter()
+            .map(|p| {
+                let out = (*p * scalar).into_affine();
+                scalar *= inc;
+                out
+            })
+            .collect();
+        check_replay(
+            &k.queue,
+            || {
+                let mut got = bases.clone();
+                let result = k.apply_key::<G>(&mut got, first, inc);
+                if result.is_err() {
+                    // Exhaustion is in the final chunk; no replay may scale the first twice.
+                    assert_eq!(&got[..k.chunk], &want[..k.chunk]);
+                    assert_eq!(&got[k.chunk..], &bases[k.chunk..]);
+                }
+                result.map(|_| got)
+            },
+            &want,
+        );
+    }
+
+    #[test]
+    fn sealed_replay_g1_multiplication_affine_and_key() {
+        let mut rng = Lcg(0x5eed_0101);
+        let scalars = corner_scalars(&mut rng, 63);
+        let pts: Vec<_> = (0..scalars.len())
+            .map(|i| {
+                if i % 9 == 0 {
+                    Xyzz::ZERO
+                } else {
+                    scaled_g1(rng.fr(), rng.word())
+                }
+            })
+            .collect();
+        let multiplied: Vec<_> = pts
+            .iter()
+            .zip(&scalars)
+            .map(|(p, s)| point_times_fr(p, s))
+            .collect();
+        let normalize = batch_to_affine::<snarkrs_field::g1::Config>;
+        check_sealed_ceremony::<CerG1>(&pts, &scalars, normalize, &normalize(&multiplied));
+    }
+
+    #[test]
+    fn sealed_replay_g2_multiplication_affine_and_key() {
+        let mut rng = Lcg(0x5eed_0102);
+        let scalars = corner_scalars(&mut rng, 63);
+        let pts: Vec<_> = (0..scalars.len())
+            .map(|i| {
+                if i % 9 == 0 {
+                    Xyzz::ZERO
+                } else {
+                    scaled_g2(rng.fr(), rng.word())
+                }
+            })
+            .collect();
+        let multiplied: Vec<_> = pts
+            .iter()
+            .zip(&scalars)
+            .map(|(p, s)| point_times_fr(p, s))
+            .collect();
+        let normalize = batch_to_affine::<snarkrs_field::g2::Config>;
+        check_sealed_ceremony::<CerG2>(&pts, &scalars, normalize, &normalize(&multiplied));
     }
 
     /// Each submission retries from its original inputs, including the ladder before

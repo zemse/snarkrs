@@ -21,7 +21,7 @@
 //! where an abort was measured to end the current compute encoder only, so a token written
 //! by a later encoder or a blit passes). `examples/cb_seal_probe.rs` measures the same
 //! question against this crate's own submissions; its numbers are in the commit that added
-//! the seal.
+//! the seal. A matching token is a completion check, not arithmetic verification.
 //!
 //! `metal-rs` 0.29 binds `status()` but not `error()`, so the NSError has to be read with a
 //! raw `msg_send!`. That is safe here because the crate marks `CommandBufferRef` as
@@ -435,7 +435,7 @@ impl Seal {
     /// still be running.
     pub(crate) fn encode_token(&self, enc: &ComputeCommandEncoderRef, token: Token) {
         #[cfg(test)]
-        if inject::cut_token() {
+        if inject::cut_token() || inject::missing_token_fires() {
             return;
         }
         enc.set_compute_pipeline_state(&self.pipeline);
@@ -511,6 +511,8 @@ pub(crate) mod inject {
         Ignored,
         /// The token `Seal::wait` reads does not match.
         Stale,
+        /// The data dispatches run, but the completion token is not encoded.
+        MissingToken,
     }
 
     /// What a cut drops after the dispatch it lands on.
@@ -533,6 +535,90 @@ pub(crate) mod inject {
         static CUT: Cell<Option<(u32, Rest)>> = const { Cell::new(None) };
         /// A cut has landed and not yet run its course: dispatches and tokens are dropped.
         static CUTTING: Cell<Option<Rest>> = const { Cell::new(None) };
+    }
+
+    struct Reset;
+
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            arm(None);
+        }
+    }
+
+    #[test]
+    fn faults_are_thread_local_and_reset_on_unwind() {
+        arm(None);
+        let failed = std::panic::catch_unwind(|| {
+            let _reset = Reset;
+            arm_with(Some((0, Fault::MissingToken)), true);
+            assert!(missing_token_fires());
+            std::thread::spawn(|| {
+                assert!(!missing_token_fires());
+                assert!(!fired());
+            })
+            .join()
+            .unwrap();
+            panic!("injected test failure");
+        });
+        assert!(failed.is_err());
+        assert!(!missing_token_fires());
+        assert!(!fired());
+        assert_eq!(calls(), 0);
+        assert_eq!(dispatches(), 0);
+        assert_eq!(cut_dispatch(8), Some(8));
+        arm(None);
+    }
+
+    /// Exercise every submission and dispatch, then exhaustion and reuse, against a CPU result.
+    pub(crate) fn check_replay<T: PartialEq + std::fmt::Debug>(
+        queue: &super::Queue,
+        mut run: impl FnMut() -> Result<T, snarkrs_groth16::ProveError>,
+        want: &T,
+    ) {
+        let _reset = Reset;
+        arm(None);
+        assert_eq!(&run().unwrap(), want);
+        let submissions = calls();
+        let launches = dispatches();
+        assert!(submissions > 0 && launches > 0);
+        for fault in [
+            Fault::Status,
+            Fault::Ignored,
+            Fault::Stale,
+            Fault::MissingToken,
+        ] {
+            for at in 0..submissions {
+                let before = queue.get();
+                arm_with(Some((at, fault)), false);
+                assert_eq!(&run().unwrap(), want, "submission {at}, {fault:?}");
+                assert!(fired());
+                assert_eq!(calls(), submissions + 1);
+                assert_eq!(
+                    !std::ptr::eq(&*before, &*queue.get()),
+                    fault == Fault::Ignored
+                );
+            }
+        }
+        for rest in [Rest::Buffer, Rest::Attempt] {
+            for at in 0..launches {
+                arm_cut(at, rest);
+                assert_eq!(&run().unwrap(), want, "dispatch {at}, {rest:?}");
+                assert!(fired());
+                assert_eq!(calls(), submissions + 1);
+            }
+        }
+        for fault in [Fault::Ignored, Fault::MissingToken] {
+            arm_with(Some((submissions - 1, fault)), true);
+            assert!(matches!(
+                run(),
+                Err(snarkrs_groth16::ProveError::Device { .. })
+            ));
+            assert!(fired());
+            assert_eq!(calls(), submissions - 1 + super::RETRIES);
+            arm(None);
+            assert_eq!(&run().unwrap(), want, "reuse after {fault:?} exhaustion");
+        }
+        arm(None);
     }
 
     /// Counts calls from zero again, and fails call `at` with a status fault if given.
@@ -630,6 +716,11 @@ pub(crate) mod inject {
 
     pub(super) fn ignored_fires() -> bool {
         hits(CALLS.get().wrapping_sub(1), Fault::Ignored)
+    }
+
+    /// Encoding precedes the submission's `wait_ok` call.
+    pub(super) fn missing_token_fires() -> bool {
+        hits(CALLS.get(), Fault::MissingToken)
     }
 
     /// For the `wait_ok` call just made, which `Seal::wait` follows at once.

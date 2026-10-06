@@ -31,7 +31,7 @@ use snarkrs_groth16::ProveError;
 use snarkrs_msm::xyzz::Xyzz;
 
 use crate::ceremony::{cer_err, cer_read_back, dispatch_1d, env_window, window_index, CER_WINDOWS};
-use crate::kernels::{CEREMONY_MSL, FFT_MSL, FR_MSL, MSM_MSL};
+use crate::kernels::{CEREMONY_MSL, FFT_MSL, FR_MSL, MSM_MSL, SEAL_MSL};
 use crate::layout::{as_bytes, Packed, PackedFq, PackedFq2};
 use crate::msm::{PackedXyzzG1, PackedXyzzG2};
 
@@ -303,6 +303,7 @@ impl FftGroup for FftG2 {
 pub struct FftKernels {
     device: Device,
     queue: crate::cb::Queue,
+    seal: crate::cb::Seal,
     g1: FftPipelines,
     g2: FftPipelines,
     window_g1: u32,
@@ -323,7 +324,7 @@ impl FftKernels {
         // One translation unit, in dependency order: the `Fr` prelude, the point
         // arithmetic, the ladder, then this file. Each has its own header guard, so the
         // concatenation is the include, and `fft.metal` adds no curve math of its own.
-        let source = format!("{FR_MSL}\n{MSM_MSL}\n{CEREMONY_MSL}\n{FFT_MSL}\n");
+        let source = format!("{FR_MSL}\n{MSM_MSL}\n{CEREMONY_MSL}\n{FFT_MSL}\n{SEAL_MSL}\n");
         let opts = CompileOptions::new();
         let library = device
             .new_library_with_source(&source, &opts)
@@ -351,9 +352,11 @@ impl FftKernels {
         let g1 = group("g1")?;
         let g2 = group("g2")?;
         let queue = crate::cb::Queue::new(&device);
+        let seal = crate::cb::Seal::new(&device, &library)?;
         Ok(Self {
             device,
             queue,
+            seal,
             g1,
             g2,
             window_g1: env_window("G16_METAL_FFT_C_G1", FFT_WINDOW_G1),
@@ -639,7 +642,7 @@ impl FftKernels {
     /// ladders a command buffer a 2^19-point G2 block takes 138 s against 16.6 s, because a
     /// dispatch that small does not fill the device.
     ///
-    /// Every commit goes through `cb::wait_ok` (cb.rs:57). A faulted buffer that went
+    /// Every commit checks both status and a completion seal. A faulted buffer that went
     /// unnoticed would leave the previous pass's points in a `dst`, which is a wrong
     /// point in a file that is otherwise perfectly formed.
     fn run_round<G: FftGroup>(&self, round: &[Pass]) -> Result<(), ProveError> {
@@ -685,6 +688,10 @@ impl FftKernels {
     /// Destinations are disjoint from sources and every attempt is waited on before
     /// the next one writes them; `cb::with_retry` also replaces an ignored queue.
     fn dispatch_with_retry(&self, batch: &[(&Pass, FftParams, usize)]) -> Result<(), ProveError> {
+        let outputs: Vec<&metal::ResourceRef> = batch
+            .iter()
+            .map(|(pass, _, _)| -> &metal::ResourceRef { pass.dst })
+            .collect();
         crate::cb::with_retry(&self.queue, |queue| {
             let cb = crate::cb::command_buffer(queue);
             // Concurrent rather than the serial default: the pieces touch disjoint
@@ -701,9 +708,12 @@ impl FftKernels {
                 set_params(enc, 3, p);
                 dispatch_1d(enc, pass.pso, *threads, THREADGROUP);
             }
+            // All concurrent pieces must complete before the token in this encoder.
+            enc.memory_barrier_with_resources(&outputs);
+            let token = self.seal.encode(enc);
             enc.end_encoding();
             cb.commit();
-            crate::cb::wait_ok(cb, "ceremony group inverse fft")
+            self.seal.wait(cb, token, "ceremony group inverse fft")
         })
     }
 
@@ -923,6 +933,63 @@ mod tests {
     fn same_g2(got: &[Xyzz<RawFq2>], want: &[Xyzz<RawFq2>]) -> bool {
         batch_to_affine::<snarkrs_field::g2::Config>(got)
             == batch_to_affine::<snarkrs_field::g2::Config>(want)
+    }
+
+    fn check_sealed_fft<G: FftGroup, A: PartialEq + std::fmt::Debug>(
+        base: Vec<Vec<Xyzz<G::Raw>>>,
+        normalize: fn(&[Xyzz<G::Raw>]) -> Vec<A>,
+        want: Vec<Vec<A>>,
+    ) {
+        let k = FftKernels::new()
+            .expect("native Metal replay test requires a device")
+            .with_min_block(1)
+            .with_budget(7);
+        let original: Vec<_> = base.iter().map(|p| normalize(p)).collect();
+        crate::cb::inject::check_replay(
+            &k.queue,
+            || {
+                let mut got = base.clone();
+                let result = k
+                    .ifft_many::<G>(&mut got.iter_mut().map(Vec::as_mut_slice).collect::<Vec<_>>());
+                let normalized: Vec<_> = got.iter().map(|p| normalize(p)).collect();
+                if result.is_err() {
+                    assert_eq!(
+                        normalized, original,
+                        "failed FFT must not copy back partial results"
+                    );
+                }
+                result.map(|_| normalized)
+            },
+            &want,
+        );
+    }
+
+    #[test]
+    fn sealed_replay_g1_concurrent_and_split_fft() {
+        let base: Vec<_> = [4, 8, 16]
+            .into_iter()
+            .map(|n| block_g1(0x5eed_2910 + n as u64, n))
+            .collect();
+        let mut want = base.clone();
+        for block in &mut want {
+            CpuGroupFft.ifft_g1(block).unwrap();
+        }
+        let normalize = batch_to_affine::<snarkrs_field::g1::Config>;
+        check_sealed_fft::<FftG1, _>(base, normalize, want.iter().map(|p| normalize(p)).collect());
+    }
+
+    #[test]
+    fn sealed_replay_g2_concurrent_and_split_fft() {
+        let base: Vec<_> = [4, 8, 16]
+            .into_iter()
+            .map(|n| block_g2(0x5eed_2920 + n as u64, n))
+            .collect();
+        let mut want = base.clone();
+        for block in &mut want {
+            CpuGroupFft.ifft_g2(block).unwrap();
+        }
+        let normalize = batch_to_affine::<snarkrs_field::g2::Config>;
+        check_sealed_fft::<FftG2, _>(base, normalize, want.iter().map(|p| normalize(p)).collect());
     }
 
     /// Every submission can be replayed without advancing the round's source buffers.
