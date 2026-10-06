@@ -923,6 +923,8 @@ const POINT_BLOCK: u32 = 128;
 /// nothing at all. The header of `kernels/msm.cu` records the two candidate fixes, both of
 /// which are benchmarks rather than obvious wins.
 pub struct CudaMsm {
+    #[cfg(test)]
+    activity: TestActivity,
     work: Work,
     ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
@@ -944,6 +946,17 @@ pub struct CudaMsm {
 
     last_device_us: AtomicU64,
     last_combine_us: AtomicU64,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TestActivity {
+    ones_allocations: AtomicU64,
+    ones_launches: AtomicU64,
+    ones_readbacks: AtomicU64,
+    legacy_launches: AtomicU64,
+    segmented_launches: AtomicU64,
+    fold_launches: AtomicU64,
 }
 
 impl CudaMsm {
@@ -1013,6 +1026,8 @@ impl CudaMsm {
         let stream = cuda.stream().clone();
 
         Ok(Self {
+            #[cfg(test)]
+            activity: TestActivity::default(),
             work: Work::Variable,
             a: upload_g1(&stream, &[])?,
             b_g2: upload_g2(&stream, &[])?,
@@ -1524,6 +1539,10 @@ impl CudaMsm {
             // SAFETY: six parameters in order; one thread owns one bucket row exclusively,
             // and the kernel guards `row < n_windows * n_buckets`.
             unsafe { lb.launch(cfg) }.map_err(|e| drv("launch msm_accumulate", e))?;
+            #[cfg(test)]
+            self.activity
+                .legacy_launches
+                .fetch_add(1, Ordering::Relaxed);
         } else {
             // A bucket that no slice writes directly still has to read as the identity,
             // which on this encoding means `zz == 0`. `zeros()` already guarantees that for
@@ -1552,6 +1571,10 @@ impl CudaMsm {
             // which is the maximum one thread writes. Every row tag is initialized before
             // an early return; unwritten point slots stay zero from allocation.
             unsafe { lb.launch(cfg) }.map_err(|e| drv("launch msm_segmented", e))?;
+            #[cfg(test)]
+            self.activity
+                .segmented_launches
+                .fetch_add(1, Ordering::Relaxed);
 
             if p.dummy_rows != 0 {
                 let fold = if out.is_g2 {
@@ -1574,6 +1597,8 @@ impl CudaMsm {
                     // SAFETY: seven arguments match msm_fold_*; checked geometry sizes
                     // the slot arrays and every level is ordered on the same stream.
                     unsafe { lb.launch(cfg) }.map_err(|e| drv("launch msm_fold", e))?;
+                    #[cfg(test)]
+                    self.activity.fold_launches.fetch_add(1, Ordering::Relaxed);
                     in_pts = &level.pts;
                     in_rows = &level.rows;
                 }
@@ -1613,6 +1638,8 @@ impl CudaMsm {
             // is what `blockIdx.x` indexes into `ones`, and the grid-stride loop is bounded by
             // `p.n`, itself bounds checked against both the scalar and the base vector.
             unsafe { lb.launch(cfg) }.map_err(|e| drv("launch msm_ones", e))?;
+            #[cfg(test)]
+            self.activity.ones_launches.fetch_add(1, Ordering::Relaxed);
         }
 
         Ok(())
@@ -1742,7 +1769,12 @@ impl Outputs {
             ones: if ones_groups == 0 {
                 None
             } else {
-                Some(msm.zeros(ones_groups * point_words)?)
+                let buf = msm.zeros(ones_groups * point_words)?;
+                #[cfg(test)]
+                msm.activity
+                    .ones_allocations
+                    .fetch_add(1, Ordering::Relaxed);
+                Some(buf)
             },
             folds,
             ones_groups,
@@ -1761,7 +1793,12 @@ impl Outputs {
     fn combine(&self, msm: &CudaMsm, plan: &Plan<'_>) -> Result<MsmResult, ProveError> {
         let w_words = download(&msm.stream, &self.window_sums)?;
         let o_words = match &self.ones {
-            Some(ones) => download(&msm.stream, ones)?,
+            Some(ones) => {
+                let words = download(&msm.stream, ones)?;
+                #[cfg(test)]
+                msm.activity.ones_readbacks.fetch_add(1, Ordering::Relaxed);
+                words
+            }
             None => Vec::new(),
         };
         if self.is_g2 {
@@ -2544,21 +2581,395 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // On-device checks. These skip, loudly, when there is no NVIDIA card, because the rest
-    // of this workspace is developed on an M2 Max; a silent pass is not something a
-    // correctness suite for a proof system should be able to do.
-    //
-    // They are `#[ignore]` as well as guarded because the guard is only cheap where there is
-    // no card: on the GPU box it is the compile below that costs, and a plain `cargo test`
-    // should not pay it. The skip itself is safe on the development Mac, where `cudarc`'s
-    // dynamic loader would panic rather than error; `context::libcuda_loadable` is what turns
-    // that back into the `Err` the guard reads.
-    //
-    // Each of these compiles the MSM unit, which is minutes of ptxas on a T4. Run them on
-    // the GPU box with
-    // `cargo test -p snarkrs-cuda --features cuda --lib msm:: -- --ignored --test-threads=1 --nocapture`
-    // and expect the first one to sit there for a while.
+    // The older optional on-device checks skip loudly without NVIDIA. The mandatory
+    // constant-work gates fail instead: a Rust build does not validate NVRTC/PTX or math.
+    // Run the two configurations in separate processes, without changing global state:
+    // G16_CUDA_MSM_LEGACY_ACC=0 cargo test -p snarkrs-cuda --features cuda --lib msm::tests::constant_work_device_ -- --ignored --test-threads=1 --nocapture
+    // G16_CUDA_MSM_LEGACY_ACC=1 cargo test -p snarkrs-cuda --features cuda --lib msm::tests::constant_work_legacy_override_gate -- --ignored --exact --test-threads=1 --nocapture
+    // All device tests remain ignored by default. The CPU oracles below need no device.
     // -----------------------------------------------------------------------
+
+    // CPU oracle for the same independent-window recoding as snarkrs_msm::signed_digit.
+    fn gate_digits(s: Fr, c: u32) -> Vec<i32> {
+        use snarkrs_field::{BigInteger, PrimeField};
+        let bits = s.into_bigint();
+        (0..RECODE_BITS.div_ceil(c as usize))
+            .map(|w| {
+                let off = w * c as usize;
+                let raw = (0..c).fold(0, |v, bit| {
+                    v | ((bits.get_bit(off + bit as usize) as i32) << bit)
+                });
+                let carry = i32::from(off != 0 && bits.get_bit(off - 1));
+                raw - i32::from(raw >= 1 << (c - 1)) * (1 << c) + carry
+            })
+            .collect()
+    }
+
+    fn gate_carry_scalars(c: u32) -> Vec<Fr> {
+        use snarkrs_field::Field;
+        let mut values = vec![Fr::zero(), Fr::one(), -Fr::one(), -Fr::from(2u64)];
+        for bit in [c - 1, c, 2 * c - 1, 2 * c, 253] {
+            let value = Fr::from(2u64).pow([u64::from(bit)]);
+            values.extend([value - Fr::one(), value, value + Fr::one()]);
+        }
+        values
+    }
+
+    #[test]
+    fn gate_recoding_oracle_reconstructs_carry_boundaries() {
+        use snarkrs_field::Field;
+        for c in [2, 3, 8, 16] {
+            for scalar in gate_carry_scalars(c) {
+                let digits = gate_digits(scalar, c);
+                assert_eq!(digits.len(), RECODE_BITS.div_ceil(c as usize));
+                let mut reconstructed = Fr::zero();
+                let mut weight = Fr::one();
+                for digit in digits {
+                    assert!(digit.unsigned_abs() <= 1 << (c - 1));
+                    let term = Fr::from(u64::from(digit.unsigned_abs())) * weight;
+                    reconstructed += if digit < 0 { -term } else { term };
+                    weight *= Fr::from(2u64).pow([u64::from(c)]);
+                }
+                assert_eq!(reconstructed, scalar);
+            }
+        }
+    }
+
+    #[test]
+    fn gate_fold_cases_straddle_all_three_levels() {
+        for (n, want) in [(2048, 1), (2049, 2), (65536, 2), (65537, 3)] {
+            let geometry = Geometry::new(n, 0, n, 8, 64, Work::Constant).unwrap();
+            assert_eq!(geometry.fold_levels().count(), want, "n={n}");
+        }
+    }
+
+    fn gate_activity(m: &CudaMsm) -> [u64; 6] {
+        let a = &m.activity;
+        [
+            &a.ones_allocations,
+            &a.ones_launches,
+            &a.ones_readbacks,
+            &a.legacy_launches,
+            &a.segmented_launches,
+            &a.fold_launches,
+        ]
+        .map(|v| v.load(Ordering::Relaxed))
+    }
+
+    fn gate_plan<'a>(
+        m: &CudaMsm,
+        scalars: Scalars<'a>,
+        off: usize,
+        n: usize,
+        c: u32,
+        len: usize,
+    ) -> Plan<'a> {
+        let general = if m.work == Work::Constant {
+            n
+        } else {
+            scalars.general_in(&(off..off + n))
+        };
+        let geometry = Geometry::new(n, off, general, c, len, m.work).unwrap();
+        // Same checked allocations as Plan::new, with explicit public geometry instead
+        // of process-wide window/slice environment overrides.
+        Plan {
+            counts: m.zeros(geometry.rows()).unwrap(),
+            cursor: m.zeros(geometry.rows()).unwrap(),
+            entries: m
+                .zeros(geometry.n_windows * geometry.cap * ENTRY_WORDS)
+                .unwrap(),
+            geometry,
+            scalars: scalars.buf,
+        }
+    }
+
+    fn gate_base_weight(index: usize) -> i64 {
+        if index < 3 {
+            return 101 + index as i64;
+        }
+        match index % 7 {
+            0 => 0,
+            1 | 2 => -1,
+            _ => 1,
+        }
+    }
+
+    fn gate_signed_scalar(value: i64) -> Fr {
+        let scalar = Fr::from(value.unsigned_abs());
+        if value < 0 {
+            -scalar
+        } else {
+            scalar
+        }
+    }
+
+    fn gate_inspect_digits(m: &CudaMsm, p: &Plan<'_>, values: &[Fr]) -> Vec<i64> {
+        m.launch_digits(p).unwrap();
+        let counts = download(&m.stream, &p.counts).unwrap();
+        let cursors = download(&m.stream, &p.cursor).unwrap();
+        let entries = download(&m.stream, &p.entries).unwrap();
+        let digits: Vec<_> = values.iter().map(|s| gate_digits(*s, p.c)).collect();
+        let mut expected_counts = vec![0u32; p.rows()];
+        let mut dummy_sums = vec![0i64; p.n_windows * p.dummy_rows];
+        let real_rows = p.n_windows * p.n_buckets;
+        for w in 0..p.n_windows {
+            for (i, scalar) in values.iter().enumerate() {
+                let digit = digits[i][w];
+                if m.work == Work::Variable && (scalar.is_zero() || scalar.is_one() || digit == 0) {
+                    continue;
+                }
+                let row = if digit == 0 {
+                    let dummy = w * p.dummy_rows + (i & (p.dummy_rows - 1));
+                    dummy_sums[dummy] += gate_base_weight(3 + i);
+                    real_rows + dummy
+                } else {
+                    w * p.n_buckets + digit.unsigned_abs() as usize - 1
+                };
+                expected_counts[row] += 1;
+            }
+            let mut seen = vec![0; values.len()];
+            let mut cursor = w * p.cap;
+            let rows = (w * p.n_buckets..(w + 1) * p.n_buckets)
+                .chain(real_rows + w * p.dummy_rows..real_rows + (w + 1) * p.dummy_rows);
+            for row in rows {
+                assert_eq!(counts[row], expected_counts[row], "window {w}, row {row}");
+                let end = cursor + counts[row] as usize;
+                assert_eq!(cursors[row] as usize, end);
+                assert!(end <= (w + 1) * p.cap);
+                for slot in cursor..end {
+                    assert_eq!(entries[2 * slot] as usize, row);
+                    let packed = entries[2 * slot + 1];
+                    let index = (packed >> 1) as usize;
+                    assert!(index < p.n);
+                    seen[index] += 1;
+                    let digit = digits[index][w];
+                    assert_eq!(packed & 1, u32::from(digit < 0));
+                    let want_row = if digit == 0 {
+                        assert_eq!(m.work, Work::Constant);
+                        real_rows + w * p.dummy_rows + (index & (p.dummy_rows - 1))
+                    } else {
+                        w * p.n_buckets + digit.unsigned_abs() as usize - 1
+                    };
+                    assert_eq!(row, want_row);
+                }
+                cursor = end;
+            }
+            for (i, scalar) in values.iter().enumerate() {
+                let active = m.work == Work::Constant
+                    || (!scalar.is_zero() && !scalar.is_one() && digits[i][w] != 0);
+                assert_eq!(seen[i], usize::from(active), "window {w}, scalar {i}");
+            }
+            if m.work == Work::Constant {
+                assert_eq!(cursor - w * p.cap, p.n);
+            }
+        }
+        if p.n != 0 && m.work == Work::Constant {
+            assert!(
+                dummy_sums.iter().any(|sum| *sum != 0),
+                "dummy arithmetic must be observable"
+            );
+        }
+        dummy_sums
+    }
+
+    fn gate_device_case(m: &CudaMsm, values: &[Fr], c: u32, len: usize, legacy: bool) {
+        use snarkrs_field::{CurveGroup, PrimeGroup};
+        eprintln!(
+            "CUDA work gate: {:?}, n={}, c={c}, slice={len}, legacy={legacy}",
+            m.work,
+            values.len()
+        );
+        let mut padded = vec![Fr::from(123u64), -Fr::one()];
+        padded.extend_from_slice(values);
+        let scalars = m.upload_scalars(&padded).unwrap();
+        let p = gate_plan(m, scalars.as_scalars(), 2, values.len(), c, len);
+        let dummy_sums = gate_inspect_digits(m, &p, values);
+        let g1 = G1Projective::generator();
+        let g2 = G2Projective::generator();
+        let a1 = g1.into_affine();
+        let a2 = g2.into_affine();
+        let b1: Vec<_> = (0..values.len() + 3)
+            .map(|i| match gate_base_weight(i) {
+                0 => G1Affine::identity(),
+                1 => a1,
+                -1 => -a1,
+                weight => (g1 * gate_signed_scalar(weight)).into_affine(),
+            })
+            .collect();
+        let b2: Vec<_> = (0..values.len() + 3)
+            .map(|i| match gate_base_weight(i) {
+                0 => G2Affine::identity(),
+                1 => a2,
+                -1 => -a2,
+                weight => (g2 * gate_signed_scalar(weight)).into_affine(),
+            })
+            .collect();
+        let db1 = m.upload_g1_bases(&b1).unwrap();
+        let db2 = m.upload_g2_bases(&b2).unwrap();
+        // Independently weighted Fr sum and one generator multiplication per group.
+        let want = values.iter().enumerate().fold(Fr::zero(), |sum, (i, s)| {
+            sum + *s * gate_signed_scalar(gate_base_weight(3 + i))
+        });
+        for job in [
+            Job::G1(JobG1 {
+                bases: &db1,
+                base_off: 3,
+                scalars: scalars.as_scalars(),
+                scalar_off: 2,
+                n: values.len(),
+            }),
+            Job::G2(JobG2 {
+                bases: &db2,
+                base_off: 3,
+                scalars: scalars.as_scalars(),
+                scalar_off: 2,
+                n: values.len(),
+            }),
+        ] {
+            let before = gate_activity(m);
+            let out = Outputs::new(m, &job, &p).unwrap();
+            assert_eq!(out.ones.is_none(), m.work == Work::Constant);
+            assert_eq!(
+                out.ones_groups,
+                if m.work == Work::Constant {
+                    0
+                } else {
+                    ones_groups_for(values.len())
+                }
+            );
+            m.launch_points(&job, &out, &p).unwrap();
+            m.stream.synchronize().unwrap();
+            let result = out.combine(m, &p).unwrap();
+            if out.is_g2 {
+                assert_eq!(result.g2().unwrap(), g2 * want);
+            } else {
+                assert_eq!(result.g1().unwrap(), g1 * want);
+            }
+            if p.dummy_rows != 0 {
+                // Read the actual accumulated dummy buckets, not only the reduced MSM.
+                let words = if out.is_g2 { G2_WORDS } else { G1_WORDS };
+                let view = out.buckets.slice(p.n_windows * p.n_buckets * words..);
+                let stored = m.stream.clone_dtoh(&view).unwrap();
+                m.stream.synchronize().unwrap();
+                if out.is_g2 {
+                    let points = from_words::<PackedXyzzG2>(&stored).unwrap();
+                    assert_eq!(points.len(), dummy_sums.len());
+                    for (point, sum) in points.iter().zip(&dummy_sums) {
+                        let positive = g2 * Fr::from(sum.unsigned_abs());
+                        assert_eq!(
+                            point.to_projective(),
+                            if *sum < 0 { -positive } else { positive }
+                        );
+                    }
+                } else {
+                    let points = from_words::<PackedXyzzG1>(&stored).unwrap();
+                    assert_eq!(points.len(), dummy_sums.len());
+                    for (point, sum) in points.iter().zip(&dummy_sums) {
+                        let positive = g1 * Fr::from(sum.unsigned_abs());
+                        assert_eq!(
+                            point.to_projective(),
+                            if *sum < 0 { -positive } else { positive }
+                        );
+                    }
+                }
+            }
+            let after = gate_activity(m);
+            let delta: Vec<_> = after.iter().zip(before).map(|(a, b)| a - b).collect();
+            let expected = if m.work == Work::Constant {
+                [0, 0, 0, 0, 1, p.fold_levels().count() as u64]
+            } else if legacy {
+                [1, 1, 1, 1, 0, 0]
+            } else {
+                [1, 1, 1, 0, 1, 0]
+            };
+            assert_eq!(delta, expected, "allocation/launch/readback accounting");
+        }
+    }
+
+    #[test]
+    #[ignore = "mandatory NVIDIA work-property gate; fails without device"]
+    fn constant_work_device_accounting() {
+        use snarkrs_field::PrimeField;
+        assert!(
+            !legacy_accumulate(),
+            "run this gate with G16_CUDA_MSM_LEGACY_ACC=0"
+        );
+        let cuda = Cuda::new(0).expect("NVIDIA work gate requires CUDA");
+        let module = CudaMsm::compile(&cuda).unwrap();
+        let variable = CudaMsm::from_module(&cuda, module.clone()).unwrap();
+        let constant = CudaMsm::from_module(&cuda, module).unwrap().constant_work();
+        let mut seed = 19u64;
+        let n = 129;
+        let cases = [
+            vec![Fr::zero(); n],
+            vec![Fr::one(); n],
+            (0..n).map(|i| Fr::from((i % 2) as u64)).collect(),
+            (0..n)
+                .map(|i| if i % 64 == 0 { -Fr::one() } else { Fr::zero() })
+                .collect(),
+            (0..n)
+                .map(|_| {
+                    let mut bytes = [0u8; 32];
+                    for chunk in bytes.chunks_mut(8) {
+                        chunk.copy_from_slice(&splitmix(&mut seed).to_le_bytes());
+                    }
+                    Fr::from_le_bytes_mod_order(&bytes)
+                })
+                .collect(),
+        ];
+        for values in cases {
+            gate_device_case(&constant, &values, 3, 3, false);
+            gate_device_case(&variable, &values, 3, 3, false);
+        }
+    }
+
+    #[test]
+    #[ignore = "mandatory NVIDIA fold/recoding boundary gate; fails without device"]
+    fn constant_work_device_boundaries() {
+        assert!(
+            !legacy_accumulate(),
+            "run this gate with G16_CUDA_MSM_LEGACY_ACC=0"
+        );
+        let cuda = Cuda::new(0).expect("NVIDIA boundary gate requires CUDA");
+        let module = CudaMsm::compile(&cuda).unwrap();
+        let variable = CudaMsm::from_module(&cuda, module.clone()).unwrap();
+        let constant = CudaMsm::from_module(&cuda, module).unwrap().constant_work();
+        for (n, c, len) in [
+            (0, 2, 3),
+            (65, 2, 3),
+            (65, 16, 65),
+            (2048, 8, 64),
+            (2049, 8, 64),
+            (65536, 8, 64),
+            (65537, 8, 64),
+        ] {
+            let corpus = gate_carry_scalars(c);
+            let values: Vec<_> = corpus.into_iter().cycle().take(n).collect();
+            gate_device_case(&constant, &values, c, len, false);
+            gate_device_case(&variable, &values, c, len, false);
+        }
+    }
+
+    #[test]
+    #[ignore = "mandatory separate-process G16_CUDA_MSM_LEGACY_ACC=1 NVIDIA gate"]
+    fn constant_work_legacy_override_gate() {
+        // The environment is supplied to this process, never mutated by a test.
+        assert!(
+            legacy_accumulate(),
+            "run this gate with G16_CUDA_MSM_LEGACY_ACC=1"
+        );
+        let cuda = Cuda::new(0).expect("NVIDIA legacy override gate requires CUDA");
+        let module = CudaMsm::compile(&cuda).unwrap();
+        let variable = CudaMsm::from_module(&cuda, module.clone()).unwrap();
+        let constant = CudaMsm::from_module(&cuda, module).unwrap().constant_work();
+        let values: Vec<_> = gate_carry_scalars(3)
+            .into_iter()
+            .cycle()
+            .take(129)
+            .collect();
+        gate_device_case(&constant, &values, 3, 3, true);
+        gate_device_case(&variable, &values, 3, 3, true);
+    }
 
     fn device() -> Option<Cuda> {
         match Cuda::new(0) {

@@ -14,7 +14,9 @@
 //!
 //! # Skipping
 //!
-//! Every test here skips, loudly, when there is no NVIDIA device or no artifacts, because
+//! Optional local tests skip loudly without NVIDIA or artifacts. The dedicated ignored
+//! proof gate instead requires G16_CUDA_REQUIRED_FIXTURES to include tiny_mul and sha256
+//! and fails on any missing required input or device. The optional skips exist because
 //! the workspace is developed on an M2 Max where neither is guaranteed. A skip prints the
 //! reason to stderr, so a silent pass on a box that *does* have a card cannot be mistaken
 //! for a real one. `CudaBackend::new` is what makes that possible at all: `cudarc`'s
@@ -116,8 +118,124 @@ fn artifact_dirs() -> Vec<(String, PathBuf)> {
     out
 }
 
-/// `None` plus a printed reason when there is no device or no artifacts. Every test starts
-/// with this and returns early, so the suite is honest about what it did not check.
+/// The dedicated gate never discovers a subset by filtering incomplete directories.
+fn required_fixture_dirs(
+    root: &Path,
+    configured: Option<&str>,
+    is_file: impl Fn(&Path) -> bool,
+) -> Result<Vec<(String, PathBuf)>, String> {
+    let configured = configured.ok_or_else(|| {
+        "set G16_CUDA_REQUIRED_FIXTURES=tiny_mul,sha256 (additional names are opt in)".to_owned()
+    })?;
+    let mut names = Vec::new();
+    for name in configured.split(',').map(str::trim) {
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            return Err(format!("invalid required CUDA fixture name {name:?}"));
+        }
+        if names.contains(&name) {
+            return Err(format!("duplicate required CUDA fixture {name}"));
+        }
+        names.push(name);
+    }
+    for required in ["tiny_mul", "sha256"] {
+        if !names.contains(&required) {
+            return Err(format!("CUDA proof gate must include {required}"));
+        }
+    }
+    let mut dirs = Vec::with_capacity(names.len());
+    for name in names {
+        let dir = root.join(name);
+        for file in ["circuit.zkey", "circuit.wtns", "vkey.json"] {
+            let path = dir.join(file);
+            if !is_file(&path) {
+                return Err(format!(
+                    "required CUDA fixture is incomplete: {}",
+                    path.display()
+                ));
+            }
+        }
+        dirs.push((name.to_owned(), dir));
+    }
+    Ok(dirs)
+}
+
+#[test]
+fn required_fixture_gate_rejects_missing_or_weakened_configuration() {
+    let root = Path::new("/fixtures");
+    for configured in [
+        None,
+        Some(""),
+        Some("tiny_mul"),
+        Some("sha256"),
+        Some("tiny_mul,sha256,tiny_mul"),
+        Some("tiny_mul,sha256,"),
+        Some("tiny_mul,sha256,../other"),
+        Some("tiny_mul,sha256,/other"),
+    ] {
+        assert!(
+            required_fixture_dirs(root, configured, |_| true).is_err(),
+            "{configured:?}"
+        );
+    }
+    // A complete tiny fixture alone cannot turn the mandatory gate green.
+    assert!(required_fixture_dirs(root, Some("tiny_mul,sha256"), |p| p
+        .parent()
+        .unwrap()
+        .file_name()
+        .unwrap()
+        == "tiny_mul")
+    .is_err());
+    for name in ["tiny_mul", "sha256"] {
+        for file in ["circuit.zkey", "circuit.wtns", "vkey.json"] {
+            let missing = root.join(name).join(file);
+            let error = required_fixture_dirs(root, Some("tiny_mul,sha256"), |p| p != missing)
+                .expect_err("each required file must be present");
+            assert!(error.contains(&missing.display().to_string()));
+        }
+    }
+}
+
+#[test]
+fn required_fixture_gate_uses_exact_names_count_and_order() {
+    let root = Path::new("/fixtures");
+    let checked = std::cell::RefCell::new(Vec::new());
+    let dirs = required_fixture_dirs(root, Some(" tiny_mul, sha256 "), |p| {
+        checked.borrow_mut().push(p.to_path_buf());
+        true
+    });
+    let dirs = dirs.unwrap();
+    assert_eq!(
+        dirs,
+        vec![
+            ("tiny_mul".into(), root.join("tiny_mul")),
+            ("sha256".into(), root.join("sha256"))
+        ]
+    );
+    assert_eq!(checked.into_inner().len(), 6);
+    let dirs = required_fixture_dirs(root, Some("tiny_mul,sha256,extra"), |_| true).unwrap();
+    assert_eq!(
+        dirs.iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        ["tiny_mul", "sha256", "extra"]
+    );
+    assert!(
+        required_fixture_dirs(root, Some("tiny_mul,sha256,extra"), |p| p
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            != "extra")
+        .is_err()
+    );
+}
+
+/// Optional local tests return `None` with a reason when there is no device or artifacts.
+/// The mandatory proof gate uses required_fixture_dirs instead.
 fn fixtures() -> Option<&'static [Fixture]> {
     static ONCE: OnceLock<Vec<Fixture>> = OnceLock::new();
     let built = ONCE.get_or_init(|| {
@@ -225,8 +343,19 @@ fn for_each(test: &str, f: impl Fn(&Fixture)) {
 #[test]
 #[ignore = "requires NVIDIA and circuit artifacts; no silent skip"]
 fn constant_work_proof_and_resident_h_match_cpu_and_variable() {
-    let dirs = artifact_dirs();
-    assert!(!dirs.is_empty(), "NVIDIA proof gate requires artifacts");
+    let root = std::env::var_os("G16_ARTIFACTS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/artifacts"));
+    let configured = std::env::var("G16_CUDA_REQUIRED_FIXTURES").ok();
+    let dirs = required_fixture_dirs(&root, configured.as_deref(), Path::is_file)
+        .unwrap_or_else(|error| panic!("NVIDIA proof gate: {error}"));
+    let expected: Vec<_> = dirs.iter().map(|(name, _)| name.clone()).collect();
+    eprintln!(
+        "Required CUDA fixtures ({}): {}",
+        expected.len(),
+        expected.join(",")
+    );
+    let mut completed = Vec::new();
     let variable = CudaBackend::new().expect("NVIDIA proof gate requires CUDA");
     let cpu = CpuBackend::new();
     let mut fixtures = Vec::new();
@@ -294,7 +423,13 @@ fn constant_work_proof_and_resident_h_match_cpu_and_variable() {
                 verify(&vk, &witness[1..=circuit.n_public()], &got).unwrap();
             }
         }
+        eprintln!("CUDA default and constant proof gate passed: {name}");
+        completed.push(name);
     }
+    assert_eq!(
+        completed, expected,
+        "every configured fixture must complete both modes"
+    );
 }
 
 // ---------------------------------------------------------------------------
