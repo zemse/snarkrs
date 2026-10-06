@@ -583,6 +583,14 @@ pub fn prepare_phase2(
     ptau_out: &Path,
     fft: &dyn GroupFft,
 ) -> Result<(), CeremonyError> {
+    crate::write::staged(ptau_out, |stage| prepare_phase2_inner(ptau_in, stage, fft))
+}
+
+fn prepare_phase2_inner(
+    ptau_in: &Path,
+    ptau_out: &Path,
+    fft: &dyn GroupFft,
+) -> Result<(), CeremonyError> {
     let src = Ptau::open(ptau_in)?;
     let power = src.header().power;
     // Section 12's last block is `2^(power+1)` points, and `lagrangeEvaluations` refuses

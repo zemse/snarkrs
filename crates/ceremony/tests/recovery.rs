@@ -224,3 +224,211 @@ fn zkey_verification_propagates_each_of_four_msm_errors() {
     contribute::verify_from_init(&init, &fixture.ptau, &final_key, &msm).unwrap();
     assert_eq!(msm.calls.load(Ordering::Relaxed), 4);
 }
+
+fn entries(dir: &Path) -> Vec<std::ffi::OsString> {
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    entries.sort();
+    entries
+}
+
+fn assert_preserved(out: &Path, mut operation: impl FnMut(&Path) -> Result<(), CeremonyError>) {
+    for existing in [false, true] {
+        if existing {
+            std::fs::write(out, b"existing destination").unwrap();
+        }
+        let before = entries(out.parent().unwrap());
+        let error = operation(out).unwrap_err();
+        assert!(matches!(
+            error,
+            CeremonyError::Accel(AccelError::Device {
+                backend: "fake",
+                ..
+            })
+        ));
+        if existing {
+            assert_eq!(std::fs::read(out).unwrap(), b"existing destination");
+        } else {
+            assert!(!out.exists());
+        }
+        assert_eq!(entries(out.parent().unwrap()), before, "orphan stage");
+    }
+}
+
+#[test]
+fn setup_late_errors_preserve_absent_and_existing_destinations() {
+    let fixture = Fixture::new("publication-setup");
+    for (op, fail_at) in [("msm_g1", 2), ("msm_g2", 1)] {
+        assert_preserved(&fixture.dir.join(op), |out| {
+            let msm = FailMsm::new(op, fail_at);
+            let result = setup::setup(&fixture.r1cs, &fixture.ptau, out, &msm).map(|_| ());
+            assert!(msm.calls.load(Ordering::Relaxed) >= fail_at);
+            result
+        });
+    }
+}
+
+struct LateScale(AtomicUsize);
+
+impl LateScale {
+    fn check(&self) -> Result<(), AccelError> {
+        if self.0.fetch_add(1, Ordering::Relaxed) == 1 {
+            return Err(AccelError::device(
+                "fake",
+                "apply_key",
+                "second section failed",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl snarkrs_msm::KeyScale for LateScale {
+    fn name(&self) -> &'static str {
+        "fake"
+    }
+    fn apply_key_g1(&self, points: &mut [G1Affine], first: Fr, inc: Fr) -> Result<(), AccelError> {
+        self.check()?;
+        snarkrs_msm::KeyScale::apply_key_g1(&CpuKeyScale, points, first, inc)
+    }
+    fn apply_key_g2(&self, points: &mut [G2Affine], first: Fr, inc: Fr) -> Result<(), AccelError> {
+        self.check()?;
+        snarkrs_msm::KeyScale::apply_key_g2(&CpuKeyScale, points, first, inc)
+    }
+}
+
+struct LateFft(AtomicUsize);
+
+impl snarkrs_msm::GroupFft for LateFft {
+    fn name(&self) -> &'static str {
+        "fake"
+    }
+    fn ifft_g1(
+        &self,
+        a: &mut [snarkrs_msm::xyzz::Xyzz<snarkrs_field::raw::RawFq>],
+    ) -> Result<(), AccelError> {
+        self.0.fetch_add(1, Ordering::Relaxed);
+        snarkrs_msm::GroupFft::ifft_g1(&CpuGroupFft, a)
+    }
+    fn ifft_g2(
+        &self,
+        _: &mut [snarkrs_msm::xyzz::Xyzz<snarkrs_field::raw::RawFq2>],
+    ) -> Result<(), AccelError> {
+        assert!(self.0.load(Ordering::Relaxed) > 0);
+        Err(AccelError::device(
+            "fake",
+            "ifft_g2",
+            "second section failed",
+        ))
+    }
+}
+
+#[test]
+fn prepare_late_error_preserves_absent_and_existing_destinations() {
+    let fixture = Fixture::new("publication-prepare");
+    assert_preserved(&fixture.dir.join("output.ptau"), |out| {
+        prepare::prepare_phase2(
+            &fixture.dir.join("contributed.ptau"),
+            out,
+            &LateFft(AtomicUsize::new(0)),
+        )
+    });
+}
+
+fn scale_operation(
+    kind: usize,
+    input: &Path,
+    output: &Path,
+    scale: &dyn snarkrs_msm::KeyScale,
+) -> Result<(), CeremonyError> {
+    let rng = transcript::rng_from_entropy_with(&[11; 64], "publication");
+    let beacon = [1; 32];
+    match kind {
+        0 => phase1::contribute_with(input, output, ContributionParams::default(), rng, scale)
+            .map(|_| ()),
+        1 => phase1::beacon(input, output, None, &beacon, 10, scale).map(|_| ()),
+        2 => contribute::contribute_with(input, output, None, rng, scale).map(|_| ()),
+        3 => contribute::beacon(input, output, None, &beacon, 10, scale).map(|_| ()),
+        4 => snarkrs_ceremony::challenge::challenge_contribute_with(input, output, rng, scale)
+            .map(|_| ()),
+        5 => snarkrs_ceremony::bellman::bellman_contribute_with(input, output, rng, scale)
+            .map(|_| ()),
+        _ => unreachable!(),
+    }
+}
+
+fn scale_inputs(fixture: &Fixture) -> [PathBuf; 6] {
+    let raw = fixture.dir.join("contributed.ptau");
+    let init = fixture.dir.join("init.zkey");
+    let challenge = fixture.dir.join("challenge");
+    let bellman = fixture.dir.join("bellman");
+    setup::setup(&fixture.r1cs, &fixture.ptau, &init, &CpuMsm::new()).unwrap();
+    snarkrs_ceremony::challenge::export_challenge(&raw, &challenge).unwrap();
+    snarkrs_ceremony::bellman::export_bellman(&init, &bellman).unwrap();
+    [raw.clone(), raw, init.clone(), init, challenge, bellman]
+}
+
+#[test]
+fn late_scale_errors_preserve_all_six_public_operations() {
+    let fixture = Fixture::new("publication-scale");
+    for (kind, input) in scale_inputs(&fixture).iter().enumerate() {
+        assert_preserved(&fixture.dir.join(format!("output-{kind}")), |out| {
+            let scale = LateScale(AtomicUsize::new(0));
+            let result = scale_operation(kind, input, out, &scale);
+            assert_eq!(scale.0.load(Ordering::Relaxed), 2);
+            result
+        });
+        let alias = fixture.dir.join(format!("failed-alias-{kind}"));
+        std::fs::copy(input, &alias).unwrap();
+        let original = std::fs::read(&alias).unwrap();
+        let before = entries(&fixture.dir);
+        let error =
+            scale_operation(kind, &alias, &alias, &LateScale(AtomicUsize::new(0))).unwrap_err();
+        assert!(matches!(error, CeremonyError::Accel(_)));
+        assert_eq!(std::fs::read(&alias).unwrap(), original);
+        assert_eq!(entries(&fixture.dir), before);
+    }
+}
+
+#[test]
+fn successful_in_place_operations_match_separate_outputs() {
+    let fixture = Fixture::new("publication-alias");
+    for (kind, input) in scale_inputs(&fixture).iter().enumerate() {
+        let expected = fixture.dir.join(format!("expected-{kind}"));
+        let alias = fixture.dir.join(format!("alias-{kind}"));
+        std::fs::copy(input, &alias).unwrap();
+        scale_operation(kind, input, &expected, &CpuKeyScale).unwrap();
+        let before = entries(&fixture.dir);
+        scale_operation(kind, &alias, &alias, &CpuKeyScale).unwrap();
+        assert_eq!(
+            std::fs::read(&alias).unwrap(),
+            std::fs::read(&expected).unwrap()
+        );
+        assert_eq!(entries(&fixture.dir), before);
+    }
+    let alias = fixture.dir.join("prepare-alias");
+    std::fs::copy(fixture.dir.join("contributed.ptau"), &alias).unwrap();
+    prepare::prepare_phase2(&alias, &alias, &CpuGroupFft).unwrap();
+    assert_eq!(
+        std::fs::read(&alias).unwrap(),
+        std::fs::read(&fixture.ptau).unwrap()
+    );
+    let expected = fixture.dir.join("setup-expected");
+    setup::setup(&fixture.r1cs, &fixture.ptau, &expected, &CpuMsm::new()).unwrap();
+    for source in [&fixture.r1cs, &fixture.ptau] {
+        let alias = fixture.dir.join("setup-alias");
+        std::fs::copy(source, &alias).unwrap();
+        let (r1cs, ptau) = if source == &fixture.r1cs {
+            (&alias, &fixture.ptau)
+        } else {
+            (&fixture.r1cs, &alias)
+        };
+        setup::setup(r1cs, ptau, &alias, &CpuMsm::new()).unwrap();
+        assert_eq!(
+            std::fs::read(&alias).unwrap(),
+            std::fs::read(&expected).unwrap()
+        );
+    }
+}

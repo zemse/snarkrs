@@ -159,6 +159,17 @@ pub fn setup(
     out_path: &Path,
     msm: &dyn MsmBackend,
 ) -> Result<SetupReport, CeremonyError> {
+    crate::write::staged(out_path, |stage| {
+        setup_inner(r1cs_path, ptau_path, stage, msm)
+    })
+}
+
+fn setup_inner(
+    r1cs_path: &Path,
+    ptau_path: &Path,
+    out_path: &Path,
+    msm: &dyn MsmBackend,
+) -> Result<SetupReport, CeremonyError> {
     let ptau = Ptau::open(ptau_path)?;
     let r1cs = R1cs::open(r1cs_path)?;
 

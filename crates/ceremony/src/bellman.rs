@@ -272,6 +272,17 @@ pub fn bellman_contribute(
 pub fn bellman_contribute_with(
     input: &Path,
     output: &Path,
+    rng: CeremonyRng,
+    scale: &dyn KeyScale,
+) -> Result<Digest, CeremonyError> {
+    crate::write::staged(output, |stage| {
+        bellman_contribute_inner(input, stage, rng, scale)
+    })
+}
+
+fn bellman_contribute_inner(
+    input: &Path,
+    output: &Path,
     mut rng: CeremonyRng,
     scale: &dyn KeyScale,
 ) -> Result<Digest, CeremonyError> {

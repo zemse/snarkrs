@@ -474,6 +474,19 @@ fn apply_contribution(
     make_key: impl FnOnce(&Digest) -> PtauKey,
     scale: &dyn KeyScale,
 ) -> Result<Phase1Report, CeremonyError> {
+    crate::write::staged(ptau_out, |stage| {
+        apply_contribution_inner(ptau_in, stage, kind, params, make_key, scale)
+    })
+}
+
+fn apply_contribution_inner(
+    ptau_in: &Path,
+    ptau_out: &Path,
+    kind: ContributionKind,
+    params: ContributionParams,
+    make_key: impl FnOnce(&Digest) -> PtauKey,
+    scale: &dyn KeyScale,
+) -> Result<Phase1Report, CeremonyError> {
     let ptau = Ptau::open(ptau_in)?;
     let header = *ptau.header();
     // A truncated file's points are a prefix of the ones the chain hashed, so a

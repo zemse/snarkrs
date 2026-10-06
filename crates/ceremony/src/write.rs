@@ -41,6 +41,276 @@ use crate::{CeremonyError, N8, SG1, SG2};
 /// syscall count stops mattering on a 2^28 section.
 const POINT_BATCH: usize = 8192;
 
+/// Run a complete output operation on an exclusively reserved sibling, then rename it.
+///
+/// The operation must flush its writers and drop all file handles before returning. All
+/// rereads of the output must use the supplied path. An error leaves the destination
+/// unchanged; cleanup is best effort and never replaces the primary error.
+///
+/// This provides atomic visibility, not crash durability (no fsync) or arithmetic
+/// verification. It assumes a trusted output directory, not adversarial path replacement.
+/// Rename replaces the directory entry, including a symlink, rather than its referent.
+/// Existing regular-file permissions are copied at commit; ownership, ACLs and hard-link
+/// identity are not preserved. New files and in-progress stages use mode 0600 on Unix
+/// and platform defaults elsewhere; inherited ACLs remain filesystem-dependent.
+///
+/// [`BinFileWriter::create`] itself still creates or truncates its path directly.
+pub(crate) fn staged<T>(
+    destination: &Path,
+    operation: impl FnOnce(&Path) -> Result<T, CeremonyError>,
+) -> Result<T, CeremonyError> {
+    use std::io::ErrorKind;
+    if destination.file_name().is_none() {
+        return Err(std::io::Error::new(ErrorKind::InvalidInput, "output has no file name").into());
+    }
+    let permissions = match std::fs::symlink_metadata(destination) {
+        Ok(meta) => meta.is_file().then(|| meta.permissions()),
+        Err(e) if e.kind() == ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
+    let parent = destination
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut stage = Stage::create(parent, &NEXT)?;
+    let path = stage.path.as_ref().expect("uncommitted stage has a path");
+    let result = operation(path)?;
+    if let Some(permissions) = permissions {
+        std::fs::set_permissions(path, permissions)?;
+    }
+    std::fs::rename(path, destination)?;
+    stage.path = None;
+    Ok(result)
+}
+
+struct Stage {
+    path: Option<std::path::PathBuf>,
+}
+
+impl Stage {
+    fn create(parent: &Path, next: &std::sync::atomic::AtomicU64) -> std::io::Result<Self> {
+        use std::io::ErrorKind;
+        use std::sync::atomic::Ordering;
+        for _ in 0..128 {
+            let id = next.fetch_add(1, Ordering::Relaxed);
+            let path = parent.join(format!(".snarkrs-stage-{}-{id}", std::process::id()));
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&path) {
+                Ok(file) => {
+                    drop(file);
+                    return Ok(Self { path: Some(path) });
+                }
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(std::io::Error::new(
+            ErrorKind::AlreadyExists,
+            "could not reserve ceremony stage after 128 attempts",
+        ))
+    }
+}
+
+impl Drop for Stage {
+    fn drop(&mut self) {
+        if let Some(path) = &self.path {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    fn dir(name: &str) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("snarkrs-publication-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn error_after_finish_preserves_destination_and_cleans_stage() {
+        let dir = dir("error");
+        let out = dir.join("output");
+        for existing in [false, true] {
+            if existing {
+                std::fs::write(&out, b"old").unwrap();
+            }
+            let result: Result<(), CeremonyError> = staged(&out, |path| {
+                let w = BinFileWriter::create(path, b"test", 1, 0)?;
+                w.finish()?;
+                assert_eq!(std::fs::read(path)?.len(), 12);
+                if existing {
+                    assert_eq!(std::fs::read(&out)?, b"old");
+                } else {
+                    assert!(!out.exists());
+                }
+                Err(snarkrs_msm::AccelError::device("fake", "late readback", "lost device").into())
+            });
+            assert!(matches!(
+                result,
+                Err(CeremonyError::Accel(snarkrs_msm::AccelError::Device { .. }))
+            ));
+            assert_eq!(
+                std::fs::read_dir(&dir).unwrap().count(),
+                usize::from(existing)
+            );
+            if existing {
+                assert_eq!(std::fs::read(&out).unwrap(), b"old");
+            } else {
+                assert!(!out.exists());
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn publishes_empty_data_and_returns_report() {
+        let dir = dir("empty");
+        let out = dir.join("output");
+        std::fs::write(&out, b"old").unwrap();
+        assert_eq!(
+            staged(&out, |path| {
+                std::fs::write(path, [])?;
+                Ok(7)
+            })
+            .unwrap(),
+            7
+        );
+        assert!(std::fs::read(&out).unwrap().is_empty());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rename_failure_cleans_stage_without_touching_directory() {
+        let dir = dir("rename");
+        let out = dir.join("output");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("sentinel"), b"old").unwrap();
+        let result = staged(&out, |path| {
+            std::fs::write(path, b"new")?;
+            Ok(())
+        });
+        assert!(matches!(result, Err(CeremonyError::Io(_))));
+        assert_eq!(std::fs::read(out.join("sentinel")).unwrap(), b"old");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn collision_retry_never_removes_unowned_files_and_is_bounded() {
+        let dir = dir("collision");
+        let collision = |id| dir.join(format!(".snarkrs-stage-{}-{id}", std::process::id()));
+        std::fs::write(collision(0), b"unowned").unwrap();
+        let next = AtomicU64::new(0);
+        let stage = Stage::create(&dir, &next).unwrap();
+        assert_eq!(stage.path.as_ref().unwrap(), &collision(1));
+        drop(stage);
+        assert_eq!(std::fs::read(collision(0)).unwrap(), b"unowned");
+        assert!(!collision(1).exists());
+        for id in 1..128 {
+            std::fs::write(collision(id), b"unowned").unwrap();
+        }
+        assert!(
+            matches!(Stage::create(&dir, &AtomicU64::new(0)), Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists)
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 128);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn operation_io_error_is_preserved() {
+        let dir = dir("io-error");
+        let out = dir.join("output");
+        std::fs::write(&out, b"old").unwrap();
+        let result: Result<(), CeremonyError> = staged(&out, |path| {
+            std::fs::write(path, b"partial")?;
+            Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "injected write failure").into())
+        });
+        assert!(
+            matches!(result, Err(CeremonyError::Io(e)) if e.kind() == std::io::ErrorKind::WriteZero)
+        );
+        assert_eq!(std::fs::read(&out).unwrap(), b"old");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn invalid_paths_return_errors_without_running_operation() {
+        for path in [Path::new(""), Path::new("/"), Path::new("\0")] {
+            let result: Result<(), CeremonyError> = staged(path, |_| panic!("invalid destination"));
+            assert!(matches!(result, Err(CeremonyError::Io(_))));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_path_follows_filesystem_support_without_panicking() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = dir("non-unicode");
+        let out = dir.join(std::ffi::OsString::from_vec(vec![0xff]));
+        match std::fs::write(&out, b"old") {
+            Ok(()) => {
+                staged(&out, |path| {
+                    std::fs::write(path, b"new")?;
+                    Ok(())
+                })
+                .unwrap();
+                assert_eq!(std::fs::read(&out).unwrap(), b"new");
+                assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+            }
+            Err(expected) => {
+                eprintln!("non-Unicode publication unavailable on this filesystem: {expected}");
+                let result = staged(&out, |path| {
+                    std::fs::write(path, b"new")?;
+                    Ok(())
+                });
+                assert!(
+                    matches!(result, Err(CeremonyError::Io(e)) if e.raw_os_error() == expected.raw_os_error())
+                );
+                assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_stage_preserves_final_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = dir("mode");
+        let out = dir.join("output");
+        for existing in [false, true] {
+            if existing {
+                std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o640)).unwrap();
+            }
+            staged(&out, |path| {
+                assert_eq!(std::fs::metadata(path)?.permissions().mode() & 0o777, 0o600);
+                std::fs::write(path, b"new")?;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(
+                std::fs::metadata(&out).unwrap().permissions().mode() & 0o777,
+                if existing { 0o640 } else { 0o600 }
+            );
+        }
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
 /// A binfile under construction.
 ///
 /// The handle is private on purpose: the length backfill seeks behind the caller's back,

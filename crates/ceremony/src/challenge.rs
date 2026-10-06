@@ -242,6 +242,17 @@ pub fn challenge_contribute(
 pub fn challenge_contribute_with(
     challenge: &Path,
     response: &Path,
+    rng: CeremonyRng,
+    scale: &dyn KeyScale,
+) -> Result<ChallengeResponse, CeremonyError> {
+    crate::write::staged(response, |stage| {
+        challenge_contribute_inner(challenge, stage, rng, scale)
+    })
+}
+
+fn challenge_contribute_inner(
+    challenge: &Path,
+    response: &Path,
     mut rng: CeremonyRng,
     scale: &dyn KeyScale,
 ) -> Result<ChallengeResponse, CeremonyError> {

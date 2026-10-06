@@ -285,6 +285,19 @@ fn apply(
     rng: &mut CeremonyRng,
     key: &dyn KeyScale,
 ) -> Result<ContributionReport, CeremonyError> {
+    crate::write::staged(zkey_out, |stage| {
+        apply_inner(zkey_in, stage, kind, params, rng, key)
+    })
+}
+
+fn apply_inner(
+    zkey_in: &Path,
+    zkey_out: &Path,
+    kind: ContributionKind,
+    params: ContributionParams,
+    rng: &mut CeremonyRng,
+    key: &dyn KeyScale,
+) -> Result<ContributionReport, CeremonyError> {
     let file = BinFile::open(zkey_in, ZKEY_MAGIC, ZKEY_MAX_VERSION)?;
     check_protocol(&file)?;
     let mut header = Groth16Header::read(file.unique_section(S_HEADER)?)?;
