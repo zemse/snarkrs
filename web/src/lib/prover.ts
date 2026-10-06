@@ -74,8 +74,8 @@ export class Prover {
   prepare() {
     return this.call('prepare');
   }
-  prove() {
-    return this.call('prove');
+  prove(constantWork = false) {
+    return this.call('prove', { constantWork });
   }
   proveHOnly() {
     return this.call('prove_h_only');

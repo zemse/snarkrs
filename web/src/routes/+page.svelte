@@ -46,7 +46,7 @@
     run.fatal != null || run.rows.some((r) => r.status === 'error')
   );
 
-  const busy = $derived(run.phase === 'running' || run.phase === 'starting');
+  const busy = $derived(run.busy);
   // Capped just short of full until the run says it is done. The ring is priced from
   // estimates, so a run that outlasts them would otherwise show a full ring with circuits
   // still to prove, which is the one thing a progress indicator must never say.
@@ -137,6 +137,26 @@
       </button>
     </div>
 
+    <div class="work-mode">
+      <label>
+        <input
+          type="checkbox"
+          bind:checked={run.constantWork}
+          disabled={busy || !run.supportsConstantWork}
+          aria-describedby="work-mode-help"
+        />
+        Constant-work WebGPU proofs (opt-in)
+      </label>
+      <p id="work-mode-help" class="fine">
+        Off by default. Applies to every warm-up and timed GPU proof; locked until the run
+        finishes. Constant-work is not constant-time and does not guarantee side-channel
+        resistance. snarkjs is unchanged.
+      </p>
+      {#if !run.supportsConstantWork}
+        <p class="fine">Unavailable for trace and stage-probe runs, which use variable-work.</p>
+      {/if}
+    </div>
+
     <div class="activity">
       {#if run.fatal}
         <p class="bad">{run.fatal}</p>
@@ -181,6 +201,7 @@
       </div>
       <div class="side gpu">
         <h2>WebGPU</h2>
+        <p class="fine">{run.resultConstantWork ? 'constant-work' : 'variable-work'}</p>
         <p class="big">{ms(t.webgpu)}</p>
         <p class="fine">{[run.env?.adapter?.vendor, run.env?.adapter?.architecture].filter(Boolean).join(' ') || 'this GPU'}</p>
       </div>
@@ -211,7 +232,12 @@
               </td>
               <td class="n">{count(row.circuit.constraints)}</td>
               <td class="n sjnum">{ms(row.snarkjsMs)}</td>
-              <td class="n gpunum">{ms(row.webgpuMs)}</td>
+              <td class="n gpunum">
+                {ms(row.webgpuMs)}
+                {#if row.constantWork !== undefined}
+                  <span class="fine">{row.constantWork ? 'constant-work' : 'variable-work'}</span>
+                {/if}
+              </td>
               <td class="n dim">{ms(row.prepareMs)}</td>
               <td class="n">
                 {#if row.status === 'done' && row.snarkjsMs && row.webgpuMs}
@@ -449,6 +475,15 @@
   }
   .cap.bad {
     color: var(--bad);
+  }
+
+  .work-mode {
+    text-align: center;
+    max-width: 34rem;
+    margin-bottom: 1rem;
+  }
+  .work-mode input {
+    accent-color: var(--gpu);
   }
 
   .activity {

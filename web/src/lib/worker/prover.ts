@@ -32,7 +32,7 @@ type Wasm = {
   bytes_free: (p: number, n: number) => void;
   unload: () => void;
   prepare: () => Promise<string>;
-  prove: () => Promise<string>;
+  prove: (constantWork?: boolean) => Promise<string>;
   prove_h_only: () => Promise<string>;
   prove_msm_probe: (which: string) => Promise<string>;
   prove_trace: () => Promise<string>;
@@ -253,10 +253,11 @@ const handlers: Record<string, (a: Args, emit: (p: unknown) => void) => Promise<
     return { ...r, wallMs: performance.now() - t0 };
   },
 
-  async prove() {
+  async prove({ constantWork = false }) {
+    if (typeof constantWork !== 'boolean') throw new Error('constantWork must be a boolean');
     const t0 = performance.now();
-    const r = JSON.parse(await w().prove());
-    return { ...r, wallMs: performance.now() - t0 };
+    const r = JSON.parse(await w().prove(constantWork));
+    return { ...r, wallMs: performance.now() - t0, constantWork };
   },
 
   /// Stages 0 to 4 and stop. See `prove_h_only` in crates/wgpu/src/wasm.rs: it splits a

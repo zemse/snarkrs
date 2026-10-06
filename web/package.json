@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "test:probes": "node --test scripts/reduce.test.mjs",
     "test:deploy": "node --test scripts/deploy.test.mjs",
+    "test:constant-work": "node --experimental-vm-modules --test scripts/constant-work.test.mjs",
     "wasm": "./scripts/build-wasm.sh",
     "deploy": "./scripts/deploy.sh",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json"

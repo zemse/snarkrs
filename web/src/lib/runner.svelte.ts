@@ -34,6 +34,8 @@ export type Row = {
   /// vendor-chart dishonesty this page exists to avoid.
   prepareMs?: number;
   webgpuMs?: number;
+  /// The mode used for every warm-up and timed GPU proof in this row.
+  constantWork?: boolean;
   snarkjsMs?: number;
   /// Every timed rep, not just the median. Kept so the page can show how tight the
   /// measurement was, and so a reader can tell a stable number from a lucky one.
@@ -89,6 +91,9 @@ export class Run {
   fatal = $state<string | null>(null);
 
   private est = new Estimator();
+  private selectedConstantWork = $state(false);
+  private usedConstantWork = $state(false);
+  private active = $state(false);
   private prover: Prover | null = null;
   private cancelled = false;
   private startedAt = 0;
@@ -234,8 +239,32 @@ export class Run {
     return this.rows.filter((r) => r.status !== 'skipped').length;
   }
 
+  get busy() {
+    return this.active;
+  }
+
+  get supportsConstantWork() {
+    return !this.traceMode && !this.stages;
+  }
+
+  get constantWork() {
+    return this.selectedConstantWork;
+  }
+
+  set constantWork(on: boolean) {
+    if (!this.busy && this.supportsConstantWork) this.selectedConstantWork = on;
+  }
+
+  /// Results keep their mode even when the next run's selection changes.
+  get resultConstantWork() {
+    return this.usedConstantWork;
+  }
+
   async start() {
-    if (this.phase === 'running' || this.phase === 'starting') return;
+    if (this.busy) return;
+    const constantWork = this.constantWork;
+    this.usedConstantWork = constantWork;
+    this.active = true;
     this.cancelled = false;
     this.deviceLost = false;
     this.fatal = null;
@@ -254,6 +283,7 @@ export class Run {
       r.crossVerified = undefined;
       r.webgpuReps = r.snarkjsReps = undefined;
       r.webgpuDone = r.snarkjsDone = undefined;
+      r.constantWork = undefined;
       r.stages = undefined;
       r.error = undefined;
       r.note = undefined;
@@ -322,7 +352,7 @@ export class Run {
       for (const row of this.rows) {
         if (this.cancelled || this.deviceLost) break;
         if (row.status === 'skipped') continue;
-        await this.runOne(row);
+        await this.runOne(row, constantWork);
         this.recomputeEta();
       }
       if (this.deviceLost) {
@@ -351,11 +381,15 @@ export class Run {
     // produced a row: a device that refused to open, or a self-test that refused to let it
     // prove. `report()` used to be called separately in each branch, which is how it came
     // to be missing from neither but duplicated in both.
-    await this.selftestAfterFailure();
-    await this.report();
-    this.activity = '';
-    this.etaMs = null;
-    if (this.phase === 'done') this.progress = 1;
+    try {
+      await this.selftestAfterFailure();
+      await this.report();
+    } finally {
+      this.activity = '';
+      this.etaMs = null;
+      if (this.phase === 'done') this.progress = 1;
+      this.active = false;
+    }
   }
 
   /// Puts a self-test verdict into a failed run's report, without anybody having to be told
@@ -413,6 +447,7 @@ export class Run {
       `cores      ${navigator.hardwareConcurrency}`,
       `startup    wasm module ${Math.round(this.env?.moduleMs ?? 0)} ms, adapter ${Math.round(this.env?.deviceMs ?? 0)} ms`,
       `phase      ${this.phase}`,
+      `work       ${this.resultConstantWork ? 'constant-work' : 'variable-work'}`,
       this.fatal ? `fatal      ${this.fatal}` : '',
       `selftest   ${this.env?.selftest ? JSON.stringify(this.env.selftest) : 'not run (add ?selftest=1)'}`,
       'limits',
@@ -458,12 +493,14 @@ export class Run {
       userAgent: navigator.userAgent,
       env: this.env,
       phase: this.phase,
+      constantWork: this.resultConstantWork,
       fatal: this.fatal,
       rows: this.rows.map((r) => ({
         circuit: r.circuit.name,
         status: r.status,
         snarkjsMs: r.snarkjsMs,
         webgpuMs: r.webgpuMs,
+        constantWork: r.constantWork,
         prepareMs: r.prepareMs,
         crossVerified: r.crossVerified,
         webgpuReps: r.webgpuReps,
@@ -486,9 +523,10 @@ export class Run {
     this.activity = 'stopping after this circuit';
   }
 
-  private async runOne(row: Row) {
+  private async runOne(row: Row, constantWork: boolean) {
     const p = this.prover!;
     const c = row.circuit;
+    if (this.supportsConstantWork) row.constantWork = constantWork;
     try {
       row.status = 'downloading';
       this.activity = `downloading ${c.label} (${(c.zkeyBytes / 1024 ** 2).toFixed(0)} MB)`;
@@ -565,7 +603,7 @@ export class Run {
         // lines sit in the same place on screen one after the other and a reader comparing
         // them should not have to know that one of them hides its warm-up.
         this.activity = `${c.label}: proving on the GPU (${i + 1}/${this.warmup + this.reps})`;
-        const r = await this.timed(this.est.proveMs('webgpu', c), () => p.prove());
+        const r = await this.timed(this.est.proveMs('webgpu', c), () => p.prove(constantWork));
         if (i >= this.warmup && document.visibilityState !== 'visible') {
           gpuDiscards.count(`${c.label} on the GPU`);
           continue;
