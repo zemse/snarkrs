@@ -36,8 +36,8 @@
 //! second caller would deadlock the worker rather than queue. There is one thread and one
 //! device there, and `crate::wasm` serialises its entry points on `busy` instead.
 
-use snarkrs_field::Fr;
-use snarkrs_gpu_layout::{PackedFr, LIMBS};
+use snarkrs_field::{Field, Fq2, Fr};
+use snarkrs_gpu_layout::{PackedFq, PackedFq2, PackedFr, LIMBS};
 use wgpu::util::DeviceExt;
 
 use crate::device::{bad, WgpuBackend};
@@ -597,16 +597,29 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
 
 /// The whole field prelude, with a call graph that reaches every part of it.
 ///
-/// `fr_mul`, `fr_add` and `fr_sub` are checked against the host; everything else (the `Fq`
-/// operations, `Fq2`, the Montgomery lift and reduction, the constants) is called and its
-/// result folded into one word that nothing predicts. The point of calling it is not the
-/// answer, it is that a browser cannot dead-strip a function whose result is stored, so a
-/// construct that only this browser rejects has to be compiled and has to be reported.
+/// `fr_mul`, `fr_add`, `fr_sub` and both components of the `Fq2` result are checked against
+/// the host. The remaining `Fq` operations, Montgomery lift and reduction, and constants
+/// are folded into a word that is checked too. Storing their results also means a browser
+/// cannot dead-strip them, so a construct that only this browser rejects is reported.
 ///
 /// Named `field_ops` and not `fr_mul` because a failure here is a failure of the prelude as a
 /// whole, which is what every kernel in the prover puts in front of its own entry points.
 async fn field_ops(backend: &WgpuBackend) -> Check {
     let t0 = web_time::Instant::now();
+    // Two values with no special structure, so a dropped limb or a lost carry changes the
+    // answer. Derived from the field itself rather than typed out.
+    let a = Fr::from(0x0123_4567_89ab_cdefu64) * Fr::from(7u64) - Fr::from(3u64);
+    let b = Fr::from(0xfedc_ba98_7654_3210u64) * Fr::from(11u64) + Fr::from(5u64);
+    let (k, want) = field_ops_kernel(a, b);
+    field_ops_check(t0, k.go(backend).await, &want)
+}
+
+fn field_ops_check(t0: web_time::Instant, got: Result<Vec<u32>, String>, want: &[u32]) -> Check {
+    let r = got.and_then(|got| compare(&got, want));
+    finish("field_ops", t0, r)
+}
+
+fn field_ops_kernel(a: Fr, b: Fr) -> (Kernel<'static>, Vec<u32>) {
     let v = Variant::Cios32Unrolled;
     let source = format!(
         "{}
@@ -631,53 +644,63 @@ fn main() {{
         io[3u * {LIMBS}u + i] = d[i];
         io[4u * {LIMBS}u + i] = e[i];
     }}
-    // Everything the prover also compiles, reached so that it cannot be stripped. The value
-    // is not predicted here; a wrong answer in this half shows up as a wrong proof, and a
-    // construct the browser cannot translate shows up as this whole check failing.
+    // Everything the prover also compiles, reached so that it cannot be stripped.
     let q = fq_add(fq_mul(qa, qb), fq_sub(fq_neg(qa), fq_sqr(qb)));
     let r = fq_from_mont(fq_to_mont(q));
     let z = fq2_mul(Fq2(qa, qb), fq2_sqr(Fq2(qb, qa)));
     let w = fr_from_mont(fr_to_mont(fr_neg(fr_one())));
     var touch: u32 = 0u;
     for (var i: u32 = 0u; i < {LIMBS}u; i = i + 1u) {{
+        io[5u * {LIMBS}u + i] = z.c0[i];
+        io[6u * {LIMBS}u + i] = z.c1[i];
         touch = touch ^ r[i] ^ z.c0[i] ^ z.c1[i] ^ w[i];
     }}
     if (fr_is_zero(fr_zero()) && fq2_is_zero(fq2_zero()) && fq2_eq(fq2_one(), fq2_one())
         && fr_eq(a, a) && fq_is_zero(fq_zero())) {{
         touch = touch + 1u;
     }}
-    io[5u * {LIMBS}u] = touch;
+    io[7u * {LIMBS}u] = touch;
 }}
 ",
         field_module(v)
     );
 
-    // Two values with no special structure, so a limb that is dropped or a carry that is lost
-    // changes the answer. Derived from the field itself rather than typed out, so this cannot
-    // drift from whatever `snarkrs-field` says BN254's scalar field is.
-    let a = Fr::from(0x0123_4567_89ab_cdefu64) * Fr::from(7u64) - Fr::from(3u64);
-    let b = Fr::from(0xfedc_ba98_7654_3210u64) * Fr::from(11u64) + Fr::from(5u64);
+    let pa = PackedFr::from_fr(&a);
+    let pb = PackedFr::from_fr(&b);
     let mut seed = Vec::with_capacity(2 * LIMBS);
-    seed.extend_from_slice(&PackedFr::from_fr(&a).v);
-    seed.extend_from_slice(&PackedFr::from_fr(&b).v);
+    seed.extend_from_slice(&pa.v);
+    seed.extend_from_slice(&pb.v);
 
     let mut want = seed.clone();
     want.extend_from_slice(&PackedFr::from_fr(&(a * b)).v);
     want.extend_from_slice(&PackedFr::from_fr(&(a + b)).v);
     want.extend_from_slice(&PackedFr::from_fr(&(a - b)).v);
 
+    // The shader reuses Fr's raw Montgomery limbs as Fq, not the same canonical integers.
+    // They are reduced Fq representatives too, because BN254's scalar modulus is smaller.
+    let qa = PackedFq { v: pa.v }.to_fq();
+    let qb = PackedFq { v: pb.v }.to_fq();
+    let z = PackedFq2::from_fq2(&(Fq2::new(qa, qb) * Fq2::new(qb, qa).square()));
+    want.extend_from_slice(&z.c0.v);
+    want.extend_from_slice(&z.c1.v);
+
+    // from_mont(to_mont(x)) preserves x's limbs in both fields.
+    let r = PackedFq::from_fq(&(qa * qb - qa - qb.square()));
+    let w = PackedFr::from_fr(&(-Fr::from(1u64)));
+    let mut touch = 0u32;
+    for i in 0..LIMBS {
+        touch ^= r.v[i] ^ z.c0.v[i] ^ z.c1.v[i] ^ w.v[i];
+    }
+    want.push(touch.wrapping_add(1));
+
     let k = Kernel {
         label: "selftest field_ops",
         source,
-        words: 5 * LIMBS + 1,
+        words: 7 * LIMBS + 1,
         seed,
         groups: 1,
     };
-    let r = k
-        .go(backend)
-        .await
-        .and_then(|got| compare(&got[..want.len()], &want));
-    finish("field_ops", t0, r)
+    (k, want)
 }
 
 /// `atomicAdd` into a storage buffer, which is how the MSM's counting sort builds its
@@ -963,7 +986,99 @@ pub fn as_error(checks: &[Check]) -> Option<snarkrs_groth16::ProveError> {
 
 #[cfg(test)]
 mod tests {
-    use super::compare;
+    use super::*;
+    use snarkrs_groth16::ProveError;
+
+    fn field_guard_error(got: Vec<u32>, want: &[u32]) -> Option<ProveError> {
+        let t0 = web_time::Instant::now();
+        let checks = [
+            finish("storage_write", t0, Ok(())),
+            field_ops_check(t0, Ok(got), want),
+        ];
+        as_error(&checks)
+    }
+
+    #[test]
+    fn fq2_corruption_fails_the_guard_with_the_fr_prefix_intact() {
+        let (k, want) = field_ops_kernel(Fr::from(17u64), Fr::from(29u64));
+        assert_eq!(want.len(), k.words);
+        assert_eq!(&want[..k.seed.len()], &k.seed);
+        assert!(field_guard_error(want.clone(), &want).is_none());
+
+        for word in 5 * LIMBS..7 * LIMBS {
+            let mut got = want.clone();
+            got[word] ^= 1;
+            let e = field_guard_error(got, &want).expect("corrupt Fq2 must fail the guard");
+            let ProveError::Backend { reason, .. } = e else {
+                panic!("wrong guard error: {e}");
+            };
+            assert!(reason.contains("field_ops"), "{reason}");
+            assert!(reason.contains(&format!("word {word} ")), "{reason}");
+        }
+
+        // Equal bit flips in c0 and c1 cancel in the folded word, but not in the full result.
+        let mut got = want.clone();
+        got[5 * LIMBS] ^= 1;
+        got[6 * LIMBS] ^= 1;
+        assert!(field_guard_error(got, &want).is_some());
+
+        let mut got = want.clone();
+        got[5 * LIMBS..7 * LIMBS].fill(0);
+        assert!(field_guard_error(got, &want).is_some());
+    }
+
+    #[test]
+    fn field_guard_checks_the_folded_word_and_readback_length() {
+        let (_, want) = field_ops_kernel(Fr::from(17u64), Fr::from(29u64));
+        let mut got = want.clone();
+        got[7 * LIMBS] ^= 1;
+        assert!(field_guard_error(got, &want).is_some());
+
+        for len in [0, 5 * LIMBS, 7 * LIMBS, want.len() + 1] {
+            let mut got = want.clone();
+            got.resize(len, 0);
+            let e = field_guard_error(got, &want).expect("wrong length must fail the guard");
+            let msg = e.to_string();
+            assert!(
+                msg.contains(&format!("read {len} words, expected {}", want.len())),
+                "{msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn fq2_expected_components_match_the_expanded_polynomial() {
+        let zero = Fr::from(0u64);
+        let one = Fr::from(1u64);
+        for (a, b) in [(zero, zero), (zero, one), (one, zero), (one, -one)] {
+            let (_, want) = field_ops_kernel(a, b);
+            let qa = PackedFq {
+                v: PackedFr::from_fr(&a).v,
+            }
+            .to_fq();
+            let qb = PackedFq {
+                v: PackedFr::from_fr(&b).v,
+            }
+            .to_fq();
+            // (a + bu)(b + au)^2 = -a(a^2 + b^2) + b(a^2 + b^2)u, where u^2 = -1.
+            let norm = qa * qa + qb * qb;
+            assert_eq!(
+                &want[5 * LIMBS..6 * LIMBS],
+                &PackedFq::from_fq(&(-qa * norm)).v
+            );
+            assert_eq!(
+                &want[6 * LIMBS..7 * LIMBS],
+                &PackedFq::from_fq(&(qb * norm)).v
+            );
+            assert!(field_guard_error(want.clone(), &want).is_none());
+        }
+
+        let (_, want) = field_ops_kernel(zero, zero);
+        assert!(want[..7 * LIMBS].iter().all(|&word| word == 0));
+        let minus_one = PackedFr::from_fr(&(-one));
+        let touch = minus_one.v.iter().fold(0u32, |acc, word| acc ^ word);
+        assert_eq!(want[7 * LIMBS], touch.wrapping_add(1));
+    }
 
     /// The half of the battery a GPU cannot pin: that a `want` which no longer matches is
     /// reported at all, and reported with enough to tell the two failures apart.
