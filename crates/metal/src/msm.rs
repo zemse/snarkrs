@@ -787,6 +787,36 @@ pub enum Job<'a> {
     G2(JobG2<'a>),
 }
 
+fn validate_job_ranges(
+    soff: usize,
+    n: usize,
+    scalars_len: usize,
+    boff: usize,
+    bases_len: usize,
+) -> Result<(), ProveError> {
+    let scalar_end = soff.checked_add(n).ok_or_else(|| {
+        err(format!(
+            "scalar range offset {soff} + length {n} overflows usize"
+        ))
+    })?;
+    if scalar_end > scalars_len {
+        return Err(err(format!(
+            "scalar range {soff}..{scalar_end} exceeds the {scalars_len} scalars uploaded"
+        )));
+    }
+    let base_end = boff.checked_add(n).ok_or_else(|| {
+        err(format!(
+            "base range offset {boff} + length {n} overflows usize"
+        ))
+    })?;
+    if base_end > bases_len {
+        return Err(err(format!(
+            "base range {boff}..{base_end} exceeds the {bases_len} bases uploaded"
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum MsmResult {
     G1(G1Projective),
@@ -1321,22 +1351,7 @@ impl MetalMsm {
                 Job::G1(j) => (j.scalars, j.scalar_off, j.n, j.bases.len, j.base_off),
                 Job::G2(j) => (j.scalars, j.scalar_off, j.n, j.bases.len, j.base_off),
             };
-            if soff + n > sbuf.len {
-                return Err(err(format!(
-                    "scalar range {}..{} exceeds the {} scalars uploaded",
-                    soff,
-                    soff + n,
-                    sbuf.len
-                )));
-            }
-            if boff + n > bases_len {
-                return Err(err(format!(
-                    "base range {}..{} exceeds the {} bases uploaded",
-                    boff,
-                    boff + n,
-                    bases_len
-                )));
-            }
+            validate_job_ranges(soff, n, sbuf.len, boff, bases_len)?;
             // Identity of the uploaded vector, not of its contents.
             ranges.push((sbuf, sbuf as *const ScalarBuf as usize, soff, n));
         }
@@ -2730,6 +2745,67 @@ mod tests {
     use snarkrs_formats::{wtns::Witness, ProvingKey};
     use snarkrs_groth16::{cpu::CpuBackend, Backend, StageTimings};
     use std::path::PathBuf;
+
+    #[test]
+    fn job_ranges_reject_scalar_overflow() {
+        for (off, n) in [(usize::MAX, 1), (1, usize::MAX), (usize::MAX, 2)] {
+            assert!(matches!(
+                validate_job_ranges(off, n, usize::MAX, 0, usize::MAX),
+                Err(ProveError::Backend {
+                    backend: "metal",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn job_ranges_reject_base_overflow() {
+        for (off, n) in [(usize::MAX, 1), (1, usize::MAX), (usize::MAX, 2)] {
+            assert!(matches!(
+                validate_job_ranges(0, n, usize::MAX, off, usize::MAX),
+                Err(ProveError::Backend {
+                    backend: "metal",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn job_ranges_reject_out_of_bounds() {
+        for (soff, n, slen, boff, blen) in [
+            (3, 2, 4, 0, 4),
+            (0, 2, 4, 3, 4),
+            (5, 0, 4, 0, 4),
+            (0, 0, 4, 5, 4),
+            (0, 1, 0, 0, 1),
+            (0, 1, 1, 0, 0),
+        ] {
+            assert!(matches!(
+                validate_job_ranges(soff, n, slen, boff, blen),
+                Err(ProveError::Backend {
+                    backend: "metal",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn job_ranges_accept_empty_and_exact_end() {
+        for (soff, n, slen, boff, blen) in [
+            (0, 0, 0, 0, 0),
+            (0, 0, 4, 0, 4),
+            (4, 0, 4, 7, 7),
+            (1, 3, 4, 2, 5),
+            (0, 4, 4, 0, 4),
+            (usize::MAX, 0, usize::MAX, usize::MAX, usize::MAX),
+            (usize::MAX - 1, 1, usize::MAX, usize::MAX - 1, usize::MAX),
+        ] {
+            assert!(validate_job_ranges(soff, n, slen, boff, blen).is_ok());
+        }
+    }
 
     /// `name` is relative to `bench/artifacts`, so the grouped sets are reached as
     /// `csp/keccak_128` rather than being unreachable from a flat name.

@@ -566,6 +566,36 @@ pub enum Job<'a> {
     G2(JobG2<'a>),
 }
 
+fn validate_job_ranges(
+    soff: usize,
+    n: usize,
+    scalars_len: usize,
+    boff: usize,
+    bases_len: usize,
+) -> Result<(), ProveError> {
+    let scalar_end = soff.checked_add(n).ok_or_else(|| {
+        bad(format!(
+            "scalar range offset {soff} + length {n} overflows usize"
+        ))
+    })?;
+    if scalar_end > scalars_len {
+        return Err(bad(format!(
+            "scalar range {soff}..{scalar_end} exceeds the {scalars_len} scalars available"
+        )));
+    }
+    let base_end = boff.checked_add(n).ok_or_else(|| {
+        bad(format!(
+            "base range offset {boff} + length {n} overflows usize"
+        ))
+    })?;
+    if base_end > bases_len {
+        return Err(bad(format!(
+            "base range {boff}..{base_end} exceeds the {bases_len} bases uploaded"
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum MsmResult {
     G1(G1Projective),
@@ -962,6 +992,14 @@ impl CudaMsm {
             return Ok(Vec::new());
         }
 
+        for job in jobs {
+            let (scalars, soff, n, bases_len, boff) = match job {
+                Job::G1(j) => (j.scalars, j.scalar_off, j.n, j.bases.len, j.base_off),
+                Job::G2(j) => (j.scalars, j.scalar_off, j.n, j.bases.len, j.base_off),
+            };
+            validate_job_ranges(soff, n, scalars.len, boff, bases_len)?;
+        }
+
         // The start event is recorded before anything is allocated, because `zeros()`
         // queues a `cuMemsetD8Async` over every buffer it hands out and that memset is real
         // per-proof device work (tens of megabytes of bucket array at 2^18). Leaving it
@@ -992,25 +1030,10 @@ impl CudaMsm {
         let mut job_plan = Vec::with_capacity(jobs.len());
 
         for job in jobs {
-            let (scalars, soff, n, bases_len, boff) = match job {
-                Job::G1(j) => (j.scalars, j.scalar_off, j.n, j.bases.len, j.base_off),
-                Job::G2(j) => (j.scalars, j.scalar_off, j.n, j.bases.len, j.base_off),
+            let (scalars, soff, n) = match job {
+                Job::G1(j) => (j.scalars, j.scalar_off, j.n),
+                Job::G2(j) => (j.scalars, j.scalar_off, j.n),
             };
-            if soff + n > scalars.len {
-                return Err(bad(format!(
-                    "scalar range {}..{} exceeds the {} scalars available",
-                    soff,
-                    soff + n,
-                    scalars.len
-                )));
-            }
-            if boff + n > bases_len {
-                return Err(bad(format!(
-                    "base range {}..{} exceeds the {bases_len} bases uploaded",
-                    boff,
-                    boff + n
-                )));
-            }
             // Identity of the borrowed `CudaSlice` handle, not of its contents and not of
             // the device allocation underneath it: two `Scalars` borrowing distinct handles
             // onto one allocation get separate plans, which is a missed share and never a
@@ -1604,6 +1627,67 @@ const _: () = {
 mod tests {
     use super::*;
     use snarkrs_gpu_layout::{FQ_MODULUS, FQ_N0};
+
+    #[test]
+    fn job_ranges_reject_scalar_overflow() {
+        for (off, n) in [(usize::MAX, 1), (1, usize::MAX), (usize::MAX, 2)] {
+            assert!(matches!(
+                validate_job_ranges(off, n, usize::MAX, 0, usize::MAX),
+                Err(ProveError::Backend {
+                    backend: "cuda",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn job_ranges_reject_base_overflow() {
+        for (off, n) in [(usize::MAX, 1), (1, usize::MAX), (usize::MAX, 2)] {
+            assert!(matches!(
+                validate_job_ranges(0, n, usize::MAX, off, usize::MAX),
+                Err(ProveError::Backend {
+                    backend: "cuda",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn job_ranges_reject_out_of_bounds() {
+        for (soff, n, slen, boff, blen) in [
+            (3, 2, 4, 0, 4),
+            (0, 2, 4, 3, 4),
+            (5, 0, 4, 0, 4),
+            (0, 0, 4, 5, 4),
+            (0, 1, 0, 0, 1),
+            (0, 1, 1, 0, 0),
+        ] {
+            assert!(matches!(
+                validate_job_ranges(soff, n, slen, boff, blen),
+                Err(ProveError::Backend {
+                    backend: "cuda",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn job_ranges_accept_empty_and_exact_end() {
+        for (soff, n, slen, boff, blen) in [
+            (0, 0, 0, 0, 0),
+            (0, 0, 4, 0, 4),
+            (4, 0, 4, 7, 7),
+            (1, 3, 4, 2, 5),
+            (0, 4, 4, 0, 4),
+            (usize::MAX, 0, usize::MAX, usize::MAX, usize::MAX),
+            (usize::MAX - 1, 1, usize::MAX, usize::MAX - 1, usize::MAX),
+        ] {
+            assert!(validate_job_ranges(soff, n, slen, boff, blen).is_ok());
+        }
+    }
 
     /// The drift guard for the two block sizes, which is the failure this file can cause
     /// most easily and diagnose least easily.
