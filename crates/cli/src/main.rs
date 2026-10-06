@@ -658,6 +658,35 @@ fn run(cmd: Cmd) -> Result<u8> {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum CeremonySeam {
+    Msm,
+    GroupFft,
+    KeyScale,
+}
+
+/// Selection without opening a device. A compiled backend can still fail to initialise.
+fn ceremony_backend_kind(kind: BackendKind, seam: CeremonySeam) -> Result<BackendKind> {
+    match kind {
+        BackendKind::Cpu => Ok(kind),
+        BackendKind::Wgpu => Err(no_wgpu()),
+        BackendKind::Cuda if matches!(seam, CeremonySeam::GroupFft) && cfg!(feature = "cuda") => {
+            Ok(kind)
+        }
+        BackendKind::Cuda => Err(no_cuda()),
+        BackendKind::Metal => {
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            {
+                Ok(kind)
+            }
+            #[cfg(not(all(feature = "metal", target_os = "macos")))]
+            {
+                Err(no_metal())
+            }
+        }
+    }
+}
+
 /// The MSM behind `setup` and the two same-ratio checks.
 ///
 /// The three constructors below are `make_backend` for the ceremony: same three failure
@@ -665,7 +694,7 @@ fn run(cmd: Cmd) -> Result<u8> {
 /// backend is not there. A benchmark that silently measures the other backend is worse than
 /// no number, and a `.zkey` that silently came from the other backend is worse than no key.
 fn msm_backend(kind: BackendKind) -> Result<Box<dyn MsmBackend>> {
-    match kind {
+    match ceremony_backend_kind(kind, CeremonySeam::Msm)? {
         BackendKind::Cpu => Ok(Box::new(CpuMsm::new())),
         BackendKind::Wgpu => Err(no_wgpu()),
         BackendKind::Metal => metal_msm(),
@@ -675,7 +704,7 @@ fn msm_backend(kind: BackendKind) -> Result<Box<dyn MsmBackend>> {
 
 /// The group inverse FFT behind `ptau prepare`.
 fn fft_backend(kind: BackendKind) -> Result<Box<dyn GroupFft>> {
-    match kind {
+    match ceremony_backend_kind(kind, CeremonySeam::GroupFft)? {
         BackendKind::Cpu => Ok(Box::new(CpuGroupFft)),
         BackendKind::Wgpu => Err(no_wgpu()),
         BackendKind::Metal => metal_fft(),
@@ -685,7 +714,7 @@ fn fft_backend(kind: BackendKind) -> Result<Box<dyn GroupFft>> {
 
 /// The batch apply-key behind every contribute and beacon command.
 fn key_backend(kind: BackendKind) -> Result<Box<dyn KeyScale>> {
-    match kind {
+    match ceremony_backend_kind(kind, CeremonySeam::KeyScale)? {
         BackendKind::Cpu => Ok(Box::new(CpuKeyScale)),
         BackendKind::Wgpu => Err(no_wgpu()),
         BackendKind::Metal => metal_key(),
@@ -1760,37 +1789,154 @@ mod tests {
         assert_eq!(key_backend(BackendKind::Cpu).unwrap().name(), "cpu");
     }
 
-    /// A backend that cannot run says which one and why. It never falls back: a `.zkey`
-    /// that silently came from the other backend is worse than no key at all.
-    #[test]
-    fn an_unavailable_ceremony_backend_names_itself() {
-        for kind in [BackendKind::Wgpu, BackendKind::Cuda] {
-            let e = match msm_backend(kind) {
-                Ok(_) => panic!(
-                    "built a {} ceremony backend that does not exist",
-                    kind.as_str()
-                ),
-                Err(e) => e.to_string(),
-            };
-            assert!(e.contains(kind.as_str()), "{e}");
-            assert!(e.contains("unavailable"), "{e}");
+    fn backend_error<T>(result: Result<T>) -> String {
+        match result {
+            Ok(_) => panic!("selected an unavailable ceremony backend"),
+            Err(e) => e.to_string(),
         }
     }
 
-    /// Without the feature the error names the feature, so the fix is the message.
-    #[cfg(not(feature = "metal"))]
+    /// All three real constructors must reject WebGPU, even when its feature is on.
     #[test]
-    fn metal_without_the_feature_says_so() {
-        let msg = |r: Result<_>| match r {
-            Ok(_) => panic!("built a metal backend without the metal feature"),
-            Err(e) => e.to_string(),
-        };
+    fn wgpu_rejects_every_ceremony_seam() {
         for e in [
-            msg(msm_backend(BackendKind::Metal).map(|_| ())),
-            msg(fft_backend(BackendKind::Metal).map(|_| ())),
-            msg(key_backend(BackendKind::Metal).map(|_| ())),
+            backend_error(msm_backend(BackendKind::Wgpu)),
+            backend_error(fft_backend(BackendKind::Wgpu)),
+            backend_error(key_backend(BackendKind::Wgpu)),
         ] {
-            assert!(e.contains("--features metal"), "{e}");
+            assert!(
+                e.contains("backend `wgpu` is unavailable for the ceremony"),
+                "{e}"
+            );
+            assert!(e.contains("--backend cpu"), "{e}");
+        }
+    }
+
+    #[test]
+    fn cuda_rejects_ceremony_msm_and_key_scaling() {
+        for e in [
+            backend_error(msm_backend(BackendKind::Cuda)),
+            backend_error(key_backend(BackendKind::Cuda)),
+        ] {
+            assert!(e.contains("backend `cuda` is unavailable"), "{e}");
+            if cfg!(feature = "cuda") {
+                assert!(e.contains("MSM and apply-key"), "{e}");
+                assert!(e.contains("no CUDA kernels"), "{e}");
+                assert!(!e.contains("WITHOUT"), "{e}");
+            } else {
+                assert!(e.contains("WITHOUT the `cuda` feature"), "{e}");
+                assert!(e.contains("--features cuda"), "{e}");
+            }
+        }
+    }
+
+    #[test]
+    fn cuda_group_fft_selection_respects_the_feature() {
+        if cfg!(feature = "cuda") {
+            // Selection only: this test must not load a CUDA driver.
+            assert!(matches!(
+                ceremony_backend_kind(BackendKind::Cuda, CeremonySeam::GroupFft),
+                Ok(BackendKind::Cuda)
+            ));
+        } else {
+            let e = backend_error(fft_backend(BackendKind::Cuda));
+            assert!(e.contains("WITHOUT the `cuda` feature"), "{e}");
+            assert!(e.contains("--features cuda"), "{e}");
+        }
+    }
+
+    #[test]
+    fn supported_ceremony_selection_keeps_the_requested_backend() {
+        for seam in [
+            CeremonySeam::Msm,
+            CeremonySeam::GroupFft,
+            CeremonySeam::KeyScale,
+        ] {
+            assert!(matches!(
+                ceremony_backend_kind(BackendKind::Cpu, seam),
+                Ok(BackendKind::Cpu)
+            ));
+            if cfg!(all(feature = "metal", target_os = "macos")) {
+                assert!(matches!(
+                    ceremony_backend_kind(BackendKind::Metal, seam),
+                    Ok(BackendKind::Metal)
+                ));
+            } else {
+                assert!(ceremony_backend_kind(BackendKind::Metal, seam).is_err());
+            }
+        }
+    }
+
+    /// Exercise clap and the command handlers, not just the capability selector.
+    #[test]
+    fn unsupported_ceremony_commands_fail_before_io_or_entropy_prompt() {
+        let dir =
+            std::env::temp_dir().join(format!("snarkrs-cli-capabilities-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("output");
+        for kind in [BackendKind::Wgpu, BackendKind::Cuda, BackendKind::Metal] {
+            for (seam, words) in [
+                (CeremonySeam::Msm, &["groth16", "setup"][..]),
+                (
+                    CeremonySeam::GroupFft,
+                    &["powersoftau", "prepare", "phase2"][..],
+                ),
+                (CeremonySeam::KeyScale, &["zkey", "contribute"][..]),
+            ] {
+                let unavailable = match kind {
+                    BackendKind::Wgpu => true,
+                    BackendKind::Cuda => {
+                        !cfg!(feature = "cuda") || !matches!(seam, CeremonySeam::GroupFft)
+                    }
+                    BackendKind::Metal => !cfg!(all(feature = "metal", target_os = "macos")),
+                    BackendKind::Cpu => false,
+                };
+                if !unavailable {
+                    continue;
+                }
+                let mut args: Vec<std::ffi::OsString> = std::iter::once("snarkrs")
+                    .chain(words.iter().copied())
+                    .map(Into::into)
+                    .collect();
+                args.push(dir.join("missing-input").into_os_string());
+                if matches!(seam, CeremonySeam::Msm) {
+                    args.push(dir.join("missing-ptau").into_os_string());
+                }
+                args.push(out.as_os_str().to_owned());
+                // If selection regresses, the test must still never prompt on stdin.
+                if matches!(seam, CeremonySeam::KeyScale) {
+                    args.push("--entropy=test".into());
+                }
+                args.extend(["--backend".into(), kind.as_str().into()]);
+                let cli = Cli::try_parse_from(args).unwrap();
+                let e = backend_error(run(cli.cmd));
+                assert!(
+                    e.contains(&format!("backend `{}` is unavailable", kind.as_str())),
+                    "{seam:?}: {e}"
+                );
+                assert!(!out.exists(), "{seam:?}: unsupported backend wrote output");
+            }
+        }
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Feature and target failures need different fixes, and both must name Metal.
+    #[cfg(not(all(feature = "metal", target_os = "macos")))]
+    #[test]
+    fn unavailable_metal_reports_the_feature_or_target() {
+        for e in [
+            backend_error(msm_backend(BackendKind::Metal)),
+            backend_error(fft_backend(BackendKind::Metal)),
+            backend_error(key_backend(BackendKind::Metal)),
+        ] {
+            assert!(e.contains("backend `metal` is unavailable"), "{e}");
+            if cfg!(feature = "metal") {
+                assert!(e.contains("not macOS"), "{e}");
+            } else {
+                assert!(e.contains("WITHOUT the `metal` feature"), "{e}");
+                assert!(e.contains("--features metal"), "{e}");
+            }
         }
     }
 }
