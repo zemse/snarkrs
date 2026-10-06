@@ -63,10 +63,11 @@ pub struct ProvingKey {
 ///
 /// The fields are `pub`, so a hand-built `Coefficients` can hold anything. What
 /// `read_coefficients` upholds, and what a consumer of a parsed key may assume, is:
-/// `row_ptr[m].len() == domain_size + 1`; `row_ptr[m]` is non-decreasing;
+/// `row_ptr[m].len() == domain_size + 1`; `row_ptr[m][0] == 0`;
+/// `row_ptr[m]` is non-decreasing;
 /// `row_ptr[m][domain_size] == signal[m].len() == value[m].len()`; and every
-/// `signal[m][k] < n_vars`. `snarkrs-groth16` re-checks all four at prepare time because a key
-/// built by hand is still reachable.
+/// `signal[m][k] < n_vars`. The backends re-check these at prepare time with
+/// [`Coefficients::check_structure`] because a key built by hand is still reachable.
 pub struct Coefficients {
     /// `row_ptr[m][c]..row_ptr[m][c+1]` indexes into `signal`/`value`, for matrix `m`,
     /// which is 0 for A and 1 for B. Transposing them is silent and produces a proof
@@ -74,6 +75,58 @@ pub struct Coefficients {
     pub row_ptr: [Vec<u32>; 2],
     pub signal: [Vec<u32>; 2],
     pub value: [Vec<Fr>; 2],
+}
+
+impl Coefficients {
+    /// Check both matrices' CSR bounds against the domain and witness length. Paid once
+    /// per key, before a backend uploads or gathers a hand-built key's coefficients.
+    pub fn check_structure(&self, domain_size: usize, n_vars: usize) -> Result<(), ZkeyError> {
+        let bad = |reason| ZkeyError::Malformed { section: 4, reason };
+        let rows_plus_one = domain_size
+            .checked_add(1)
+            .ok_or_else(|| bad(format!("domain size {domain_size} overflows CSR row count")))?;
+        for (m, name) in [(0usize, "A"), (1usize, "B")] {
+            let rp = &self.row_ptr[m];
+            if rp.len() != rows_plus_one {
+                return Err(bad(format!(
+                    "matrix {name} has {} row_ptr entries, domain size {domain_size} needs {rows_plus_one}",
+                    rp.len()
+                )));
+            }
+            for c in 1..rp.len() {
+                if rp[c] < rp[c - 1] {
+                    return Err(bad(format!(
+                        "matrix {name} row_ptr is not monotone at row {}: {} then {}",
+                        c - 1,
+                        rp[c - 1],
+                        rp[c]
+                    )));
+                }
+            }
+            if rp[0] != 0 {
+                return Err(bad(format!(
+                    "matrix {name} row_ptr starts at {}, expected 0",
+                    rp[0]
+                )));
+            }
+            let total = rp[domain_size] as usize;
+            if total != self.signal[m].len() || total != self.value[m].len() {
+                return Err(bad(format!(
+                    "matrix {name} row_ptr ends at {total} but has {} signals and {} values",
+                    self.signal[m].len(),
+                    self.value[m].len()
+                )));
+            }
+            for (k, &s) in self.signal[m].iter().enumerate() {
+                if s as usize >= n_vars {
+                    return Err(bad(format!(
+                        "matrix {name} nonzero {k} references signal {s} beyond n_vars {n_vars}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 pub struct VerifyingKey {
@@ -780,6 +833,119 @@ fn json_g2(v: &serde_json::Value, what: &str) -> Result<G2Affine, ZkeyError> {
         )));
     }
     Ok(p)
+}
+
+#[cfg(test)]
+mod csr_tests {
+    use super::*;
+
+    fn coefficients() -> Coefficients {
+        Coefficients {
+            row_ptr: [vec![0, 1, 1, 2, 2], vec![0, 1, 1, 2, 2]],
+            signal: [vec![0, 1], vec![0, 1]],
+            value: [vec![Fr::one(); 2], vec![Fr::one(); 2]],
+        }
+    }
+
+    fn rejects(c: &Coefficients, m: usize, message: &str) {
+        let ZkeyError::Malformed { section, reason } = c.check_structure(4, 2).unwrap_err() else {
+            panic!("expected a malformed CSR error");
+        };
+        assert_eq!(section, 4);
+        assert!(
+            reason.contains(&format!("matrix {}", ["A", "B"][m])),
+            "{reason}"
+        );
+        assert!(reason.contains(message), "{reason}");
+    }
+
+    #[test]
+    fn rejects_nonzero_origins() {
+        for m in 0..2 {
+            let mut c = coefficients();
+            c.row_ptr[m][0] = 1;
+            rejects(&c, m, "starts at 1, expected 0");
+        }
+    }
+
+    #[test]
+    fn rejects_wrong_row_lengths() {
+        for m in 0..2 {
+            for rows in [vec![], vec![0, 1, 1, 2], vec![0, 1, 1, 2, 2, 2]] {
+                let mut c = coefficients();
+                c.row_ptr[m] = rows;
+                rejects(&c, m, "row_ptr entries");
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_wrong_totals_and_array_lengths() {
+        for m in 0..2 {
+            for fault in 0..4 {
+                let mut c = coefficients();
+                match fault {
+                    0 => c.row_ptr[m] = vec![0, 1, 1, 1, 1],
+                    1 => c.row_ptr[m][4] = 3,
+                    2 => {
+                        c.signal[m].pop();
+                    }
+                    _ => {
+                        c.value[m].pop();
+                    }
+                }
+                rejects(&c, m, "row_ptr ends at");
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_decreasing_rows() {
+        for m in 0..2 {
+            for rows in [vec![0, 2, 1, 2, 2], vec![0, 3, 3, 3, 2]] {
+                let mut c = coefficients();
+                c.row_ptr[m] = rows;
+                rejects(&c, m, "not monotone");
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_out_of_range_signals() {
+        for m in 0..2 {
+            for signal in [2, u32::MAX] {
+                let mut c = coefficients();
+                c.signal[m][1] = signal;
+                rejects(&c, m, "beyond n_vars 2");
+            }
+        }
+    }
+
+    #[test]
+    fn accepts_empty_rows_and_matrices() {
+        assert!(coefficients().check_structure(4, 2).is_ok());
+        for m in 0..2 {
+            let mut c = coefficients();
+            c.row_ptr[m].fill(0);
+            c.signal[m].clear();
+            c.value[m].clear();
+            assert!(c.check_structure(4, 2).is_ok());
+        }
+        let c = Coefficients {
+            row_ptr: [vec![0; 5], vec![0; 5]],
+            signal: [vec![], vec![]],
+            value: [vec![], vec![]],
+        };
+        assert!(c.check_structure(4, 0).is_ok());
+    }
+
+    #[test]
+    fn rejects_overflowing_row_count() {
+        assert!(matches!(
+            coefficients().check_structure(usize::MAX, 2),
+            Err(ZkeyError::Malformed { section: 4, .. })
+        ));
+    }
 }
 
 #[cfg(test)]

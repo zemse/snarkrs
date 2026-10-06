@@ -444,47 +444,9 @@ impl HResident {
         .map_err(|e| bad(format!("no 2n-th root of unity: {e}")))?
         .group_gen;
 
-        for (m, name) in [(0usize, "A"), (1usize, "B")] {
-            let row_ptr = &pk.coeffs.row_ptr[m];
-            if row_ptr.len() != domain.size + 1 {
-                return Err(bad(format!(
-                    "matrix {name} has {} rows, domain size is {}",
-                    row_ptr.len().saturating_sub(1),
-                    domain.size
-                )));
-            }
-            // `gather.metal` walks `for (k = lo; k < hi; k++)`, so a decreasing pair is a
-            // row that silently accumulates zero and a total past the signal array is an
-            // out-of-bounds device read. Same two loops as `snarkrs_groth16::cpu`, the oracle.
-            for c in 1..row_ptr.len() {
-                if row_ptr[c] < row_ptr[c - 1] {
-                    return Err(bad(format!(
-                        "matrix {name} row_ptr is not monotone at row {}: {} then {}",
-                        c - 1,
-                        row_ptr[c - 1],
-                        row_ptr[c]
-                    )));
-                }
-            }
-            let total = row_ptr[row_ptr.len() - 1] as usize;
-            if total != pk.coeffs.signal[m].len() || total != pk.coeffs.value[m].len() {
-                return Err(bad(format!(
-                    "matrix {name} row_ptr ends at {total} but has {} signals and {} values",
-                    pk.coeffs.signal[m].len(),
-                    pk.coeffs.value[m].len()
-                )));
-            }
-            // Checked once per key rather than per proof. On the GPU an out-of-range
-            // signal index is not a panic, it is a silent out-of-bounds read of whatever
-            // follows the witness buffer, so this check is the only thing standing
-            // between a malformed key and a proof built on garbage.
-            if pk.coeffs.signal[m].iter().any(|&s| s as usize >= pk.n_vars) {
-                return Err(bad(format!(
-                    "matrix {name} references a signal beyond n_vars {}",
-                    pk.n_vars
-                )));
-            }
-        }
+        pk.coeffs
+            .check_structure(domain.size, pk.n_vars)
+            .map_err(|e| bad(e.to_string()))?;
 
         // shift^j for j in [0, n). Not the twiddles: the twiddles are powers of the
         // domain's own root of unity and this is a primitive 2n-th root, so no table

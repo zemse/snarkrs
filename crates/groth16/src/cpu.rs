@@ -101,48 +101,9 @@ impl CpuCircuit {
         .map_err(|e| bad(format!("no 2n-th root of unity: {e}")))?
         .group_gen;
 
-        for (m, name) in [(0usize, "A"), (1, "B")] {
-            let row_ptr = &pk.coeffs.row_ptr[m];
-            if row_ptr.len() != domain.size + 1 {
-                return Err(bad(format!(
-                    "matrix {name} has {} rows, domain size is {}",
-                    row_ptr.len().saturating_sub(1),
-                    domain.size
-                )));
-            }
-            // A decreasing pair makes `lo..hi` in `gather` an empty range, so that row
-            // would accumulate `Fr::zero()` with no panic and no error, and the proof that
-            // came out would fail `snarkjs groth16 verify` with nothing in any log. The
-            // same two loops belong in every backend's prepare path (`CsrHost::build` is
-            // snarkrs-wgpu's copy), and this backend is the oracle the other three are diffed
-            // against, so it must not be the one copy that proves garbage quietly.
-            for c in 1..row_ptr.len() {
-                if row_ptr[c] < row_ptr[c - 1] {
-                    return Err(bad(format!(
-                        "matrix {name} row_ptr is not monotone at row {}: {} then {}",
-                        c - 1,
-                        row_ptr[c - 1],
-                        row_ptr[c]
-                    )));
-                }
-            }
-            let total = row_ptr[row_ptr.len() - 1] as usize;
-            if total != pk.coeffs.signal[m].len() || total != pk.coeffs.value[m].len() {
-                return Err(bad(format!(
-                    "matrix {name} row_ptr ends at {total} but has {} signals and {} values",
-                    pk.coeffs.signal[m].len(),
-                    pk.coeffs.value[m].len()
-                )));
-            }
-            // Paid once per key, not per proof, and it turns a would-be panic deep inside
-            // the parallel gather into an error at load time.
-            if pk.coeffs.signal[m].iter().any(|&s| s as usize >= pk.n_vars) {
-                return Err(bad(format!(
-                    "matrix {name} references a signal beyond n_vars {}",
-                    pk.n_vars
-                )));
-            }
-        }
+        pk.coeffs
+            .check_structure(domain.size, pk.n_vars)
+            .map_err(|e| bad(e.to_string()))?;
 
         // `msms` slices the private witness as `witness[n_public + 1..]`, which past
         // `n_vars` is a panic and not an error, and the workspace release profile's
@@ -455,6 +416,70 @@ mod tests {
     }
 
     use super::*;
+
+    fn csr_key() -> ProvingKey {
+        use snarkrs_formats::{Coefficients, VerifyingKey};
+
+        ProvingKey {
+            n_vars: 2,
+            n_public: 0,
+            domain_size: 4,
+            alpha_g1: G1Affine::identity(),
+            beta_g1: G1Affine::identity(),
+            beta_g2: G2Affine::identity(),
+            delta_g1: G1Affine::identity(),
+            delta_g2: G2Affine::identity(),
+            a_query: Vec::new(),
+            b_g1_query: Vec::new(),
+            b_g2_query: Vec::new(),
+            l_query: Vec::new(),
+            h_query: Vec::new(),
+            coeffs: Coefficients {
+                row_ptr: [vec![0, 1, 1, 2, 2], vec![0, 1, 1, 2, 2]],
+                signal: [vec![0, 1], vec![0, 1]],
+                value: [vec![Fr::one(); 2], vec![Fr::one(); 2]],
+            },
+            vk: VerifyingKey {
+                alpha_g1: G1Affine::identity(),
+                beta_g2: G2Affine::identity(),
+                gamma_g2: G2Affine::identity(),
+                delta_g2: G2Affine::identity(),
+                ic: Vec::new(),
+            },
+        }
+    }
+
+    fn rejects_csr_origin(m: usize) {
+        let mut pk = csr_key();
+        pk.coeffs.row_ptr[m][0] = 1;
+        let Err(err) = CpuCircuit::new(pk) else {
+            panic!("accepted matrix {m} with a nonzero CSR origin");
+        };
+        assert!(matches!(err, ProveError::Backend { backend: "cpu", .. }));
+        assert!(err.to_string().contains("starts at 1"), "{err}");
+    }
+
+    #[test]
+    fn csr_rejects_nonzero_a_origin() {
+        rejects_csr_origin(0);
+    }
+
+    #[test]
+    fn csr_rejects_nonzero_b_origin() {
+        rejects_csr_origin(1);
+    }
+
+    #[test]
+    fn csr_accepts_empty_rows() {
+        let circuit = CpuCircuit::new(csr_key()).unwrap();
+        let witness = [Fr::from(2u64), Fr::from(3u64)];
+        for m in 0..2 {
+            assert_eq!(
+                circuit.gather(m, &witness),
+                vec![witness[0], Fr::zero(), witness[1], Fr::zero()]
+            );
+        }
+    }
 
     fn tiny_key() -> Option<ProvingKey> {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

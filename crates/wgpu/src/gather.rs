@@ -20,10 +20,10 @@
 //! An out-of-range index in WGSL is not a fault. naga and every browser bounds-check storage
 //! access, so `WITNESS[signal]` with a signal past the end of the witness quietly returns
 //! zero and the proof comes out wrong with nothing in any log. [`CsrHost::build`] therefore
-//! walks the CSR once at key load and rejects a non-monotone `row_ptr`, a `row_ptr` of the
-//! wrong length, a nonzero count that disagrees with the arrays, and a signal at or past
-//! `n_vars`. `snarkrs_groth16::cpu::CpuCircuit::prepare` already checks two of those four, but this
-//! backend must not depend on somebody else having looked.
+//! checks the CSR once at key load with [`Coefficients::check_structure`], rejecting a
+//! non-monotone `row_ptr`, a nonzero origin, a `row_ptr` of the wrong length, a nonzero count
+//! that disagrees with the arrays, and a signal at or past `n_vars`. The CPU, CUDA and Metal
+//! backends use the same check before gathering or uploading a hand-built key.
 
 use bytemuck::{Pod, Zeroable};
 use snarkrs_field::Fr;
@@ -123,38 +123,15 @@ impl CsrHost {
             .ok_or_else(|| bad(format!("domain size {domain_size} overflows u32")))?;
         u32::try_from(n_vars).map_err(|_| bad(format!("n_vars {n_vars} overflows u32")))?;
 
+        coeffs
+            .check_structure(domain_size, n_vars)
+            .map_err(|e| bad(e.to_string()))?;
+
         let mut row_ptr = Vec::with_capacity(2 * rows_plus_one);
         let mut nnz = [0u32; 2];
-        for (m, name) in [(0usize, "A"), (1usize, "B")] {
+        for m in 0..2 {
             let rp = &coeffs.row_ptr[m];
-            if rp.len() != rows_plus_one {
-                return Err(bad(format!(
-                    "matrix {name} has {} row_ptr entries, domain size {domain_size} needs {rows_plus_one}",
-                    rp.len()
-                )));
-            }
-            // Monotonicity is what makes `lo < hi` a bounded loop in the kernel. A single
-            // decreasing pair would make one thread loop until it walked off the end of a
-            // 4 GiB address space, which on a GPU is a hang and not an error.
-            for c in 1..rp.len() {
-                if rp[c] < rp[c - 1] {
-                    return Err(bad(format!(
-                        "matrix {name} row_ptr is not monotone at row {}: {} then {}",
-                        c - 1,
-                        rp[c - 1],
-                        rp[c]
-                    )));
-                }
-            }
-            let total = rp[rp.len() - 1] as usize;
-            if total != coeffs.signal[m].len() || total != coeffs.value[m].len() {
-                return Err(bad(format!(
-                    "matrix {name} row_ptr ends at {total} but has {} signals and {} values",
-                    coeffs.signal[m].len(),
-                    coeffs.value[m].len()
-                )));
-            }
-            nnz[m] = rp[rp.len() - 1];
+            nnz[m] = rp[domain_size];
             row_ptr.extend_from_slice(rp);
         }
 
@@ -166,14 +143,7 @@ impl CsrHost {
 
         let mut signal = Vec::with_capacity(total_nz);
         let mut value = Vec::with_capacity(total_nz * LIMBS);
-        for (m, name) in [(0usize, "A"), (1usize, "B")] {
-            for (k, &s) in coeffs.signal[m].iter().enumerate() {
-                if s as usize >= n_vars {
-                    return Err(bad(format!(
-                        "matrix {name} nonzero {k} references signal {s}, witness has {n_vars}"
-                    )));
-                }
-            }
+        for m in 0..2 {
             signal.extend_from_slice(&coeffs.signal[m]);
             push_fr_words(&coeffs.value[m], &mut value);
         }
@@ -895,6 +865,68 @@ impl GatherAbc {
 
     pub fn kernels(&self) -> &Kernels {
         &self.kernels
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn coefficients() -> Coefficients {
+        Coefficients {
+            row_ptr: [vec![0, 1, 1, 2, 2], vec![0, 1, 1, 2, 2]],
+            signal: [vec![0, 1], vec![0, 1]],
+            value: [vec![Fr::from(1u64); 2], vec![Fr::from(1u64); 2]],
+        }
+    }
+
+    fn rejects_csr_origin(m: usize) {
+        let mut c = coefficients();
+        c.row_ptr[m][0] = 1;
+        let Err(err) = CsrHost::build(&c, 4, 2) else {
+            panic!("accepted matrix {m} with a nonzero CSR origin");
+        };
+        assert!(matches!(
+            err,
+            ProveError::Backend {
+                backend: "wgpu",
+                ..
+            }
+        ));
+        assert!(err.to_string().contains("starts at 1"), "{err}");
+    }
+
+    #[test]
+    fn csr_rejects_nonzero_a_origin() {
+        rejects_csr_origin(0);
+    }
+
+    #[test]
+    fn csr_rejects_nonzero_b_origin() {
+        rejects_csr_origin(1);
+    }
+
+    #[test]
+    fn csr_accepts_empty_rows_and_matrices() {
+        let c = coefficients();
+        let host = CsrHost::build(&c, 4, 2).unwrap();
+        assert_eq!(
+            host.row_ptr,
+            [c.row_ptr[0].clone(), c.row_ptr[1].clone()].concat()
+        );
+        assert_eq!(host.signal, vec![0, 1, 0, 1]);
+        assert_eq!(host.nnz, [2, 2]);
+        assert_eq!(host.nz_base, [0, 2]);
+        for m in 0..2 {
+            let mut c = coefficients();
+            c.row_ptr[m].fill(0);
+            c.signal[m].clear();
+            c.value[m].clear();
+            let host = CsrHost::build(&c, 4, 2).unwrap();
+            assert_eq!(host.nnz[m], 0);
+            assert_eq!(host.signal.len(), 2);
+            assert_eq!(host.value.len(), 2 * LIMBS);
+        }
     }
 }
 
