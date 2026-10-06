@@ -458,8 +458,11 @@ impl WgpuCircuit {
         &self.stages
     }
 
-    /// The key this circuit was prepared from. Inherent as well as on `PreparedCircuit`,
+    /// The retained key data, with the same contract as [`PreparedCircuit::key`]. Inherent
     /// because that trait is native only and stage 11 in the browser needs it.
+    ///
+    /// This backend also retains the bulk coefficients and queries for [`Self::reupload`];
+    /// other backends may release them after upload.
     pub fn key(&self) -> &ProvingKey {
         &self.pk
     }
@@ -979,3 +982,83 @@ const _: () = {
     assert_send_sync::<WgpuProver>();
     assert_send_sync::<WgpuCircuit>();
 };
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires a native GPU and bench/artifacts/tiny_mul/circuit.zkey"]
+    fn key_retention_preserves_wgpu_host_storage() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../bench/artifacts/tiny_mul/circuit.zkey");
+        let expected = ProvingKey::load(&path).expect("tiny_mul key");
+        let circuit = WgpuProver::new()
+            .expect("WebGPU device")
+            .prepare(ProvingKey::load(&path).unwrap())
+            .unwrap();
+        let key = circuit.key();
+        let dimensions = (expected.n_vars, expected.n_public, expected.domain_size);
+        assert_eq!((key.n_vars, key.n_public, key.domain_size), dimensions);
+        assert_eq!(
+            (circuit.n_vars(), circuit.n_public(), circuit.domain_size()),
+            dimensions
+        );
+        assert_eq!(
+            (
+                key.alpha_g1,
+                key.beta_g1,
+                key.beta_g2,
+                key.delta_g1,
+                key.delta_g2
+            ),
+            (
+                expected.alpha_g1,
+                expected.beta_g1,
+                expected.beta_g2,
+                expected.delta_g1,
+                expected.delta_g2
+            )
+        );
+        assert_eq!(
+            (
+                key.vk.alpha_g1,
+                key.vk.beta_g2,
+                key.vk.gamma_g2,
+                key.vk.delta_g2,
+                &key.vk.ic
+            ),
+            (
+                expected.vk.alpha_g1,
+                expected.vk.beta_g2,
+                expected.vk.gamma_g2,
+                expected.vk.delta_g2,
+                &expected.vk.ic
+            )
+        );
+        assert_eq!(
+            (&key.coeffs.row_ptr, &key.coeffs.signal, &key.coeffs.value),
+            (
+                &expected.coeffs.row_ptr,
+                &expected.coeffs.signal,
+                &expected.coeffs.value
+            )
+        );
+        assert_eq!(
+            (
+                &key.a_query,
+                &key.b_g1_query,
+                &key.b_g2_query,
+                &key.l_query,
+                &key.h_query
+            ),
+            (
+                &expected.a_query,
+                &expected.b_g1_query,
+                &expected.b_g2_query,
+                &expected.l_query,
+                &expected.h_query
+            )
+        );
+    }
+}

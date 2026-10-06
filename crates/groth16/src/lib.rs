@@ -297,7 +297,15 @@ pub trait PreparedCircuit: Send + Sync {
     fn n_vars(&self) -> usize;
     fn n_public(&self) -> usize;
     fn domain_size(&self) -> usize;
-    /// Read-only access to the key, for the stages that stay on the host (11).
+    /// Read-only key data for verification and host-side blinding/assembly (stage 11).
+    ///
+    /// Preserves `n_vars`, `n_public`, `domain_size`, the full `vk` (including `ic`), and
+    /// `alpha_g1`, `beta_g1`, `beta_g2`, `delta_g1`, `delta_g2` from the prepared key.
+    /// The dimensions agree with this circuit's corresponding accessors.
+    ///
+    /// Bulk storage (`coeffs` and the five query vectors) is backend-dependent and may
+    /// be released after upload. This is not guaranteed to be a complete proving key
+    /// reusable to prepare another backend; retain or reload the original key for that.
     fn key(&self) -> &ProvingKey;
 
     /// Stages 0-4. Returns `H` evaluated on the coset, length `domain_size`.

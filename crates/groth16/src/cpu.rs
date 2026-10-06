@@ -50,6 +50,8 @@ impl Backend for CpuBackend {
     }
 }
 
+/// The CPU keeps the complete host key: gather and MSMs read its coefficient and query
+/// vectors per proof. [`PreparedCircuit::key`] does not require GPU backends to do so.
 pub struct CpuCircuit {
     pk: ProvingKey,
     domain: Domain,
@@ -447,6 +449,109 @@ mod tests {
                 ic: Vec::new(),
             },
         }
+    }
+
+    #[test]
+    fn key_retention_preserves_full_cpu_key_and_assembly() {
+        let g1 = |n: u64| (G1Projective::generator() * Fr::from(n)).into_affine();
+        let g2 = |n: u64| (G2Projective::generator() * Fr::from(n)).into_affine();
+        let mut pk = csr_key();
+        pk.n_vars = 3;
+        pk.n_public = 1;
+        pk.alpha_g1 = g1(2);
+        pk.beta_g1 = g1(3);
+        pk.beta_g2 = g2(5);
+        pk.delta_g1 = g1(7);
+        pk.delta_g2 = g2(11);
+        pk.vk.alpha_g1 = g1(13);
+        pk.vk.beta_g2 = g2(17);
+        pk.vk.gamma_g2 = g2(19);
+        pk.vk.delta_g2 = g2(23);
+        pk.vk.ic = vec![g1(29), g1(31)];
+        pk.a_query = vec![g1(37); 3];
+        pk.b_g1_query = vec![g1(41); 3];
+        pk.b_g2_query = vec![g2(43); 3];
+        pk.l_query = vec![g1(47)];
+        pk.h_query = vec![g1(53); 4];
+
+        let dimensions = (pk.n_vars, pk.n_public, pk.domain_size);
+        let points = (
+            pk.alpha_g1,
+            pk.beta_g1,
+            pk.beta_g2,
+            pk.delta_g1,
+            pk.delta_g2,
+        );
+        let vk = (
+            pk.vk.alpha_g1,
+            pk.vk.beta_g2,
+            pk.vk.gamma_g2,
+            pk.vk.delta_g2,
+            pk.vk.ic.clone(),
+        );
+        let coefficients = (
+            pk.coeffs.row_ptr.clone(),
+            pk.coeffs.signal.clone(),
+            pk.coeffs.value.clone(),
+        );
+        let queries = (
+            pk.a_query.clone(),
+            pk.b_g1_query.clone(),
+            pk.b_g2_query.clone(),
+            pk.l_query.clone(),
+            pk.h_query.clone(),
+        );
+        let msms = MsmOutputs {
+            a_g1: G1Projective::zero(),
+            b_g1: G1Projective::zero(),
+            b_g2: G2Projective::zero(),
+            l_g1: G1Projective::zero(),
+            h_g1: G1Projective::zero(),
+        };
+        let expected = crate::prove::assemble_trace(&pk, &msms, &mut StageTimings::default());
+        let circuit = CpuBackend::new().prepare(pk).unwrap();
+        let key = circuit.key();
+        assert_eq!((key.n_vars, key.n_public, key.domain_size), dimensions);
+        assert_eq!(
+            (circuit.n_vars(), circuit.n_public(), circuit.domain_size()),
+            dimensions
+        );
+        assert_eq!(
+            (
+                key.alpha_g1,
+                key.beta_g1,
+                key.beta_g2,
+                key.delta_g1,
+                key.delta_g2
+            ),
+            points
+        );
+        assert_eq!(
+            (
+                key.vk.alpha_g1,
+                key.vk.beta_g2,
+                key.vk.gamma_g2,
+                key.vk.delta_g2,
+                &key.vk.ic
+            ),
+            (vk.0, vk.1, vk.2, vk.3, &vk.4)
+        );
+        assert_eq!(
+            (&key.coeffs.row_ptr, &key.coeffs.signal, &key.coeffs.value),
+            (&coefficients.0, &coefficients.1, &coefficients.2)
+        );
+        assert_eq!(
+            (
+                &key.a_query,
+                &key.b_g1_query,
+                &key.b_g2_query,
+                &key.l_query,
+                &key.h_query
+            ),
+            (&queries.0, &queries.1, &queries.2, &queries.3, &queries.4)
+        );
+        let got = crate::prove::assemble_trace(key, &msms, &mut StageTimings::default());
+        assert_eq!((got.a, got.b, got.c), (expected.a, expected.b, expected.c));
     }
 
     fn rejects_csr_origin(m: usize) {

@@ -169,9 +169,10 @@ impl Backend for MetalBackend {
 ///
 /// # What stays on the host
 ///
-/// Only the header and the verifying key. The five query sections and the coefficients
-/// are emptied as each one is uploaded, so [`PreparedCircuit::key`] returns a key whose
-/// vectors are empty. Nothing on the host reads them after `prepare`.
+/// The dimensions, all five header points used for blinding/assembly, and the full
+/// verifying key (including `vk.ic`). The five query sections and all coefficient vectors
+/// are emptied as each one is uploaded. [`PreparedCircuit::key`] permits releasing this
+/// bulk storage; its result is not a complete key for preparing another backend.
 ///
 /// They go through [`crate::alloc::release`] rather than a plain drop, because macOS
 /// malloc keeps freed large blocks resident in its large cache, and on js_384x384_d32
@@ -615,6 +616,97 @@ mod tests {
     use snarkrs_groth16::prove::prove_with_blinders;
     use snarkrs_groth16::verify::verify;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    #[ignore = "requires a Metal device and bench/artifacts/tiny_mul/circuit.zkey"]
+    fn key_retention_releases_only_metal_bulk_storage() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../bench/artifacts/tiny_mul/circuit.zkey");
+        let expected = ProvingKey::load(&path).expect("tiny_mul key");
+        assert!(!expected.a_query.is_empty());
+        assert!(!expected.vk.ic.is_empty());
+        let circuit = MetalBackend::new()
+            .expect("Metal device")
+            .prepare(ProvingKey::load(&path).unwrap())
+            .unwrap();
+        let key = circuit.key();
+        let dimensions = (expected.n_vars, expected.n_public, expected.domain_size);
+        assert_eq!((key.n_vars, key.n_public, key.domain_size), dimensions);
+        assert_eq!(
+            (circuit.n_vars(), circuit.n_public(), circuit.domain_size()),
+            dimensions
+        );
+        assert_eq!(
+            (
+                key.alpha_g1,
+                key.beta_g1,
+                key.beta_g2,
+                key.delta_g1,
+                key.delta_g2
+            ),
+            (
+                expected.alpha_g1,
+                expected.beta_g1,
+                expected.beta_g2,
+                expected.delta_g1,
+                expected.delta_g2
+            )
+        );
+        assert_eq!(
+            (
+                key.vk.alpha_g1,
+                key.vk.beta_g2,
+                key.vk.gamma_g2,
+                key.vk.delta_g2,
+                &key.vk.ic
+            ),
+            (
+                expected.vk.alpha_g1,
+                expected.vk.beta_g2,
+                expected.vk.gamma_g2,
+                expected.vk.delta_g2,
+                &expected.vk.ic
+            )
+        );
+        assert_eq!(
+            [
+                key.a_query.len(),
+                key.b_g1_query.len(),
+                key.b_g2_query.len(),
+                key.l_query.len(),
+                key.h_query.len()
+            ],
+            [0; 5]
+        );
+        assert_eq!(
+            [
+                key.a_query.capacity(),
+                key.b_g1_query.capacity(),
+                key.b_g2_query.capacity(),
+                key.l_query.capacity(),
+                key.h_query.capacity()
+            ],
+            [0; 5]
+        );
+        for m in 0..2 {
+            assert_eq!(
+                [
+                    key.coeffs.row_ptr[m].len(),
+                    key.coeffs.signal[m].len(),
+                    key.coeffs.value[m].len()
+                ],
+                [0; 3]
+            );
+            assert_eq!(
+                [
+                    key.coeffs.row_ptr[m].capacity(),
+                    key.coeffs.signal[m].capacity(),
+                    key.coeffs.value[m].capacity()
+                ],
+                [0; 3]
+            );
+        }
+    }
 
     fn artifacts() -> Vec<(String, PathBuf)> {
         let Ok(root) = Path::new(env!("CARGO_MANIFEST_DIR"))
