@@ -6,10 +6,16 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
+import { once } from 'node:events';
+import { finished } from 'node:stream/promises';
+import { createServer as createHttpServer } from 'node:http';
 import { createServer, mergeConfig } from 'vite';
+import { sveltekit } from '@sveltejs/kit/vite';
 
 // Local correctness smoke, not a benchmark. Only the circuit catalogue is replaced with a
 // tiny fixture; the actual page, runner, worker, WASM and snarkjs execute without mocks.
+// The fixture config uses SvelteKit directly, not private operational/deployed Vite config.
+// Asset hashes identify the supplied files; --wasm-revision is caller-declared provenance.
 // node scripts/browser-parity.mjs --assets /absolute/pkg --fixtures /absolute/tiny_mul
 //   --wasm-revision <Rust build revision> [--out /absolute/ignored/output]
 const web = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -19,28 +25,36 @@ const { values } = parseArgs({
     assets: { type: 'string' }, fixtures: { type: 'string' },
     'wasm-revision': { type: 'string' }, out: { type: 'string' },
     'test-server-config': { type: 'boolean', default: false },
+    'test-lifecycle': { type: 'boolean', default: false },
     chrome: { type: 'string', default: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' }
   }
 });
 // Ignore checkout-local TLS settings: loopback HTTP is a secure context for WebGPU.
 const ownedServer = { host: '127.0.0.1', port: 0, open: false, https: false };
+function fixtureConfig(options = {}) {
+  return mergeConfig(options, {
+    root: web, configFile: false, server: ownedServer, plugins: [sveltekit()]
+  });
+}
+if (values['test-lifecycle']) {
+  await lifecycleTests();
+  process.exit(0);
+}
 if (values['test-server-config']) {
   for (const https of [undefined, { cert: 'unused test certificate', key: 'unused test key' }]) {
-    const server = await createServer(mergeConfig(
-      { server: { https } },
-      {
-        root: web, configFile: false, server: ownedServer,
-        plugins: [{
-          name: 'http-readiness',
-          configureServer(server) {
-            server.middlewares.use('/__parity-ready', (_req, res) => res.end('ready'));
-          }
-        }]
-      }
-    ));
+    const server = await deadline(createServer(fixtureConfig({
+      configFile: join(web, 'must-not-load-this-config.mjs'), server: { https },
+      plugins: [{
+        name: 'http-readiness',
+        configureServer(server) {
+          server.middlewares.use('/__parity-ready', (_req, res) => res.end('ready'));
+        }
+      }]
+    })), 30000, 'fixture config');
     try {
+      assert.ok(!server.config.configFile, 'no operational Vite config may be loaded');
       assert.equal(server.config.server.https, false, 'inherited TLS must be disabled');
-      await server.listen();
+      await deadline(server.listen(), 10000, 'HTTP listen');
       const response = await fetch(`http://127.0.0.1:${server.httpServer.address().port}/__parity-ready`, {
         signal: AbortSignal.timeout(10000), redirect: 'error'
       });
@@ -48,7 +62,7 @@ if (values['test-server-config']) {
       assert.equal(await response.text(), 'ready');
       console.log(`server config ${https ? 'with inherited TLS' : 'without TLS'}: HTTP readiness passed`);
     } finally {
-      await server.close();
+      await deadline(server.close(), 5000, 'HTTP close');
     }
   }
   process.exit(0);
@@ -87,6 +101,12 @@ const evidence = {
   revision: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim(),
   workingTree: execFileSync('git', ['status', '--short'], { cwd: repo, encoding: 'utf8' }).trim(),
   wasmRevision: values['wasm-revision'],
+  limitations: {
+    wasmRevision: 'Caller-declared, not independently attested.',
+    assets: 'Supplied Rust release assets before wasm-opt, not production asset validation.',
+    config: 'Owned HTTP fixture config with SvelteKit, not operational/deployed Vite config.',
+    adapter: 'Separately requested window adapter; worker device identity is not attested.'
+  },
   harnessSha256: sha256(readFileSync(fileURLToPath(import.meta.url))),
   assets: Object.fromEntries([...assets].map(([name, data]) => [name, { bytes: data.length, sha256: sha256(data) }])),
   fixtures: Object.fromEntries([...fixtures].map(([name, data]) => [name, { bytes: data.length, sha256: sha256(data) }])),
@@ -97,11 +117,160 @@ const evidence = {
 const reports = [], pendingReports = new Set();
 let server, chrome, browser, page;
 const chromeLog = createWriteStream(join(out, 'chrome.log'));
+chromeLog.on('error', (e) => evidence.errors.push(`Chrome log: ${e.message}`));
+
+async function deadline(work, ms, label) {
+  let timer;
+  try {
+    return await Promise.race([
+      work,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`timed out: ${label}`)), ms);
+      })
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function connectSocket(url, timeout = 10000, Socket = WebSocket) {
+  const ws = new Socket(url);
+  let open, error, close;
+  try {
+    await deadline(new Promise((resolve, reject) => {
+      open = resolve;
+      error = () => reject(new Error('WebSocket connection failed'));
+      close = () => reject(new Error('WebSocket closed before connecting'));
+      ws.addEventListener('open', open, { once: true });
+      ws.addEventListener('error', error, { once: true });
+      ws.addEventListener('close', close, { once: true });
+    }), timeout, 'WebSocket handshake');
+    return ws;
+  } catch (e) {
+    ws.close();
+    throw e;
+  } finally {
+    ws.removeEventListener('open', open);
+    ws.removeEventListener('error', error);
+    ws.removeEventListener('close', close);
+  }
+}
+
+async function closeSocket(ws) {
+  if (ws.readyState === 3) return;
+  let close;
+  try {
+    await deadline(new Promise((resolve) => {
+      close = resolve;
+      ws.addEventListener('close', close, { once: true });
+      ws.close();
+    }), 2000, 'WebSocket close');
+  } finally {
+    ws.removeEventListener('close', close);
+  }
+}
+
+async function fetchJson(url, options = {}, timeout = 10000) {
+  const response = await fetch(url, { ...options, signal: AbortSignal.timeout(timeout), redirect: 'error' });
+  assert.equal(response.status, 200, `HTTP status for ${url}`);
+  return response.json();
+}
+
+function childExited(child) {
+  return child.exitCode !== null || child.signalCode !== null;
+}
+async function waitForExit(child, timeout) {
+  if (childExited(child)) return true;
+  let timer, exit;
+  try {
+    return await new Promise((resolve) => {
+      exit = () => resolve(true);
+      child.once('exit', exit);
+      timer = setTimeout(() => resolve(false), timeout);
+    });
+  } finally {
+    clearTimeout(timer);
+    child.removeListener('exit', exit);
+  }
+}
+
+async function stopOwnedChild(child, { graceMs = 0, termMs = 5000, killMs = 2000 } = {}) {
+  const result = { pid: child?.pid, termSent: false, killSent: false };
+  try {
+    if (!child?.pid) return { ...result, notSpawned: true };
+    if (!childExited(child) && graceMs) await waitForExit(child, graceMs);
+    if (!childExited(child)) {
+      result.termSent = child.kill('SIGTERM');
+      await waitForExit(child, termMs);
+    }
+    if (!childExited(child)) {
+      result.killSent = child.kill('SIGKILL');
+      if (!await waitForExit(child, killMs)) throw new Error(`owned child ${child.pid} did not exit after SIGKILL`);
+    }
+    return { ...result, exitCode: child.exitCode, signalCode: child.signalCode };
+  } finally {
+    for (const stream of child?.stdio ?? []) stream?.destroy();
+    if (child?.connected) child.disconnect();
+  }
+}
+
+async function cleanupStep(steps, name, action, timeout = 5000) {
+  try {
+    const result = await deadline(Promise.resolve().then(action), timeout, name);
+    steps.push({ name, ok: true, result });
+  } catch (e) {
+    steps.push({ name, ok: false, error: e.message ?? String(e) });
+  }
+}
+
+async function lifecycleTests() {
+  class StalledSocket extends EventTarget {
+    static last;
+    constructor() { super(); StalledSocket.last = this; }
+    close() { this.closed = true; }
+  }
+  await assert.rejects(connectSocket('ws://unused', 20, StalledSocket), /timed out: WebSocket handshake/);
+  assert.equal(StalledSocket.last.closed, true);
+  console.log('stalled WebSocket: deadline and close passed');
+  await assert.rejects(waitFor(() => new Promise(() => {}), 'stalled readiness', 20), /timed out: stalled readiness/);
+  console.log('stalled readiness callback: deadline passed');
+  const steps = [];
+  await cleanupStep(steps, 'stalled teardown', () => new Promise(() => {}), 20);
+  assert.equal(steps[0].ok, false);
+  assert.match(steps[0].error, /timed out/);
+  console.log('stalled teardown: recorded as a failed cleanup step');
+  const http = createHttpServer((_req, res) => { res.writeHead(200); res.write('{'); });
+  try {
+    http.listen(0, '127.0.0.1');
+    await deadline(once(http, 'listening'), 1000, 'test HTTP listen');
+    await assert.rejects(fetchJson(`http://127.0.0.1:${http.address().port}`, {}, 30), /abort|timeout/i);
+    console.log('stalled HTTP body: abort deadline passed');
+  } finally {
+    http.closeAllConnections();
+    await deadline(new Promise((resolve) => http.close(resolve)), 1000, 'test HTTP close');
+  }
+  for (const refuseTerm of [false, true]) {
+    const child = spawn(process.execPath, ['-e',
+      `${refuseTerm ? "process.on('SIGTERM', () => {});" : ''} process.send('ready'); setInterval(() => {}, 1000);`
+    ], { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
+    try {
+      await deadline(once(child, 'message'), 2000, 'owned dummy readiness');
+      const stopped = await stopOwnedChild(child, { termMs: 100, killMs: 2000 });
+      assert.equal(stopped.termSent, true);
+      assert.equal(stopped.killSent, refuseTerm);
+      assert.equal(stopped.signalCode, refuseTerm ? 'SIGKILL' : 'SIGTERM');
+      assert.ok(child.stdout.destroyed && child.stderr.destroyed);
+      console.log(`owned child ${refuseTerm ? 'refusing TERM' : 'accepting TERM'}: exit and pipe cleanup passed`);
+    } finally {
+      await stopOwnedChild(child, { termMs: 100, killMs: 2000 });
+    }
+  }
+}
 
 async function waitFor(fn, label, timeout = 120000) {
   const end = Date.now() + timeout;
   while (Date.now() < end) {
-    const value = await fn();
+    const value = await deadline(Promise.resolve().then(fn), Math.max(1, end - Date.now()), label);
     if (value) return value;
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
@@ -109,11 +278,7 @@ async function waitFor(fn, label, timeout = 120000) {
 }
 
 async function cdp(url) {
-  const ws = new WebSocket(url);
-  await new Promise((resolve, reject) => {
-    ws.addEventListener('open', resolve, { once: true });
-    ws.addEventListener('error', reject, { once: true });
-  });
+  const ws = await connectSocket(url);
   let next = 0;
   const pending = new Map();
   ws.addEventListener('message', ({ data }) => {
@@ -133,34 +298,38 @@ async function cdp(url) {
     pending.clear();
   });
   return {
-    send(method, params = {}) {
+    send(method, params = {}, timeout = 120000) {
       const id = ++next;
       return new Promise((resolve, reject) => {
         const timer = setTimeout(() => {
           pending.delete(id);
           reject(new Error(`CDP timeout: ${method}`));
-        }, 120000);
+        }, timeout);
         pending.set(id, { resolve, reject, timer });
-        ws.send(JSON.stringify({ id, method, params }));
+        try {
+          ws.send(JSON.stringify({ id, method, params }));
+        } catch (e) {
+          clearTimeout(timer);
+          pending.delete(id);
+          reject(e);
+        }
       });
     },
-    close() { ws.close(); }
+    close() { return closeSocket(ws); }
   };
 }
 
-async function evaluate(expression) {
+async function evaluate(expression, timeout = 120000) {
   const result = await page.send('Runtime.evaluate', {
     expression, awaitPromise: true, returnByValue: true
-  });
+  }, timeout);
   if (result.exceptionDetails) throw new Error(JSON.stringify(result.exceptionDetails));
   return result.result.value;
 }
 
 try {
-  server = await createServer({
-    root: web, configFile: join(web, 'vite.config.ts'),
+  server = await deadline(createServer(fixtureConfig({
     define: { 'import.meta.env.VITE_ARTIFACT_BASE': JSON.stringify('/__fixtures') },
-    server: ownedServer,
     plugins: [{
       name: 'tiny-parity-fixture', enforce: 'pre',
       resolveId(id) { if (id === '../pkg-version') return '\0parity-version'; },
@@ -200,9 +369,10 @@ try {
         });
       }
     }]
-  });
+  })), 30000, 'fixture server creation');
+  assert.ok(!server.config.configFile, 'operational Vite config must not be loaded');
   assert.equal(server.config.server.https, false, 'the smoke server must override inherited HTTPS');
-  await server.listen();
+  await deadline(server.listen(), 10000, 'fixture server listen');
   const origin = `http://127.0.0.1:${server.httpServer.address().port}`;
   evidence.origin = origin;
   const readinessUrl = `${origin}/pkg/snarkrs_web.js?v=${version}`;
@@ -226,11 +396,11 @@ try {
     catch { return false; }
   }, 'Chrome debugger readiness', 30000);
   const endpoint = `http://127.0.0.1:${port}`;
-  const info = await (await fetch(`${endpoint}/json/version`)).json();
+  const info = await fetchJson(`${endpoint}/json/version`);
   evidence.browser = info;
   browser = await cdp(info.webSocketDebuggerUrl);
   evidence.gpu = await browser.send('SystemInfo.getInfo');
-  const tab = await (await fetch(`${endpoint}/json/new?about:blank`, { method: 'PUT' })).json();
+  const tab = await fetchJson(`${endpoint}/json/new?about:blank`, { method: 'PUT' });
   page = await cdp(tab.webSocketDebuggerUrl);
   await page.send('Page.enable');
   await page.send('Runtime.enable');
@@ -332,26 +502,55 @@ try {
     assert.ok(evidence.requests.some((url) => url === `${name}?v=${version}`), `fresh asset not requested: ${name}`);
   }
   assert.equal(evidence.errors.length, 0, JSON.stringify(evidence.errors));
-  evidence.passed = true;
+  evidence.checksPassed = true;
 } catch (e) {
   evidence.failure = e.stack ?? String(e);
   console.error(evidence.failure);
-  process.exitCode = 1;
 } finally {
+  const started = performance.now();
+  const steps = [];
+  evidence.cleanup = { state: 'in-progress', steps };
   evidence.reports = reports.map(({ report }) => report);
-  if (page && !evidence.passed) {
-    try { evidence.pageAtFailure = await evaluate(`document.body?.innerText ?? ''`); }
-    catch { /* navigation or device loss may already have closed the page */ }
+  // A killed or stuck teardown must leave a record that has not declared the gate passed.
+  await cleanupStep(steps, 'preliminary evidence', () =>
+    writeFile(join(out, 'evidence.json'), JSON.stringify(evidence, null, 2)));
+  if (page && !evidence.checksPassed) {
+    try { evidence.pageAtFailure = await evaluate(`document.body?.innerText ?? ''`, 2000); }
+    catch (e) { evidence.pageDiagnosticError = e.message; }
   }
-  for (const res of pendingReports) res.writeHead(503).end();
-  page?.close();
+  await cleanupStep(steps, 'release reports', () => {
+    for (const res of pendingReports) res.writeHead(503).end();
+  });
   if (browser) {
-    try { await browser.send('Browser.close'); } catch { /* the socket may close first */ }
-    browser.close();
+    await cleanupStep(steps, 'Browser.close', async () => {
+      try { await browser.send('Browser.close', {}, 2000); }
+      catch (e) {
+        if (e.message !== 'CDP connection closed') throw e;
+        return { closedBeforeReply: true };
+      }
+    }, 3000);
   }
-  if (chrome && chrome.exitCode === null) chrome.kill('SIGTERM');
-  await server?.close();
-  chromeLog.end();
-  await writeFile(join(out, 'evidence.json'), JSON.stringify(evidence, null, 2));
+  await cleanupStep(steps, 'owned Chrome exit and pipes', () =>
+    stopOwnedChild(chrome, { graceMs: 2000 }), 10000);
+  await cleanupStep(steps, 'page socket close', () => page?.close(), 3000);
+  await cleanupStep(steps, 'browser socket close', () => browser?.close(), 3000);
+  await cleanupStep(steps, 'fixture server close', () => server?.close());
+  server?.httpServer?.closeAllConnections();
+  await cleanupStep(steps, 'Chrome log close', async () => {
+    chromeLog.end();
+    await finished(chromeLog);
+  }, 2000);
+  chromeLog.destroy();
+  evidence.cleanup.state = steps.every((step) => step.ok) ? 'complete' : 'failed';
+  evidence.cleanup.elapsedMs = performance.now() - started;
+  evidence.passed = evidence.checksPassed === true && evidence.cleanup.state === 'complete' && evidence.errors.length === 0;
+  try {
+    await deadline(writeFile(join(out, 'evidence.json'), JSON.stringify(evidence, null, 2)), 5000, 'final evidence');
+  } catch (e) {
+    evidence.passed = false;
+    console.error(e);
+  }
   console.log(`Evidence: ${join(out, 'evidence.json')}`);
+  // Bound process lifetime even when a failed close left a socket or watcher referenced.
+  process.exit(evidence.passed ? 0 : 1);
 }

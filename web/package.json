@@ -12,6 +12,7 @@
     "test:constant-work": "node --experimental-vm-modules --test scripts/constant-work.test.mjs",
     "test:browser-parity": "node scripts/browser-parity.mjs",
     "test:browser-server": "node scripts/browser-parity.mjs --test-server-config",
+    "test:browser-lifecycle": "node scripts/browser-parity.mjs --test-lifecycle",
     "wasm": "./scripts/build-wasm.sh",
     "deploy": "./scripts/deploy.sh",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json"
