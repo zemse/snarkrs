@@ -116,6 +116,24 @@ impl CpuNtt {
         Arc::clone(guard.entry(key).or_insert(built))
     }
 
+    /// Pack the fused block's strided reads into a 32 KB table.
+    /// The sampled root shares the ordinary CACHE_BLOCK-sized cache entry.
+    fn block_twiddles(&self, twiddles: &[Fr], n: usize) -> Arc<Vec<Fr>> {
+        let stride = n / CACHE_BLOCK;
+        let key = (CACHE_BLOCK, twiddles[stride]);
+        if let Some(hit) = self
+            .twiddles
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            return Arc::clone(hit);
+        }
+        let built = Arc::new(twiddles.iter().step_by(stride).copied().collect());
+        let mut guard = self.twiddles.write().unwrap_or_else(|e| e.into_inner());
+        Arc::clone(guard.entry(key).or_insert(built))
+    }
+
     /// The transform, with the serial/parallel choice left to the caller so tests can
     /// drive both paths over one input.
     fn transform(&self, domain: &Domain, a: &mut [Fr], dir: Direction, parallel: bool) {
@@ -156,10 +174,11 @@ impl CpuNtt {
             // per pass. The twiddle indexing is unchanged because a butterfly's table
             // index depends on its offset within its 2*half block, not on where the
             // block sits in the array.
+            let local = self.block_twiddles(twiddles, n);
             a.par_chunks_mut(CACHE_BLOCK).for_each(|block| {
                 let mut h = 1usize;
                 while h < CACHE_BLOCK {
-                    serial_pass::<false>(block, h, twiddles, n / (2 * h));
+                    serial_pass::<false>(block, h, &local, CACHE_BLOCK / (2 * h));
                     h <<= 1;
                 }
             });
@@ -216,10 +235,11 @@ impl CpuNtt {
         let n = a.len();
         if parallel && n > CACHE_BLOCK {
             self.dif_outer_passes(a, twiddles, CACHE_BLOCK / 2);
+            let local = self.block_twiddles(twiddles, n);
             a.par_chunks_mut(CACHE_BLOCK).for_each(|block| {
                 let mut h = CACHE_BLOCK / 2;
                 while h >= 1 {
-                    serial_pass::<true>(block, h, twiddles, n / (2 * h));
+                    serial_pass::<true>(block, h, &local, CACHE_BLOCK / (2 * h));
                     h >>= 1;
                 }
             });
@@ -296,7 +316,7 @@ impl CpuNtt {
             });
     }
 
-    /// Builds every table [`Self::intt_coset_ntt`] reads, each exactly once. The cache lets
+    /// Builds the domain-sized tables [`Self::intt_coset_ntt`] reads. The cache lets
     /// concurrent callers race on a cold entry, which costs nothing in correctness and a
     /// lot in memory: the prover runs three pipelines at once, so a cold proof built every
     /// table three times, and on anon-aadhaar (2^21) the two losing copies of each were
@@ -336,6 +356,8 @@ impl CpuNtt {
         let inv = self.twiddles(domain, Direction::Inverse);
         let fwd = self.twiddles(domain, Direction::Forward);
         let table = self.coset_table(domain, shift);
+        let local_inv = self.block_twiddles(&inv, n);
+        let local_fwd = self.block_twiddles(&fwd, n);
 
         self.dif_outer_passes(a, &inv, CACHE_BLOCK / 2);
         a.par_chunks_mut(CACHE_BLOCK)
@@ -343,7 +365,7 @@ impl CpuNtt {
             .for_each(|(block, tab)| {
                 let mut h = CACHE_BLOCK / 2;
                 while h >= 1 {
-                    serial_pass::<true>(block, h, &inv, n / (2 * h));
+                    serial_pass::<true>(block, h, &local_inv, CACHE_BLOCK / (2 * h));
                     h >>= 1;
                 }
                 for (x, s) in block.iter_mut().zip(tab.iter()) {
@@ -351,7 +373,7 @@ impl CpuNtt {
                 }
                 let mut h = 1usize;
                 while h < CACHE_BLOCK {
-                    serial_pass::<false>(block, h, &fwd, n / (2 * h));
+                    serial_pass::<false>(block, h, &local_fwd, CACHE_BLOCK / (2 * h));
                     h <<= 1;
                 }
             });
@@ -1023,6 +1045,39 @@ mod tests {
         );
         assert_eq!(*first, d.twiddles());
         assert_eq!(*ntt.twiddles(&d, Direction::Inverse), d.twiddles_inv());
+    }
+
+    #[test]
+    fn block_twiddle_cache_tracks_the_sampled_root() {
+        let ntt = CpuNtt::new();
+        for exponent in [1u64, 3, 1] {
+            let mut block_domain = domain(CACHE_BLOCK);
+            block_domain.group_gen = block_domain.group_gen.pow([exponent]);
+            block_domain.group_gen_inv = block_domain.group_gen_inv.pow([exponent]);
+            for dir in [Direction::Forward, Direction::Inverse] {
+                let want = ntt.twiddles(&block_domain, dir);
+                for n in [CACHE_BLOCK * 2, CACHE_BLOCK * 4, CACHE_BLOCK * 8] {
+                    let mut d = domain(n);
+                    d.group_gen = d.group_gen.pow([exponent]);
+                    d.group_gen_inv = d.group_gen_inv.pow([exponent]);
+                    let full = ntt.twiddles(&d, dir);
+                    let local = ntt.block_twiddles(&full, n);
+                    assert_eq!(local.len(), CACHE_BLOCK / 2);
+                    assert_eq!(*local, *want);
+                    assert!(Arc::ptr_eq(&local, &want));
+                    for (i, value) in local.iter().enumerate() {
+                        assert_eq!(*value, full[i * (n / CACHE_BLOCK)]);
+                    }
+                }
+            }
+        }
+        let fresh = CpuNtt::new();
+        let d = domain(CACHE_BLOCK * 4);
+        let full = fresh.twiddles(&d, Direction::Forward);
+        let local = fresh.block_twiddles(&full, d.size);
+        let want = fresh.twiddles(&domain(CACHE_BLOCK), Direction::Forward);
+        assert!(Arc::ptr_eq(&local, &want));
+        assert_eq!(*local, domain(CACHE_BLOCK).twiddles());
     }
 
     #[test]
