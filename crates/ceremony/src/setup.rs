@@ -34,7 +34,7 @@ use snarkrs_field::{
     PrimeField, Zero,
 };
 use snarkrs_formats::binfile;
-use snarkrs_msm::MsmBackend;
+use snarkrs_msm::{AccelError, MsmBackend};
 
 use crate::ptau::{self, Ptau};
 use crate::r1cs::{Matrix, R1cs};
@@ -554,7 +554,7 @@ pub fn compose_points_g1(
     let acc = binfile::collect_records(
         slots.par_iter().map(|slot| -> Result<_, CeremonyError> {
             let (points, scalars) = gather(slot, r1cs, |term| bases.g1(term))?;
-            Ok(combine(&points, &scalars, |b, s| msm.msm_g1(b, s)))
+            Ok(combine(&points, &scalars, |b, s| msm.try_msm_g1(b, s))?)
         }),
         G1Projective::zero(),
     )?;
@@ -571,7 +571,7 @@ pub fn compose_points_g2(
     let acc = binfile::collect_records(
         slots.par_iter().map(|slot| -> Result<_, CeremonyError> {
             let (points, scalars) = gather(slot, r1cs, |term| bases.g2(term))?;
-            Ok(combine(&points, &scalars, |b, s| msm.msm_g2(b, s)))
+            Ok(combine(&points, &scalars, |b, s| msm.try_msm_g2(b, s))?)
         }),
         G2Projective::zero(),
     )?;
@@ -612,12 +612,18 @@ where
 /// snarkjs' three-way dispatch (`zkey_new.js:459-486`): identity, one scalar
 /// multiplication, or a multiexp. See [`MULTIEXP_MIN_TERMS`] for the fourth case, which is
 /// a small-slot shortcut and not a fourth behaviour.
-fn combine<A, P, F>(points: &[A], scalars: &[Fr], msm: F) -> P
+fn combine<A, P, F>(points: &[A], scalars: &[Fr], msm: F) -> Result<P, AccelError>
 where
     A: Copy + Mul<Fr, Output = P>,
     P: Zero + Copy + std::ops::AddAssign<P>,
-    F: Fn(&[A], &[Fr]) -> P,
+    F: Fn(&[A], &[Fr]) -> Result<P, AccelError>,
 {
+    if points.len() != scalars.len() {
+        return Err(AccelError::Shape {
+            op: "setup combine",
+            reason: format!("{} bases but {} scalars", points.len(), scalars.len()),
+        });
+    }
     if points.len() >= MULTIEXP_MIN_TERMS {
         return msm(points, scalars);
     }
@@ -625,7 +631,44 @@ where
     for (p, s) in points.iter().zip(scalars) {
         acc += *p * *s;
     }
-    acc
+    Ok(acc)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn combine_checks_shape_before_either_branch() {
+        for n in [0, 1, MULTIEXP_MIN_TERMS - 1, MULTIEXP_MIN_TERMS + 1] {
+            let points = vec![G1Affine::generator(); n];
+            let scalars = vec![Fr::one(); n + 1];
+            assert!(matches!(
+                combine(&points, &scalars, |_, _| panic!("must reject before MSM")),
+                Err(AccelError::Shape { .. })
+            ));
+            assert!(matches!(
+                combine(
+                    &vec![G1Affine::generator(); n + 1],
+                    &scalars[..n],
+                    |_, _| panic!("must reject before MSM")
+                ),
+                Err(AccelError::Shape { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn combine_small_slots_stay_on_cpu() {
+        for n in [0, 1, MULTIEXP_MIN_TERMS - 1] {
+            let scalars = vec![Fr::from(3u64); n];
+            let got = combine(&vec![G1Affine::generator(); n], &scalars, |_, _| {
+                panic!("small slot must stay on CPU")
+            })
+            .unwrap();
+            assert_eq!(got, G1Affine::generator() * Fr::from(3 * n as u64));
+        }
+    }
 }
 
 /// The four `domainSize`-point Lagrange blocks setup reads out of the ptau, one per

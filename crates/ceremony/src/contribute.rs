@@ -633,8 +633,8 @@ fn check_l_section(
     // to survive a random combination, and 32 bits of soundness per check is snarkjs'
     // choice, not something the port gets to tighten without diverging.
     let scalars: Vec<Fr> = (0..n).map(|_| Fr::from(rng.next_u32())).collect();
-    let r1 = msm.msm_g1(&decode_g1(init_body)?, &scalars);
-    let r2 = msm.msm_g1(&decode_g1(final_body)?, &scalars);
+    let r1 = msm.try_msm_g1(&decode_g1(init_body)?, &scalars)?;
+    let r2 = msm.try_msm_g1(&decode_g1(final_body)?, &scalars)?;
     if !same_ratio(
         &r1.into_affine(),
         &r2.into_affine(),
@@ -697,7 +697,7 @@ fn check_h_section(
             .map(|(a, b)| *a - *b)
             .collect::<Vec<_>>(),
     );
-    let r1 = msm.msm_g1(&diff, &coeffs[..n]);
+    let r1 = msm.try_msm_g1(&diff, &coeffs[..n])?;
 
     // `Fr.w[power+1]`: a primitive `2n`-th root, so `inc^i` walks the odd coset the H
     // bases live on. The `power >= Fr.s` branch snarkjs also has is unreachable here,
@@ -716,7 +716,7 @@ fn check_h_section(
     let ntt = CpuNtt::new();
     ntt.ntt(&domain, &mut shifted, Direction::Forward);
 
-    let r2 = msm.msm_g1(&decode_g1(h_body)?, &shifted);
+    let r2 = msm.try_msm_g1(&decode_g1(h_body)?, &shifted)?;
     if !same_ratio(
         &r1.into_affine(),
         &r2.into_affine(),

@@ -70,44 +70,62 @@ impl MetalMsmBackend {
     }
 }
 
-/// The trait is infallible, so a device failure has nowhere to go but a panic.
-///
-/// That is the right end for it. Every failure `MetalMsm` reports here is a lost device or
-/// a pipeline that would not build, never a numeric one, and the alternative to stopping is
-/// returning a point: an identity, or whatever a half-run command buffer left behind. Both
-/// are silently wrong bytes in a `.zkey` that people will prove against for years. The
-/// panic message names the backend so it is not mistaken for an arithmetic bug.
+/// Ceremony callers use the fallible methods. The legacy methods still panic on device
+/// failure rather than return a silently wrong point. Neither path guarantees that an
+/// output file has not already been created or truncated by the caller.
 impl MsmBackend for MetalMsmBackend {
     fn name(&self) -> &'static str {
         BACKEND
     }
 
     fn msm_g1(&self, bases: &[G1Affine], scalars: &[Fr]) -> G1Projective {
-        let bases = self
-            .msm
-            .upload_g1_bases(bases)
-            .unwrap_or_else(|e| panic!("metal msm_g1 failed, no zkey was written: {e}"));
-        let scalars = self
-            .msm
-            .upload_scalars(scalars)
-            .unwrap_or_else(|e| panic!("metal msm_g1 failed, no zkey was written: {e}"));
-        self.msm
-            .msm_g1(&bases, &scalars)
-            .unwrap_or_else(|e| panic!("metal msm_g1 failed, no zkey was written: {e}"))
+        self.try_msm_g1(bases, scalars)
+            .unwrap_or_else(|e| panic!("{e}"))
     }
 
     fn msm_g2(&self, bases: &[G2Affine], scalars: &[Fr]) -> G2Projective {
+        self.try_msm_g2(bases, scalars)
+            .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    fn try_msm_g1(&self, bases: &[G1Affine], scalars: &[Fr]) -> Result<G1Projective, AccelError> {
+        if bases.len() != scalars.len() {
+            return Err(AccelError::Shape {
+                op: "msm_g1",
+                reason: format!("{} bases but {} scalars", bases.len(), scalars.len()),
+            });
+        }
         let bases = self
             .msm
-            .upload_g2_bases(bases)
-            .unwrap_or_else(|e| panic!("metal msm_g2 failed, no zkey was written: {e}"));
+            .upload_g1_bases(bases)
+            .map_err(|e| AccelError::device(BACKEND, "msm_g1 upload bases", e.to_string()))?;
         let scalars = self
             .msm
             .upload_scalars(scalars)
-            .unwrap_or_else(|e| panic!("metal msm_g2 failed, no zkey was written: {e}"));
+            .map_err(|e| AccelError::device(BACKEND, "msm_g1 upload scalars", e.to_string()))?;
+        self.msm
+            .msm_g1(&bases, &scalars)
+            .map_err(|e| AccelError::device(BACKEND, "msm_g1", e.to_string()))
+    }
+
+    fn try_msm_g2(&self, bases: &[G2Affine], scalars: &[Fr]) -> Result<G2Projective, AccelError> {
+        if bases.len() != scalars.len() {
+            return Err(AccelError::Shape {
+                op: "msm_g2",
+                reason: format!("{} bases but {} scalars", bases.len(), scalars.len()),
+            });
+        }
+        let bases = self
+            .msm
+            .upload_g2_bases(bases)
+            .map_err(|e| AccelError::device(BACKEND, "msm_g2 upload bases", e.to_string()))?;
+        let scalars = self
+            .msm
+            .upload_scalars(scalars)
+            .map_err(|e| AccelError::device(BACKEND, "msm_g2 upload scalars", e.to_string()))?;
         self.msm
             .msm_g2(&bases, &scalars)
-            .unwrap_or_else(|e| panic!("metal msm_g2 failed, no zkey was written: {e}"))
+            .map_err(|e| AccelError::device(BACKEND, "msm_g2", e.to_string()))
     }
 }
 
@@ -1023,6 +1041,40 @@ mod tests {
     use super::*;
     use snarkrs_ceremony::prepare::{batch_to_affine, point_times_fr};
     use snarkrs_ceremony::CpuKeyScale;
+
+    #[test]
+    fn fallible_msm_rejects_shape_before_upload() {
+        let backend = MetalMsmBackend::new().expect("Metal device required for adapter test");
+        let g1 = [G1Affine::generator(); 2];
+        let g2 = [G2Affine::generator(); 2];
+        let scalars = [Fr::from(3u64); 2];
+        for (bases_len, scalars_len) in [(0, 1), (1, 0), (1, 2), (2, 1)] {
+            assert!(matches!(
+                backend.try_msm_g1(&g1[..bases_len], &scalars[..scalars_len]),
+                Err(AccelError::Shape { op: "msm_g1", .. })
+            ));
+            assert!(matches!(
+                backend.try_msm_g2(&g2[..bases_len], &scalars[..scalars_len]),
+                Err(AccelError::Shape { op: "msm_g2", .. })
+            ));
+        }
+        assert_eq!(
+            backend.try_msm_g1(&[], &[]).unwrap(),
+            G1Projective::default()
+        );
+        assert_eq!(
+            backend.try_msm_g2(&[], &[]).unwrap(),
+            G2Projective::default()
+        );
+        assert_eq!(
+            backend.try_msm_g1(&g1, &scalars).unwrap(),
+            g1[0] * Fr::from(6u64)
+        );
+        assert_eq!(
+            backend.try_msm_g2(&g2, &scalars).unwrap(),
+            g2[0] * Fr::from(6u64)
+        );
+    }
 
     /// Bits the recoding covers. A local copy because `msm::RECODE_BITS` is private to
     /// that module.

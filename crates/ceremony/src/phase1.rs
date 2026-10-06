@@ -105,7 +105,11 @@ pub(crate) trait PtauGroup: AffineRepr<ScalarField = Fr> + Send + Sync {
     fn write_uncompressed(&self, out: &mut [u8]);
     /// The one call `verify` makes that the group cannot express generically: the backend
     /// trait has a separate entry point per group.
-    fn msm(backend: &dyn MsmBackend, bases: &[Self], scalars: &[Fr]) -> Self::Group;
+    fn msm(
+        backend: &dyn MsmBackend,
+        bases: &[Self],
+        scalars: &[Fr],
+    ) -> Result<Self::Group, AccelError>;
     /// [`Self::msm`] for the contribution's own primitive.
     fn apply_key(
         scale: &dyn KeyScale,
@@ -144,8 +148,12 @@ impl PtauGroup for Affine<g1::Config> {
         out.copy_from_slice(&g1_uncompressed(self));
     }
 
-    fn msm(backend: &dyn MsmBackend, bases: &[Self], scalars: &[Fr]) -> Self::Group {
-        backend.msm_g1(bases, scalars)
+    fn msm(
+        backend: &dyn MsmBackend,
+        bases: &[Self],
+        scalars: &[Fr],
+    ) -> Result<Self::Group, AccelError> {
+        backend.try_msm_g1(bases, scalars)
     }
 
     fn apply_key(
@@ -187,8 +195,12 @@ impl PtauGroup for Affine<g2::Config> {
         out.copy_from_slice(&g2_uncompressed(self));
     }
 
-    fn msm(backend: &dyn MsmBackend, bases: &[Self], scalars: &[Fr]) -> Self::Group {
-        backend.msm_g2(bases, scalars)
+    fn msm(
+        backend: &dyn MsmBackend,
+        bases: &[Self],
+        scalars: &[Fr],
+    ) -> Result<Self::Group, AccelError> {
+        backend.try_msm_g2(bases, scalars)
     }
 
     fn apply_key(
@@ -887,8 +899,8 @@ fn verify_powers<C: PtauGroup>(
             r2 += bases[0] * r;
         }
         if n > 1 {
-            r1 += C::msm(msm, &bases[..n - 1], &scalars);
-            r2 += C::msm(msm, &bases[1..], &scalars);
+            r1 += C::msm(msm, &bases[..n - 1], &scalars)?;
+            r2 += C::msm(msm, &bases[1..], &scalars)?;
         }
         last_base = Some(bases[n - 1]);
 
@@ -949,7 +961,7 @@ fn verify_lagrange<C: PtauGroup>(
         if padded {
             bases.push(C::zero());
         }
-        let raw = C::msm(msm, &bases, &scalars);
+        let raw = C::msm(msm, &bases, &scalars)?;
 
         // `Fr.fft` over the same random vector. snarkjs re-seeds the RNG to rebuild it
         // rather than keeping it, which is why the zero at the top of the padded block has
@@ -961,7 +973,7 @@ fn verify_lagrange<C: PtauGroup>(
         // Block `p` starts at element `2^p - 1`, the same seek `powersoftau_verify.js:478`
         // makes.
         let block = C::read_points(file, lagrange_section, n - 1, n)?;
-        let transformed = C::msm(msm, &block, &scalars);
+        let transformed = C::msm(msm, &block, &scalars)?;
 
         if raw != transformed {
             return Err(failed(format!(
@@ -1225,4 +1237,112 @@ pub fn parse_beacon_args(
     })?;
     check_beacon(&bytes, exp)?;
     Ok((bytes, exp))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use snarkrs_field::{G1Projective, G2Projective};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FailMsm {
+        fail_at: usize,
+        calls: AtomicUsize,
+    }
+
+    impl FailMsm {
+        fn check(&self, op: &'static str) -> Result<(), AccelError> {
+            if self.calls.fetch_add(1, Ordering::Relaxed) + 1 == self.fail_at {
+                return Err(AccelError::device("fake", op, "injected device loss"));
+            }
+            Ok(())
+        }
+    }
+
+    impl MsmBackend for FailMsm {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+        fn msm_g1(&self, _: &[G1Affine], _: &[Fr]) -> G1Projective {
+            panic!("phase1 must not call legacy G1 MSM")
+        }
+        fn msm_g2(&self, _: &[G2Affine], _: &[Fr]) -> G2Projective {
+            panic!("phase1 must not call legacy G2 MSM")
+        }
+        fn try_msm_g1(
+            &self,
+            bases: &[G1Affine],
+            scalars: &[Fr],
+        ) -> Result<G1Projective, AccelError> {
+            self.check("msm_g1")?;
+            CpuMsm::new().try_msm_g1(bases, scalars)
+        }
+        fn try_msm_g2(
+            &self,
+            bases: &[G2Affine],
+            scalars: &[Fr],
+        ) -> Result<G2Projective, AccelError> {
+            self.check("msm_g2")?;
+            CpuMsm::new().try_msm_g2(bases, scalars)
+        }
+    }
+
+    fn check_errors<C: PtauGroup>(tau: u32, lagrange: u32, op: &'static str) {
+        let dir =
+            std::env::temp_dir().join(format!("snarkrs-phase1-msm-{op}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.join("raw.ptau");
+        let prepared = dir.join("prepared.ptau");
+        ptau_new(2, &raw).unwrap();
+        crate::prepare::prepare_phase2(&raw, &prepared, &crate::CpuGroupFft).unwrap();
+        let file = Ptau::open(&prepared).unwrap();
+        for fail_at in [1, 2] {
+            for powers in [true, false] {
+                let msm = FailMsm {
+                    fail_at,
+                    calls: AtomicUsize::new(0),
+                };
+                let result = if powers {
+                    verify_powers::<C>(
+                        &file,
+                        tau,
+                        4,
+                        &[0],
+                        &mut CeremonyRng::from_seed_words([7; 8]),
+                        &mut Transcript::new(),
+                        &msm,
+                    )
+                    .map(|_| ())
+                } else {
+                    verify_lagrange::<C>(&file, tau, lagrange, 2, [7; 8], &msm, &CpuNtt::new())
+                };
+                assert!(
+                    matches!(result, Err(CeremonyError::Accel(AccelError::Device { backend: "fake", op: actual, .. })) if actual == op)
+                );
+                assert_eq!(msm.calls.load(Ordering::Relaxed), fail_at);
+            }
+        }
+        verify_lagrange::<C>(
+            &file,
+            tau,
+            lagrange,
+            2,
+            [7; 8],
+            &CpuMsm::new(),
+            &CpuNtt::new(),
+        )
+        .unwrap();
+        drop(file);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn verification_propagates_g1_msm_errors() {
+        check_errors::<G1Affine>(ptau::S_TAU_G1, ptau::S_LAGRANGE_TAU_G1, "msm_g1");
+    }
+
+    #[test]
+    fn verification_propagates_g2_msm_errors() {
+        check_errors::<G2Affine>(ptau::S_TAU_G2, ptau::S_LAGRANGE_TAU_G2, "msm_g2");
+    }
 }

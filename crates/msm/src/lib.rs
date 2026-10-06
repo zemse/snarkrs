@@ -47,6 +47,32 @@ pub trait MsmBackend: Send + Sync {
     fn name(&self) -> &'static str;
     fn msm_g1(&self, bases: &[G1Affine], scalars: &[Fr]) -> G1Projective;
     fn msm_g2(&self, bases: &[G2Affine], scalars: &[Fr]) -> G2Projective;
+
+    /// Fallible G1 MSM for ceremony callers. Rejects unequal input lengths.
+    ///
+    /// The default delegates to the legacy method and cannot recover its panics. Device
+    /// adapters must override this method to return upload and execution errors instead.
+    fn try_msm_g1(&self, bases: &[G1Affine], scalars: &[Fr]) -> Result<G1Projective, AccelError> {
+        if bases.len() != scalars.len() {
+            return Err(AccelError::Shape {
+                op: "msm_g1",
+                reason: format!("{} bases but {} scalars", bases.len(), scalars.len()),
+            });
+        }
+        Ok(self.msm_g1(bases, scalars))
+    }
+
+    /// Fallible G2 MSM, with the same default and device override contract as
+    /// [`Self::try_msm_g1`].
+    fn try_msm_g2(&self, bases: &[G2Affine], scalars: &[Fr]) -> Result<G2Projective, AccelError> {
+        if bases.len() != scalars.len() {
+            return Err(AccelError::Shape {
+                op: "msm_g2",
+                reason: format!("{} bases but {} scalars", bases.len(), scalars.len()),
+            });
+        }
+        Ok(self.msm_g2(bases, scalars))
+    }
 }
 
 /// Bits in the scalar field modulus: 254 for BN254's Fr.
@@ -836,6 +862,53 @@ mod tests {
 
     fn rand_scalars(n: usize, rng: &mut impl Rng) -> Vec<Fr> {
         (0..n).map(|_| Fr::rand(rng)).collect()
+    }
+
+    #[test]
+    fn fallible_defaults_reject_both_length_mismatches() {
+        let cpu = CpuMsm::new();
+        let backend: &dyn MsmBackend = &cpu;
+        let g1 = [G1Affine::identity(); 2];
+        let g2 = [G2Affine::identity(); 2];
+        let scalars = [Fr::one(); 2];
+        for (bases, scalars_len) in [(0, 1), (1, 0), (1, 2), (2, 1)] {
+            assert!(matches!(
+                backend.try_msm_g1(&g1[..bases], &scalars[..scalars_len]),
+                Err(AccelError::Shape { op: "msm_g1", .. })
+            ));
+            assert!(matches!(
+                backend.try_msm_g2(&g2[..bases], &scalars[..scalars_len]),
+                Err(AccelError::Shape { op: "msm_g2", .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn fallible_defaults_match_legacy_and_reference() {
+        let cpu = CpuMsm::new();
+        let backend: &dyn MsmBackend = &cpu;
+        assert!(backend.try_msm_g1(&[], &[]).unwrap().is_zero());
+        assert!(backend.try_msm_g2(&[], &[]).unwrap().is_zero());
+        let mut rng = test_rng();
+        let g1 = rand_points::<snarkrs_field::g1::Config>(33, &mut rng);
+        let g2 = rand_points::<snarkrs_field::g2::Config>(33, &mut rng);
+        let scalars = rand_scalars(33, &mut rng);
+        assert_eq!(
+            backend.try_msm_g1(&g1, &scalars).unwrap(),
+            naive(&g1, &scalars)
+        );
+        assert_eq!(
+            backend.try_msm_g2(&g2, &scalars).unwrap(),
+            naive(&g2, &scalars)
+        );
+        assert_eq!(
+            backend.try_msm_g1(&g1, &scalars).unwrap(),
+            backend.msm_g1(&g1, &scalars)
+        );
+        assert_eq!(
+            backend.try_msm_g2(&g2, &scalars).unwrap(),
+            backend.msm_g2(&g2, &scalars)
+        );
     }
 
     #[test]
