@@ -134,12 +134,13 @@ test('cold proving is not exposed by the worker without a retained-input loader'
 });
 
 async function runner(options = {}) {
-  const calls = [], reports = [];
+  const calls = [], reports = [], instances = [], deadlines = [];
   const document = { visibilityState: 'visible' };
   const proof = { proof: {}, publicSignals: ['1'], timings: {}, wallMs: 2 };
   class Prover {
+    constructor() { this.index = instances.length; this.terminated = 0; instances.push(this); }
     async init() {
-      await options.init?.();
+      await options.init?.(this.index);
       return { caps: {}, moduleMs: 0, deviceMs: 0 };
     }
     async load() { return { downloadedBytes: 1, downloadMs: 1, vkey: {} }; }
@@ -154,19 +155,23 @@ async function runner(options = {}) {
     async cpuTrace() { return { text: 'CPU trace' }; }
     async proveHOnly() { return { wallMs: 1 }; }
     async proveMsmProbe() { return { wallMs: 1 }; }
-    async unload() {}
-    terminate() {}
+    async selftest() { return await options.selftest?.(this.index) ?? { ok: true }; }
+    async unload() { await options.unload?.(); }
+    terminate() { this.terminated++; }
   }
   const search = '?circuits=railgun-01x01,tornado&warmup=1&reps=2&report=1' + (options.query ?? '');
   const load = modules({
     location: { search, origin: 'https://test.invalid', href: `https://test.invalid/${search}` },
     navigator: { userAgent: 'Node mock, no GPU', hardwareConcurrency: 1 },
     self: {}, document,
-    setInterval: () => 1, clearInterval() {},
+    setInterval: () => 1, clearInterval() {}, AbortController,
+    setTimeout(fn, ms) { deadlines.push(ms); return setTimeout(fn, options.fastDeadlines ? 5 : ms); },
+    clearTimeout,
     async fetch(url, init) {
       assert.equal(url, '/__report');
       reports.push(JSON.parse(init.body));
-      await options.report?.();
+      await options.report?.(init.signal);
+      return { ok: true, status: 200 };
     }
   }, {
     './prover': { Prover },
@@ -177,7 +182,7 @@ async function runner(options = {}) {
     ...(options.imports ?? {})
   });
   const { Run } = await load('lib/runner.svelte.ts');
-  return { run: new Run(), calls, reports };
+  return { run: new Run(), calls, reports, instances, deadlines };
 }
 
 for (const constantWork of [false, true]) {
@@ -301,6 +306,123 @@ test('page renders the selection, lock, warning and actual result mode', async (
   assert.match(locked, /\bdisabled\b/);
   await running;
 });
+
+async function transport() {
+  let bridge;
+  class Worker {
+    constructor() { bridge = this; this.sent = []; this.terminations = 0; }
+    postMessage(data) {
+      if (this.sendError) throw new Error('send failed');
+      this.sent.push(data);
+    }
+    terminate() { this.terminations++; }
+  }
+  const { Prover } = await modules({}, {
+    './worker/prover?worker': { default: Worker }
+  })('lib/prover.ts');
+  return { prover: new Prover(), get bridge() { return bridge; } };
+}
+
+for (const fault of ['error', 'messageerror', 'send', 'terminate']) {
+  test(`terminal worker ${fault} rejects pending and future calls once`, async () => {
+    const { prover, bridge } = await transport();
+    const first = prover.prove(true), second = prover.prepare();
+    const checked = [assert.rejects(first, /prover worker:/), assert.rejects(second, /prover worker:/)];
+    if (fault === 'error') bridge.onerror({ message: 'module failed' });
+    if (fault === 'messageerror') bridge.onmessageerror({});
+    if (fault === 'send') {
+      bridge.sendError = true;
+      checked.push(assert.rejects(prover.unload(), /send failed/));
+    }
+    if (fault === 'terminate') prover.terminate();
+    await Promise.all(checked);
+    const sent = bridge.sent.length;
+    await assert.rejects(prover.selftest(), /prover worker:/);
+    await assert.rejects(prover.unload(), /prover worker:/);
+    prover.terminate();
+    bridge.onerror({ message: 'late failure' });
+    assert.equal(bridge.sent.length, sent);
+    assert.equal(bridge.terminations, 1);
+  });
+}
+
+test('ordinary worker operation errors leave diagnostics and cleanup usable', async () => {
+  const { prover, bridge } = await transport();
+  const failed = prover.prove(true);
+  bridge.onmessage({ data: { id: bridge.sent.at(-1).id, ok: false, error: 'bad proof' } });
+  await assert.rejects(failed, /bad proof/);
+  for (const operation of ['selftest', 'unload']) {
+    const pending = prover[operation]();
+    bridge.onmessage({ data: { id: bridge.sent.at(-1).id, ok: true, value: 'reported' } });
+    assert.equal(await pending, 'reported');
+  }
+  assert.equal(bridge.terminations, 0);
+  prover.terminate();
+});
+
+const stalled = () => new Promise(() => {});
+for (const constantWork of [false, true]) {
+  for (const fault of ['diagnostic-init', 'diagnostic-selftest', 'report']) {
+    test(`${fault} deadline preserves startup error and unlocks mode ${constantWork}`, async () => {
+      let signal;
+      const f = await runner({
+        fastDeadlines: true,
+        init(index) {
+          if (index === 0) throw new Error('primary startup failure');
+          if (fault === 'diagnostic-init') return stalled();
+        },
+        selftest: fault === 'diagnostic-selftest' ? stalled : undefined,
+        report(s) { signal = s; if (fault === 'report') return stalled(); }
+      });
+      f.run.constantWork = constantWork;
+      await f.run.start();
+      assert.equal(f.run.fatal, 'primary startup failure');
+      assert.equal(f.run.phase, 'error');
+      assert.equal(f.run.busy, false);
+      assert.equal(f.run.resultConstantWork, constantWork);
+      assert.equal(f.reports[0].fatal, 'primary startup failure');
+      assert.equal(f.reports[0].constantWork, constantWork);
+      assert.ok(f.instances.every((p) => p.terminated > 0));
+      if (fault === 'report') {
+        assert.equal(signal.aborted, true);
+        assert.match(f.run.env.reportError, /timed out after 10000/);
+      } else {
+        assert.match(f.run.env.selftest.error, /timed out after 30000/);
+      }
+      f.run.constantWork = !constantWork;
+      assert.equal(f.run.constantWork, !constantWork);
+    });
+  }
+  test(`unload deadline preserves proving errors and unlocks mode ${constantWork}`, async () => {
+    const f = await runner({
+      fastDeadlines: true,
+      prove() { throw new Error('primary proving failure'); },
+      unload: stalled
+    });
+    f.run.constantWork = constantWork;
+    await f.run.start();
+    assert.equal(f.run.busy, false);
+    assert.ok(f.run.rows.every((r) => r.error === 'primary proving failure'));
+    assert.equal(f.run.env.cleanupErrors.length, 2);
+    assert.ok(f.run.env.cleanupErrors.every((e) => /timed out after 10000/.test(e.error)));
+    assert.deepEqual(f.calls, [constantWork, constantWork]);
+    assert.ok(f.reports[0].rows.every((r) => r.error === 'primary proving failure' && r.constantWork === constantWork));
+  });
+  test(`slow legitimate proof has no deadline in mode ${constantWork}`, async () => {
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const f = await runner({ fastDeadlines: true, prove: () => gate });
+    f.run.constantWork = constantWork;
+    const running = f.run.start();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(f.run.busy, true);
+    assert.deepEqual(f.deadlines, []);
+    release();
+    await running;
+    assert.ok(f.run.rows.every((r) => r.status === 'done'));
+    assert.deepEqual(f.calls, Array(6).fill(constantWork));
+  });
+}
 
 async function importFormat() {
   return modules()('lib/format.ts');

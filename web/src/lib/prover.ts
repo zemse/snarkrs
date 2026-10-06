@@ -12,6 +12,15 @@ export class Prover {
   private worker: Worker;
   private pending = new Map<number, Pending>();
   private next = 1;
+  private failure: Error | null = null;
+
+  private fail(err: Error) {
+    if (this.failure) return;
+    this.failure = err;
+    for (const [, p] of this.pending) p.reject(err);
+    this.pending.clear();
+    this.worker.terminate();
+  }
 
   constructor() {
     this.worker = new ProverWorker();
@@ -28,17 +37,23 @@ export class Prover {
     // a typo in an import path is a page that sits at "starting" forever with a clean
     // console on the main thread.
     this.worker.onerror = (e) => {
-      const err = new Error(`prover worker: ${e.message ?? 'failed to load'}`);
-      for (const [, p] of this.pending) p.reject(err);
-      this.pending.clear();
+      this.fail(new Error(`prover worker: ${e.message ?? 'failed to load'}`));
+    };
+    this.worker.onmessageerror = () => {
+      this.fail(new Error('prover worker: could not deserialize message'));
     };
   }
 
   private call<T = any>(type: string, args: object = {}, onProgress?: (p: any) => void) {
+    if (this.failure) return Promise.reject<T>(this.failure);
     const id = this.next++;
     return new Promise<T>((resolve, reject) => {
       this.pending.set(id, { resolve, reject, onProgress });
-      this.worker.postMessage({ id, type, ...args });
+      try {
+        this.worker.postMessage({ id, type, ...args });
+      } catch (e) {
+        this.fail(new Error(`prover worker: ${String(e)}`));
+      }
     });
   }
 
@@ -99,6 +114,6 @@ export class Prover {
     return this.call('unload');
   }
   terminate() {
-    this.worker.terminate();
+    this.fail(new Error('prover worker: terminated'));
   }
 }

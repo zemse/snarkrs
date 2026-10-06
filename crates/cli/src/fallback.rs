@@ -18,7 +18,7 @@
 //! does not satisfy the circuit fails on the CPU too, which is how the last message tells the
 //! two apart.
 
-use anyhow::Result;
+use anyhow::{ensure, Result};
 use snarkrs_field::Fr;
 use snarkrs_groth16::{prove::prove, PreparedCircuit, Proof, ProveError, StageTimings};
 
@@ -89,6 +89,32 @@ pub fn prove_with_fallback<R: ark_std::rand::RngCore + ark_std::rand::CryptoRng>
 
     report(Fallback::Cpu { backend, cause });
     let cpu = cpu()?;
+    ensure!(
+        cpu.backend_name() == "cpu",
+        "fallback factory did not return a CPU backend"
+    );
+    ensure!(
+        (cpu.n_vars(), cpu.n_public(), cpu.domain_size())
+            == (circuit.n_vars(), circuit.n_public(), circuit.domain_size())
+            && (cpu.key().n_vars, cpu.key().n_public, cpu.key().domain_size)
+                == (circuit.n_vars(), circuit.n_public(), circuit.domain_size()),
+        "CPU fallback dimensions differ from the original circuit"
+    );
+    let original = &circuit.key().vk;
+    let replacement = &cpu.key().vk;
+    ensure!(
+        replacement.alpha_g1 == original.alpha_g1
+            && replacement.beta_g2 == original.beta_g2
+            && replacement.gamma_g2 == original.gamma_g2
+            && replacement.delta_g2 == original.delta_g2
+            && replacement.ic == original.ic
+            && cpu.key().alpha_g1 == circuit.key().alpha_g1
+            && cpu.key().beta_g1 == circuit.key().beta_g1
+            && cpu.key().beta_g2 == circuit.key().beta_g2
+            && cpu.key().delta_g1 == circuit.key().delta_g1
+            && cpu.key().delta_g2 == circuit.key().delta_g2,
+        "CPU fallback verification key differs from the original statement"
+    );
     *timings = StageTimings::default();
     let proof = prove(cpu.as_ref(), witness, rng, timings)?;
     report(Fallback::DeviceSuspect { backend });
@@ -115,6 +141,8 @@ mod tests {
         Device,
         /// A key the backend cannot use, which no retry changes.
         Key,
+        /// A device fault followed by a deterministic error.
+        DeviceThenKey,
     }
 
     /// The CPU backend, except that its first `faults` MSMs fail as `fault` says.
@@ -122,23 +150,26 @@ mod tests {
         inner: Box<dyn PreparedCircuit>,
         fault: Fault,
         faults: AtomicUsize,
+        backend: &'static str,
+        metadata: Option<ProvingKey>,
+        dimensions: Option<(usize, usize, usize)>,
     }
 
     impl PreparedCircuit for Faulty {
         fn backend_name(&self) -> &'static str {
-            "faulty"
+            self.backend
         }
         fn n_vars(&self) -> usize {
-            self.inner.n_vars()
+            self.dimensions.map_or(self.inner.n_vars(), |d| d.0)
         }
         fn n_public(&self) -> usize {
-            self.inner.n_public()
+            self.dimensions.map_or(self.inner.n_public(), |d| d.1)
         }
         fn domain_size(&self) -> usize {
-            self.inner.domain_size()
+            self.dimensions.map_or(self.inner.domain_size(), |d| d.2)
         }
         fn key(&self) -> &ProvingKey {
-            self.inner.key()
+            self.metadata.as_ref().unwrap_or_else(|| self.inner.key())
         }
         fn compute_h(&self, w: &[Fr], t: &mut StageTimings) -> Result<HPoly, ProveError> {
             self.inner.compute_h(w, t)
@@ -155,15 +186,18 @@ mod tests {
                 return Ok(m);
             }
             self.faults.store(left - 1, Ordering::SeqCst);
+            t.msm_us += 1 << 60;
             match self.fault {
                 Fault::Wrong => m.a_g1 += G1Projective::generator(),
-                Fault::Device => {
+                Fault::Device | Fault::DeviceThenKey
+                    if left > 1 || matches!(self.fault, Fault::Device) =>
+                {
                     return Err(ProveError::Device {
                         backend: "faulty",
                         reason: "msm: command buffer did not complete".to_string(),
                     })
                 }
-                Fault::Key => {
+                Fault::Key | Fault::DeviceThenKey | Fault::Device => {
                     return Err(ProveError::Backend {
                         backend: "faulty",
                         reason: "h_query has 3 bases, domain size is 4".to_string(),
@@ -174,9 +208,18 @@ mod tests {
         }
     }
 
-    fn tiny() -> Option<PathBuf> {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/artifacts/tiny_mul");
-        dir.join("circuit.zkey").is_file().then_some(dir)
+    fn tiny() -> PathBuf {
+        let dir = std::env::var_os("G16_ARTIFACTS")
+            .map(|root| PathBuf::from(root).join("tiny_mul"))
+            .unwrap_or_else(|| {
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/artifacts/tiny_mul")
+            });
+        assert!(
+            dir.join("circuit.zkey").is_file(),
+            "tiny_mul fixture required: {}",
+            dir.display()
+        );
+        dir
     }
 
     fn cpu(dir: &Path) -> Box<dyn PreparedCircuit> {
@@ -195,21 +238,135 @@ mod tests {
             inner: cpu(dir),
             fault,
             faults: AtomicUsize::new(faults),
+            backend: "faulty",
+            metadata: None,
+            dimensions: None,
         };
         let mut steps = Vec::new();
         let mut built = false;
+        let mut timings = StageTimings::default();
         let out = prove_with_fallback(
             &circuit,
             witness,
             &mut StdRng::from_seed([3; 32]),
-            &mut StageTimings::default(),
+            &mut timings,
             || {
                 built = true;
                 Ok(cpu(dir))
             },
             &mut |f| steps.push(f),
         );
+        if out.is_ok() {
+            assert!(timings.msm_us < 1 << 60, "failed attempt timings leaked");
+        }
         (out, steps, built)
+    }
+
+    fn faulty(dir: &Path, backend: &'static str, faults: usize) -> Faulty {
+        Faulty {
+            inner: cpu(dir),
+            fault: Fault::Device,
+            faults: AtomicUsize::new(faults),
+            backend,
+            metadata: None,
+            dimensions: None,
+        }
+    }
+
+    #[test]
+    fn replacement_must_be_cpu_and_bind_the_original_statement() {
+        let dir = tiny();
+        let w = Witness::load(&dir.join("circuit.wtns")).unwrap().0;
+        for case in 0..17 {
+            let circuit = faulty(&dir, "faulty", 2);
+            let mut replacement = faulty(&dir, "cpu", 0);
+            let mut key = ProvingKey::load(&dir.join("circuit.zkey")).unwrap();
+            match case {
+                0 => replacement.backend = "another-gpu",
+                1 => replacement.dimensions = Some((key.n_vars + 1, key.n_public, key.domain_size)),
+                2 => replacement.dimensions = Some((key.n_vars, key.n_public + 1, key.domain_size)),
+                3 => replacement.dimensions = Some((key.n_vars, key.n_public, key.domain_size * 2)),
+                4 => key.n_vars += 1,
+                5 => key.n_public += 1,
+                6 => key.domain_size *= 2,
+                7 => key.vk.alpha_g1 = Default::default(),
+                8 => key.vk.beta_g2 = Default::default(),
+                9 => key.vk.gamma_g2 = Default::default(),
+                10 => key.vk.delta_g2 = Default::default(),
+                11 => key.vk.ic[0] = Default::default(),
+                12 => key.alpha_g1 = Default::default(),
+                13 => key.beta_g1 = Default::default(),
+                14 => key.beta_g2 = Default::default(),
+                15 => key.delta_g1 = Default::default(),
+                16 => key.delta_g2 = Default::default(),
+                _ => unreachable!(),
+            }
+            replacement.metadata = Some(key);
+            let mut steps = Vec::new();
+            let out = prove_with_fallback(
+                &circuit,
+                &w,
+                &mut StdRng::from_seed([3; 32]),
+                &mut StageTimings::default(),
+                || Ok(Box::new(replacement)),
+                &mut |f| steps.push(f),
+            );
+            let message = out.unwrap_err().to_string();
+            assert!(
+                message.contains(if case == 0 {
+                    "CPU backend"
+                } else if case <= 6 {
+                    "dimensions"
+                } else {
+                    "verification key"
+                }),
+                "case {case}: {message}"
+            );
+            assert_eq!(steps.len(), 2, "case {case}: {steps:?}");
+            assert!(matches!(steps[1], Fallback::Cpu { .. }));
+        }
+    }
+
+    #[test]
+    fn factory_and_cpu_proof_errors_never_report_success_or_retry_cpu() {
+        let dir = tiny();
+        let w = Witness::load(&dir.join("circuit.wtns")).unwrap().0;
+        for case in 0..3 {
+            let circuit = faulty(&dir, "faulty", 2);
+            let mut steps = Vec::new();
+            let out = prove_with_fallback(
+                &circuit,
+                &w,
+                &mut StdRng::from_seed([3; 32]),
+                &mut StageTimings::default(),
+                || {
+                    if case == 0 {
+                        anyhow::bail!("factory failed");
+                    }
+                    let mut replacement = faulty(&dir, "cpu", 1);
+                    if case == 2 {
+                        replacement.fault = Fault::Wrong;
+                    }
+                    Ok(Box::new(replacement))
+                },
+                &mut |f| steps.push(f),
+            );
+            assert!(out.is_err());
+            assert_eq!(steps.len(), 2);
+            assert!(matches!(steps[1], Fallback::Cpu { .. }));
+        }
+        let circuit = faulty(&dir, "cpu", 1);
+        let mut steps = Vec::new();
+        assert!(prove_with_fallback(
+            &circuit,
+            &w,
+            &mut StdRng::from_seed([3; 32]),
+            &mut StageTimings::default(),
+            || panic!("CPU must not fall back"),
+            &mut |f| steps.push(f),
+        )
+        .is_err());
+        assert!(steps.is_empty());
     }
 
     fn device() -> Cause {
@@ -220,10 +377,7 @@ mod tests {
 
     #[test]
     fn one_fault_is_absorbed_by_the_retry_and_two_by_the_cpu() {
-        let Some(dir) = tiny() else {
-            eprintln!("SKIPPED fallback: no tiny_mul");
-            return;
-        };
+        let dir = tiny();
         let w = Witness::load(&dir.join("circuit.wtns")).unwrap().0;
         let backend = "faulty";
 
@@ -270,15 +424,23 @@ mod tests {
     /// again on a retry, so it fails at once and the CPU is never built.
     #[test]
     fn a_deterministic_error_is_not_retried() {
-        let Some(dir) = tiny() else {
-            eprintln!("SKIPPED fallback: no tiny_mul");
-            return;
-        };
+        let dir = tiny();
         let mut w = Witness::load(&dir.join("circuit.wtns")).unwrap().0;
         let (out, steps, built) = run(Fault::Key, 1, &w, &dir);
         let e = out.unwrap_err();
         assert!(e.to_string().contains("h_query has 3 bases"), "{e}");
         assert!(steps.is_empty(), "{steps:?}");
+        assert!(!built);
+
+        let (out, steps, built) = run(Fault::DeviceThenKey, 2, &w, &dir);
+        assert!(out.unwrap_err().to_string().contains("h_query has 3 bases"));
+        assert_eq!(
+            steps,
+            [Fallback::Retry {
+                backend: "faulty",
+                cause: device()
+            }]
+        );
         assert!(!built);
 
         w[0] = Fr::from(2u64);
@@ -293,10 +455,7 @@ mod tests {
     /// too and the device is not blamed.
     #[test]
     fn an_unsatisfying_witness_fails_on_the_cpu_too_and_blames_no_device() {
-        let Some(dir) = tiny() else {
-            eprintln!("SKIPPED fallback: no tiny_mul");
-            return;
-        };
+        let dir = tiny();
         let mut w = Witness::load(&dir.join("circuit.wtns")).unwrap().0;
         let last = w.len() - 1;
         w[last] += Fr::from(1u64);

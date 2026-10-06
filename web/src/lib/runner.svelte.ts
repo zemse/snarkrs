@@ -68,6 +68,24 @@ const param = (k: string, d: number) => {
   return Number.isFinite(v) && v > 0 ? v : d;
 };
 
+/// Only auxiliary work is bounded; a legitimate proof may take minutes.
+async function deadline<T>(work: () => Promise<T>, ms: number, expired: () => void): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(work),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(new Error(`auxiliary operation timed out after ${ms} ms`));
+          expired();
+        }, ms);
+      })
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export class Run {
   rows = $state<Row[]>(
     selectCircuits(typeof location === 'undefined' ? '' : location.search).map((circuit) => ({
@@ -342,7 +360,8 @@ export class Run {
       if (new URLSearchParams(q()).get('selftest') === '1') {
         this.activity = 'running the GPU self-test';
         try {
-          this.env.selftest = await this.prover.selftest();
+          const p = this.prover;
+          this.env.selftest = await deadline(() => p.selftest(), 30_000, () => p.terminate());
         } catch (e: any) {
           this.env.selftest = { error: String(e?.message ?? e) };
         }
@@ -409,18 +428,27 @@ export class Run {
     if (this.env?.selftest) return;
     if (this.fatal == null && !this.rows.some((r) => r.status === 'error')) return;
     this.activity = 'running the GPU self-test, to say more about what failed';
-    const p = new Prover();
+    let p: Prover | null = null;
     try {
-      const init = await p.init(`${location.origin}/pkg`, this.profile);
-      this.env ??= {};
-      this.env.limits ??= init.caps?.limits;
-      this.env.adapter ??= await adapterInfo();
-      this.env.selftest = await p.selftest();
+      p = new Prover();
+      const diagnostic = p;
+      await deadline(
+        async () => {
+          const init = await diagnostic.init(`${location.origin}/pkg`, this.profile);
+          this.env ??= {};
+          this.env.limits ??= init.caps?.limits;
+          const verdict = await diagnostic.selftest();
+          this.env.adapter ??= await adapterInfo();
+          this.env.selftest = verdict;
+        },
+        30_000,
+        () => diagnostic.terminate()
+      );
     } catch (e: any) {
       this.env ??= {};
       this.env.selftest = { error: String(e?.message ?? e) };
     } finally {
-      p.terminate();
+      p?.terminate();
     }
   }
 
@@ -449,6 +477,8 @@ export class Run {
       `phase      ${this.phase}`,
       `work       ${this.resultConstantWork ? 'constant-work' : 'variable-work'}`,
       this.fatal ? `fatal      ${this.fatal}` : '',
+      this.env?.reportError ? `report     ${this.env.reportError}` : '',
+      this.env?.cleanupErrors ? `cleanup    ${JSON.stringify(this.env.cleanupErrors)}` : '',
       `selftest   ${this.env?.selftest ? JSON.stringify(this.env.selftest) : 'not run (add ?selftest=1)'}`,
       'limits',
       limits || '  (device never opened)',
@@ -511,10 +541,23 @@ export class Run {
         note: r.note
       }))
     };
+    const controller = new AbortController();
     try {
-      await fetch('/__report', { method: 'POST', body: JSON.stringify(body, null, 2) });
-    } catch {
-      /* reporting is a debugging aid; never let it take a completed run down */
+      await deadline(
+        async () => {
+          const response = await fetch('/__report', {
+            method: 'POST',
+            body: JSON.stringify(body, null, 2),
+            signal: controller.signal
+          });
+          if (!response.ok) throw new Error(`report HTTP ${response.status}`);
+        },
+        10_000,
+        () => controller.abort()
+      );
+    } catch (e: any) {
+      this.env ??= {};
+      this.env.reportError = String(e?.message ?? e);
     }
   }
 
@@ -719,9 +762,10 @@ export class Run {
       // resident when the next circuit allocates its own and the whole run dies at a
       // circuit that would have been fine on its own.
       try {
-        await p.unload();
-      } catch {
-        /* the worker is already gone; nothing left to free */
+        await deadline(() => p.unload(), 10_000, () => p.terminate());
+      } catch (e: any) {
+        this.env ??= {};
+        (this.env.cleanupErrors ??= []).push({ circuit: c.name, error: String(e?.message ?? e) });
       }
     }
   }
