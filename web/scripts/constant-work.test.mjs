@@ -162,7 +162,7 @@ async function runner(options = {}) {
   const search = '?circuits=railgun-01x01,tornado&warmup=1&reps=2&report=1' + (options.query ?? '');
   const load = modules({
     location: { search, origin: 'https://test.invalid', href: `https://test.invalid/${search}` },
-    navigator: { userAgent: 'Node mock, no GPU', hardwareConcurrency: 1 },
+    navigator: { userAgent: 'Node mock, no GPU', hardwareConcurrency: 1, gpu: options.gpu },
     self: {}, document,
     setInterval: () => 1, clearInterval() {}, AbortController,
     setTimeout(fn, ms) { deadlines.push(ms); return setTimeout(fn, options.fastDeadlines ? 5 : ms); },
@@ -422,6 +422,47 @@ for (const constantWork of [false, true]) {
     assert.ok(f.run.rows.every((r) => r.status === 'done'));
     assert.deepEqual(f.calls, Array(6).fill(constantWork));
   });
+}
+
+for (const constantWork of [false, true]) {
+  for (const restart of [false, true]) {
+    test(`late diagnostic adapter cannot change verdicts (mode ${constantWork}, restart ${restart})`, async () => {
+      let resolveOldAdapter;
+      const oldAdapter = new Promise((resolve) => { resolveOldAdapter = resolve; });
+      const adapter = { info: { description: 'new adapter' }, limits: {} };
+      let requests = 0;
+      const f = await runner({
+        fastDeadlines: true,
+        query: '&selftest=1',
+        init(index) { if (index === 0) throw new Error('primary startup failure'); },
+        selftest: async (index) => ({ verdict: index === 1 ? 'old diagnostic' : 'new run' }),
+        gpu: { requestAdapter() { return ++requests === 1 ? oldAdapter : Promise.resolve(adapter); } }
+      });
+      f.run.constantWork = constantWork;
+      await f.run.start();
+      assert.equal(requests, 1);
+      assert.equal(f.run.busy, false);
+      assert.equal(f.run.fatal, 'primary startup failure');
+      const firstEnv = f.run.env;
+      const firstVerdict = JSON.stringify(firstEnv.selftest);
+      assert.match(firstVerdict, /timed out after 30000/);
+      if (restart) {
+        await f.run.start();
+        assert.equal(f.run.busy, false);
+        assert.equal(f.run.env.selftest.verdict, 'new run');
+        assert.equal(f.run.env.adapter.description, 'new adapter');
+      }
+      const currentEnv = f.run.env;
+      const currentVerdict = JSON.stringify(currentEnv.selftest);
+      resolveOldAdapter({ info: { description: 'old adapter' }, limits: {} });
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(JSON.stringify(firstEnv.selftest), firstVerdict);
+      assert.equal(f.run.env, currentEnv);
+      assert.equal(JSON.stringify(f.run.env.selftest), currentVerdict);
+      assert.equal(f.run.resultConstantWork, constantWork);
+      assert.equal(f.reports[0].fatal, 'primary startup failure');
+    });
+  }
 }
 
 async function importFormat() {

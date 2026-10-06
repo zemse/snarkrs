@@ -432,18 +432,24 @@ export class Run {
     try {
       p = new Prover();
       const diagnostic = p;
-      await deadline(
+      const adapter = this.env?.adapter;
+      const result = await deadline(
         async () => {
           const init = await diagnostic.init(`${location.origin}/pkg`, this.profile);
-          this.env ??= {};
-          this.env.limits ??= init.caps?.limits;
           const verdict = await diagnostic.selftest();
-          this.env.adapter ??= await adapterInfo();
-          this.env.selftest = verdict;
+          return {
+            limits: init.caps?.limits,
+            adapter: adapter ?? await adapterInfo(),
+            selftest: verdict
+          };
         },
         30_000,
         () => diagnostic.terminate()
       );
+      this.env ??= {};
+      this.env.limits ??= result.limits;
+      this.env.adapter ??= result.adapter;
+      this.env.selftest = result.selftest;
     } catch (e: any) {
       this.env ??= {};
       this.env.selftest = { error: String(e?.message ?? e) };
