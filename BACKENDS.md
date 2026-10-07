@@ -16,6 +16,15 @@ The GPU proving paths keep H resident between its computation and the H MSM. Deb
 readback and host-H comparisons are separate from that normal path. A device H handle
 belongs to the circuit that computed it, not another circuit or backend.
 
+CUDA and Metal default to fusing H into the final store of C's forward NTT. CUDA keeps
+both Montgomery and standard-form H buffers; Metal keeps only standard-form H. WGPU
+defaults to standalone `h_join`, with a selectable fused epilogue. That default reflects
+historical native Apple measurements, not a fresh benchmark or a browser performance
+guarantee. Metal's normal H path submits gather and each of the three domain vectors in
+separate sealed command buffers, not one command buffer for all stages. See the current
+[CUDA](crates/cuda/src/stages.rs), [Metal](crates/metal/src/stages.rs) and
+[WGPU](crates/wgpu/src/stages.rs) stage implementations.
+
 `PreparedCircuit::key()` guarantees `n_vars`, `n_public`, `domain_size`, the full `vk`
 (including `ic`), and `alpha_g1`, `beta_g1`, `beta_g2`, `delta_g1`, `delta_g2`. Dimensions
 agree with the circuit accessors. Bulk coefficients and the five query vectors are
