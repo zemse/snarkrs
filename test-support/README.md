@@ -217,9 +217,9 @@ features plus `--features metal` build, which includes WGPU.
 - An initial CPU prepare-time query-shape assertion failed. It was corrected
   to the CPU's documented `msms` validation boundary; no production arithmetic
   was changed and no arithmetic mismatch was observed.
-- Large proof gate: NOT RUN, unavailable execution coverage pending separate
-  coordinator memory/time approval. Physical NVIDIA and phones: unavailable,
-  not launched. Held D gates and full hardware parity remain uncovered.
+- At this revision the large proof gate was not run, pending coordinator
+  memory/time approval. Later main execution is recorded below. Physical NVIDIA
+  and phones were not launched; held D gates and full hardware parity were uncovered.
 
 ## Independent review fix validation
 
@@ -251,7 +251,42 @@ large circuit.
 - Both integration targets compiled with default features plus Metal/WGPU and
   separately with CPU/CUDA, release/locked/offline with two jobs. CUDA remained
   compile-only. No production, dependency, or lockfile changes were made.
-- Large same-instance proof gate: NOT RUN, pending separate approval. Its
-  compile and small-mock checks are not large proof-success evidence. No
-  NVIDIA, phone, benchmark, or large-memory jobs were launched. Full hardware
-  parity and held D gates remain uncovered.
+- At this review-fix revision the large same-instance proof gate was not run.
+  Compile and small-mock checks were not large proof-success evidence. No
+  NVIDIA, phone, benchmark, or large-memory jobs were launched at that point.
+  Later main execution is recorded below; full hardware parity and held D gates
+  remain uncovered.
+
+## Large main execution evidence (d506763)
+
+EXECUTED on main `d506763981fb9234d32b191ca47f9b45930da4d0`, with unchanged
+tracked source before and after. Four serial variable-work jobs passed, 0 failed,
+0 ignored: CPU, Metal on Apple M2 Max, and WGPU Floor/Auto on Apple M2 Max
+IntegratedGpu with Metal transport. Each completed exactly `1/1` on
+`large/js_384x384_d32`, domain 4194304 (`2^22`), totaling 4 large fixture cases.
+These are separate from the corrected bounded matrix's 8 jobs and 16 cases.
+
+Each proof used the actual inspected backend instance, with no fallback. The
+serialized proof was accepted by our verifier against the fixture vkey and by
+snarkjs (successful exit and `OK!`); serialized public signals matched the fixture
+reference. This is direct-API/JSON interoperability, not CLI argument dispatch.
+All 4 proof/public pairs were retained; JSON, sizes and SHA-256 hashes checked.
+
+Floor requested/granted buffer/storage-binding caps were 268435456/134217728
+bytes. Auto requested/granted 4294967295/4294967292 bytes, with no fallback.
+Both kept 16384 workgroup bytes and 256 invocations. Memory pressure remained
+normal. Elapsed times include builds; sampled aggregate process-group RSS is
+not physical footprint. These are validation runs, not benchmarks or a speed
+comparison, and do not establish universal device capacity.
+
+Retained evidence is at repository-root `target/large-validation-main/summary.json`
+and `target/large-validation-main/handoff.json`, with per-job `gate.log`, metadata,
+trace and `proof.json`/`public.json` under the same directory. These files are
+local, ignored and not published. The original F worktree evidence was deleted
+by automatic cleanup; it is not a retained evidence path.
+
+Large constant work and domains above `2^22` remain unexecuted and need separate
+memory/time approval. Physical NVIDIA gates, phones/Safari and a production
+wrong-arithmetic guard remain open. This run does not close held D gates,
+BUG-28 real-load recovery or full hardware parity; full CPU duplication remains
+unapproved for its cost. See the [backend evidence scope](../BACKENDS.md#evidence).

@@ -1,6 +1,6 @@
 # backends
 
-Scope: main `2348fb0fe1eb4e8b1fef266a9df9e5b2fc93729e`. Source support is not hardware
+Scope: main `d506763981fb9234d32b191ca47f9b45930da4d0`. Source support is not hardware
 validation. Historical benchmark tables are not current conformance evidence.
 
 ## implementation
@@ -84,7 +84,7 @@ documentation change. Commands and detailed F evidence live in
 | COMPILE, F | CPU/CUDA integration targets; default plus Metal/WGPU targets | release/locked/offline builds passed; CUDA had no current physical run. |
 | EXECUTED, Stage3 | 5 fallback tests, 56 web tests; desktop Floor Chrome 154 smoke, both work modes | 14 selftests and 4 snarkjs-accepted GPU proofs passed. Browser scope is bounded tiny-circuit validation, not phones or production assets. |
 | EXECUTED, C3 `621a9e0` | Metal sealed ceremony/group FFT | 68 tests passed, 1 measurement ignored. Synthetic fault recovery and CPU comparisons, not a production arithmetic guard or BUG-28 real-load closure. |
-| CURRENT, NOT RUN | domain `2^22` same-instance large proof gate | implemented, pending separate memory/time approval; capacity refusal does not satisfy it. |
+| EXECUTED, main `d506763` | domain `2^22` same-instance large proof gate, variable work: CPU, Metal, WGPU Floor/Auto | 4/4 jobs passed, each `1/1` on `large/js_384x384_d32`, totaling 4 large cases; both verifiers and reference public signals accepted, no fallback. Large constant work and domains above `2^22` remain unexecuted. |
 | CURRENT, historical only | NVIDIA variable-work prover and CUDA ceremony group FFT | source support and historical benchmarks, not current hardware validation. |
 | BLOCKED / UNSUPPORTED on main | held CUDA D2 constant-work changes | require physical NVRTC/PTX arithmetic and default/constant proof gates before merge; no approved NVIDIA host or rental. |
 | BLOCKED | phones, Safari and other browser/device combinations | not currently validated by the desktop smoke or shader compilation. |
@@ -102,6 +102,24 @@ bytes. Auto requested/granted 4294967295/4294967292 bytes without fallback. Both
 16 KiB workgroup storage and 256 invocations. This is bounded proof and negotiation
 evidence, not universal capacity.
 
+The later large run used unchanged tracked source at `d506763`, domain 4194304, on the
+same inspected backend instance without fallback. Metal reported Apple M2 Max; WGPU
+reported Apple M2 Max IntegratedGpu with Metal transport. Floor requested/granted
+268435456/134217728 buffer/storage-binding bytes; Auto requested/granted
+4294967295/4294967292 without fallback. Both kept 16384 workgroup bytes and 256
+invocations. Our verifier accepted each serialized proof against the fixture vkey;
+snarkjs accepted it and public signals matched the reference. Four proof/public pairs
+were retained and their sizes, JSON and SHA-256 hashes checked.
+
+Large evidence is retained at repository-root `target/large-validation-main/summary.json`
+and `target/large-validation-main/handoff.json`, with per-job logs and proof/public JSON
+under that directory (local, ignored, not published). The original F worktree evidence
+was removed by automatic cleanup; it is not a retained evidence path. These four large
+cases are separate from the bounded eight jobs and sixteen cases above. Normal memory
+pressure was observed. Elapsed times include builds; sampled aggregate process RSS is
+not physical footprint. This validation is not a benchmark or speed comparison, or CLI
+argument-dispatch coverage. See the [large-run evidence](test-support/README.md#large-main-execution-evidence-d506763).
+
 Stage3's local smoke evidence is `target/parity-browser/stage3-coordinator-smoke/evidence.json`
 (ignored, not published). Rust wasm source revision `d16e568` and supplied-byte SHA-256
 `aa141e9c237d276c3dc5984d09f02d38286aaa179fd2e6dd474ae3921c3c04a3` identify caller-declared,
@@ -109,6 +127,7 @@ pre-wasm-opt release assets. The run substituted a tiny catalogue/configuration.
 identity came from a separately requested window adapter, not worker-device attestation;
 see the [smoke harness](web/scripts/browser-parity.mjs).
 
-This evidence does not establish full backend parity. NVIDIA, phones, larger runs and a
-production wrong-arithmetic guard remain open. Default full CPU duplication has not
-been approved for its cost; sealed completion and synthetic recovery do not replace it.
+This evidence does not establish full backend parity. NVIDIA, phones, large constant-work
+runs, domains above `2^22` and a production wrong-arithmetic guard remain open. Default
+full CPU duplication has not been approved for its cost; sealed completion and synthetic
+recovery do not replace it.
