@@ -9,6 +9,9 @@
 - Backends behind a rust feature flags
 - Library support
 
+[Backend support and validation](BACKENDS.md) covers work modes, ceremony capabilities,
+failure policies and the hardware actually tested.
+
 ## benchmarks
 
 ### apple-m2-max
@@ -124,8 +127,10 @@ snarkrs bench --artifacts <DIR> [--variant NAME]... [--reps N] \
 ```
 
 The short aliases work too (`ptn`, `ptc`, `pt2`, `g16s`, `zkc`, `zkev`, `g16p`, `g16v`, ...),
-and the ceremony commands take `--backend cpu|metal`. The output is what snarkjs expects,
-so the two are interchangeable in either direction:
+and the ceremony commands generally take `--backend cpu|metal`. CUDA supports only the
+`ptau prepare` group FFT, not ceremony MSM or key scaling; WGPU supports none of those
+three ceremony seams. The output is what snarkjs expects, so the two are interchangeable
+in either direction:
 
 ```sh
 snarkrs g16p circuit.zkey circuit.wtns proof.json public.json --backend metal
@@ -198,6 +203,12 @@ snarkrs::write_public("public.json".as_ref(), public)?;
 Swap `MetalBackend` for `snarkrs::CpuBackend` or `snarkrs::cuda::CudaBackend` to change where
 it runs; nothing else in the snippet changes, which is the point of the trait.
 
+`circuit.key()` preserves the dimensions, full verification key (including IC), and the
+five assembly headers (`alpha_g1`, `beta_g1`, `beta_g2`, `delta_g1`, `delta_g2`). Bulk
+coefficients and query vectors are backend-dependent and may be released after upload.
+It is not guaranteed to be a complete key for preparing another backend; retain or reload
+the original key for that.
+
 The blinders come from the OS CSPRNG. There is no seed override on this path on purpose: a
 reused `(r, s)` across two proofs of different witnesses leaks the witness, so the
 deterministic entry point stays test-only.
@@ -229,8 +240,8 @@ witness generator is one written in optimised Rust for your circuit, with no was
 
 ## what it checks
 
-Every entry point validates its input by default, and each has an `_unchecked` twin that
-skips the check for input you already trust:
+These APIs have checked defaults and explicit `_unchecked` alternatives for input you
+already trust. This is not a claim that every entry point has an unchecked twin:
 
 | checked | what it adds | unchecked |
 | --- | --- | --- |
@@ -246,8 +257,8 @@ witness entries are zero or one unless you pass `--constant-work` (cpu, metal an
 backends, 2.5% to about 10x slower depending on the circuit and backend). This fixes the
 scalar-dependent MSM sizing and disables zero/one fast paths, not all witness-dependent
 work: GPU bucket occupancy, atomics contention and accumulation still depend on the
-witness. Constant-work is not constant-time; CUDA refuses this flag. The audit and its
-current status are in
+witness. Constant-work is not constant-time; CUDA still refuses this flag on main (see the
+[backend matrix](BACKENDS.md#implementation)). The audit and its current status are in
 [`security/README.md`](security/README.md).
 
 ## References

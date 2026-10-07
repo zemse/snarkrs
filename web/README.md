@@ -10,6 +10,12 @@ circuit with snarkjs, makes each prover verify the other's proof, and shows the 
 
 `npm run build` writes a fully static `build/` directory. There is no server side.
 
+The constant-work control is opt-in; variable work remains the default. It fixes
+scalar-dependent MSM sizing and removes zero/one fast paths, not all witness-dependent
+GPU work. Constant-work is not constant-time. Results retain the mode used for the run,
+not a later control setting. Browser proving does not automatically fall back to CPU.
+See the [backend matrix and validation scope](../BACKENDS.md).
+
 ## The bucket needs a CORS rule
 
 Every proving key is fetched cross-origin from `gpu-snark-bench`, so the bucket has to
@@ -60,9 +66,9 @@ workers. It is a genuine multi-threaded wasm baseline, not a strawman.
 
 ## Circuits
 
-Measured on an M2 Max in Chrome 152, warm, three untimed warm-ups then five timed reps, every
-proof cross-verified in both directions. These are the numbers baked into the estimator as its
-reference.
+Historical measurements on an M2 Max in Chrome 152, warm, three untimed warm-ups then five
+timed reps, every proof cross-verified in both directions. These are the numbers baked into
+the estimator as its reference, not current backend conformance evidence.
 
 | circuit | constraints | key | snarkjs | WebGPU | GPU upload | |
 |---|---:|---:|---:|---:|---:|---:|
@@ -85,26 +91,24 @@ entries in the A/B/C matrices rather than rows of them, and on our side the MSM 
 skips zero digits, so a bit-valued witness leaves most high windows empty. That is why the
 estimator keys its reference by circuit instead of fitting a curve.
 
-The WebGPU column also shows where this backend stops winning. It does not go below about
-330 ms however small the circuit is, because that floor is fixed per-proof cost rather than
-arithmetic: Railgun 1x1 is only 1.9x, and something a little smaller would lose outright.
+Railgun 1x1 is only 1.9x in this table, but SHA-256 and Keccak-256 are both below 330 ms.
+The table does not establish an absolute per-proof latency floor.
 
-Anon Aadhaar is the row that does not fit everywhere. Its 1,101,048 wires need 134.4 MB of G2
-bases in a single storage binding, against the 128 MB the WebGPU specification guarantees, so
-it is 5% over a floor-only device's ceiling. The page does not ask the reader to care about
-that. It reads the adapter's real `maxStorageBufferBindingSize` before enabling the button,
-runs the row if the number covers it, and marks it skipped with the two sizes spelled out if
-it does not. Chunked base bindings would put it in reach of floor-only devices too, and are
-not written yet. A prover's ceiling is a result; dropping the row would leave a page whose
-largest circuit is the largest one that happens to work.
+Anon Aadhaar remains a capacity-sensitive row. Chunked G1/G2 base bindings are now
+implemented, so a full base vector need not fit in one storage binding. That does not
+remove limits on other buffers, bindings or total memory, or establish that this circuit
+fits every Floor device. The page checks capacity and reports skipped rows; a refusal is
+not a proof-success result. Current bounded Floor/Auto evidence is in the
+[backend matrix](../BACKENDS.md#evidence).
 
 The limits it asks for are narrower than they look. `auto`, the default, takes the floor for
 everything that shapes a kernel and the adapter's own number only for the two limits that
 decide how much fits, so a device with 32 KiB of workgroup storage still runs the 16 KiB
-kernels the floor guarantees and the numbers stay comparable across machines. Measured back
-to back on an M2 Max, `auto` and `raised` are the same proof to within noise (1778 ms against
-1789 ms), which is the evidence that the extra geometry buys nothing and the two capacity
-limits are the whole of it.
+kernels the floor guarantees and the numbers stay comparable across machines. Historically
+measured back to back on an M2 Max, `auto` and `raised` were within noise (1778 ms against
+1789 ms); that observation is not a guarantee for other hardware. If Auto device creation
+is refused, it can retry with Floor limits and reports the reason. This is a WebGPU limits
+fallback, not CPU proving.
 
 `?circuits=tornado,sha256` picks a subset, `?reps=5` changes the rep count, `?warmup=N` the
 number of untimed reps before it, and `?profile=floor|raised|auto` overrides the limits
@@ -155,9 +159,11 @@ has to be kept in step by hand), or install rustup and wasm-pack in the Vercel b
 above it). Neither is worth it for a page that is deployed when a number changes.
 
 WebGPU needs a secure context: HTTPS in production, with `localhost` and `127.0.0.1` exempt.
-Chrome 113+ on desktop, 121+ on Android. Feature-detect `navigator.gpu` **and** null-check the
-adapter — browsers with the property and a blocklisted driver hand back null, and a page that
-only checks the first reports "supported" and then dies at the first proof.
+Feature-detect `navigator.gpu` **and** null-check the adapter: browsers with the property
+and a blocklisted driver can hand back null. Browser version or API presence alone does
+not establish proof compatibility. The current smoke covers desktop Floor Chrome 154,
+both work modes, not phones, Safari or production assets; see
+[executed evidence and its provenance limits](../BACKENDS.md#evidence).
 
 `.wasm` must be served as `application/wasm` or `WebAssembly.instantiateStreaming` refuses it.
 `static/_headers` covers Netlify and Cloudflare Pages, `vercel.json` covers Vercel.
