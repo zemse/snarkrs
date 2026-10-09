@@ -34,10 +34,10 @@ FEATURES := metal,cuda
 # Target, then the GitHub runner that builds it natively. Linux builds on 22.04 so the
 # binary needs glibc 2.35, not the newer one a later image would link against.
 RELEASE_TARGETS := \
-	aarch64-apple-darwin:macos-latest \
+	aarch64-apple-darwin:macos-26 \
 	x86_64-unknown-linux-gnu:ubuntu-22.04 \
 	aarch64-unknown-linux-gnu:ubuntu-22.04-arm \
-	x86_64-pc-windows-msvc:windows-latest
+	x86_64-pc-windows-msvc:windows-2025-vs2026
 
 DIST := target/dist
 # A target dir of its own: the remapping flags below differ from a normal build's, and
@@ -61,8 +61,9 @@ RELEASE_RUSTFLAGS = --remap-path-prefix=$(CURDIR)=/snarkrs --remap-path-prefix=$
 	--remap-path-prefix=$$(rustc +$(RUST_TOOLCHAIN) --print sysroot)/lib/rustlib/src/rust=/rustc/$$(rustc +$(RUST_TOOLCHAIN) -vV | sed -n 's/^commit-hash: //p')
 
 # The workspace version, as a shell command. Inline rather than a recursive $(MAKE), whose
-# "Entering directory" lines Make 3.81 prints even under -s.
-VERSION_CMD := $(CARGO) metadata --format-version 1 --no-deps --offline | $(PYTHON) -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "snarkrs"))'
+# "Entering directory" lines Make 3.81 prints even under -s. Plain `cargo`, because reading
+# a manifest needs no particular toolchain and the CI plan job never installs the pinned one.
+VERSION_CMD := cargo metadata --format-version 1 --no-deps --offline | $(PYTHON) -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "snarkrs"))'
 comma := ,
 
 .PHONY: release bump version release-build release-matrix check-tag publish-dry-run github-release publish-crates
