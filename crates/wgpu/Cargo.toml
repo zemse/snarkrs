@@ -14,8 +14,8 @@ license.workspace = true
 # `cargo test --workspace --release` is built twice, and those two units then wrote the same
 # `target/release/deps/libsnarkrs_wgpu.rlib`. Cargo says so ("output filename collision", cargo
 # issue 6313, "this may become a hard error") and the effect was not a warning: with
-# `snarkrs-wgpu` in `snarkrs-cli`'s default features, `cargo build --workspace --release --tests`
-# failed 5 times out of 5 with `can't find crate for g16_cli` (now snarkrs-cli).
+# `snarkrs-wgpu` in `snarkrs`'s default features, `cargo build --workspace --release --tests`
+# failed 5 times out of 5 with `can't find crate for g16_cli` (now snarkrs).
 #
 # U13's browser entry point needs `cdylib` plus wasm-bindgen, js-sys and web-sys, none of
 # which belong in the native dependency tree. It gets its own thin wrapper crate, which is

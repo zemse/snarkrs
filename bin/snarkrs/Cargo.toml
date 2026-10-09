@@ -1,5 +1,5 @@
 [package]
-name = "snarkrs-cli"
+name = "snarkrs"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -23,7 +23,7 @@ required-features = ["dhat-heap"]
 [dependencies]
 # The library facade, with everything the CLI runs. The GPU backends and the wasm witness
 # calculator stay this crate's own features and forward to it.
-snarkrs = { workspace = true, features = ["ceremony", "witness"] }
+snarkrs-lib = { workspace = true, features = ["ceremony", "witness"] }
 snarkrs-field.workspace = true
 snarkrs-formats.workspace = true
 snarkrs-groth16.workspace = true
@@ -62,17 +62,17 @@ snarkrs-groth16 = { workspace = true, features = ["deterministic-blinders"] }
 # a binary that cannot ask.
 default = ["cpu", "wgpu", "witness-wasm"]
 cpu = []
-wgpu = ["dep:snarkrs-wgpu", "snarkrs/wgpu"]
-metal = ["dep:snarkrs-metal", "snarkrs/metal"]
+wgpu = ["dep:snarkrs-wgpu", "snarkrs-lib/wgpu"]
+metal = ["dep:snarkrs-metal", "snarkrs-lib/metal"]
 # `dep:snarkrs-cuda` alone is not enough: snarkrs-cuda gates its whole backend behind its own
 # `cuda` feature so that a default macOS workspace build never pulls cudarc. Without
 # forwarding the feature the crate compiles to an empty shell and `CudaBackend` is
 # "configured out", which rustc reports as a missing item rather than a missing feature.
-cuda = ["dep:snarkrs-cuda", "snarkrs-cuda/cuda", "snarkrs/cuda"]
+cuda = ["dep:snarkrs-cuda", "snarkrs-cuda/cuda", "snarkrs-lib/cuda"]
 # `wtns calculate` and `fullprove` on circom's circuit.wasm, through wasmtime. On by default
 # because that is what snarkjs users have; off, the release binary is about 5 MB smaller
 # and runs only circom's native witness binaries.
-witness-wasm = ["snarkrs-witness/wasm", "snarkrs/witness-wasm"]
+witness-wasm = ["snarkrs-witness/wasm", "snarkrs-lib/witness-wasm"]
 # Heap profiling. Off by default and optional, so `cargo build --release` neither links
 # dhat nor builds the binary that would install its allocator.
 dhat-heap = ["dep:dhat"]

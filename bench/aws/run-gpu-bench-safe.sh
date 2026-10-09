@@ -96,7 +96,7 @@ if (( ${#VARIANTS[@]} > 0 )); then
 fi
 
 BIN="$REPO_ROOT/target/x86_64-unknown-linux-gnu/release/snarkrs"
-(cd "$REPO_ROOT" && cargo zigbuild --locked --release -p snarkrs-cli --features cuda --target x86_64-unknown-linux-gnu.2.31)
+(cd "$REPO_ROOT" && cargo zigbuild --locked --release -p snarkrs --features cuda --target x86_64-unknown-linux-gnu.2.31)
 file "$BIN" | grep -q 'ELF 64-bit.*x86-64'
 COMMIT=$(git -C "$REPO_ROOT" rev-parse HEAD)
 AMI=$(resolve_ami "$TYPE")

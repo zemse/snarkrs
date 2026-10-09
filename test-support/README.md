@@ -73,12 +73,12 @@ Prerequisites:
 From the repository root, CPU guards/build and both required CPU modes:
 
 ```sh
-cargo test --release --locked --offline -j 2 -p snarkrs-cli --no-default-features --features cpu --test conformance --test large
-cargo build --release --locked --offline -j 2 -p snarkrs-cli --no-default-features --features cpu --bin snarkrs
+cargo test --release --locked --offline -j 2 -p snarkrs --no-default-features --features cpu --test conformance --test large
+cargo build --release --locked --offline -j 2 -p snarkrs --no-default-features --features cpu --bin snarkrs
 export G16_CONFORMANCE_ROOT=/absolute/path/to/bench/artifacts
 export G16_CONFORMANCE_FIXTURES=tiny_mul,sha256
-G16_CONFORMANCE_BACKEND=cpu G16_CONFORMANCE_WORK=variable G16_CONFORMANCE_PROFILE=none cargo test --release --locked --offline -j 2 -p snarkrs-cli --no-default-features --features cpu --test conformance required_backend_conformance -- --ignored --exact --nocapture --test-threads=1
-G16_CONFORMANCE_BACKEND=cpu G16_CONFORMANCE_WORK=constant G16_CONFORMANCE_PROFILE=none cargo test --release --locked --offline -j 2 -p snarkrs-cli --no-default-features --features cpu --test conformance required_backend_conformance -- --ignored --exact --nocapture --test-threads=1
+G16_CONFORMANCE_BACKEND=cpu G16_CONFORMANCE_WORK=variable G16_CONFORMANCE_PROFILE=none cargo test --release --locked --offline -j 2 -p snarkrs --no-default-features --features cpu --test conformance required_backend_conformance -- --ignored --exact --nocapture --test-threads=1
+G16_CONFORMANCE_BACKEND=cpu G16_CONFORMANCE_WORK=constant G16_CONFORMANCE_PROFILE=none cargo test --release --locked --offline -j 2 -p snarkrs --no-default-features --features cpu --test conformance required_backend_conformance -- --ignored --exact --nocapture --test-threads=1
 ```
 
 The gate uses library APIs, with no fallback. It compares H and all five MSMs
@@ -106,25 +106,25 @@ Reserve one physical GPU slot and run these commands serially, without benches.
 Compile-only checks do not count as device execution:
 
 ```sh
-cargo test --release --locked --offline -j 2 -p snarkrs-cli --features metal --test conformance --test large --no-run
-cargo test --release --locked --offline -j 2 -p snarkrs-cli --no-default-features --features cpu,wgpu --test conformance --test large --no-run
-cargo test --release --locked --offline -j 2 -p snarkrs-cli --no-default-features --features cpu,cuda --test conformance --test large --no-run
-G16_CONFORMANCE_BACKEND=metal G16_CONFORMANCE_WORK=variable G16_CONFORMANCE_PROFILE=none cargo test --release --locked --offline -j 2 -p snarkrs-cli --features metal --test conformance required_backend_conformance -- --ignored --exact --nocapture --test-threads=1
-G16_CONFORMANCE_BACKEND=metal G16_CONFORMANCE_WORK=constant G16_CONFORMANCE_PROFILE=none cargo test --release --locked --offline -j 2 -p snarkrs-cli --features metal --test conformance required_backend_conformance -- --ignored --exact --nocapture --test-threads=1
-G16_WGPU_LIMITS=floor G16_CONFORMANCE_BACKEND=wgpu G16_CONFORMANCE_WORK=variable G16_CONFORMANCE_PROFILE=floor cargo test --release --locked --offline -j 2 -p snarkrs-cli --no-default-features --features cpu,wgpu --test conformance required_backend_conformance -- --ignored --exact --nocapture --test-threads=1
-G16_WGPU_LIMITS=floor G16_CONFORMANCE_BACKEND=wgpu G16_CONFORMANCE_WORK=constant G16_CONFORMANCE_PROFILE=floor cargo test --release --locked --offline -j 2 -p snarkrs-cli --no-default-features --features cpu,wgpu --test conformance required_backend_conformance -- --ignored --exact --nocapture --test-threads=1
-G16_WGPU_LIMITS=auto G16_CONFORMANCE_BACKEND=wgpu G16_CONFORMANCE_WORK=variable G16_CONFORMANCE_PROFILE=auto cargo test --release --locked --offline -j 2 -p snarkrs-cli --no-default-features --features cpu,wgpu --test conformance required_backend_conformance -- --ignored --exact --nocapture --test-threads=1
-G16_WGPU_LIMITS=auto G16_CONFORMANCE_BACKEND=wgpu G16_CONFORMANCE_WORK=constant G16_CONFORMANCE_PROFILE=auto cargo test --release --locked --offline -j 2 -p snarkrs-cli --no-default-features --features cpu,wgpu --test conformance required_backend_conformance -- --ignored --exact --nocapture --test-threads=1
+cargo test --release --locked --offline -j 2 -p snarkrs --features metal --test conformance --test large --no-run
+cargo test --release --locked --offline -j 2 -p snarkrs --no-default-features --features cpu,wgpu --test conformance --test large --no-run
+cargo test --release --locked --offline -j 2 -p snarkrs --no-default-features --features cpu,cuda --test conformance --test large --no-run
+G16_CONFORMANCE_BACKEND=metal G16_CONFORMANCE_WORK=variable G16_CONFORMANCE_PROFILE=none cargo test --release --locked --offline -j 2 -p snarkrs --features metal --test conformance required_backend_conformance -- --ignored --exact --nocapture --test-threads=1
+G16_CONFORMANCE_BACKEND=metal G16_CONFORMANCE_WORK=constant G16_CONFORMANCE_PROFILE=none cargo test --release --locked --offline -j 2 -p snarkrs --features metal --test conformance required_backend_conformance -- --ignored --exact --nocapture --test-threads=1
+G16_WGPU_LIMITS=floor G16_CONFORMANCE_BACKEND=wgpu G16_CONFORMANCE_WORK=variable G16_CONFORMANCE_PROFILE=floor cargo test --release --locked --offline -j 2 -p snarkrs --no-default-features --features cpu,wgpu --test conformance required_backend_conformance -- --ignored --exact --nocapture --test-threads=1
+G16_WGPU_LIMITS=floor G16_CONFORMANCE_BACKEND=wgpu G16_CONFORMANCE_WORK=constant G16_CONFORMANCE_PROFILE=floor cargo test --release --locked --offline -j 2 -p snarkrs --no-default-features --features cpu,wgpu --test conformance required_backend_conformance -- --ignored --exact --nocapture --test-threads=1
+G16_WGPU_LIMITS=auto G16_CONFORMANCE_BACKEND=wgpu G16_CONFORMANCE_WORK=variable G16_CONFORMANCE_PROFILE=auto cargo test --release --locked --offline -j 2 -p snarkrs --no-default-features --features cpu,wgpu --test conformance required_backend_conformance -- --ignored --exact --nocapture --test-threads=1
+G16_WGPU_LIMITS=auto G16_CONFORMANCE_BACKEND=wgpu G16_CONFORMANCE_WORK=constant G16_CONFORMANCE_PROFILE=auto cargo test --release --locked --offline -j 2 -p snarkrs --no-default-features --features cpu,wgpu --test conformance required_backend_conformance -- --ignored --exact --nocapture --test-threads=1
 ```
 
 Auto logs requested/effective caps and fallback reason. Auto falling back to Floor,
 capacity not exceeding Floor, and software/unknown adapters are `UNAVAILABLE`,
 not Auto-capacity or physical-job passes. Run Auto only where the requested
 capacity is actually granted. Metal logs its device name. CPU/CUDA factory
-metadata is not physical worker attestation. CUDA variable work requires a
-separately available physical NVIDIA slot; CUDA constant work is explicitly
-rejected because held lane D has not landed. Do not launch NVIDIA/phone jobs
-from this gate. Successful local Metal/WGPU runs do not finish hardware parity.
+metadata is not physical worker attestation. CUDA variable/constant work requires a
+separately available physical NVIDIA slot; both modes are selectable since `b759c4c`.
+Do not launch NVIDIA/phone jobs from this gate. Successful local Metal/WGPU runs do
+not finish hardware parity. The bounded CUDA execution below is a separate gate.
 
 Every successful gate prints the revision, backend, device information, work,
 profile, fixture, domain, results, and exact completed count (`2/2`). Retain the
@@ -155,7 +155,7 @@ run automatically after the bounded gate. Once approved, an exact Floor command
 is (other approved selections use the same backend/work/profile variables):
 
 ```sh
-G16_LARGE_FIXTURES=large/js_384x384_d32 G16_WGPU_LIMITS=floor G16_CONFORMANCE_BACKEND=wgpu G16_CONFORMANCE_WORK=variable G16_CONFORMANCE_PROFILE=floor cargo test --release --locked --offline -j 2 -p snarkrs-cli --no-default-features --features cpu,wgpu --test large every_backend_proves_the_large_artifacts -- --ignored --exact --nocapture --test-threads=1
+G16_LARGE_FIXTURES=large/js_384x384_d32 G16_WGPU_LIMITS=floor G16_CONFORMANCE_BACKEND=wgpu G16_CONFORMANCE_WORK=variable G16_CONFORMANCE_PROFILE=floor cargo test --release --locked --offline -j 2 -p snarkrs --no-default-features --features cpu,wgpu --test large every_backend_proves_the_large_artifacts -- --ignored --exact --nocapture --test-threads=1
 ```
 
 Expected capacity refusal is a separate outcome, never large proof success.
@@ -286,7 +286,54 @@ local, ignored and not published. The original F worktree evidence was deleted
 by automatic cleanup; it is not a retained evidence path.
 
 Large constant work and domains above `2^22` remain unexecuted and need separate
-memory/time approval. Physical NVIDIA gates, phones/Safari and a production
-wrong-arithmetic guard remain open. This run does not close held D gates,
-BUG-28 real-load recovery or full hardware parity; full CPU duplication remains
-unapproved for its cost. See the [backend evidence scope](../BACKENDS.md#evidence).
+memory/time approval. At this checkpoint physical NVIDIA gates were open; the later
+bounded CUDA run below closes lane D, not large CUDA coverage. Phones/Safari,
+BUG-28 real-load recovery and a production wrong-arithmetic guard remain open; full
+CPU duplication remains unapproved for its cost. See the
+[backend evidence scope](../BACKENDS.md#evidence).
+
+## NVIDIA constant-work execution (2026-10-09)
+
+EXECUTED on CUDA source `c50353c`, merged into main `b759c4c` with unchanged GPU
+sources. AWS `g4dn.xlarge`, Tesla T4 (15360 MiB), driver 595.91.07, NVRTC 12.8.93.
+Linux x86-64 binaries were cross-built locally with locked dependencies. A fresh
+PTX cache exercised NVRTC compilation; the real driver and matching 12.8 runtime
+libraries were used, not toolkit stubs.
+
+Four serial commands explicitly selected five ignored tests, all passed with no
+skips: device accounting and recoding/fold boundaries, legacy override, adversarial
+G1/G2, and proof/resident-H comparison. Mandatory fixtures were exactly tiny_mul
+(domain 8) and sha256 (domain 65536), not optional fixture discovery. The proof gate
+compared CPU H and all five MSMs, resident versus host H, and zero/nonzero pinned
+proofs in variable and constant modes. Our verifier accepted every pinned GPU proof.
+
+```sh
+export G16_ARTIFACTS=/absolute/path/to/fixtures
+export G16_CUDA_REQUIRED_FIXTURES=tiny_mul,sha256
+export G16_CUDA_WITNESS_REUSE=1
+G16_CUDA_MSM_LEGACY_ACC=0 cargo test --release --locked -p snarkrs-cuda --features cuda --lib msm::tests::constant_work_device_ -- --ignored --nocapture --test-threads=1
+G16_CUDA_MSM_LEGACY_ACC=1 cargo test --release --locked -p snarkrs-cuda --features cuda --lib msm::tests::constant_work_legacy_override_gate -- --ignored --exact --nocapture --test-threads=1
+G16_CUDA_MSM_LEGACY_ACC=0 cargo test --release --locked -p snarkrs-cuda --features cuda --test adversarial_gpu constant_work_matches_cpu_and_variable_for_both_groups -- --ignored --exact --nocapture --test-threads=1
+G16_CUDA_MSM_LEGACY_ACC=0 cargo test --release --locked -p snarkrs-cuda --features cuda --test pipeline_gpu constant_work_proof_and_resident_h_match_cpu_and_variable -- --ignored --exact --nocapture --test-threads=1
+```
+
+The retained run used prebuilt test binaries with those exact filters, not Cargo on
+the server. Four separate CLI proofs (both fixtures/modes), `--fallback false` and
+independent `--vkey`, were accepted by snarkjs after download. Public signals match
+the reference files. Twenty serial warm benchmark reps passed our verifier:
+
+| fixture | reps per mode | variable median ms | constant median ms | ratio |
+| --- | --- | --- | --- | --- |
+| tiny_mul | 5 | 2.379 | 22.991 | 9.66x |
+| sha256 | 5 | 17.782 | 83.659 | 4.70x |
+
+Preparation and verification are outside those warm timings. This small T4 sample
+is not a performance bound for other circuits/devices, or a constant-time claim.
+Atomics and segmented accumulation remain occupancy dependent. Large CUDA proofs,
+other NVIDIA devices and the full shared `required_backend_conformance` GPU job
+remain unexecuted. The private five-test CUDA gate and separate CLI/snarkjs proof
+checks close the held port's hardware requirement, not universal backend parity.
+
+Evidence is retained at repository-root `target/cuda-validation-20261009/summary.json`,
+with commands, original build provenance, gate logs, proof/public pairs, snarkjs logs
+and warm CSVs (local, ignored, not published).

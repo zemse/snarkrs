@@ -474,7 +474,7 @@ fn degenerate_blinders_still_verify() {
 /// the same ground in under a minute and is the one that has to stay in everyone's
 /// `cargo test`.
 ///
-///     cargo test --release -p snarkrs-cli --test campaign -- --ignored --nocapture
+///     cargo test --release -p snarkrs --test campaign -- --ignored --nocapture
 #[test]
 #[ignore = "long: 200 proofs per variant, roughly four minutes in release mode"]
 fn deep_campaign_two_hundred_proofs_per_variant() {

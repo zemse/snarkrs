@@ -30,7 +30,7 @@ rsync -az -e "ssh -i $KEY -o StrictHostKeyChecking=no" \
   "$HERE/" "$HOST:~/g16/"
 
 echo "==> building with cuda"
-"${SSH[@]}" 'source ~/.cargo/env; cd ~/g16 && cargo build --release -p snarkrs-cli --features cuda 2>&1 | tail -2'
+"${SSH[@]}" 'source ~/.cargo/env; cd ~/g16 && cargo build --release -p snarkrs --features cuda 2>&1 | tail -2'
 
 if [ "${2:-}" = "--first-compile" ]; then
   echo "==> measuring a genuine first compile (clearing both caches)"

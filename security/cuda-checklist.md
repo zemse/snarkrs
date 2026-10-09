@@ -260,7 +260,7 @@ assertion against the CPU reference, which will otherwise fail spuriously.
 `prove_with_blinders(cpu, w, r, s)` and `prove_with_blinders(cuda, w, r, s)` must serialise
 to the **same compressed bytes** on all six artifacts, and independent blinders must produce
 **different** bytes, so the test cannot pass on a backend that ignores its inputs. The Metal
-version is `metal_and_cpu_agree_on_every_variant` in `crates/cli/tests/campaign.rs`.
+version is `metal_and_cpu_agree_on_every_variant` in `bin/snarkrs/tests/campaign.rs`.
 Then `snarkjs groth16 verify` and rapidsnark on the output.
 
 ---

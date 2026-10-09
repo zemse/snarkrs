@@ -1,6 +1,6 @@
 # backends
 
-Scope: main `d506763981fb9234d32b191ca47f9b45930da4d0`. Source support is not hardware
+Scope: main `b759c4c`. Source support is not hardware
 validation. Historical benchmark tables are not current conformance evidence.
 
 ## implementation
@@ -9,7 +9,7 @@ validation. Historical benchmark tables are not current conformance evidence.
 | --- | --- | --- | --- | --- | --- | --- |
 | CPU | CPU | CPU | host | yes | variable, constant | native Rust |
 | Metal | GPU | GPU | device | no | variable, constant | Apple Metal, feature-gated |
-| CUDA | GPU | GPU | device | yes | variable only | NVIDIA CUDA/NVRTC, feature-gated |
+| CUDA | GPU | GPU | device | yes | variable, constant | NVIDIA CUDA/NVRTC, feature-gated |
 | WGPU | GPU | GPU | device | yes | variable, constant | native WGPU or browser WebGPU, feature-gated |
 
 The GPU proving paths keep H resident between its computation and the H MSM. Debug
@@ -33,8 +33,8 @@ to prepare another backend; `key()` is not a re-preparation contract.
 
 Variable work is the default. Constant work fixes scalar-dependent MSM sizing and
 removes zero/one fast paths, but does not make GPU occupancy, contention or all other
-witness-dependent work constant-time. CUDA constant work is unavailable on this main;
-held D2 changes are not landed support.
+witness-dependent work constant-time. CUDA constant work is opt-in via
+`CudaBackend::constant_work()` or CLI `--constant-work` with the `cuda` feature.
 
 | ceremony seam | CPU | Metal | CUDA | WGPU |
 | --- | --- | --- | --- | --- |
@@ -45,7 +45,7 @@ held D2 changes are not landed support.
 These are capability boundaries, not a promise that every ceremony command uses a GPU.
 Unsupported CLI selections fail before input/output work or entropy prompts rather than
 silently substituting CPU. Supported accelerators still require their build feature and
-runtime. See the [selection gates](crates/cli/src/main.rs) and
+runtime. See the [selection gates](bin/snarkrs/src/main.rs) and
 [prepared-circuit contract](crates/groth16/src/lib.rs).
 
 ## failure policies
@@ -61,7 +61,7 @@ checked CPU proof. The CPU factory must identify as CPU and match dimensions, fu
 and the five assembly headers. Deterministic input errors do not trigger this policy;
 CPU preparation or proving errors propagate, not success. Timings name the successful
 backend. `--fallback=false` disables CLI fallback; `--self-verify=false` bypasses checked
-proving and disables that fallback policy. See the [CLI policy](crates/cli/src/fallback.rs).
+proving and disables that fallback policy. See the [CLI policy](bin/snarkrs/src/fallback.rs).
 
 WGPU `Auto` is limit negotiation, not CPU backend selection. It raises buffer and
 storage-binding capacity while keeping Floor kernel geometry; a refused Auto device
@@ -94,8 +94,8 @@ documentation change. Commands and detailed F evidence live in
 | EXECUTED, Stage3 | 5 fallback tests, 56 web tests; desktop Floor Chrome 154 smoke, both work modes | 14 selftests and 4 snarkjs-accepted GPU proofs passed. Browser scope is bounded tiny-circuit validation, not phones or production assets. |
 | EXECUTED, C3 `621a9e0` | Metal sealed ceremony/group FFT | 68 tests passed, 1 measurement ignored. Synthetic fault recovery and CPU comparisons, not a production arithmetic guard or BUG-28 real-load closure. |
 | EXECUTED, main `d506763` | domain `2^22` same-instance large proof gate, variable work: CPU, Metal, WGPU Floor/Auto | 4/4 jobs passed, each `1/1` on `large/js_384x384_d32`, totaling 4 large cases; both verifiers and reference public signals accepted, no fallback. Large constant work and domains above `2^22` remain unexecuted. |
-| CURRENT, historical only | NVIDIA variable-work prover and CUDA ceremony group FFT | source support and historical benchmarks, not current hardware validation. |
-| BLOCKED / UNSUPPORTED on main | held CUDA D2 constant-work changes | require physical NVRTC/PTX arithmetic and default/constant proof gates before merge; no approved NVIDIA host or rental. |
+| EXECUTED, CUDA `c50353c`, merged on `b759c4c` | Tesla T4, driver 595.91.07, NVRTC 12.8.93; variable and constant proving | 5 mandatory device tests passed; CPU H/all-five-MSM/pinned-proof comparisons for tiny_mul and sha256 passed. 4 no-fallback CLI proofs accepted by snarkjs with reference public signals. 20 serial warm reps verified. Other NVIDIA devices and large CUDA proofs untested. |
+| CURRENT, historical only | CUDA ceremony group FFT | source support and historical benchmarks, not a fresh ceremony run. |
 | BLOCKED | phones, Safari and other browser/device combinations | not currently validated by the desktop smoke or shader compilation. |
 
 Each corrected F case covered `tiny_mul` (domain 8) or SHA-256 (domain 65536): CPU H and
@@ -136,7 +136,14 @@ pre-wasm-opt release assets. The run substituted a tiny catalogue/configuration.
 identity came from a separately requested window adapter, not worker-device attestation;
 see the [smoke harness](web/scripts/browser-parity.mjs).
 
-This evidence does not establish full backend parity. NVIDIA, phones, large constant-work
-runs, domains above `2^22` and a production wrong-arithmetic guard remain open. Default
+CUDA evidence is retained at repository-root `target/cuda-validation-20261009/summary.json`,
+with gate logs, CLI proof/public JSON, snarkjs logs and warm CSVs (local, ignored).
+Five warm reps per fixture/mode measured medians of 2.379/22.991 ms on tiny_mul and
+17.782/83.659 ms on sha256 (variable/constant). This bounded T4 sample is not a speed
+claim for other circuits or GPUs. See the [CUDA gate scope](test-support/README.md#nvidia-constant-work-execution-2026-10-09).
+
+This evidence does not establish full backend parity. Other NVIDIA devices, large CUDA
+proofs, phones, large constant-work runs, domains above `2^22` and a production
+wrong-arithmetic guard remain open. Default
 full CPU duplication has not been approved for its cost; sealed completion and synthetic
 recovery do not replace it.

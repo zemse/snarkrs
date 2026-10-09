@@ -966,7 +966,7 @@ fn reparse() -> Result<(ProvingKey, Vec<Fr>, String), JsError> {
 
 /// One **cold** proof: everything a rep can pay for, it pays for, and nothing survives it.
 ///
-/// This is `crates/cli/src/bench.rs`'s cold mode, minus the one thing a browser cannot
+/// This is `bin/snarkrs/src/bench.rs`'s cold mode, minus the one thing a browser cannot
 /// repeat: opening the adapter and compiling the shader modules. Those are page-lifetime costs
 /// and they are excluded on purpose, because snarkjs' equivalent (building its BN254 wasm
 /// module and spawning `hardwareConcurrency` workers) is amortised by the three warm-ups and

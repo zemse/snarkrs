@@ -14,8 +14,8 @@ members = [
     "crates/wgpu",
     "crates/web",
     "crates/witness",
-    "crates/snarkrs",
-    "crates/cli",
+    "crates/lib",
+    "bin/snarkrs",
 ]
 # Its own workspace: it links a C++ witness generator and pulls rand, sha3 and
 # witnesscalc-adapter, and none of that belongs in a `cargo build` of the prover.
@@ -86,7 +86,7 @@ snarkrs-cuda  = { path = "crates/cuda" }
 snarkrs-wgpu  = { path = "crates/wgpu" }
 snarkrs-web  = { path = "crates/web" }
 snarkrs-witness = { path = "crates/witness", default-features = false }
-snarkrs = { path = "crates/snarkrs" }
+snarkrs-lib = { path = "crates/lib" }
 
 [profile.release]
 opt-level = 3

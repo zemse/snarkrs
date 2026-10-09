@@ -1868,8 +1868,7 @@ mod tests {
     /// Exercise clap and the command handlers, not just the capability selector.
     #[test]
     fn unsupported_ceremony_commands_fail_before_io_or_entropy_prompt() {
-        let dir =
-            std::env::temp_dir().join(format!("snarkrs-cli-capabilities-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("snarkrs-capabilities-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join("output");
         for kind in [BackendKind::Wgpu, BackendKind::Cuda, BackendKind::Metal] {

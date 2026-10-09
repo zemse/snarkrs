@@ -38,7 +38,7 @@ TARGET="x86_64-unknown-linux-gnu.2.31"
 BIN="$HERE/target/x86_64-unknown-linux-gnu/release/snarkrs"
 
 echo "==> cross-compiling for $TARGET on this machine"
-( cd "$HERE" && cargo zigbuild --release -p snarkrs-cli --features cuda --target "$TARGET" )
+( cd "$HERE" && cargo zigbuild --release -p snarkrs --features cuda --target "$TARGET" )
 file "$BIN" | grep -q 'ELF 64-bit.*x86-64' || { echo "not an x86-64 ELF, refusing to ship"; exit 1; }
 echo "    $(ls -lh "$BIN" | awk '{print $5}')  $(cd "$HERE" && git rev-parse --short HEAD)"
 

@@ -360,7 +360,7 @@ impl Seal {
         };
         self.map.unmap();
         if got != sealed.epoch {
-            // `Device` and not `Backend`, so `snarkrs-cli`'s fallback treats it as the
+            // `Device` and not `Backend`, so `snarkrs`'s fallback treats it as the
             // transient it is once the retry in `crate::backend` has given up.
             return Err(ProveError::Device {
                 backend: "wgpu",

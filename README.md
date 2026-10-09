@@ -99,12 +99,12 @@ picking a newer run.
 ## using it from the command line
 
 ```sh
-cargo install --path crates/cli                     # CPU and WebGPU
-cargo install --path crates/cli --features metal    # + Apple Metal
-cargo install --path crates/cli --features cuda     # + NVIDIA CUDA
+cargo install --path bin/snarkrs                     # CPU and WebGPU
+cargo install --path bin/snarkrs --features metal    # + Apple Metal
+cargo install --path bin/snarkrs --features cuda     # + NVIDIA CUDA
 ```
 
-The package is `snarkrs-cli` and the binary is `snarkrs`, a drop-in for the snarkjs 0.7.6 command line on Groth16 and
+The package and the binary are both `snarkrs`, a drop-in for the snarkjs 0.7.6 command line on Groth16 and
 BN254: the same commands, aliases, positional file names and defaults, `-e=`/`-n=`/`-v`
 options, exit codes (0 ok, 1 failed or invalid, 99 bad usage) and `[INFO]  snarkJS: OK!`
 log lines. `snarkrs --help` lists what it runs; a snarkjs command it does not run yet
@@ -167,7 +167,7 @@ a circuit is MSM-bound or transform-bound:
 ## using it as a library
 
 ```toml
-snarkrs = { git = "https://github.com/zemse/gpu-snark", features = ["metal"] }
+snarkrs-lib = { git = "https://github.com/zemse/gpu-snark", features = ["metal"] }
 ```
 
 The prover, verifier, key formats and CPU backend are always in. The rest is opt in, so a
@@ -175,32 +175,32 @@ build compiles only the backend it runs on:
 
 | feature | adds |
 | --- | --- |
-| `metal` | `snarkrs::metal`, Apple GPUs |
-| `cuda` | `snarkrs::cuda`, NVIDIA GPUs |
-| `wgpu` | `snarkrs::wgpu`, WebGPU |
-| `ceremony` | `snarkrs::ceremony`, powers of tau and phase 2 |
-| `witness` | `snarkrs::witness`, circom's native witness binary |
+| `metal` | `snarkrs_lib::metal`, Apple GPUs |
+| `cuda` | `snarkrs_lib::cuda`, NVIDIA GPUs |
+| `wgpu` | `snarkrs_lib::wgpu`, WebGPU |
+| `ceremony` | `snarkrs_lib::ceremony`, powers of tau and phase 2 |
+| `witness` | `snarkrs_lib::witness`, circom's native witness binary |
 | `witness-wasm` | `witness` plus circom's `circuit.wasm` on wasmtime |
 
 ```rust
-use snarkrs::{prove, verify, Backend, ProvingKey, StageTimings, Witness};
+use snarkrs_lib::{prove, verify, Backend, ProvingKey, StageTimings, Witness};
 
 // warm pk once for repeated proving the same circuit
 let pk = ProvingKey::load("circuit.zkey".as_ref())?;
 let n_public = pk.n_public;
-let circuit = snarkrs::metal::MetalBackend::new()?.prepare(pk)?;
+let circuit = snarkrs_lib::metal::MetalBackend::new()?.prepare(pk)?;
 
 let w = Witness::load("circuit.wtns".as_ref())?.0;
 let mut t = StageTimings::default();
-let proof = prove(circuit.as_ref(), &w, &mut snarkrs::rand::thread_rng(), &mut t)?;
+let proof = prove(circuit.as_ref(), &w, &mut snarkrs_lib::rand::thread_rng(), &mut t)?;
 
 let public = &w[1..=n_public];
 verify(&circuit.key().vk, public, &proof)?;
-snarkrs::write_proof("proof.json".as_ref(), &proof)?;
-snarkrs::write_public("public.json".as_ref(), public)?;
+snarkrs_lib::write_proof("proof.json".as_ref(), &proof)?;
+snarkrs_lib::write_public("public.json".as_ref(), public)?;
 ```
 
-Swap `MetalBackend` for `snarkrs::CpuBackend` or `snarkrs::cuda::CudaBackend` to change where
+Swap `MetalBackend` for `snarkrs_lib::CpuBackend` or `snarkrs_lib::cuda::CudaBackend` to change where
 it runs; nothing else in the snippet changes, which is the point of the trait.
 
 `circuit.key()` preserves the dimensions, full verification key (including IC), and the
@@ -218,18 +218,18 @@ deterministic entry point stays test-only.
 `prove` takes the witness as `&[Fr]`, so it never has to be a file:
 
 ```rust
-use snarkrs::witness::{Input, WitnessCalculator};
-use snarkrs::{prove, Backend, ProvingKey, StageTimings};
+use snarkrs_lib::witness::{Input, WitnessCalculator};
+use snarkrs_lib::{prove, Backend, ProvingKey, StageTimings};
 
 let pk = ProvingKey::load("circuit.zkey".as_ref())?;
-let circuit = snarkrs::metal::MetalBackend::new()?.prepare(pk)?;
+let circuit = snarkrs_lib::metal::MetalBackend::new()?.prepare(pk)?;
 
 // compile the wasm once, then one witness per input (feature `witness-wasm`)
 let calc = WitnessCalculator::from_file("circuit_js/circuit.wasm".as_ref())?;
 let w = calc.calculate(&Input::from_json_str(r#"{"a": "3", "b": "11"}"#)?)?;
 
 let mut t = StageTimings::default();
-let proof = prove(circuit.as_ref(), &w, &mut snarkrs::rand::thread_rng(), &mut t)?;
+let proof = prove(circuit.as_ref(), &w, &mut snarkrs_lib::rand::thread_rng(), &mut t)?;
 ```
 
 `w` is just `1`, the public signals, then the other wires in circom's order (the second
@@ -253,12 +253,12 @@ already trust. This is not a claim that every entry point has an unchecked twin:
 The check in `prove` is also what stops a hostile zkey from reading the witness out of the
 proof, so a key from someone else should only ever meet `prove`, and should still be checked
 with `snarkrs zkey verify` against the circuit and the ptau. Proving time depends on how many
-witness entries are zero or one unless you pass `--constant-work` (cpu, metal and wgpu
-backends, 2.5% to about 10x slower depending on the circuit and backend). This fixes the
-scalar-dependent MSM sizing and disables zero/one fast paths, not all witness-dependent
-work: GPU bucket occupancy, atomics contention and accumulation still depend on the
-witness. Constant-work is not constant-time; CUDA still refuses this flag on main (see the
-[backend matrix](BACKENDS.md#implementation)). The audit and its current status are in
+witness entries are zero or one unless you pass `--constant-work` (cpu, metal, wgpu and cuda
+backends, with circuit-dependent overhead). This fixes the scalar-dependent MSM sizing
+and disables zero/one fast paths, not all witness-dependent work: GPU bucket occupancy,
+atomics contention and accumulation still depend on the witness. Constant-work is not
+constant-time. CUDA's bounded Tesla T4 validation and measured overhead are in the
+[backend matrix](BACKENDS.md#evidence). The audit and its current status are in
 [`security/README.md`](security/README.md).
 
 ## References

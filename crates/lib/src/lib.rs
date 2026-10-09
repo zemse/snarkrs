@@ -16,7 +16,7 @@
 //! Proving from memory, with the witness already a `Vec<Fr>`:
 //!
 //! ```no_run
-//! use snarkrs::{prove, verify, Backend, CpuBackend, ProvingKey, StageTimings, Witness};
+//! use snarkrs_lib::{prove, verify, Backend, CpuBackend, ProvingKey, StageTimings, Witness};
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! // Parse and prepare once, prove many times: on a GPU backend `prepare` is the upload.
@@ -26,18 +26,18 @@
 //!
 //! let w = Witness::load("circuit.wtns".as_ref())?.0;
 //! let mut t = StageTimings::default();
-//! let proof = prove(circuit.as_ref(), &w, &mut snarkrs::rand::thread_rng(), &mut t)?;
+//! let proof = prove(circuit.as_ref(), &w, &mut snarkrs_lib::rand::thread_rng(), &mut t)?;
 //!
 //! let public = &w[1..=n_public];
 //! verify(&circuit.key().vk, public, &proof)?;
-//! snarkrs::write_proof("proof.json".as_ref(), &proof)?;
-//! snarkrs::write_public("public.json".as_ref(), public)?;
+//! snarkrs_lib::write_proof("proof.json".as_ref(), &proof)?;
+//! snarkrs_lib::write_public("public.json".as_ref(), public)?;
 //! # Ok(())
 //! # }
 //! ```
 //!
-//! Swap [`CpuBackend`] for `snarkrs::metal::MetalBackend`, `snarkrs::cuda::CudaBackend` or
-//! `snarkrs::wgpu::WgpuProver` to change where it runs.
+//! Swap [`CpuBackend`] for `snarkrs_lib::metal::MetalBackend`, `snarkrs_lib::cuda::CudaBackend` or
+//! `snarkrs_lib::wgpu::WgpuProver` to change where it runs.
 
 pub mod json;
 

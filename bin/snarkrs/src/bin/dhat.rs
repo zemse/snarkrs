@@ -1,6 +1,6 @@
 //! Heap profile of one cold proof, phase by phase.
 //!
-//! `cargo run --release -p snarkrs-cli --features dhat-heap --bin snarkrs-dhat -- ARTIFACT_DIR [OUT.json]`
+//! `cargo run --release -p snarkrs --features dhat-heap --bin snarkrs-dhat -- ARTIFACT_DIR [OUT.json]`
 //!
 //! This is a separate binary rather than a flag on `snarkrs` because it installs a global
 //! allocator. `dhat::Alloc` wraps every allocation with a backtrace capture, which is

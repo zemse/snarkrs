@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 fn scratch(test: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("snarkrs-cli-{test}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("snarkrs-{test}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir

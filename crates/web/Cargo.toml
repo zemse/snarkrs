@@ -12,7 +12,7 @@ publish = false
 # so the shared object has a predictable name, and the `rlib` from the same rustc invocation
 # loses its hash with it. The workspace release profile is `panic = "abort"` and a test
 # harness needs `unwind`, so `cargo test --workspace --release` builds every library twice and
-# two units then write one path. That took `snarkrs-cli` down 5 times out of 5 at U11 with an
+# two units then write one path. That took `snarkrs` down 5 times out of 5 at U11 with an
 # error naming neither crate. This crate has no `rlib` and nothing depends on it, so the
 # collision has nothing to collide with. `crates/wgpu/tests/manifest.rs` holds the other half.
 crate-type = ["cdylib"]

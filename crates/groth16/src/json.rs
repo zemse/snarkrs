@@ -18,13 +18,13 @@
 //!
 //! # Why this is in `snarkrs-groth16` and not next to the CLI
 //!
-//! It lived in `snarkrs-cli` until U13, which is fine while a proof only ever leaves this
+//! It lived in the CLI crate until U13, which is fine while a proof only ever leaves this
 //! workspace through a file. The browser prover has no filesystem and hands its proof to
 //! `snarkjs.groth16.verify` across the JS boundary as a string, so it needs exactly these
-//! three rules and nothing else in `snarkrs-cli`. Two copies of a `c0`/`c1` ordering is how
+//! three rules and nothing else in the CLI. Two copies of a `c0`/`c1` ordering is how
 //! one of them ends up wrong, and the copy that would have been wrong is the one no `cargo
 //! test` on this machine ever exercises. The path-taking half, `read_proof`, `read_public`,
-//! `write_proof` and `write_public`, is `snarkrs::json` in the library facade.
+//! `write_proof` and `write_public`, is `snarkrs_lib::json` in the library facade.
 //!
 //! `anyhow` does not appear here. A library that returns `anyhow::Error` forces the choice on
 //! everything downstream, and `snarkrs-wgpu`'s wasm entry point turns errors into `JsError`.

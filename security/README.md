@@ -4,7 +4,7 @@ Four audits and three adversarial test suites, run against the tree at commit `e
 on an Apple M2 Max, macOS 26.6. Raw notes are in `security/notes/`: four `audit-*.md`
 files (our code) and four `research-*.md` files (prior art, CVEs, and the theory the
 audits are measured against). The test suites are
-`crates/cli/tests/{campaign,verifier_negative,edge_witness}.rs`.
+`bin/snarkrs/tests/{campaign,verifier_negative,edge_witness}.rs`.
 
 Nothing in this report is a fix. The audits were report-only and the test lanes added
 test files only. The findings below are as audited, and their file and line references are
@@ -19,7 +19,7 @@ to that tree; the table that follows says what has landed since.
 | 3 | Query sections never validated | Fixed, `9445d85`: every point on the curve at load; the G2 subgroup is checked on the proof's `B` (`d170f78`, `3a610a5`) because per point it costs 1.2-6.6 s. `load_unchecked` skips it |
 | 4 | Metal command buffer status never checked | Fixed, `69d2802` (`cb::wait_ok`) |
 | 5 | Threadgroup memory never cleared | Fixed, `dd21174` |
-| 6 | Witness-dependent MSM cost | CPU: opt-in constant work, `ae15a9b` (`prove --constant-work`; +2.5% dense, 3.3-4x bit-heavy). Metal: opt-in constant work, `f48db69`, `3bd3aec`, `6c026ce`, `c233628` (`--backend metal`; +26% dense, 3.7-5.7x bit-heavy); stage 0, the merge and the reduce follow the key (complete formulas); atomics contention, the accumulation's run count and which slots are stored still follow occupancy. wgpu: opt-in constant work, `095a3d1` (`--backend wgpu`, and `prove(true)` in the browser; +55% dense, 3.5-9.8x bit-heavy); the merge and the reduce follow the key; atomics contention and the accumulation's run count still follow occupancy. cuda: **open** |
+| 6 | Witness-dependent MSM cost | CPU: opt-in constant work, `ae15a9b` (`prove --constant-work`; +2.5% dense, 3.3-4x bit-heavy). Metal: opt-in constant work, `f48db69`, `3bd3aec`, `6c026ce`, `c233628` (`--backend metal`; +26% dense, 3.7-5.7x bit-heavy); stage 0, the merge and the reduce follow the key (complete formulas); atomics contention, the accumulation's run count and which slots are stored still follow occupancy. wgpu: opt-in constant work, `095a3d1` (`--backend wgpu`, and `prove(true)` in the browser; +55% dense, 3.5-9.8x bit-heavy); the merge and the reduce follow the key; atomics contention and the accumulation's run count still follow occupancy. cuda: opt-in constant work, `a61f650` / `c50353c` (`--backend cuda`); five mandatory device tests and tiny_mul/SHA-256 proofs validated on Tesla T4 with NVRTC 12.8.93. Fixed geometry, dummy zero digits, no ones path, fixed complete-formula folds/reduce; accumulation and atomics remain occupancy dependent. Not constant time; see [bounded evidence](../BACKENDS.md#evidence). |
 | 7 | GPU concurrency failure | Fixed on Metal, `2e2d06f`, and on wgpu, `4ce2c96`, where wgpu hid the kill and proofs came back wrong: macOS `ImpactingInteractivity` kills of a proving command buffer, now retried whole. One unchecked proof came back wrong after a GPU hang and recovery under deliberate three-process overload: **open**, caught by `prove`'s self-verify |
 | 8 | Lenient proof JSON encoding | Fixed, `d170f78` |
 | 9 | `verify()` validates nothing | Fixed, `d170f78`; `verify_unchecked` is the bare check |
@@ -86,7 +86,7 @@ read. Then **60 crafted mutants** of `bench/artifacts/tiny_mul/circuit.zkey` and
 through the release binary (then `g16`, now `snarkrs`). Executed, not reasoned: the 34 GB allocation, the SIGBUS,
 the SIGABRT, and the zero-knowledge break all have run output behind them.
 
-**Verifier soundness** (`crates/groth16/src/verify.rs`, `crates/cli/src/json.rs`, the vkey reader
+**Verifier soundness** (`crates/groth16/src/verify.rs`, `bin/snarkrs/src/json.rs`, the vkey reader
 in `snarkrs-formats`). A probe binary outside the repo linked against the real crates and run
 against the real `js_2x2_d16` artifact. Re-randomisation, non-canonical encodings, the
 infinity cases and the degenerate-key case were all executed. A genuine order-10069 twist
@@ -530,7 +530,7 @@ state.
 
 **Do not try to fix this with a uniqueness or canonicalisation check.** The attacker picks
 `z`, so such a check only starts rejecting honest proofs. The property is pinned by
-`malleated_proof_still_verifies` in `crates/cli/tests/verifier_negative.rs` and
+`malleated_proof_still_verifies` in `bin/snarkrs/tests/verifier_negative.rs` and
 documented on `Proof` and `verify`, precisely so that it reads as intentional rather than as
 a bug someone should go and repair.
 

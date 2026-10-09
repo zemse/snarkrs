@@ -1,11 +1,11 @@
 //! snarkjs' `proof.json` and `public.json` interop, from the library.
 //!
 //! The encoding lives in [`snarkrs_groth16::json`], which is where the browser prover can
-//! reach it, and the path-taking readers and writers in [`snarkrs::json`], which is where a
+//! reach it, and the path-taking readers and writers in [`snarkrs_lib::json`], which is where a
 //! library user writing a proof.json reaches them. This module only re-exports both, so the
 //! CLI writes exactly what the library writes.
 
-pub use snarkrs::json::{
+pub use snarkrs_lib::json::{
     dec, parse_field, proof_from_str, proof_from_value, proof_to_string, public_from_str,
     public_from_value, public_to_string, read_g1, read_g2, read_proof, read_public, write_proof,
     write_public, FileError, JsonError,

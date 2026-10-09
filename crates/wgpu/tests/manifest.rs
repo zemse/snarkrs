@@ -19,10 +19,10 @@ use std::path::Path;
 /// that one path. Cargo warns ("output filename collision", cargo issue 6313, "this may
 /// become a hard error") and then a downstream unit fails.
 ///
-/// Measured at U11, with `snarkrs-wgpu` in `snarkrs-cli`'s default feature set:
+/// Measured at U11, with `snarkrs-wgpu` in `snarkrs`'s default feature set:
 /// `cargo build --workspace --release --tests` failed **5 times out of 5** after touching
 /// `crates/wgpu/src/lib.rs`, with `error[E0463]: can't find crate for g16_cli` (now
-/// snarkrs-cli) pointing at `crates/cli/src/main.rs`. Nothing in that message mentions `snarkrs-wgpu`, a crate type, or
+/// snarkrs) pointing at `bin/snarkrs/src/main.rs`. Nothing in that message mentions `snarkrs-wgpu`, a crate type, or
 /// a panic strategy. With `crate-type = ["rlib"]` the same command passed 3 times out of 3
 /// and emitted no collision warning.
 ///
@@ -53,7 +53,7 @@ fn the_lib_is_rlib_only_while_the_release_profile_aborts() {
         "[lib] {crate_type} and the workspace release profile is panic = \"abort\". Those two \
          together make cargo write one unhashed libsnarkrs_wgpu.rlib from two units, and \
          `cargo test --workspace --release` then fails with `can't find crate for g16_cli` \
-         (now snarkrs-cli). \
+         (now snarkrs). \
          Put the cdylib in a wasm wrapper crate instead."
     );
 }

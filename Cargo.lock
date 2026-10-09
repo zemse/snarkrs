@@ -2022,18 +2022,29 @@ dependencies = [
 name = "snarkrs"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "ark-bn254",
+ "ark-ec",
+ "ark-ff",
+ "ark-serialize",
  "ark-std",
+ "clap",
+ "dhat",
+ "hex",
+ "libc",
+ "num-bigint",
+ "serde",
+ "serde_json",
  "snarkrs-ceremony",
  "snarkrs-cuda",
  "snarkrs-field",
  "snarkrs-formats",
  "snarkrs-groth16",
+ "snarkrs-lib",
  "snarkrs-metal",
  "snarkrs-msm",
- "snarkrs-ntt",
  "snarkrs-wgpu",
  "snarkrs-witness",
- "thiserror",
 ]
 
 [[package]]
@@ -2059,35 +2070,6 @@ dependencies = [
  "snarkrs-ntt",
  "thiserror",
  "zeroize",
-]
-
-[[package]]
-name = "snarkrs-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "ark-bn254",
- "ark-ec",
- "ark-ff",
- "ark-serialize",
- "ark-std",
- "clap",
- "dhat",
- "hex",
- "libc",
- "num-bigint",
- "serde",
- "serde_json",
- "snarkrs",
- "snarkrs-ceremony",
- "snarkrs-cuda",
- "snarkrs-field",
- "snarkrs-formats",
- "snarkrs-groth16",
- "snarkrs-metal",
- "snarkrs-msm",
- "snarkrs-wgpu",
- "snarkrs-witness",
 ]
 
 [[package]]
@@ -2168,6 +2150,24 @@ dependencies = [
  "snarkrs-ntt",
  "thiserror",
  "web-time",
+]
+
+[[package]]
+name = "snarkrs-lib"
+version = "0.1.0"
+dependencies = [
+ "ark-std",
+ "snarkrs-ceremony",
+ "snarkrs-cuda",
+ "snarkrs-field",
+ "snarkrs-formats",
+ "snarkrs-groth16",
+ "snarkrs-metal",
+ "snarkrs-msm",
+ "snarkrs-ntt",
+ "snarkrs-wgpu",
+ "snarkrs-witness",
+ "thiserror",
 ]
 
 [[package]]

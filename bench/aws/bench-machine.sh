@@ -186,7 +186,7 @@ rsh "$IP" 'source ~/.cargo/env
 # carried on past a build that had failed to compile libc.
 say "building (release${FEATURES:+, cuda})"
 BUILD_T0=$(date +%s)
-if ! rsh "$IP" "set -o pipefail; source ~/.cargo/env; cd ~/g16 && cargo build --release -p snarkrs-cli $FEATURES" > "$OUT/build.log" 2>&1; then
+if ! rsh "$IP" "set -o pipefail; source ~/.cargo/env; cd ~/g16 && cargo build --release -p snarkrs $FEATURES" > "$OUT/build.log" 2>&1; then
   say "BUILD FAILED after $(( $(date +%s) - BUILD_T0 ))s:"
   tail -25 "$OUT/build.log" | tee -a "$LOG"
   exit 1

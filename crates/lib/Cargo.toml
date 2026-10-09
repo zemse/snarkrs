@@ -1,5 +1,5 @@
 [package]
-name = "snarkrs"
+name = "snarkrs-lib"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -33,7 +33,7 @@ snarkrs-ceremony = { workspace = true, optional = true }
 # The workspace entry has no default features, so wasmtime comes only with `witness-wasm`.
 snarkrs-witness = { workspace = true, optional = true }
 # `getrandom` is ark-std's name for rand/std: `prove` needs an OS-seeded RNG for the
-# blinders, and `snarkrs::rand::thread_rng` is that.
+# blinders, and `snarkrs_lib::rand::thread_rng` is that.
 ark-std = { workspace = true, features = ["std", "getrandom"] }
 thiserror.workspace = true
 
