@@ -170,6 +170,15 @@ a circuit is MSM-bound or transform-bound:
 snarkrs-lib = { git = "https://github.com/zemse/snarkrs", features = ["metal"] }
 ```
 
+Proving needs an optimised build. In a debug build `prove` returns `ProveError::Unoptimized`
+rather than run tens of times slower, so optimise dependencies there too, which keeps your
+own code quick to compile and debug:
+
+```toml
+[profile.dev.package."*"]
+opt-level = 3
+```
+
 The prover, verifier, key formats and CPU backend are always in. The rest is opt in, so a
 build compiles only the backend it runs on:
 

@@ -112,13 +112,24 @@ pub enum ProveError {
     /// opt-level 0 with `overflow-checks` branching on every limb of the CIOS multiply. The
     /// campaign sweep that `campaign.rs` measures at under a minute took 19 minutes and
     /// 187 CPU-minutes that way before it was killed, with twelve variants still to go.
+    ///
+    /// The same holds for a library user's debug build, whose profile is the one our crates
+    /// are compiled with, so the message is written for them: what happened, and the
+    /// `Cargo.toml` lines that fix it without giving up a debug build of their own code.
     #[error(
-        "refusing to prove at opt-level 0 or 1: overflow checks on every limb of the CIOS \
-         multiply make this tens of times slower than the numbers in README.md, which is how \
-         a bare `cargo test` comes to saturate every core for the better part of an hour.\n\
-         \n  release:  cargo test --release --workspace\
-         \n  filtered: cargo test --workspace -- --skip campaign --skip roundtrip\
-         \n  override: G16_ALLOW_UNOPTIMIZED_PROVING=1 (no effect on wasm32, which has no env)"
+        "refusing to prove: snarkrs was compiled without optimisation (opt-level {level}), \
+         which makes proving tens of times slower, minutes where an optimised build takes \
+         seconds. This is usually a debug build (`cargo run`, `cargo test`).\n\
+         \nFix it in one of two ways:\n\
+         \n  1. Optimise dependencies in debug builds. Your own code stays quick to compile\
+         \n     and debug. Add this to the Cargo.toml at your workspace root:\n\
+         \n         [profile.dev.package.\"*\"]\
+         \n         opt-level = 3\n\
+         \n  2. Build in release mode: `cargo run --release`, `cargo test --release`.\n\
+         \nTo prove unoptimised anyway, for example in a test that has to run in a debug\
+         \nbuild, set G16_ALLOW_UNOPTIMIZED_PROVING=1. That works on native targets only:\
+         \nwasm32 has no environment, so there use 1 or 2.",
+        level = env!("SNARKRS_OPT_LEVEL")
     )]
     Unoptimized,
 }

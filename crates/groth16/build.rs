@@ -12,7 +12,10 @@
 fn main() {
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rustc-check-cfg=cfg(unoptimized)");
-    if matches!(std::env::var("OPT_LEVEL").as_deref(), Ok("0") | Ok("1")) {
+    let level = std::env::var("OPT_LEVEL").unwrap_or_default();
+    // For the `ProveError::Unoptimized` message, which names the level it refused.
+    println!("cargo::rustc-env=SNARKRS_OPT_LEVEL={level}");
+    if matches!(level.as_str(), "0" | "1") {
         println!("cargo::rustc-cfg=unoptimized");
     }
 }

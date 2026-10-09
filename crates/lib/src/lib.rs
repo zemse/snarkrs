@@ -13,6 +13,15 @@
 //! | `witness` | [`witness`], circom's native witness binary as a subprocess |
 //! | `witness-wasm` | `witness` plus circom's `circuit.wasm` on wasmtime |
 //!
+//! Proving needs an optimised build. In a debug build [`prove`] returns
+//! [`ProveError::Unoptimized`] rather than run tens of times slower, so optimise
+//! dependencies there too, which keeps your own code quick to compile and debug:
+//!
+//! ```toml
+//! [profile.dev.package."*"]
+//! opt-level = 3
+//! ```
+//!
 //! Proving from memory, with the witness already a `Vec<Fr>`:
 //!
 //! ```no_run
