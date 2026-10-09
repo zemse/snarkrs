@@ -167,7 +167,7 @@ a circuit is MSM-bound or transform-bound:
 ## using it as a library
 
 ```toml
-snarkrs-lib = { git = "https://github.com/zemse/gpu-snark", features = ["metal"] }
+snarkrs-lib = { git = "https://github.com/zemse/snarkrs", features = ["metal"] }
 ```
 
 The prover, verifier, key formats and CPU backend are always in. The rest is opt in, so a

@@ -27,7 +27,7 @@ edition = "2021"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 authors = ["Soham Zemse <soham@zemse.in>"]
-repository = "https://github.com/zemse/gpu-snark"
+repository = "https://github.com/zemse/snarkrs"
 
 [workspace.dependencies]
 ark-bn254    = { version = "0.5", default-features = false, features = ["curve"] }
