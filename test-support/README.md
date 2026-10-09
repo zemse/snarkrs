@@ -334,6 +334,14 @@ other NVIDIA devices and the full shared `required_backend_conformance` GPU job
 remain unexecuted. The private five-test CUDA gate and separate CLI/snarkjs proof
 checks close the held port's hardware requirement, not universal backend parity.
 
+After the concurrent CLI relocation, main `e338b8f` rebuilt for Linux x86-64 and
+repeated all four no-fallback CUDA CLI proofs on the same T4. Downloaded proofs were
+accepted by snarkjs and matched reference public signals, giving eight independently
+verified CLI proofs across the two source snapshots. Main's four selection guards
+and three CPU CLI regressions passed; the default-feature CLI was reinstalled.
+GPU sources are unchanged from the mandatory five-test run. The source and binary
+hashes distinguish the original gate bundle from the rebuilt main executable.
+
 Evidence is retained at repository-root `target/cuda-validation-20261009/summary.json`,
 with commands, original build provenance, gate logs, proof/public pairs, snarkjs logs
 and warm CSVs (local, ignored, not published).

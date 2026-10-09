@@ -1,6 +1,6 @@
 # backends
 
-Scope: main `b759c4c`. Source support is not hardware
+Scope: main `e338b8f`. Source support is not hardware
 validation. Historical benchmark tables are not current conformance evidence.
 
 ## implementation
@@ -140,7 +140,10 @@ CUDA evidence is retained at repository-root `target/cuda-validation-20261009/su
 with gate logs, CLI proof/public JSON, snarkjs logs and warm CSVs (local, ignored).
 Five warm reps per fixture/mode measured medians of 2.379/22.991 ms on tiny_mul and
 17.782/83.659 ms on sha256 (variable/constant). This bounded T4 sample is not a speed
-claim for other circuits or GPUs. See the [CUDA gate scope](test-support/README.md#nvidia-constant-work-execution-2026-10-09).
+claim for other circuits or GPUs. After the CLI relocation, main `e338b8f` rebuilt
+successfully and repeated four no-fallback CUDA CLI proofs on the same T4; snarkjs
+accepted all four and public signals matched. Four selection guards and three CPU
+CLI regressions passed on that main. See the [CUDA gate scope](test-support/README.md#nvidia-constant-work-execution-2026-10-09).
 
 This evidence does not establish full backend parity. Other NVIDIA devices, large CUDA
 proofs, phones, large constant-work runs, domains above `2^22` and a production
