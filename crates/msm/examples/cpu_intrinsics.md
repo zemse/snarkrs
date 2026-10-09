@@ -35,6 +35,10 @@ Configure with positive `PROBE_ROUNDS` (default 16384), `PROBE_REPS` (5),
 `PROBE_PASSES` (16), `PROBE_THREADS` (available parallelism), and comma-separated
 `PROBE_BYTES` (32768,1048576,16777216; positive multiples of eight).
 Bytes are per buffer: copy retains two buffers, stream read one.
+`PROBE_THREADS` is limited to 1 through 256 in both modes, checked before pool
+startup or output. This practical safety limit supports 16-worker campaigns without
+allowing pathological thread creation. If available parallelism exceeds 256, set an
+explicit value within the limit.
 Record `PROBE_REV`, `PROBE_BUILD` (rustc version, target, profile, RUSTFLAGS), and
 `PROBE_CONTENTION`. These strings are caller declarations, not attestation.
 Output also records compiled ADX/BMI2 flags, architecture, OS, debug assertions,
@@ -82,7 +86,24 @@ copies, stream sums and join results are checked every pass group.
 pool or an extrapolation from one thread. It broadcasts one kernel to every pool
 worker for Fr/RawFq/RawFq2 multiply and G1/G2 XYZZ mixed-add. Each worker interleaves
 1/4/8 independently seeded chains. Seed construction/reservation is outside timing;
-the worker seed is `SEED wrapping_add worker_index`. Differential gates are retained.
+the worker seed is `SEED wrapping_add worker_index`.
+
+Before any sample timing or output, enabled aggregate probes compare all five kernels
+with field-power/group-scalar-multiplication oracles for 17 rounds at each of 1/4/8
+chains on every configured worker. These gates cover the actual parallel kernel;
+they are not oracle comparisons for arbitrary configured measurement rounds.
+Measured result checksums are noncryptographic fingerprints only. Worker identity
+checks also remain outside timing. `parallel_provenance` states the gate round count,
+primitive count and that measured results are not individually oracle checked.
+
+Mixed-add operands use a separate per-worker StdRng stream seeded with
+`(SEED wrapping_add worker_index) xor 0xadd0_2026`. The operand is nonzero and its
+x-coordinate differs from all eight initial lane points, avoiding initial doubling
+and inverse-add branches. Seeds and operands share the same preparation helpers in
+the oracle and measured paths. Later exceptional branches remain possible: reported
+mixed-add operations count `madd` calls, not guaranteed uniform field/group formulas.
+The additional operand vector is prepared outside timing and is not included in
+`preallocated_seed_bytes`, which describes only the initial lane arrays.
 
 `parallel_primitive` records use `aggregate_interleaved_throughput` even with one
 chain per worker: that is an aggregate rate, not dependent-chain latency. Actual

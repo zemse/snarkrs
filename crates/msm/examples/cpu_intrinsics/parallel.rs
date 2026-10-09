@@ -131,11 +131,64 @@ fn dispatch(cfg: &Config, pool: &rayon::ThreadPool) -> ProbeResult {
     Ok(())
 }
 
-fn differential_gate(pool: &rayon::ThreadPool) -> ProbeResult {
+type MixedInputs<F> = (Vec<[Xyzz<F>; 8]>, Vec<(F, F)>);
+
+fn mixed_inputs<P: RawCurve>(threads: usize) -> ProbeResult<MixedInputs<P::RF>> {
+    use ark_ec::short_weierstrass::Projective;
+    use snarkrs_field::raw::RawField;
+    let seeds = worker_seeds(threads, |rng| loop {
+        let point = Projective::<P>::rand(rng).into_affine();
+        if !point.is_zero() {
+            let (x, y) = P::raw_xy(&point);
+            break Xyzz {
+                x,
+                y,
+                zz: P::RF::ONE,
+                zzz: P::RF::ONE,
+            };
+        }
+    })?;
+    validate_work(1, 1, threads, size_of::<(P::RF, P::RF)>())?;
+    let mut operands = Vec::new();
+    operands.try_reserve_exact(threads)?;
+    for (worker, lanes) in seeds.iter().enumerate() {
+        let mut rng = StdRng::seed_from_u64(SEED.wrapping_add(worker as u64) ^ 0xadd0_2026);
+        loop {
+            let point = Projective::<P>::rand(&mut rng).into_affine();
+            if point.is_zero() {
+                continue;
+            }
+            let (x, y) = P::raw_xy(&point);
+            if lanes.iter().all(|p| p.x != x) {
+                operands.push((x, y));
+                break;
+            }
+        }
+    }
+    Ok((seeds, operands))
+}
+
+pub(super) fn differential_gate(pool: &rayon::ThreadPool) -> ProbeResult {
+    differential_width::<1>(pool)?;
+    differential_width::<4>(pool)?;
+    differential_width::<8>(pool)
+}
+
+fn differential_width<const L: usize>(pool: &rayon::ThreadPool) -> ProbeResult {
     let threads = pool.current_num_threads();
     {
+        let seeds = worker_seeds(threads, Fr::rand)?;
+        let results = kernel::<_, L>(pool, &seeds, 17, |i, x| x * seeds[i][7]);
+        verify_workers(&results, threads);
+        for (i, _, result) in results {
+            for (lane, x) in result.into_iter().enumerate() {
+                assert_eq!(x, seeds[i][lane] * seeds[i][7].pow([17]));
+            }
+        }
+    }
+    {
         let seeds = worker_seeds(threads, |rng| RawFq::from_fq(&Fq::rand(rng)))?;
-        let results = kernel::<_, 4>(pool, &seeds, 17, |i, x| x.mul(seeds[i][7]));
+        let results = kernel::<_, L>(pool, &seeds, 17, |i, x| x.mul(seeds[i][7]));
         verify_workers(&results, threads);
         for (i, _, result) in results {
             for (lane, x) in result.into_iter().enumerate() {
@@ -148,7 +201,7 @@ fn differential_gate(pool: &rayon::ThreadPool) -> ProbeResult {
     }
     {
         let seeds = worker_seeds(threads, |rng| RawFq2::from_fq2(&Fq2::rand(rng)))?;
-        let results = kernel::<_, 4>(pool, &seeds, 17, |i, x| x.mul(seeds[i][7]));
+        let results = kernel::<_, L>(pool, &seeds, 17, |i, x| x.mul(seeds[i][7]));
         verify_workers(&results, threads);
         for (i, _, result) in results {
             for (lane, x) in result.into_iter().enumerate() {
@@ -159,34 +212,22 @@ fn differential_gate(pool: &rayon::ThreadPool) -> ProbeResult {
             }
         }
     }
-    mixed_differential_gate::<g1::Config>(pool)?;
-    mixed_differential_gate::<g2::Config>(pool)
+    mixed_differential_gate::<g1::Config, L>(pool)?;
+    mixed_differential_gate::<g2::Config, L>(pool)
 }
 
-fn mixed_differential_gate<P: RawCurve>(pool: &rayon::ThreadPool) -> ProbeResult
-where
-    P::RF: Send + Sync,
-{
-    use ark_ec::short_weierstrass::{Affine, Projective};
-    use snarkrs_field::raw::RawField;
+fn mixed_differential_gate<P: RawCurve, const L: usize>(pool: &rayon::ThreadPool) -> ProbeResult {
+    use ark_ec::short_weierstrass::Affine;
     let threads = pool.current_num_threads();
-    let seeds = worker_seeds(threads, |rng| {
-        let (x, y) = P::raw_xy(&Projective::<P>::rand(rng).into_affine());
-        Xyzz {
-            x,
-            y,
-            zz: P::RF::ONE,
-            zzz: P::RF::ONE,
-        }
-    })?;
-    let results = kernel::<_, 4>(pool, &seeds, 17, |i, mut p| {
-        p.madd(seeds[i][7].x, seeds[i][7].y);
+    let (seeds, operands) = mixed_inputs::<P>(threads)?;
+    let results = kernel::<_, L>(pool, &seeds, 17, |i, mut p| {
+        p.madd(operands[i].0, operands[i].1);
         p
     });
     verify_workers(&results, threads);
     for (i, _, result) in results {
         let rhs =
-            Affine::<P>::new_unchecked(P::field_back(seeds[i][7].x), P::field_back(seeds[i][7].y));
+            Affine::<P>::new_unchecked(P::field_back(operands[i].0), P::field_back(operands[i].1));
         for (lane, p) in result.into_iter().enumerate() {
             let initial = to_projective::<P>(&seeds[i][lane]);
             let expected = initial + rhs.into_group() * P::ScalarField::from(17u64);
@@ -199,8 +240,7 @@ where
 pub(super) fn run(cfg: &Config, pool: &rayon::ThreadPool) -> ProbeResult {
     let threads = pool.current_num_threads();
     validate_work(cfg.rounds, 8, threads, size_of::<Xyzz<RawFq2>>())?;
-    differential_gate(pool)?;
-    println!("{{\"kind\":\"parallel_provenance\",\"worker_seed_rule\":\"StdRng(SEED wrapping_add worker_index)\",\"actual_pool_threads\":{threads},\"chain_counts\":[1,4,8],\"saturation_certified\":false}}");
+    println!("{{\"kind\":\"parallel_provenance\",\"worker_seed_rule\":\"StdRng(SEED wrapping_add worker_index)\",\"actual_pool_threads\":{threads},\"chain_counts\":[1,4,8],\"oracle_rounds\":17,\"oracle_primitive_count\":5,\"measured_results_oracle_checked\":false,\"saturation_certified\":false}}");
     dispatch(cfg, pool)?;
     {
         let seeds = worker_seeds(threads, Fr::rand)?;
@@ -229,21 +269,12 @@ pub(super) fn run(cfg: &Config, pool: &rayon::ThreadPool) -> ProbeResult {
         )?;
     }
     {
-        let seeds = worker_seeds(threads, |rng| {
-            let p = G1Projective::rand(rng).into_affine();
-            let (x, y) = <g1::Config as RawCurve>::raw_xy(&p);
-            Xyzz {
-                x,
-                y,
-                zz: RawFq::ONE,
-                zzz: RawFq::ONE,
-            }
-        })?;
+        let (seeds, operands) = mixed_inputs::<g1::Config>(threads)?;
         measure(
             "G1.XYZZ.mixed_add",
             &seeds,
             |i, mut p| {
-                p.madd(seeds[i][7].x, seeds[i][7].y);
+                p.madd(operands[i].0, operands[i].1);
                 p
             },
             |p| checksum([fq_hash(p.x), fq_hash(p.y), fq_hash(p.zz), fq_hash(p.zzz)]),
@@ -252,21 +283,12 @@ pub(super) fn run(cfg: &Config, pool: &rayon::ThreadPool) -> ProbeResult {
         )?;
     }
     {
-        let seeds = worker_seeds(threads, |rng| {
-            let p = G2Projective::rand(rng).into_affine();
-            let (x, y) = <g2::Config as RawCurve>::raw_xy(&p);
-            Xyzz {
-                x,
-                y,
-                zz: RawFq2::ONE,
-                zzz: RawFq2::ONE,
-            }
-        })?;
+        let (seeds, operands) = mixed_inputs::<g2::Config>(threads)?;
         measure(
             "G2.XYZZ.mixed_add",
             &seeds,
             |i, mut p| {
-                p.madd(seeds[i][7].x, seeds[i][7].y);
+                p.madd(operands[i].0, operands[i].1);
                 p
             },
             |p| {
@@ -291,11 +313,27 @@ mod tests {
 
     #[test]
     fn actual_parallel_kernels_match_field_and_group_oracles() {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(2)
-            .build()
-            .unwrap();
-        differential_gate(&pool).unwrap();
+        for threads in [1, 2, 3] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            differential_gate(&pool).unwrap();
+        }
+    }
+
+    fn check_operand_selection<P: RawCurve>() {
+        let (seeds, operands) = mixed_inputs::<P>(3).unwrap();
+        assert_eq!(seeds.len(), operands.len());
+        for (lanes, (x, _)) in seeds.iter().zip(operands) {
+            assert!(lanes.iter().all(|p| p.x != x));
+        }
+    }
+
+    #[test]
+    fn mixed_operands_are_distinct_from_all_initial_lanes() {
+        check_operand_selection::<g1::Config>();
+        check_operand_selection::<g2::Config>();
     }
 
     #[test]

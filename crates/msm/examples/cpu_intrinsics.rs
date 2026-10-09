@@ -50,6 +50,15 @@ fn setting(name: &str, default: usize) -> ProbeResult<usize> {
     Ok(n)
 }
 
+const MAX_POOL_THREADS: usize = 256;
+
+fn validate_threads(threads: usize) -> ProbeResult<usize> {
+    if threads == 0 || threads > MAX_POOL_THREADS {
+        return Err("PROBE_THREADS must be in 1..=256".into());
+    }
+    Ok(threads)
+}
+
 impl Config {
     fn load() -> ProbeResult<Self> {
         let sets = env::var("PROBE_BYTES").unwrap_or_else(|_| "32768,1048576,16777216".into());
@@ -62,7 +71,10 @@ impl Config {
             reps: setting("PROBE_REPS", 5)?,
             passes: setting("PROBE_PASSES", 16)?,
             sets,
-            threads: setting("PROBE_THREADS", std::thread::available_parallelism()?.get())?,
+            threads: validate_threads(setting(
+                "PROBE_THREADS",
+                std::thread::available_parallelism()?.get(),
+            )?)?,
             all_core: match env::var("PROBE_ALL_CORE") {
                 Err(env::VarError::NotPresent) => false,
                 Ok(s) if s == "0" => false,
@@ -404,6 +416,9 @@ fn main() -> ProbeResult {
         .num_threads(cfg.threads)
         .build()?;
     correctness();
+    if cfg.all_core {
+        parallel::differential_gate(&pool)?;
+    }
     println!("{{\"kind\":\"provenance\",\"schema\":1,\"arch\":{},\"os\":{},\"debug_assertions\":{},\"compiled_adx\":{},\"compiled_bmi2\":{},\"configured_threads\":{},\"actual_pool_threads\":{},\"rounds\":{},\"reps\":{},\"seed\":{SEED},\"revision_declared\":{},\"build_declared\":{},\"contention_declared\":{},\"correctness\":\"passed\"}}", json(env::consts::ARCH), json(env::consts::OS), cfg!(debug_assertions), cfg!(target_feature = "adx"), cfg!(target_feature = "bmi2"), cfg.threads, pool.current_num_threads(), cfg.rounds, cfg.reps, json(&env::var("PROBE_REV").unwrap_or_else(|_| "unknown".into())), json(&env::var("PROBE_BUILD").unwrap_or_else(|_| "unknown".into())), json(&env::var("PROBE_CONTENTION").unwrap_or_else(|_| "unknown".into())));
     field_probes(&cfg)?;
     mixed_probes(&cfg)?;
@@ -418,6 +433,16 @@ fn main() -> ProbeResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn practical_pool_limit_is_validated_before_startup() {
+        for threads in [1, 2, 3, 16, MAX_POOL_THREADS] {
+            assert_eq!(validate_threads(threads).unwrap(), threads);
+        }
+        for threads in [0, MAX_POOL_THREADS + 1, usize::MAX] {
+            assert!(validate_threads(threads).is_err());
+        }
+    }
 
     #[test]
     fn oversized_memory_is_rejected_before_reservation() {
