@@ -664,35 +664,48 @@ impl<P: RawCurve> BatchFill<P> {
         self.flush();
         self.reschedule();
         self.flush();
+        to_projective(&affine_running_sum(
+            &self.bx,
+            &self.by,
+            &self.occupied,
+            self.side.as_ref(),
+        ))
+    }
+}
 
-        // The same running sum as [`window_chunk`], with the occupied buckets entering
-        // as mixed additions (8M + 2S against the XYZZ-bucket add's 12M + 2S) and the
-        // side buckets, when the chunk was degenerate enough to have any, folded in.
-        let mut running = Xyzz::<P::RF>::ZERO;
-        let mut total = Xyzz::<P::RF>::ZERO;
-        match &self.side {
-            Some(side) => {
-                for j in (0..self.bx.len()).rev() {
-                    if self.occupied[j] {
-                        running.madd(self.bx[j], self.by[j]);
-                    }
-                    if side.slot[j] != 0 {
-                        running.add_assign(&side[j]);
-                    }
-                    total.add_assign(&running);
+/// The same running sum as [`window_chunk`], with the occupied buckets entering as mixed
+/// additions (8M + 2S against the XYZZ-bucket add's 12M + 2S) and the side buckets, when
+/// the chunk was degenerate enough to have any, folded in.
+fn affine_running_sum<F: RawField>(
+    bx: &[F],
+    by: &[F],
+    occupied: &[bool],
+    side: Option<&SideBuckets<F>>,
+) -> Xyzz<F> {
+    let mut running = Xyzz::<F>::ZERO;
+    let mut total = Xyzz::<F>::ZERO;
+    match side {
+        Some(side) => {
+            for j in (0..bx.len()).rev() {
+                if occupied[j] {
+                    running.madd(bx[j], by[j]);
                 }
-            }
-            None => {
-                for j in (0..self.bx.len()).rev() {
-                    if self.occupied[j] {
-                        running.madd(self.bx[j], self.by[j]);
-                    }
-                    total.add_assign(&running);
+                if side.slot[j] != 0 {
+                    running.add_assign(&side[j]);
                 }
+                total.add_assign(&running);
             }
         }
-        to_projective(&total)
+        None => {
+            for j in (0..bx.len()).rev() {
+                if occupied[j] {
+                    running.madd(bx[j], by[j]);
+                }
+                total.add_assign(&running);
+            }
+        }
     }
+    total
 }
 
 /// [`window_chunk`] with the fill batched: affine buckets, additions applied in rounds
@@ -734,7 +747,56 @@ fn window_chunk_batch<P: RawCurve>(
     fill.finish()
 }
 
-fn pippenger<P: RawCurve>(
+/// A per-group replacement for [`window_chunk_batch`], prepared once per MSM. Only G1 on
+/// an x86_64 with AVX-512 IFMA has one (see [`ifma`]); everything else keeps the portable
+/// fill.
+trait FastFill: RawCurve {
+    /// Whatever the replacement needs per MSM, built from the prescan.
+    type Prepared: Sync;
+    /// `None` when the replacement cannot run here.
+    fn prepare(bases: &[Affine<Self>], scan: &Prescan<Self>) -> Option<Self::Prepared>;
+    fn window_chunk(
+        prep: &Self::Prepared,
+        bases: &[Affine<Self>],
+        scan: &Prescan<Self>,
+        range: core::ops::Range<usize>,
+        window: usize,
+        c: u32,
+        work: Work,
+    ) -> Projective<Self>;
+}
+
+/// No replacement: `prepare` always declines, so `window_chunk` is never reached.
+macro_rules! no_fast_fill {
+    ($cfg:ty) => {
+        impl FastFill for $cfg {
+            type Prepared = core::convert::Infallible;
+            fn prepare(_: &[Affine<Self>], _: &Prescan<Self>) -> Option<Self::Prepared> {
+                None
+            }
+            fn window_chunk(
+                prep: &Self::Prepared,
+                _: &[Affine<Self>],
+                _: &Prescan<Self>,
+                _: core::ops::Range<usize>,
+                _: usize,
+                _: u32,
+                _: Work,
+            ) -> Projective<Self> {
+                match *prep {}
+            }
+        }
+    };
+}
+
+no_fast_fill!(snarkrs_field::g2::Config);
+#[cfg(not(target_arch = "x86_64"))]
+no_fast_fill!(snarkrs_field::g1::Config);
+
+#[cfg(target_arch = "x86_64")]
+mod ifma;
+
+fn pippenger<P: FastFill>(
     bases: &[Affine<P>],
     scalars: &[Fr],
     threads: usize,
@@ -787,6 +849,12 @@ where
         .div_ceil(n_windows)
         .clamp(1, (m / (CHUNK_BUCKET_RATIO * n_buckets)).max(1));
     let chunk_len = m.div_ceil(point_chunks);
+    let batched = batch_size(n_buckets) >= MIN_BATCH;
+    let fast = if batched {
+        P::prepare(bases, &scan)
+    } else {
+        None
+    };
 
     let window_sums: Vec<Projective<P>> = (0..n_windows)
         .into_par_iter()
@@ -802,7 +870,9 @@ where
                     // The wide windows batch their fill behind a shared inversion; the
                     // narrow ones stay on the XYZZ fill, which has no round overhead
                     // to amortise.
-                    if batch_size(n_buckets) >= MIN_BATCH {
+                    if let Some(prep) = &fast {
+                        P::window_chunk(prep, bases, &scan, lo..hi, w, c, work)
+                    } else if batched {
                         window_chunk_batch(bases, &scan, lo..hi, w, c, work)
                     } else {
                         window_chunk(bases, &scan, lo..hi, w, c, work)
@@ -1215,7 +1285,7 @@ mod tests {
 
     /// The first lengths choosing c = 9, 10 and 11: the batch fill below the full
     /// [`BATCH`], at half the bucket count (128 to 512).
-    fn narrow_batch_fill<P: RawCurve<ScalarField = Fr>>()
+    fn narrow_batch_fill<P: FastFill<ScalarField = Fr>>()
     where
         Projective<P>: UniformRand,
         P::BaseField: Send + Sync,

@@ -235,7 +235,7 @@ fn batch_size_stays_below_the_bucket_count() {
     }
 }
 
-fn threshold_and_infinity<P: RawCurve<ScalarField = Fr>>() {
+fn threshold_and_infinity<P: FastFill<ScalarField = Fr>>() {
     // The exact first prescanned lengths choosing c = 9 (the batch fill at MIN_BATCH)
     // and c = 12 (at the full BATCH), not just nearby powers of two.
     for (n, c) in [(3_328, 9), (30_720, 12)] {
@@ -264,7 +264,7 @@ fn threshold_and_infinity<P: RawCurve<ScalarField = Fr>>() {
     }
 }
 
-fn threshold_and_infinity_at<P: RawCurve<ScalarField = Fr>>(n: usize, c: u32) {
+fn threshold_and_infinity_at<P: FastFill<ScalarField = Fr>>(n: usize, c: u32) {
     // Split one scalar to keep the mathematical MSM unchanged across the threshold.
     assert_eq!(window_size(n), c - 1);
     assert_eq!(window_size(n + 1), c);
@@ -309,7 +309,7 @@ fn threshold_and_infinity_at<P: RawCurve<ScalarField = Fr>>(n: usize, c: u32) {
 /// fixed by which bases are at infinity, not by the scalars. A witness that is all zeros and
 /// ones and a dense one of the same length give the same general count, so the same window
 /// width and the same allocations, and the same result as the variable-time path.
-fn constant_work_ignores_the_scalar_values<P: RawCurve<ScalarField = Fr>>() {
+fn constant_work_ignores_the_scalar_values<P: FastFill<ScalarField = Fr>>() {
     let n = 3 * SCAN_CHUNK + 5;
     let p = P::GENERATOR;
     let bases: Vec<_> = (0..n)
