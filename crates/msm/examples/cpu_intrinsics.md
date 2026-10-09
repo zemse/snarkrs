@@ -39,7 +39,9 @@ Record `PROBE_REV`, `PROBE_BUILD` (rustc version, target, profile, RUSTFLAGS), a
 `PROBE_CONTENTION`. These strings are caller declarations, not attestation.
 Output also records compiled ADX/BMI2 flags, architecture, OS, debug assertions,
 configured threads and actual dedicated Rayon pool size. Primitive/memory probes
-run on one caller thread; only the join probe runs inside that pool.
+run on one caller thread by default; the join probe runs inside that pool.
+`PROBE_ALL_CORE=1` enables additional aggregate samples; omitted or `0` preserves
+the existing single-caller probes. Other values are configuration errors.
 Keep CPU model, affinity/core class, governor, thermal state, input SHA-256s,
 command and dirty-tree state alongside the output. No cycles inferred from GHz.
 
@@ -74,6 +76,35 @@ are part of those timed kernels. Differential gates compare raw operations with
 arkworks and XYZZ additions with ark group arithmetic before any timing. Memory
 copies, stream sums and join results are checked every pass group.
 
+## optional aggregate throughput
+
+`PROBE_ALL_CORE=1 PROBE_THREADS=8` uses the existing dedicated pool, not a new
+pool or an extrapolation from one thread. It broadcasts one kernel to every pool
+worker for Fr/RawFq/RawFq2 multiply and G1/G2 XYZZ mixed-add. Each worker interleaves
+1/4/8 independently seeded chains. Seed construction/reservation is outside timing;
+the worker seed is `SEED wrapping_add worker_index`. Differential gates are retained.
+
+`parallel_primitive` records use `aggregate_interleaved_throughput` even with one
+chain per worker: that is an aggregate rate, not dependent-chain latency. Actual
+kernel worker indices are checked against the executing Rayon thread indices after
+timing. Operations are exactly `rounds * chains_per_worker * actual_kernel_threads`.
+Counts and seed/result storage bounds are validated before pool/seed allocation.
+Aggregate rates divide this count by a common caller wall interval, including pool
+entry, broadcast dispatch, skew, loop/operand lookup, result collection and completion.
+No simultaneous-start barrier or subtraction is hidden. Checksums/worker checks
+are outside timing, and pool construction is excluded.
+
+`parallel_dispatch` separately reports a broadcast of a trivial black-boxed closure
+to every worker, including return-value collection and worker-index bookkeeping.
+It is a distinct overhead sample, not subtracted from any kernel measurement.
+These measurements are not certified saturation, hardware instruction ceilings or
+CPU-scaling predictions. A pool of eight workers need not equal eight physical cores.
+Capture core class/affinity and competing work before interpreting rates.
+
+Parallel memory sweeps, u64 wide-multiply/carry probes and real batch-affine round
+counts remain deferred. Existing memory samples are still single-threaded. No floor
+may substitute these single-thread memory numbers for measured aggregate bandwidth.
+
 ## computation trace and remaining work
 
 `cpu_trace` loads one key/witness and emits counts without proving or timing.
@@ -91,7 +122,8 @@ The old trace's full dense-H mixed-add estimate is not an exact bucket-add count
 
 Before deriving floors: count compact-kernel operations, actual signed-digit
 occupancy, batch-affine inversion rounds/conflicts, point-chunk splitting and key
-preparation. Add representative batch-affine round and all-core field/stream probes
-if those segments have measured headroom. Combine counts with same-machine,
-uncontended samples and verified stage wall times. Account for overlap rather
+preparation. Add representative batch-affine rounds and aggregate stream probes
+if those segments have measured headroom. Run the optional aggregate field probes
+on the measurement machine rather than multiplying single-thread rates by core count.
+Combine counts with same-machine, uncontended samples and verified stage wall times. Account for overlap rather
 than adding concurrent stage times. Broaden circuits after the initial pair.

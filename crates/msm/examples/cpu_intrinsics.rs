@@ -11,6 +11,9 @@ use snarkrs_field::{
 };
 use snarkrs_msm::xyzz::{to_projective, RawCurve, Xyzz};
 
+#[path = "cpu_intrinsics/parallel.rs"]
+mod parallel;
+
 const SEED: u64 = 0x5eed_2026;
 type ProbeResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -32,6 +35,7 @@ struct Config {
     passes: usize,
     sets: Vec<usize>,
     threads: usize,
+    all_core: bool,
 }
 
 fn setting(name: &str, default: usize) -> ProbeResult<usize> {
@@ -59,7 +63,21 @@ impl Config {
             passes: setting("PROBE_PASSES", 16)?,
             sets,
             threads: setting("PROBE_THREADS", std::thread::available_parallelism()?.get())?,
+            all_core: match env::var("PROBE_ALL_CORE") {
+                Err(env::VarError::NotPresent) => false,
+                Ok(s) if s == "0" => false,
+                Ok(s) if s == "1" => true,
+                _ => return Err("PROBE_ALL_CORE must be 0 or 1".into()),
+            },
         };
+        if cfg.all_core {
+            parallel::validate_work(
+                cfg.rounds,
+                8,
+                cfg.threads,
+                std::mem::size_of::<Xyzz<RawFq2>>(),
+            )?;
+        }
         for &bytes in &cfg.sets {
             memory_layout(bytes, cfg.passes)?;
         }
@@ -391,6 +409,9 @@ fn main() -> ProbeResult {
     mixed_probes(&cfg)?;
     memory_probes(&cfg)?;
     fork_join(&cfg, &pool)?;
+    if cfg.all_core {
+        parallel::run(&cfg, &pool)?;
+    }
     Ok(())
 }
 
@@ -406,6 +427,7 @@ mod tests {
             passes: 1,
             sets: vec![usize::MAX & !7],
             threads: 1,
+            all_core: false,
         };
         assert!(memory_layout(cfg.sets[0], cfg.passes).is_err());
         assert!(memory_probes(&cfg).is_err());
