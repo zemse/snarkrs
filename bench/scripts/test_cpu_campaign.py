@@ -15,6 +15,7 @@ spec.loader.exec_module(campaign)
 
 class CpuCampaignTests(unittest.TestCase):
     def bundle(self, root):
+        root = root.resolve()
         runtime = root / "runtime"
         (runtime / "bin").mkdir(parents=True)
         cert = {"binaries": {}}
@@ -29,6 +30,7 @@ class CpuCampaignTests(unittest.TestCase):
                 flags="",
             )
         cert["binaries"]["snarkrs-adx"]["flags"] = campaign.FLAGS["adx"]
+        cert["binaries"]["rapidsnark-warm"]["wrapper_source"] = "b" * 40
         campaign.save_json(runtime / "certification.json", cert)
         artifacts = root / "artifacts"
         for variant in campaign.VARIANTS:
@@ -50,6 +52,108 @@ class CpuCampaignTests(unittest.TestCase):
             (bundle / "bench/bin/snarkrs-adx").write_bytes(b"corrupt")
             with self.assertRaisesRegex(ValueError, "digest mismatch"):
                 campaign.verify_bundle(bundle)
+
+    def test_symlinked_execution_directories_with_removed_hashes_are_rejected(self):
+        for relative in ("bench/bin", "bench/scripts", "bench/artifacts"):
+            with self.subTest(relative=relative), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                _, bundle = self.bundle(root)
+                external = root / "external"
+                (bundle / relative).rename(external)
+                (bundle / relative).symlink_to(external, target_is_directory=True)
+                hashes = campaign.read_json(bundle / "manifest.json")
+                hashes = {
+                    name: value
+                    for name, value in hashes.items()
+                    if not name.startswith(relative + "/")
+                }
+                campaign.save_json(bundle / "manifest.json", hashes)
+                with self.assertRaisesRegex(ValueError, "unsafe bundle path"):
+                    campaign.verify_bundle(bundle)
+
+    def test_hashed_preexisting_layouts_and_unexpected_paths_are_rejected(self):
+        for relative in (
+            "runtime-generic/target/release/snarkrs",
+            "runtime-adx/target/release/snarkrs",
+            "results/forged.json",
+            "bench/bin/extra",
+        ):
+            with self.subTest(relative=relative), tempfile.TemporaryDirectory() as directory:
+                _, bundle = self.bundle(Path(directory))
+                path = bundle / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("untrusted preexisting runtime")
+                hashes = campaign.read_json(bundle / "manifest.json")
+                hashes[relative] = campaign.digest(path)
+                campaign.save_json(bundle / "manifest.json", hashes)
+                with self.assertRaisesRegex(ValueError, "required runtime whitelist"):
+                    campaign.verify_bundle(bundle)
+
+    def test_bundle_ancestor_links_and_missing_required_paths_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            _, bundle = self.bundle(root)
+            alias = root / "alias"
+            alias.symlink_to(root, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "symlink in bundle ancestry"):
+                campaign.verify_bundle(alias / "bundle")
+            hashes = campaign.read_json(bundle / "manifest.json")
+            (bundle / "bench/bin/rapidsnark-oracle").unlink()
+            del hashes["bench/bin/rapidsnark-oracle"]
+            campaign.save_json(bundle / "manifest.json", hashes)
+            with self.assertRaisesRegex(ValueError, "required runtime whitelist"):
+                campaign.verify_bundle(bundle)
+
+    def test_only_explicitly_certified_libraries_are_allowed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, bundle = self.bundle(Path(directory))
+            library = bundle / "lib/libfixture.so.1"
+            library.parent.mkdir()
+            library.write_text("synthetic library")
+            cert = campaign.read_json(bundle / "certification.json")
+            cert["libraries"] = {library.name: campaign.digest(library)}
+            campaign.save_json(bundle / "certification.json", cert)
+            hashes = campaign.read_json(bundle / "manifest.json")
+            hashes["lib/" + library.name] = campaign.digest(library)
+            hashes["certification.json"] = campaign.digest(bundle / "certification.json")
+            campaign.save_json(bundle / "manifest.json", hashes)
+            campaign.verify_bundle(bundle)
+            cert["libraries"][library.name] = "0" * 64
+            campaign.save_json(bundle / "certification.json", cert)
+            hashes["certification.json"] = campaign.digest(bundle / "certification.json")
+            campaign.save_json(bundle / "manifest.json", hashes)
+            with self.assertRaisesRegex(ValueError, "uncertified runtime library"):
+                campaign.verify_bundle(bundle)
+
+    def test_every_binary_requires_explicit_flags_and_wrapper_revision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime, _ = self.bundle(Path(directory))
+            original = campaign.read_json(runtime / "certification.json")
+            campaign.certify(runtime)  # Explicit empty competitor flags are valid.
+            for name in campaign.BINARIES:
+                cert = campaign.read_json(runtime / "certification.json")
+                del cert["binaries"][name]["flags"]
+                campaign.save_json(runtime / "certification.json", cert)
+                with self.subTest(name=name), self.assertRaisesRegex(ValueError, "flags string"):
+                    campaign.certify(runtime)
+                campaign.save_json(runtime / "certification.json", original)
+            del original["binaries"]["rapidsnark-warm"]["wrapper_source"]
+            campaign.save_json(runtime / "certification.json", original)
+            with self.assertRaisesRegex(ValueError, "wrapper_source"):
+                campaign.certify(runtime)
+
+    def test_missing_loaded_column_is_rejected(self):
+        row = dict(
+            rep="1",
+            variant="v",
+            prover="ours",
+            mode="warm",
+            backend="cpu",
+            verified="yes",
+            ms="1.25",
+        )
+        with self.assertRaisesRegex(ValueError, "loaded timing rejected"):
+            campaign.validate_rows([row], "v", "ours", "warm", 1)
 
     def test_build_flags_and_certification_are_required(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -134,7 +238,7 @@ class CpuCampaignTests(unittest.TestCase):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 campaign.warm_samples(text, 2)
 
-    def competitor_case(self, root, failure=""):
+    def competitor_case(self, root, failure="", cold=1):
         results = root / "results"
         results.mkdir()
         commands = []
@@ -157,6 +261,9 @@ class CpuCampaignTests(unittest.TestCase):
                 (directory / "stderr-rss.log").write_text("ffiasm_pool_threads=16\n")
                 return "rep 1 1.234567\nrep 2 2.345678\n"
             if command[0].endswith("/rapidsnark"):
+                if failure == "cold-status" and directory.name == "2":
+                    campaign.save_json(directory / "exit.json", {"exit": 7})
+                    raise ValueError("configuration exited 7")
                 Path(command[-2]).write_text("synthetic proof")
                 Path(command[-1]).write_text("synthetic public")
             if command[0] == "python3" and failure == "reference":
@@ -171,9 +278,9 @@ class CpuCampaignTests(unittest.TestCase):
         with mock.patch.object(campaign.os, "cpu_count", return_value=16), mock.patch.object(
             campaign, "idle", return_value=0
         ), mock.patch.object(campaign, "run_logged", side_effect=logged), mock.patch.object(
-            campaign.time, "monotonic", side_effect=[0, 0.00125]
+            campaign.time, "monotonic", side_effect=[0, 0.00125, 1]
         ):
-            campaign.competitor(root, results, "v", 1, 2, {"OMP_NUM_THREADS": "16"}, 100, 1)
+            campaign.competitor(root, results, "v", cold, 2, {"OMP_NUM_THREADS": "16"}, 100, 1)
         return commands
 
     def test_warm_exact_interface_independent_oracle_and_precision(self):
@@ -203,6 +310,22 @@ class CpuCampaignTests(unittest.TestCase):
             self.assertEqual(accepted["actual_pool_threads"], 16)
             self.assertEqual(accepted["independent_oracle"], "snarkrs-generic groth16 verify")
             self.assertEqual(accepted["snarkjs_compatible"], "unknown")
+
+    def test_verified_cold_sample_survives_later_rep_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaisesRegex(ValueError, "exited 7"):
+                self.competitor_case(root, "cold-status", cold=2)
+            cold = root / "results/rapidsnark-native16-v-cold"
+            sample = campaign.read_json(cold / "1/verified-sample.json")
+            self.assertEqual(sample["rep"], 1)
+            self.assertEqual(sample["ms"], 1.25)
+            self.assertEqual(sample["verified"], "yes")
+            self.assertEqual(sample["verification_scope"], "each-proof")
+            self.assertIn("excluding verification", sample["timing_scope"])
+            self.assertFalse((cold / "accepted.json").exists())
+            self.assertFalse((cold / "2/verified-sample.json").exists())
+            self.assertEqual(campaign.read_json(cold / "2/exit.json")["exit"], 7)
 
     def test_missing_rep_failed_wrapper_or_oracle_never_accepts_warm(self):
         for failure in ("missing", "status", "reference", "oracle", "marker"):

@@ -47,11 +47,18 @@ def save_json(path, value):
     path.write_text(json.dumps(value, indent=2) + "\n")
 
 
-def certify(runtime):
+def certify(runtime, binary_dir=None):
     cert = read_json(runtime / "certification.json")
+    binary_dir = binary_dir or runtime / "bin"
     for name in BINARIES:
         entry = cert["binaries"][name]
-        path = runtime / "bin" / name
+        if not isinstance(entry.get("flags"), str):
+            raise ValueError(f"{name}: explicit flags string required")
+        if name == "rapidsnark-warm" and not re.fullmatch(
+            r"[0-9a-f]{40}", entry.get("wrapper_source", "")
+        ):
+            raise ValueError("rapidsnark-warm: separate wrapper_source revision required")
+        path = binary_dir / name
         with path.open("rb") as stream:
             header = stream.read(20)
         if header[:6] != b"\x7fELF\x02\x01" or header[18:20] != b"\x3e\x00":
@@ -110,25 +117,56 @@ def pack(runtime, artifacts, destination):
 
 
 def verify_bundle(root):
+    root = root.absolute()
+    if any(path.is_symlink() for path in (root, *root.parents)):
+        raise ValueError("symlink in bundle ancestry")
+    actual_files, actual_dirs = set(), set()
+    for directory, dirs, files in os.walk(root, followlinks=False):
+        for name in dirs + files:
+            path = Path(directory) / name
+            if path.is_symlink() or root.resolve() not in path.resolve().parents:
+                raise ValueError(f"unsafe bundle path: {path}")
+            relative = str(path.relative_to(root))
+            if name in dirs:
+                actual_dirs.add(relative)
+            elif path.is_file():
+                actual_files.add(relative)
+            else:
+                raise ValueError(f"non-regular bundle file: {path}")
     hashes = read_json(root / "manifest.json")
-    actual = {
-        str(p.relative_to(root))
-        for p in root.rglob("*")
-        if p.is_file() and p.name != "manifest.json" and "results" not in p.relative_to(root).parts
-    }
-    if actual != set(hashes):
-        raise ValueError("runtime bundle file set differs from manifest")
-    for relative, expected in hashes.items():
-        path = Path(relative)
-        if path.is_absolute() or ".." in path.parts or (root / path).is_symlink():
-            raise ValueError("unsafe manifest path")
-        if digest(root / path) != expected:
-            raise ValueError(f"runtime digest mismatch: {relative}")
-    # The same binary identities are rechecked before any guest execution.
     cert = read_json(root / "certification.json")
-    for name in BINARIES:
-        if digest(root / "bench/bin" / name) != cert["binaries"][name]["sha256"]:
-            raise ValueError(f"certification digest mismatch: {name}")
+    libraries = cert.get("libraries", {})
+    if not isinstance(libraries, dict) or any(
+        not re.fullmatch(r"[A-Za-z0-9_+.-]+\.so(?:\.[A-Za-z0-9_+.-]+)?", name) for name in libraries
+    ):
+        raise ValueError("invalid certified library filenames")
+    required = {
+        "certification.json",
+        "bench/aws/cpu-campaign.py",
+        "bench/bin/rapidsnark-oracle",
+        "bench/bin/check_reference_public.py",
+        "bench/scripts/run-comparison.py",
+        "bench/scripts/check_reference_public.py",
+    }
+    required.update(f"bench/bin/{name}" for name in BINARIES)
+    required.update(f"bench/artifacts/{v}/{name}" for v in VARIANTS for name in ARTIFACTS)
+    required.update(f"lib/{name}" for name in libraries)
+    allowed_dirs = {
+        str(parent) for name in required for parent in Path(name).parents if str(parent) != "."
+    }
+    if not isinstance(hashes, dict) or set(hashes) != required:
+        raise ValueError("manifest differs from required runtime whitelist")
+    if actual_files != required | {"manifest.json"} or actual_dirs != allowed_dirs:
+        raise ValueError(
+            "unexpected or missing bundle paths; runtime layouts/results must not preexist"
+        )
+    for relative, expected in hashes.items():
+        if digest(root / relative) != expected:
+            raise ValueError(f"runtime digest mismatch: {relative}")
+    for name, expected in libraries.items():
+        if hashes[f"lib/{name}"] != expected:
+            raise ValueError(f"uncertified runtime library: {name}")
+    certify(root, root / "bench/bin")
     return hashes
 
 
@@ -164,7 +202,7 @@ def validate_rows(rows, variant, prover, mode, reps):
             raise ValueError("unverified or wrong configuration")
         if not math.isfinite(float(row["ms"])) or float(row["ms"]) <= 0:
             raise ValueError("invalid timing")
-        if row.get("loaded", "no") != "no":
+        if row.get("loaded") != "no":
             raise ValueError("loaded timing rejected")
 
 
@@ -477,6 +515,19 @@ def competitor(root, results, variant, cold, warm, env, deadline, max_load):
                 oracle = sample / "oracle"
                 oracle.mkdir()
                 verify_proof(root, oracle, variant, public, proof, env, deadline)
+                save_json(
+                    sample / "verified-sample.json",
+                    {
+                        "rep": rep,
+                        "ms": elapsed,
+                        "variant": variant,
+                        "mode": "cold",
+                        "verified": "yes",
+                        "verification_scope": "each-proof",
+                        "verification_oracle": "snarkrs-generic groth16 verify + reference public",
+                        "timing_scope": "driver wall including GNU time/log overhead, excluding verification",
+                    },
+                )
                 rows.append(elapsed)
         else:
             proof_dir = directory / "proofs"
@@ -553,18 +604,18 @@ def main():
     args = parser.parse_args()
     try:
         if args.action == "pack":
-            pack(args.runtime.resolve(), args.artifacts.resolve(), args.bundle.resolve())
+            pack(args.runtime.resolve(), args.artifacts.resolve(), args.bundle.absolute())
         elif args.action in ("deploy", "retrieve"):
             transfer(
                 args.host,
                 args.key.resolve(),
                 args.remote,
-                args.local.resolve(),
+                args.local.absolute(),
                 args.action == "retrieve",
             )
         else:
             guest(
-                args.root.resolve(),
+                args.root.absolute(),
                 args.cold_reps,
                 args.warm_reps,
                 args.budget_seconds,

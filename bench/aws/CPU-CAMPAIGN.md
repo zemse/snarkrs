@@ -19,14 +19,25 @@ The certification object has a `binaries` entry for each filename. Each entry ne
 Generic flags must be the empty string. ADX flags must be exactly
 `-C target-feature=+adx,+bmi2`. Both snarkrs builds must have the same source revision.
 Record target triple and linker details in `compiler`; record all competitor flags
-in its `flags`. The verifier and warm wrapper also need pinned source identities.
+in its `flags`. Every binary requires a flags string, including an explicit empty
+string when no extra flags apply. For rapidsnark binaries, `source` identifies the
+upstream revision; `rapidsnark-warm` additionally requires a separate full
+`wrapper_source` revision for our wrapper contribution. Both identities survive in
+retrieved certification metadata.
 For optional shared libraries, add `libraries` mapping each filename to its SHA256.
 Do not claim native CPU tuning or gnark performance from these labels.
 
 The pack command copies only these runtimes, the driver, existing comparison and
 oracle helpers, and six files per fixed fixture: zkey, witness, vkey, reference
 public signals, input JSON and constraint metadata. Every copied file is hashed.
-A corrupt transfer or changed binary fails before proving.
+A corrupt transfer or changed binary fails before proving. The manifest must match
+this required whitelist plus exactly the explicitly certified libraries. Symlinks
+in the bundle or any ancestor, escaping paths, unexpected files/directories and
+preexisting runtime layouts are rejected, even when listed in the manifest. Use
+canonical absolute paths. Deployment and execution require a fresh bundle: neither
+`results/` nor generated runtime layouts may preexist. Generated results are created
+only after validation and retrieved as data, not accepted as another executable
+input bundle.
 
 ```bash
 python3 bench/aws/cpu-campaign.py pack \
@@ -48,6 +59,12 @@ It renews that existing lease every 30 seconds and marks `done` after success or
 failure. State-file presence does not attest timer installation or firing; the
 coordinator verifies that separately. It does not install another shutdown mechanism
 or cancel any deadline.
+
+Limitation: heartbeat-thread errors do not propagate into the proving loop. A failed
+renewal can leave proving active until a guest timer or the independently armed AWS
+deadline acts. The coordinator must retain that native-gated deadline as the overall
+rental-cost backstop, observe renewal and retrieve/stop promptly; the heartbeat alone
+does not bound cost. Scheduler delivery is best-effort, not a guaranteed stop time.
 
 Deploy only after those gates. Replace `HOST` and `KEY` with coordinator-approved
 values. The SSH host key must already be trusted. The remote parent must exist;
@@ -116,6 +133,9 @@ does not. Warm proving excludes verification on both sides; rapidsnark additiona
 reparses its mapped witness inside the timed call. Report these scope differences,
 not an unqualified cold proving speed ratio. Rapidsnark cold wall time also includes
 GNU time and driver log/metadata overhead, explicitly labelled in its records.
+Each verified cold repetition immediately persists its timing, repetition, scope
+and verification in `REP/verified-sample.json`. Later failure retains those samples,
+but the configuration is accepted only after every required repetition succeeds.
 This driver does not change CLI policy.
 
 Every rapidsnark cold and warm proof/public pair must pass our `snarkrs-generic
