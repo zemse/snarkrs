@@ -153,6 +153,99 @@ class ComparisonOracleTests(unittest.TestCase):
                 self.assertEqual([row["mode"] for row in rows], ["cold"])
 
 
+class RapidsnarkWarmComparisonTests(unittest.TestCase):
+    def run_comparison(self, stdout="rep 1 2\nrep 2 3\n", code=0,
+                       public='["123"]', compat=True, final_valid=True):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifacts = root / "artifacts"
+            variant = artifacts / "competitor_test"
+            variant.mkdir(parents=True)
+            (variant / "public.json").write_text('["123"]')
+            (variant / "r1cs-info.txt").write_text("# of Constraints: 10\n")
+            binaries = root / "bin"
+            binaries.mkdir()
+            for name in ("rapidsnark", "rapidsnark-warm"):
+                (binaries / name).touch()
+            output = root / "result.csv"
+            commands = []
+
+            def sh(cmd):
+                commands.append(cmd)
+                self.assertEqual(Path(cmd[-1]), variant / "vkey.json")
+                self.assertFalse(Path(cmd[3]).exists())
+                self.assertFalse(Path(cmd[4]).exists())
+                Path(cmd[3]).write_text("{}")
+                Path(cmd[4]).write_text(public)
+                return subprocess.CompletedProcess(cmd, code, stdout, "rejected" if code else "")
+
+            args = ["run-comparison.py", "--variants", "competitor_test", "--reps", "2",
+                    "--cold-reps", "1", "--backends", "--csv", str(output)]
+            status = 0
+            try:
+                with mock.patch.object(sys, "argv", args), \
+                        mock.patch.object(comparison, "HERE", root / "bench"), \
+                        mock.patch.object(comparison, "ART", artifacts), \
+                        mock.patch.object(comparison, "BIN", binaries), \
+                        mock.patch.object(comparison, "detect_machine", return_value="fixture"), \
+                        mock.patch.object(comparison, "detect_gpu", return_value=""), \
+                        mock.patch.object(comparison, "load_average", return_value=0), \
+                        mock.patch.object(comparison, "time_cold", return_value=([1.0], None)), \
+                        mock.patch.object(comparison, "verify_fast", return_value=final_valid), \
+                        mock.patch.object(comparison, "verify_snarkjs", side_effect=[True, compat]), \
+                        mock.patch.object(comparison, "sh", side_effect=sh), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    comparison.main()
+            except SystemExit as error:
+                status = error.code
+            finally:
+                for name in ("/tmp/g16bench_proof.json", "/tmp/g16bench_public.json"):
+                    Path(name).unlink(missing_ok=True)
+            with output.open() as stream:
+                rows = list(csv.DictReader(stream))
+            return status, rows, commands
+
+    def test_required_key_and_verification_scopes(self):
+        status, rows, commands = self.run_comparison()
+        self.assertEqual(status, 0)
+        self.assertEqual(len(commands), 1)
+        warm = [row for row in rows if row["mode"] == "warm"]
+        self.assertEqual(len(warm), 2)
+        for row in warm:
+            self.assertEqual(row["self_verifier"], "rapidsnark")
+            self.assertEqual(row["self_verification_scope"], "each-proof")
+            self.assertEqual(row["independent_verifier"], "snarkjs")
+            self.assertEqual(row["independent_verification_scope"], "final-proof")
+        cold = rows[0]
+        self.assertEqual(cold["self_verification_scope"], "each-proof")
+        self.assertEqual(cold["independent_verifier"], "snarkjs")
+        self.assertEqual(cold["independent_verification_scope"], "final-proof")
+
+    def test_missing_independent_oracle_is_not_claimed(self):
+        status, rows, _ = self.run_comparison(compat=None)
+        self.assertEqual(status, 0)
+        for row in rows[1:]:
+            self.assertEqual(row["self_verification_scope"], "each-proof")
+            self.assertEqual(row["independent_verifier"], "")
+            self.assertEqual(row["independent_verification_scope"], "not-measured")
+            self.assertEqual(row["snarkjs_compatible"], "unknown")
+
+    def test_failed_or_partial_warm_runs_are_rejected(self):
+        for kw in ({"code": 1}, {"stdout": "rep 1 2\n"}, {"compat": False},
+                   {"public": '["124"]'}, {"final_valid": False}):
+            with self.subTest(kw=kw):
+                status, rows, _ = self.run_comparison(**kw)
+                self.assertEqual(status, 1)
+                self.assertEqual([row["mode"] for row in rows], ["cold"])
+
+    def test_warm_parser_rejects_invalid_records(self):
+        self.assertEqual(comparison.rapidsnark_warm_times("log\nrep 1 2\nrep 2 3\n", 2), [2, 3])
+        for output in ("rep 1 nan\n", "rep 1 inf\n", "rep 1 -1\n", "rep 1 junk\n",
+                       "rep 1 2 extra\n", "rep 2 2\n", "rep 1 2\nrep 1 3\n"):
+            with self.subTest(output=output):
+                self.assertIsNone(comparison.rapidsnark_warm_times(output, 1))
+
+
 class RapidsnarkAdapterTests(unittest.TestCase):
     def run_adapter(self, output, code=0, stderr=False):
         with tempfile.TemporaryDirectory() as directory:

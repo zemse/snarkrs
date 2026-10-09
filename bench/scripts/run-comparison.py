@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Benchmark our prover against rapidsnark on the same artifacts, cold and warm.
 
-Every recorded timing belongs to a proof that was independently verified first. A
-benchmark that times a broken prover is worse than no benchmark, and "it produced a
-file" is not the same as "it produced a proof".
+Every recorded timing belongs to a verified proof. Verification scope is recorded:
+rapidsnark warm proofs are self-verified each repetition, with an independent snarkjs
+check of the final proof when available. Self verification is not independent.
 
 Three verification oracles are available and they answer different questions:
   our own verifier   does our pairing check accept it
-  rapidsnark-verify  does an independent C++ implementation accept it
+  rapidsnark-verify  does the C++ verifier accept it (independent only of ours)
   snarkjs verify     is the JSON encoding ecosystem-compatible
 The loop uses rapidsnark-verify because it is fast; snarkjs runs once per
 configuration as the encoding cross-check, because it costs about a second a call.
@@ -149,6 +149,19 @@ def valid_warm_rows(rows, variant, backend, reps):
         return False
 
 
+def rapidsnark_warm_times(stdout, reps):
+    try:
+        records = [line.split() for line in stdout.splitlines() if line.startswith("rep ")]
+        if (len(records) != reps
+                or any(len(record) != 3 or record[1] != str(i)
+                       for i, record in enumerate(records, 1))):
+            return None
+        times = [float(record[2]) for record in records]
+        return times if all(math.isfinite(ms) and ms >= 0 for ms in times) else None
+    except (ValueError, TypeError):
+        return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--reps", type=int, default=15)
@@ -271,6 +284,9 @@ def main():
                 note(f"{v}/{prover}/{backend}/{mode}: {err}")
                 continue
             compat = verify_snarkjs(vkey, "/tmp/g16bench_public.json", "/tmp/g16bench_proof.json")
+            if compat is False:
+                note(f"{v}/{prover}/{backend}/{mode}: final proof failed snarkjs verification")
+                continue
             print(f"  {prover:12s} {backend:6s} {mode:5s}  median {statistics.median(ms):8.1f} ms "
                   f"(min {min(ms):.1f} max {max(ms):.1f})  snarkjs-compatible: {compat_cell(compat)}", flush=True)
             for i, m in enumerate(ms, 1):
@@ -278,24 +294,42 @@ def main():
                                  constraints=nc, prover=prover, backend=backend, mode=mode,
                                  rep=i, ms=round(m, 3), verified="yes",
                                  snarkjs_compatible=compat_cell(compat),
-                                 independent_verifier="rapidsnark-verify",
-                                 independent_verification_scope="each-proof"))
+                                 self_verifier="rapidsnark-verify" if prover == "rapidsnark" else "",
+                                 self_verification_scope="each-proof" if prover == "rapidsnark" else "",
+                                 independent_verifier=("snarkjs" if compat is True else "")
+                                     if prover == "rapidsnark" else "rapidsnark-verify",
+                                 independent_verification_scope=("final-proof" if compat is True else "not-measured")
+                                     if prover == "rapidsnark" else "each-proof"))
 
         # warm: rapidsnark through its object API, ours through `snarkrs bench --mode warm`
         if not args.skip_rapidsnark and (BIN / "rapidsnark-warm").exists():
+            proof_out, public_out = "/tmp/g16bench_proof.json", "/tmp/g16bench_public.json"
+            for output in (proof_out, public_out):
+                Path(output).unlink(missing_ok=True)
             r = sh([str(BIN / "rapidsnark-warm"), str(zkey), str(wtns),
-                    "/tmp/g16bench_proof.json", "/tmp/g16bench_public.json", str(warm_reps)])
-            times = [float(l.split()[-1]) for l in r.stdout.splitlines() if l.startswith("rep ")]
-            if times and verify_fast(vkey, "/tmp/g16bench_public.json", "/tmp/g16bench_proof.json"):
+                    proof_out, public_out, str(warm_reps), str(vkey)])
+            times = rapidsnark_warm_times(r.stdout, warm_reps)
+            try:
+                final_valid = (r.returncode == 0 and times is not None
+                               and matches_reference(vkey, public_out)
+                               and verify_fast(vkey, public_out, proof_out))
+            except (OSError, ValueError):
+                final_valid = False
+            compat = verify_snarkjs(vkey, public_out, proof_out) if final_valid else None
+            if final_valid and compat is not False:
                 print(f"  {'rapidsnark':12s} {'cpu':6s} {'warm':5s}  median {statistics.median(times):8.1f} ms "
                       f"(min {min(times):.1f} max {max(times):.1f})", flush=True)
                 for i, m in enumerate(times, 1):
                     rows.append(dict(**stamp, variant=v,
                                      constraints=nc, prover="rapidsnark", backend="cpu", mode="warm",
                                      rep=i, ms=m, verified="yes",
-                                     snarkjs_compatible=compat_cell(True if HAVE_SNARKJS else None)))
+                                     self_verifier="rapidsnark",
+                                     self_verification_scope="each-proof",
+                                     independent_verifier="snarkjs" if compat is True else "",
+                                     independent_verification_scope="final-proof" if compat is True else "not-measured",
+                                     snarkjs_compatible=compat_cell(compat)))
             else:
-                note(f"{v}/rapidsnark/warm: no timings or proof failed to verify")
+                note(f"{v}/rapidsnark/warm: incomplete timings, failed process or proof failed to verify")
 
         for b in args.backends:
             if not g16.exists():
