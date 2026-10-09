@@ -54,3 +54,8 @@ default = []
 # else rather than switching it off crate-wide; the selector calls in src/cb.rs are the
 # only place the macro is used.
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
+
+# Everything but `layout` is macOS only, so docs.rs's default Linux build shows an empty crate.
+[package.metadata.docs.rs]
+default-target = "aarch64-apple-darwin"
+targets = ["aarch64-apple-darwin"]

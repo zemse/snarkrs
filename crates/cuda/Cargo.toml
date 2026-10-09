@@ -47,3 +47,8 @@ cudarc = { version = "0.19", optional = true, default-features = false, features
     "dynamic-loading",
     "std",
 ] }
+
+# Without `cuda` the crate is an empty shell. It builds with no CUDA installed, since cudarc
+# loads the libraries at run time.
+[package.metadata.docs.rs]
+features = ["cuda"]

@@ -51,3 +51,11 @@ thiserror.workspace = true
 [[example]]
 name = "readme_library_usage"
 required-features = ["metal"]
+
+# docs.rs builds on Linux with default features, where every backend module is missing and
+# `metal` is empty. Every feature but `witness-wasm`, whose wasmtime build script needs a C
+# compiler for the target that docs.rs does not have for macOS; snarkrs-witness documents it.
+[package.metadata.docs.rs]
+default-target = "aarch64-apple-darwin"
+targets = ["aarch64-apple-darwin"]
+features = ["metal", "cuda", "wgpu", "ceremony", "witness"]
