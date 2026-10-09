@@ -53,13 +53,17 @@ impl Config {
         if sets.is_empty() || sets.iter().any(|n| *n == 0 || n % 8 != 0) {
             return Err("PROBE_BYTES must contain positive multiples of eight".into());
         }
-        Ok(Self {
+        let cfg = Self {
             rounds: setting("PROBE_ROUNDS", 16384)?,
             reps: setting("PROBE_REPS", 5)?,
             passes: setting("PROBE_PASSES", 16)?,
             sets,
             threads: setting("PROBE_THREADS", std::thread::available_parallelism()?.get())?,
-        })
+        };
+        for &bytes in &cfg.sets {
+            memory_layout(bytes, cfg.passes)?;
+        }
+        Ok(cfg)
     }
 }
 
@@ -240,14 +244,31 @@ fn mixed_probes(cfg: &Config) -> ProbeResult {
     Ok(())
 }
 
+fn memory_layout(bytes: usize, passes: usize) -> ProbeResult<(usize, usize, usize)> {
+    if bytes == 0 || bytes % 8 != 0 || passes == 0 {
+        return Err(
+            "memory buffers require positive multiples of eight and positive passes".into(),
+        );
+    }
+    if bytes > isize::MAX as usize {
+        return Err("PROBE_BYTES exceeds Vec allocation capacity".into());
+    }
+    let traffic = bytes.checked_mul(passes).ok_or("byte count overflow")?;
+    let working_set = bytes.checked_mul(2).ok_or("working set overflow")?;
+    let copy_traffic = traffic.checked_mul(2).ok_or("copy byte count overflow")?;
+    Ok((traffic, working_set, copy_traffic))
+}
+
 fn memory_probes(cfg: &Config) -> ProbeResult {
     for &bytes in &cfg.sets {
+        let (traffic, working_set, copy_traffic) = memory_layout(bytes, cfg.passes)?;
         let n = bytes / 8;
-        let src: Vec<u64> = (0..n).map(|i| (i as u64).wrapping_mul(SEED)).collect();
-        let mut dst = vec![0u64; n];
-        let traffic = bytes.checked_mul(cfg.passes).ok_or("byte count overflow")?;
-        let working_set = bytes.checked_mul(2).ok_or("working set overflow")?;
-        let copy_traffic = traffic.checked_mul(2).ok_or("copy byte count overflow")?;
+        let mut src = Vec::<u64>::new();
+        let mut dst = Vec::<u64>::new();
+        src.try_reserve_exact(n)?;
+        dst.try_reserve_exact(n)?;
+        src.extend((0..n).map(|i| (i as u64).wrapping_mul(SEED)));
+        dst.resize(n, 0);
         for rep in 0..=cfg.reps {
             let t = Instant::now();
             for _ in 0..cfg.passes {
@@ -376,6 +397,30 @@ fn main() -> ProbeResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_memory_is_rejected_before_reservation() {
+        let cfg = Config {
+            rounds: 32,
+            reps: 1,
+            passes: 1,
+            sets: vec![usize::MAX & !7],
+            threads: 1,
+        };
+        assert!(memory_layout(cfg.sets[0], cfg.passes).is_err());
+        assert!(memory_probes(&cfg).is_err());
+    }
+
+    #[test]
+    fn memory_layout_checks_capacity_and_all_byte_counts() {
+        assert_eq!(memory_layout(4096, 16).unwrap(), (65536, 8192, 131072));
+        assert!(memory_layout(8, usize::MAX).is_err());
+        assert!(memory_layout(8, usize::MAX / 8).is_err());
+        assert!(memory_layout(0, 1).is_err());
+        assert!(memory_layout(7, 1).is_err());
+        assert!(memory_layout(8, 0).is_err());
+        assert!(memory_layout((isize::MAX as usize) & !7, 1).is_ok());
+    }
 
     #[test]
     fn rejects_unresolved_timer_samples() {
