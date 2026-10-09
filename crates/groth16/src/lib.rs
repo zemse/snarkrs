@@ -76,6 +76,7 @@ use snarkrs_field::*;
 use snarkrs_formats::ProvingKey;
 
 #[derive(thiserror::Error)]
+#[non_exhaustive]
 pub enum ProveError {
     #[error("witness has {got} entries, proving key expects {want}")]
     WitnessLength { got: usize, want: usize },

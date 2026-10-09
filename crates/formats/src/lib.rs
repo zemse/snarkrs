@@ -139,6 +139,7 @@ pub struct VerifyingKey {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ZkeyError {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),

@@ -32,6 +32,7 @@ use crate::xyzz::Xyzz;
 /// Deliberately not `CeremonyError`: that type is about file formats and lives a crate
 /// away, and a backend has nothing to say about either.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum AccelError {
     /// The backend exists on this machine but has no kernel for this primitive yet. The
     /// command has to stop rather than fall back, for the reason `make_backend` gives:

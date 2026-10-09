@@ -9,6 +9,7 @@ use snarkrs_field::*;
 use snarkrs_formats::VerifyingKey;
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum VerifyError {
     #[error("expected {want} public inputs, got {got}")]
     PublicInputCount { got: usize, want: usize },

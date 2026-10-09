@@ -14,6 +14,7 @@ use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream, DriverEr
 use snarkrs_groth16::ProveError;
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum CudaError {
     #[error("no CUDA device: {0}")]
     NoDevice(String),

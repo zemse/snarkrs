@@ -80,6 +80,7 @@ pub const N8: usize = 32;
 pub const PROTOCOL_GROTH16: u32 = 1;
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum CeremonyError {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),

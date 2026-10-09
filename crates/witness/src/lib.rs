@@ -53,6 +53,7 @@ impl JsKind {
 /// included where circom_runtime puts them; [`WitnessError::snarkjs_line`] is the whole
 /// line snarkjs logs.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum WitnessError {
     /// What `BigInt()`, `JSON.parse`, `Object.keys` or a file open throws.
     #[error("{message}")]

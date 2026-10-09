@@ -17,6 +17,7 @@ pub use snarkrs_groth16::json::{
 /// A `proof.json` or `public.json` that could not be read or written. The message names the
 /// file and carries the cause, so printing it is enough.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum FileError {
     #[error("{what} {}: {error}", path.display())]
     Io {

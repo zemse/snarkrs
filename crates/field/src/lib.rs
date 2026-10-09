@@ -31,6 +31,7 @@ pub struct Domain {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum DomainError {
     #[error("domain size {0} exceeds the 2-adicity of the BN254 scalar field")]
     TooLarge(usize),
