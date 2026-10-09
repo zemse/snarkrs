@@ -102,20 +102,27 @@ const SCAN_CHUNK: usize = 1 << 12;
 /// so at 16x the reduction overhead of the split stays under a fifth of the chunk's work.
 const CHUNK_BUCKET_RATIO: usize = 16;
 
-/// Entries per shared inversion in the batch-affine fill. Conflicts (a second point for
-/// a bucket that already has a pending addition) grow as `BATCH^2 / n_buckets` while the
-/// inversion amortises as `1 / BATCH`; at 1024 over the 4096 buckets H uses, ~12% of
+/// Most entries per shared inversion in the batch-affine fill. Conflicts (a second point
+/// for a bucket that already has a pending addition) grow as `batch^2 / n_buckets` while
+/// the inversion amortises as `1 / batch`; at 1024 over the 4096 buckets H uses, ~12% of
 /// points conflict (nearly all rescued by the retry pass, see [`BatchFill`]) and the
 /// shared inversion costs well under one Fq product per point.
 const BATCH: usize = 1024;
 
-/// The batch-affine fill only runs with at least this many buckets. Two reasons: the
-/// busy map caps a round at one pending addition per bucket, so `BATCH` must sit below
-/// the bucket count or the flush trigger starves, and a window this narrow means a small
-/// `m`, where the fill is not the cost that matters. On this ladder the split lands
-/// where the arithmetic wants it: the dense H MSM (c = 13) batches, the sparse witness
-/// MSMs (c = 7) keep the XYZZ fill.
-const BATCH_MIN_BUCKETS: usize = 2 * BATCH;
+/// The batch-affine fill only runs when [`batch_size`] gives at least this many entries
+/// per inversion, which is 256 buckets (c = 9). At 128 the shared inversion still costs
+/// under one Fq product per point; narrower windows mean a small `m`, where the fill is
+/// not the cost that matters, and they keep the XYZZ fill.
+const MIN_BATCH: usize = 128;
+
+/// Batch size for a window of `n_buckets`: half the buckets, capped at [`BATCH`]. Below
+/// the cap this holds the conflict share `batch / n_buckets` where the 2048-bucket window
+/// has it, instead of letting it climb as the window narrows. It also keeps the batch
+/// below the bucket count, which the busy map needs: a round holds at most one pending
+/// addition per bucket, so a batch at or past the bucket count starves the flush trigger.
+fn batch_size(n_buckets: usize) -> usize {
+    BATCH.min(n_buckets / 2)
+}
 
 /// Window size for `n` points. Pippenger's cost is minimised near `ln(n)`; sppark uses
 /// `min(floor(lg2(1.5n)) - 8, 18)` floored at 10 on GPU, but the CPU optimum is smaller
@@ -475,6 +482,8 @@ struct BatchFill<P: RawCurve> {
     dens: Vec<P::RF>,
     prefix: Vec<P::RF>,
     ops: Vec<Op>,
+    /// Pending (or retry) count that triggers a flush; see [`batch_size`].
+    batch: usize,
 }
 
 /// The XYZZ buckets [`BatchFill`] falls back to, stored only for the buckets that needed
@@ -524,10 +533,10 @@ enum Op {
 }
 
 impl<P: RawCurve> BatchFill<P> {
-    fn new(n_buckets: usize) -> Self {
+    fn new(n_buckets: usize, batch: usize) -> Self {
         // Retries rescheduled after a flush ride on top of the trigger threshold, so
-        // the round vectors get headroom past BATCH.
-        let cap = BATCH + BATCH / 2;
+        // the round vectors get headroom past the batch.
+        let cap = batch + batch / 2;
         BatchFill {
             bx: vec![P::RF::ZERO; n_buckets],
             by: vec![P::RF::ZERO; n_buckets],
@@ -539,6 +548,7 @@ impl<P: RawCurve> BatchFill<P> {
             dens: Vec::with_capacity(cap),
             prefix: Vec::with_capacity(cap),
             ops: Vec::with_capacity(cap),
+            batch,
         }
     }
 
@@ -555,7 +565,7 @@ impl<P: RawCurve> BatchFill<P> {
             self.retry.push((b as u32, x, y));
             // Also a flush trigger: with degenerate digits it is the conflicts, not
             // the pending entries, that accumulate, and this bounds them.
-            if self.retry.len() >= BATCH {
+            if self.retry.len() >= self.batch {
                 self.flush();
                 self.reschedule();
             }
@@ -563,7 +573,7 @@ impl<P: RawCurve> BatchFill<P> {
         }
         self.busy[b] = true;
         self.pending.push((b as u32, x, y));
-        if self.pending.len() >= BATCH {
+        if self.pending.len() >= self.batch {
             self.flush();
             self.reschedule();
         }
@@ -688,7 +698,7 @@ impl<P: RawCurve> BatchFill<P> {
 /// [`window_chunk`] with the fill batched: affine buckets, additions applied in rounds
 /// that share one field inversion. See [`BatchFill`] for the machinery and the conflict
 /// story. Only worth it with buckets to spare; [`pippenger`] switches on
-/// [`BATCH_MIN_BUCKETS`].
+/// [`MIN_BATCH`].
 fn window_chunk_batch<P: RawCurve>(
     bases: &[Affine<P>],
     scan: &Prescan<P>,
@@ -699,7 +709,7 @@ fn window_chunk_batch<P: RawCurve>(
 ) -> Projective<P> {
     // `d` is in [-2^(c-1), 2^(c-1)], so `2^(c-1)` buckets is tight.
     let n_buckets = 1usize << (c - 1);
-    let mut fill = BatchFill::<P>::new(n_buckets);
+    let mut fill = BatchFill::<P>::new(n_buckets, batch_size(n_buckets));
     // See `window_chunk`. XYZZ rather than a batched slot: a zero scalar sends every one
     // of its digits here, and one batched bucket that contended would push them all through
     // the retry and side-bucket machinery instead.
@@ -792,7 +802,7 @@ where
                     // The wide windows batch their fill behind a shared inversion; the
                     // narrow ones stay on the XYZZ fill, which has no round overhead
                     // to amortise.
-                    if n_buckets >= BATCH_MIN_BUCKETS {
+                    if batch_size(n_buckets) >= MIN_BATCH {
                         window_chunk_batch(bases, &scan, lo..hi, w, c, work)
                     } else {
                         window_chunk(bases, &scan, lo..hi, w, c, work)
@@ -1175,15 +1185,15 @@ mod tests {
     }
 
     /// 2^15 points is where [`window_size`] first picks a window wide enough (c = 12,
-    /// 2048 buckets) for the batch-affine fill to engage through the public API; every
-    /// smaller test in this file runs the XYZZ fill.
+    /// 2048 buckets) for the batch-affine fill to run at the full [`BATCH`].
     #[test]
     fn matches_arkworks_g1_through_the_batch_fill() {
         let mut rng = test_rng();
         let n = 1usize << 15;
-        assert!(
-            (1usize << (window_size(n) - 1)) >= BATCH_MIN_BUCKETS,
-            "2^15 no longer reaches the batch fill; move this test"
+        assert_eq!(
+            batch_size(1usize << (window_size(n) - 1)),
+            BATCH,
+            "2^15 no longer reaches the full batch; move this test"
         );
         let bases: Vec<G1Affine> = walk_points(n, &mut rng);
         let scalars = rand_scalars(n, &mut rng);
@@ -1201,6 +1211,56 @@ mod tests {
         let s = Fr::rand(&mut rng);
         let want = p[0] * (s * Fr::from(n as u64));
         assert_eq!(CpuMsm::new().msm_g1(&vec![p[0]; n], &vec![s; n]), want);
+    }
+
+    /// The first lengths choosing c = 9, 10 and 11: the batch fill below the full
+    /// [`BATCH`], at half the bucket count (128 to 512).
+    fn narrow_batch_fill<P: RawCurve<ScalarField = Fr>>()
+    where
+        Projective<P>: UniformRand,
+        P::BaseField: Send + Sync,
+    {
+        let mut rng = test_rng();
+        let msm = CpuMsm::new();
+        for (n, c) in [(3_329, 9), (5_889, 10), (16_897, 11)] {
+            assert_eq!(window_size(n), c);
+            let batch = batch_size(1usize << (c - 1));
+            assert!((MIN_BATCH..BATCH).contains(&batch), "c = {c}");
+            let bases: Vec<Affine<P>> = walk_points(n, &mut rng);
+            let scalars = rand_scalars(n, &mut rng);
+            let want = Projective::<P>::msm(&bases, &scalars).unwrap();
+            assert_eq!(
+                pippenger(&bases, &scalars, msm.threads, Work::Variable),
+                want
+            );
+            assert_eq!(pippenger(&bases, &scalars, 1, Work::Constant), want);
+        }
+
+        // Degenerate digits at the smallest batch. Equal scalars put every point of a
+        // window in one bucket; equal bases on top make each round all doublings.
+        let n = 3_329;
+        let bases: Vec<Affine<P>> = walk_points(n, &mut rng);
+        let s = Fr::rand(&mut rng);
+        let want = bases.iter().fold(Projective::<P>::zero(), |acc, b| acc + b) * s;
+        assert_eq!(
+            pippenger(&bases, &vec![s; n], msm.threads, Work::Variable),
+            want
+        );
+        let hot = vec![bases[0]; n];
+        assert_eq!(
+            pippenger(&hot, &vec![s; n], msm.threads, Work::Variable),
+            bases[0] * (s * Fr::from(n as u64))
+        );
+    }
+
+    #[test]
+    fn matches_arkworks_through_the_narrow_batch_fill_g1() {
+        narrow_batch_fill::<snarkrs_field::g1::Config>();
+    }
+
+    #[test]
+    fn matches_arkworks_through_the_narrow_batch_fill_g2() {
+        narrow_batch_fill::<snarkrs_field::g2::Config>();
     }
 
     /// `cargo test -p snarkrs-msm --release -- --ignored --nocapture bench`

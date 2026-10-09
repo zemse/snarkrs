@@ -43,7 +43,7 @@ fn denominator_positions<P: RawCurve<ScalarField = Fr>>() {
     // All other denominators are ordinary x differences.
     for exceptional in 0..17 {
         for cancel in [false, true] {
-            let mut fill = BatchFill::<P>::new(17);
+            let mut fill = BatchFill::<P>::new(17, MIN_BATCH);
             let mut want = vec![Projective::<P>::zero(); 17];
             for (b, expected) in want.iter_mut().enumerate() {
                 insert(&mut fill, b, p);
@@ -72,24 +72,27 @@ fn denominator_positions<P: RawCurve<ScalarField = Fr>>() {
     }
 
     // An entirely cancelling batch has product ONE, even at the automatic flush
-    // boundary. Empty and singleton rounds must also leave the scheduler reusable.
-    for n in [0, 1, BATCH - 1, BATCH, BATCH + 1] {
-        let mut fill = BatchFill::<P>::new(n);
-        for b in 0..n {
-            insert(&mut fill, b, p);
-            insert(&mut fill, b, -p);
+    // boundary of either end of the batch range. Empty and singleton rounds must also
+    // leave the scheduler reusable.
+    for batch in [MIN_BATCH, BATCH] {
+        for n in [0, 1, batch - 1, batch, batch + 1] {
+            let mut fill = BatchFill::<P>::new(n, batch);
+            for b in 0..n {
+                insert(&mut fill, b, p);
+                insert(&mut fill, b, -p);
+            }
+            fill.flush();
+            assert!(fill.occupied.iter().all(|b| !b));
+            assert!(fill.dens.iter().all(|d| *d == P::RF::ONE));
+            let mut want = vec![Projective::<P>::zero(); n];
+            check_buckets(&fill, &want);
+            for (b, expected) in want.iter_mut().enumerate() {
+                insert(&mut fill, b, q);
+                *expected = q.into();
+            }
+            check_buckets(&fill, &want);
+            check_finish(fill, &want);
         }
-        fill.flush();
-        assert!(fill.occupied.iter().all(|b| !b));
-        assert!(fill.dens.iter().all(|d| *d == P::RF::ONE));
-        let mut want = vec![Projective::<P>::zero(); n];
-        check_buckets(&fill, &want);
-        for (b, expected) in want.iter_mut().enumerate() {
-            insert(&mut fill, b, q);
-            *expected = q.into();
-        }
-        check_buckets(&fill, &want);
-        check_finish(fill, &want);
     }
 }
 
@@ -104,11 +107,17 @@ fn batch_denominator_positions_g2() {
 }
 
 fn retries_and_side<P: RawCurve<ScalarField = Fr>>() {
+    for batch in [MIN_BATCH, BATCH] {
+        retries_and_side_at::<P>(batch);
+    }
+}
+
+fn retries_and_side_at<P: RawCurve<ScalarField = Fr>>(batch: usize) {
     let p = P::GENERATOR;
     let q = (Projective::<P>::from(p) + p).into_affine();
     let b = 7;
     for cancel_first in [false, true] {
-        let mut fill = BatchFill::<P>::new(8);
+        let mut fill = BatchFill::<P>::new(8, batch);
         let mut want = vec![Projective::<P>::zero(); 8];
         let rhs = if cancel_first { -p } else { q };
         for point in [p, rhs, p, -p, p, p] {
@@ -141,9 +150,9 @@ fn retries_and_side<P: RawCurve<ScalarField = Fr>>() {
     // The retry trigger must bound a hot bucket without an explicit flush. The
     // side stays live when the affine half later cancels, and after it refills.
     for refill in [false, true] {
-        let mut fill = BatchFill::<P>::new(8);
+        let mut fill = BatchFill::<P>::new(8, batch);
         let mut want = vec![Projective::<P>::zero(); 8];
-        for _ in 0..BATCH + 2 {
+        for _ in 0..batch + 2 {
             insert(&mut fill, b, p);
             want[b] += p;
         }
@@ -151,7 +160,7 @@ fn retries_and_side<P: RawCurve<ScalarField = Fr>>() {
         assert_eq!(fill.pending.len(), 1);
         assert_eq!(
             to_projective::<P>(&fill.side.as_ref().expect("retry trigger")[b]),
-            Projective::<P>::from(p) * Fr::from((BATCH - 1) as u64)
+            Projective::<P>::from(p) * Fr::from((batch - 1) as u64)
         );
         fill.flush();
         let affine =
@@ -169,28 +178,31 @@ fn retries_and_side<P: RawCurve<ScalarField = Fr>>() {
         check_finish(fill, &want);
     }
 
-    let mut fill = BatchFill::<P>::new(8);
+    let mut fill = BatchFill::<P>::new(8, batch);
     let mut want = vec![Projective::<P>::zero(); 8];
-    for i in 0..6 * BATCH + 7 {
+    for i in 0..6 * batch + 7 {
         let point = if i % 3 == 0 { -p } else { p };
         insert(&mut fill, b, point);
         want[b] += point;
-        assert!(fill.pending.len() <= BATCH);
-        assert!(fill.retry.len() < BATCH);
+        assert!(fill.pending.len() <= batch);
+        assert!(fill.retry.len() < batch);
     }
     assert!(fill.side.is_some());
     assert!(!fill.retry.is_empty());
     check_finish(fill, &want);
 
-    // The other trigger: BATCH independent pending entries with retries already
-    // queued. A normal pending flush must reschedule those retries exactly once.
-    let mut fill = BatchFill::<P>::new(BATCH_MIN_BUCKETS);
-    let mut want = vec![Projective::<P>::zero(); BATCH_MIN_BUCKETS];
+    // The other trigger: `batch` independent pending entries with retries already
+    // queued, over the bucket count that batch is sized for. A normal pending flush
+    // must reschedule those retries exactly once.
+    let n_buckets = 2 * batch;
+    assert_eq!(batch_size(n_buckets), batch);
+    let mut fill = BatchFill::<P>::new(n_buckets, batch);
+    let mut want = vec![Projective::<P>::zero(); n_buckets];
     for point in [p, q, p, p] {
         insert(&mut fill, 0, point);
         want[0] += point;
     }
-    for (b, expected) in want.iter_mut().enumerate().take(BATCH).skip(1) {
+    for (b, expected) in want.iter_mut().enumerate().take(batch).skip(1) {
         insert(&mut fill, b, p);
         insert(&mut fill, b, q);
         *expected = Projective::<P>::from(p) + q;
@@ -212,23 +224,60 @@ fn batch_retries_and_side_g2() {
     retries_and_side::<snarkrs_field::g2::Config>();
 }
 
+#[test]
+fn batch_size_stays_below_the_bucket_count() {
+    for c in 3..=MAX_WINDOW {
+        let n_buckets = 1usize << (c - 1);
+        let batch = batch_size(n_buckets);
+        assert!(batch < n_buckets, "c = {c}");
+        assert_eq!(batch >= MIN_BATCH, c >= 9, "c = {c}");
+        assert_eq!(batch == BATCH, c >= 12, "c = {c}");
+    }
+}
+
 fn threshold_and_infinity<P: RawCurve<ScalarField = Fr>>() {
-    assert_eq!(BATCH_MIN_BUCKETS, 2048);
-    // The exact first prescanned length choosing c = 12, not just a nearby power
-    // of two. Split one scalar to keep the mathematical MSM unchanged across it.
-    let n = 30_720;
-    assert_eq!(window_size(n), 11);
-    assert_eq!(window_size(n + 1), 12);
+    // The exact first prescanned lengths choosing c = 9 (the batch fill at MIN_BATCH)
+    // and c = 12 (at the full BATCH), not just nearby powers of two.
+    for (n, c) in [(3_328, 9), (30_720, 12)] {
+        threshold_and_infinity_at::<P>(n, c);
+    }
+    let p = P::GENERATOR;
+
+    // Ones can double, cancel, and refill an XYZZ accumulator across scan chunks.
+    for n in [17, 4 * SCAN_CHUNK, 4 * SCAN_CHUNK + 1] {
+        let bases: Vec<_> = (0..n)
+            .map(|i| match i % 4 {
+                0 | 2 => p,
+                1 => -p,
+                _ => Affine::<P>::identity(),
+            })
+            .collect();
+        let want = bases.iter().fold(Projective::<P>::zero(), |acc, p| acc + p);
+        assert_eq!(
+            pippenger(&bases, &vec![Fr::one(); n], 12, Work::Variable),
+            want
+        );
+        assert_eq!(
+            pippenger(&bases, &vec![Fr::one(); n], 12, Work::Constant),
+            want
+        );
+    }
+}
+
+fn threshold_and_infinity_at<P: RawCurve<ScalarField = Fr>>(n: usize, c: u32) {
+    // Split one scalar to keep the mathematical MSM unchanged across the threshold.
+    assert_eq!(window_size(n), c - 1);
+    assert_eq!(window_size(n + 1), c);
     let p = P::GENERATOR;
     let mut bases = vec![p; n];
     let mut scalars = vec![-Fr::one(); n];
     let want = Projective::<P>::from(p) * -Fr::from(n as u64);
     // Identity as the right operand never enters BatchFill's raw coordinate API.
-    // Test every scalar class across parallel prescan chunks.
+    // Test every scalar class, across parallel prescan chunks when n spans them.
     for (i, s) in [
         (0, Fr::zero()),
-        (SCAN_CHUNK, Fr::one()),
-        (2 * SCAN_CHUNK, Fr::from(2u64)),
+        (SCAN_CHUNK.min(n / 3), Fr::one()),
+        ((2 * SCAN_CHUNK).min(2 * n / 3), Fr::from(2u64)),
         (n, -Fr::one()),
     ] {
         bases.insert(i, Affine::<P>::identity());
@@ -254,26 +303,6 @@ fn threshold_and_infinity<P: RawCurve<ScalarField = Fr>>() {
     );
     assert_eq!(pippenger(&bases, &scalars, 12, Work::Constant), want);
     assert_eq!(pippenger(&bases, &scalars, 12, Work::Variable), want);
-
-    // Ones can double, cancel, and refill an XYZZ accumulator across scan chunks.
-    for n in [17, 4 * SCAN_CHUNK, 4 * SCAN_CHUNK + 1] {
-        let bases: Vec<_> = (0..n)
-            .map(|i| match i % 4 {
-                0 | 2 => p,
-                1 => -p,
-                _ => Affine::<P>::identity(),
-            })
-            .collect();
-        let want = bases.iter().fold(Projective::<P>::zero(), |acc, p| acc + p);
-        assert_eq!(
-            pippenger(&bases, &vec![Fr::one(); n], 12, Work::Variable),
-            want
-        );
-        assert_eq!(
-            pippenger(&bases, &vec![Fr::one(); n], 12, Work::Constant),
-            want
-        );
-    }
 }
 
 /// `Work::Constant`'s promise, checked where it is decided: what reaches the bucket loop is
