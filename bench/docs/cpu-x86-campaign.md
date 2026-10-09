@@ -10,6 +10,7 @@ Target: c7i.4xlarge, x86 Ubuntu, 16 vCPU, 32 GiB RAM. Compare snarkrs with rapid
 - Measure key preparation, cold process time and warm proving separately. Verification stays outside proving time but gates every accepted result.
 - Check foreign verifier exit status as well as its success marker. Use an independent verifier at the start and end of each experiment.
 - Record actual worker counts, CPU topology, affinity, peak memory and machine load. Run one benchmark process at a time.
+- The pinned ffiasm `c/misc.hpp::ThreadPool::defaultThreadCount` uses `std::thread::hardware_concurrency()`, not `OMP_NUM_THREADS`. Do not label environment settings as measured rapidsnark pool sizes. Use the native 16-thread comparison first; smaller matched pools require a documented control patch and validation.
 - Compare generic x86 and explicit ADX/BMI2 builds before attributing differences to MSM or FFT algorithms. The workspace manifest documents the earlier assembly-path gap.
 - Use 15 to 25 warm repetitions where the runtime budget permits. Record median and spread, not only the fastest sample.
 
