@@ -1,0 +1,63 @@
+# Builds the snarkrs binary for every target in the Makefile's RELEASE_TARGETS and attaches
+# them to the GitHub release for the tag. Every step is a make target, so this file holds no
+# build settings of its own. Crates are published from a local machine with `make release`,
+# which pushes the tag that starts this.
+#
+# Run it by hand (workflow_dispatch) to build every target without releasing anything.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - if: startsWith(github.ref, 'refs/tags/')
+        run: make check-tag TAG=${{ github.ref_name }}
+      - id: matrix
+        run: echo "matrix=$(make -s release-matrix)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - if: runner.os == 'Windows'
+        run: choco install make --no-progress -y
+      - run: make release-build TARGET=${{ matrix.target }} PYTHON=${{ runner.os == 'Windows' && 'python' || 'python3' }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: snarkrs-${{ matrix.target }}
+          path: target/dist/*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: target/dist
+          merge-multiple: true
+      - run: make github-release TAG=${{ github.ref_name }}
+        env:
+          GH_TOKEN: ${{ github.token }}
