@@ -203,15 +203,26 @@ fn foreign_verify(
         .output()
         .with_context(|| format!("running {}", bin.display()))?;
     std::fs::remove_dir_all(&dir).ok();
-    let said = String::from_utf8_lossy(&out.stdout);
-    if !said.contains("OK!") {
-        bail!(
-            "{} {mode}: our verifier accepted the {} proof and snarkjs rejected it: {said}",
+    check_foreign_verify_output(&out).with_context(|| {
+        format!(
+            "{} {mode}: our verifier accepted the {} proof and snarkjs rejected it",
             v.name,
             args.backend.as_str()
+        )
+    })?;
+    println!("  snarkjs accepted the {mode} proof");
+    Ok(())
+}
+
+fn check_foreign_verify_output(out: &std::process::Output) -> Result<()> {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() || !stdout.contains("OK!") {
+        bail!(
+            "verifier status: {}; stdout: {stdout}; stderr: {stderr}",
+            out.status
         );
     }
-    println!("  snarkjs accepted the {mode} proof");
     Ok(())
 }
 
@@ -375,6 +386,55 @@ fn report(rows: &[Row]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(unix, windows))]
+    fn verifier_output(code: u32, stdout: &str, stderr: &str) -> std::process::Output {
+        #[cfg(unix)]
+        let status = {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw((code as i32) << 8)
+        };
+        #[cfg(windows)]
+        let status = {
+            use std::os::windows::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(code)
+        };
+        std::process::Output {
+            status,
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn foreign_verify_rejects_nonzero_exit_even_with_ok() {
+        let out = verifier_output(7, "OK! accepted", "verifier failed afterwards");
+        let error = check_foreign_verify_output(&out).unwrap_err().to_string();
+        assert!(error.contains(&out.status.to_string()), "{error}");
+        assert!(error.contains("stdout: OK! accepted"), "{error}");
+        assert!(
+            error.contains("stderr: verifier failed afterwards"),
+            "{error}"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn foreign_verify_rejects_zero_exit_without_ok() {
+        let out = verifier_output(0, "no valid-proof marker", "OK! on stderr only");
+        let error = check_foreign_verify_output(&out).unwrap_err().to_string();
+        assert!(error.contains(&out.status.to_string()), "{error}");
+        assert!(error.contains("stdout: no valid-proof marker"), "{error}");
+        assert!(error.contains("stderr: OK! on stderr only"), "{error}");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn foreign_verify_accepts_zero_exit_with_ok() {
+        let out = verifier_output(0, "snarkjs: OK!", "verifier diagnostics");
+        check_foreign_verify_output(&out).unwrap();
+    }
 
     #[test]
     fn median_matches_pythons_definition() {
