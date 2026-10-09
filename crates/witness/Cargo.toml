@@ -3,6 +3,15 @@ name = "snarkrs-witness"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "circom witness generation for snarkrs: the wasm calculator and the native binary"
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+include = ["src/**/*", "LICENSE-MIT", "LICENSE-APACHE"]
 
 [features]
 # The circom wasm calculator. Off, the crate is the native-binary runner alone and links no

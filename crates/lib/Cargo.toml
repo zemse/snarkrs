@@ -3,6 +3,15 @@ name = "snarkrs-lib"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Groth16 prover and verifier for BN254, byte-compatible with snarkjs, with CPU, Metal, CUDA and WebGPU backends"
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+include = ["src/**/*", "LICENSE-MIT", "LICENSE-APACHE"]
 
 # The prover, verifier, key formats and CPU backend are always in; everything else is a
 # feature, so a library user compiles only the backend it runs on.

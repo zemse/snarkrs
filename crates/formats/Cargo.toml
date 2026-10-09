@@ -3,6 +3,15 @@ name = "snarkrs-formats"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "snarkjs .zkey and .wtns parsing for snarkrs"
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+include = ["src/**/*", "LICENSE-MIT", "LICENSE-APACHE"]
 
 [dependencies]
 # Scrubs an owned `.wtns` buffer once it is decoded. Already in the tree through ark-ff;

@@ -3,6 +3,15 @@ name = "snarkrs-wgpu"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "WebGPU backend for the snarkrs Groth16 prover, native and in the browser"
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+include = ["src/**/*", "LICENSE-MIT", "LICENSE-APACHE"]
 
 [lib]
 # rlib only, and the `cdylib` that was here until U11 is not coming back to this crate.

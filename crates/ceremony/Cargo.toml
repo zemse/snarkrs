@@ -3,6 +3,15 @@ name = "snarkrs-ceremony"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "snarkjs-compatible powers of tau and Groth16 phase 2 ceremony for snarkrs"
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+include = ["src/**/*", "LICENSE-MIT", "LICENSE-APACHE"]
 
 [dependencies]
 # Scrubs the contributor's toxic waste when it is dropped. Already in the tree through

@@ -3,6 +3,15 @@ name = "snarkrs-msm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Pippenger multi-scalar multiplication over BN254 G1 and G2 for snarkrs"
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+include = ["src/**/*", "LICENSE-MIT", "LICENSE-APACHE"]
 
 [dependencies]
 snarkrs-field.workspace = true

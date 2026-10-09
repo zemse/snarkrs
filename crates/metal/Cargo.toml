@@ -3,6 +3,15 @@ name = "snarkrs-metal"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Apple Metal backend for the snarkrs Groth16 prover"
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+include = ["src/**/*", "LICENSE-MIT", "LICENSE-APACHE"]
 
 [dependencies]
 snarkrs-field.workspace = true
@@ -32,8 +41,9 @@ snarkrs-groth16 = { workspace = true, features = ["deterministic-blinders"] }
 # The CPU reference the ceremony kernels are tested against: `prepare::point_times_fr`,
 # `prepare::batch_to_affine` and `CpuKeyScale` are the implementations `--backend cpu`
 # runs, and byte-identity with snarkjs rests on them. No cycle: snarkrs-ceremony does not
-# depend on this crate.
-snarkrs-ceremony.workspace = true
+# depend on this crate. Path only, with no version, so `cargo publish` drops it: the two
+# crates dev-depend on each other and one of them has to reach crates.io first.
+snarkrs-ceremony = { path = "../ceremony" }
 
 [features]
 default = []
