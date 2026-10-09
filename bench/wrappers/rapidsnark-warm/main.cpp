@@ -1,6 +1,7 @@
 // Warm/steady-state rapidsnark: load the zkey ONCE, then prove N times.
 //
 //     rapidsnark-warm <zkey> <wtns> <proof.json> <public.json> <reps> <vkey.json>
+//                    [--proof-dir DIR]
 //
 // This exists because rapidsnark's stock CLI cannot measure warm proving. Its
 // `groth16_prover` entry point takes the raw zkey BUFFER on every call and
@@ -13,10 +14,11 @@
 // zkey parse outside the timed region instead of inside it.
 //
 // Verifies every proof outside the timed region before emitting "rep <i> <ms>".
-// Writes the last proof out for an independent verifier.
+// Writes the last proof and optional per-repetition proofs for independent checks.
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iterator>
@@ -25,14 +27,28 @@
 #include <string>
 #include <vector>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include "fileloader.hpp"
+#include "misc.hpp"
 #include "prover.h"
 #include "verifier.h"
 
+void write_json(const std::filesystem::path &path, const std::vector<char> &buffer,
+                unsigned long long size) {
+    std::ofstream file(path);
+    file.write(buffer.data(), size);
+    file.close();
+    if (!file)
+        throw std::runtime_error("cannot write JSON output: " + path.string());
+}
+
 int main(int argc, char **argv) {
-    if (argc != 7) {
+    if ((argc != 7 && argc != 9) ||
+        (argc == 9 && (std::string(argv[7]) != "--proof-dir" || !argv[8][0]))) {
         std::cerr << "Usage: rapidsnark-warm <zkey> <wtns> <proof.json> "
-                     "<public.json> <reps> <vkey.json>\n";
+                     "<public.json> <reps> <vkey.json> [--proof-dir DIR]\n";
         return EXIT_FAILURE;
     }
     const std::string zkeyFilename = argv[1];
@@ -43,6 +59,28 @@ int main(int argc, char **argv) {
         const int reps = std::stoi(argv[5], &consumed);
         if (reps <= 0 || consumed != std::string(argv[5]).size())
             throw std::runtime_error("reps must be a positive integer");
+        if (std::filesystem::weakly_canonical(argv[3]) ==
+            std::filesystem::weakly_canonical(argv[4]))
+            throw std::runtime_error("proof and public outputs must differ");
+        std::filesystem::path proofDir;
+        if (argc == 9) {
+            proofDir = argv[8];
+            std::filesystem::create_directories(proofDir);
+            if (!std::filesystem::is_directory(proofDir))
+                throw std::runtime_error("proof-dir must be a directory");
+            for (int i = 0; i < reps; i++) {
+                for (const auto &name : {"proof-", "public-"}) {
+                    auto output = proofDir /
+                                  (std::string(name) + std::to_string(i + 1) + ".json");
+                    if (std::filesystem::weakly_canonical(output) ==
+                            std::filesystem::weakly_canonical(argv[3]) ||
+                        std::filesystem::weakly_canonical(output) ==
+                            std::filesystem::weakly_canonical(argv[4]))
+                        throw std::runtime_error(
+                            "final outputs must not overwrite repetition outputs");
+                }
+            }
+        }
         std::ifstream vkeyFile(argv[6]);
         if (!vkeyFile)
             throw std::runtime_error("cannot open verification key");
@@ -65,13 +103,15 @@ int main(int argc, char **argv) {
             throw std::runtime_error("invalid prover buffer size");
         std::vector<char> publicBuffer(publicSize + 1), proofBuffer(proofSize + 1);
 
-        // --- setup, deliberately OUTSIDE the timed region ---
+        // Setup stays outside the timed region.
         void *prover = nullptr;
         if (groth16_prover_create(&prover, zkeyFile.dataBuffer(), zkeyFile.dataSize(),
                                   errorMsg, sizeof(errorMsg)) != PROVER_OK)
             throw std::runtime_error(errorMsg);
         std::unique_ptr<void, decltype(&groth16_prover_destroy)> owner(
             prover, &groth16_prover_destroy);
+        std::cerr << "ffiasm_pool_threads="
+                  << ThreadPool::defaultPool().getThreadCount() << '\n';
 
         for (int i = 0; i < reps; i++) {
             unsigned long long ps = proofSize, us = publicSize;
@@ -91,18 +131,17 @@ int main(int argc, char **argv) {
                                errorMsg, sizeof(errorMsg)) != VERIFIER_VALID_PROOF)
                 throw std::runtime_error(std::string("verification failed: ") +
                                          errorMsg);
-            if (i + 1 == reps) {
-                std::ofstream proofFile(argv[3]), publicFile(argv[4]);
-                proofFile.write(proofBuffer.data(), ps);
-                publicFile.write(publicBuffer.data(), us);
-                proofFile.close();
-                publicFile.close();
-                if (!proofFile || !publicFile)
-                    throw std::runtime_error("cannot write proof or public signals");
+            if (!proofDir.empty()) {
+                const std::string suffix = std::to_string(i + 1) + ".json";
+                write_json(proofDir / ("proof-" + suffix), proofBuffer, ps);
+                write_json(proofDir / ("public-" + suffix), publicBuffer, us);
             }
-            auto ms =
-                std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
-            printf("rep %d %lld\n", i + 1, (long long)ms);
+            if (i + 1 == reps) {
+                write_json(argv[3], proofBuffer, ps);
+                write_json(argv[4], publicBuffer, us);
+            }
+            auto ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            printf("rep %d %.6f\n", i + 1, ms);
         }
     } catch (std::exception &e) {
         std::cerr << "Error: " << e.what() << std::endl;

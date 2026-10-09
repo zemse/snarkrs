@@ -40,12 +40,12 @@ cp "$PKG/bin/verifier" "$HERE/bin/rapidsnark-verify"
 # happens once in groth16_prover_create and lands outside the timed region.
 g++ -std=c++17 -O3 -o "$HERE/bin/rapidsnark-warm" \
   "$HERE/wrappers/rapidsnark-warm/main.cpp" \
-  -I"$PKG/include" -I"$SRC/src" -I"$SRC/depends/json/include" \
+  -I"$PKG/include" -I"$SRC/src" -I"$SRC/depends/ffiasm/c" -I"$SRC/depends/json/include" \
   -L"$PKG/lib" -lrapidsnark -lrapidsnark-fr-fq -lfr -lfq -lgmp -lpthread -lomp \
   -Wl,-rpath,"$PKG/lib" \
   || g++ -std=c++17 -O3 -fopenmp -o "$HERE/bin/rapidsnark-warm" \
     "$HERE/wrappers/rapidsnark-warm/main.cpp" \
-    -I"$PKG/include" -I"$SRC/src" -I"$SRC/depends/json/include" \
+    -I"$PKG/include" -I"$SRC/src" -I"$SRC/depends/ffiasm/c" -I"$SRC/depends/json/include" \
     -L"$PKG/lib" -lrapidsnark -lrapidsnark-fr-fq -lfr -lfq -lgmp -lpthread \
     -Wl,-rpath,"$PKG/lib"
 

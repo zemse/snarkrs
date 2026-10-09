@@ -231,7 +231,8 @@ class RapidsnarkWarmComparisonTests(unittest.TestCase):
             self.assertEqual(row["snarkjs_compatible"], "unknown")
 
     def test_failed_or_partial_warm_runs_are_rejected(self):
-        for kw in ({"code": 1}, {"stdout": "rep 1 2\n"}, {"compat": False},
+        for kw in ({"code": 1}, {"code": 1, "stdout": "rep 1 0.125123\n"},
+                   {"stdout": "rep 1 2\n"}, {"compat": False},
                    {"public": '["124"]'}, {"final_valid": False}):
             with self.subTest(kw=kw):
                 status, rows, _ = self.run_comparison(**kw)
@@ -240,6 +241,7 @@ class RapidsnarkWarmComparisonTests(unittest.TestCase):
 
     def test_warm_parser_rejects_invalid_records(self):
         self.assertEqual(comparison.rapidsnark_warm_times("log\nrep 1 2\nrep 2 3\n", 2), [2, 3])
+        self.assertEqual(comparison.rapidsnark_warm_times("rep 1 0.125123\n", 1), [0.125123])
         for output in ("rep 1 nan\n", "rep 1 inf\n", "rep 1 -1\n", "rep 1 junk\n",
                        "rep 1 2 extra\n", "rep 2 2\n", "rep 1 2\nrep 1 3\n"):
             with self.subTest(output=output):

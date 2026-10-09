@@ -34,7 +34,7 @@ PKG="$SRC/package_macos_arm64"
 mkdir -p "$HERE/bin"
 clang++ -std=c++17 -O3 -o "$HERE/bin/rapidsnark-warm" \
   "$HERE/wrappers/rapidsnark-warm/main.cpp" \
-  -I"$PKG/include" -I"$SRC/src" -I"$SRC/depends/json/include" \
+  -I"$PKG/include" -I"$SRC/src" -I"$SRC/depends/ffiasm/c" -I"$SRC/depends/json/include" \
   -L"$PKG/lib" -lrapidsnark -lrapidsnark-fr-fq -lfr -lfq -lgmp \
   -Wl,-rpath,"$PKG/lib"
 

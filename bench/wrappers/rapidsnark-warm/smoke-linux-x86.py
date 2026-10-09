@@ -14,6 +14,7 @@ def main():
         sys.exit("run inside the disposable arm64 Linux guest")
     bundle, fixtures, manifest = map(Path, sys.argv[1:])
     metadata = bundle / "metadata"
+    (metadata / "certification.json").unlink(missing_ok=True)
     records = json.loads(manifest.read_text())
     for record in records["fixtures"]:
         path = fixtures / record["path"]
@@ -52,12 +53,30 @@ def main():
                                           fixture / "vkey.json", public, proof], "Result: Valid proof")
         run(f"{variant}-cold-independent", ["snarkjs", "groth16", "verify",
                                             fixture / "vkey.json", public, proof], "OK!")
+        exports = metadata / f"{variant}-exports"
+        exports.mkdir(exist_ok=True)
+        for rep in (1, 2):
+            for name in ("proof", "public"):
+                (exports / f"{name}-{rep}.json").unlink(missing_ok=True)
         result = run(f"{variant}-warm", qemu + [bundle / "bin/rapidsnark-warm",
                      fixture / "circuit.zkey", fixture / "circuit.wtns", proof, public,
-                     "2", fixture / "vkey.json"])
+                     "2", fixture / "vkey.json", "--proof-dir", exports])
         repetitions = [line.split() for line in result.stdout.splitlines() if line.startswith("rep ")]
         if len(repetitions) != 2 or [row[1] for row in repetitions] != ["1", "2"]:
             sys.exit(f"incomplete warm correctness run: {variant}")
+        pools = [int(line.split("=", 1)[1]) for line in result.stderr.splitlines()
+                 if line.startswith("ffiasm_pool_threads=")]
+        if len(pools) != 1 or pools[0] <= 0:
+            sys.exit(f"missing actual ffiasm pool instrumentation: {variant}")
+        for rep in (1, 2):
+            exported_proof = exports / f"proof-{rep}.json"
+            exported_public = exports / f"public-{rep}.json"
+            check_public(exported_public, fixture / "public.json")
+            run(f"{variant}-warm-export-{rep}-independent",
+                ["snarkjs", "groth16", "verify", fixture / "vkey.json",
+                 exported_public, exported_proof], "OK!")
+        if proof.read_bytes() != (exports / "proof-2.json").read_bytes() or public.read_bytes() != (exports / "public-2.json").read_bytes():
+            sys.exit(f"final outputs differ from last exported proof: {variant}")
         check_public(public, fixture / "public.json")
         run(f"{variant}-warm-self", qemu + [bundle / "bin/rapidsnark-verify",
                                           fixture / "vkey.json", public, proof], "Result: Valid proof")
@@ -66,7 +85,9 @@ def main():
         results.append(dict(variant=variant, cold_proofs=1, warm_proofs=2,
                             self_verification_scope="each-proof",
                             independent_verifier="snarkjs",
-                            independent_verification_scope="cold-proof-and-final-warm-proof"))
+                            independent_verification_scope="cold-and-each-exported-warm-and-final-proof",
+                            ffiasm_pool_threads_actual=pools[0],
+                            omp_num_threads_setting=env["OMP_NUM_THREADS"]))
     run("snarkjs-version", ["npm", "ls", "-g", "snarkjs", "--depth=0"])
     (metadata / "fixture-manifest.json").write_text(json.dumps(records, indent=2) + "\n")
     (metadata / "smoke-commands.json").write_text(json.dumps(commands, indent=2) + "\n")

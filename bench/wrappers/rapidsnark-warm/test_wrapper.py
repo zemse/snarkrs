@@ -25,6 +25,14 @@ public:
 };
 }
 ''')
+        (cls.root / "misc.hpp").write_text('''
+#pragma once
+class ThreadPool {
+public:
+    static ThreadPool &defaultPool() { static ThreadPool pool; return pool; }
+    unsigned int getThreadCount() const { return 7; }
+};
+''')
         (cls.root / "prover.h").write_text('''
 #pragma once
 #define PROVER_OK 0
@@ -60,6 +68,8 @@ int groth16_prover_create(void **p, const void *, unsigned long long,
 int groth16_prover_prove(void *, const void *, unsigned long long, char *p,
     unsigned long long *ps, char *u, unsigned long long *us, char *, unsigned long long) {
     if (proofs != verified) return 1;
+    if (std::getenv("SLOW_PROVE"))
+        std::this_thread::sleep_for(std::chrono::microseconds(1500));
     ++proofs;
     *ps = std::snprintf(p, 64, "{\\"rep\\":%d}", proofs);
     *us = std::snprintf(u, 64, "[%d]", proofs);
@@ -95,7 +105,8 @@ void groth16_prover_destroy(void *) {
     def tearDownClass(cls):
         cls.temp.cleanup()
 
-    def run_wrapper(self, reps="3", vkey="{}", extra_env=None, bad_output=False):
+    def run_wrapper(self, reps="3", vkey="{}", extra_env=None, bad_output=False,
+                    exports=False, bad_export="", extra_args=None):
         self.case = tempfile.TemporaryDirectory()
         self.addCleanup(self.case.cleanup)
         self.path = Path(self.case.name)
@@ -104,10 +115,19 @@ void groth16_prover_destroy(void *) {
         env = dict(os.environ, DESTROY_MARKER=str(self.marker))
         env.update(extra_env or {})
         self.proof = self.path / ("missing/proof.json" if bad_output else "proof.json")
-        return subprocess.run([str(self.binary), "key", "witness", str(self.proof),
-                               str(self.path / "public.json"), reps,
-                               str(self.path / "vkey.json")], env=env,
-                              capture_output=True, text=True, timeout=10)
+        args = [str(self.binary), "key", "witness", str(self.proof),
+                str(self.path / "public.json"), reps, str(self.path / "vkey.json")]
+        self.exports = self.path / "exports"
+        if exports:
+            args.extend(["--proof-dir", str(self.exports)])
+        if bad_export == "file":
+            self.exports.write_text("not a directory")
+        elif bad_export == "output":
+            (self.exports / "proof-1.json").mkdir(parents=True)
+        elif bad_export == "collision":
+            args[3] = str(self.exports / "proof-1.json")
+        args.extend(extra_args or [])
+        return subprocess.run(args, env=env, capture_output=True, text=True, timeout=10)
 
     def test_verifies_every_repetition(self):
         result = self.run_wrapper()
@@ -133,7 +153,7 @@ void groth16_prover_destroy(void *) {
     def test_verification_is_outside_timer(self):
         result = self.run_wrapper(extra_env={"SLOW_VERIFY": "1"})
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(all(int(line.split()[2]) < 100
+        self.assertTrue(all(float(line.split()[2]) < 100
                             for line in result.stdout.splitlines()))
 
     def test_rejects_invalid_counts(self):
@@ -153,6 +173,51 @@ void groth16_prover_destroy(void *) {
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
         self.assertEqual(self.marker.read_text(), "1")
+
+    def test_exports_every_verified_repetition(self):
+        result = self.run_wrapper(exports=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for rep in range(1, 4):
+            self.assertEqual((self.exports / f"proof-{rep}.json").read_text(),
+                             f'{{"rep":{rep}}}')
+            self.assertEqual((self.exports / f"public-{rep}.json").read_text(), f"[{rep}]")
+        self.assertEqual(self.proof.read_bytes(), (self.exports / "proof-3.json").read_bytes())
+
+    def test_invalid_middle_proof_is_not_exported(self):
+        result = self.run_wrapper(exports=True, extra_env={"FAIL_REP": "2"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(len(result.stdout.splitlines()), 1)
+        self.assertTrue((self.exports / "proof-1.json").exists())
+        self.assertFalse((self.exports / "proof-2.json").exists())
+        self.assertFalse((self.exports / "public-2.json").exists())
+        self.assertFalse(self.proof.exists())
+
+    def test_bad_export_paths_fail(self):
+        for bad_export in ("file", "output", "collision"):
+            with self.subTest(bad_export=bad_export):
+                result = self.run_wrapper(exports=True, bad_export=bad_export)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+
+    def test_bad_optional_arguments_fail(self):
+        for args in (["--proof-dir"], ["--proof-dir", ""], ["--unknown", "dir"],
+                     ["--proof-dir", "dir", "extra"]):
+            with self.subTest(args=args):
+                result = self.run_wrapper(extra_args=args)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+
+    def test_reports_actual_pool_not_openmp(self):
+        result = self.run_wrapper(extra_env={"OMP_NUM_THREADS": "2"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ffiasm_pool_threads=7", result.stderr)
+        self.assertNotIn("ffiasm_pool_threads=2", result.stderr)
+
+    def test_fractional_millisecond_output(self):
+        result = self.run_wrapper(reps="1", extra_env={"SLOW_PROVE": "1"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stdout, r"^rep 1 [0-9]+\.[0-9]{6}\n$")
+        self.assertGreater(float(result.stdout.split()[2]), 1.0)
 
     def test_key_argument_is_required(self):
         result = subprocess.run([str(self.binary), "key", "witness", "p", "u", "1"],
