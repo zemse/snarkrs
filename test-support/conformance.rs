@@ -109,9 +109,6 @@ pub fn selection<'a>(
     if !matches!(work, "variable" | "constant") {
         return Err("UNAVAILABLE: select exactly one known work mode");
     }
-    if backend == "cuda" && work == "constant" {
-        return Err("UNAVAILABLE: CUDA constant work is not landed");
-    }
     if (backend == "wgpu" && !matches!(profile, "floor" | "auto"))
         || (backend != "wgpu" && profile != "none")
     {
@@ -198,7 +195,8 @@ mod tests {
         for backend in ["", "cpu,cpu", "cpu,metal", "unknown", " cpu"] {
             assert!(selection(Some(backend), Some("variable"), Some("none")).is_err());
         }
-        assert!(selection(Some("cuda"), Some("constant"), Some("none")).is_err());
+        assert!(selection(Some("cuda"), Some("constant"), Some("none")).is_ok());
+        assert!(selection(Some("cuda"), Some("constant"), Some("floor")).is_err());
         assert!(selection(Some("cpu"), Some("variable"), Some("floor")).is_err());
         assert!(selection(Some("wgpu"), Some("variable"), Some("raised")).is_err());
         assert!(selection(Some("cpu"), Some("other"), Some("none")).is_err());

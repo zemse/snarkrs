@@ -324,11 +324,9 @@ struct ProveOpts {
     /// --self-verify false or --backend cpu.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     fallback: bool,
-    /// MSMs whose cost follows the key and not the witness, so proving time does not
-    /// reveal how many witness entries are zero or one (the timing channel USENIX
-    /// Security 2020 used on Zcash). From 2.5% (cpu), 26% (metal) or 55% (wgpu) slower
-    /// on a dense circuit to 4x (cpu), 6x (metal) or 10x (wgpu) on a bit-heavy one. cpu,
-    /// metal and wgpu backends.
+    /// Fix scalar-dependent MSM sizing and disable zero/one fast paths. cpu, metal,
+    /// wgpu and cuda backends. Slower by a circuit-dependent amount; this is not a
+    /// constant-time guarantee.
     #[arg(long)]
     constant_work: bool,
 }

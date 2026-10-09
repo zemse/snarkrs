@@ -10,9 +10,19 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 fn artifact(name: &str) -> Option<PathBuf> {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../bench/artifacts")
+    let root = std::env::var_os("G16_ARTIFACTS");
+    let dir = root
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/artifacts"))
         .join(name);
+    if root.is_some() {
+        assert!(
+            dir.join("circuit.zkey").is_file(),
+            "missing fixture: {}",
+            dir.display()
+        );
+    }
     dir.join("circuit.zkey").is_file().then_some(dir)
 }
 
@@ -149,10 +159,9 @@ fn join(head: &[u8], sections: &[(u32, Vec<u8>)]) -> Vec<u8> {
     out
 }
 
-/// `--constant-work` proves and verifies on the cpu, on wgpu and on metal, and cuda
-/// refuses it rather than proving in variable time under a flag that says otherwise.
+/// `--constant-work` proves without fallback on every enabled backend.
 #[test]
-fn constant_work_proves_on_the_cpu_wgpu_and_metal_and_is_refused_on_cuda() {
+fn constant_work_proves_on_every_enabled_backend() {
     let Some(tiny) = artifact("tiny_mul") else {
         eprintln!("SKIPPED constant_work: no tiny_mul");
         return;
@@ -165,7 +174,13 @@ fn constant_work_proves_on_the_cpu_wgpu_and_metal_and_is_refused_on_cuda() {
             .arg(tiny.join("circuit.wtns"))
             .arg(out.join("proof.json"))
             .arg(out.join("public.json"))
-            .args(["--constant-work", "--backend", backend])
+            .args([
+                "--constant-work",
+                "--backend",
+                backend,
+                "--fallback",
+                "false",
+            ])
             .arg("--vkey")
             .arg(tiny.join("vkey.json"))
             .output()
@@ -178,19 +193,24 @@ fn constant_work_proves_on_the_cpu_wgpu_and_metal_and_is_refused_on_cuda() {
     if cfg!(feature = "metal") {
         proves.push("metal");
     }
+    if cfg!(feature = "cuda") {
+        proves.push("cuda");
+    }
     for backend in proves {
         let o = run(backend);
         assert!(o.status.success(), "{backend}: {}", said(&o));
         std::fs::remove_file(out.join("proof.json")).unwrap();
     }
 
-    let o = run("cuda");
-    assert_eq!(o.status.code(), Some(1), "cuda: {}", said(&o));
-    assert!(
-        said(&o).contains("cpu, metal and wgpu backends only"),
-        "{}",
-        said(&o)
-    );
-    assert!(!out.join("proof.json").exists());
+    if !cfg!(feature = "cuda") {
+        let o = run("cuda");
+        assert_eq!(o.status.code(), Some(1), "cuda: {}", said(&o));
+        assert!(
+            said(&o).contains("WITHOUT the `cuda` feature"),
+            "{}",
+            said(&o)
+        );
+        assert!(!out.join("proof.json").exists());
+    }
     std::fs::remove_dir_all(&out).ok();
 }
