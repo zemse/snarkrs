@@ -186,11 +186,12 @@ def launch(box, args):
         raise RuntimeError(f"{box.itype} is not offered in {REGION}")
     subnets = {s["AvailabilityZone"]: s["SubnetId"] for s in
                aws("ec2", "describe-subnets", "--filters", "Name=default-for-az,Values=true")["Subnets"]}
-    ami = ubuntu_ami(box.arch)
+    # `ami` and `name` are set by drivers that reuse this launcher (bench/aws/arkab-ec2.py).
+    ami = getattr(args, "ami", None) or ubuntu_ami(box.arch)
     # The guest hard cap: shutdown with terminate behaviour ends the instance.
     user_data = f"#!/bin/bash\nshutdown -h +{args.max_minutes}\n"
     tags = (f"ResourceType=instance,Tags=[{{Key=Owner,Value={OWNER}}},"
-            f"{{Key=Name,Value=g16-matrix-{box.itype}-EPHEMERAL}}]")
+            f"{{Key=Name,Value={getattr(args, 'name', 'g16-matrix')}-{box.itype}-EPHEMERAL}}]")
     last = None
     for z in zones:
         if z not in subnets:
