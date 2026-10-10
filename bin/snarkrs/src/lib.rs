@@ -15,6 +15,32 @@ pub mod log;
 use anyhow::Result;
 use snarkrs_groth16::{cpu::CpuBackend, Backend};
 
+/// Whether CPUID reports BMI2 (leaf 7 EBX bit 8) and ADX (bit 19), given the highest
+/// basic leaf and leaf 7 subleaf 0's EBX.
+pub fn adx_bmi2(max_leaf: u32, leaf7_ebx: u32) -> bool {
+    max_leaf >= 7 && leaf7_ebx & (1 << 8) != 0 && leaf7_ebx & (1 << 19) != 0
+}
+
+/// Whether this CPU has ADX and BMI2. Raw CPUID, because `is_x86_feature_detected!` folds to
+/// `true` when the feature is enabled at compile time, which is exactly the build that asks.
+#[cfg(target_arch = "x86_64")]
+// Older toolchains declare the cpuid intrinsics unsafe and newer ones do not.
+#[allow(unused_unsafe)]
+pub fn cpu_has_adx_bmi2() -> bool {
+    use std::arch::x86_64::{__cpuid, __cpuid_count};
+    // SAFETY: every x86_64 CPU has CPUID, and leaf 7 is read only when leaf 0 lists it.
+    let (max_leaf, leaf7_ebx) = unsafe {
+        let max_leaf = __cpuid(0).eax;
+        let ebx = if max_leaf >= 7 {
+            __cpuid_count(7, 0).ebx
+        } else {
+            0
+        };
+        (max_leaf, ebx)
+    };
+    adx_bmi2(max_leaf, leaf7_ebx)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum BackendKind {
     Cpu,
@@ -227,6 +253,28 @@ mod tests {
     #[test]
     fn cpu_backend_is_always_available() {
         assert_eq!(make_backend(BackendKind::Cpu).unwrap().name(), "cpu");
+    }
+
+    #[test]
+    fn adx_bmi2_needs_both_bits_and_leaf_7() {
+        let both = (1 << 8) | (1 << 19);
+        assert!(adx_bmi2(7, both));
+        assert!(adx_bmi2(0x20, both | 0xffff_0000));
+        assert!(!adx_bmi2(6, both), "leaf 7 is garbage below max leaf 7");
+        assert!(!adx_bmi2(7, 1 << 8), "bmi2 alone (x86-64-v3)");
+        assert!(!adx_bmi2(7, 1 << 19), "adx alone");
+        assert!(!adx_bmi2(7, !both));
+    }
+
+    /// The machine running the tests built this binary, so a `+adx,+bmi2` build must see both.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "adx",
+        target_feature = "bmi2"
+    ))]
+    #[test]
+    fn adx_bmi2_build_runs_on_a_cpu_with_both() {
+        assert!(cpu_has_adx_bmi2());
     }
 
     /// Every backend has a spelling in the CSV and on the command line, and they have to be

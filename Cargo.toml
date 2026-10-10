@@ -44,8 +44,8 @@ ark-bn254    = { version = "0.5", default-features = false, features = ["curve"]
 # the Montgomery multiply is generic Rust, which is part of why profiling ranks field
 # arithmetic so high on the Mac. And ark-ff 0.5 also requires `target_feature = "bmi2"`
 # and `"adx"` (montgomery_backend.rs:157-160), neither of which is in the baseline
-# x86-64 target, and this repo sets no `target-cpu`, so the EC2 boxes were not running
-# the assembly either. See the entry in TASKS.local.md before quoting any x86 CPU row.
+# x86-64 target, and ark-bn254's derived MontConfig never reaches it even with both: see
+# crates/field/Cargo.toml before quoting any x86 CPU row as an assembly number.
 ark-ff       = { version = "0.5", default-features = false }
 ark-ec       = { version = "0.5", default-features = false }
 ark-serialize = { version = "0.5", default-features = false }

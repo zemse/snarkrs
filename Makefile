@@ -60,6 +60,13 @@ export SOURCE_DATE_EPOCH
 RELEASE_RUSTFLAGS = --remap-path-prefix=$(CURDIR)=/snarkrs --remap-path-prefix=$(CARGO_HOME)=/cargo \
 	--remap-path-prefix=$$(rustc +$(RUST_TOOLCHAIN) --print sysroot)/lib/rustlib/src/rust=/rustc/$$(rustc +$(RUST_TOOLCHAIN) -vV | sed -n 's/^commit-hash: //p')
 
+# x86_64 builds get bmi2 and adx, which the x86_64 baseline lacks (x86-64-v3 adds bmi2, not
+# adx). bmi2 lets LLVM use mulx in the field multiply; adx is what ark-ff's assembly multiply
+# needs, though BN254 does not reach it yet (crates/field/Cargo.toml). The floor is Broadwell
+# or Zen, and `main` checks CPUID and refuses to start on an older CPU rather than dying on
+# an illegal instruction. aarch64 gets nothing extra.
+TARGET_RUSTFLAGS = $(if $(findstring x86_64,$(TARGET)), -C target-feature=+adx$(comma)+bmi2)
+
 # The workspace version, as a shell command. Inline rather than a recursive $(MAKE), whose
 # "Entering directory" lines Make 3.81 prints even under -s. Plain `cargo`, because reading
 # a manifest needs no particular toolchain and the CI plan job never installs the pinned one.
@@ -102,7 +109,7 @@ check-tag:
 release-build:
 	@test -n "$(TARGET)" || { echo "usage: make release-build TARGET=<triple>"; exit 2; }
 	rustup toolchain install $(RUST_TOOLCHAIN) --profile minimal --target $(TARGET) --no-self-update
-	RUSTFLAGS="$(RELEASE_RUSTFLAGS)" CARGO_TARGET_DIR=$(BUILD_DIR) \
+	RUSTFLAGS="$(RELEASE_RUSTFLAGS)$(TARGET_RUSTFLAGS)" CARGO_TARGET_DIR=$(BUILD_DIR) \
 		$(CARGO) build --release --locked -p snarkrs --bin snarkrs --target $(TARGET) --features $(FEATURES)
 	mkdir -p $(DIST)
 	$(PYTHON) -c "$$PACKAGE_PY" $(DIST)/$(ARCHIVE).tar.xz $(ARCHIVE) \

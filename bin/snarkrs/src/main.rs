@@ -572,6 +572,18 @@ enum FileCmd {
 }
 
 fn main() -> ExitCode {
+    // A `+adx,+bmi2` build runs mulx everywhere; say so instead of dying on SIGILL.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "adx",
+        target_feature = "bmi2"
+    ))]
+    if !snarkrs_cli::cpu_has_adx_bmi2() {
+        log::error(
+            "this snarkrs build needs a CPU with ADX and BMI2 (Intel Broadwell, AMD Zen or newer)",
+        );
+        return ExitCode::FAILURE;
+    }
     let line = match cli::normalise(std::env::args_os()) {
         Parsed::Clap(line) => line,
         Parsed::Help => {

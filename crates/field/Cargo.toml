@@ -31,10 +31,14 @@ thiserror.workspace = true
 # target_arch = "x86_64")` (montgomery_backend.rs:157-160, 230-240), and bmi2 and adx are
 # Haswell and Broadwell era features that are NOT in the default x86-64 baseline. Checked:
 # `rustc --print cfg --target x86_64-unknown-linux-gnu` reports only fxsr, sse and sse2,
-# while adding `-C target-cpu=broadwell` is what makes bmi2 and adx appear. We set no
-# RUSTFLAGS and no target-cpu anywhere in this repo, so the asm path has been compiled out
-# on the x86_64 boxes in PERFORMANCE.md just as it has on this M2 Max. Turning it on means
-# building with `-C target-cpu=native` (or `+bmi2,+adx`) as well, and that is a separate,
-# unmeasured change.
+# while adding `-C target-cpu=broadwell` is what makes bmi2 and adx appear.
+#
+# And even with both on, BN254 never runs the assembly. ark-bn254 0.5 derives its
+# `MontConfig`, and the derive (ark-ff-macros montgomery/mul.rs, square.rs) overrides
+# `mul_assign` and `square_in_place` with a copy of that cfg, which then reads
+# `feature = "asm"` of ark-bn254, a crate with no such feature. Checked: an x86_64 build
+# with `+adx,+bmi2` has no adcx/adox at all; passing `--cfg feature="asm"` to ark-bn254 alone
+# gives about 15k. The x86_64 release builds set `+adx,+bmi2` (`TARGET_RUSTFLAGS` in the
+# Makefile), which buys LLVM's mulx in the generic multiply and nothing more.
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 ark-ff = { workspace = true, features = ["asm"] }
