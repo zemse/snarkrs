@@ -2,8 +2,9 @@
 """CPU prover vs rapidsnark across EC2 instance types, one disposable instance per run.
 
     matrix.py prep --out target/matrix/bundle
+    matrix.py prep --arch arm64 --out target/matrix/bundle-arm64
     matrix.py run --instance-type c6i.2xlarge --bundle target/matrix/bundle \
-        --results target/matrix/results --summary target/matrix/summary/c6i.2xlarge.json
+        --arm64-bundle target/matrix/bundle-arm64 --results target/matrix/results --summary target/matrix/summary/c6i.2xlarge.json
 
 `run` launches a tagged instance that terminates itself on shutdown, arms a guest
 shutdown at the hard cap plus an AWS scheduler stop as a backstop, uploads the bundle,
@@ -35,9 +36,10 @@ KEY_NAME = "agent-us-east-1"
 KEY = Path.home() / ".claude/skills/aws/keys/agent-us-east-1.pem"
 SG = "sg-0123456789abcdef0"
 STOP_ROLE = "arn:aws:iam::123456789012:role/g16-benchmark-stop"
-# Canonical's Ubuntu 22.04 amd64 images.
+# Canonical's Ubuntu images: 22.04 on x86, 24.04 on Graviton, whose bundle is built on 24.04.
 UBUNTU_OWNER = "099720109477"
-UBUNTU_NAME = "ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"
+UBUNTU_NAME = {"x86_64": "ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*",
+               "arm64": "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-arm64-server-*"}
 SNARKJS = Path.home() / "Library/pnpm/snarkjs"
 
 CIRCUITS = [
@@ -54,10 +56,19 @@ CIRCUITS = [
 CIRCUIT_FILES = ["circuit.zkey", "circuit.wtns", "vkey.json", "public.json", "r1cs-info.txt"]
 BUILD = REPO / "target/matrix/build"
 BINARIES = {
-    "snarkrs-adx": BUILD / "adx/x86_64-unknown-linux-gnu/release/snarkrs",
-    "snarkrs-generic": BUILD / "generic/x86_64-unknown-linux-gnu/release/snarkrs",
-    "rapidsnark-warm": REPO / "target/cpu-x86-campaign/rapidsnark-bundle/bin/rapidsnark-warm",
+    "x86_64": {
+        "snarkrs-adx": BUILD / "adx/x86_64-unknown-linux-gnu/release/snarkrs",
+        "snarkrs-generic": BUILD / "generic/x86_64-unknown-linux-gnu/release/snarkrs",
+        "rapidsnark-warm": REPO / "target/cpu-x86-campaign/rapidsnark-bundle/bin/rapidsnark-warm",
+    },
+    "arm64": {
+        "snarkrs-arm64": BUILD / "arm64/release/snarkrs",
+        "rapidsnark-warm": BUILD / "rapidsnark-arm64/bin/rapidsnark-warm",
+    },
 }
+FLAGS = {"x86_64": {"snarkrs-adx": "-C target-feature=+adx,+bmi2", "snarkrs-generic": ""},
+         "arm64": {"snarkrs-arm64": "native aarch64-linux build on Ubuntu 24.04, no target flags"}}
+ISA_FLAGS = ["adx", "bmi2", "avx2", "avx512f", "avx512ifma", "asimd", "sve", "sve2", "i8mm"]
 
 
 def say(msg):
@@ -95,9 +106,8 @@ def prep(args):
     (out / "bin").mkdir(parents=True)
     manifest = {"source": sh(["git", "-C", str(REPO), "rev-parse", "HEAD"]).stdout.strip(),
                 "dirty": bool(sh(["git", "-C", str(REPO), "status", "--porcelain", "--", "crates", "bin", "Cargo.toml", "Cargo.lock"]).stdout.strip()),
-                "flags": {"snarkrs-adx": "-C target-feature=+adx,+bmi2", "snarkrs-generic": ""},
-                "files": {}}
-    for name, src in BINARIES.items():
+                "arch": args.arch, "flags": FLAGS[args.arch], "files": {}}
+    for name, src in BINARIES[args.arch].items():
         shutil.copy2(src, out / "bin" / name)
         os.chmod(out / "bin" / name, 0o755)
     shutil.copy2(REPO / "bench/aws/matrix-guest.sh", out / "matrix-guest.sh")
@@ -120,6 +130,7 @@ class Box:
     def __init__(self, itype, results):
         self.itype = itype
         self.results = results
+        self.arch = None
         self.id = None
         self.ip = None
         self.schedule = None
@@ -135,9 +146,15 @@ class Box:
                 "-o", "BatchMode=yes"]
 
 
-def ubuntu_ami():
+def arch_of(itype):
+    archs = aws("ec2", "describe-instance-types", "--instance-types", itype)["InstanceTypes"][0][
+        "ProcessorInfo"]["SupportedArchitectures"]
+    return "arm64" if "arm64" in archs else "x86_64"
+
+
+def ubuntu_ami(arch):
     imgs = aws("ec2", "describe-images", "--owners", UBUNTU_OWNER,
-               "--filters", f"Name=name,Values={UBUNTU_NAME}", "Name=state,Values=available")
+               "--filters", f"Name=name,Values={UBUNTU_NAME[arch]}", "Name=state,Values=available")
     return max(imgs["Images"], key=lambda i: i["CreationDate"])["ImageId"]
 
 
@@ -149,7 +166,7 @@ def launch(box, args):
         raise RuntimeError(f"{box.itype} is not offered in {REGION}")
     subnets = {s["AvailabilityZone"]: s["SubnetId"] for s in
                aws("ec2", "describe-subnets", "--filters", "Name=default-for-az,Values=true")["Subnets"]}
-    ami = ubuntu_ami()
+    ami = ubuntu_ami(box.arch)
     # The guest hard cap: shutdown with terminate behaviour ends the instance.
     user_data = f"#!/bin/bash\nshutdown -h +{args.max_minutes}\n"
     tags = (f"ResourceType=instance,Tags=[{{Key=Owner,Value={OWNER}}},"
@@ -194,7 +211,8 @@ def wait_ready(box):
     say(f"running at {box.ip}; waiting for the console host key")
     # The host key comes from the console log, not from whoever answers on port 22.
     want = None
-    deadline = time.time() + 900
+    # Bare-metal hosts take far longer to post than VMs.
+    deadline = time.time() + (2400 if ".metal" in box.itype else 900)
     while time.time() < deadline and want is None:
         out = aws("ec2", "get-console-output", "--instance-id", box.id, "--latest", check=False)
         text = out.get("Output", "") if isinstance(out, dict) else ""
@@ -204,7 +222,7 @@ def wait_ready(box):
         else:
             time.sleep(15)
     if want is None:
-        raise RuntimeError("no ED25519 host key fingerprint in the console log within 15 minutes")
+        raise RuntimeError("no ED25519 host key fingerprint in the console log in time")
     while True:
         k = sh(["ssh-keyscan", "-T", "10", "-t", "ed25519", box.ip], check=False).stdout
         if k.strip():
@@ -308,7 +326,8 @@ def median(xs):
 
 def summarise(box, args, guest_failed):
     g = box.results / "guest/results"
-    flags = next((l for l in (g / "cpuinfo.txt").read_text().splitlines() if l.startswith("flags")), "").split()
+    flags = next((l.split(":", 1)[1] for l in (g / "cpuinfo.txt").read_text().splitlines()
+                  if l.startswith(("flags", "Features"))), "").split()
     model = next((l.split(":", 1)[1].strip() for l in (g / "lscpu.txt").read_text().splitlines()
                   if l.startswith("Model name")), "?")
     lscpu = {l.split(":", 1)[0].strip(): l.split(":", 1)[1].strip()
@@ -318,7 +337,7 @@ def summarise(box, args, guest_failed):
         "logical_cpus": int((g / "nproc.txt").read_text()),
         "threads_per_core": lscpu.get("Thread(s) per core"), "sockets": lscpu.get("Socket(s)"),
         "numa_nodes": lscpu.get("NUMA node(s)"), "l3": lscpu.get("L3 cache"),
-        "isa": {f: f in flags for f in ["adx", "bmi2", "avx2", "avx512f", "avx512ifma"]},
+        "arch": box.arch, "isa": {f: f in flags for f in ISA_FLAGS},
         "build": (g / "build.txt").read_text().strip(), "reps": args.reps,
         "bundle": json.loads((box.results / "guest/manifest.json").read_text())["source"],
         "guest_failed": guest_failed, "circuits": {},
@@ -374,13 +393,17 @@ def summarise(box, args, guest_failed):
 
 
 def run(args):
-    bundle = Path(args.bundle).resolve()
+    arch = arch_of(args.instance_type)
+    bundle = Path(args.arm64_bundle if arch == "arm64" else args.bundle or "").resolve()
     if not (bundle / "manifest.json").exists():
         sys.exit(f"{bundle} is not a prepared bundle")
+    if json.loads((bundle / "manifest.json").read_text()).get("arch", "x86_64") != arch:
+        sys.exit(f"{bundle} is not an {arch} bundle")
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     results = Path(args.results).resolve() / f"{args.instance_type}-{stamp}"
     results.mkdir(parents=True)
     box = Box(args.instance_type, results)
+    box.arch = arch
     guest_failed = None
     try:
         launch(box, args)
@@ -414,9 +437,11 @@ def main():
     sub = p.add_subparsers(dest="cmd", required=True)
     a = sub.add_parser("prep")
     a.add_argument("--out", required=True)
+    a.add_argument("--arch", choices=list(BINARIES), default="x86_64")
     b = sub.add_parser("run")
     b.add_argument("--instance-type", required=True)
-    b.add_argument("--bundle", required=True)
+    b.add_argument("--bundle", help="x86_64 bundle")
+    b.add_argument("--arm64-bundle", help="arm64 bundle, used for Graviton types")
     b.add_argument("--results", required=True, help="parent directory; each run gets a fresh subdirectory")
     b.add_argument("--summary", required=True, help="JSON file to write")
     b.add_argument("--reps", type=int, default=10)

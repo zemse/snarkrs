@@ -30,7 +30,9 @@ uname -a > "$out/uname.txt"
 cp /etc/os-release "$out/os-release.txt"
 
 flags=$(grep -m1 '^flags' /proc/cpuinfo)
-if [[ " $flags " == *" adx "* && " $flags " == *" bmi2 "* ]]; then
+if [[ $(uname -m) == aarch64 ]]; then
+  build=arm64
+elif [[ " $flags " == *" adx "* && " $flags " == *" bmi2 "* ]]; then
   build=adx
 else
   build=generic

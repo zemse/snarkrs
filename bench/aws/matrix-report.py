@@ -12,6 +12,8 @@ circuits = list(summaries[0]["circuits"]) if summaries else []
 
 def isa(s):
     i = s["isa"]
+    if s.get("arch") == "arm64":
+        return "SVE2" if i.get("sve2") else "SVE" if i.get("sve") else "NEON only"
     if i["avx512ifma"]:
         return "AVX-512 IFMA"
     if i["avx512f"]:
