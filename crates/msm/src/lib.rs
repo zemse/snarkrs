@@ -747,9 +747,8 @@ fn window_chunk_batch<P: RawCurve>(
     fill.finish()
 }
 
-/// A per-group replacement for [`window_chunk_batch`], prepared once per MSM. Only G1 on
-/// an x86_64 with AVX-512 IFMA has one (see [`ifma`]); everything else keeps the portable
-/// fill.
+/// A per-group replacement for [`window_chunk_batch`], prepared once per MSM. Only an
+/// x86_64 with AVX-512 IFMA has one (see `ifma`); everything else keeps the portable fill.
 trait FastFill: RawCurve {
     /// Whatever the replacement needs per MSM, built from the prescan.
     type Prepared: Sync;
@@ -789,9 +788,10 @@ macro_rules! no_fast_fill {
     };
 }
 
-no_fast_fill!(snarkrs_field::g2::Config);
 #[cfg(not(target_arch = "x86_64"))]
 no_fast_fill!(snarkrs_field::g1::Config);
+#[cfg(not(target_arch = "x86_64"))]
+no_fast_fill!(snarkrs_field::g2::Config);
 
 #[cfg(target_arch = "x86_64")]
 mod ifma;

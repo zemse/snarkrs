@@ -7,7 +7,7 @@ use crate::{window_chunk_batch, CpuMsm, MsmBackend, RECODE_BITS};
 use ark_ec::{CurveGroup, VariableBaseMSM};
 use ark_ff::{PrimeField, Zero};
 use ark_std::{rand::Rng, test_rng, UniformRand};
-use snarkrs_field::{Fr, G1Projective};
+use snarkrs_field::Fr;
 
 fn skip() -> bool {
     if available() {
@@ -84,7 +84,7 @@ fn field_ops_match_ark() {
                 };
             }
             if a.iter().all(|x| !x.is_zero()) {
-                assert_eq!(unlanes(&invert_lanes(&va)), inv);
+                assert_eq!(unlanes(&va.invert()), inv);
             }
         }
     }
@@ -104,18 +104,52 @@ fn field_ops_match_ark() {
     assert_eq!(unlanes(&va), want);
 }
 
-fn walk(n: usize, rng: &mut impl Rng) -> Vec<G1Affine> {
-    let step = G1Projective::rand(rng);
-    let mut cur = G1Projective::rand(rng);
+/// Karatsuba, the lane inversion and the domain round trip for Fq2, against ark.
+#[test]
+fn fq2_lanes_match_ark() {
+    if skip() {
+        return;
+    }
+    let mut rng = test_rng();
+    for round in 0..512 {
+        let mut a: [Fq2; 8] = core::array::from_fn(|_| Fq2::rand(&mut rng));
+        let b: [Fq2; 8] = core::array::from_fn(|_| Fq2::rand(&mut rng));
+        if round == 0 {
+            // A zero component, as a G2 coordinate can have.
+            a[1] = Fq2::new(Fq::ZERO, Fq::ONE);
+            a[2] = Fq2::new(-Fq::ONE, Fq::ZERO);
+        }
+        let raw = |x: &[Fq2; 8]| x.map(|e| RawFq2::from_fq2(&e));
+        unsafe {
+            let (va, vb) = (V2::enter(&raw(&a)), V2::enter(&raw(&b)));
+            assert_eq!(va.leave(), raw(&a));
+            let want = |f: fn(Fq2, Fq2) -> Fq2| -> [RawFq2; 8] {
+                core::array::from_fn(|l| RawFq2::from_fq2(&f(a[l], b[l])))
+            };
+            assert_eq!(va.mul(&vb).leave(), want(|x, y| x * y));
+            assert_eq!(va.add(&vb).leave(), want(|x, y| x + y));
+            assert_eq!(va.sub(&vb).leave(), want(|x, y| x - y));
+            assert_eq!(va.sub(&va).is_zero(), 0xff);
+            assert_eq!(va.invert().leave(), raw(&a.map(|x| x.inverse().unwrap())));
+        }
+    }
+}
+
+fn walk<P: RawCurve>(n: usize, rng: &mut impl Rng) -> Vec<Affine<P>>
+where
+    Projective<P>: UniformRand,
+{
+    let step = Projective::<P>::rand(rng);
+    let mut cur = Projective::<P>::rand(rng);
     let mut proj = Vec::with_capacity(n);
     for _ in 0..n {
         proj.push(cur);
         cur += &step;
     }
-    G1Projective::normalize_batch(&proj)
+    Projective::normalize_batch(&proj)
 }
 
-fn scan_of(scalars: &[Fr]) -> Prescan<G1> {
+fn scan_of<P: RawCurve>(scalars: &[Fr]) -> Prescan<P> {
     Prescan {
         idx: (0..scalars.len() as u32).collect(),
         bigints: scalars.iter().map(|s| s.into_bigint()).collect(),
@@ -124,16 +158,16 @@ fn scan_of(scalars: &[Fr]) -> Prescan<G1> {
 }
 
 /// Every window at every `c`, whole range and an offset sub-range, both work modes.
-fn chunks_agree(bases: &[G1Affine], scalars: &[Fr], cs: &[u32]) -> usize {
-    let scan = scan_of(scalars);
-    let prep = G1::prepare(bases, &scan).expect("IFMA is available");
+fn chunks_agree<P: FastFill>(bases: &[Affine<P>], scalars: &[Fr], cs: &[u32]) -> usize {
+    let scan = scan_of::<P>(scalars);
+    let prep = P::prepare(bases, &scan).expect("IFMA is available");
     let n = bases.len();
     let mut checked = 0;
     for &c in cs {
         for w in 0..RECODE_BITS.div_ceil(c as usize) {
             for (range, work) in [(0..n, Work::Variable), (n / 3..n, Work::Constant)] {
                 assert_eq!(
-                    G1::window_chunk(&prep, bases, &scan, range.clone(), w, c, work),
+                    P::window_chunk(&prep, bases, &scan, range.clone(), w, c, work),
                     window_chunk_batch(bases, &scan, range, w, c, work),
                     "window {w} at c = {c}"
                 );
@@ -144,33 +178,48 @@ fn chunks_agree(bases: &[G1Affine], scalars: &[Fr], cs: &[u32]) -> usize {
     checked
 }
 
-#[test]
-fn fill_matches_the_portable_fill() {
-    if skip() {
-        return;
-    }
+fn random_chunks<P: FastFill>(cs: core::ops::RangeInclusive<u32>) -> usize
+where
+    Projective<P>: UniformRand,
+{
     let mut rng = test_rng();
     let mut checked = 0;
-    for c in 9u32..=15 {
+    for c in cs {
         // Enough points per bucket that every window flushes several full rounds.
         let n = 3 << (c - 1);
-        let bases = walk(n, &mut rng);
+        let bases = walk::<P>(n, &mut rng);
         let scalars: Vec<Fr> = (0..n).map(|_| Fr::rand(&mut rng)).collect();
         checked += chunks_agree(&bases, &scalars, &[c]);
     }
-    eprintln!("ifma: {checked} random window chunks agree");
+    checked
+}
+
+#[test]
+fn fill_matches_the_portable_fill_g1() {
+    if skip() {
+        return;
+    }
+    let checked = random_chunks::<G1>(9..=15);
+    eprintln!("ifma: {checked} random G1 window chunks agree");
+}
+
+#[test]
+fn fill_matches_the_portable_fill_g2() {
+    if skip() {
+        return;
+    }
+    let checked = random_chunks::<G2>(9..=13);
+    eprintln!("ifma: {checked} random G2 window chunks agree");
 }
 
 /// Doublings, cancellations, a hot bucket and zero digits, at the narrowest and the
 /// widest batched window.
-#[test]
-fn fill_matches_on_degenerate_digits() {
-    if skip() {
-        return;
-    }
+fn degenerate<P: FastFill>(n: usize, cs: &[u32]) -> usize
+where
+    Projective<P>: UniformRand,
+{
     let mut rng = test_rng();
-    let n = 4000;
-    let mut bases = walk(n, &mut rng);
+    let mut bases = walk::<P>(n, &mut rng);
     let mut s: Vec<Fr> = (0..n).map(|_| Fr::rand(&mut rng)).collect();
     for i in 0..n / 4 {
         // One point under one scalar: every window funnels into a single bucket, all
@@ -202,22 +251,39 @@ fn fill_matches_on_degenerate_digits() {
     for si in s.iter_mut().skip(n - 400).take(100) {
         *si = Fr::from(3u64);
     }
-    let checked = chunks_agree(&bases, &s, &[9, 10, 12, 15]);
+    let checked = chunks_agree(&bases, &s, cs);
 
     // All-equal scalars over distinct bases, and a single hot bucket.
     let k = Fr::rand(&mut rng);
     let eq = vec![k; n];
-    let distinct = walk(n, &mut rng);
-    let checked = checked + chunks_agree(&distinct, &eq, &[9, 13]);
+    let distinct = walk::<P>(n, &mut rng);
+    let checked = checked + chunks_agree(&distinct, &eq, &cs[..1]);
     let hot = vec![distinct[0]; n];
-    let checked = checked + chunks_agree(&hot, &eq, &[9, 13]);
-    eprintln!("ifma: {checked} degenerate window chunks agree");
+    checked + chunks_agree(&hot, &eq, &cs[..1])
 }
 
-/// End to end through `msm_g1`, which dispatches here, against arkworks: the first
-/// lengths at c = 9, 12 and 15, bases at infinity, and constant work.
 #[test]
-fn msm_g1_matches_arkworks() {
+fn fill_matches_on_degenerate_digits_g1() {
+    if skip() {
+        return;
+    }
+    let checked = degenerate::<G1>(4000, &[9, 10, 12, 15]);
+    eprintln!("ifma: {checked} degenerate G1 window chunks agree");
+}
+
+#[test]
+fn fill_matches_on_degenerate_digits_g2() {
+    if skip() {
+        return;
+    }
+    let checked = degenerate::<G2>(2000, &[9, 13]);
+    eprintln!("ifma: {checked} degenerate G2 window chunks agree");
+}
+
+/// End to end through `msm_g1`/`msm_g2`, which dispatch here, against arkworks: the
+/// first lengths at c = 9, 12 and 15, bases at infinity, and constant work.
+#[test]
+fn msm_matches_arkworks() {
     if skip() {
         return;
     }
@@ -225,18 +291,33 @@ fn msm_g1_matches_arkworks() {
     // Every 7th base is infinity, so `m = n - ceil(n / 7)` sets the window.
     for (n, c) in [(3_884usize, 9u32), (38_230, 12), (305_838, 15)] {
         assert_eq!(crate::window_size(n - n.div_ceil(7)), c, "n = {n}");
-        let mut bases = walk(n, &mut rng);
-        for i in (0..n).step_by(7) {
-            bases[i] = G1Affine::identity();
-        }
         let scalars: Vec<Fr> = (0..n).map(|_| Fr::rand(&mut rng)).collect();
-        let want = G1Projective::msm(&bases, &scalars).unwrap();
-        assert_eq!(CpuMsm::new().msm_g1(&bases, &scalars), want, "n = {n}");
+        let mut g1 = walk::<G1>(n, &mut rng);
+        for i in (0..n).step_by(7) {
+            g1[i] = Affine::identity();
+        }
+        let want = Projective::<G1>::msm(&g1, &scalars).unwrap();
+        assert_eq!(CpuMsm::new().msm_g1(&g1, &scalars), want, "G1 n = {n}");
         assert_eq!(
-            CpuMsm::constant_work().msm_g1(&bases, &scalars),
+            CpuMsm::constant_work().msm_g1(&g1, &scalars),
             want,
-            "n = {n}, constant work"
+            "G1 n = {n}, constant work"
+        );
+        if c > 12 {
+            // G2 at 2^18 is slow to build and to check; c = 9 and 12 cover its path.
+            continue;
+        }
+        let mut g2 = walk::<G2>(n, &mut rng);
+        for i in (0..n).step_by(7) {
+            g2[i] = Affine::identity();
+        }
+        let want = Projective::<G2>::msm(&g2, &scalars).unwrap();
+        assert_eq!(CpuMsm::new().msm_g2(&g2, &scalars), want, "G2 n = {n}");
+        assert_eq!(
+            CpuMsm::constant_work().msm_g2(&g2, &scalars),
+            want,
+            "G2 n = {n}, constant work"
         );
     }
-    eprintln!("ifma: msm_g1 agrees with arkworks at c = 9, 12, 15");
+    eprintln!("ifma: msm_g1 agrees with arkworks at c = 9, 12, 15, msm_g2 at c = 9, 12");
 }
