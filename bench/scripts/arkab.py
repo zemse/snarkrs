@@ -25,7 +25,7 @@ exits 0 and, for the verifiers, prints its OK line. Deterministic outputs (prepa
 beacons, trace) are hashed per variant and round so they can be compared byte for byte.
 Round-1 outputs worth a second verifier are kept under OUT/keep for snarkjs afterwards.
 
-With `--max-load`, each timed command waits until the one-minute load average is below it.
+With `--max-load`, each timed command waits until other processes use fewer cores than that.
 """
 
 import argparse
@@ -89,20 +89,54 @@ class Runner:
         self.failures = []
         for d in (self.out, self.tmp, self.keep):
             d.mkdir(parents=True, exist_ok=True)
+        if args.resume and (self.out / "rows.json").exists():
+            self.rows = json.loads((self.out / "rows.json").read_text())
+            self.hashes = json.loads((self.out / "hashes.json").read_text())
+            self.failures = json.loads((self.out / "failures.json").read_text())
+            say(f"resuming: {len(self.rows)} rows, {len(self.hashes)} hashes")
         self.log = open(self.out / "commands.log", "a")
+
+    def unit_done(self, rnd, v, steps, last, item=None):
+        """With --resume: whether a unit of work already finished. `last` is the step whose
+        row closes the unit. A unit cut short is forgotten, rows and hashes, and redone."""
+        if not self.a.resume:
+            return False
+        mine = [r for r in self.rows if r["round"] == rnd and r["variant"] == v and r["step"] in steps
+                and (item is None or r["item"] == item)]
+        if any(r["step"] == last and (item is not None or r["item"] == self.last_item(last)) for r in mine):
+            return True
+        if mine:
+            self.rows = [r for r in self.rows if r not in mine]
+            self.hashes = [h for h in self.hashes if not (h["round"] == rnd and h["variant"] == v and (
+                item is None and h["what"].startswith(("ptau beacon", "prepare"))
+                or item is not None and h["what"].endswith(f" {item}")))]
+            say(f"  resume: redoing round {rnd} {v} {item or 'phase 1'}")
+        return False
+
+    def last_item(self, step):
+        sizes = self.a.prepare if step == "prepare" else self.a.contribute
+        return f"2^{sizes[-1][0]}"
 
     def bin(self, v, name="snarkrs"):
         return str(Path(self.a.bin_dir) / f"{name}-{v}")
+
+    @staticmethod
+    def others_cpu():
+        """CPU in use by every other process, in cores. Not the load average, which still
+        carries this runner's own last step for a minute after it ends."""
+        r = subprocess.run(["ps", "-A", "-o", "pid=,%cpu="], capture_output=True, text=True)
+        me = os.getpid()
+        return sum(float(c) for p, c in (l.split() for l in r.stdout.splitlines()) if int(p) != me) / 100
 
     def wait_load(self):
         if self.a.max_load is None:
             return
         while True:
-            load = os.getloadavg()[0]
-            if load < self.a.max_load:
+            busy = self.others_cpu()
+            if busy < self.a.max_load:
                 return
-            say(f"  load {load:.2f} >= {self.a.max_load}, waiting")
-            time.sleep(30)
+            say(f"  other processes use {busy:.1f} cores >= {self.a.max_load}, waiting")
+            time.sleep(20)
 
     def run(self, cmd, ok_text=None, timed=True):
         """Run one command; return its wall clock in ms, or None if it failed."""
@@ -126,6 +160,8 @@ class Runner:
     def record(self, rnd, v, step, item, ms, **extra):
         row = {"round": rnd, "variant": v, "step": step, "item": item, "ms": ms,
                "load": round(os.getloadavg()[0], 2), **extra}
+        if self.a.max_load is not None:
+            row["others_cores"] = round(self.others_cpu(), 2)
         self.rows.append(row)
         self.save()
 
@@ -285,28 +321,41 @@ class Runner:
         if "proof" in steps or "verify" in steps:
             for v in a.variants:
                 for c in a.circuits:
-                    self.proof(v, c)
+                    if not (a.resume and (self.keep / v / "proofs" / c / "proof.json").exists()):
+                        self.proof(v, c)
         if "trace" in steps:
             for v in a.variants:
-                self.trace(v, a.circuits[0])
+                if not (a.resume and any(h["variant"] == v and h["what"].startswith("trace") for h in self.hashes)):
+                    self.trace(v, a.circuits[0])
         for rnd in range(1, a.rounds + 1):
             order = list(a.variants) if rnd % 2 else list(reversed(a.variants))
             say(f"round {rnd}: {' then '.join(order)}")
             if "prove" in steps:
                 for c in a.circuits:
                     for v in order:
+                        if self.unit_done(rnd, v, {"prove"}, "prove", c):
+                            continue
                         say(f"  r{rnd} prove {c} {v}")
                         self.prove(rnd, v, c)
             if "verify" in steps:
                 for v in order:
-                    self.verify(rnd, v, a.circuits)
+                    if not self.unit_done(rnd, v, {"verify"}, "verify", a.circuits[-1]):
+                        self.verify(rnd, v, a.circuits)
             if steps & {"contribute", "pverify", "prepare", "beacon"}:
+                p1 = {"contribute", "pverify", "beacon", "prepare"}
+                last = "prepare" if "prepare" in steps else "contribute"
                 for v in order:
+                    if self.unit_done(rnd, v, p1, last):
+                        continue
                     say(f"  r{rnd} phase 1 {v}")
                     self.phase1(rnd, v, steps)
             if steps & {"setup", "zcontribute", "zverify", "zbeacon"}:
                 for c in a.phase2:
+                    p2 = {"setup", "zcontribute", "zverify"}
+                    last = next(x for x in ["zverify", "zcontribute", "setup"] if x in steps)
                     for v in order:
+                        if self.unit_done(rnd, v, p2, last, c):
+                            continue
                         say(f"  r{rnd} phase 2 {c} {v}")
                         self.phase2(rnd, v, c, steps)
         say(f"done, {len(self.rows)} rows, {len(self.failures)} failures")
@@ -345,6 +394,7 @@ def main():
                    default=["proof", "trace", "prove", "verify", "contribute", "pverify", "beacon", "prepare",
                             "setup", "zcontribute", "zverify", "zbeacon"])
     p.add_argument("--max-load", type=float, default=None)
+    p.add_argument("--resume", action="store_true", help="keep OUT's rows and skip the work they cover")
     a = p.parse_args()
     a.ceremony_backend = a.ceremony_backend or a.backend
     a.prepare_backend = a.prepare_backend or a.backend

@@ -78,18 +78,21 @@ def dlami():
     return img["ImageId"], root["Ebs"]["VolumeSize"], img["Name"]
 
 
-def run_guest(box, args):
+def run_guest(box, args, variants):
     guest = " ".join(args.guest)
-    pre = ""
+    vs = " ".join(variants)
+    # field_ops twice per build first: the per-primitive check that the builds differ here.
+    pre = (f"for r in 1 2; do for v in {vs}; do echo == $v round $r; bin/field_ops-$v; done; done "
+           f"> results/field_ops.txt 2>&1; ")
     if args.warm:
         # The first NVRTC compile of a unit costs about two minutes; pay it before any timing.
-        pre = (f"for v in $(ls bin | sed -n 's/^snarkrs-//p'); do bin/snarkrs-$v groth16 prove "
-               f"artifacts/{args.warm}/circuit.zkey artifacts/{args.warm}/circuit.wtns /tmp/w.json /tmp/wp.json "
-               f"--backend cuda > results/warm-$v.log 2>&1; done; ")
+        pre += (f"for v in {vs}; do bin/snarkrs-$v groth16 prove artifacts/{args.warm}/circuit.zkey "
+                f"artifacts/{args.warm}/circuit.wtns /tmp/w.json /tmp/wp.json --backend cuda "
+                f"> results/warm-$v.log 2>&1; done; ")
     cmd = ("cd ~/m && mkdir -p results && lscpu > results/lscpu.txt && nproc > results/nproc.txt && "
            "(nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader > results/gpu.txt 2>&1 || true) && "
            f"nohup bash -c '{pre}python3 arkab.py --bin-dir bin --artifacts artifacts --ptau-dir ptau "
-           f"--out results {guest}' > guest.log 2>&1 < /dev/null &")
+           f"--variants {vs} --out results {guest}' > guest.log 2>&1 < /dev/null &")
     box.ssh(cmd)
     say(f"guest started: {guest}")
     seen = 0
@@ -132,7 +135,8 @@ def run(args):
         matrix.arm_backstop(box, args)
         matrix.wait_ready(box)
         matrix.upload(box, bundle)
-        failures = run_guest(box, args)
+        variants = list(json.loads((bundle / "manifest.json").read_text())["build"]["variants"])
+        failures = run_guest(box, args, variants)
         matrix.retrieve(box)
     except BaseException as e:
         say(f"ERROR: {e!r}")

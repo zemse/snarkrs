@@ -47,7 +47,9 @@ def fpct(p):
 
 def snarkjs(bin_, *args):
     r = subprocess.run([bin_, *map(str, args)], capture_output=True, text=True)
-    return r.returncode == 0 and "OK" in (r.stdout + r.stderr), (r.stdout + r.stderr)[-300:]
+    text = r.stdout + r.stderr
+    # "OK!" from groth16 verify, "ZKey Ok!" and "Powers of Tau Ok!" from the other two.
+    return r.returncode == 0 and ("OK!" in text or "Ok!" in text), text[-300:]
 
 
 def main():
@@ -58,18 +60,34 @@ def main():
     p.add_argument("--artifacts")
     p.add_argument("--ptau-dir")
     p.add_argument("--json")
+    p.add_argument("--more", nargs="*", default=[],
+                   help="further arkab.py output dirs of the same builds, e.g. re-runs; their rounds follow")
+    p.add_argument("--busy", type=float, default=3.0,
+                   help="a row whose others_cores reached this ran beside another job (marked *)")
+    p.add_argument("--drop-busy", action="store_true",
+                   help="drop both variants' rows of any (step, item, round) with a busy row")
     a = p.parse_args()
     out = Path(a.out)
-    rows = json.loads((out / "rows.json").read_text())
-    hashes = json.loads((out / "hashes.json").read_text())
-    failures = json.loads((out / "failures.json").read_text())
+    rows, hashes, failures = [], [], []
+    for i, d in enumerate([out, *map(Path, a.more)]):
+        for r in json.loads((d / "rows.json").read_text()):
+            rows.append({**r, "round": r["round"] + 100 * i})
+        hashes += [{**h, "round": h["round"] + 100 * i} for h in json.loads((d / "hashes.json").read_text())]
+        failures += json.loads((d / "failures.json").read_text())
+    busy = {(r["step"], r["item"], r["round"]) for r in rows if r.get("others_cores", 0) >= a.busy}
+    dropped = 0
+    if a.drop_busy:
+        dropped = len(busy)
+        rows = [r for r in rows if (r["step"], r["item"], r["round"]) not in busy]
+        busy = set()
     variants = list(dict.fromkeys(r["variant"] for r in rows))
     base, new = variants[0], variants[1]
     rounds = sorted({r["round"] for r in rows})
     by = defaultdict(list)
     for r in rows:
         by[(r["step"], r["item"], r["variant"], r["round"])].append(r)
-    summary = {"variants": variants, "rounds": rounds, "steps": {}, "failures": len(failures)}
+    summary = {"variants": variants, "rounds": rounds, "steps": {}, "failures": len(failures),
+               "busy_cells_dropped": dropped}
     lines = [f"## {a.title or out.name}\n"]
 
     for step, label in STEPS:
@@ -90,7 +108,8 @@ def main():
                     cell[v] = med([x for x in rms if x is not None])
                 per_round.append(rms)
             change = pct(cell[base], cell[new])
-            rr = " ; ".join(f"{fmt(x)} / {fmt(y)}" for x, y in zip(*per_round))
+            rr = " ; ".join(f"{fmt(x)} / {fmt(y)}" + ("*" if (step, it, r) in busy else "")
+                            for x, y, r in zip(*per_round, rounds) if x is not None or y is not None)
             lines.append(f"| {it} | {fmt(cell[base])} | {fmt(cell[new])} | {fpct(change)} | {rr} |")
             s = {v: cell[v] for v in variants}
             s["change_pct"] = change
@@ -123,6 +142,11 @@ def main():
                  f"byte-identical across variants and rounds ({sum(count.values())} files hashed)"
                  + ("" if all(d["identical"] for d in det.values()) else
                     ": DIFFER " + ", ".join(w for w, d in det.items() if not d["identical"])) + ".\n")
+    if busy:
+        lines.append(f"`*`: some row of that round ran while other processes used {a.busy:g} or more cores.\n")
+    if dropped:
+        lines.append(f"{dropped} (step, item, round) cells that ran beside another job were dropped, "
+                     "both variants.\n")
     prove_reps = sum(1 for r in rows if r["step"] == "prove")
     summary["self_verified_prove_reps"] = prove_reps
     lines.append(f"Self-verified warm proofs: {prove_reps}. Failures recorded by the runner: {len(failures)}.\n")
