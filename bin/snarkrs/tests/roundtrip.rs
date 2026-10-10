@@ -316,7 +316,8 @@ fn bench_writes_a_verified_csv() {
             "pointwise_us",
             "msm_us",
             "assemble_us",
-            "verified"
+            "verified",
+            "adx_bmi2"
         ]
     );
     let rows: Vec<Vec<&str>> = lines.map(|l| l.split(',').collect()).collect();

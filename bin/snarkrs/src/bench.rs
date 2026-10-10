@@ -26,7 +26,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
-use snarkrs_field::Fr;
+use snarkrs_field::{Fr, ADX_BMI2};
 use snarkrs_formats::{wtns::Witness, ProvingKey, VerifyingKey};
 use snarkrs_groth16::{prove::prove_unchecked, verify::verify, StageTimings};
 
@@ -68,7 +68,7 @@ pub struct Args {
     pub snarkjs: Option<PathBuf>,
 }
 
-pub const CSV_HEADER: &str = "host,os,arch,cores,variant,constraints,prover,backend,mode,rep,ms,prepare_ms,gather_us,ntt_us,pointwise_us,msm_us,assemble_us,verified";
+pub const CSV_HEADER: &str = "host,os,arch,cores,variant,constraints,prover,backend,mode,rep,ms,prepare_ms,gather_us,ntt_us,pointwise_us,msm_us,assemble_us,verified,adx_bmi2";
 
 /// One proof and what it cost. `prepare_ms` is setup only, and for a cold rep it is the
 /// part of `ms` spent before `prove()` was entered.
@@ -90,7 +90,7 @@ impl Row {
     fn to_csv(&self, host: &HostInfo) -> String {
         let t = self.timings;
         format!(
-            "{},{},{},{},{},{},ours,{},{},{},{:.3},{:.3},{},{},{},{},{},yes",
+            "{},{},{},{},{},{},ours,{},{},{},{:.3},{:.3},{},{},{},{},{},yes,{}",
             host.host,
             host.os,
             host.arch,
@@ -107,6 +107,7 @@ impl Row {
             t.pointwise_us,
             t.msm_us,
             t.assemble_us,
+            if ADX_BMI2 { "yes" } else { "no" },
         )
     }
 }
@@ -123,6 +124,8 @@ pub fn run(args: Args) -> Result<()> {
         Mode::Both => &[Mode::Cold, Mode::Warm],
     };
 
+    // Which x86 build this is, so a baseline build is never read as an adx+bmi2 one.
+    println!("adx+bmi2 build: {}", if ADX_BMI2 { "yes" } else { "no" });
     let mut rows = Vec::new();
     for v in &variants {
         let constraints = v.constraints();
@@ -472,7 +475,11 @@ mod tests {
         );
         // The stage split has to survive into the CSV, otherwise `bench` reports a total
         // with no way to see which stage owns it.
-        assert!(line.ends_with(",1,2,3,4,5,yes"), "{line}");
+        assert!(line.contains(",1,2,3,4,5,yes,"), "{line}");
+        assert!(
+            line.ends_with(if ADX_BMI2 { ",yes" } else { ",no" }),
+            "{line}"
+        );
         assert!(line.contains(",ours,cpu,warm,3,1.500,2.250,"), "{line}");
     }
 }

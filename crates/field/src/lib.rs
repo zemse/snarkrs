@@ -10,6 +10,14 @@ pub use ark_bn254::{g1, g2, Bn254, Fq, Fq2, Fr, G1Affine, G1Projective, G2Affine
 pub use ark_ec::{pairing::Pairing, AffineRepr, CurveGroup, PrimeGroup};
 pub use ark_ff::{BigInteger, FftField, Field, One, PrimeField, UniformRand, Zero};
 
+/// Whether this is an x86_64 build with `+adx,+bmi2`. That buys LLVM's mulx, not ark-ff's
+/// assembly multiply, which BN254 never reaches (see this crate's Cargo.toml).
+pub const ADX_BMI2: bool = cfg!(all(
+    target_arch = "x86_64",
+    target_feature = "adx",
+    target_feature = "bmi2"
+));
+
 /// A radix-2 evaluation domain over `Fr`.
 ///
 /// The prover needs the `size`-th roots of unity for the NTT and their inverses for the
