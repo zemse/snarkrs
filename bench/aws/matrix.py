@@ -20,6 +20,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import statistics
 import subprocess
 import sys
@@ -401,7 +402,14 @@ def run(args):
     summarise(box, args, guest_failed)
 
 
+def interrupted(signum, _frame):
+    raise KeyboardInterrupt(f"signal {signum}")
+
+
 def main():
+    # Any kill still runs `run`'s finally, which terminates the instance.
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGHUP, interrupted)
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
     a = sub.add_parser("prep")
