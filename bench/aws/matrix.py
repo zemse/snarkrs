@@ -6,11 +6,19 @@
     matrix.py run --instance-type c6i.2xlarge --bundle target/matrix/bundle \
         --arm64-bundle target/matrix/bundle-arm64 --results target/matrix/results --summary target/matrix/summary/c6i.2xlarge.json
 
+    matrix.py prep --with-asm --out target/matrix/bundle-ab
+    matrix.py run --guest ab --rounds 3 --instance-type c6a.4xlarge --bundle target/matrix/bundle-ab \
+        --results target/matrix/ab-results --summary target/matrix/ab-summary/c6a.4xlarge.json
+
 `run` launches a tagged instance that terminates itself on shutdown, arms a guest
 shutdown at the hard cap plus an AWS scheduler stop as a backstop, uploads the bundle,
 runs `matrix-guest.sh`, pulls the results back, terminates the instance in a `finally`,
 verifies every retrieved proof locally with snarkjs and writes the summary JSON.
 Nothing is compiled on the instance.
+
+`--guest ab` runs `matrix-ab-guest.sh` instead: every snarkrs build in the bundle, interleaved
+over `--rounds`, with rapidsnark once for reference. `prep --with-asm` adds the experimental
+`snarkrs-asm` build (see ASM_BUILD).
 """
 
 import argparse
@@ -68,6 +76,11 @@ BINARIES = {
 }
 FLAGS = {"x86_64": {"snarkrs-adx": "-C target-feature=+adx,+bmi2", "snarkrs-generic": ""},
          "arm64": {"snarkrs-arm64": "native aarch64-linux build on Ubuntu 24.04, no target flags"}}
+# Experimental, not a release build: `+adx,+bmi2` plus `--cfg feature="asm"` on ark-bn254 alone
+# (RUSTC_WRAPPER=bench/aws/rustc-bn254-asm.sh), the only way its derived MontConfig reaches
+# ark-ff's assembly.
+ASM_BUILD = BUILD / "asm/x86_64-unknown-linux-gnu/release/snarkrs"
+ASM_FLAGS = '-C target-feature=+adx,+bmi2, and --cfg feature="asm" for ark-bn254 only'
 ISA_FLAGS = ["adx", "bmi2", "avx2", "avx512f", "avx512ifma", "asimd", "sve", "sve2", "i8mm"]
 
 
@@ -106,11 +119,18 @@ def prep(args):
     (out / "bin").mkdir(parents=True)
     manifest = {"source": sh(["git", "-C", str(REPO), "rev-parse", "HEAD"]).stdout.strip(),
                 "dirty": bool(sh(["git", "-C", str(REPO), "status", "--porcelain", "--", "crates", "bin", "Cargo.toml", "Cargo.lock"]).stdout.strip()),
-                "arch": args.arch, "flags": FLAGS[args.arch], "files": {}}
-    for name, src in BINARIES[args.arch].items():
+                "arch": args.arch, "flags": dict(FLAGS[args.arch]), "files": {}}
+    binaries = dict(BINARIES[args.arch])
+    if args.with_asm:
+        if args.arch != "x86_64":
+            sys.exit("--with-asm is an x86_64 build")
+        binaries["snarkrs-asm"] = ASM_BUILD
+        manifest["flags"]["snarkrs-asm"] = ASM_FLAGS
+    for name, src in binaries.items():
         shutil.copy2(src, out / "bin" / name)
         os.chmod(out / "bin" / name, 0o755)
-    shutil.copy2(REPO / "bench/aws/matrix-guest.sh", out / "matrix-guest.sh")
+    for script in ["matrix-guest.sh", "matrix-ab-guest.sh"]:
+        shutil.copy2(REPO / "bench/aws" / script, out / script)
     for c in CIRCUITS:
         (out / "artifacts" / c).mkdir(parents=True)
         for f in CIRCUIT_FILES:
@@ -261,8 +281,9 @@ def upload(box, bundle):
 
 def run_guest(box, args):
     circuits = " ".join(args.circuits)
-    box.ssh(f"cd ~/m && nohup bash matrix-guest.sh /home/ubuntu/m {args.reps} {circuits} "
-            "> guest.log 2>&1 < /dev/null &")
+    guest = (f"matrix-ab-guest.sh /home/ubuntu/m {args.reps} {args.rounds}" if args.guest == "ab"
+             else f"matrix-guest.sh /home/ubuntu/m {args.reps}")
+    box.ssh(f"cd ~/m && nohup bash {guest} {circuits} > guest.log 2>&1 < /dev/null &")
     say("guest started")
     seen = 0
     deadline = time.time() + args.max_minutes * 60
@@ -322,6 +343,91 @@ def snarkjs_ok(vkey, public, proof):
 
 def median(xs):
     return round(statistics.median(xs), 3) if xs else None
+
+
+def host_summary(box, args, guest_failed):
+    g = box.results / "guest/results"
+    flags = next((l.split(":", 1)[1] for l in (g / "cpuinfo.txt").read_text().splitlines()
+                  if l.startswith(("flags", "Features"))), "").split()
+    lscpu = {l.split(":", 1)[0].strip(): l.split(":", 1)[1].strip()
+             for l in (g / "lscpu.txt").read_text().splitlines() if ":" in l}
+    return {
+        "instance_type": box.itype, "instance_id": box.id, "cpu": lscpu.get("Model name", "?"),
+        "logical_cpus": int((g / "nproc.txt").read_text()),
+        "threads_per_core": lscpu.get("Thread(s) per core"), "sockets": lscpu.get("Socket(s)"),
+        "numa_nodes": lscpu.get("NUMA node(s)"), "l3": lscpu.get("L3 cache"),
+        "arch": box.arch, "isa": {f: f in flags for f in ISA_FLAGS},
+        "build": (g / "build.txt").read_text().strip(), "reps": args.reps,
+        "bundle": json.loads((box.results / "guest/manifest.json").read_text())["source"],
+        "guest_failed": guest_failed, "circuits": {},
+    }
+
+
+def rapidsnark_summary(d, art, ref, row, checks):
+    if (d / "rs.out").exists():
+        ms = [float(l.split()[2]) for l in (d / "rs.out").read_text().splitlines() if l.startswith("rep ")]
+        if ms:
+            row["rapidsnark_ms"] = {"median": median(ms), "min": min(ms), "max": max(ms), "n": len(ms)}
+    rs_proofs = sorted((d / "rs-proofs").glob("proof-*.json"), key=lambda p: int(re.sub(r"\D", "", p.name)))
+    pairs = {"rapidsnark_last": (d / "rs-last-public.json", d / "rs-last-proof.json")}
+    if rs_proofs:
+        first = rs_proofs[0]
+        pairs["rapidsnark_first"] = (first.with_name(first.name.replace("proof", "public")), first)
+    for name, (pub, prf) in pairs.items():
+        checks[name] = pub.exists() and prf.exists() and snarkjs_ok(art / "vkey.json", pub, prf) and ints(pub) == ref
+
+
+def summarise_ab(box, args, guest_failed):
+    """Per build and circuit: warm medians pooled over every round, plus each round's median."""
+    g = box.results / "guest/results"
+    summary = host_summary(box, args, guest_failed)
+    summary["rounds"] = args.rounds
+    builds = summary["build"].split()
+    ok_all = not guest_failed
+    for c in args.circuits:
+        d = g / c
+        art = REPO / "bench/artifacts" / c
+        ref = ints(art / "public.json")
+        row, checks = {}, {}
+        for b in builds:
+            rows, per_round = [], []
+            for r in range(1, args.rounds + 1):
+                f = d / f"{b}-r{r}.csv"
+                got = [x for x in csv.DictReader(open(f)) if x["mode"] == "warm"] if f.exists() else []
+                rows += got
+                per_round.append(median([float(x["ms"]) for x in got]))
+            ms = [float(x["ms"]) for x in rows]
+            want = "no" if b == "generic" else "yes"
+            row[b] = {
+                "ms": {"median": median(ms), "min": min(ms, default=None), "max": max(ms, default=None),
+                       "n": len(ms)},
+                "round_medians_ms": per_round,
+                "stages_ms": {k: median([float(x[f"{k}_us"]) / 1000 for x in rows])
+                              for k in ["gather", "ntt", "pointwise", "msm", "assemble"]},
+                "prepare_ms": median([float(x["prepare_ms"]) for x in rows]),
+                "self_verified_reps": sum(x["verified"] == "yes" for x in rows),
+                "adx_bmi2_column_ok": bool(rows) and all(x.get("adx_bmi2") == want for x in rows),
+            }
+            ok_all &= len(ms) == args.reps * args.rounds and row[b]["adx_bmi2_column_ok"]
+            pub, prf = d / f"{b}-public.json", d / f"{b}-proof.json"
+            checks[b] = pub.exists() and prf.exists() and snarkjs_ok(art / "vkey.json", pub, prf) and ints(pub) == ref
+        rapidsnark_summary(d, art, ref, row, checks)
+        row["snarkjs_and_reference_public"] = checks
+        ok_all &= all(checks.values()) and bool(row.get("rapidsnark_ms"))
+        base = row.get("generic", {}).get("ms", {}).get("median")
+        for b in builds:
+            if b != "generic" and base and row[b]["ms"]["median"]:
+                row[b]["change_vs_generic_pct"] = round(100 * (row[b]["ms"]["median"] / base - 1), 2)
+        summary["circuits"][c] = row
+    summary["accepted"] = ok_all
+    out = Path(args.summary)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(summary, indent=1) + "\n")
+    say(f"summary {out}: accepted={ok_all}")
+    for c, r in summary["circuits"].items():
+        cells = "  ".join(f"{b} {r[b]['ms']['median']} ({r[b].get('change_vs_generic_pct', 0):+}%)" for b in builds)
+        say(f"  {c:15} {cells}  rapidsnark {r.get('rapidsnark_ms', {}).get('median')}  "
+            f"checks {r['snarkjs_and_reference_public']}")
 
 
 def summarise(box, args, guest_failed):
@@ -422,7 +528,7 @@ def run(args):
         raise
     finally:
         terminate(box)
-    summarise(box, args, guest_failed)
+    (summarise_ab if args.guest == "ab" else summarise)(box, args, guest_failed)
 
 
 def interrupted(signum, _frame):
@@ -438,6 +544,7 @@ def main():
     a = sub.add_parser("prep")
     a.add_argument("--out", required=True)
     a.add_argument("--arch", choices=list(BINARIES), default="x86_64")
+    a.add_argument("--with-asm", action="store_true", help="also bundle the experimental snarkrs-asm build")
     b = sub.add_parser("run")
     b.add_argument("--instance-type", required=True)
     b.add_argument("--bundle", help="x86_64 bundle")
@@ -448,6 +555,9 @@ def main():
     b.add_argument("--max-minutes", type=int, default=120, help="guest hard cap; the instance terminates itself")
     b.add_argument("--disk-gb", type=int, default=40)
     b.add_argument("--circuits", nargs="+", default=CIRCUITS)
+    b.add_argument("--guest", choices=["matrix", "ab"], default="matrix",
+                   help="ab: interleaved A/B of every snarkrs build in the bundle")
+    b.add_argument("--rounds", type=int, default=3, help="ab rounds")
     args = p.parse_args()
     prep(args) if args.cmd == "prep" else run(args)
 
