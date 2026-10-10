@@ -23,7 +23,8 @@ x86, has been measured yet.
 - Graviton 4 at 64 vCPU (c8g.16xlarge): anon-aadhaar 290 ms vs rapidsnark 1593 ms. Only c8a.16xlarge
   (199 ms) and c8i.16xlarge (258 ms) were faster in the x86 matrix.
 - Metal vs VM, same chip and core count (c7g.metal vs c7g.16xlarge): within 3% for both provers on
-  every circuit except tornado (10%). Nitro overhead does not matter here.
+  the five large circuits; metal is 1% to 10% faster on the four small ones, where a few ms of
+  overhead shows. The speedup over rapidsnark is the same either way.
 - Unlike the IFMA x86 boxes, the MSM still dominates: anon-aadhaar MSM is 2.4x to 3.7x the NTT on
   every Graviton. An aarch64 MSM lane is where the remaining ARM headroom is.
 - Memory: same pattern as x86, about 1.25 to 1.3 GiB ours vs about 1 GiB rapidsnark on anon-aadhaar.
