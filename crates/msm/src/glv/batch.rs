@@ -17,7 +17,7 @@ use ark_ec::short_weierstrass::Affine;
 use snarkrs_field::raw::RawField;
 use snarkrs_field::Fr;
 
-use super::{decompose, wnaf, GlvField, DIGITS, W};
+use super::{wnaf, GlvField, DIGITS, W};
 use crate::xyzz::{RawCurve, Xyzz};
 
 const TABLE: usize = 1 << (W - 2);
@@ -28,13 +28,12 @@ struct Pt<F> {
     y: F,
 }
 
-/// Per-point ladder state.
+/// Per-point ladder state: up to four parts of the scalar (two on G1, four on G2; see
+/// [`GlvField::split`]), each with its wNAF digits, sign and table of odd multiples.
 struct Lane<F> {
-    d1: [i8; DIGITS],
-    d2: [i8; DIGITS],
-    neg1: bool,
-    neg2: bool,
-    t1: [Pt<F>; TABLE],
+    d: [[i8; DIGITS]; 4],
+    neg: [bool; 4],
+    t: [[Pt<F>; TABLE]; 4],
     /// Out of the batch: zero input, or an exceptional addition; see the module doc.
     out: bool,
 }
@@ -73,9 +72,13 @@ where
 
 /// `out[i] = [k_i] P_i` for every `i`. The inputs may be any XYZZ points; every output is
 /// either the identity or affine, `ZZ = ZZZ = 1`.
+///
+/// On G2 the scalar is cut in four 64-bit parts rather than two 127-bit ones, with `psi`
+/// beside `phi` ([`GlvField::split`]): half the doublings again, for two more tables.
 pub fn mul_batch_xyzz<F: GlvField>(points: &[Xyzz<F>], scalars: &[Fr], out: &mut [Xyzz<F>]) {
     assert_eq!(points.len(), scalars.len(), "one scalar per point");
     assert_eq!(points.len(), out.len(), "one output per point");
+    let dims = F::DIMS;
     let mut scratch = Scratch {
         den: Vec::new(),
         pre: Vec::new(),
@@ -91,21 +94,20 @@ pub fn mul_batch_xyzz<F: GlvField>(points: &[Xyzz<F>], scalars: &[Fr], out: &mut
     let mut steps = 0;
     for (p, k) in base.iter().zip(scalars) {
         let mut lane = Lane {
-            d1: [0; DIGITS],
-            d2: [0; DIGITS],
-            neg1: false,
-            neg2: false,
-            t1: [zero; TABLE],
+            d: [[0; DIGITS]; 4],
+            neg: [false; 4],
+            t: [[zero; TABLE]; 4],
             out: true,
         };
         if let Some(p) = p {
-            let (k1, k2) = decompose(k);
-            let n =
-                wnaf(k1.unsigned_abs(), &mut lane.d1).max(wnaf(k2.unsigned_abs(), &mut lane.d2));
+            let parts = F::split(k);
+            let mut n = 0;
+            for j in 0..dims {
+                n = n.max(wnaf(parts[j].unsigned_abs(), &mut lane.d[j]));
+                lane.neg[j] = parts[j] < 0;
+            }
             if n > 0 {
-                lane.t1[0] = *p;
-                lane.neg1 = k1 < 0;
-                lane.neg2 = k2 < 0;
+                lane.t[0][0] = *p;
                 lane.out = false;
                 steps = steps.max(n);
             }
@@ -113,30 +115,38 @@ pub fn mul_batch_xyzz<F: GlvField>(points: &[Xyzz<F>], scalars: &[Fr], out: &mut
         lanes.push(lane);
     }
 
-    // Odd multiples: 2P, then 3P = P + 2P and so on, one batched addition per entry.
+    // Odd multiples: 2P, then 3P = P + 2P and so on, one batched addition per entry; then
+    // each endomorphism's table is its image of the first, entry by entry.
     let live: Vec<usize> = (0..lanes.len()).filter(|&i| !lanes[i].out).collect();
     {
-        let mut two: Vec<Pt<F>> = lanes.iter().map(|l| l.t1[0]).collect();
+        let mut two: Vec<Pt<F>> = lanes.iter().map(|l| l.t[0][0]).collect();
         let mut ok = vec![true; lanes.len()];
         batch_dbl(&mut two, &live, &mut ok, &mut scratch);
         let mut next: Vec<Pt<F>> = vec![zero; lanes.len()];
         let mut nz = vec![false; lanes.len()];
         let mut adds = Vec::with_capacity(live.len());
-        for j in 1..TABLE {
+        for e in 1..TABLE {
             adds.clear();
             for &i in &live {
-                next[i] = lanes[i].t1[j - 1];
+                next[i] = lanes[i].t[0][e - 1];
                 adds.push((i, two[i]));
             }
             batch_add(&mut next, &mut nz, &adds, &mut ok, &mut scratch);
             for &i in &live {
-                lanes[i].t1[j] = next[i];
+                lanes[i].t[0][e] = next[i];
             }
         }
         // Odd multiples of a point of prime order never collide; this is belt and braces.
         for &i in &live {
             if !ok[i] {
                 lanes[i].out = true;
+            }
+            let l = &mut lanes[i];
+            for j in 1..dims {
+                for e in 0..TABLE {
+                    let (x, y) = F::endo_j(j, l.t[0][e].x, l.t[0][e].y);
+                    l.t[j][e] = Pt { x, y };
+                }
             }
         }
     }
@@ -150,25 +160,18 @@ pub fn mul_batch_xyzz<F: GlvField>(points: &[Xyzz<F>], scalars: &[Fr], out: &mut
         idx.clear();
         idx.extend((0..lanes.len()).filter(|&i| !lanes[i].out && ok[i] && !acc_zero[i]));
         batch_dbl(&mut acc, &idx, &mut ok, &mut scratch);
-        for half in 0..2 {
+        for j in 0..dims {
             adds.clear();
             for (i, l) in lanes.iter().enumerate() {
                 if l.out || !ok[i] {
                     continue;
                 }
-                let (d, neg) = if half == 0 {
-                    (l.d1[s], l.neg1)
-                } else {
-                    (l.d2[s], l.neg2)
-                };
+                let d = l.d[j][s];
                 if d == 0 {
                     continue;
                 }
-                let mut e = l.t1[(d.unsigned_abs() >> 1) as usize];
-                if half == 1 {
-                    e.x = F::endo_x(e.x);
-                }
-                if (d < 0) != neg {
+                let mut e = l.t[j][(d.unsigned_abs() >> 1) as usize];
+                if (d < 0) != l.neg[j] {
                     e.y = e.y.neg();
                 }
                 adds.push((i, e));

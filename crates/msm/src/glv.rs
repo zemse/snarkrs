@@ -24,7 +24,7 @@
 use ark_ec::short_weierstrass::Affine;
 use ark_ff::{Field, MontFp, PrimeField};
 use snarkrs_field::raw::{RawField, RawFq, RawFq2};
-use snarkrs_field::{Fq, Fr};
+use snarkrs_field::{Fq, Fq2, Fr};
 
 use crate::xyzz::{RawCurve, Xyzz};
 
@@ -64,11 +64,23 @@ const DIGITS: usize = 130;
 /// Keyed on the field rather than the curve so code generic over [`RawField`], like the
 /// group FFT, can call it.
 pub trait GlvField: RawField {
+    /// How many parts [`GlvField::split`] cuts a scalar into, for [`mul_batch_xyzz`]: two
+    /// on G1, four on G2, which also has `psi`.
+    const DIMS: usize;
+
     /// `phi` on an affine `x`: a multiplication by the cube root of unity.
     fn endo_x(x: Self) -> Self;
 
     /// The inverse of a nonzero element, through arkworks. Once per batch, never per point.
     fn inv(self) -> Self;
+
+    /// `k = sum_j k_j e_j (mod r)`, with `e_j` the eigenvalue of [`GlvField::endo_j`]`(j)`.
+    /// Parts past [`GlvField::DIMS`] are zero.
+    fn split(k: &Fr) -> [i128; 4];
+
+    /// The `j`-th endomorphism on an affine point: the identity, then `phi`, then (G2 only)
+    /// `psi` and `phi psi`.
+    fn endo_j(j: usize, x: Self, y: Self) -> (Self, Self);
 
     /// `phi` on the XYZZ representation. `x = X / ZZ`, so scaling `X` scales `x`.
     #[inline(always)]
@@ -81,6 +93,8 @@ pub trait GlvField: RawField {
 }
 
 impl GlvField for RawFq {
+    const DIMS: usize = 2;
+
     #[inline(always)]
     fn endo_x(x: RawFq) -> RawFq {
         x.mul(RawFq(BETA.0 .0))
@@ -89,9 +103,24 @@ impl GlvField for RawFq {
     fn inv(self) -> RawFq {
         RawFq::from_fq(&self.to_fq().inverse().expect("inverse of zero"))
     }
+
+    fn split(k: &Fr) -> [i128; 4] {
+        let (k1, k2) = decompose(k);
+        [k1, k2, 0, 0]
+    }
+
+    #[inline]
+    fn endo_j(j: usize, x: RawFq, y: RawFq) -> (RawFq, RawFq) {
+        match j {
+            0 => (x, y),
+            _ => (Self::endo_x(x), y),
+        }
+    }
 }
 
 impl GlvField for RawFq2 {
+    const DIMS: usize = 4;
+
     #[inline(always)]
     fn endo_x(x: RawFq2) -> RawFq2 {
         let b = RawFq(BETA2.0 .0);
@@ -104,6 +133,123 @@ impl GlvField for RawFq2 {
     fn inv(self) -> RawFq2 {
         RawFq2::from_fq2(&self.to_fq2().inverse().expect("inverse of zero"))
     }
+
+    fn split(k: &Fr) -> [i128; 4] {
+        decompose4(k)
+    }
+
+    #[inline]
+    fn endo_j(j: usize, x: RawFq2, y: RawFq2) -> (RawFq2, RawFq2) {
+        // psi: Frobenius (conjugation on Fq2) between the twist isomorphisms, ark-bn254's
+        // `p_power_endomorphism`.
+        let psi = |x: RawFq2, y: RawFq2| {
+            let conj = |a: RawFq2| RawFq2 {
+                c0: a.c0,
+                c1: a.c1.neg(),
+            };
+            (
+                conj(x).mul(RawFq2::from_fq2(&PSI_X)),
+                conj(y).mul(RawFq2::from_fq2(&PSI_Y)),
+            )
+        };
+        match j {
+            0 => (x, y),
+            1 => (Self::endo_x(x), y),
+            2 => psi(x, y),
+            _ => {
+                let (x, y) = psi(x, y);
+                (Self::endo_x(x), y)
+            }
+        }
+    }
+}
+
+/// `psi(x, y) = (conj(x) PSI_X, conj(y) PSI_Y)` on G2, `(u + 9)^((q - 1)/3)` and
+/// `(u + 9)^((q - 1)/2)` (ark-bn254's `P_POWER_ENDOMORPHISM_COEFF_0/1`). It is `[MU]` on G2.
+const PSI_X: Fq2 = Fq2::new(
+    MontFp!("21575463638280843010398324269430826099269044274347216827212613867836435027261"),
+    MontFp!("10307601595873709700152284273816112264069230130616436755625194854815875713954"),
+);
+const PSI_Y: Fq2 = Fq2::new(
+    MontFp!("2821565182194536844548159561693502659359617185244120367078079554186484126554"),
+    MontFp!("3505843767911556378687030309984248845540243509899259641013678093033130930403"),
+);
+
+/// `MU = 6 x^2 = q mod r`, the eigenvalue of `psi` on G2.
+pub const MU: Fr = MontFp!("147946756881789318990833708069417712966");
+
+/// An LLL-reduced basis of `{a : a0 + a1 LAMBDA + a2 MU + a3 LAMBDA MU = 0 mod r}`, every
+/// entry below 2^64. Its determinant is `-r`.
+const BASIS4: [[i128; 4]; 4] = [
+    [9931322734385697762, -9931322734385697763, 1, 0],
+    [
+        4965661367192848881,
+        -4965661367192848882,
+        -9931322734385697762,
+        -4965661367192848881,
+    ],
+    [
+        -4965661367192848882,
+        -9931322734385697763,
+        -4965661367192848881,
+        4965661367192848881,
+    ],
+    [
+        4965661367192848881,
+        9931322734385697762,
+        -4965661367192848881,
+        4965661367192848882,
+    ],
+];
+
+/// `round(2^256 n_i / r)` for `(n_0..n_3) / r` the first row of `BASIS4`'s inverse, as
+/// (negative, little-endian magnitude).
+const G4: [(bool, [u64; 4]); 4] = [
+    (
+        false,
+        [
+            0x74f3e6bec8b942da,
+            0x5e9aa4e2a056dc2d,
+            0x3d00631561b25728,
+            0x1,
+        ],
+    ),
+    (false, [0x5398fd0300ff6565, 0x4ccef014a773d2d2, 0x2, 0]),
+    (
+        true,
+        [
+            0x071c4c43fac4db00,
+            0x55b4ca7ba3e55782,
+            0x9e80318ab0d92b95,
+            0,
+        ],
+    ),
+    (
+        false,
+        [
+            0x2dff291532e42728,
+            0x55b4ca7ba3e5577f,
+            0x9e80318ab0d92b95,
+            0,
+        ],
+    ),
+];
+
+/// `k = k0 + k1 LAMBDA + k2 MU + k3 LAMBDA MU (mod r)` with every part below 2^66, the
+/// four-dimensional GLV-GLS split of G2. Babai rounding against [`BASIS4`] as in
+/// [`decompose`]; each quotient is off by at most 0.625, which bounds the parts by
+/// `0.625 * 4 * 2^63.2 < 2^65`, so they are exact computed modulo 2^128.
+pub fn decompose4(k: &Fr) -> [i128; 4] {
+    let kk = k.into_bigint().0;
+    let mut v = [kk[0] as u128 | (kk[1] as u128) << 64, 0, 0, 0];
+    for (i, (neg, g)) in G4.iter().enumerate() {
+        let c = mul_shift_round(&kk, g);
+        let c = if *neg { c.wrapping_neg() } else { c };
+        for j in 0..4 {
+            v[j] = v[j].wrapping_sub(c.wrapping_mul(BASIS4[i][j] as u128));
+        }
+    }
+    v.map(|x| x as i128)
 }
 
 /// `k = k1 + k2 LAMBDA (mod r)` with both halves below 2^127 in magnitude.
@@ -120,10 +266,11 @@ pub fn decompose(k: &Fr) -> (i128, i128) {
     (k1 as i128, k2 as i128)
 }
 
-/// `(k g + 2^255) >> 256`, the rounded quotient. Below 2^128 for `k < 2^254`, `g < 2^130`.
+/// `(k g + 2^255) >> 256`, the rounded quotient, modulo 2^128 (the callers only need it
+/// that far: what they subtract it into fits an `i128`).
 #[inline]
 fn mul_shift_round(k: &[u64; 4], g: &[u64]) -> u128 {
-    let mut t = [0u64; 7];
+    let mut t = [0u64; 8];
     for (i, &gi) in g.iter().enumerate() {
         let mut carry = 0u128;
         for (j, &kj) in k.iter().enumerate() {
@@ -333,6 +480,50 @@ mod tests {
         }
         assert_eq!(decompose(&-Fr::one()), (-1, 0));
         assert_eq!(decompose(&Fr::one()), (1, 0));
+    }
+
+    #[test]
+    fn the_four_way_split_recomposes_and_is_short() {
+        let mu = MU;
+        assert_eq!(
+            mu * mu,
+            LAMBDA + Fr::one(),
+            "psi^2 = phi + 1 on the eigenvalues"
+        );
+        for b in BASIS4 {
+            let f = |x: i128| {
+                let m = Fr::from(x.unsigned_abs());
+                if x < 0 {
+                    -m
+                } else {
+                    m
+                }
+            };
+            assert_eq!(
+                f(b[0]) + f(b[1]) * LAMBDA + f(b[2]) * mu + f(b[3]) * LAMBDA * mu,
+                Fr::zero()
+            );
+        }
+        for k in edge_scalars() {
+            let p = decompose4(&k);
+            let f = |x: i128| {
+                let m = Fr::from(x.unsigned_abs());
+                if x < 0 {
+                    -m
+                } else {
+                    m
+                }
+            };
+            assert_eq!(
+                f(p[0]) + f(p[1]) * LAMBDA + f(p[2]) * mu + f(p[3]) * LAMBDA * mu,
+                k,
+                "k = {k}"
+            );
+            assert!(
+                p.iter().all(|x| x.unsigned_abs() < 1 << 66),
+                "k = {k}: {p:?}"
+            );
+        }
     }
 
     #[test]
