@@ -83,8 +83,17 @@ const PTAU_VERSION: u32 = 1;
 const BUTTERFLIES_PER_TASK: usize = 1024;
 
 /// Below this many butterflies a task multiplies one point at a time instead, which is
-/// what a pass too small to give every thread a full batch gets.
-const MIN_BATCH: usize = 256;
+/// what a pass too small to give every thread a full batch gets. Where a batch starts to
+/// pay differs by group: single thread on an M2 Max, a G1 multiplication is 26.1 us alone
+/// against 30.6 and 25.4 a point in batches of 128 and 256, a G2 one 75.8 against 72.8
+/// and 54.5 in batches of 32 and 64.
+fn min_batch<F: GlvField>() -> usize {
+    if F::DIMS == 4 {
+        64
+    } else {
+        256
+    }
+}
 
 /// Butterflies per task on the one-point path. Each one is a point scalar multiplication
 /// in the tens of microseconds, so this keeps the task count high enough to balance
@@ -301,11 +310,11 @@ fn bit_reverse<T>(a: &mut [T], bits: u32) {
 fn mix_pass<F: GlvField>(a: &mut [Xyzz<F>], exp: u32, w: Fr, scale: Option<Fr>) {
     let per_group = 1usize << exp;
     let half = per_group >> 1;
-    // Batches only where every thread still gets four of at least MIN_BATCH; a smaller
+    // Batches only where every thread still gets four of at least `min_batch`; a smaller
     // pass keeps the one-point path in tasks of SINGLE_PER_TASK, fine enough that the
     // efficiency cores do not set its pace.
     let fill = a.len() / 2 / (4 * rayon::current_num_threads());
-    let batched = fill >= MIN_BATCH;
+    let batched = fill >= min_batch::<F>();
     let per_task = if batched {
         prev_power_of_two(fill.min(BUTTERFLIES_PER_TASK))
     } else {
@@ -483,7 +492,7 @@ fn butterflies<F: GlvField>(
 fn mix_pass4<F: GlvField>(a: &mut [Xyzz<F>], exp: u32, w: Fr, scale: Option<Fr>) -> Option<()> {
     let h = 1usize << (exp - 1);
     let fill = a.len() / 4 / (4 * rayon::current_num_threads());
-    if F::DIMS != 2 || fill < MIN_BATCH {
+    if F::DIMS != 2 || fill < min_batch::<F>() {
         return None;
     }
     let per_task = prev_power_of_two(fill.min(BUTTERFLIES_PER_TASK));
