@@ -925,12 +925,8 @@ impl<'a, P: IfmaCurve> Fill<'a, P> {
         let mut by = vec![P::RF::ZERO; n_buckets];
         // SAFETY: see the type's doc.
         unsafe { export::<P::L>(&self.buckets, &mut bx, &mut by) };
-        to_projective(&affine_running_sum(
-            &bx,
-            &by,
-            &self.occupied,
-            self.side.as_ref(),
-        ))
+        let xy: Vec<[P::RF; 2]> = bx.into_iter().zip(by).map(|(x, y)| [x, y]).collect();
+        to_projective(&affine_running_sum(&xy, &self.occupied, self.side.as_ref()))
     }
 }
 

@@ -17,7 +17,10 @@ fn check_buckets<P: RawCurve>(fill: &BatchFill<P>, want: &[Projective<P>]) {
     for (b, expected) in want.iter().enumerate() {
         let mut got = Projective::<P>::zero();
         if fill.occupied[b] {
-            got += Affine::<P>::new_unchecked(P::field_back(fill.bx[b]), P::field_back(fill.by[b]));
+            got += Affine::<P>::new_unchecked(
+                P::field_back(fill.xy[b][0]),
+                P::field_back(fill.xy[b][1]),
+            );
         }
         if let Some(side) = &fill.side {
             got += to_projective::<P>(&side[b]);
@@ -164,7 +167,7 @@ fn retries_and_side_at<P: RawCurve<ScalarField = Fr>>(batch: usize) {
         );
         fill.flush();
         let affine =
-            Affine::<P>::new_unchecked(P::field_back(fill.bx[b]), P::field_back(fill.by[b]));
+            Affine::<P>::new_unchecked(P::field_back(fill.xy[b][0]), P::field_back(fill.xy[b][1]));
         insert(&mut fill, b, -affine);
         want[b] -= affine;
         fill.flush();

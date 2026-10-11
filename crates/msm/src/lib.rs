@@ -468,8 +468,8 @@ fn window_chunk<P: RawCurve>(
 /// whole chunk landing in one bucket (equal scalars over equal bases) at one madd per
 /// point instead of a one-entry flush per point.
 struct BatchFill<P: RawCurve> {
-    bx: Vec<P::RF>,
-    by: Vec<P::RF>,
+    /// Bucket `(x, y)`, together so a visit is one cache line rather than two.
+    xy: Vec<[P::RF; 2]>,
     /// Bucket holds a point. Set by the first point, cleared again by a cancellation.
     occupied: Vec<bool>,
     /// Bucket has a pending addition in the current round.
@@ -539,8 +539,7 @@ impl<P: RawCurve> BatchFill<P> {
         // the round vectors get headroom past the batch.
         let cap = batch + batch / 2;
         BatchFill {
-            bx: vec![P::RF::ZERO; n_buckets],
-            by: vec![P::RF::ZERO; n_buckets],
+            xy: vec![[P::RF::ZERO; 2]; n_buckets],
             occupied: vec![false; n_buckets],
             busy: vec![false; n_buckets],
             pending: Vec::with_capacity(cap),
@@ -557,8 +556,7 @@ impl<P: RawCurve> BatchFill<P> {
     /// entry when it is quiet, a retry when it is contended.
     fn insert(&mut self, b: usize, x: P::RF, y: P::RF) {
         if !self.occupied[b] {
-            self.bx[b] = x;
-            self.by[b] = y;
+            self.xy[b] = [x, y];
             self.occupied[b] = true;
             return;
         }
@@ -587,12 +585,11 @@ impl<P: RawCurve> BatchFill<P> {
         while let Some((b, x, y)) = self.retry.pop() {
             let b = b as usize;
             if !self.occupied[b] {
-                self.bx[b] = x;
-                self.by[b] = y;
+                self.xy[b] = [x, y];
                 self.occupied[b] = true;
             } else if self.busy[b] {
                 self.side
-                    .get_or_insert_with(|| SideBuckets::new(self.bx.len()))
+                    .get_or_insert_with(|| SideBuckets::new(self.xy.len()))
                     .entry(b)
                     .madd(x, y);
             } else {
@@ -611,51 +608,106 @@ impl<P: RawCurve> BatchFill<P> {
         if self.pending.is_empty() {
             return;
         }
+        let n = self.pending.len();
         self.dens.clear();
-        self.prefix.clear();
         self.ops.clear();
-        let mut acc = P::RF::ONE;
         for &(b, px, py) in &self.pending {
-            let b = b as usize;
-            let dx = px.sub(self.bx[b]);
+            let [bx, by] = self.xy[b as usize];
+            let dx = px.sub(bx);
             let (op, den) = if !dx.is_zero() {
                 (Op::Add, dx)
-            } else if py == self.by[b] {
-                (Op::Dbl, self.by[b].double())
+            } else if py == by {
+                (Op::Dbl, by.double())
             } else {
                 // Same x, different y: the negative. The bucket empties.
                 (Op::Cancel, P::RF::ONE)
             };
             self.ops.push(op);
             self.dens.push(den);
-            self.prefix.push(acc);
-            acc = acc.mul(den);
         }
-        let mut inv = P::raw_inv(acc);
-        for i in (0..self.pending.len()).rev() {
-            let (b, px, py) = self.pending[i];
-            let b = b as usize;
-            let d_inv = inv.mul(self.prefix[i]);
-            inv = inv.mul(self.dens[i]);
-            match self.ops[i] {
-                Op::Add => {
-                    let lambda = py.sub(self.by[b]).mul(d_inv);
-                    let x3 = lambda.sqr().sub(self.bx[b]).sub(px);
-                    self.by[b] = lambda.mul(self.bx[b].sub(x3)).sub(self.by[b]);
-                    self.bx[b] = x3;
-                }
-                Op::Dbl => {
-                    let xx = self.bx[b].sqr();
-                    let lambda = xx.double().add(xx).mul(d_inv);
-                    let x3 = lambda.sqr().sub(self.bx[b].double());
-                    self.by[b] = lambda.mul(self.bx[b].sub(x3)).sub(self.by[b]);
-                    self.bx[b] = x3;
-                }
-                Op::Cancel => self.occupied[b] = false,
+        // The running products are two chains, one per half, walked side by side, whose
+        // totals share the inversion. The point is the backward walk: it then holds two
+        // independent entries at each step, and two additions with their formulas
+        // interleaved ([`Self::add2`]) keep the multiplier busy where one addition's
+        // dependent multiplies, each a long asm block, outrun what the core looks ahead.
+        let h = n / 2;
+        self.prefix.clear();
+        self.prefix.resize(n, P::RF::ONE);
+        let (mut a, mut c) = (P::RF::ONE, P::RF::ONE);
+        for k in 0..h {
+            self.prefix[k] = a;
+            self.prefix[h + k] = c;
+            a = a.mul(self.dens[k]);
+            c = c.mul(self.dens[h + k]);
+        }
+        if n % 2 == 1 {
+            self.prefix[n - 1] = c;
+            c = c.mul(self.dens[n - 1]);
+        }
+        let ac = P::raw_inv(a.mul(c));
+        let (mut ia, mut ic) = (ac.mul(c), ac.mul(a));
+        if n % 2 == 1 {
+            self.apply(n - 1, ic.mul(self.prefix[n - 1]));
+            ic = ic.mul(self.dens[n - 1]);
+        }
+        for k in (0..h).rev() {
+            let (da, dc) = (ia.mul(self.prefix[k]), ic.mul(self.prefix[h + k]));
+            if matches!(self.ops[k], Op::Add) && matches!(self.ops[h + k], Op::Add) {
+                self.add2(k, da, h + k, dc);
+            } else {
+                self.apply(k, da);
+                self.apply(h + k, dc);
             }
-            self.busy[b] = false;
+            ia = ia.mul(self.dens[k]);
+            ic = ic.mul(self.dens[h + k]);
         }
         self.pending.clear();
+    }
+
+    /// Two additions into two different buckets, the formulas interleaved step by step so
+    /// each multiply has an independent one beside it.
+    #[inline(always)]
+    fn add2(&mut self, i: usize, di: P::RF, j: usize, dj: P::RF) {
+        let (bi, pxi, pyi) = self.pending[i];
+        let (bj, pxj, pyj) = self.pending[j];
+        let (bi, bj) = (bi as usize, bj as usize);
+        let [xi, yi] = self.xy[bi];
+        let [xj, yj] = self.xy[bj];
+        let li = pyi.sub(yi).mul(di);
+        let lj = pyj.sub(yj).mul(dj);
+        let si = li.sqr();
+        let sj = lj.sqr();
+        let x3i = si.sub(xi).sub(pxi);
+        let x3j = sj.sub(xj).sub(pxj);
+        let y3i = li.mul(xi.sub(x3i)).sub(yi);
+        let y3j = lj.mul(xj.sub(x3j)).sub(yj);
+        self.xy[bi] = [x3i, y3i];
+        self.xy[bj] = [x3j, y3j];
+        self.busy[bi] = false;
+        self.busy[bj] = false;
+    }
+
+    /// Pending entry `i`, its denominator's inverse in hand.
+    #[inline(always)]
+    fn apply(&mut self, i: usize, d_inv: P::RF) {
+        let (b, px, py) = self.pending[i];
+        let b = b as usize;
+        let [bx, by] = self.xy[b];
+        match self.ops[i] {
+            Op::Add => {
+                let lambda = py.sub(by).mul(d_inv);
+                let x3 = lambda.sqr().sub(bx).sub(px);
+                self.xy[b] = [x3, lambda.mul(bx.sub(x3)).sub(by)];
+            }
+            Op::Dbl => {
+                let xx = bx.sqr();
+                let lambda = xx.double().add(xx).mul(d_inv);
+                let x3 = lambda.sqr().sub(bx.double());
+                self.xy[b] = [x3, lambda.mul(bx.sub(x3)).sub(by)];
+            }
+            Op::Cancel => self.occupied[b] = false,
+        }
+        self.busy[b] = false;
     }
 
     /// Flush the stragglers, then reduce. Two flushes settle everything: after the
@@ -666,8 +718,7 @@ impl<P: RawCurve> BatchFill<P> {
         self.reschedule();
         self.flush();
         to_projective(&affine_running_sum(
-            &self.bx,
-            &self.by,
+            &self.xy,
             &self.occupied,
             self.side.as_ref(),
         ))
@@ -678,8 +729,7 @@ impl<P: RawCurve> BatchFill<P> {
 /// additions (8M + 2S against the XYZZ-bucket add's 12M + 2S) and the side buckets, when
 /// the chunk was degenerate enough to have any, folded in.
 fn affine_running_sum<F: RawField>(
-    bx: &[F],
-    by: &[F],
+    xy: &[[F; 2]],
     occupied: &[bool],
     side: Option<&SideBuckets<F>>,
 ) -> Xyzz<F> {
@@ -687,9 +737,9 @@ fn affine_running_sum<F: RawField>(
     let mut total = Xyzz::<F>::ZERO;
     match side {
         Some(side) => {
-            for j in (0..bx.len()).rev() {
+            for j in (0..xy.len()).rev() {
                 if occupied[j] {
-                    running.madd(bx[j], by[j]);
+                    running.madd(xy[j][0], xy[j][1]);
                 }
                 if side.slot[j] != 0 {
                     running.add_assign(&side[j]);
@@ -698,9 +748,9 @@ fn affine_running_sum<F: RawField>(
             }
         }
         None => {
-            for j in (0..bx.len()).rev() {
+            for j in (0..xy.len()).rev() {
                 if occupied[j] {
-                    running.madd(bx[j], by[j]);
+                    running.madd(xy[j][0], xy[j][1]);
                 }
                 total.add_assign(&running);
             }
