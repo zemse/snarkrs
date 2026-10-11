@@ -420,14 +420,29 @@ fn batch_dbl<F: GlvField>(a: &mut [Pt<F>], idx: &[usize], ok: &mut [bool], s: &m
         s.who.push(i);
     }
     let who = &s.who;
-    invert_each(&s.den, &mut s.pre, |k, inv| {
+    invert_pairs(&s.den, &mut s.pre, |k, inv, other| {
         let i = who[k];
         let p = a[i];
-        let xx = p.x.sqr();
+        let Some((k2, inv2)) = other else {
+            let xx = p.x.sqr();
+            let l = xx.double().add(xx).mul(inv);
+            let x3 = l.sqr().sub(p.x.double());
+            let y3 = l.mul(p.x.sub(x3)).sub(p.y);
+            a[i] = Pt { x: x3, y: y3 };
+            return;
+        };
+        // Two at once, step by step; see [`invert_pairs`].
+        let j = who[k2];
+        let q = a[j];
+        let (xx, xx2) = (p.x.sqr(), q.x.sqr());
         let l = xx.double().add(xx).mul(inv);
+        let l2 = xx2.double().add(xx2).mul(inv2);
         let x3 = l.sqr().sub(p.x.double());
+        let x32 = l2.sqr().sub(q.x.double());
         let y3 = l.mul(p.x.sub(x3)).sub(p.y);
+        let y32 = l2.mul(q.x.sub(x32)).sub(q.y);
         a[i] = Pt { x: x3, y: y3 };
+        a[j] = Pt { x: x32, y: y32 };
     });
 }
 
@@ -457,25 +472,57 @@ fn batch_add<F: GlvField>(
         s.who.push(k);
     }
     let who = &s.who;
-    invert_each(&s.den, &mut s.pre, |j, inv| {
+    invert_pairs(&s.den, &mut s.pre, |j, inv, other| {
         let (i, q) = adds[who[j]];
         let p = a[i];
+        let Some((j2, inv2)) = other else {
+            let l = q.y.sub(p.y).mul(inv);
+            let x3 = l.sqr().sub(p.x).sub(q.x);
+            let y3 = l.mul(p.x.sub(x3)).sub(p.y);
+            a[i] = Pt { x: x3, y: y3 };
+            return;
+        };
+        // Two at once, step by step; see [`invert_pairs`].
+        let (i2, q2) = adds[who[j2]];
+        let p2 = a[i2];
         let l = q.y.sub(p.y).mul(inv);
+        let l2 = q2.y.sub(p2.y).mul(inv2);
         let x3 = l.sqr().sub(p.x).sub(q.x);
+        let x32 = l2.sqr().sub(p2.x).sub(q2.x);
         let y3 = l.mul(p.x.sub(x3)).sub(p.y);
+        let y32 = l2.mul(p2.x.sub(x32)).sub(p2.y);
         a[i] = Pt { x: x3, y: y3 };
+        a[i2] = Pt { x: x32, y: y32 };
     });
 }
 
 /// `f(k, 1 / den[k])` for every `k`, from one field inversion.
-///
-/// The running products are two chains, one per half, walked side by side: each is a
-/// serial dependency, so one chain runs at the multiply's latency and two at nearer its
-/// throughput. Their two totals share the inversion. Each inverse goes to `f` as it comes
-/// out of the backward walk, so the caller's formula runs in that loop rather than in a
-/// pass of its own.
 #[inline(always)]
 fn invert_each<F: GlvField>(den: &[F], pre: &mut Vec<F>, mut f: impl FnMut(usize, F)) {
+    invert_pairs(den, pre, |k, i, other| {
+        f(k, i);
+        if let Some((k2, i2)) = other {
+            f(k2, i2);
+        }
+    });
+}
+
+/// [`invert_each`] two at a time: `f(k, 1 / den[k], Some((k2, 1 / den[k2])))`, or `None`
+/// for the one left over.
+///
+/// The running products are two chains, one per half, walked side by side, and their two
+/// totals share the inversion. Each pair of inverses goes to `f` as it comes out of the
+/// backward walk, one from each chain, so the caller's formula runs in that loop rather
+/// than in a pass of its own, and for two independent points at once. That is the point:
+/// a doubling or an addition is a chain of dependent multiplies, each a long asm block,
+/// longer than what the core looks ahead across, so one point at a time leaves the
+/// multiplier waiting; two interleaved step by step keep it busy.
+#[inline(always)]
+fn invert_pairs<F: GlvField>(
+    den: &[F],
+    pre: &mut Vec<F>,
+    mut f: impl FnMut(usize, F, Option<(usize, F)>),
+) {
     let n = den.len();
     if n == 0 {
         return;
@@ -498,12 +545,11 @@ fn invert_each<F: GlvField>(den: &[F], pre: &mut Vec<F>, mut f: impl FnMut(usize
     let ab = a.mul(b).inv();
     let (mut ia, mut ib) = (ab.mul(b), ab.mul(a));
     if n % 2 == 1 {
-        f(n - 1, ib.mul(pre[n - 1]));
+        f(n - 1, ib.mul(pre[n - 1]), None);
         ib = ib.mul(den[n - 1]);
     }
     for k in (0..h).rev() {
-        f(k, ia.mul(pre[k]));
-        f(h + k, ib.mul(pre[h + k]));
+        f(k, ia.mul(pre[k]), Some((h + k, ib.mul(pre[h + k]))));
         ia = ia.mul(den[k]);
         ib = ib.mul(den[h + k]);
     }
