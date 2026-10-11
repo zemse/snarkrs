@@ -151,3 +151,63 @@ fn g1_batch_matches_ark() {
 fn g2_batch_matches_ark() {
     check_batch::<snarkrs_field::g2::Config>("G2", |r| G2Projective::rand(r));
 }
+
+/// `mul_sum_batch_xyzz_in` over sums of one to three terms: every edge scalar beside random
+/// ones, the identity among the terms, a sum that cancels (`[k] P + [-k] P`), a term
+/// repeated, and the empty batch.
+fn check_sum<P: RawCurve + ark_ec::CurveConfig<ScalarField = Fr>>(
+    label: &str,
+    rand: impl Fn(&mut StdRng) -> Projective<P>,
+) where
+    Projective<P>: std::fmt::Debug,
+    P::RF: GlvField,
+{
+    let mut rng = StdRng::seed_from_u64(0x5a3d);
+    let mut st = glv::BatchState::default();
+    glv::mul_sum_batch_xyzz_in::<P::RF>(&mut st, &[], &[], 2, &mut []);
+    for terms in 1..=3 {
+        let mut ks = scalars(&mut rng);
+        ks.extend(scalars(&mut rng));
+        ks.truncate(ks.len() / terms * terms);
+        let m = ks.len();
+        let mut ps: Vec<Affine<P>> = (0..m).map(|_| rand(&mut rng).into_affine()).collect();
+        ps[1] = Affine::<P>::identity();
+        if terms > 1 {
+            // Output 2 cancels; output 3 repeats a term.
+            ps[2 * terms + 1] = ps[2 * terms];
+            ks[2 * terms + 1] = -ks[2 * terms];
+            ps[3 * terms + 1] = ps[3 * terms];
+            ks[3 * terms + 1] = ks[3 * terms];
+        }
+        let xyzz: Vec<Xyzz<P::RF>> = ps
+            .iter()
+            .map(|p| {
+                let mut a = Xyzz::<P::RF>::ZERO;
+                if !p.infinity {
+                    let (x, y) = P::raw_xy(p);
+                    a.madd(x, y);
+                }
+                a
+            })
+            .collect();
+        let mut out = vec![Xyzz::<P::RF>::ZERO; m / terms];
+        glv::mul_sum_batch_xyzz_in(&mut st, &xyzz, &ks, terms, &mut out);
+        for (i, o) in out.iter().enumerate() {
+            let want: Projective<P> = (0..terms)
+                .map(|t| ps[i * terms + t] * ks[i * terms + t])
+                .sum();
+            assert_eq!(to_projective(o), want, "{label}: {terms} terms, output {i}");
+            assert!(o.is_zero() || (o.zz == P::RF::ONE && o.zzz == P::RF::ONE));
+        }
+    }
+}
+
+#[test]
+fn g1_sum_batch_matches_ark() {
+    check_sum::<snarkrs_field::g1::Config>("G1", |r| G1Projective::rand(r));
+}
+
+#[test]
+fn g2_sum_batch_matches_ark() {
+    check_sum::<snarkrs_field::g2::Config>("G2", |r| G2Projective::rand(r));
+}

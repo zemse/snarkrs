@@ -85,6 +85,22 @@ fn run<P: RawCurve + ark_ec::CurveConfig<ScalarField = Fr>>(
         }
         println!("{name} batch {b} {:.2}", median(t));
     }
+
+    // Sums of two products, `b` of them from `2b` points: us per sum.
+    for &b in batches.iter().filter(|&&b| 2 * b <= n) {
+        let mut st = glv::BatchState::default();
+        let mut out = vec![Xyzz::<P::RF>::ZERO; b];
+        let mut t = Vec::new();
+        for _ in 0..reps {
+            let t0 = Instant::now();
+            glv::mul_sum_batch_xyzz_in(&mut st, &xyzz[..2 * b], &ks[..2 * b], 2, &mut out);
+            t.push(t0.elapsed().as_secs_f64() * 1e6 / b as f64);
+        }
+        for i in 0..b {
+            assert_eq!(to_projective::<P>(&out[i]), want[2 * i] + want[2 * i + 1]);
+        }
+        println!("{name} sum2 {b} {:.2}", median(t));
+    }
 }
 
 fn main() {

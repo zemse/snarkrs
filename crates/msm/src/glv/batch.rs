@@ -89,6 +89,7 @@ pub struct BatchState<F> {
     neg: Vec<bool>,
     tab: Vec<Pt<F>>,
     gone: Vec<bool>,
+    live: Vec<bool>,
     two: Vec<Pt<F>>,
     next: Vec<Pt<F>>,
     acc: Vec<Pt<F>>,
@@ -106,6 +107,7 @@ impl<F> Default for BatchState<F> {
             neg: Vec::new(),
             tab: Vec::new(),
             gone: Vec::new(),
+            live: Vec::new(),
             two: Vec::new(),
             next: Vec::new(),
             acc: Vec::new(),
@@ -135,67 +137,92 @@ pub fn mul_batch_xyzz_in<F: GlvField>(
     scalars: &[Fr],
     out: &mut [Xyzz<F>],
 ) {
-    assert_eq!(points.len(), scalars.len(), "one scalar per point");
     assert_eq!(points.len(), out.len(), "one output per point");
+    mul_sum_batch_xyzz_in(st, points, scalars, 1, out)
+}
+
+/// `out[i] = sum_t [k_(i terms + t)] P_(i terms + t)` for every `i`: sums of `terms`
+/// products, each sum one ladder. The terms of a sum share its doublings (Shamir's trick
+/// over the GLV parts of every term), so a sum of two costs the doublings of one product
+/// and the additions of two. Inputs and outputs as in [`mul_batch_xyzz`].
+pub fn mul_sum_batch_xyzz_in<F: GlvField>(
+    st: &mut BatchState<F>,
+    points: &[Xyzz<F>],
+    scalars: &[Fr],
+    terms: usize,
+    out: &mut [Xyzz<F>],
+) {
+    assert_eq!(points.len(), scalars.len(), "one scalar per point");
+    assert!(terms > 0, "a sum of at least one term");
+    assert_eq!(points.len(), terms * out.len(), "terms points per output");
+    // Parts per output: two or four per term (see [`GlvField::split`]).
     let dims = F::DIMS;
+    let parts = terms * dims;
     let base = to_affine_all(points, &mut st.s);
 
     let zero = Pt {
         x: F::ZERO,
         y: F::ZERO,
     };
-    // Per point: up to four parts of the scalar (two on G1, four on G2; see
-    // [`GlvField::split`]), each with its wNAF digits, sign and table of odd multiples.
-    // Digits are stored step-major, `[s][j][i]`, so a step's scan for nonzero digits reads
-    // one contiguous row per part rather than touching every point's whole state.
-    let n = points.len();
-    let row = |s: usize, j: usize| (s * dims + j) * n;
-    let at = |i: usize, j: usize, e: usize| (i * dims + j) * TABLE + e;
-    fill(&mut st.dig, DIGITS * dims * n, 0);
-    fill(&mut st.neg, dims * n, false);
+    // Per output and part: wNAF digits, a sign and a table of odd multiples, part `j`
+    // belonging to term `j / dims`. Digits are stored step-major, `[s][j][i]`, so a step's
+    // scan for nonzero digits reads one contiguous row per part rather than touching every
+    // output's whole state.
+    let n = out.len();
+    let m = points.len();
+    let row = |s: usize, j: usize| (s * parts + j) * n;
+    let at = |i: usize, j: usize, e: usize| (i * parts + j) * TABLE + e;
+    fill(&mut st.dig, DIGITS * parts * n, 0);
+    fill(&mut st.neg, parts * n, false);
     // Every live entry is written before it is read, so the tables are only grown.
-    if st.tab.len() < dims * TABLE * n {
-        st.tab.resize(dims * TABLE * n, zero);
+    if st.tab.len() < parts * TABLE * n {
+        st.tab.resize(parts * TABLE * n, zero);
     }
-    // Out of the batch: zero input, or an exceptional addition; see the module doc.
+    // Out of the batch: every term zero, or an exceptional addition; see the module doc.
     fill(&mut st.gone, n, true);
+    // Per term, `u = i terms + t`: whether it has a table to build.
+    fill(&mut st.live, m, false);
     let mut steps = 0;
     let mut tmp = [0i8; DIGITS];
-    for (i, (p, k)) in base.iter().zip(scalars).enumerate() {
+    for (u, (p, k)) in base.iter().zip(scalars).enumerate() {
         let Some(p) = p else { continue };
-        let parts = F::split(k);
-        let mut m = 0;
-        for (j, part) in parts.iter().enumerate().take(dims) {
+        let (i, t) = (u / terms, u % terms);
+        let split = F::split(k);
+        let mut len_max = 0;
+        for (d, part) in split.iter().enumerate().take(dims) {
+            let j = t * dims + d;
             let len = wnaf(part.unsigned_abs(), &mut tmp);
-            for (s, &d) in tmp[..len].iter().enumerate() {
-                st.dig[row(s, j) + i] = d;
+            for (s, &x) in tmp[..len].iter().enumerate() {
+                st.dig[row(s, j) + i] = x;
             }
-            st.neg[i * dims + j] = *part < 0;
-            m = m.max(len);
+            st.neg[i * parts + j] = *part < 0;
+            len_max = len_max.max(len);
         }
-        if m > 0 {
-            st.tab[at(i, 0, 0)] = *p;
+        if len_max > 0 {
+            st.tab[at(i, t * dims, 0)] = *p;
+            st.live[u] = true;
             st.gone[i] = false;
-            steps = steps.max(m);
+            steps = steps.max(len_max);
         }
     }
 
     // Odd multiples: 2P, then 3P = P + 2P and so on, one batched addition per entry; then
     // each endomorphism's table is its image of the first, entry by entry.
     st.idx.clear();
-    st.idx.extend((0..n).filter(|&i| !st.gone[i]));
+    st.idx.extend((0..m).filter(|&u| st.live[u]));
     {
+        let first = |u: usize| at(u / terms, (u % terms) * dims, 0);
         st.two.clear();
-        st.two.extend((0..n).map(|i| st.tab[at(i, 0, 0)]));
-        fill(&mut st.ok, n, true);
+        st.two.extend((0..m).map(|u| st.tab[first(u)]));
+        fill(&mut st.ok, m, true);
         batch_dbl(&mut st.two, &st.idx, &mut st.ok, &mut st.s);
-        fill(&mut st.next, n, zero);
-        fill(&mut st.acc_zero, n, false);
+        fill(&mut st.next, m, zero);
+        fill(&mut st.acc_zero, m, false);
         for e in 1..TABLE {
             st.adds.clear();
-            for &i in &st.idx {
-                st.next[i] = st.tab[at(i, 0, e - 1)];
-                st.adds.push((i, st.two[i]));
+            for &u in &st.idx {
+                st.next[u] = st.tab[first(u) + e - 1];
+                st.adds.push((u, st.two[u]));
             }
             batch_add(
                 &mut st.next,
@@ -204,20 +231,20 @@ pub fn mul_batch_xyzz_in<F: GlvField>(
                 &mut st.ok,
                 &mut st.s,
             );
-            for &i in &st.idx {
-                st.tab[at(i, 0, e)] = st.next[i];
+            for &u in &st.idx {
+                st.tab[first(u) + e] = st.next[u];
             }
         }
         // Odd multiples of a point of prime order never collide; this is belt and braces.
-        for &i in &st.idx {
-            if !st.ok[i] {
-                st.gone[i] = true;
+        for &u in &st.idx {
+            if !st.ok[u] {
+                st.gone[u / terms] = true;
             }
-            for j in 1..dims {
+            for d in 1..dims {
                 for e in 0..TABLE {
-                    let q = st.tab[at(i, 0, e)];
-                    let (x, y) = F::endo_j(j, q.x, q.y);
-                    st.tab[at(i, j, e)] = Pt { x, y };
+                    let q = st.tab[first(u) + e];
+                    let (x, y) = F::endo_j(d, q.x, q.y);
+                    st.tab[first(u) + d * TABLE + e] = Pt { x, y };
                 }
             }
         }
@@ -231,7 +258,7 @@ pub fn mul_batch_xyzz_in<F: GlvField>(
         st.idx
             .extend((0..n).filter(|&i| !st.gone[i] && st.ok[i] && !st.acc_zero[i]));
         batch_dbl(&mut st.acc, &st.idx, &mut st.ok, &mut st.s);
-        for j in 0..dims {
+        for j in 0..parts {
             st.adds.clear();
             let r = &st.dig[row(s, j)..row(s, j) + n];
             for (i, &d) in r.iter().enumerate() {
@@ -239,7 +266,7 @@ pub fn mul_batch_xyzz_in<F: GlvField>(
                     continue;
                 }
                 let mut e = st.tab[at(i, j, (d.unsigned_abs() >> 1) as usize)];
-                if (d < 0) != st.neg[i * dims + j] {
+                if (d < 0) != st.neg[i * parts + j] {
                     e.y = e.y.neg();
                 }
                 st.adds.push((i, e));
@@ -255,10 +282,17 @@ pub fn mul_batch_xyzz_in<F: GlvField>(
     }
 
     for i in 0..n {
-        out[i] = if base[i].is_none() || scalars[i] == Fr::from(0u64) {
+        let us = i * terms..(i + 1) * terms;
+        out[i] = if us
+            .clone()
+            .all(|u| base[u].is_none() || scalars[u] == Fr::from(0u64))
+        {
             Xyzz::ZERO
         } else if st.gone[i] || !st.ok[i] {
-            let r = super::mul(&points[i], &scalars[i]);
+            let mut r = Xyzz::ZERO;
+            for u in us {
+                r.add_assign(&super::mul(&points[u], &scalars[u]));
+            }
             to_affine_all(&[r], &mut st.s)[0].map_or(Xyzz::ZERO, |p| affine_xyzz(p))
         } else if st.acc_zero[i] {
             Xyzz::ZERO
