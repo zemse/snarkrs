@@ -77,7 +77,7 @@ fn apply_key<P: PrepareCurve>(points: &mut [Affine<P>], first: Fr, inc: Fr) {
     points
         .par_chunks_mut(KEY_SUBCHUNK)
         .enumerate()
-        .for_each(|(k, chunk)| {
+        .for_each_init(glv::BatchState::default, |st, (k, chunk)| {
             let mut t = first * inc.pow([(k * KEY_SUBCHUNK) as u64]);
             let scalars: Vec<Fr> = (0..chunk.len())
                 .map(|_| {
@@ -87,6 +87,6 @@ fn apply_key<P: PrepareCurve>(points: &mut [Affine<P>], first: Fr, inc: Fr) {
                 })
                 .collect();
             let input = chunk.to_vec();
-            glv::mul_batch(&input, &scalars, chunk);
+            glv::mul_batch_in(st, &input, &scalars, chunk);
         });
 }

@@ -86,6 +86,11 @@ const BUTTERFLIES_PER_TASK: usize = 1024;
 /// what a pass too small to give every thread a full batch gets.
 const MIN_BATCH: usize = 256;
 
+/// Butterflies per task on the one-point path. Each one is a point scalar multiplication
+/// in the tens of microseconds, so this keeps the task count high enough to balance
+/// rather than amortising the fork: at 32 a task is on the order of a millisecond.
+const SINGLE_PER_TASK: usize = 32;
+
 /// Points per [`batch_to_affine`] inversion. Montgomery's trick trades one inversion for
 /// three multiplications a point, so the batch only has to be long enough that the
 /// inversion disappears; past a few hundred it buys nothing and costs residency.
@@ -296,14 +301,19 @@ fn bit_reverse<T>(a: &mut [T], bits: u32) {
 fn mix_pass<F: GlvField>(a: &mut [Xyzz<F>], exp: u32, w: Fr, scale: Option<Fr>) {
     let per_group = 1usize << exp;
     let half = per_group >> 1;
-    // Four tasks a thread at least, so a pass is never a handful of batches on a twelve-
-    // thread pool, and a batch only when that still leaves one worth batching.
-    let fill = (a.len() / 2 / (4 * rayon::current_num_threads())).max(1);
-    let per_task = prev_power_of_two(fill.clamp(32, BUTTERFLIES_PER_TASK));
-    let batched = per_task >= MIN_BATCH;
-    let run = |runs: Vec<(&mut [Xyzz<F>], &mut [Xyzz<F>], usize)>| {
+    // Batches only where every thread still gets four of at least MIN_BATCH; a smaller
+    // pass keeps the one-point path in tasks of SINGLE_PER_TASK, fine enough that the
+    // efficiency cores do not set its pace.
+    let fill = a.len() / 2 / (4 * rayon::current_num_threads());
+    let batched = fill >= MIN_BATCH;
+    let per_task = if batched {
+        prev_power_of_two(fill.min(BUTTERFLIES_PER_TASK))
+    } else {
+        SINGLE_PER_TASK
+    };
+    let run = |st: &mut glv::BatchState<F>, runs: Vec<(&mut [Xyzz<F>], &mut [Xyzz<F>], usize)>| {
         if batched {
-            butterflies(runs, w, scale)
+            butterflies(st, runs, w, scale)
         } else {
             for (lo, hi, first) in runs {
                 butterflies_each(lo, hi, w, first, scale);
@@ -314,24 +324,32 @@ fn mix_pass<F: GlvField>(a: &mut [Xyzz<F>], exp: u32, w: Fr, scale: Option<Fr>) 
     // group and the last has one group, so splitting on either alone leaves a pass serial.
     if half <= per_task {
         let groups_per_task = per_task / half;
-        a.par_chunks_mut(per_group * groups_per_task)
-            .for_each(|slab| {
-                run(slab
-                    .chunks_mut(per_group)
-                    .map(|group| {
-                        let (lo, hi) = group.split_at_mut(half);
-                        (lo, hi, 0)
-                    })
-                    .collect())
-            });
+        a.par_chunks_mut(per_group * groups_per_task).for_each_init(
+            glv::BatchState::default,
+            |st, slab| {
+                run(
+                    st,
+                    slab.chunks_mut(per_group)
+                        .map(|group| {
+                            let (lo, hi) = group.split_at_mut(half);
+                            (lo, hi, 0)
+                        })
+                        .collect(),
+                )
+            },
+        );
     } else {
-        for group in a.chunks_mut(per_group) {
+        // The groups in parallel as well as the tasks inside each: a pass with a few large
+        // groups, 64 groups of 4096 say, is otherwise a few tasks at a time.
+        a.par_chunks_mut(per_group).for_each(|group| {
             let (lo, hi) = group.split_at_mut(half);
             lo.par_chunks_mut(per_task)
                 .zip(hi.par_chunks_mut(per_task))
                 .enumerate()
-                .for_each(|(c, (lo, hi))| run(vec![(lo, hi, c * per_task)]));
-        }
+                .for_each_init(glv::BatchState::default, |st, (c, (lo, hi))| {
+                    run(st, vec![(lo, hi, c * per_task)])
+                });
+        });
     }
 }
 
@@ -381,6 +399,7 @@ fn butterflies_each<F: GlvField>(
 /// Every multiplication of the call goes through one [`glv::mul_batch_xyzz`], whose
 /// outputs are affine, so the sum and difference are mixed additions.
 fn butterflies<F: GlvField>(
+    st: &mut glv::BatchState<F>,
     mut runs: Vec<(&mut [Xyzz<F>], &mut [Xyzz<F>], usize)>,
     w: Fr,
     scale: Option<Fr>,
@@ -404,7 +423,7 @@ fn butterflies<F: GlvField>(
         }
     }
     let mut ts = vec![Xyzz::ZERO; vs.len()];
-    glv::mul_batch_xyzz(&vs, &ks, &mut ts);
+    glv::mul_batch_xyzz_in(st, &vs, &ks, &mut ts);
     let mut us = Vec::new();
     if let Some(s) = scale {
         let lo: Vec<Xyzz<F>> = runs
@@ -412,7 +431,7 @@ fn butterflies<F: GlvField>(
             .flat_map(|(lo, _, _)| lo.iter().copied())
             .collect();
         us = vec![Xyzz::ZERO; lo.len()];
-        glv::mul_batch_xyzz(&lo, &vec![s; lo.len()], &mut us);
+        glv::mul_batch_xyzz_in(st, &lo, &vec![s; lo.len()], &mut us);
     }
 
     let (mut k, mut j) = (0, 0);
