@@ -41,7 +41,7 @@ use snarkrs_msm::{AccelError, MsmBackend};
 
 use crate::ptau::{self, Ptau};
 use crate::r1cs::{Matrix, R1cs};
-use crate::transcript::{Digest, Transcript};
+use crate::transcript::{self, Digest, Transcript};
 use crate::write::BinFileWriter;
 use crate::{CeremonyError, Groth16Header, N8, SG1};
 
@@ -533,9 +533,7 @@ fn write_points_g1(
     w.start_section(id)?;
     w.write_g1_slice(&points)?;
     w.end_section()?;
-    for p in &points {
-        cs.update_g1(p);
-    }
+    cs.update_g1_all(&points);
     Ok(())
 }
 
@@ -554,9 +552,7 @@ fn write_points_g2(
     w.start_section(id)?;
     w.write_g2_slice(&points)?;
     w.end_section()?;
-    for p in &points {
-        cs.update_g2(p);
-    }
+    cs.update_g2_all(&points);
     Ok(())
 }
 
@@ -975,20 +971,17 @@ pub fn hash_h_points(
         .start;
     let bytes = file.bytes();
 
-    let mut i = 0usize;
-    while i < domain_size - 1 {
-        let n = std::cmp::min(domain_size - 1, H_CHUNK);
-        let read = |element: usize| -> Result<&[u8], CeremonyError> {
-            let from = start + element * SG1;
-            bytes.get(from..from + n * SG1).ok_or_else(|| {
-                CeremonyError::malformed(
-                    ptau::S_TAU_G1,
-                    format!(
-                        "H hash reads {n} points at element {element}, past the end of the file"
-                    ),
-                )
-            })
-        };
+    let n = std::cmp::min(domain_size - 1, H_CHUNK);
+    let read = |element: usize| -> Result<&[u8], CeremonyError> {
+        let from = start + element * SG1;
+        bytes.get(from..from + n * SG1).ok_or_else(|| {
+            CeremonyError::malformed(
+                ptau::S_TAU_G1,
+                format!("H hash reads {n} points at element {element}, past the end of the file"),
+            )
+        })
+    };
+    let chunk = |i: usize| -> Result<Vec<u8>, CeremonyError> {
         let hi = read(i + domain_size)?;
         let lo = read(i)?;
         let diff: Vec<G1Projective> = hi
@@ -996,10 +989,30 @@ pub fn hash_h_points(
             .zip(lo.par_chunks_exact(SG1))
             .map(|(a, b)| h_difference(a, b))
             .collect();
-        for p in G1Projective::normalize_batch(&diff) {
-            transcript.update_g1(&p);
-        }
+        // Normalised a few thousand at a time rather than the chunk under one inversion;
+        // each point's `x / z^2` and `y / z^3` are exact either way, the overrun point's
+        // included (see above).
+        Ok(transcript::g1_uncompressed_all(&to_affine(&diff)))
+    };
+    // The hash is serial, so it runs beside the next chunk's arithmetic rather than
+    // between chunks.
+    let mut prev: Option<Vec<u8>> = None;
+    let mut i = 0usize;
+    while i < domain_size - 1 {
+        let hash = prev.take();
+        let (next, ()) = rayon::join(
+            || chunk(i),
+            || {
+                if let Some(b) = hash {
+                    transcript.update(&b);
+                }
+            },
+        );
+        prev = Some(next?);
         i += H_CHUNK;
+    }
+    if let Some(b) = prev {
+        transcript.update(&b);
     }
     Ok(())
 }

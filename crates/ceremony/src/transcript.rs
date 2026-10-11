@@ -44,6 +44,7 @@ use ark_ff::{AdditiveGroup, BigInt};
 use blake2::{Blake2b512, Digest as _};
 use rand_chacha::rand_core::{RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
+use rayon::prelude::*;
 use sha2::Sha256;
 use snarkrs_field::{
     g1, g2, AffineRepr, BigInteger, Bn254, CurveGroup, Field, Fq, Fq2, Fr, G1Affine, G2Affine,
@@ -77,6 +78,9 @@ pub const PERSONALIZATION_BETA: u8 = 2;
 /// BLAKE2b's block, and therefore the length of the buffer [`Transcript::partial_hash`]
 /// dumps.
 const BLOCK_BYTES: usize = 128;
+
+/// Points encoded per buffer in [`Transcript::update_g1_all`]: 4 MB of G1, 8 of G2.
+const ENCODE_BATCH: usize = 1 << 16;
 
 /// SHA-512's IV, which BLAKE2b reuses unchanged (RFC 7693 §2.6).
 const IV: [u64; 8] = [
@@ -248,6 +252,24 @@ impl Transcript {
     /// (`zkey_utils.js:552-556`).
     pub fn update_g2(&mut self, p: &G2Affine) {
         self.update(&g2_uncompressed(p));
+    }
+
+    /// [`Self::update_g1`] over every point in order. The digest is the same; the
+    /// encodings, two Montgomery reductions and a byte swap a coordinate, are computed in
+    /// parallel, which leaves the hash alone on the one thread.
+    pub fn update_g1_all(&mut self, points: &[G1Affine]) {
+        self.update_all(points, g1_uncompressed);
+    }
+
+    /// [`Self::update_g2`] over every point in order; see [`Self::update_g1_all`].
+    pub fn update_g2_all(&mut self, points: &[G2Affine]) {
+        self.update_all(points, g2_uncompressed);
+    }
+
+    fn update_all<T: Sync, const N: usize>(&mut self, points: &[T], enc: fn(&T) -> [u8; N]) {
+        for batch in points.chunks(ENCODE_BATCH) {
+            self.update(&encode_all(batch, enc));
+        }
     }
 
     pub fn finalize(mut self) -> Digest {
@@ -937,6 +959,19 @@ pub fn g1_uncompressed(p: &G1Affine) -> [u8; SG1] {
     out[..N8].copy_from_slice(&fq_be(&p.x));
     out[N8..].copy_from_slice(&fq_be(&p.y));
     out
+}
+
+/// [`g1_uncompressed`] of every point, concatenated, encoded in parallel.
+pub fn g1_uncompressed_all(points: &[G1Affine]) -> Vec<u8> {
+    encode_all(points, g1_uncompressed)
+}
+
+fn encode_all<T: Sync, const N: usize>(points: &[T], enc: fn(&T) -> [u8; N]) -> Vec<u8> {
+    let mut buf = vec![0u8; points.len() * N];
+    buf.par_chunks_mut(N)
+        .zip(points.par_iter())
+        .for_each(|(b, p)| b.copy_from_slice(&enc(p)));
+    buf
 }
 
 /// Uncompressed G2: `x.c1, x.c0, y.c1, y.c0`, each 32 bytes big-endian. The swap is what

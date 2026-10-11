@@ -54,16 +54,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     ] {
         let pts = compose_points_g1(slots, &bases, &r1cs, &msm)?;
         on_curve &= pts.iter().all(|p| p.is_on_curve());
-        for p in &pts {
-            cs.update_g1(p);
-        }
+        cs.update_g1_all(&pts);
         stage(name);
     }
     let b2 = compose_points_g2(&acc.b2, &bases, &r1cs, &msm)?;
     on_curve &= b2.iter().all(|p| p.is_on_curve());
-    for p in &b2 {
-        cs.update_g2(p);
-    }
+    cs.update_g2_all(&b2);
     stage("compose_b2");
     if !on_curve {
         return Err("a composed point is off the curve".into());
