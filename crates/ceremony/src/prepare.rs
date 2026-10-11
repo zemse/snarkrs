@@ -57,9 +57,9 @@ use ark_ec::short_weierstrass::{Affine, Projective};
 use rayon::prelude::*;
 use snarkrs_field::raw::{RawFq, RawFq2};
 use snarkrs_field::{
-    raw::RawField, BigInteger, FftField, Field, Fq, Fq2, Fr, G1Affine, G1Projective, G2Affine, One,
-    PrimeField, Zero,
+    raw::RawField, FftField, Field, Fq, Fq2, Fr, G1Affine, G1Projective, G2Affine, One, Zero,
 };
+use snarkrs_msm::glv::{self, GlvField};
 use snarkrs_msm::xyzz::{to_projective, RawCurve, Xyzz};
 use snarkrs_msm::{AccelError, GroupFft};
 
@@ -74,15 +74,6 @@ use crate::{ptau, CeremonyError};
 /// `createBinFile(newPTauFilename, "ptau", 1, 11)` (`powersoftau_preparephase2.js:29`).
 /// Not `PTAU_MAX_VERSION`: that is the highest version this crate will *read*.
 const PTAU_VERSION: u32 = 1;
-
-/// wNAF window for the twiddle multiplication. The table is `2^(w-2)` odd multiples, so
-/// the cost is `2^(w-2) - 1` additions to build it against a density of one nonzero digit
-/// every `w + 1` bits. Over BN254's 254-bit scalars the minimum sits flat across 4, 5 and
-/// 6; 5 costs 8 table entries and about 42 additions on top of the 254 doublings.
-const WNAF_WIDTH: usize = 5;
-
-/// Odd multiples `1P, 3P, ..., (2^(w-1)-1)P`.
-const WNAF_TABLE_LEN: usize = 1 << (WNAF_WIDTH - 2);
 
 /// Butterflies per rayon task. Each one is a point scalar multiplication in the tens of
 /// microseconds, so this is chosen to keep the task count high enough to balance rather
@@ -114,7 +105,7 @@ fn shift() -> Fr {
 ///
 /// Both are per batch, not per point. `invert` runs once per [`AFFINE_BATCH`] points and
 /// goes through arkworks rather than [`snarkrs_field::raw`], which has no inversion at all.
-pub trait PrepareCurve: RawCurve {
+pub trait PrepareCurve: RawCurve<RF: GlvField> {
     fn raw(f: &Self::BaseField) -> Self::RF;
     fn invert(f: Self::RF) -> Option<Self::RF>;
     /// The one call the transform cannot express generically: [`GroupFft`] has a separate
@@ -189,39 +180,13 @@ impl PrepareCurve for snarkrs_field::g2::Config {
 /// *how* it is done, only that the answer is `[k] p`, so a Metal or CUDA kernel replaces
 /// exactly this function and nothing around it.
 ///
-/// Kept generic over [`RawField`] rather than over the curve: G1 and G2 differ only in
-/// which field the [`Xyzz`] coordinates live in, and the GPU port wants the same.
+/// Kept generic over the coordinate field rather than over the curve: G1 and G2 differ
+/// only in which field the [`Xyzz`] coordinates live in, and the GPU port wants the same.
+/// The CPU path is [`glv::mul`], two interleaved 127-bit wNAF ladders over `p` and its
+/// endomorphism image, half the doublings of a plain 254-bit one.
 #[inline]
-pub fn point_times_fr<F: RawField>(p: &Xyzz<F>, k: &Fr) -> Xyzz<F> {
-    if p.is_zero() {
-        return Xyzz::ZERO;
-    }
-    // wNAF digits are odd and in `-(2^(w-1)-1) ..= 2^(w-1)-1`, so `|d| >> 1` indexes the
-    // odd-multiple table directly.
-    let digits = k
-        .into_bigint()
-        .find_wnaf(WNAF_WIDTH)
-        .expect("WNAF_WIDTH is in 2..64");
-
-    let two_p = p.dbl();
-    let mut table = [Xyzz::<F>::ZERO; WNAF_TABLE_LEN];
-    table[0] = *p;
-    for i in 1..WNAF_TABLE_LEN {
-        let mut next = table[i - 1];
-        next.add_assign(&two_p);
-        table[i] = next;
-    }
-
-    let mut acc = Xyzz::<F>::ZERO;
-    for &d in digits.iter().rev() {
-        acc = acc.dbl();
-        match d {
-            0 => {}
-            d if d > 0 => acc.add_assign(&table[(d as usize) >> 1]),
-            d => acc.add_assign(&negated(&table[((-d) as usize) >> 1])),
-        }
-    }
-    acc
+pub fn point_times_fr<F: GlvField>(p: &Xyzz<F>, k: &Fr) -> Xyzz<F> {
+    glv::mul(p, k)
 }
 
 /// `-p`. Negating `y` alone is correct in XYZZ for the same reason it is in Jacobian, and
@@ -249,7 +214,10 @@ pub fn batch_to_affine<P: PrepareCurve>(points: &[Xyzz<P::RF>]) -> Vec<Affine<P>
     out
 }
 
-fn batch_to_affine_serial<P: PrepareCurve>(points: &[Xyzz<P::RF>], out: &mut [Affine<P>]) {
+pub(crate) fn batch_to_affine_serial<P: PrepareCurve>(
+    points: &[Xyzz<P::RF>],
+    out: &mut [Affine<P>],
+) {
     // `prefix[i]` is the product of every `t` before `i`, skipping the points at infinity
     // so a zero never enters the accumulator.
     let mut prefix = Vec::with_capacity(points.len());
@@ -316,7 +284,7 @@ fn bit_reverse<T>(a: &mut [T], bits: u32) {
 /// snarkjs walks `W` forward one multiply at a time, which is serial by construction. The
 /// same twiddle sequence is recovered here per task from `w^first`, so a task can start
 /// anywhere in the group without replaying the ones before it.
-fn mix_pass<F: RawField>(a: &mut [Xyzz<F>], exp: u32, w: Fr) {
+fn mix_pass<F: GlvField>(a: &mut [Xyzz<F>], exp: u32, w: Fr) {
     let per_group = 1usize << exp;
     let half = per_group >> 1;
     // Tasks are sized in butterflies, not in groups: the first pass has one butterfly per
@@ -343,7 +311,7 @@ fn mix_pass<F: RawField>(a: &mut [Xyzz<F>], exp: u32, w: Fr) {
 ///
 /// The `w^0` case is skipped rather than multiplied. snarkjs does the multiplication, but
 /// `[1]P == P`, and at exponent 1 it is every butterfly in the pass.
-fn butterflies<F: RawField>(lo: &mut [Xyzz<F>], hi: &mut [Xyzz<F>], w: Fr, first: usize) {
+fn butterflies<F: GlvField>(lo: &mut [Xyzz<F>], hi: &mut [Xyzz<F>], w: Fr, first: usize) {
     let mut tw = w.pow([first as u64]);
     for (u, v) in lo.iter_mut().zip(hi.iter_mut()) {
         let t = if tw.is_one() {
@@ -366,7 +334,7 @@ fn butterflies<F: RawField>(lo: &mut [Xyzz<F>], hi: &mut [Xyzz<F>], w: Fr, first
 ///
 /// This is the whole of what a [`GroupFft`] backend replaces, which is why it is one
 /// function taking one slice: every pass is here and nothing else is.
-pub(crate) fn ifft<F: RawField>(a: &mut [Xyzz<F>]) {
+pub(crate) fn ifft<F: GlvField>(a: &mut [Xyzz<F>]) {
     let n = a.len();
     if n <= 1 {
         return;
@@ -421,7 +389,7 @@ fn ifft_block<P: PrepareCurve>(
 /// `tau`: the first half over `H`, the second over `shift*H`. That is the identity the
 /// unit test below checks, since no `power` this crate will ever see reaches the
 /// `bits == TWO_ADICITY + 1` gate that puts this on the real path.
-fn lagrange_split<F: RawField>(a: &mut [Xyzz<F>]) {
+fn lagrange_split<F: GlvField>(a: &mut [Xyzz<F>]) {
     let m = a.len() / 2;
     let shift_to_m = shift().pow([m as u64]);
     let s_const = (Fr::one() - shift_to_m)

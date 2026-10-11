@@ -1,16 +1,20 @@
 //! The CPU side of [`GroupFft`] and [`KeyScale`], and the reference every other
 //! implementation of them is compared against.
 //!
-//! Both are the code the commands used to call directly, moved behind the trait and not
-//! otherwise touched: the ceremony's whole claim is that its output is byte-identical to
-//! snarkjs 0.7.6, so the CPU path a `--backend cpu` run takes has to be the same arithmetic
-//! in the same order it was before there was a flag.
+//! Both are the code the commands used to call directly, moved behind the trait: the
+//! ceremony's whole claim is that its output is byte-identical to snarkjs 0.7.6, so the CPU
+//! path a `--backend cpu` run takes has to produce the same points it did before there was
+//! a flag. Every output is affine, which is canonical, so how a point is computed is free.
 
+use ark_ec::short_weierstrass::Affine;
 use rayon::prelude::*;
 use snarkrs_field::raw::{RawFq, RawFq2};
-use snarkrs_field::{AffineRepr, CurveGroup, Field, Fr, G1Affine, G2Affine};
+use snarkrs_field::{Field, Fr, G1Affine, G2Affine};
+use snarkrs_msm::glv;
 use snarkrs_msm::xyzz::Xyzz;
 use snarkrs_msm::{AccelError, GroupFft, KeyScale};
+
+use crate::prepare::{batch_to_affine_serial, PrepareCurve};
 
 /// Points per rayon task inside one applied-key chunk.
 ///
@@ -62,26 +66,25 @@ impl KeyScale for CpuKeyScale {
 /// `P_i *= first * inc^i` over one chunk, in place.
 ///
 /// One `Fr` exponentiation per task and then a running product, so the recurrence
-/// parallelises without changing which scalar any point gets.
-fn apply_key<C>(points: &mut [C], first: Fr, inc: Fr)
-where
-    C: AffineRepr<ScalarField = Fr> + Send + Sync,
-{
+/// parallelises without changing which scalar any point gets. Each product is
+/// [`glv::mul_affine`] on raw limbs rather than arkworks' affine multiply, which is plain
+/// double-and-add over all 254 bits; affine is canonical, so the bytes are the same.
+fn apply_key<P: PrepareCurve>(points: &mut [Affine<P>], first: Fr, inc: Fr) {
     points
         .par_chunks_mut(KEY_SUBCHUNK)
         .enumerate()
         .for_each(|(k, chunk)| {
             let mut t = first * inc.pow([(k * KEY_SUBCHUNK) as u64]);
-            let scaled: Vec<C::Group> = chunk
+            let scaled: Vec<Xyzz<P::RF>> = chunk
                 .iter()
                 .map(|p| {
-                    let q = *p * t;
+                    let q = glv::mul_affine(p, &t);
                     t *= inc;
                     q
                 })
                 .collect();
             // One inversion per task instead of one per point, which is what makes the
             // affine output cheaper than the multiplications that produced it.
-            chunk.copy_from_slice(&C::Group::normalize_batch(&scaled));
+            batch_to_affine_serial::<P>(&scaled, chunk);
         });
 }

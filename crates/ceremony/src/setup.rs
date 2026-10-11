@@ -25,15 +25,17 @@
 //! The one shipped bug that has to be reproduced rather than fixed lives in
 //! [`hash_h_points`].
 
-use std::ops::Mul;
 use std::path::Path;
 
+use ark_ec::short_weierstrass::{Affine, Projective};
 use rayon::prelude::*;
 use snarkrs_field::{
     AffineRepr, CurveGroup, FftField, Fq, Fr, G1Affine, G1Projective, G2Affine, G2Projective, One,
     PrimeField, Zero,
 };
 use snarkrs_formats::binfile;
+use snarkrs_msm::glv::{self, GlvField};
+use snarkrs_msm::xyzz::{to_projective, RawCurve, Xyzz};
 use snarkrs_msm::{AccelError, MsmBackend};
 
 use crate::ptau::{self, Ptau};
@@ -623,11 +625,10 @@ where
 /// snarkjs' three-way dispatch (`zkey_new.js:459-486`): identity, one scalar
 /// multiplication, or a multiexp. See [`MULTIEXP_MIN_TERMS`] for the fourth case, which is
 /// a small-slot shortcut and not a fourth behaviour.
-fn combine<A, P, F>(points: &[A], scalars: &[Fr], msm: F) -> Result<P, AccelError>
+fn combine<P, F>(points: &[Affine<P>], scalars: &[Fr], msm: F) -> Result<Projective<P>, AccelError>
 where
-    A: Copy + Mul<Fr, Output = P>,
-    P: Zero + Copy + std::ops::AddAssign<P>,
-    F: Fn(&[A], &[Fr]) -> Result<P, AccelError>,
+    P: RawCurve<RF: GlvField>,
+    F: Fn(&[Affine<P>], &[Fr]) -> Result<Projective<P>, AccelError>,
 {
     if points.len() != scalars.len() {
         return Err(AccelError::Shape {
@@ -638,11 +639,13 @@ where
     if points.len() >= MULTIEXP_MIN_TERMS {
         return msm(points, scalars);
     }
-    let mut acc = P::zero();
+    // On raw limbs through GLV: arkworks' affine multiply is double-and-add over all 254
+    // bits, and a small coefficient costs no table here (see `glv::mul`).
+    let mut acc = Xyzz::<P::RF>::ZERO;
     for (p, s) in points.iter().zip(scalars) {
-        acc += *p * *s;
+        acc.add_assign(&glv::mul_affine(p, s));
     }
-    Ok(acc)
+    Ok(to_projective(&acc))
 }
 
 #[cfg(test)]
