@@ -27,6 +27,7 @@ use rayon::prelude::*;
 use snarkrs_field::{Fr, G1Affine, G1Projective, G2Affine, G2Projective};
 
 pub mod accel;
+pub mod glv;
 pub mod xyzz;
 use snarkrs_field::raw::RawField;
 use xyzz::{to_projective, RawCurve, Xyzz};
