@@ -373,7 +373,7 @@ def size_list(xs):
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--bin-dir", required=True)
-    p.add_argument("--variants", nargs=2, default=["stock", "perf"])
+    p.add_argument("--variants", nargs="+", default=["stock", "perf"])
     p.add_argument("--backend", default="cpu", help="prove backend")
     p.add_argument("--ceremony-backend", default=None, help="contribute/beacon/setup backend (default: --backend)")
     p.add_argument("--prepare-backend", default=None, help="ptau prepare backend (default: --backend)")

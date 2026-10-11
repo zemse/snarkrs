@@ -95,8 +95,10 @@ def main():
         if not items:
             continue
         lines.append(f"### {label}, ms\n")
-        lines.append(f"| item | {base} | {new} | change | per round ({base} / {new}) |")
-        lines.append("|---|---:|---:|---:|---|")
+        others = variants[1:]
+        lines.append(f"| item | {' | '.join(variants)} | " + " | ".join(f"{v} vs {base}" for v in others)
+                     + f" | per round ({' / '.join(variants)}) |")
+        lines.append("|---|" + "---:|" * (len(variants) + len(others)) + "---|")
         summary["steps"][step] = {}
         for it in items:
             cell, per_round = {}, []
@@ -108,11 +110,14 @@ def main():
                     cell[v] = med([x for x in rms if x is not None])
                 per_round.append(rms)
             change = pct(cell[base], cell[new])
-            rr = " ; ".join(f"{fmt(x)} / {fmt(y)}" + ("*" if (step, it, r) in busy else "")
-                            for x, y, r in zip(*per_round, rounds) if x is not None or y is not None)
-            lines.append(f"| {it} | {fmt(cell[base])} | {fmt(cell[new])} | {fpct(change)} | {rr} |")
+            changes = {v: pct(cell[base], cell[v]) for v in others}
+            rr = " ; ".join(" / ".join(fmt(x) for x in xs) + ("*" if (step, it, r) in busy else "")
+                            for *xs, r in zip(*per_round, rounds) if any(x is not None for x in xs))
+            lines.append(f"| {it} | " + " | ".join(fmt(cell[v]) for v in variants) + " | "
+                         + " | ".join(fpct(changes[v]) for v in others) + f" | {rr} |")
             s = {v: cell[v] for v in variants}
             s["change_pct"] = change
+            s["change_pct_vs_" + base] = changes
             s["n"] = {v: sum(len(by[(step, it, v, r)]) for r in rounds) for v in variants}
             if step == "prove":
                 s["stages"] = {v: {k: med([x[k] for r in rounds for x in by[(step, it, v, r)]]) for k in STAGES}
@@ -168,7 +173,8 @@ def main():
                                                        Path(a.ptau_dir) / ptau, z)
         ok = sum(c[0] for c in checks.values())
         summary["snarkjs"] = {k: c[0] for k, c in checks.items()}
-        lines.append(f"snarkjs 0.7.6: {ok} of {len(checks)} accepted"
+        ver = subprocess.run([a.snarkjs], capture_output=True, text=True).stdout.split()[0]
+        lines.append(f"{ver}: {ok} of {len(checks)} accepted"
                      + ("" if ok == len(checks) else ": REJECTED " + ", ".join(k for k, c in checks.items() if not c[0]))
                      + ".\n")
     print("\n".join(lines))

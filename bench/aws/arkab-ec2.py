@@ -90,7 +90,7 @@ def run_guest(box, args, variants):
                 f"artifacts/{args.warm}/circuit.wtns /tmp/w.json /tmp/wp.json --backend cuda "
                 f"> results/warm-$v.log 2>&1; done; ")
     cmd = ("cd ~/m && mkdir -p results && lscpu > results/lscpu.txt && nproc > results/nproc.txt && "
-           "(nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader > results/gpu.txt 2>&1 || true) && "
+           "(nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader > results/gpu.txt 2>&1 || true); "
            f"nohup bash -c '{pre}python3 arkab.py --bin-dir bin --artifacts artifacts --ptau-dir ptau "
            f"--variants {vs} --out results {guest}' > guest.log 2>&1 < /dev/null &")
     box.ssh(cmd)

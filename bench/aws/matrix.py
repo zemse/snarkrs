@@ -267,7 +267,9 @@ def wait_ready(box):
 def upload(box, bundle):
     say("uploading bundle")
     t = time.time()
-    tar = subprocess.Popen(["tar", "-C", str(bundle), "-cf", "-", "."], stdout=subprocess.PIPE)
+    # COPYFILE_DISABLE stops macOS tar adding ._* AppleDouble files the guest would glob.
+    tar = subprocess.Popen(["tar", "-C", str(bundle), "-cf", "-", "."], stdout=subprocess.PIPE,
+                           env={**os.environ, "COPYFILE_DISABLE": "1"})
     r = subprocess.run(["ssh", *box.opts(), f"ubuntu@{box.ip}", "mkdir -p ~/m && tar -C ~/m -xf -"],
                        stdin=tar.stdout, capture_output=True, text=True)
     tar.wait()
