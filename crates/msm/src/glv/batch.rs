@@ -288,19 +288,18 @@ fn to_affine_all<F: GlvField>(points: &[Xyzz<F>], s: &mut Scratch<F>) -> Vec<Opt
             s.who.push(i);
         }
     }
-    invert_all(s);
     let mut out: Vec<Option<Pt<F>>> = points
         .iter()
         .map(|p| (!p.is_zero()).then_some(Pt { x: p.x, y: p.y }))
         .collect();
-    for (k, &i) in s.who.iter().enumerate() {
-        let p = &points[i];
-        let t = s.den[k];
-        out[i] = Some(Pt {
+    let who = &s.who;
+    invert_each(&s.den, &mut s.pre, |k, t| {
+        let p = &points[who[k]];
+        out[who[k]] = Some(Pt {
             x: p.x.mul(p.zzz).mul(t),
             y: p.y.mul(p.zz).mul(t),
         });
-    }
+    });
     out
 }
 
@@ -324,15 +323,16 @@ fn batch_dbl<F: GlvField>(a: &mut [Pt<F>], idx: &[usize], ok: &mut [bool], s: &m
         s.den.push(d);
         s.who.push(i);
     }
-    invert_all(s);
-    for (k, &i) in s.who.iter().enumerate() {
+    let who = &s.who;
+    invert_each(&s.den, &mut s.pre, |k, inv| {
+        let i = who[k];
         let p = a[i];
         let xx = p.x.sqr();
-        let l = xx.double().add(xx).mul(s.den[k]);
+        let l = xx.double().add(xx).mul(inv);
         let x3 = l.sqr().sub(p.x.double());
         let y3 = l.mul(p.x.sub(x3)).sub(p.y);
         a[i] = Pt { x: x3, y: y3 };
-    }
+    });
 }
 
 /// `a[i] += q` for each `(i, q)` in `adds` (at most one per `i`). Into the identity is a
@@ -360,34 +360,56 @@ fn batch_add<F: GlvField>(
         s.den.push(d);
         s.who.push(k);
     }
-    invert_all(s);
-    for (j, &k) in s.who.iter().enumerate() {
-        let (i, q) = adds[k];
+    let who = &s.who;
+    invert_each(&s.den, &mut s.pre, |j, inv| {
+        let (i, q) = adds[who[j]];
         let p = a[i];
-        let l = q.y.sub(p.y).mul(s.den[j]);
+        let l = q.y.sub(p.y).mul(inv);
         let x3 = l.sqr().sub(p.x).sub(q.x);
         let y3 = l.mul(p.x.sub(x3)).sub(p.y);
         a[i] = Pt { x: x3, y: y3 };
-    }
+    });
 }
 
-/// Replace every `s.den[k]` by its inverse: one field inversion for the lot.
-fn invert_all<F: GlvField>(s: &mut Scratch<F>) {
-    let n = s.den.len();
+/// `f(k, 1 / den[k])` for every `k`, from one field inversion.
+///
+/// The running products are two chains, one per half, walked side by side: each is a
+/// serial dependency, so one chain runs at the multiply's latency and two at nearer its
+/// throughput. Their two totals share the inversion. Each inverse goes to `f` as it comes
+/// out of the backward walk, so the caller's formula runs in that loop rather than in a
+/// pass of its own.
+#[inline(always)]
+fn invert_each<F: GlvField>(den: &[F], pre: &mut Vec<F>, mut f: impl FnMut(usize, F)) {
+    let n = den.len();
     if n == 0 {
         return;
     }
-    s.pre.clear();
-    let mut acc = F::ONE;
-    for d in &s.den {
-        s.pre.push(acc);
-        acc = acc.mul(*d);
+    let h = n / 2;
+    pre.clear();
+    pre.resize(n, F::ONE);
+    let (mut a, mut b) = (F::ONE, F::ONE);
+    for k in 0..h {
+        pre[k] = a;
+        pre[h + k] = b;
+        a = a.mul(den[k]);
+        b = b.mul(den[h + k]);
     }
-    let mut inv = acc.inv();
-    for k in (0..n).rev() {
-        let d = s.den[k];
-        s.den[k] = inv.mul(s.pre[k]);
-        inv = inv.mul(d);
+    // An odd one out goes on the end of the second chain.
+    if n % 2 == 1 {
+        pre[n - 1] = b;
+        b = b.mul(den[n - 1]);
+    }
+    let ab = a.mul(b).inv();
+    let (mut ia, mut ib) = (ab.mul(b), ab.mul(a));
+    if n % 2 == 1 {
+        f(n - 1, ib.mul(pre[n - 1]));
+        ib = ib.mul(den[n - 1]);
+    }
+    for k in (0..h).rev() {
+        f(k, ia.mul(pre[k]));
+        f(h + k, ib.mul(pre[h + k]));
+        ia = ia.mul(den[k]);
+        ib = ib.mul(den[h + k]);
     }
 }
 
@@ -398,6 +420,29 @@ mod tests {
     use snarkrs_field::{g1, G1Projective};
 
     type F = snarkrs_field::raw::RawFq;
+
+    /// Both chains of the shared inversion, at every length up to a few past two, odd ones
+    /// included, against one inversion per element.
+    #[test]
+    fn invert_each_matches_one_at_a_time() {
+        let mut pre = Vec::new();
+        invert_each::<F>(&[], &mut pre, |_, _| panic!("nothing to invert"));
+        let mut x = F::ONE.add(F::ONE);
+        for n in 1..=9 {
+            let den: Vec<F> = (0..n)
+                .map(|_| {
+                    x = x.sqr().add(F::ONE);
+                    x
+                })
+                .collect();
+            let mut seen = vec![false; n];
+            invert_each(&den, &mut pre, |k, i| {
+                assert_eq!(den[k].mul(i), F::ONE, "n = {n}, k = {k}");
+                seen[k] = true;
+            });
+            assert!(seen.iter().all(|&s| s), "n = {n}");
+        }
+    }
 
     /// The two exceptional additions, doubling and cancellation, are refused rather than
     /// divided by zero, and the rest of the batch is untouched.
