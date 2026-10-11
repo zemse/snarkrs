@@ -14,17 +14,19 @@ use snarkrs_msm::glv;
 use snarkrs_msm::xyzz::Xyzz;
 use snarkrs_msm::{AccelError, GroupFft, KeyScale};
 
-use crate::prepare::{batch_to_affine_serial, PrepareCurve};
+use crate::prepare::PrepareCurve;
 
-/// Points per rayon task inside one applied-key chunk.
+/// Points per rayon task inside one applied-key chunk, which is also the batch
+/// [`glv::mul_batch`] shares its inversions across.
 ///
 /// The scalar sequence `first * inc^i` is a serial recurrence, so each task recovers its
 /// own head with a single `inc^(k*SUBCHUNK)` exponentiation and then carries the product
 /// forward locally. Per-point exponentiation would also parallelise but costs a 254-bit
 /// `Fr` power per point next to one point multiplication, which is a few percent of the
-/// work for nothing. At 256 the head costs under 1% of a task, and a call over 8192
-/// points (phase 1's G2 chunk) is 32 tasks rather than 8 for a twelve-thread pool.
-const KEY_SUBCHUNK: usize = 256;
+/// work for nothing. The batch wants to be large: an addition step involves the sixth of
+/// it whose digit is nonzero, and one inversion is spread over those. Phase 1 calls with
+/// sixteen response chunks (262144 G1 or 131072 G2 points), zkey contribute with 65536.
+const KEY_SUBCHUNK: usize = 2048;
 
 /// The group FFT on the CPU: [`crate::prepare::ifft`] behind the trait.
 pub struct CpuGroupFft;
@@ -67,25 +69,24 @@ impl KeyScale for CpuKeyScale {
 /// `P_i *= first * inc^i` over one chunk, in place.
 ///
 /// One `Fr` exponentiation per task and then a running product, so the recurrence
-/// parallelises without changing which scalar any point gets. Each product is
-/// [`glv::mul_affine`] on raw limbs rather than arkworks' affine multiply, which is plain
-/// double-and-add over all 254 bits; affine is canonical, so the bytes are the same.
+/// parallelises without changing which scalar any point gets. The products are
+/// [`glv::mul_batch`]: GLV on raw limbs, every point of the task in lockstep in affine
+/// coordinates with one shared inversion a step, where arkworks' affine multiply is plain
+/// double-and-add over all 254 bits. Affine is canonical, so the bytes are the same.
 fn apply_key<P: PrepareCurve>(points: &mut [Affine<P>], first: Fr, inc: Fr) {
     points
         .par_chunks_mut(KEY_SUBCHUNK)
         .enumerate()
         .for_each(|(k, chunk)| {
             let mut t = first * inc.pow([(k * KEY_SUBCHUNK) as u64]);
-            let scaled: Vec<Xyzz<P::RF>> = chunk
-                .iter()
-                .map(|p| {
-                    let q = glv::mul_affine(p, &t);
+            let scalars: Vec<Fr> = (0..chunk.len())
+                .map(|_| {
+                    let s = t;
                     t *= inc;
-                    q
+                    s
                 })
                 .collect();
-            // One inversion per task instead of one per point, which is what makes the
-            // affine output cheaper than the multiplications that produced it.
-            batch_to_affine_serial::<P>(&scaled, chunk);
+            let input = chunk.to_vec();
+            glv::mul_batch(&input, &scalars, chunk);
         });
 }

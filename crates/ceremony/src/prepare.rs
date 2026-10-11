@@ -75,10 +75,16 @@ use crate::{ptau, CeremonyError};
 /// Not `PTAU_MAX_VERSION`: that is the highest version this crate will *read*.
 const PTAU_VERSION: u32 = 1;
 
-/// Butterflies per rayon task. Each one is a point scalar multiplication in the tens of
-/// microseconds, so this is chosen to keep the task count high enough to balance rather
-/// than to amortise the fork: at 32 a task is on the order of a millisecond.
-const BUTTERFLIES_PER_TASK: usize = 32;
+/// Most butterflies per rayon task, which is also the batch [`glv::mul_batch_xyzz`]
+/// shares its inversions across: an addition step of that ladder involves the sixth of the
+/// batch whose digit is nonzero, so the batch wants to be large. Single thread on an M2
+/// Max a G1 multiplication is 35.5 us alone in XYZZ against 44.6, 31.6 and 28.5 us a point
+/// in batches of 64, 256 and 1024 (G2: 136 against 70, 57 and 54).
+const BUTTERFLIES_PER_TASK: usize = 1024;
+
+/// Below this many butterflies a task multiplies one point at a time instead, which is
+/// what a pass too small to give every thread a full batch gets.
+const MIN_BATCH: usize = 256;
 
 /// Points per [`batch_to_affine`] inversion. Montgomery's trick trades one inversion for
 /// three multiplications a point, so the batch only has to be long enough that the
@@ -290,36 +296,51 @@ fn bit_reverse<T>(a: &mut [T], bits: u32) {
 fn mix_pass<F: GlvField>(a: &mut [Xyzz<F>], exp: u32, w: Fr, scale: Option<Fr>) {
     let per_group = 1usize << exp;
     let half = per_group >> 1;
+    // Four tasks a thread at least, so a pass is never a handful of batches on a twelve-
+    // thread pool, and a batch only when that still leaves one worth batching.
+    let fill = (a.len() / 2 / (4 * rayon::current_num_threads())).max(1);
+    let per_task = prev_power_of_two(fill.clamp(32, BUTTERFLIES_PER_TASK));
+    let batched = per_task >= MIN_BATCH;
+    let run = |runs: Vec<(&mut [Xyzz<F>], &mut [Xyzz<F>], usize)>| {
+        if batched {
+            butterflies(runs, w, scale)
+        } else {
+            for (lo, hi, first) in runs {
+                butterflies_each(lo, hi, w, first, scale);
+            }
+        }
+    };
     // Tasks are sized in butterflies, not in groups: the first pass has one butterfly per
     // group and the last has one group, so splitting on either alone leaves a pass serial.
-    let groups_per_task = BUTTERFLIES_PER_TASK.div_ceil(half).max(1);
-
-    a.par_chunks_mut(per_group * groups_per_task)
-        .for_each(|slab| {
-            for group in slab.chunks_mut(per_group) {
-                let (lo, hi) = group.split_at_mut(half);
-                if half <= BUTTERFLIES_PER_TASK {
-                    butterflies(lo, hi, w, 0, scale);
-                } else {
-                    lo.par_chunks_mut(BUTTERFLIES_PER_TASK)
-                        .zip(hi.par_chunks_mut(BUTTERFLIES_PER_TASK))
-                        .enumerate()
-                        .for_each(|(c, (lo, hi))| {
-                            butterflies(lo, hi, w, c * BUTTERFLIES_PER_TASK, scale)
-                        });
-                }
-            }
-        });
+    if half <= per_task {
+        let groups_per_task = per_task / half;
+        a.par_chunks_mut(per_group * groups_per_task)
+            .for_each(|slab| {
+                run(slab
+                    .chunks_mut(per_group)
+                    .map(|group| {
+                        let (lo, hi) = group.split_at_mut(half);
+                        (lo, hi, 0)
+                    })
+                    .collect())
+            });
+    } else {
+        for group in a.chunks_mut(per_group) {
+            let (lo, hi) = group.split_at_mut(half);
+            lo.par_chunks_mut(per_task)
+                .zip(hi.par_chunks_mut(per_task))
+                .enumerate()
+                .for_each(|(c, (lo, hi))| run(vec![(lo, hi, c * per_task)]));
+        }
+    }
 }
 
-/// `lo[i], hi[i] <- lo[i] + w^(first+i) hi[i], lo[i] - w^(first+i) hi[i]`, both times
-/// `s` when `scale` is `Some(s)`.
-///
-/// The `w^0` case is skipped rather than multiplied. snarkjs does the multiplication, but
-/// `[1]P == P`, and at exponent 1 it is every butterfly in the pass. A scaled butterfly
-/// is `[s] lo[i] +- [s w^j] hi[i]`: two multiplications for two scaled outputs, where
-/// scaling after the pass would cost those two on top of the twiddle.
-fn butterflies<F: GlvField>(
+fn prev_power_of_two(x: usize) -> usize {
+    1 << (usize::BITS - 1 - x.leading_zeros())
+}
+
+/// [`butterflies`] one point at a time in XYZZ, for passes too small to batch.
+fn butterflies_each<F: GlvField>(
     lo: &mut [Xyzz<F>],
     hi: &mut [Xyzz<F>],
     w: Fr,
@@ -346,6 +367,78 @@ fn butterflies<F: GlvField>(
         *u = sum;
         *v = diff;
         tw *= w;
+    }
+}
+
+/// `lo[i], hi[i] <- lo[i] + w^(first+i) hi[i], lo[i] - w^(first+i) hi[i]` over every run,
+/// both outputs times `s` when `scale` is `Some(s)`.
+///
+/// The `w^0` case is skipped rather than multiplied. snarkjs does the multiplication, but
+/// `[1]P == P`, and at exponent 1 it is every butterfly in the pass. A scaled butterfly
+/// is `[s] lo[i] +- [s w^j] hi[i]`: two multiplications for two scaled outputs, where
+/// scaling after the pass would cost those two on top of the twiddle.
+///
+/// Every multiplication of the call goes through one [`glv::mul_batch_xyzz`], whose
+/// outputs are affine, so the sum and difference are mixed additions.
+fn butterflies<F: GlvField>(
+    mut runs: Vec<(&mut [Xyzz<F>], &mut [Xyzz<F>], usize)>,
+    w: Fr,
+    scale: Option<Fr>,
+) {
+    let mut vs = Vec::new();
+    let mut ks = Vec::new();
+    let mut twiddled = Vec::new();
+    for (_, hi, first) in &runs {
+        let mut tw = w.pow([*first as u64]);
+        if let Some(s) = scale {
+            tw *= s;
+        }
+        for v in hi.iter() {
+            let one = tw.is_one();
+            twiddled.push(!one);
+            if !one {
+                vs.push(*v);
+                ks.push(tw);
+            }
+            tw *= w;
+        }
+    }
+    let mut ts = vec![Xyzz::ZERO; vs.len()];
+    glv::mul_batch_xyzz(&vs, &ks, &mut ts);
+    let mut us = Vec::new();
+    if let Some(s) = scale {
+        let lo: Vec<Xyzz<F>> = runs
+            .iter()
+            .flat_map(|(lo, _, _)| lo.iter().copied())
+            .collect();
+        us = vec![Xyzz::ZERO; lo.len()];
+        glv::mul_batch_xyzz(&lo, &vec![s; lo.len()], &mut us);
+    }
+
+    let (mut k, mut j) = (0, 0);
+    for (lo, hi, _) in runs.iter_mut() {
+        for (u, v) in lo.iter_mut().zip(hi.iter_mut()) {
+            if scale.is_some() {
+                *u = us[j];
+            }
+            let mut sum = *u;
+            let mut diff = *u;
+            if twiddled[j] {
+                // Affine: a mixed addition each.
+                let t = &ts[k];
+                k += 1;
+                if !t.is_zero() {
+                    sum.madd(t.x, t.y);
+                    diff.madd(t.x, t.y.neg());
+                }
+            } else {
+                sum.add_assign(v);
+                diff.add_assign(&negated(v));
+            }
+            *u = sum;
+            *v = diff;
+            j += 1;
+        }
     }
 }
 
