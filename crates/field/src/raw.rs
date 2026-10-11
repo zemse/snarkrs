@@ -35,6 +35,14 @@
 //! top word 0x30644e72e131a029 is below 2^63 - 1 on both fields. The same shape was
 //! validated for the GPU ports against a bit-exact host simulation; here it is
 //! additionally differential-tested against `ark-ff` in `tests/raw_matches_ark.rs`.
+//!
+//! On aarch64 the add, sub, conditional subtraction and multiply are inline assembly, the
+//! same arithmetic in the instruction sequence LLVM will not produce from the portable
+//! code: it turns a subtraction of the modulus into an addition of its complement and
+//! carries every borrow through cset/csinc or cinc/sbc pairs. Single thread on an M2 Max
+//! (`examples/raw_ops.rs`, ns, dependent chain / eight chains / random stream) that took
+//! add from 6.43/3.30/3.40 to 2.72/1.84/1.81, sub from 5.39/2.49/2.64 to 2.71/1.84/1.83 and
+//! mul from 25.7/19.4/19.6 to 20.4/13.9/13.9. Every other target keeps the portable code.
 
 use crate::{Fq, Fq2, Fr};
 
@@ -63,6 +71,7 @@ pub const FR_N0: u64 = 0xc2e1f593efffffff;
 // swallowed whole by the caller's loop body.
 // ---------------------------------------------------------------------------
 
+#[cfg(not(target_arch = "aarch64"))]
 #[inline(always)]
 fn sbb(a: u64, b: u64, borrow: u64) -> (u64, u64) {
     // 128-bit subtract keeps the borrow as data rather than as a flag the compiler is
@@ -73,6 +82,7 @@ fn sbb(a: u64, b: u64, borrow: u64) -> (u64, u64) {
     (t as u64, (t >> 127) as u64)
 }
 
+#[cfg(not(target_arch = "aarch64"))]
 #[inline(always)]
 fn adc(a: u64, b: u64, carry: u64) -> (u64, u64) {
     let t = a as u128 + b as u128 + carry as u128;
@@ -92,6 +102,7 @@ fn is_reduced(t: &[u64; 4], m: &[u64; 4]) -> bool {
 
 /// `if t >= m { t - m } else { t }`, branch-free: both candidates are computed and
 /// blended by a mask. LLVM emits csel/cmov for the blend.
+#[cfg(not(target_arch = "aarch64"))]
 #[inline(always)]
 fn cond_sub(t: [u64; 4], m: &[u64; 4]) -> [u64; 4] {
     let (r0, b) = sbb(t[0], m[0], 0);
@@ -111,6 +122,7 @@ fn cond_sub(t: [u64; 4], m: &[u64; 4]) -> [u64; 4] {
 /// `(a + b) mod m` for fully reduced inputs. The carry out of limb 3 is provably zero
 /// for both BN254 fields (moduli are 254-bit), so the sum fits four limbs and one
 /// conditional subtraction finishes it.
+#[cfg(not(target_arch = "aarch64"))]
 #[inline(always)]
 fn add_mod(a: [u64; 4], b: [u64; 4], m: &[u64; 4]) -> [u64; 4] {
     let (s0, c) = adc(a[0], b[0], 0);
@@ -121,6 +133,7 @@ fn add_mod(a: [u64; 4], b: [u64; 4], m: &[u64; 4]) -> [u64; 4] {
 }
 
 /// `(a - b) mod m`, branch-free: the modulus is masked in when the subtraction borrows.
+#[cfg(not(target_arch = "aarch64"))]
 #[inline(always)]
 fn sub_mod(a: [u64; 4], b: [u64; 4], m: &[u64; 4]) -> [u64; 4] {
     let (d0, bw) = sbb(a[0], b[0], 0);
@@ -138,6 +151,7 @@ fn sub_mod(a: [u64; 4], b: [u64; 4], m: &[u64; 4]) -> [u64; 4] {
 /// Montgomery product, fused no-final-carry CIOS. Montgomery in, Montgomery out, fully
 /// reduced. Valid for moduli whose top word is at most (2^64 - 1)/2 - 1, which both
 /// BN254 fields satisfy; see the module doc.
+#[cfg(not(target_arch = "aarch64"))]
 #[inline(always)]
 fn mont_mul(a: [u64; 4], b: [u64; 4], m: &[u64; 4], n0: u64) -> [u64; 4] {
     let mut t = [0u64; 4];
@@ -160,6 +174,277 @@ fn mont_mul(a: [u64; 4], b: [u64; 4], m: &[u64; 4], n0: u64) -> [u64; 4] {
         t[3] = (c as u64).wrapping_add(aa as u64);
     }
     cond_sub(t, m)
+}
+
+/// `(a + b) mod m` on aarch64: one adds/adcs chain for the sum, one subs/sbcs chain
+/// against `m`, four csel. Written out because LLVM will not emit the subs/sbcs chain
+/// against a constant: it rewrites `s - m` as `s + (2^64 - m)` and carries the borrow
+/// through cinc/sbc or cset/csinc pairs, twice the instructions.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn add_mod(a: [u64; 4], b: [u64; 4], m: &[u64; 4]) -> [u64; 4] {
+    let [mut a0, mut a1, mut a2, mut a3] = a;
+    // SAFETY: register arithmetic only: no memory, no stack; the flags are clobbered,
+    // which `asm!` assumes unless told `preserves_flags`.
+    unsafe {
+        core::arch::asm!(
+            "adds {a0}, {a0}, {b0}",
+            "adcs {a1}, {a1}, {b1}",
+            "adcs {a2}, {a2}, {b2}",
+            "adc {a3}, {a3}, {b3}",
+            "subs {d0}, {a0}, {m0}",
+            "sbcs {d1}, {a1}, {m1}",
+            "sbcs {d2}, {a2}, {m2}",
+            "sbcs {d3}, {a3}, {m3}",
+            "csel {a0}, {a0}, {d0}, lo",
+            "csel {a1}, {a1}, {d1}, lo",
+            "csel {a2}, {a2}, {d2}, lo",
+            "csel {a3}, {a3}, {d3}, lo",
+            a0 = inout(reg) a0,
+            a1 = inout(reg) a1,
+            a2 = inout(reg) a2,
+            a3 = inout(reg) a3,
+            b0 = in(reg) b[0],
+            b1 = in(reg) b[1],
+            b2 = in(reg) b[2],
+            b3 = in(reg) b[3],
+            m0 = in(reg) m[0],
+            m1 = in(reg) m[1],
+            m2 = in(reg) m[2],
+            m3 = in(reg) m[3],
+            d0 = out(reg) _,
+            d1 = out(reg) _,
+            d2 = out(reg) _,
+            d3 = out(reg) _,
+            options(pure, nomem, nostack),
+        );
+    }
+    [a0, a1, a2, a3]
+}
+
+/// `(a - b) mod m` on aarch64: the difference, then `m` masked in by csel when it
+/// borrowed and added back.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn sub_mod(a: [u64; 4], b: [u64; 4], m: &[u64; 4]) -> [u64; 4] {
+    let [mut a0, mut a1, mut a2, mut a3] = a;
+    // SAFETY: register arithmetic only: no memory, no stack; the flags are clobbered,
+    // which `asm!` assumes unless told `preserves_flags`.
+    unsafe {
+        core::arch::asm!(
+            "subs {a0}, {a0}, {b0}",
+            "sbcs {a1}, {a1}, {b1}",
+            "sbcs {a2}, {a2}, {b2}",
+            "sbcs {a3}, {a3}, {b3}",
+            "csel {d0}, {m0}, xzr, lo",
+            "csel {d1}, {m1}, xzr, lo",
+            "csel {d2}, {m2}, xzr, lo",
+            "csel {d3}, {m3}, xzr, lo",
+            "adds {a0}, {a0}, {d0}",
+            "adcs {a1}, {a1}, {d1}",
+            "adcs {a2}, {a2}, {d2}",
+            "adc {a3}, {a3}, {d3}",
+            a0 = inout(reg) a0,
+            a1 = inout(reg) a1,
+            a2 = inout(reg) a2,
+            a3 = inout(reg) a3,
+            b0 = in(reg) b[0],
+            b1 = in(reg) b[1],
+            b2 = in(reg) b[2],
+            b3 = in(reg) b[3],
+            m0 = in(reg) m[0],
+            m1 = in(reg) m[1],
+            m2 = in(reg) m[2],
+            m3 = in(reg) m[3],
+            d0 = out(reg) _,
+            d1 = out(reg) _,
+            d2 = out(reg) _,
+            d3 = out(reg) _,
+            options(pure, nomem, nostack),
+        );
+    }
+    [a0, a1, a2, a3]
+}
+
+/// [`mont_mul`] on aarch64: gnark-crypto's 4-word arm64 `mul`
+/// (`field/asm/element_4w/element_4w_arm64.s`), the same no-final-carry CIOS, a row at a
+/// time with one adds/adcs chain per row, closed by the same branch-free subs/sbcs and
+/// csel. LLVM's code for the portable version spends a cinc or cset per limb on carries
+/// and rematerialises the modulus inside the loop.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn mont_mul(a: [u64; 4], b: [u64; 4], m: &[u64; 4], n0: u64) -> [u64; 4] {
+    let (t0, t1, t2, t3): (u64, u64, u64, u64);
+    // SAFETY: register arithmetic only: no memory, no stack; flags clobbered.
+    unsafe {
+        core::arch::asm!(
+            "mul {t0}, {a0}, {b0}",
+            "mul {t1}, {a1}, {b0}",
+            "mul {t2}, {a2}, {b0}",
+            "mul {t3}, {a3}, {b0}",
+            "umulh {tmp}, {a0}, {b0}",
+            "adds {t1}, {t1}, {tmp}",
+            "umulh {tmp}, {a1}, {b0}",
+            "adcs {t2}, {t2}, {tmp}",
+            "umulh {tmp}, {a2}, {b0}",
+            "adcs {t3}, {t3}, {tmp}",
+            "umulh {tmp}, {a3}, {b0}",
+            "adc {t4}, {tmp}, xzr",
+            "mul {m}, {t0}, {inv}",
+            "mul {tmp}, {q0}, {m}",
+            "adds {t0}, {t0}, {tmp}",
+            "mul {tmp}, {q1}, {m}",
+            "adcs {t1}, {t1}, {tmp}",
+            "mul {tmp}, {q2}, {m}",
+            "adcs {t2}, {t2}, {tmp}",
+            "mul {tmp}, {q3}, {m}",
+            "adcs {t3}, {t3}, {tmp}",
+            "adc {t4}, {t4}, xzr",
+            "umulh {tmp}, {q0}, {m}",
+            "adds {t0}, {t1}, {tmp}",
+            "umulh {tmp}, {q1}, {m}",
+            "adcs {t1}, {t2}, {tmp}",
+            "umulh {tmp}, {q2}, {m}",
+            "adcs {t2}, {t3}, {tmp}",
+            "umulh {tmp}, {q3}, {m}",
+            "adc {t3}, {t4}, {tmp}",
+            "mul {tmp}, {a0}, {b1}",
+            "adds {t0}, {t0}, {tmp}",
+            "mul {m}, {t0}, {inv}",
+            "mul {tmp}, {a1}, {b1}",
+            "adcs {t1}, {t1}, {tmp}",
+            "mul {tmp}, {a2}, {b1}",
+            "adcs {t2}, {t2}, {tmp}",
+            "mul {tmp}, {a3}, {b1}",
+            "adcs {t3}, {t3}, {tmp}",
+            "adc {t4}, xzr, xzr",
+            "umulh {tmp}, {a0}, {b1}",
+            "adds {t1}, {t1}, {tmp}",
+            "umulh {tmp}, {a1}, {b1}",
+            "adcs {t2}, {t2}, {tmp}",
+            "umulh {tmp}, {a2}, {b1}",
+            "adcs {t3}, {t3}, {tmp}",
+            "umulh {tmp}, {a3}, {b1}",
+            "adc {t4}, {t4}, {tmp}",
+            "mul {tmp}, {q0}, {m}",
+            "adds {t0}, {t0}, {tmp}",
+            "mul {tmp}, {q1}, {m}",
+            "adcs {t1}, {t1}, {tmp}",
+            "mul {tmp}, {q2}, {m}",
+            "adcs {t2}, {t2}, {tmp}",
+            "mul {tmp}, {q3}, {m}",
+            "adcs {t3}, {t3}, {tmp}",
+            "adc {t4}, {t4}, xzr",
+            "umulh {tmp}, {q0}, {m}",
+            "adds {t0}, {t1}, {tmp}",
+            "umulh {tmp}, {q1}, {m}",
+            "adcs {t1}, {t2}, {tmp}",
+            "umulh {tmp}, {q2}, {m}",
+            "adcs {t2}, {t3}, {tmp}",
+            "umulh {tmp}, {q3}, {m}",
+            "adc {t3}, {t4}, {tmp}",
+            "mul {tmp}, {a0}, {b2}",
+            "adds {t0}, {t0}, {tmp}",
+            "mul {m}, {t0}, {inv}",
+            "mul {tmp}, {a1}, {b2}",
+            "adcs {t1}, {t1}, {tmp}",
+            "mul {tmp}, {a2}, {b2}",
+            "adcs {t2}, {t2}, {tmp}",
+            "mul {tmp}, {a3}, {b2}",
+            "adcs {t3}, {t3}, {tmp}",
+            "adc {t4}, xzr, xzr",
+            "umulh {tmp}, {a0}, {b2}",
+            "adds {t1}, {t1}, {tmp}",
+            "umulh {tmp}, {a1}, {b2}",
+            "adcs {t2}, {t2}, {tmp}",
+            "umulh {tmp}, {a2}, {b2}",
+            "adcs {t3}, {t3}, {tmp}",
+            "umulh {tmp}, {a3}, {b2}",
+            "adc {t4}, {t4}, {tmp}",
+            "mul {tmp}, {q0}, {m}",
+            "adds {t0}, {t0}, {tmp}",
+            "mul {tmp}, {q1}, {m}",
+            "adcs {t1}, {t1}, {tmp}",
+            "mul {tmp}, {q2}, {m}",
+            "adcs {t2}, {t2}, {tmp}",
+            "mul {tmp}, {q3}, {m}",
+            "adcs {t3}, {t3}, {tmp}",
+            "adc {t4}, {t4}, xzr",
+            "umulh {tmp}, {q0}, {m}",
+            "adds {t0}, {t1}, {tmp}",
+            "umulh {tmp}, {q1}, {m}",
+            "adcs {t1}, {t2}, {tmp}",
+            "umulh {tmp}, {q2}, {m}",
+            "adcs {t2}, {t3}, {tmp}",
+            "umulh {tmp}, {q3}, {m}",
+            "adc {t3}, {t4}, {tmp}",
+            "mul {tmp}, {a0}, {b3}",
+            "adds {t0}, {t0}, {tmp}",
+            "mul {m}, {t0}, {inv}",
+            "mul {tmp}, {a1}, {b3}",
+            "adcs {t1}, {t1}, {tmp}",
+            "mul {tmp}, {a2}, {b3}",
+            "adcs {t2}, {t2}, {tmp}",
+            "mul {tmp}, {a3}, {b3}",
+            "adcs {t3}, {t3}, {tmp}",
+            "adc {t4}, xzr, xzr",
+            "umulh {tmp}, {a0}, {b3}",
+            "adds {t1}, {t1}, {tmp}",
+            "umulh {tmp}, {a1}, {b3}",
+            "adcs {t2}, {t2}, {tmp}",
+            "umulh {tmp}, {a2}, {b3}",
+            "adcs {t3}, {t3}, {tmp}",
+            "umulh {tmp}, {a3}, {b3}",
+            "adc {t4}, {t4}, {tmp}",
+            "mul {tmp}, {q0}, {m}",
+            "adds {t0}, {t0}, {tmp}",
+            "mul {tmp}, {q1}, {m}",
+            "adcs {t1}, {t1}, {tmp}",
+            "mul {tmp}, {q2}, {m}",
+            "adcs {t2}, {t2}, {tmp}",
+            "mul {tmp}, {q3}, {m}",
+            "adcs {t3}, {t3}, {tmp}",
+            "adc {t4}, {t4}, xzr",
+            "umulh {tmp}, {q0}, {m}",
+            "adds {t0}, {t1}, {tmp}",
+            "umulh {tmp}, {q1}, {m}",
+            "adcs {t1}, {t2}, {tmp}",
+            "umulh {tmp}, {q2}, {m}",
+            "adcs {t2}, {t3}, {tmp}",
+            "umulh {tmp}, {q3}, {m}",
+            "adc {t3}, {t4}, {tmp}",
+            "subs {a0}, {t0}, {q0}",
+            "sbcs {a1}, {t1}, {q1}",
+            "sbcs {a2}, {t2}, {q2}",
+            "sbcs {a3}, {t3}, {q3}",
+            "csel {t0}, {a0}, {t0}, cs",
+            "csel {t1}, {a1}, {t1}, cs",
+            "csel {t2}, {a2}, {t2}, cs",
+            "csel {t3}, {a3}, {t3}, cs",
+            a0 = inout(reg) a[0] => _,
+            a1 = inout(reg) a[1] => _,
+            a2 = inout(reg) a[2] => _,
+            a3 = inout(reg) a[3] => _,
+            b0 = in(reg) b[0],
+            b1 = in(reg) b[1],
+            b2 = in(reg) b[2],
+            b3 = in(reg) b[3],
+            q0 = in(reg) m[0],
+            q1 = in(reg) m[1],
+            q2 = in(reg) m[2],
+            q3 = in(reg) m[3],
+            inv = in(reg) n0,
+            t0 = out(reg) t0,
+            t1 = out(reg) t1,
+            t2 = out(reg) t2,
+            t3 = out(reg) t3,
+            t4 = out(reg) _,
+            m = out(reg) _,
+            tmp = out(reg) _,
+            options(pure, nomem, nostack),
+        );
+    }
+    [t0, t1, t2, t3]
 }
 
 // ---------------------------------------------------------------------------
