@@ -22,14 +22,14 @@
 //! integer quotients; only the bound depends on the rounding.
 
 use ark_ec::short_weierstrass::Affine;
-use ark_ff::{MontFp, PrimeField};
+use ark_ff::{Field, MontFp, PrimeField};
 use snarkrs_field::raw::{RawField, RawFq, RawFq2};
 use snarkrs_field::{Fq, Fr};
 
 use crate::xyzz::{RawCurve, Xyzz};
 
 mod batch;
-pub use batch::mul_batch;
+pub use batch::{mul_batch, mul_batch_xyzz};
 
 /// `lambda`, the eigenvalue of `phi` on G1 (ark-bn254's G1 `LAMBDA`). On G2 the same
 /// `beta` gives `lambda^2`, so G2's [`GlvField::endo`] uses `beta^2` to stay on this one.
@@ -67,6 +67,9 @@ pub trait GlvField: RawField {
     /// `phi` on an affine `x`: a multiplication by the cube root of unity.
     fn endo_x(x: Self) -> Self;
 
+    /// The inverse of a nonzero element, through arkworks. Once per batch, never per point.
+    fn inv(self) -> Self;
+
     /// `phi` on the XYZZ representation. `x = X / ZZ`, so scaling `X` scales `x`.
     #[inline(always)]
     fn endo(p: &Xyzz<Self>) -> Xyzz<Self> {
@@ -82,6 +85,10 @@ impl GlvField for RawFq {
     fn endo_x(x: RawFq) -> RawFq {
         x.mul(RawFq(BETA.0 .0))
     }
+
+    fn inv(self) -> RawFq {
+        RawFq::from_fq(&self.to_fq().inverse().expect("inverse of zero"))
+    }
 }
 
 impl GlvField for RawFq2 {
@@ -92,6 +99,10 @@ impl GlvField for RawFq2 {
             c0: x.c0.mul(b),
             c1: x.c1.mul(b),
         }
+    }
+
+    fn inv(self) -> RawFq2 {
+        RawFq2::from_fq2(&self.to_fq2().inverse().expect("inverse of zero"))
     }
 }
 

@@ -8,6 +8,7 @@ use ark_ff::{AdditiveGroup, FftField};
 use ark_ff::{BigInt, Field, One, PrimeField, Zero};
 use ark_std::rand::{rngs::StdRng, SeedableRng};
 use ark_std::UniformRand;
+use snarkrs_field::raw::RawField;
 use snarkrs_field::{Fr, G1Projective, G2Projective};
 use snarkrs_msm::glv::{self, GlvField, LAMBDA};
 use snarkrs_msm::xyzz::{to_projective, RawCurve, Xyzz};
@@ -114,6 +115,30 @@ fn check_batch<P: RawCurve + ark_ec::CurveConfig<ScalarField = Fr>>(
             "{label}: lane {i}, k = {}",
             ks[i]
         );
+    }
+
+    // Non-normalised XYZZ in (each point doubled, so ZZ != 1), affine XYZZ out.
+    let xyzz: Vec<Xyzz<P::RF>> = ps
+        .iter()
+        .map(|p| {
+            let mut a = Xyzz::<P::RF>::ZERO;
+            if !p.infinity {
+                let (x, y) = P::raw_xy(p);
+                a.madd(x, y);
+            }
+            a.dbl()
+        })
+        .collect();
+    let mut res = vec![Xyzz::<P::RF>::ZERO; n];
+    glv::mul_batch_xyzz(&xyzz, &ks, &mut res);
+    for i in 0..n {
+        assert_eq!(
+            to_projective(&res[i]),
+            (ps[i] * ks[i]).double(),
+            "{label}: xyzz lane {i}, k = {}",
+            ks[i]
+        );
+        assert!(res[i].is_zero() || (res[i].zz == P::RF::ONE && res[i].zzz == P::RF::ONE));
     }
 }
 
