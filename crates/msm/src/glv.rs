@@ -153,7 +153,10 @@ fn wnaf(mut k: u128, out: &mut [i8; DIGITS]) -> usize {
     n
 }
 
-/// `[k] p`.
+/// `[k] p`. Never inlined: a call is tens of microseconds, so the call costs nothing,
+/// and two inlined copies in one loop body (the scaled butterfly) kept LLVM busy for
+/// over twenty minutes on the ceremony crate.
+#[inline(never)]
 pub fn mul<F: GlvField>(p: &Xyzz<F>, k: &Fr) -> Xyzz<F> {
     if p.is_zero() {
         return Xyzz::ZERO;
