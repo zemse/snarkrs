@@ -84,6 +84,12 @@ const fn response_chunk(sg: usize) -> usize {
     (1 << 20) / sg
 }
 
+/// `response_chunk`s scaled per [`KeyScale`] call. One chunk is 16384 G1 or 8192 G2
+/// points, which a call splits into too few tasks to keep twelve threads busy to the end,
+/// and every call is followed by a serial write and hash; sixteen at a time amortise both.
+/// The response hash still sees one `response_chunk` per update.
+const KEY_GROUP: usize = 16;
+
 /// Points read back per `update` of the next-challenge hash, `floor((1<<24)/sG)`
 /// (`powersoftau_contribute.js:165`). Only the digest of that hasher is ever used, so
 /// unlike [`response_chunk`] this one is a pure buffering choice.
@@ -378,8 +384,9 @@ impl Drop for SectionPlan {
 /// Transform one section into the new file, hashing the compressed form into the response
 /// as it goes, and return the point the contribution record keeps.
 ///
-/// Reads and writes one `response_chunk` at a time, so peak memory is a megabyte of input
-/// plus the transformed copy, independent of `power`.
+/// Reads and transforms [`KEY_GROUP`] `response_chunk`s at a time and hashes them one
+/// `response_chunk` at a time, so peak memory is a few megabytes of input plus the
+/// transformed copy, independent of `power`.
 fn process_section<C: PtauGroup>(
     ptau: &Ptau,
     w: &mut BinFileWriter,
@@ -388,15 +395,16 @@ fn process_section<C: PtauGroup>(
     scale: &dyn KeyScale,
 ) -> Result<C, CeremonyError> {
     let chunk = response_chunk(C::SG).min(plan.n_points.max(1));
-    let mut lem = vec![0u8; chunk * C::SG];
-    let mut comp = vec![0u8; chunk * C::SCG];
+    let group = chunk * KEY_GROUP;
+    let mut lem = vec![0u8; group.min(plan.n_points.max(1)) * C::SG];
+    let mut comp = vec![0u8; group.min(plan.n_points.max(1)) * C::SCG];
     let mut kept = None;
     let mut t = plan.first;
 
     w.start_section(plan.id)?;
     let mut done = 0usize;
     while done < plan.n_points {
-        let n = (plan.n_points - done).min(chunk);
+        let n = (plan.n_points - done).min(group);
         let raw = ptau.section_elements(plan.id, C::SG, done, n)?;
         let mut points = binfile::decode_records(raw, C::SG, C::zero(), |_, b| C::from_lem(b))?;
         C::apply_key(scale, &mut points, t, plan.inc)?;
@@ -412,7 +420,11 @@ fn process_section<C: PtauGroup>(
                 p.write_compressed(c);
             });
         w.write_bytes(lem_out)?;
-        response.update(comp_out);
+        // The hash still takes one `response_chunk` per update: the update boundaries are
+        // part of the bytes written (see `response_chunk`).
+        for c in comp_out.chunks(chunk * C::SCG) {
+            response.update(c);
+        }
 
         if plan.keep >= done && plan.keep < done + n {
             kept = Some(points[plan.keep - done]);

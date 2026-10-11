@@ -22,8 +22,9 @@ use crate::prepare::{batch_to_affine_serial, PrepareCurve};
 /// own head with a single `inc^(k*SUBCHUNK)` exponentiation and then carries the product
 /// forward locally. Per-point exponentiation would also parallelise but costs a 254-bit
 /// `Fr` power per point next to one point multiplication, which is a few percent of the
-/// work for nothing.
-const KEY_SUBCHUNK: usize = 1024;
+/// work for nothing. At 256 the head costs under 1% of a task, and a call over 8192
+/// points (phase 1's G2 chunk) is 32 tasks rather than 8 for a twelve-thread pool.
+const KEY_SUBCHUNK: usize = 256;
 
 /// The group FFT on the CPU: [`crate::prepare::ifft`] behind the trait.
 pub struct CpuGroupFft;
