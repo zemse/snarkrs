@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use rayon::prelude::*;
+use snarkrs_field::raw::RawFr;
 use snarkrs_field::{Domain, Field, Fr};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -523,16 +524,25 @@ fn butterflies<const DIF: bool>(
     j0: usize,
 ) {
     for (k, (x, y)) in lo.iter_mut().zip(hi.iter_mut()).enumerate() {
+        let (a, b) = (raw(x), raw(y));
+        let w = raw(&twiddles[(j0 + k) * stride]);
         if DIF {
-            let t = (*x - *y) * twiddles[(j0 + k) * stride];
-            *x += *y;
-            *y = t;
+            *x = a.add(b).to_fr();
+            *y = a.sub(b).mul(w).to_fr();
         } else {
-            let t = *y * twiddles[(j0 + k) * stride];
-            *y = *x - t;
-            *x += t;
+            let t = b.mul(w);
+            *x = a.add(t).to_fr();
+            *y = a.sub(t).to_fr();
         }
     }
+}
+
+/// The butterflies' arithmetic runs on [`RawFr`], whose add and sub reduce with a select
+/// rather than ark-ff's compare-and-branch: in a butterfly that branch is a coin flip.
+/// Same limbs either side, so the conversion is a copy.
+#[inline(always)]
+fn raw(x: &Fr) -> RawFr {
+    RawFr::from_fr(x)
 }
 
 /// Two consecutive DIT passes, `half` and `2 * half`, over one run of quads. The quad at
@@ -546,19 +556,20 @@ fn quad_dit(strips: [&mut [Fr]; 4], twiddles: &[Fr], s2: usize, half: usize, j0:
     let [x0, x1, x2, x3] = strips;
     for k in 0..x0.len() {
         let j = j0 + k;
-        let w1 = twiddles[2 * j * s2];
-        let t0 = x1[k] * w1;
-        let a0 = x0[k] + t0;
-        let a1 = x0[k] - t0;
-        let t1 = x3[k] * w1;
-        let a2 = x2[k] + t1;
-        let a3 = x2[k] - t1;
-        let u0 = a2 * twiddles[j * s2];
-        x0[k] = a0 + u0;
-        x2[k] = a0 - u0;
-        let u1 = a3 * twiddles[(j + half) * s2];
-        x1[k] = a1 + u1;
-        x3[k] = a1 - u1;
+        let w1 = raw(&twiddles[2 * j * s2]);
+        let (y0, y1, y2, y3) = (raw(&x0[k]), raw(&x1[k]), raw(&x2[k]), raw(&x3[k]));
+        let t0 = y1.mul(w1);
+        let a0 = y0.add(t0);
+        let a1 = y0.sub(t0);
+        let t1 = y3.mul(w1);
+        let a2 = y2.add(t1);
+        let a3 = y2.sub(t1);
+        let u0 = a2.mul(raw(&twiddles[j * s2]));
+        x0[k] = a0.add(u0).to_fr();
+        x2[k] = a0.sub(u0).to_fr();
+        let u1 = a3.mul(raw(&twiddles[(j + half) * s2]));
+        x1[k] = a1.add(u1).to_fr();
+        x3[k] = a1.sub(u1).to_fr();
     }
 }
 
@@ -571,15 +582,16 @@ fn quad_dif(strips: [&mut [Fr]; 4], twiddles: &[Fr], s1: usize, hh: usize, j0: u
     let [y0, y1, y2, y3] = strips;
     for k in 0..y0.len() {
         let j = j0 + k;
-        let a0 = y0[k] + y2[k];
-        let a2 = (y0[k] - y2[k]) * twiddles[j * s1];
-        let a1 = y1[k] + y3[k];
-        let a3 = (y1[k] - y3[k]) * twiddles[(j + hh) * s1];
-        let w2 = twiddles[2 * j * s1];
-        y0[k] = a0 + a1;
-        y1[k] = (a0 - a1) * w2;
-        y2[k] = a2 + a3;
-        y3[k] = (a2 - a3) * w2;
+        let (z0, z1, z2, z3) = (raw(&y0[k]), raw(&y1[k]), raw(&y2[k]), raw(&y3[k]));
+        let a0 = z0.add(z2);
+        let a2 = z0.sub(z2).mul(raw(&twiddles[j * s1]));
+        let a1 = z1.add(z3);
+        let a3 = z1.sub(z3).mul(raw(&twiddles[(j + hh) * s1]));
+        let w2 = raw(&twiddles[2 * j * s1]);
+        y0[k] = a0.add(a1).to_fr();
+        y1[k] = a0.sub(a1).mul(w2).to_fr();
+        y2[k] = a2.add(a3).to_fr();
+        y3[k] = a2.sub(a3).mul(w2).to_fr();
     }
 }
 
