@@ -88,3 +88,41 @@ fn g1_matches_ark() {
 fn g2_matches_ark() {
     check::<snarkrs_field::g2::Config>("G2", |r| G2Projective::rand(r));
 }
+
+fn check_batch<P: RawCurve + ark_ec::CurveConfig<ScalarField = Fr>>(
+    label: &str,
+    rand: impl Fn(&mut StdRng) -> Projective<P>,
+) where
+    Projective<P>: std::fmt::Debug,
+    P::RF: GlvField,
+{
+    let mut rng = StdRng::seed_from_u64(0xba7c);
+    let mut ks = scalars(&mut rng);
+    let n = ks.len();
+    let mut ps: Vec<Affine<P>> = (0..n).map(|_| rand(&mut rng).into_affine()).collect();
+    // The identity in, a repeated point, and one point under opposite scalars.
+    ps[3] = Affine::<P>::identity();
+    ps[5] = ps[4];
+    ps[7] = ps[6];
+    ks[7] = -ks[6];
+    let mut out = vec![Affine::<P>::identity(); n];
+    glv::mul_batch(&ps, &ks, &mut out);
+    for i in 0..n {
+        assert_eq!(
+            out[i],
+            (ps[i] * ks[i]).into_affine(),
+            "{label}: lane {i}, k = {}",
+            ks[i]
+        );
+    }
+}
+
+#[test]
+fn g1_batch_matches_ark() {
+    check_batch::<snarkrs_field::g1::Config>("G1", |r| G1Projective::rand(r));
+}
+
+#[test]
+fn g2_batch_matches_ark() {
+    check_batch::<snarkrs_field::g2::Config>("G2", |r| G2Projective::rand(r));
+}

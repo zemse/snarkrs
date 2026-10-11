@@ -28,6 +28,9 @@ use snarkrs_field::{Fq, Fr};
 
 use crate::xyzz::{RawCurve, Xyzz};
 
+mod batch;
+pub use batch::mul_batch;
+
 /// `lambda`, the eigenvalue of `phi` on G1 (ark-bn254's G1 `LAMBDA`). On G2 the same
 /// `beta` gives `lambda^2`, so G2's [`GlvField::endo`] uses `beta^2` to stay on this one.
 pub const LAMBDA: Fr =
@@ -61,30 +64,33 @@ const DIGITS: usize = 130;
 /// Keyed on the field rather than the curve so code generic over [`RawField`], like the
 /// group FFT, can call it.
 pub trait GlvField: RawField {
-    /// `phi` on the XYZZ representation. `x = X / ZZ`, so scaling `X` scales `x`.
-    fn endo(p: &Xyzz<Self>) -> Xyzz<Self>;
-}
+    /// `phi` on an affine `x`: a multiplication by the cube root of unity.
+    fn endo_x(x: Self) -> Self;
 
-impl GlvField for RawFq {
+    /// `phi` on the XYZZ representation. `x = X / ZZ`, so scaling `X` scales `x`.
     #[inline(always)]
-    fn endo(p: &Xyzz<RawFq>) -> Xyzz<RawFq> {
+    fn endo(p: &Xyzz<Self>) -> Xyzz<Self> {
         Xyzz {
-            x: p.x.mul(RawFq(BETA.0 .0)),
+            x: Self::endo_x(p.x),
             ..*p
         }
     }
 }
 
+impl GlvField for RawFq {
+    #[inline(always)]
+    fn endo_x(x: RawFq) -> RawFq {
+        x.mul(RawFq(BETA.0 .0))
+    }
+}
+
 impl GlvField for RawFq2 {
     #[inline(always)]
-    fn endo(p: &Xyzz<RawFq2>) -> Xyzz<RawFq2> {
+    fn endo_x(x: RawFq2) -> RawFq2 {
         let b = RawFq(BETA2.0 .0);
-        Xyzz {
-            x: RawFq2 {
-                c0: p.x.c0.mul(b),
-                c1: p.x.c1.mul(b),
-            },
-            ..*p
+        RawFq2 {
+            c0: x.c0.mul(b),
+            c1: x.c1.mul(b),
         }
     }
 }
