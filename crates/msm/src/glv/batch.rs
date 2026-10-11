@@ -33,6 +33,18 @@ pub fn mul_batch<P: RawCurve>(points: &[Affine<P>], scalars: &[Fr], out: &mut [A
 where
     P::RF: GlvField,
 {
+    mul_batch_in(&mut BatchState::default(), points, scalars, out)
+}
+
+/// [`mul_batch`] with caller-kept working memory; see [`BatchState`].
+pub fn mul_batch_in<P: RawCurve>(
+    st: &mut BatchState<P::RF>,
+    points: &[Affine<P>],
+    scalars: &[Fr],
+    out: &mut [Affine<P>],
+) where
+    P::RF: GlvField,
+{
     assert_eq!(points.len(), out.len(), "one output per point");
     let xyzz: Vec<Xyzz<P::RF>> = points
         .iter()
@@ -50,7 +62,7 @@ where
         })
         .collect();
     let mut res = vec![Xyzz::ZERO; points.len()];
-    mul_batch_xyzz(&xyzz, scalars, &mut res);
+    mul_batch_xyzz_in(st, &xyzz, scalars, &mut res);
     for (o, r) in out.iter_mut().zip(&res) {
         *o = if r.is_zero() {
             Affine::identity()
@@ -66,15 +78,67 @@ where
 /// On G2 the scalar is cut in four 64-bit parts rather than two 127-bit ones, with `psi`
 /// beside `phi` ([`GlvField::split`]): half the doublings again, for two more tables.
 pub fn mul_batch_xyzz<F: GlvField>(points: &[Xyzz<F>], scalars: &[Fr], out: &mut [Xyzz<F>]) {
+    mul_batch_xyzz_in(&mut BatchState::default(), points, scalars, out)
+}
+
+/// The working memory of [`mul_batch_xyzz_in`], kept between calls. A batch of 1024 G2
+/// points holds 4.6 MB of tables; allocating that afresh per call, from every thread of a
+/// pass at once, costs page faults the multiplications then wait on.
+pub struct BatchState<F> {
+    dig: Vec<i8>,
+    neg: Vec<bool>,
+    tab: Vec<Pt<F>>,
+    gone: Vec<bool>,
+    two: Vec<Pt<F>>,
+    next: Vec<Pt<F>>,
+    acc: Vec<Pt<F>>,
+    acc_zero: Vec<bool>,
+    ok: Vec<bool>,
+    idx: Vec<usize>,
+    adds: Vec<(usize, Pt<F>)>,
+    s: Scratch<F>,
+}
+
+impl<F> Default for BatchState<F> {
+    fn default() -> Self {
+        BatchState {
+            dig: Vec::new(),
+            neg: Vec::new(),
+            tab: Vec::new(),
+            gone: Vec::new(),
+            two: Vec::new(),
+            next: Vec::new(),
+            acc: Vec::new(),
+            acc_zero: Vec::new(),
+            ok: Vec::new(),
+            idx: Vec::new(),
+            adds: Vec::new(),
+            s: Scratch {
+                den: Vec::new(),
+                pre: Vec::new(),
+                who: Vec::new(),
+            },
+        }
+    }
+}
+
+/// `v` as `n` copies of `x`, reusing its allocation.
+fn fill<T: Copy>(v: &mut Vec<T>, n: usize, x: T) {
+    v.clear();
+    v.resize(n, x);
+}
+
+/// [`mul_batch_xyzz`] with caller-kept working memory.
+pub fn mul_batch_xyzz_in<F: GlvField>(
+    st: &mut BatchState<F>,
+    points: &[Xyzz<F>],
+    scalars: &[Fr],
+    out: &mut [Xyzz<F>],
+) {
     assert_eq!(points.len(), scalars.len(), "one scalar per point");
     assert_eq!(points.len(), out.len(), "one output per point");
     let dims = F::DIMS;
-    let mut scratch = Scratch {
-        den: Vec::new(),
-        pre: Vec::new(),
-        who: Vec::new(),
-    };
-    let base = to_affine_all(points, &mut scratch);
+    let base = to_affine_all(points, &mut st.s);
 
     let zero = Pt {
         x: F::ZERO,
@@ -85,13 +149,16 @@ pub fn mul_batch_xyzz<F: GlvField>(points: &[Xyzz<F>], scalars: &[Fr], out: &mut
     // Digits are stored step-major, `[s][j][i]`, so a step's scan for nonzero digits reads
     // one contiguous row per part rather than touching every point's whole state.
     let n = points.len();
-    let row = |s: usize, j: usize| (s * 4 + j) * n;
-    let mut dig = vec![0i8; DIGITS * 4 * n];
-    let mut neg = vec![false; 4 * n];
-    let mut tab: Vec<Pt<F>> = vec![zero; 4 * TABLE * n];
-    let at = |i: usize, j: usize, e: usize| (i * 4 + j) * TABLE + e;
+    let row = |s: usize, j: usize| (s * dims + j) * n;
+    let at = |i: usize, j: usize, e: usize| (i * dims + j) * TABLE + e;
+    fill(&mut st.dig, DIGITS * dims * n, 0);
+    fill(&mut st.neg, dims * n, false);
+    // Every live entry is written before it is read, so the tables are only grown.
+    if st.tab.len() < dims * TABLE * n {
+        st.tab.resize(dims * TABLE * n, zero);
+    }
     // Out of the batch: zero input, or an exceptional addition; see the module doc.
-    let mut gone = vec![true; n];
+    fill(&mut st.gone, n, true);
     let mut steps = 0;
     let mut tmp = [0i8; DIGITS];
     for (i, (p, k)) in base.iter().zip(scalars).enumerate() {
@@ -101,90 +168,102 @@ pub fn mul_batch_xyzz<F: GlvField>(points: &[Xyzz<F>], scalars: &[Fr], out: &mut
         for (j, part) in parts.iter().enumerate().take(dims) {
             let len = wnaf(part.unsigned_abs(), &mut tmp);
             for (s, &d) in tmp[..len].iter().enumerate() {
-                dig[row(s, j) + i] = d;
+                st.dig[row(s, j) + i] = d;
             }
-            neg[i * 4 + j] = *part < 0;
+            st.neg[i * dims + j] = *part < 0;
             m = m.max(len);
         }
         if m > 0 {
-            tab[at(i, 0, 0)] = *p;
-            gone[i] = false;
+            st.tab[at(i, 0, 0)] = *p;
+            st.gone[i] = false;
             steps = steps.max(m);
         }
     }
 
     // Odd multiples: 2P, then 3P = P + 2P and so on, one batched addition per entry; then
     // each endomorphism's table is its image of the first, entry by entry.
-    let live: Vec<usize> = (0..n).filter(|&i| !gone[i]).collect();
+    st.idx.clear();
+    st.idx.extend((0..n).filter(|&i| !st.gone[i]));
     {
-        let mut two: Vec<Pt<F>> = (0..n).map(|i| tab[at(i, 0, 0)]).collect();
-        let mut ok = vec![true; n];
-        batch_dbl(&mut two, &live, &mut ok, &mut scratch);
-        let mut next: Vec<Pt<F>> = vec![zero; n];
-        let mut nz = vec![false; n];
-        let mut adds = Vec::with_capacity(live.len());
+        st.two.clear();
+        st.two.extend((0..n).map(|i| st.tab[at(i, 0, 0)]));
+        fill(&mut st.ok, n, true);
+        batch_dbl(&mut st.two, &st.idx, &mut st.ok, &mut st.s);
+        fill(&mut st.next, n, zero);
+        fill(&mut st.acc_zero, n, false);
         for e in 1..TABLE {
-            adds.clear();
-            for &i in &live {
-                next[i] = tab[at(i, 0, e - 1)];
-                adds.push((i, two[i]));
+            st.adds.clear();
+            for &i in &st.idx {
+                st.next[i] = st.tab[at(i, 0, e - 1)];
+                st.adds.push((i, st.two[i]));
             }
-            batch_add(&mut next, &mut nz, &adds, &mut ok, &mut scratch);
-            for &i in &live {
-                tab[at(i, 0, e)] = next[i];
+            batch_add(
+                &mut st.next,
+                &mut st.acc_zero,
+                &st.adds,
+                &mut st.ok,
+                &mut st.s,
+            );
+            for &i in &st.idx {
+                st.tab[at(i, 0, e)] = st.next[i];
             }
         }
         // Odd multiples of a point of prime order never collide; this is belt and braces.
-        for &i in &live {
-            if !ok[i] {
-                gone[i] = true;
+        for &i in &st.idx {
+            if !st.ok[i] {
+                st.gone[i] = true;
             }
             for j in 1..dims {
                 for e in 0..TABLE {
-                    let q = tab[at(i, 0, e)];
+                    let q = st.tab[at(i, 0, e)];
                     let (x, y) = F::endo_j(j, q.x, q.y);
-                    tab[at(i, j, e)] = Pt { x, y };
+                    st.tab[at(i, j, e)] = Pt { x, y };
                 }
             }
         }
     }
 
-    let mut acc: Vec<Pt<F>> = vec![zero; n];
-    let mut acc_zero = vec![true; n];
-    let mut ok = vec![true; n];
-    let mut idx = Vec::with_capacity(n);
-    let mut adds = Vec::with_capacity(n);
+    fill(&mut st.acc, n, zero);
+    fill(&mut st.acc_zero, n, true);
+    fill(&mut st.ok, n, true);
     for s in (0..steps).rev() {
-        idx.clear();
-        idx.extend((0..n).filter(|&i| !gone[i] && ok[i] && !acc_zero[i]));
-        batch_dbl(&mut acc, &idx, &mut ok, &mut scratch);
+        st.idx.clear();
+        st.idx
+            .extend((0..n).filter(|&i| !st.gone[i] && st.ok[i] && !st.acc_zero[i]));
+        batch_dbl(&mut st.acc, &st.idx, &mut st.ok, &mut st.s);
         for j in 0..dims {
-            adds.clear();
-            let r = &dig[row(s, j)..row(s, j) + n];
+            st.adds.clear();
+            let r = &st.dig[row(s, j)..row(s, j) + n];
             for (i, &d) in r.iter().enumerate() {
-                if d == 0 || gone[i] || !ok[i] {
+                if d == 0 || st.gone[i] || !st.ok[i] {
                     continue;
                 }
-                let mut e = tab[at(i, j, (d.unsigned_abs() >> 1) as usize)];
-                if (d < 0) != neg[i * 4 + j] {
+                let mut e = st.tab[at(i, j, (d.unsigned_abs() >> 1) as usize)];
+                if (d < 0) != st.neg[i * dims + j] {
                     e.y = e.y.neg();
                 }
-                adds.push((i, e));
+                st.adds.push((i, e));
             }
-            batch_add(&mut acc, &mut acc_zero, &adds, &mut ok, &mut scratch);
+            batch_add(
+                &mut st.acc,
+                &mut st.acc_zero,
+                &st.adds,
+                &mut st.ok,
+                &mut st.s,
+            );
         }
     }
 
     for i in 0..n {
         out[i] = if base[i].is_none() || scalars[i] == Fr::from(0u64) {
             Xyzz::ZERO
-        } else if gone[i] || !ok[i] {
+        } else if st.gone[i] || !st.ok[i] {
             let r = super::mul(&points[i], &scalars[i]);
-            to_affine_all(&[r], &mut scratch)[0].map_or(Xyzz::ZERO, |p| affine_xyzz(p))
-        } else if acc_zero[i] {
+            to_affine_all(&[r], &mut st.s)[0].map_or(Xyzz::ZERO, |p| affine_xyzz(p))
+        } else if st.acc_zero[i] {
             Xyzz::ZERO
         } else {
-            affine_xyzz(acc[i])
+            affine_xyzz(st.acc[i])
         };
     }
 }
