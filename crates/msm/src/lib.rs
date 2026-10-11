@@ -837,16 +837,18 @@ where
     // sizes there are usually more of them (17 to 20) than there are cores. When there are
     // not, split the point range too and give each chunk its own bucket array. Summing the
     // per-chunk reduced sums is exact because the running-sum reduction is linear in the
-    // buckets, and it is far cheaper than merging bucket arrays. Splitting past what the
-    // pool can run at once is a pure loss: it buys no parallelism and pays another bucket
-    // reduction per chunk.
+    // buckets, and it is far cheaper than merging bucket arrays. The tasks are sized for
+    // twice the pool rather than once: 16 windows on 12 threads are two waves of equal
+    // tasks, the second a third full, and with four of the twelve being efficiency cores at
+    // under half a performance core's pace the last task out sets the wall. On
+    // anon-aadhaar's H (2^21 points, c = 16, M2 Max) one chunk a window measured 588 ms,
+    // two 535, three 531, four 537: past that each chunk is another bucket reduction.
     // Signed digits land in [-2^(c-1), 2^(c-1)] and index as `d - 1` when positive and
     // `-d - 1` when negative, so the highest reachable index is 2^(c-1) - 1. Allocating
     // 2^(c-1) + 1 left a bucket that is never written and still walked by the running-sum
     // reduction, costing two Jacobian additions per window per point chunk.
     let n_buckets = 1usize << (c - 1);
-    let point_chunks = threads
-        .max(1)
+    let point_chunks = (2 * threads.max(1))
         .div_ceil(n_windows)
         .clamp(1, (m / (CHUNK_BUCKET_RATIO * n_buckets)).max(1));
     let chunk_len = m.div_ceil(point_chunks);
