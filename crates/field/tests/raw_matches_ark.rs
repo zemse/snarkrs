@@ -6,11 +6,13 @@
 //! vectors that a random sweep essentially never generates, plus a large random sweep,
 //! for both fields and for Fq2.
 
-use snarkrs_field::raw::{RawFq, RawFq2, RawFr};
+use ark_ff::BigInt;
+use snarkrs_field::raw::{RawFq, RawFq2, RawFr, FQ_MOD, FR_MOD};
 use snarkrs_field::{Field, Fq, Fq2, Fr, UniformRand};
 
 /// Structured operands: conditional-subtraction boundaries in both directions, the
-/// largest representable values, and small integers.
+/// largest representable values, small integers, and the limb patterns of
+/// [`limb_edges`].
 fn edge_fq() -> Vec<Fq> {
     let one = Fq::from(1u64);
     let m1 = -one;
@@ -22,6 +24,42 @@ fn edge_fq() -> Vec<Fq> {
         m1 - one,
         m1 - Fq::from(2u64),
         Fq::from(1u64 << 63),
+    ]
+    .into_iter()
+    .chain(
+        limb_edges(FQ_MOD)
+            .into_iter()
+            .map(|l| Fq::new_unchecked(BigInt::new(l))),
+    )
+    .collect()
+}
+
+/// Montgomery limb patterns at the boundaries of the carry and borrow chains, as stored:
+/// the add, sub and reduction chains run on these limbs, not on the integers they stand
+/// for. Every one is below `m`, so each is a valid element.
+fn limb_edges(m: [u64; 4]) -> Vec<[u64; 4]> {
+    let x = u64::MAX;
+    let half = [
+        m[0] >> 1 | m[1] << 63,
+        m[1] >> 1 | m[2] << 63,
+        m[2] >> 1 | m[3] << 63,
+        m[3] >> 1,
+    ];
+    vec![
+        [0, 0, 0, 0],
+        [1, 0, 0, 0],
+        [m[0] - 1, m[1], m[2], m[3]],
+        [m[0] - 2, m[1], m[2], m[3]],
+        [x, x, x, m[3] - 1],
+        [0, 0, 0, m[3]],
+        half,
+        [half[0] + 1, half[1], half[2], half[3]],
+        [x, 0, 0, 0],
+        [0, x, 0, 0],
+        [0, 0, x, 0],
+        [x, x, x, 0],
+        [0, 0, 0, 1 << 61],
+        [x, x, 0, 1 << 61],
     ]
 }
 
@@ -36,6 +74,13 @@ fn edge_fr() -> Vec<Fr> {
         m1 - one,
         Fr::from(1u64 << 63),
     ]
+    .into_iter()
+    .chain(
+        limb_edges(FR_MOD)
+            .into_iter()
+            .map(|l| Fr::new_unchecked(BigInt::new(l))),
+    )
+    .collect()
 }
 
 #[test]
