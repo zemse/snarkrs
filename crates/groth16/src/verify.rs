@@ -5,8 +5,11 @@
 //! final exponentiation is needed.
 
 use crate::Proof;
+use snarkrs_field::raw::RawFq;
 use snarkrs_field::*;
 use snarkrs_formats::VerifyingKey;
+use snarkrs_msm::glv;
+use snarkrs_msm::xyzz::{to_projective, RawCurve, Xyzz};
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -103,7 +106,7 @@ pub fn verify_unchecked(
 }
 
 /// Aggregate the public inputs: `L_bar = sum_i w_i * IC[i]`. An MSM over `n_public + 1`
-/// points, small enough that a plain double-and-add loop is the right choice.
+/// points, small enough that one scalar multiplication per point is the right choice.
 pub fn aggregate_public(vk: &VerifyingKey, public: &[Fr]) -> Result<G1Projective, VerifyError> {
     // `VerifyingKey`'s fields are public, so a key reaching here need not have come through
     // `from_json`: it can be built by hand or over FFI. An empty `ic` has no constant-wire
@@ -122,11 +125,16 @@ pub fn aggregate_public(vk: &VerifyingKey, public: &[Fr]) -> Result<G1Projective
         });
     }
 
-    let mut acc = vk.ic[0].into_group();
-    for (point, scalar) in vk.ic[1..].iter().zip(public) {
-        acc += *point * *scalar;
+    // GLV on raw limbs: arkworks' affine multiply is double-and-add over all 254 bits.
+    let mut acc = Xyzz::<RawFq>::ZERO;
+    if !vk.ic[0].infinity {
+        let (x, y) = <g1::Config as RawCurve>::raw_xy(&vk.ic[0]);
+        acc.madd(x, y);
     }
-    Ok(acc)
+    for (point, scalar) in vk.ic[1..].iter().zip(public) {
+        acc.add_assign(&glv::mul_affine(point, scalar));
+    }
+    Ok(to_projective::<g1::Config>(&acc))
 }
 
 #[cfg(test)]
