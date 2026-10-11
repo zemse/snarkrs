@@ -284,7 +284,10 @@ fn bit_reverse<T>(a: &mut [T], bits: u32) {
 /// snarkjs walks `W` forward one multiply at a time, which is serial by construction. The
 /// same twiddle sequence is recovered here per task from `w^first`, so a task can start
 /// anywhere in the group without replaying the ones before it.
-fn mix_pass<F: GlvField>(a: &mut [Xyzz<F>], exp: u32, w: Fr) {
+///
+/// `scale`, when given, multiplies both outputs of every butterfly: the last pass carries
+/// the transform's `1/n` this way (see [`ifft`]).
+fn mix_pass<F: GlvField>(a: &mut [Xyzz<F>], exp: u32, w: Fr, scale: Option<Fr>) {
     let per_group = 1usize << exp;
     let half = per_group >> 1;
     // Tasks are sized in butterflies, not in groups: the first pass has one butterfly per
@@ -296,29 +299,46 @@ fn mix_pass<F: GlvField>(a: &mut [Xyzz<F>], exp: u32, w: Fr) {
             for group in slab.chunks_mut(per_group) {
                 let (lo, hi) = group.split_at_mut(half);
                 if half <= BUTTERFLIES_PER_TASK {
-                    butterflies(lo, hi, w, 0);
+                    butterflies(lo, hi, w, 0, scale);
                 } else {
                     lo.par_chunks_mut(BUTTERFLIES_PER_TASK)
                         .zip(hi.par_chunks_mut(BUTTERFLIES_PER_TASK))
                         .enumerate()
-                        .for_each(|(c, (lo, hi))| butterflies(lo, hi, w, c * BUTTERFLIES_PER_TASK));
+                        .for_each(|(c, (lo, hi))| {
+                            butterflies(lo, hi, w, c * BUTTERFLIES_PER_TASK, scale)
+                        });
                 }
             }
         });
 }
 
-/// `lo[i], hi[i] <- lo[i] + w^(first+i) hi[i], lo[i] - w^(first+i) hi[i]`.
+/// `lo[i], hi[i] <- lo[i] + w^(first+i) hi[i], lo[i] - w^(first+i) hi[i]`, both times
+/// `s` when `scale` is `Some(s)`.
 ///
 /// The `w^0` case is skipped rather than multiplied. snarkjs does the multiplication, but
-/// `[1]P == P`, and at exponent 1 it is every butterfly in the pass.
-fn butterflies<F: GlvField>(lo: &mut [Xyzz<F>], hi: &mut [Xyzz<F>], w: Fr, first: usize) {
+/// `[1]P == P`, and at exponent 1 it is every butterfly in the pass. A scaled butterfly
+/// is `[s] lo[i] +- [s w^j] hi[i]`: two multiplications for two scaled outputs, where
+/// scaling after the pass would cost those two on top of the twiddle.
+fn butterflies<F: GlvField>(
+    lo: &mut [Xyzz<F>],
+    hi: &mut [Xyzz<F>],
+    w: Fr,
+    first: usize,
+    scale: Option<Fr>,
+) {
     let mut tw = w.pow([first as u64]);
+    if let Some(s) = scale {
+        tw *= s;
+    }
     for (u, v) in lo.iter_mut().zip(hi.iter_mut()) {
         let t = if tw.is_one() {
             *v
         } else {
             point_times_fr(v, &tw)
         };
+        if let Some(s) = scale {
+            *u = point_times_fr(u, &s);
+        }
         let mut sum = *u;
         sum.add_assign(&t);
         let mut diff = *u;
@@ -342,18 +362,18 @@ pub(crate) fn ifft<F: GlvField>(a: &mut [Xyzz<F>]) {
     let bits = n.trailing_zeros();
     bit_reverse(a, bits);
     let roots = root_table(bits);
-    for exp in 1..=bits {
-        mix_pass(a, exp, roots[exp as usize]);
-    }
-
-    // `fftFinal` plus the inverse reassembly, as one step: scale by `1/n` and reverse
-    // everything but element 0. See the module doc for why splitting these apart produces
-    // an answer that is off by a rotation and still looks plausible.
+    // `fftFinal` plus the inverse reassembly: scale by `1/n` and reverse everything but
+    // element 0. See the module doc for why splitting these apart produces an answer that
+    // is off by a rotation and still looks plausible. The scale rides on the last pass,
+    // which already multiplies half its inputs, so it costs `n/2` multiplications on top
+    // of the transform rather than `n`.
     let size_inv = Fr::from(n as u64)
         .inverse()
         .expect("a power of two is a unit mod r");
-    a.par_iter_mut()
-        .for_each(|p| *p = point_times_fr(p, &size_inv));
+    for exp in 1..=bits {
+        let scale = (exp == bits).then_some(size_inv);
+        mix_pass(a, exp, roots[exp as usize], scale);
+    }
     a[1..].reverse();
 }
 
