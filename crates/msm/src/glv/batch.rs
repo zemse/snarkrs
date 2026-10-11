@@ -240,10 +240,13 @@ pub fn mul_sum_batch_xyzz_in<F: GlvField>(
             if !st.ok[u] {
                 st.gone[u / terms] = true;
             }
+            // An odd part's table is `phi` of the one before it, so `phi psi` costs a `phi`
+            // rather than a `psi` and a `phi`.
             for d in 1..dims {
+                let (src, j) = if d % 2 == 1 { (d - 1, 1) } else { (0, d) };
                 for e in 0..TABLE {
-                    let q = st.tab[first(u) + e];
-                    let (x, y) = F::endo_j(d, q.x, q.y);
+                    let q = st.tab[first(u) + src * TABLE + e];
+                    let (x, y) = F::endo_j(j, q.x, q.y);
                     st.tab[first(u) + d * TABLE + e] = Pt { x, y };
                 }
             }
