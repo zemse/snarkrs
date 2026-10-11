@@ -16,7 +16,10 @@ use snarkrs_witness::{Input, WitnessCalculator};
 fn wasm_in(dir: &Path) -> Result<PathBuf, Box<dyn Error>> {
     for e in std::fs::read_dir(dir)? {
         let p = e?.path();
-        if p.is_dir() && p.file_name().is_some_and(|n| n.to_string_lossy().ends_with("_js")) {
+        if p.is_dir()
+            && p.file_name()
+                .is_some_and(|n| n.to_string_lossy().ends_with("_js"))
+        {
             for f in std::fs::read_dir(&p)? {
                 let f = f?.path();
                 if f.extension().is_some_and(|x| x == "wasm") {
