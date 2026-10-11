@@ -100,7 +100,7 @@ impl Fixture {
         write_r1cs(&r1cs);
         let raw = dir.join("new.ptau");
         let contributed = dir.join("contributed.ptau");
-        phase1::ptau_new(7, &raw).unwrap();
+        phase1::ptau_new(9, &raw).unwrap();
         phase1::contribute_with(
             &raw,
             &contributed,
@@ -120,7 +120,7 @@ impl Drop for Fixture {
     }
 }
 
-/// Repeating x * 1 = y gives G1 and G2 slots above setup's 32-term crossover.
+/// Repeating x * 1 = y gives G1 and G2 slots above setup's 256-term crossover.
 fn write_r1cs(path: &Path) {
     let mut w = BinFileWriter::create(path, b"r1cs", 1, 3).unwrap();
     w.start_section(1).unwrap();
@@ -132,10 +132,10 @@ fn write_r1cs(path: &Path) {
         w.write_u32(value).unwrap();
     }
     w.write_u64(3).unwrap();
-    w.write_u32(33).unwrap();
+    w.write_u32(257).unwrap();
     w.end_section().unwrap();
     w.start_section(2).unwrap();
-    for _ in 0..33 {
+    for _ in 0..257 {
         for signal in [2, 0, 1] {
             w.write_u32(1).unwrap();
             w.write_u32(signal).unwrap();
@@ -171,7 +171,7 @@ fn setup_propagates_g1_and_g2_errors_above_crossover() {
         .unwrap_err();
         assert_device(error, op);
         assert!(msm.calls.load(Ordering::Relaxed) >= 1);
-        assert!(msm.largest_slot.load(Ordering::Relaxed) >= 33);
+        assert!(msm.largest_slot.load(Ordering::Relaxed) >= 257);
     }
 }
 

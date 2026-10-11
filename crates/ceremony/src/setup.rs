@@ -29,9 +29,10 @@ use std::path::Path;
 
 use ark_ec::short_weierstrass::{Affine, Projective};
 use rayon::prelude::*;
+use snarkrs_field::raw::RawField;
 use snarkrs_field::{
-    AffineRepr, CurveGroup, FftField, Fq, Fr, G1Affine, G1Projective, G2Affine, G2Projective, One,
-    PrimeField, Zero,
+    AffineRepr, CurveGroup, FftField, Fq, Fr, G1Affine, G1Projective, G2Affine, One, PrimeField,
+    Zero,
 };
 use snarkrs_formats::binfile;
 use snarkrs_msm::glv::{self, GlvField};
@@ -84,19 +85,21 @@ const NORMALIZE_CHUNK: usize = 4096;
 const H_CHUNK: usize = 1 << 14;
 
 /// Terms in one accumulator slot below which a Pippenger multiexp is not worth its bucket
-/// array, and the slot is summed with plain scalar multiplications instead.
+/// array, and the slot is summed by batched ladders instead (see [`compose`]).
 ///
 /// snarkjs splits at 2 (`zkey_new.js:467-481`), but only because its alternative is a
 /// round trip into a wasm worker either way. The sum is the same however it is computed,
 /// and slots here are tiny: on `anon-aadhaar` the mean A slot holds three terms, so
 /// dispatching a full MSM per slot would be several million bucket allocations.
 ///
-/// 32 is tuned for [`snarkrs_msm::CpuMsm`], where it earns 3.3x to 4.6x per term over the loop
-/// below it, and even the slots above it are small: the mean slot that reaches the multiexp
-/// on the two dense production circuits holds 85 terms, so this bucket is "32 to 255", not
-/// thousands. A backend whose dispatch costs more than 85 terms of arithmetic wants a much
-/// higher threshold than this, and the trait has no way to say so. See [`setup`].
-const MULTIEXP_MIN_TERMS: usize = 32;
+/// 256 is tuned for [`snarkrs_msm::CpuMsm`] against the batched ladders, where a term costs
+/// its additions and a share of doublings, about what a Pippenger over a slot of a few
+/// hundred spends per term. On `js_16x16_d32`, whose C section has 21,897 slots of 32 or
+/// more (55 terms on average), `compose_c` measured 2.14 s at 32, 1.81 at 128, 1.78 at 256
+/// and 1.77 at 512. A backend whose dispatch costs more than a few hundred terms of
+/// arithmetic wants a higher threshold still, and the trait has no way to say so. See
+/// [`setup`].
+const MULTIEXP_MIN_TERMS: usize = 256;
 
 /// What a setup produced, for the CLI to print and a test to assert on.
 #[derive(Clone, Debug)]
@@ -145,7 +148,9 @@ pub fn circuit_power(n_constraints: usize, n_public: usize) -> u32 {
 /// circom produces with no flags an MSM that ran in zero time takes the 2^20 circuit from
 /// 15.12 s to 15.04 s. What holds the rest is millions of scalar multiplications of one to
 /// thirty terms each, which is a different kernel and would need a different seam: N terms
-/// in, N products out, reduced per slot, rather than one multiexp per output point.
+/// in, N products out, reduced per slot, rather than one multiexp per output point. (The
+/// table and timings here are from when the threshold was 32 and the loop multiplied one
+/// term at a time; [`compose`] is now that seam, and the threshold is 256.)
 ///
 /// A device behind *this* parameter loses, and the reason is the per-slot dispatch. A
 /// `--backend metal` run measures 1.15 ms per `msm_g1` call against 0.149 ms for a bare
@@ -564,14 +569,12 @@ pub fn compose_points_g1(
     r1cs: &R1cs,
     msm: &dyn MsmBackend,
 ) -> Result<Vec<G1Affine>, CeremonyError> {
-    let acc = binfile::collect_records(
-        slots.par_iter().map(|slot| -> Result<_, CeremonyError> {
-            let (points, scalars) = gather(slot, r1cs, |term| bases.g1(term))?;
-            Ok(combine(&points, &scalars, |b, s| msm.try_msm_g1(b, s))?)
-        }),
-        G1Projective::zero(),
-    )?;
-    Ok(to_affine(&acc))
+    compose(
+        slots,
+        |term| bases.g1(term),
+        |term| coefficient(r1cs, term.coef_ptr),
+        |b, s| msm.try_msm_g1(b, s),
+    )
 }
 
 /// [`compose_points_g1`] for section 7, the only G2 output.
@@ -581,13 +584,146 @@ pub fn compose_points_g2(
     r1cs: &R1cs,
     msm: &dyn MsmBackend,
 ) -> Result<Vec<G2Affine>, CeremonyError> {
-    let acc = binfile::collect_records(
-        slots.par_iter().map(|slot| -> Result<_, CeremonyError> {
-            let (points, scalars) = gather(slot, r1cs, |term| bases.g2(term))?;
-            Ok(combine(&points, &scalars, |b, s| msm.try_msm_g2(b, s))?)
-        }),
-        G2Projective::zero(),
-    )?;
+    compose(
+        slots,
+        |term| bases.g2(term),
+        |term| coefficient(r1cs, term.coef_ptr),
+        |b, s| msm.try_msm_g2(b, s),
+    )
+}
+
+/// Terms per rayon task in [`compose`], counting a slot that goes to the multiexp as
+/// none. The task's slots are one [`glv::mul_sums_xyzz_in`] batch, which shares an
+/// inversion per ladder step across all of them and holds a table per term.
+const TERMS_PER_TASK: usize = 4096;
+
+/// Most terms under one ladder in [`compose`]; a larger slot is several sums. The terms of
+/// a sum share its doublings, but each step of the batch takes as many inversion rounds as
+/// its busiest sum has nonzero digits at that step, so a sum of hundreds would pay a round
+/// per term where its neighbours pay two or three.
+const TERMS_PER_SUM: usize = 16;
+
+/// [`compose_points_g1`] over any group: `base` and `scalar` give a term's point and
+/// coefficient, `msm` takes the slots of at least `MULTIEXP_MIN_TERMS` terms.
+///
+/// The smaller slots go through batched ladders rather than one multiplication per term
+/// ([`glv::mul_sums_xyzz_in`]): the terms of a slot, up to [`TERMS_PER_SUM`] at a time,
+/// share their doublings, and the batch shares each step's inversion across the task. A
+/// coefficient of 1 or -1, which is most of them on some circuits, is an addition and no
+/// ladder. An error is the one of the lowest failing slot, as a serial walk would report
+/// it.
+fn compose<P, B, S, M>(
+    slots: &[Vec<PointTerm>],
+    base: B,
+    scalar: S,
+    msm: M,
+) -> Result<Vec<Affine<P>>, CeremonyError>
+where
+    P: RawCurve<RF: GlvField>,
+    B: Fn(&PointTerm) -> Result<Affine<P>, CeremonyError> + Sync,
+    S: Fn(&PointTerm) -> Result<Fr, CeremonyError> + Sync,
+    M: Fn(&[Affine<P>], &[Fr]) -> Result<Projective<P>, AccelError> + Sync,
+{
+    let first_err = std::sync::Mutex::new(None::<(usize, CeremonyError)>);
+    let fail = |i: usize, e: CeremonyError| {
+        let mut slot = first_err.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.as_ref().is_none_or(|(j, _)| i < *j) {
+            *slot = Some((i, e));
+        }
+    };
+    // Contiguous slot ranges of about `per_task` terms each.
+    let mut tasks = Vec::new();
+    let (mut from, mut terms) = (0, 0);
+    for (i, slot) in slots.iter().enumerate() {
+        if slot.len() < MULTIEXP_MIN_TERMS {
+            terms += slot.len();
+        }
+        if terms >= TERMS_PER_TASK {
+            tasks.push(from..i + 1);
+            (from, terms) = (i + 1, 0);
+        }
+    }
+    if from < slots.len() {
+        tasks.push(from..slots.len());
+    }
+    let mut acc = vec![Projective::<P>::zero(); slots.len()];
+    let mut rest = acc.as_mut_slice();
+    let mut parts = Vec::with_capacity(tasks.len());
+    for t in &tasks {
+        let (head, tail) = rest.split_at_mut(t.len());
+        parts.push((t.clone(), head));
+        rest = tail;
+    }
+    parts
+        .into_par_iter()
+        .for_each_init(glv::BatchState::default, |st, (range, acc)| {
+            let (mut points, mut scalars, mut ends, mut which) =
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            // Per slot: its terms of coefficient 1 or -1 (most of them on some circuits),
+            // added straight in, and then its ladders' sums.
+            let mut sum = vec![Xyzz::<P::RF>::ZERO; range.len()];
+            let mut ladder = vec![false; range.len()];
+            let minus_one = -Fr::one();
+            for (k, slot) in slots[range.clone()].iter().enumerate() {
+                let i = range.start + k;
+                let (p, s) = match gather(slot, &base, &scalar) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        fail(i, e);
+                        continue;
+                    }
+                };
+                if p.len() >= MULTIEXP_MIN_TERMS {
+                    match combine(&p, &s, &msm) {
+                        Ok(r) => acc[k] = r,
+                        Err(e) => fail(i, e.into()),
+                    }
+                    continue;
+                }
+                ladder[k] = true;
+                let start = points.len();
+                for (q, s) in p.iter().zip(s) {
+                    if q.infinity || s.is_zero() {
+                        continue;
+                    }
+                    let (x, y) = P::raw_xy(q);
+                    if s.is_one() {
+                        sum[k].madd(x, y);
+                    } else if s == minus_one {
+                        sum[k].madd(x, y.neg());
+                    } else {
+                        points.push(Xyzz {
+                            x,
+                            y,
+                            zz: P::RF::ONE,
+                            zzz: P::RF::ONE,
+                        });
+                        scalars.push(s);
+                    }
+                }
+                let mut end = start;
+                while end < points.len() {
+                    end = (end + TERMS_PER_SUM).min(points.len());
+                    ends.push(end);
+                    which.push(k);
+                }
+            }
+            let mut out = vec![Xyzz::ZERO; ends.len()];
+            glv::mul_sums_xyzz_in(st, &points, &scalars, &ends, &mut out);
+            for (o, &k) in out.iter().zip(&which) {
+                if !o.is_zero() {
+                    sum[k].madd(o.x, o.y);
+                }
+            }
+            for (k, s) in sum.iter().enumerate() {
+                if ladder[k] {
+                    acc[k] = to_projective(s);
+                }
+            }
+        });
+    if let Some((_, e)) = first_err.into_inner().unwrap_or_else(|p| p.into_inner()) {
+        return Err(e);
+    }
     Ok(to_affine(&acc))
 }
 
@@ -605,29 +741,30 @@ fn to_affine<P: CurveGroup>(acc: &[P]) -> Vec<P::Affine> {
 }
 
 /// The bases and scalars of one slot, in term order.
-fn gather<P, F>(
+fn gather<P, B, S>(
     slot: &[PointTerm],
-    r1cs: &R1cs,
-    base: F,
+    base: &B,
+    scalar: &S,
 ) -> Result<(Vec<P>, Vec<Fr>), CeremonyError>
 where
-    F: Fn(&PointTerm) -> Result<P, CeremonyError>,
+    B: Fn(&PointTerm) -> Result<P, CeremonyError>,
+    S: Fn(&PointTerm) -> Result<Fr, CeremonyError>,
 {
     let mut points = Vec::with_capacity(slot.len());
     let mut scalars = Vec::with_capacity(slot.len());
     for term in slot {
         points.push(base(term)?);
-        scalars.push(coefficient(r1cs, term.coef_ptr)?);
+        scalars.push(scalar(term)?);
     }
     Ok((points, scalars))
 }
 
-/// snarkjs' three-way dispatch (`zkey_new.js:459-486`): identity, one scalar
-/// multiplication, or a multiexp. See [`MULTIEXP_MIN_TERMS`] for the fourth case, which is
-/// a small-slot shortcut and not a fourth behaviour.
+/// snarkjs' multiexp branch (`zkey_new.js:476-481`) for a slot of at least
+/// `MULTIEXP_MIN_TERMS` terms, with the shape checked first; the smaller slots, which
+/// snarkjs splits again at one term, are [`compose`]'s batched ladders.
 fn combine<P, F>(points: &[Affine<P>], scalars: &[Fr], msm: F) -> Result<Projective<P>, AccelError>
 where
-    P: RawCurve<RF: GlvField>,
+    P: RawCurve,
     F: Fn(&[Affine<P>], &[Fr]) -> Result<Projective<P>, AccelError>,
 {
     if points.len() != scalars.len() {
@@ -636,16 +773,7 @@ where
             reason: format!("{} bases but {} scalars", points.len(), scalars.len()),
         });
     }
-    if points.len() >= MULTIEXP_MIN_TERMS {
-        return msm(points, scalars);
-    }
-    // On raw limbs through GLV: arkworks' affine multiply is double-and-add over all 254
-    // bits, and a small coefficient costs no table here (see `glv::mul`).
-    let mut acc = Xyzz::<P::RF>::ZERO;
-    for (p, s) in points.iter().zip(scalars) {
-        acc.add_assign(&glv::mul_affine(p, s));
-    }
-    Ok(to_projective(&acc))
+    msm(points, scalars)
 }
 
 #[cfg(test)]
@@ -673,15 +801,42 @@ mod tests {
     }
 
     #[test]
-    fn combine_small_slots_stay_on_cpu() {
-        for n in [0, 1, MULTIEXP_MIN_TERMS - 1] {
-            let scalars = vec![Fr::from(3u64); n];
-            let got = combine(&vec![G1Affine::generator(); n], &scalars, |_, _| {
-                panic!("small slot must stay on CPU")
+    fn small_slots_stay_on_cpu() {
+        // Slots of 0, 1 and 31 terms, an empty one between, and one term a base the
+        // lookup refuses, which must surface as the error of its slot and no other's.
+        let len = [0, 1, MULTIEXP_MIN_TERMS - 1, 0, 3];
+        let slots: Vec<Vec<PointTerm>> = len
+            .iter()
+            .map(|&n| {
+                (0..n)
+                    .map(|i| PointTerm {
+                        tag: BaseTag::TauG1,
+                        index: i as u32,
+                        coef_ptr: None,
+                    })
+                    .collect()
             })
-            .unwrap();
-            assert_eq!(got, G1Affine::generator() * Fr::from(3 * n as u64));
+            .collect();
+        let g = G1Affine::generator();
+        let three = |_: &PointTerm| Ok(Fr::from(3u64));
+        let msm = |_: &[G1Affine], _: &[Fr]| -> Result<G1Projective, AccelError> {
+            panic!("small slot must stay on CPU")
+        };
+        let got = compose(&slots, |_| Ok(g), three, msm).unwrap();
+        for (p, &n) in got.iter().zip(&len) {
+            assert_eq!(*p, (g * Fr::from(3 * n as u64)).into_affine());
         }
+        let bad = |t: &PointTerm| {
+            if t.index == 2 {
+                Err(CeremonyError::BadParams("no such base".into()))
+            } else {
+                Ok(g)
+            }
+        };
+        assert!(matches!(
+            compose(&slots, bad, three, msm),
+            Err(CeremonyError::BadParams(_))
+        ));
     }
 }
 
