@@ -461,6 +461,160 @@ fn butterflies<F: GlvField>(
     }
 }
 
+/// The passes at `exp` and `exp + 1` as one radix-4 pass, with `w` the primitive
+/// `2^(exp+1)`-th root; `None` if they are too small to batch, for the caller to run one
+/// at a time instead.
+///
+/// With `h = 2^(exp-1)`, `v = w^j` and `i = w^h` (a fourth root of unity), the two passes
+/// take `x0..x3 = a[g+j], a[g+j+h], a[g+j+2h], a[g+j+3h]` to
+///
+/// ```text
+///   A = [v^2] x1,   B = [v] x2 + [v^3] x3,   C = [v i] x2 - [v^3 i] x3
+///   x0 + A + B,   x0 - A + C,   x0 + A - B,   x0 - A - C
+/// ```
+///
+/// which is three ladders for four points where the two passes take four: `B` and `C`
+/// are sums of two products, and two products under one ladder share its doublings
+/// ([`glv::mul_sum_batch_xyzz_in`]). On G1, where the doublings are most of a
+/// multiplication, that is about a twelfth less work; on G2, whose additions weigh more,
+/// a sum of two costs nearly two products and this gains nothing, so G2 keeps radix 2.
+///
+/// `scale` multiplies all four outputs, `[s] x0` taking a ladder of its own.
+fn mix_pass4<F: GlvField>(a: &mut [Xyzz<F>], exp: u32, w: Fr, scale: Option<Fr>) -> Option<()> {
+    let h = 1usize << (exp - 1);
+    let fill = a.len() / 4 / (4 * rayon::current_num_threads());
+    if F::DIMS != 2 || fill < MIN_BATCH {
+        return None;
+    }
+    let per_task = prev_power_of_two(fill.min(BUTTERFLIES_PER_TASK));
+    let i4 = w.pow([h as u64]);
+    let run = |st: &mut glv::BatchState<F>, runs: Vec<([&mut [Xyzz<F>]; 4], usize)>| {
+        butterflies4(st, runs, w, i4, scale)
+    };
+    if h <= per_task {
+        let groups_per_task = per_task / h;
+        a.par_chunks_mut(4 * h * groups_per_task).for_each_init(
+            glv::BatchState::default,
+            |st, slab| {
+                run(
+                    st,
+                    slab.chunks_mut(4 * h)
+                        .map(|g| (quarters(g, h), 0))
+                        .collect(),
+                )
+            },
+        );
+    } else {
+        a.par_chunks_mut(4 * h).for_each(|group| {
+            let [q0, q1, q2, q3] = quarters(group, h);
+            q0.par_chunks_mut(per_task)
+                .zip(q1.par_chunks_mut(per_task))
+                .zip(q2.par_chunks_mut(per_task))
+                .zip(q3.par_chunks_mut(per_task))
+                .enumerate()
+                .for_each_init(glv::BatchState::default, |st, (c, (((q0, q1), q2), q3))| {
+                    run(st, vec![([q0, q1, q2, q3], c * per_task)])
+                });
+        });
+    }
+    Some(())
+}
+
+fn quarters<T>(g: &mut [T], h: usize) -> [&mut [T]; 4] {
+    let (q0, rest) = g.split_at_mut(h);
+    let (q1, rest) = rest.split_at_mut(h);
+    let (q2, q3) = rest.split_at_mut(h);
+    [q0, q1, q2, q3]
+}
+
+/// [`mix_pass4`]'s butterflies over every run, `([x0, x1, x2, x3], first j)`. Every
+/// ladder of the call goes through two batches, the single products and the sums.
+fn butterflies4<F: GlvField>(
+    st: &mut glv::BatchState<F>,
+    mut runs: Vec<([&mut [Xyzz<F>]; 4], usize)>,
+    w: Fr,
+    i4: Fr,
+    scale: Option<Fr>,
+) {
+    let s = scale.unwrap_or(Fr::one());
+    let (mut one_p, mut one_k) = (Vec::new(), Vec::new());
+    let (mut two_p, mut two_k) = (Vec::new(), Vec::new());
+    for ([x0, x1, x2, x3], first) in &runs {
+        let mut v = w.pow([*first as u64]);
+        for k in 0..x0.len() {
+            if v.is_one() && scale.is_none() {
+                // j = 0: A = x1 and B = x2 + x3 need no product, C = [i] (x2 - x3) one.
+                let mut d = x2[k];
+                d.add_assign(&negated(&x3[k]));
+                one_p.push(d);
+                one_k.push(i4);
+            } else {
+                let (v2, v3) = (v * v, v * v * v);
+                if scale.is_some() {
+                    one_p.push(x0[k]);
+                    one_k.push(s);
+                }
+                one_p.push(x1[k]);
+                one_k.push(s * v2);
+                two_p.extend([x2[k], x3[k], x2[k], x3[k]]);
+                two_k.extend([s * v, s * v3, s * v * i4, -(s * v3 * i4)]);
+            }
+            v *= w;
+        }
+    }
+    let mut one = vec![Xyzz::ZERO; one_p.len()];
+    glv::mul_batch_xyzz_in(st, &one_p, &one_k, &mut one);
+    let mut two = vec![Xyzz::ZERO; two_p.len() / 2];
+    glv::mul_sum_batch_xyzz_in(st, &two_p, &two_k, 2, &mut two);
+
+    // `p + q` and `p - q`, `q` affine (a mixed addition, the identity skipped) or not.
+    let pm = |p: &Xyzz<F>, q: &Xyzz<F>, affine: bool| {
+        let (mut plus, mut minus) = (*p, *p);
+        if affine {
+            if !q.is_zero() {
+                plus.madd(q.x, q.y);
+                minus.madd(q.x, q.y.neg());
+            }
+        } else {
+            plus.add_assign(q);
+            minus.add_assign(&negated(q));
+        }
+        (plus, minus)
+    };
+    let (mut o, mut t) = (0, 0);
+    for ([x0, x1, x2, x3], first) in runs.iter_mut() {
+        let mut v = w.pow([*first as u64]);
+        for k in 0..x0.len() {
+            let (p, m, b, c, affine_b);
+            if v.is_one() && scale.is_none() {
+                (p, m) = pm(&x0[k], &x1[k], false);
+                let mut sum = x2[k];
+                sum.add_assign(&x3[k]);
+                (b, c, affine_b) = (sum, one[o], false);
+                o += 1;
+            } else {
+                let base = if scale.is_some() {
+                    o += 1;
+                    one[o - 1]
+                } else {
+                    x0[k]
+                };
+                (p, m) = pm(&base, &one[o], true);
+                o += 1;
+                (b, c, affine_b) = (two[t], two[t + 1], true);
+                t += 2;
+            }
+            let (z0, z2) = pm(&p, &b, affine_b);
+            let (z1, z3) = pm(&m, &c, true);
+            x0[k] = z0;
+            x1[k] = z1;
+            x2[k] = z2;
+            x3[k] = z3;
+            v *= w;
+        }
+    }
+}
+
 /// In-place inverse FFT over the group. `a.len()` must be a power of two no larger than
 /// `2^Fr::TWO_ADICITY`; the caller has already checked both.
 ///
@@ -482,9 +636,20 @@ pub(crate) fn ifft<F: GlvField>(a: &mut [Xyzz<F>]) {
     let size_inv = Fr::from(n as u64)
         .inverse()
         .expect("a power of two is a unit mod r");
-    for exp in 1..=bits {
-        let scale = (exp == bits).then_some(size_inv);
-        mix_pass(a, exp, roots[exp as usize], scale);
+    // Passes in pairs ending at the last, through `mix_pass4` where it takes them; an odd
+    // count leaves the first pass, which multiplies nothing, on its own.
+    let mut exp = 1;
+    if bits % 2 == 1 {
+        mix_pass(a, 1, roots[1], (bits == 1).then_some(size_inv));
+        exp = 2;
+    }
+    while exp < bits {
+        let scale = (exp + 1 == bits).then_some(size_inv);
+        if mix_pass4(a, exp, roots[exp as usize + 1], scale).is_none() {
+            mix_pass(a, exp, roots[exp as usize], None);
+            mix_pass(a, exp + 1, roots[exp as usize + 1], scale);
+        }
+        exp += 2;
     }
     a[1..].reverse();
 }
@@ -962,6 +1127,48 @@ mod tests {
                 "j={j}"
             );
         }
+    }
+
+    /// The radix-4 passes against radix 2 alone, at sizes where they batch: on one thread,
+    /// so a block of 2^13 or 2^14 is large enough, with an odd and an even pass count, both
+    /// task shapes (groups smaller and larger than a task) and the identity among the
+    /// inputs.
+    #[test]
+    fn radix_4_passes_match_radix_2() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            for bits in [13u32, 14] {
+                let n = 1usize << bits;
+                let g = xyzz_from_projective::<snarkrs_field::g1::Config>(
+                    &(G1Projective::generator() * Fr::from(3u64)),
+                );
+                let mut acc = g;
+                let mut a: Vec<Xyzz<RawFq>> = (0..n)
+                    .map(|_| {
+                        acc.add_assign(&g);
+                        acc
+                    })
+                    .collect();
+                a[5] = Xyzz::ZERO;
+                let mut want = a.clone();
+                let bits_n = want.len().trailing_zeros();
+                bit_reverse(&mut want, bits_n);
+                let roots = root_table(bits_n);
+                let size_inv = Fr::from(n as u64).inverse().unwrap();
+                for exp in 1..=bits_n {
+                    let scale = (exp == bits_n).then_some(size_inv);
+                    mix_pass(&mut want, exp, roots[exp as usize], scale);
+                }
+                want[1..].reverse();
+                assert!(mix_pass4(&mut a.clone(), 2, roots[3], None).is_some());
+                ifft(&mut a);
+                let g1 = batch_to_affine::<snarkrs_field::g1::Config>;
+                assert_eq!(g1(&a), g1(&want), "bits={bits}");
+            }
+        });
     }
 
     /// `point_times_fr` against arkworks, over the corners a random sweep misses: the
