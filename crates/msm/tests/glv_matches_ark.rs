@@ -202,6 +202,69 @@ fn check_sum<P: RawCurve + ark_ec::CurveConfig<ScalarField = Fr>>(
     }
 }
 
+/// `mul_sums_xyzz_in`, a term count per sum: empty sums, single terms, a sum of 31, every
+/// edge scalar (so tables of one entry up to the full eight), the identity, a sum that
+/// cancels, and repeats.
+fn check_sums<P: RawCurve + ark_ec::CurveConfig<ScalarField = Fr>>(
+    label: &str,
+    rand: impl Fn(&mut StdRng) -> Projective<P>,
+) where
+    Projective<P>: std::fmt::Debug,
+    P::RF: GlvField,
+{
+    let mut rng = StdRng::seed_from_u64(0x7a66);
+    let mut st = glv::BatchState::default();
+    let sizes = [0usize, 1, 2, 3, 0, 5, 1, 31, 4, 2, 0, 7, 1, 1, 3];
+    let mut ks = scalars(&mut rng);
+    ks.extend(scalars(&mut rng));
+    let m: usize = sizes.iter().sum();
+    ks.truncate(m);
+    let mut ps: Vec<Affine<P>> = (0..m).map(|_| rand(&mut rng).into_affine()).collect();
+    ps[10] = Affine::<P>::identity();
+    // The sum of three at terms 3..6 cancels its first two; the sum of 31 repeats one.
+    ps[4] = ps[3];
+    ks[4] = -ks[3];
+    ps[20] = ps[19];
+    ks[20] = ks[19];
+    let xyzz: Vec<Xyzz<P::RF>> = ps
+        .iter()
+        .map(|p| {
+            let mut a = Xyzz::<P::RF>::ZERO;
+            if !p.infinity {
+                let (x, y) = P::raw_xy(p);
+                a.madd(x, y);
+            }
+            a
+        })
+        .collect();
+    let ends: Vec<usize> = sizes
+        .iter()
+        .scan(0, |e, s| {
+            *e += s;
+            Some(*e)
+        })
+        .collect();
+    let mut out = vec![Xyzz::<P::RF>::ZERO; sizes.len()];
+    glv::mul_sums_xyzz_in(&mut st, &xyzz, &ks, &ends, &mut out);
+    let mut from = 0;
+    for (i, &to) in ends.iter().enumerate() {
+        let want: Projective<P> = (from..to).map(|u| ps[u] * ks[u]).sum();
+        assert_eq!(to_projective(&out[i]), want, "{label}: sum {i}");
+        from = to;
+    }
+    glv::mul_sums_xyzz_in::<P::RF>(&mut st, &[], &[], &[], &mut []);
+}
+
+#[test]
+fn g1_sums_match_ark() {
+    check_sums::<snarkrs_field::g1::Config>("G1", |r| G1Projective::rand(r));
+}
+
+#[test]
+fn g2_sums_match_ark() {
+    check_sums::<snarkrs_field::g2::Config>("G2", |r| G2Projective::rand(r));
+}
+
 #[test]
 fn g1_sum_batch_matches_ark() {
     check_sum::<snarkrs_field::g1::Config>("G1", |r| G1Projective::rand(r));

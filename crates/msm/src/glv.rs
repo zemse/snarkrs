@@ -30,7 +30,8 @@ use crate::xyzz::{RawCurve, Xyzz};
 
 mod batch;
 pub use batch::{
-    mul_batch, mul_batch_in, mul_batch_xyzz, mul_batch_xyzz_in, mul_sum_batch_xyzz_in, BatchState,
+    mul_batch, mul_batch_in, mul_batch_xyzz, mul_batch_xyzz_in, mul_sum_batch_xyzz_in,
+    mul_sums_xyzz_in, BatchState,
 };
 
 /// `lambda`, the eigenvalue of `phi` on G1 (ark-bn254's G1 `LAMBDA`). On G2 the same
