@@ -177,11 +177,7 @@ impl CpuNtt {
             // block sits in the array.
             let local = self.block_twiddles(twiddles, n);
             a.par_chunks_mut(CACHE_BLOCK).for_each(|block| {
-                let mut h = 1usize;
-                while h < CACHE_BLOCK {
-                    serial_pass::<false>(block, h, &local, CACHE_BLOCK / (2 * h));
-                    h <<= 1;
-                }
+                block_dit(block, &local);
             });
             self.dit_outer_passes(a, twiddles, CACHE_BLOCK);
             return;
@@ -238,11 +234,7 @@ impl CpuNtt {
             self.dif_outer_passes(a, twiddles, CACHE_BLOCK / 2);
             let local = self.block_twiddles(twiddles, n);
             a.par_chunks_mut(CACHE_BLOCK).for_each(|block| {
-                let mut h = CACHE_BLOCK / 2;
-                while h >= 1 {
-                    serial_pass::<true>(block, h, &local, CACHE_BLOCK / (2 * h));
-                    h >>= 1;
-                }
+                block_dif(block, &local);
             });
             return;
         }
@@ -364,19 +356,11 @@ impl CpuNtt {
         a.par_chunks_mut(CACHE_BLOCK)
             .zip(table.par_chunks(CACHE_BLOCK))
             .for_each(|(block, tab)| {
-                let mut h = CACHE_BLOCK / 2;
-                while h >= 1 {
-                    serial_pass::<true>(block, h, &local_inv, CACHE_BLOCK / (2 * h));
-                    h >>= 1;
-                }
+                block_dif(block, &local_inv);
                 for (x, s) in block.iter_mut().zip(tab.iter()) {
                     *x *= s;
                 }
-                let mut h = 1usize;
-                while h < CACHE_BLOCK {
-                    serial_pass::<false>(block, h, &local_fwd, CACHE_BLOCK / (2 * h));
-                    h <<= 1;
-                }
+                block_dit(block, &local_fwd);
             });
         self.dit_outer_passes(a, &fwd, CACHE_BLOCK);
     }
@@ -592,6 +576,89 @@ fn quad_dif(strips: [&mut [Fr]; 4], twiddles: &[Fr], s1: usize, hh: usize, j0: u
         y1[k] = a0.sub(a1).mul(w2).to_fr();
         y2[k] = a2.add(a3).to_fr();
         y3[k] = a2.sub(a3).mul(w2).to_fr();
+    }
+}
+
+/// Every DIT pass inside one CACHE_BLOCK-sized block, `local` its table from
+/// [`CpuNtt::block_twiddles`]: the first three as [`dit_head`], the rest radix 2.
+fn block_dit(block: &mut [Fr], local: &[Fr]) {
+    dit_head(block, local, CACHE_BLOCK / 8);
+    let mut h = 8usize;
+    while h < CACHE_BLOCK {
+        serial_pass::<false>(block, h, local, CACHE_BLOCK / (2 * h));
+        h <<= 1;
+    }
+}
+
+/// [`block_dit`]'s mirror: the radix-2 DIF passes down to `half = 8`, then [`dif_tail`].
+fn block_dif(block: &mut [Fr], local: &[Fr]) {
+    let mut h = CACHE_BLOCK / 2;
+    while h >= 8 {
+        serial_pass::<true>(block, h, local, CACHE_BLOCK / (2 * h));
+        h >>= 1;
+    }
+    dif_tail(block, local, CACHE_BLOCK / 8);
+}
+
+/// The DIT passes at `half` 1, 2 and 4 over every aligned run of eight, as one radix-8
+/// kernel. Their twiddles are the eighth roots `w^j = twiddles[j * s8]`, `w^0 = 1`, so of
+/// the twelve multiplies the three passes spend on a run, seven are by one and are
+/// skipped; the passes' short inner loops, one, two and four butterflies a block, go too.
+#[inline]
+fn dit_head(a: &mut [Fr], twiddles: &[Fr], s8: usize) {
+    let (w1, w2, w3) = (
+        raw(&twiddles[s8]),
+        raw(&twiddles[2 * s8]),
+        raw(&twiddles[3 * s8]),
+    );
+    for c in a.as_chunks_mut::<8>().0 {
+        let x: [RawFr; 8] = std::array::from_fn(|i| raw(&c[i]));
+        let (a0, a1) = (x[0].add(x[1]), x[0].sub(x[1]));
+        let (a2, a3) = (x[2].add(x[3]), x[2].sub(x[3]));
+        let (a4, a5) = (x[4].add(x[5]), x[4].sub(x[5]));
+        let (a6, a7) = (x[6].add(x[7]), x[6].sub(x[7]));
+        let t = a3.mul(w2);
+        let (b0, b2, b1, b3) = (a0.add(a2), a0.sub(a2), a1.add(t), a1.sub(t));
+        let t = a7.mul(w2);
+        let (b4, b6, b5, b7) = (a4.add(a6), a4.sub(a6), a5.add(t), a5.sub(t));
+        c[0] = b0.add(b4).to_fr();
+        c[4] = b0.sub(b4).to_fr();
+        let t = b5.mul(w1);
+        c[1] = b1.add(t).to_fr();
+        c[5] = b1.sub(t).to_fr();
+        let t = b6.mul(w2);
+        c[2] = b2.add(t).to_fr();
+        c[6] = b2.sub(t).to_fr();
+        let t = b7.mul(w3);
+        c[3] = b3.add(t).to_fr();
+        c[7] = b3.sub(t).to_fr();
+    }
+}
+
+/// The DIF passes at `half` 4, 2 and 1, the mirror of [`dit_head`].
+#[inline]
+fn dif_tail(a: &mut [Fr], twiddles: &[Fr], s8: usize) {
+    let (w1, w2, w3) = (
+        raw(&twiddles[s8]),
+        raw(&twiddles[2 * s8]),
+        raw(&twiddles[3 * s8]),
+    );
+    for c in a.as_chunks_mut::<8>().0 {
+        let x: [RawFr; 8] = std::array::from_fn(|i| raw(&c[i]));
+        let (u0, u4) = (x[0].add(x[4]), x[0].sub(x[4]));
+        let (u1, u5) = (x[1].add(x[5]), x[1].sub(x[5]).mul(w1));
+        let (u2, u6) = (x[2].add(x[6]), x[2].sub(x[6]).mul(w2));
+        let (u3, u7) = (x[3].add(x[7]), x[3].sub(x[7]).mul(w3));
+        let (v0, v2, v1, v3) = (u0.add(u2), u0.sub(u2), u1.add(u3), u1.sub(u3).mul(w2));
+        let (v4, v6, v5, v7) = (u4.add(u6), u4.sub(u6), u5.add(u7), u5.sub(u7).mul(w2));
+        c[0] = v0.add(v1).to_fr();
+        c[1] = v0.sub(v1).to_fr();
+        c[2] = v2.add(v3).to_fr();
+        c[3] = v2.sub(v3).to_fr();
+        c[4] = v4.add(v5).to_fr();
+        c[5] = v4.sub(v5).to_fr();
+        c[6] = v6.add(v7).to_fr();
+        c[7] = v6.sub(v7).to_fr();
     }
 }
 
