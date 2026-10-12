@@ -120,8 +120,16 @@ impl CpuNtt {
     /// Pack the fused block's strided reads into a 32 KB table.
     /// The sampled root shares the ordinary CACHE_BLOCK-sized cache entry.
     fn block_twiddles(&self, twiddles: &[Fr], n: usize) -> Arc<Vec<Fr>> {
-        let stride = n / CACHE_BLOCK;
-        let key = (CACHE_BLOCK, twiddles[stride]);
+        self.stride_twiddles(twiddles, n, n / CACHE_BLOCK)
+    }
+
+    /// `twiddles[i * stride]` packed, which is the table of the transform `stride` times
+    /// smaller and is cached under its key. A pass reading the full table at a stride puts
+    /// every twiddle on a cache line of its own, and at a power-of-two stride of kilobytes
+    /// on a few of L1's sets: at 2^21 the two outer passes next to the fused block, stride
+    /// 8 KB, took 1.5x the others' time.
+    fn stride_twiddles(&self, twiddles: &[Fr], n: usize, stride: usize) -> Arc<Vec<Fr>> {
+        let key = (n / stride, twiddles[stride]);
         if let Some(hit) = self
             .twiddles
             .read()
@@ -202,7 +210,8 @@ impl CpuNtt {
     fn dit_outer_passes(&self, a: &mut [Fr], twiddles: &[Fr], mut half: usize) {
         let n = a.len();
         while half * 4 <= n {
-            parallel_quad_pass_dit(a, half, twiddles, self.tasks());
+            let tw = self.stride_twiddles(twiddles, n, n / (4 * half));
+            parallel_quad_pass_dit(a, half, &tw, self.tasks());
             half <<= 2;
         }
         if half < n {
@@ -216,7 +225,8 @@ impl CpuNtt {
         let n = a.len();
         let mut half = n / 2;
         while half > 2 * floor {
-            parallel_quad_pass_dif(a, half, twiddles, self.tasks());
+            let tw = self.stride_twiddles(twiddles, n, n / (2 * half));
+            parallel_quad_pass_dif(a, half, &tw, self.tasks());
             half >>= 2;
         }
         if half > floor {
@@ -713,9 +723,10 @@ fn quad_strips(block: &mut [Fr], half: usize) -> [&mut [Fr]; 4] {
 /// [`parallel_pass`] for a fused DIT pass pair. Only the outer passes come here, so a
 /// block is at least `4 * CACHE_BLOCK` elements and needs no grouping; the split branch
 /// mirrors the radix-2 one for the late passes where blocks are fewer than tasks.
+/// `twiddles` is packed for the pair ([`CpuNtt::stride_twiddles`]), so its stride is one.
 fn parallel_quad_pass_dit(a: &mut [Fr], half: usize, twiddles: &[Fr], tasks: usize) {
     let n = a.len();
-    let s2 = n / (4 * half);
+    let s2 = 1;
     let block_len = 4 * half;
     let blocks = n / block_len;
     if blocks >= tasks {
@@ -741,7 +752,7 @@ fn parallel_quad_pass_dit(a: &mut [Fr], half: usize, twiddles: &[Fr], tasks: usi
 /// The DIF twin: blocks are `2 * half` and the strips are `half / 2` long.
 fn parallel_quad_pass_dif(a: &mut [Fr], half: usize, twiddles: &[Fr], tasks: usize) {
     let n = a.len();
-    let s1 = n / (2 * half);
+    let s1 = 1;
     let hh = half / 2;
     let block_len = 2 * half;
     let blocks = n / block_len;
@@ -1157,6 +1168,27 @@ mod tests {
         let want = fresh.twiddles(&domain(CACHE_BLOCK), Direction::Forward);
         assert!(Arc::ptr_eq(&local, &want));
         assert_eq!(*local, domain(CACHE_BLOCK).twiddles());
+    }
+
+    /// The outer passes' packed tables are the full table at the pass's stride, the same
+    /// entry as the smaller transform's own table, and stride one is the full table.
+    #[test]
+    fn stride_twiddles_are_the_smaller_transforms_tables() {
+        let ntt = CpuNtt::new();
+        let d = domain(1 << 14);
+        for dir in [Direction::Forward, Direction::Inverse] {
+            let full = ntt.twiddles(&d, dir);
+            assert!(Arc::ptr_eq(&ntt.stride_twiddles(&full, d.size, 1), &full));
+            for s in [2usize, 4, 64, 256] {
+                let packed = ntt.stride_twiddles(&full, d.size, s);
+                let want: Vec<Fr> = full.iter().step_by(s).copied().collect();
+                assert_eq!(*packed, want, "stride {s}");
+                assert!(Arc::ptr_eq(
+                    &packed,
+                    &ntt.twiddles(&domain(d.size / s), dir)
+                ));
+            }
+        }
     }
 
     #[test]
