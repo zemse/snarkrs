@@ -77,6 +77,16 @@ pub trait GlvField: RawField {
     /// The inverse of a nonzero element, through arkworks. Once per batch, never per point.
     fn inv(self) -> Self;
 
+    /// The field a batch inversion runs in: `Fq` on both groups. G2 inverts the norms of
+    /// its denominators, a third of the multiplies of inverting them in `Fq2`.
+    type Norm: GlvField;
+
+    /// The norm of every element of `den`, which on G1 is `den` itself.
+    fn norms<'a>(den: &'a [Self], buf: &'a mut Vec<Self::Norm>) -> &'a [Self::Norm];
+
+    /// `1 / self` from `1 / norm(self)`.
+    fn inv_from_norm(self, n: Self::Norm) -> Self;
+
     /// `k = sum_j k_j e_j (mod r)`, with `e_j` the eigenvalue of [`GlvField::endo_j`]`(j)`.
     /// Parts past [`GlvField::DIMS`] are zero.
     fn split(k: &Fr) -> [i128; 4];
@@ -107,6 +117,18 @@ impl GlvField for RawFq {
         RawFq::from_fq(&self.to_fq().inverse().expect("inverse of zero"))
     }
 
+    type Norm = RawFq;
+
+    #[inline(always)]
+    fn norms<'a>(den: &'a [RawFq], _: &'a mut Vec<RawFq>) -> &'a [RawFq] {
+        den
+    }
+
+    #[inline(always)]
+    fn inv_from_norm(self, n: RawFq) -> RawFq {
+        n
+    }
+
     fn split(k: &Fr) -> [i128; 4] {
         let (k1, k2) = decompose(k);
         [k1, k2, 0, 0]
@@ -135,6 +157,23 @@ impl GlvField for RawFq2 {
 
     fn inv(self) -> RawFq2 {
         RawFq2::from_fq2(&self.to_fq2().inverse().expect("inverse of zero"))
+    }
+
+    type Norm = RawFq;
+
+    #[inline(always)]
+    fn norms<'a>(den: &'a [RawFq2], buf: &'a mut Vec<RawFq>) -> &'a [RawFq] {
+        buf.clear();
+        buf.extend(den.iter().map(|d| d.norm()));
+        buf
+    }
+
+    #[inline(always)]
+    fn inv_from_norm(self, n: RawFq) -> RawFq2 {
+        RawFq2 {
+            c0: self.c0.mul(n),
+            c1: self.c1.mul(n).neg(),
+        }
     }
 
     fn split(k: &Fr) -> [i128; 4] {

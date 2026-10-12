@@ -222,3 +222,40 @@ pub(super) fn add_wrap(a: [u64; 4], b: [u64; 4]) -> [u64; 4] {
     }
     [a0, a1, a2, a3]
 }
+
+/// `a + b` on eight limbs, wrapping: no reduction, the caller bounds the sum.
+#[inline(always)]
+pub(super) fn add_wide(a: [u64; 8], b: [u64; 8]) -> [u64; 8] {
+    let [mut a0, mut a1, mut a2, mut a3, mut a4, mut a5, mut a6, mut a7] = a;
+    // SAFETY: register arithmetic only: no memory, no stack; flags clobbered.
+    unsafe {
+        core::arch::asm!(
+            "adds {a0}, {a0}, {b0}",
+            "adcs {a1}, {a1}, {b1}",
+            "adcs {a2}, {a2}, {b2}",
+            "adcs {a3}, {a3}, {b3}",
+            "adcs {a4}, {a4}, {b4}",
+            "adcs {a5}, {a5}, {b5}",
+            "adcs {a6}, {a6}, {b6}",
+            "adc {a7}, {a7}, {b7}",
+            a0 = inout(reg) a0,
+            a1 = inout(reg) a1,
+            a2 = inout(reg) a2,
+            a3 = inout(reg) a3,
+            a4 = inout(reg) a4,
+            a5 = inout(reg) a5,
+            a6 = inout(reg) a6,
+            a7 = inout(reg) a7,
+            b0 = in(reg) b[0],
+            b1 = in(reg) b[1],
+            b2 = in(reg) b[2],
+            b3 = in(reg) b[3],
+            b4 = in(reg) b[4],
+            b5 = in(reg) b[5],
+            b6 = in(reg) b[6],
+            b7 = in(reg) b[7],
+            options(pure, nomem, nostack),
+        );
+    }
+    [a0, a1, a2, a3, a4, a5, a6, a7]
+}

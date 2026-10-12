@@ -84,7 +84,7 @@ pub fn mul_batch_xyzz<F: GlvField>(points: &[Xyzz<F>], scalars: &[Fr], out: &mut
 /// The working memory of [`mul_batch_xyzz_in`], kept between calls. A batch of 1024 G2
 /// points holds 4.6 MB of tables; allocating that afresh per call, from every thread of a
 /// pass at once, costs page faults the multiplications then wait on.
-pub struct BatchState<F> {
+pub struct BatchState<F: GlvField> {
     dig: Vec<i8>,
     neg: Vec<bool>,
     tab: Vec<Pt<F>>,
@@ -105,7 +105,7 @@ pub struct BatchState<F> {
     s: Scratch<F>,
 }
 
-impl<F> Default for BatchState<F> {
+impl<F: GlvField> Default for BatchState<F> {
     fn default() -> Self {
         BatchState {
             dig: Vec::new(),
@@ -127,6 +127,7 @@ impl<F> Default for BatchState<F> {
             adds: Vec::new(),
             s: Scratch {
                 den: Vec::new(),
+                norm: Vec::new(),
                 pre: Vec::new(),
                 who: Vec::new(),
             },
@@ -389,7 +390,7 @@ fn to_affine_all<F: GlvField>(points: &[Xyzz<F>], s: &mut Scratch<F>) -> Vec<Opt
         .map(|p| (!p.is_zero()).then_some(Pt { x: p.x, y: p.y }))
         .collect();
     let who = &s.who;
-    invert_each(&s.den, &mut s.pre, |k, t| {
+    invert_each(&s.den, &mut s.norm, &mut s.pre, |k, t| {
         let p = &points[who[k]];
         out[who[k]] = Some(Pt {
             x: p.x.mul(p.zzz).mul(t),
@@ -399,9 +400,10 @@ fn to_affine_all<F: GlvField>(points: &[Xyzz<F>], s: &mut Scratch<F>) -> Vec<Opt
     out
 }
 
-struct Scratch<F> {
+struct Scratch<F: GlvField> {
     den: Vec<F>,
-    pre: Vec<F>,
+    norm: Vec<F::Norm>,
+    pre: Vec<F::Norm>,
     who: Vec<usize>,
 }
 
@@ -420,7 +422,7 @@ fn batch_dbl<F: GlvField>(a: &mut [Pt<F>], idx: &[usize], ok: &mut [bool], s: &m
         s.who.push(i);
     }
     let who = &s.who;
-    invert_pairs(&s.den, &mut s.pre, |k, inv, other| {
+    invert_pairs(&s.den, &mut s.norm, &mut s.pre, |k, inv, other| {
         let i = who[k];
         let p = a[i];
         let Some((k2, inv2)) = other else {
@@ -472,7 +474,7 @@ fn batch_add<F: GlvField>(
         s.who.push(k);
     }
     let who = &s.who;
-    invert_pairs(&s.den, &mut s.pre, |j, inv, other| {
+    invert_pairs(&s.den, &mut s.norm, &mut s.pre, |j, inv, other| {
         let (i, q) = adds[who[j]];
         let p = a[i];
         let Some((j2, inv2)) = other else {
@@ -498,8 +500,13 @@ fn batch_add<F: GlvField>(
 
 /// `f(k, 1 / den[k])` for every `k`, from one field inversion.
 #[inline(always)]
-fn invert_each<F: GlvField>(den: &[F], pre: &mut Vec<F>, mut f: impl FnMut(usize, F)) {
-    invert_pairs(den, pre, |k, i, other| {
+fn invert_each<F: GlvField>(
+    den: &[F],
+    norm: &mut Vec<F::Norm>,
+    pre: &mut Vec<F::Norm>,
+    mut f: impl FnMut(usize, F),
+) {
+    invert_pairs(den, norm, pre, |k, i, other| {
         f(k, i);
         if let Some((k2, i2)) = other {
             f(k2, i2);
@@ -517,8 +524,29 @@ fn invert_each<F: GlvField>(den: &[F], pre: &mut Vec<F>, mut f: impl FnMut(usize
 /// a doubling or an addition is a chain of dependent multiplies, each a long asm block,
 /// longer than what the core looks ahead across, so one point at a time leaves the
 /// multiplier waiting; two interleaved step by step keep it busy.
+///
+/// The chains run over [`GlvField::norms`] of `den`, and each inverse is rebuilt from its
+/// norm's on the way out: on G2 a batch inversion in `Fq` and two `Fq` multiplies a point
+/// to come back, against one in `Fq2`.
 #[inline(always)]
 fn invert_pairs<F: GlvField>(
+    den: &[F],
+    norm: &mut Vec<F::Norm>,
+    pre: &mut Vec<F::Norm>,
+    mut f: impl FnMut(usize, F, Option<(usize, F)>),
+) {
+    let nd = F::norms(den, norm);
+    invert_pairs_in(nd, pre, |k, i, other| {
+        f(
+            k,
+            den[k].inv_from_norm(i),
+            other.map(|(k2, i2)| (k2, den[k2].inv_from_norm(i2))),
+        )
+    });
+}
+
+#[inline(always)]
+fn invert_pairs_in<F: GlvField>(
     den: &[F],
     pre: &mut Vec<F>,
     mut f: impl FnMut(usize, F, Option<(usize, F)>),
@@ -559,31 +587,46 @@ fn invert_pairs<F: GlvField>(
 mod tests {
     use super::*;
     use ark_ec::{AffineRepr, CurveGroup, PrimeGroup};
+    use snarkrs_field::raw::RawFq2;
     use snarkrs_field::{g1, G1Projective};
 
     type F = snarkrs_field::raw::RawFq;
 
     /// Both chains of the shared inversion, at every length up to a few past two, odd ones
-    /// included, against one inversion per element.
-    #[test]
-    fn invert_each_matches_one_at_a_time() {
-        let mut pre = Vec::new();
-        invert_each::<F>(&[], &mut pre, |_, _| panic!("nothing to invert"));
-        let mut x = F::ONE.add(F::ONE);
+    /// included, against one inversion per element, in both fields (G2's through norms).
+    fn invert_each_in<G: GlvField>(seed: G) {
+        let (mut norm, mut pre) = (Vec::new(), Vec::new());
+        invert_each::<G>(&[], &mut norm, &mut pre, |_, _| panic!("nothing to invert"));
+        let mut x = seed;
         for n in 1..=9 {
-            let den: Vec<F> = (0..n)
+            let den: Vec<G> = (0..n)
                 .map(|_| {
-                    x = x.sqr().add(F::ONE);
+                    x = x.sqr().add(G::ONE);
                     x
                 })
                 .collect();
             let mut seen = vec![false; n];
-            invert_each(&den, &mut pre, |k, i| {
-                assert_eq!(den[k].mul(i), F::ONE, "n = {n}, k = {k}");
+            invert_each(&den, &mut norm, &mut pre, |k, i| {
+                assert!(den[k].mul(i) == G::ONE, "n = {n}, k = {k}");
+                assert!(i == den[k].inv(), "n = {n}, k = {k}");
                 seen[k] = true;
             });
             assert!(seen.iter().all(|&s| s), "n = {n}");
         }
+    }
+
+    #[test]
+    fn invert_each_matches_one_at_a_time() {
+        invert_each_in(F::ONE.add(F::ONE));
+        let two = F::ONE.add(F::ONE);
+        invert_each_in(RawFq2 {
+            c0: two,
+            c1: two.add(F::ONE),
+        });
+        invert_each_in(RawFq2 {
+            c0: F::ZERO,
+            c1: two,
+        });
     }
 
     /// The two exceptional additions, doubling and cancellation, are refused rather than
@@ -598,6 +641,7 @@ mod tests {
         let other = Pt { x: rx, y: ry };
         let mut s = Scratch {
             den: Vec::new(),
+            norm: Vec::new(),
             pre: Vec::new(),
             who: Vec::new(),
         };

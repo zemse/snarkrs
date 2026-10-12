@@ -540,6 +540,26 @@ impl RawFq2 {
     pub fn double(self) -> Self {
         self.add(self)
     }
+
+    /// `a0^2 + a1^2`, the norm down to `Fq`: `x conj(x)`. Nonzero exactly when `x` is, and
+    /// `1 / x = conj(x) / norm(x)`. On aarch64 one reduction of the two squares' sum,
+    /// which is below `2q^2`.
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    pub fn norm(self) -> RawFq {
+        RawFq(fq_reduce(wide::add_wide(
+            wide::mul_wide(self.c0.0, self.c0.0),
+            wide::mul_wide(self.c1.0, self.c1.0),
+        )))
+    }
+
+    /// `a0^2 + a1^2`, the norm down to `Fq`: `x conj(x)`. Nonzero exactly when `x` is, and
+    /// `1 / x = conj(x) / norm(x)`.
+    #[cfg(not(target_arch = "aarch64"))]
+    #[inline(always)]
+    pub fn norm(self) -> RawFq {
+        self.c0.sqr().add(self.c1.sqr())
+    }
 }
 
 impl RawField for RawFq2 {

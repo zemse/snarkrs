@@ -127,6 +127,7 @@ fn raw_fq2_matches_ark() {
         assert_eq!(ra.mul(rb).to_fq2(), *a * *b, "mul {i}");
         assert_eq!(ra.sqr().to_fq2(), *a * *a, "sqr {i}");
         assert_eq!(ra.double().to_fq2(), *a + *a, "double {i}");
+        assert_eq!(ra.norm().to_fq(), a.norm(), "norm {i}");
     }
 }
 
