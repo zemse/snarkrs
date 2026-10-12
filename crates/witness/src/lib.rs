@@ -20,6 +20,8 @@
 mod input;
 pub mod native;
 #[cfg(feature = "wasm")]
+mod pow;
+#[cfg(feature = "wasm")]
 mod wasm;
 
 pub use input::{Input, Json};

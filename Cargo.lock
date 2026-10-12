@@ -2257,6 +2257,7 @@ dependencies = [
  "snarkrs-field",
  "snarkrs-formats",
  "thiserror",
+ "wasmparser",
  "wasmtime",
  "zeroize",
 ]

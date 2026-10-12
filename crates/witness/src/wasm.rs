@@ -92,8 +92,14 @@ impl WitnessCalculator {
         // wasmtime's defaults: bounds-checked linear memory behind guard pages, no fuel, no
         // WASI. The module gets the host functions below and nothing else.
         let engine = Engine::new(&Config::new()).map_err(wasm_err)?;
-        let module = Module::new(&engine, wasm)
-            .map_err(|e| WitnessError::Wasm(format!("CompileError: {e:#}")))?;
+        // `**` with the exponent's zero top bytes skipped (see pow.rs). Should the rewritten
+        // module fail to compile, the one as given is what runs.
+        let trimmed = crate::pow::trim_exponent(wasm).and_then(|w| Module::new(&engine, w).ok());
+        let module = match trimmed {
+            Some(m) => m,
+            None => Module::new(&engine, wasm)
+                .map_err(|e| WitnessError::Wasm(format!("CompileError: {e:#}")))?,
+        };
 
         if module.get_export("getVersion").is_none() {
             let circom1 = module.get_export("getNVars").is_some();

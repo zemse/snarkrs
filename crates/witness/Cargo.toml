@@ -17,7 +17,7 @@ include = ["src/**/*", "LICENSE-MIT", "LICENSE-APACHE"]
 # The circom wasm calculator. Off, the crate is the native-binary runner alone and links no
 # wasm runtime at all.
 default = ["wasm"]
-wasm = ["dep:wasmtime"]
+wasm = ["dep:wasmtime", "dep:wasmparser"]
 
 [dependencies]
 snarkrs-field.workspace = true
@@ -41,3 +41,7 @@ wasmtime = { version = "34.0.2", optional = true, default-features = false, feat
     "std",
     "parallel-compilation",
 ] }
+
+# The version wasmtime 34 parses with, so the tree keeps one copy. Only its parser: the
+# load-time rewrite in src/pow.rs finds byte ranges and leaves validation to wasmtime.
+wasmparser = { version = "0.233.0", optional = true, default-features = false }
