@@ -8,15 +8,16 @@
 //! Every kernel is checked against arkworks on its own inputs before it is timed.
 //! Prints `field op mode ns_per_op` lines, the median of `REPS` (default 21).
 //!
-//! `cargo run --release -p snarkrs-field --example raw_ops`
+//! `cargo run --release -p snarkrs-field --example raw_ops -- [FIELD...]`, every field
+//! (`RawFq RawFr RawFq2 ArkFq ArkFr ArkFq2`) when none is named.
 
 use std::hint::black_box;
 use std::time::Instant;
 
 use ark_ff::UniformRand;
 use ark_std::rand::{rngs::StdRng, SeedableRng};
-use snarkrs_field::raw::{RawFq, RawFr};
-use snarkrs_field::{Fq, Fr};
+use snarkrs_field::raw::{RawFq, RawFq2, RawFr};
+use snarkrs_field::{Fq, Fq2, Fr};
 
 const TABLE: usize = 1024;
 const CHAIN: usize = 1 << 20;
@@ -48,6 +49,7 @@ macro_rules! raw_ops {
 }
 raw_ops!(RawFq);
 raw_ops!(RawFr);
+raw_ops!(RawFq2);
 
 macro_rules! ark_ops {
     ($t:ty) => {
@@ -69,6 +71,7 @@ macro_rules! ark_ops {
 }
 ark_ops!(Fq);
 ark_ops!(Fr);
+ark_ops!(Fq2);
 
 const ADD: u8 = 0;
 const SUB: u8 = 1;
@@ -185,8 +188,25 @@ fn main() {
     let mut rng = StdRng::seed_from_u64(0x7261_775f_6f70);
     let fq: Vec<Fq> = (0..2 * STREAM).map(|_| Fq::rand(&mut rng)).collect();
     let fr: Vec<Fr> = (0..2 * STREAM).map(|_| Fr::rand(&mut rng)).collect();
-    run("RawFq", &fq, RawFq::from_fq, RawFq::to_fq, reps);
-    run("RawFr", &fr, RawFr::from_fr, RawFr::to_fr, reps);
-    run("ArkFq", &fq, |x| *x, |x| x, reps);
-    run("ArkFr", &fr, |x| *x, |x| x, reps);
+    let fq2: Vec<Fq2> = (0..2 * STREAM).map(|_| Fq2::rand(&mut rng)).collect();
+    let pick: Vec<String> = std::env::args().skip(1).collect();
+    let on = |name: &str| pick.is_empty() || pick.iter().any(|p| p == name);
+    if on("RawFq") {
+        run("RawFq", &fq, RawFq::from_fq, RawFq::to_fq, reps);
+    }
+    if on("RawFr") {
+        run("RawFr", &fr, RawFr::from_fr, RawFr::to_fr, reps);
+    }
+    if on("RawFq2") {
+        run("RawFq2", &fq2, RawFq2::from_fq2, RawFq2::to_fq2, reps);
+    }
+    if on("ArkFq") {
+        run("ArkFq", &fq, |x| *x, |x| x, reps);
+    }
+    if on("ArkFr") {
+        run("ArkFr", &fr, |x| *x, |x| x, reps);
+    }
+    if on("ArkFq2") {
+        run("ArkFq2", &fq2, |x| *x, |x| x, reps);
+    }
 }

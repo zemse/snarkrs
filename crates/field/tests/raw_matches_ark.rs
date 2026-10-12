@@ -130,6 +130,26 @@ fn raw_fq2_matches_ark() {
     }
 }
 
+/// Every edge value in every one of the four coefficients of a product: the aarch64
+/// multiply subtracts its Karatsuba terms before reducing, and the signs of `a0 b0 - a1 b1`
+/// and the size of `(a0 + a1)(b0 + b1)` depend on all four.
+#[test]
+fn raw_fq2_mul_every_edge_coefficient() {
+    let e = edge_fq();
+    for a0 in &e {
+        for a1 in &e {
+            let a = Fq2::new(*a0, *a1);
+            let ra = RawFq2::from_fq2(&a);
+            for b0 in &e {
+                for b1 in &e {
+                    let b = Fq2::new(*b0, *b1);
+                    assert_eq!(ra.mul(RawFq2::from_fq2(&b)).to_fq2(), a * b, "{a} * {b}");
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn raw_fr_matches_ark() {
     let mut rng = ark_std::test_rng();

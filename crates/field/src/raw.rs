@@ -271,6 +271,19 @@ mod aarch64;
 #[cfg(target_arch = "aarch64")]
 use aarch64::mont_mul;
 
+#[cfg(target_arch = "aarch64")]
+mod wide;
+
+/// `t / 2^256 mod q`, fully reduced, for any `t < q 2^256`: the low half reduced on its
+/// own leaves at most `q`, the high half is below `q` by the bound on `t`, so their sum is
+/// below `2q` and `add_mod` finishes it.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn fq_reduce(t: [u64; 8]) -> [u64; 4] {
+    let lo = wide::redc_low([t[0], t[1], t[2], t[3]], &FQ_MOD, FQ_N0);
+    add_mod(lo, [t[4], t[5], t[6], t[7]], &FQ_MOD)
+}
+
 // ---------------------------------------------------------------------------
 // The operation surface, as a trait, so curve arithmetic can be written once over a
 // generic base field and instantiated for G1 (RawFq) and G2 (RawFq2), exactly as the
@@ -465,6 +478,40 @@ impl RawFq2 {
     }
 
     /// `(a0 + a1 u)(b0 + b1 u)` with `u^2 = -1`: Karatsuba, three `Fq` products.
+    ///
+    /// On aarch64 the products are taken double width and only the two coefficients are
+    /// reduced, two reductions instead of three. With every input below `q < 2^254`: the
+    /// unreduced sums are below `2q`, so `c1 = (a0 + a1)(b0 + b1) - v0 - v1 = a0 b1 + a1 b0`
+    /// is exact and below `2q^2`; `c0 = v0 - v1` lies in `(-q^2, q^2)` and gets `q 2^256`
+    /// added when negative. Both end below `q 2^256`, which is what `fq_reduce` takes.
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    pub fn mul(self, o: Self) -> Self {
+        let v0 = wide::mul_wide(self.c0.0, o.c0.0);
+        let v1 = wide::mul_wide(self.c1.0, o.c1.0);
+        let s = wide::add_wrap(self.c0.0, self.c1.0);
+        let t = wide::add_wrap(o.c0.0, o.c1.0);
+        let c1 = wide::sub_wide(wide::sub_wide(wide::mul_wide(s, t), v0).0, v1).0;
+        let (mut c0, bw) = wide::sub_wide(v0, v1);
+        let mask = bw.wrapping_neg();
+        let hi = wide::add_wrap(
+            [c0[4], c0[5], c0[6], c0[7]],
+            [
+                FQ_MOD[0] & mask,
+                FQ_MOD[1] & mask,
+                FQ_MOD[2] & mask,
+                FQ_MOD[3] & mask,
+            ],
+        );
+        c0[4..].copy_from_slice(&hi);
+        RawFq2 {
+            c0: RawFq(fq_reduce(c0)),
+            c1: RawFq(fq_reduce(c1)),
+        }
+    }
+
+    /// `(a0 + a1 u)(b0 + b1 u)` with `u^2 = -1`: Karatsuba, three `Fq` products.
+    #[cfg(not(target_arch = "aarch64"))]
     #[inline(always)]
     pub fn mul(self, o: Self) -> Self {
         let v0 = self.c0.mul(o.c0);
@@ -595,6 +642,125 @@ mod tests {
         assert_eq!(RawFq::ONE.to_fq(), Fq::one());
         assert_eq!(RawFq2::ONE.to_fq2(), Fq2::one());
         assert_eq!(RawFq::ONE, <RawFq as RawField>::ONE);
+    }
+
+    /// Limbs at the carry and borrow boundaries of the wide chains, plus random ones.
+    #[cfg(target_arch = "aarch64")]
+    fn wide_operands() -> Vec<[u64; 4]> {
+        use ark_std::rand::RngCore;
+        let x = u64::MAX;
+        let q = FQ_MOD;
+        let mut v = vec![
+            [0, 0, 0, 0],
+            [1, 0, 0, 0],
+            [x, x, x, x],
+            [x, 0, 0, 0],
+            [0, 0, 0, x],
+            [x, x, x, 0],
+            q,
+            [q[0] - 1, q[1], q[2], q[3]],
+            // 2^254 - 1 and 2^255 - 1, around the largest unreduced Karatsuba sum.
+            [x, x, x, (1 << 62) - 1],
+            [x, x, x, (1 << 63) - 1],
+        ];
+        // 2q - 2, the largest unreduced Karatsuba sum, and 2q - 1. Limb 0 of 2q is far
+        // above 2, so neither borrows.
+        let mut q2 = [0u64; 4];
+        let mut c = 0u128;
+        for i in 0..4 {
+            let t = 2 * q[i] as u128 + c;
+            q2[i] = t as u64;
+            c = t >> 64;
+        }
+        for d in [2, 1] {
+            v.push([q2[0] - d, q2[1], q2[2], q2[3]]);
+        }
+        let mut rng = ark_std::test_rng();
+        for _ in 0..300 {
+            v.push(std::array::from_fn(|_| rng.next_u64()));
+        }
+        v
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn mul_wide_and_sub_wide_match_u128() {
+        let ops = wide_operands();
+        for a in &ops {
+            for b in &ops {
+                let mut want = [0u64; 8];
+                for i in 0..4 {
+                    let mut c = 0u128;
+                    for j in 0..4 {
+                        let t = want[i + j] as u128 + a[i] as u128 * b[j] as u128 + c;
+                        want[i + j] = t as u64;
+                        c = t >> 64;
+                    }
+                    want[i + 4] = c as u64;
+                }
+                let got = wide::mul_wide(*a, *b);
+                assert_eq!(got, want, "{a:x?} * {b:x?}");
+
+                let c = wide::mul_wide(*b, *b);
+                let (d, bw) = wide::sub_wide(got, c);
+                let mut back = [0u64; 8];
+                let mut carry = 0u128;
+                for i in 0..8 {
+                    let t = d[i] as u128 + c[i] as u128 + carry;
+                    back[i] = t as u64;
+                    carry = t >> 64;
+                }
+                assert_eq!(back, got);
+                assert_eq!(bw == 1, got.iter().rev().cmp(c.iter().rev()).is_lt());
+            }
+        }
+    }
+
+    /// `fq_reduce(t)` is below `q` and `fq_reduce(t) 2^256 = t mod q`, checked through
+    /// arkworks on plain integers, for `t` up to the documented bound `q 2^256 - 1`.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn fq_reduce_matches_ark() {
+        use ark_ff::{Field, PrimeField};
+        let int = |l: &[u64]| {
+            let b: Vec<u8> = l.iter().flat_map(|w| w.to_le_bytes()).collect();
+            Fq::from_le_bytes_mod_order(&b)
+        };
+        let r = Fq::from(2u64).pow([256]);
+        let q = FQ_MOD;
+        let below = |t: &[u64; 8]| is_reduced(&[t[4], t[5], t[6], t[7]], &q);
+        let mut ts: Vec<[u64; 8]> = vec![
+            [0; 8],
+            [1, 0, 0, 0, 0, 0, 0, 0],
+            [u64::MAX, u64::MAX, u64::MAX, u64::MAX, 0, 0, 0, 0],
+            // q 2^256 - 1
+            [
+                u64::MAX,
+                u64::MAX,
+                u64::MAX,
+                u64::MAX,
+                q[0] - 1,
+                q[1],
+                q[2],
+                q[3],
+            ],
+            [0, 0, 0, 0, q[0] - 1, q[1], q[2], q[3]],
+        ];
+        let ops = wide_operands();
+        for a in &ops {
+            for b in &ops {
+                let t = wide::mul_wide(*a, *b);
+                if below(&t) {
+                    ts.push(t);
+                }
+            }
+        }
+        assert!(ts.len() > 10_000);
+        for t in &ts {
+            let got = fq_reduce(*t);
+            assert!(is_reduced(&got, &q), "{t:x?}");
+            assert_eq!(int(&got) * r, int(t), "{t:x?}");
+        }
     }
 
     #[test]
