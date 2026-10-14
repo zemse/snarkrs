@@ -763,7 +763,7 @@ pub fn set_reduce_tg(tg: u32) {
 /// [`crate::gen::points::MERGE_BODY`].
 #[wasm_bindgen]
 pub fn set_merge_body(level: u32) {
-    crate::gen::points::MERGE_BODY.store(level, std::sync::atomic::Ordering::Relaxed);
+    crate::gen::points::MERGE_BODY.set(level);
 }
 
 /// Restores the reduce kernel's pre-fix per-thread body at level 1, or 0 for the one that
@@ -772,7 +772,7 @@ pub fn set_merge_body(level: u32) {
 /// that is still true. Before `create_prover`, like `set_merge_body`.
 #[wasm_bindgen]
 pub fn set_reduce_body(level: u32) {
-    crate::gen::points::REDUCE_BODY.store(level, std::sync::atomic::Ordering::Relaxed);
+    crate::gen::points::REDUCE_BODY.set(level);
 }
 
 /// Restores the two-call-site `pt_mul_small_*`, or 0 for the folded spelling that ships.
@@ -780,7 +780,7 @@ pub fn set_reduce_body(level: u32) {
 /// `set_merge_body`.
 #[wasm_bindgen]
 pub fn set_mul_small_body(level: u32) {
-    crate::gen::points::MUL_SMALL_BODY.store(level, std::sync::atomic::Ordering::Relaxed);
+    crate::gen::points::MUL_SMALL_BODY.set(level);
 }
 
 /// Stops a point MSM after the nth kernel, or 0 to run all five: 1 clear, 2 segmented,

@@ -10,10 +10,7 @@ fn main() {
         _ => snarkrs_wgpu::gen::points::G2,
     };
     if let Some(n) = std::env::args().nth(2).and_then(|s| s.parse().ok()) {
-        // Run the environment seed first, so the argument is what wins rather than what
-        // `G16_WGPU_POINT_BODY` happens to be in this shell.
-        snarkrs_wgpu::gen::points::point_body();
-        snarkrs_wgpu::gen::points::POINT_BODY.store(n, std::sync::atomic::Ordering::Relaxed);
+        snarkrs_wgpu::gen::points::POINT_BODY.set(n);
     }
     print!(
         "{}",

@@ -590,6 +590,60 @@ struct {pt} {{ x: {fty}, y: {fty}, zz: {fty}, zzz: {fty} }}
     )
 }
 
+/// A generation-time bisection gate: a level the shader generators read, seeded once from an
+/// environment variable on native and set directly by a browser, which has none.
+///
+/// [`GenKnob::set`] wins over the environment whichever order they happen in, so a caller that
+/// wants its own level just sets it. [`GenKnob::get`] panics on a level above `max`, so a bad
+/// level fails the next generation rather than reading as accepted.
+pub struct GenKnob {
+    cell: std::sync::atomic::AtomicU32,
+    seed: std::sync::OnceLock<()>,
+    name: &'static str,
+    env: &'static str,
+    max: u32,
+}
+
+impl GenKnob {
+    const fn new(name: &'static str, env: &'static str, default: u32, max: u32) -> Self {
+        Self {
+            cell: std::sync::atomic::AtomicU32::new(default),
+            seed: std::sync::OnceLock::new(),
+            name,
+            env,
+            max,
+        }
+    }
+
+    /// Replaces the level, and keeps the environment from replacing it afterwards.
+    pub fn set(&self, level: u32) {
+        self.seed.get_or_init(|| ());
+        self.cell.store(level, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The level, taking it from the environment variable first if nothing has set it.
+    ///
+    /// # Panics
+    ///
+    /// On a level above the knob's largest.
+    pub fn get(&self) -> u32 {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.seed.get_or_init(|| {
+            if let Some(n) = std::env::var(self.env).ok().and_then(|v| v.parse().ok()) {
+                self.cell.store(n, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        let level = self.cell.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            level <= self.max,
+            "{} is {level}; the largest level is {}",
+            self.name,
+            self.max
+        );
+        level
+    }
+}
+
 /// Which spelling of the two heavy point routines to emit. **2, the split register file,
 /// ships.**
 ///
@@ -665,40 +719,19 @@ struct {pt} {{ x: {fty}, y: {fty}, zz: {fty}, zzz: {fty} }}
 ///
 /// 0 and 1 stay reachable for that same reason, and because they are the only way to ask a
 /// future compiler whether either cliff is still there.
-pub static POINT_BODY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(2);
+pub static POINT_BODY: GenKnob = GenKnob::new("POINT_BODY", "G16_WGPU_POINT_BODY", 2, 2);
 
 /// [`POINT_BODY`]'s level, seeding it from `G16_WGPU_POINT_BODY` on the first call.
 ///
-/// The seed is a call and not a side effect of generating, so a caller that wants its own
-/// level runs this first and stores afterwards. It used to run inside `pt_madd` on the way
-/// through, which put it after anything a caller stored: `dump_points_wgsl` took a level from
-/// its command line, stored it, and had the environment overwrite it with no message.
+/// `G16_WGPU_POINT_BODY=0` or `=1` runs the whole native suite against another spelling without
+/// a second copy of any test, the same way `G16_WGPU_LIMITS` does for the limits profile.
+/// A browser has no environment and calls [`GenKnob::set`].
 ///
 /// # Panics
 ///
 /// On a level above 2, which used to mean "microcoded, not split" and so read as accepted.
 pub fn point_body() -> u32 {
-    // `G16_WGPU_POINT_BODY=0` or `=1` runs the whole native suite against another spelling without
-    // a second copy of any test, the same way `G16_WGPU_LIMITS` does for the limits profile.
-    // A browser has no environment and sets the atomic directly.
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        static SEED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-        SEED.get_or_init(|| {
-            if let Some(n) = std::env::var("G16_WGPU_POINT_BODY")
-                .ok()
-                .and_then(|v| v.parse().ok())
-            {
-                POINT_BODY.store(n, std::sync::atomic::Ordering::Relaxed);
-            }
-        });
-    }
-    let level = POINT_BODY.load(std::sync::atomic::Ordering::Relaxed);
-    assert!(
-        level <= 2,
-        "POINT_BODY is {level}; the spellings are 0, 1 and 2"
-    );
-    level
+    POINT_BODY.get()
 }
 
 fn microcoded() -> bool {
@@ -1094,7 +1127,7 @@ fn pt_dbl_{sfx}(p: {pt}) -> {pt} {{
     // `MUL_SMALL_BODY`
     // keeps the failing spelling reachable, because a workaround for a compiler nobody can
     // inspect should not also be the only record of what was tried.
-    if MUL_SMALL_BODY.load(std::sync::atomic::Ordering::Relaxed) == 1 {
+    if MUL_SMALL_BODY.get() == 1 {
         let _ = write!(
             s,
             "
@@ -1138,8 +1171,10 @@ fn pt_mul_small_{sfx}(p: {pt}, k: u32) -> {pt} {{
 
 /// Restores `pt_mul_small_*`'s two-call-site spelling, the one that loses an iPhone 15
 /// Pro's device; 0 is the folded single-call-site form that ships. See the comment above
-/// the function body. A bisection gate, kept for `MERGE_BODY`'s reason.
-pub static MUL_SMALL_BODY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// the function body. A bisection gate, kept for `MERGE_BODY`'s reason. Native runs seed it
+/// from `G16_WGPU_MUL_SMALL_BODY`.
+pub static MUL_SMALL_BODY: GenKnob =
+    GenKnob::new("MUL_SMALL_BODY", "G16_WGPU_MUL_SMALL_BODY", 0, 1);
 
 /// A limb list as a WGSL constructor of `ty`, for a module-scope `const`. That is the one
 /// place an array value constructor is allowed: WebKit emits a module-scope one with
@@ -1563,12 +1598,14 @@ fn {entry}(@builtin(global_invocation_id) gid: vec3<u32>) {{
 /// At generation time rather than behind a uniform, because the question is what Metal is
 /// asked to compile, and a branch the compiler can see is a different experiment from code
 /// that is not there.
-pub static MERGE_BODY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+///
+/// Native runs seed it from `G16_WGPU_MERGE_BODY`.
+pub static MERGE_BODY: GenKnob = GenKnob::new("MERGE_BODY", "G16_WGPU_MERGE_BODY", 0, 5);
 
 fn entry_merge(c: Curve, wg: u32) -> String {
     let sfx = c.suffix;
     let entry = c.entry_merge();
-    let level = MERGE_BODY.load(std::sync::atomic::Ordering::Relaxed);
+    let level = MERGE_BODY.get();
     if level == 1 {
         return format!(
             "\n@compute @workgroup_size({wg})\nfn {entry}(@builtin(global_invocation_id) gid: vec3<u32>) {{\n    return;\n}}\n"
@@ -1723,8 +1760,8 @@ fn {entry}(@builtin(global_invocation_id) gid: vec3<u32>) {{
 /// way left to ask a future Safari whether the compiler bug is still there.
 ///
 /// At generation time rather than behind a uniform, also for `MERGE_BODY`'s reason: the
-/// question is what Metal is asked to compile.
-pub static REDUCE_BODY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// question is what Metal is asked to compile. Native runs seed it from `G16_WGPU_REDUCE_BODY`.
+pub static REDUCE_BODY: GenKnob = GenKnob::new("REDUCE_BODY", "G16_WGPU_REDUCE_BODY", 0, 1);
 
 /// The reduce, on the XYZZ shortcuts (`constant` false) or on the complete formulas over
 /// projective points for a constant-work plan (`constant` true, `msm_reduce_constant_*`).
@@ -1756,11 +1793,7 @@ fn entry_reduce(c: Curve, tg: u32, constant: bool) -> String {
             c.workgroup_bytes(tg),
         )
     };
-    let level = if constant {
-        0
-    } else {
-        REDUCE_BODY.load(std::sync::atomic::Ordering::Relaxed)
-    };
+    let level = if constant { 0 } else { REDUCE_BODY.get() };
     let mine = if level != 1 {
         format!(
             "    // One point-operation call site for everything this thread computes: even
