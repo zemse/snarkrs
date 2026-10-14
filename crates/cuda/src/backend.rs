@@ -412,10 +412,11 @@ impl PreparedCircuit for CudaCircuit {
     /// out, as the trait default does, because [`Self::msms`] accepts one and so it reaches
     /// here whenever stages 0 to 4 ran elsewhere.
     fn h_to_host(&self, h: &HPoly) -> Option<Vec<Fr>> {
-        if let Some(v) = h.to_host() {
-            return Some(v.to_vec());
+        match h.require_handle::<HHandle>(TAG) {
+            Ok(Some(handle)) => handle.to_host().ok(),
+            Ok(None) => h.to_host().map(<[Fr]>::to_vec),
+            Err(_) => None,
         }
-        h.device_handle::<HHandle>(TAG)?.to_host().ok()
     }
 }
 

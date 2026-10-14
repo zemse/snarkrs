@@ -800,9 +800,7 @@ impl WgpuCircuit {
                 // A `compute_h` from another backend. Not the proving path, and the only
                 // thing it is really for is letting a test hold stages 5 to 9 to the CPU's
                 // stages 0 to 4 without the device's own H in the way.
-                let host_h = host_h.ok_or_else(|| {
-                    bad("compute_h output is neither a wgpu handle nor a host vector")
-                })?;
+                let host_h = host_h.expect("require_handle returns None only for a host vector");
                 (
                     None,
                     vec![
@@ -859,11 +857,11 @@ impl WgpuCircuit {
     /// somebody else's pointer. A host `HPoly` is copied straight out: [`Self::msms_async`]
     /// accepts one, so it reaches here whenever stages 0 to 4 ran elsewhere.
     pub async fn h_to_host_async(&self, h: &HPoly) -> Option<Vec<Fr>> {
-        if let Some(v) = h.to_host() {
-            return Some(v.to_vec());
+        match h.require_handle::<WgpuHandle>(crate::stages::TAG) {
+            Ok(Some(handle)) => handle.to_host(&self.device).await.ok(),
+            Ok(None) => h.to_host().map(<[Fr]>::to_vec),
+            Err(_) => None,
         }
-        let handle = h.device_handle::<WgpuHandle>(crate::stages::TAG)?;
-        handle.to_host(&self.device).await.ok()
     }
 
     /// Stages 5 to 9, one MSM at a time, for bisecting a device loss. Not a proving path.
@@ -885,7 +883,7 @@ impl WgpuCircuit {
     ) -> Result<u64, ProveError> {
         self.check_witness(witness)?;
         let handle = h
-            .device_handle::<WgpuHandle>(crate::stages::TAG)
+            .require_handle::<WgpuHandle>(crate::stages::TAG)?
             .ok_or_else(|| bad("msm_probe needs an H that is still on the device"))?;
 
         let private_from = self.pk.n_public + 1;

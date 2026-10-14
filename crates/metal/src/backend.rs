@@ -390,9 +390,9 @@ impl MetalCircuit {
                     .with_lent(handle.lend_entries()))
             }
             None => {
-                let host = h.to_host().ok_or_else(|| {
-                    bad("compute_h output is neither a metal handle nor a host vector")
-                })?;
+                let HPoly::Host(host) = h else {
+                    unreachable!("require_handle returns None only for a host vector")
+                };
                 self.msm.upload_scalars_with(host, self.work)
             }
         }
@@ -522,9 +522,10 @@ impl PreparedCircuit for MetalCircuit {
     /// `snarkrs trace` on this backend would print the H rows empty. Debugging seam only:
     /// it costs a full-domain readback, which is the round trip [`HPoly`] exists to avoid.
     fn h_to_host(&self, h: &HPoly) -> Option<Vec<Fr>> {
-        match h.device_handle::<HHandle>(crate::stages::TAG) {
-            Some(handle) => handle.to_host(),
-            None => h.to_host().map(<[Fr]>::to_vec),
+        match h.require_handle::<HHandle>(crate::stages::TAG) {
+            Ok(Some(handle)) => handle.to_host(),
+            Ok(None) => h.to_host().map(<[Fr]>::to_vec),
+            Err(_) => None,
         }
     }
 
