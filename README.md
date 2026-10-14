@@ -123,7 +123,8 @@ snarkrs groth16 prove circuit_final.zkey witness.wtns proof.json public.json \
 snarkrs groth16 verify verification_key.json public.json proof.json
 
 snarkrs bench --artifacts <DIR> [--variant NAME]... [--reps N] \
-        [--backend cpu|wgpu|metal|cuda] [--mode cold|warm|both] [--csv FILE]
+        [--backend cpu|wgpu|metal|cuda] [--mode cold-inprocess|cold-process|warm|both] \
+        [--csv FILE]
 ```
 
 The short aliases work too (`ptn`, `ptc`, `pt2`, `g16s`, `zkc`, `zkev`, `g16p`, `g16v`, ...),
