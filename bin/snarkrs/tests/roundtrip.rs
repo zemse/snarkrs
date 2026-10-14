@@ -8,6 +8,13 @@
 //! Everything runs against the checked-in artifacts and skips with a message when they
 //! are absent, so a fresh clone without `gen-artifacts.sh` does not report false green.
 
+mod resources {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-support/resources.rs"
+    ));
+}
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -104,7 +111,7 @@ fn prove_with(v: &Variant, out: &Path, backend: &str, extra: &[&str]) -> (PathBu
 fn each(test: &str, f: impl Fn(&Variant, &Path)) {
     let found = variants();
     if found.is_empty() {
-        eprintln!("SKIPPED {test}: no artifacts under bench/artifacts");
+        resources::skip(format_args!("{test}: no artifacts under bench/artifacts"));
         return;
     }
     let out = scratch(test);
@@ -168,7 +175,7 @@ fn backends() -> Vec<&'static str> {
 #[test]
 fn snarkjs_accepts_our_proof() {
     if Command::new("snarkjs").arg("--version").output().is_err() {
-        eprintln!("SKIPPED snarkjs_accepts_our_proof: snarkjs is not on PATH");
+        resources::skip("snarkjs_accepts_our_proof: snarkjs is not on PATH");
         return;
     }
     each("snarkjs", |v, out| {
@@ -197,7 +204,7 @@ fn snarkjs_accepts_our_proof() {
 #[test]
 fn snarkjs_accepts_a_constant_work_proof() {
     if Command::new("snarkjs").arg("--version").output().is_err() {
-        eprintln!("SKIPPED snarkjs_accepts_a_constant_work_proof: snarkjs is not on PATH");
+        resources::skip("snarkjs_accepts_a_constant_work_proof: snarkjs is not on PATH");
         return;
     }
     let found = variants();
@@ -206,7 +213,7 @@ fn snarkjs_accepts_a_constant_work_proof() {
         .find(|v| v.name == "keccak256")
         .or(found.first())
     else {
-        eprintln!("SKIPPED snarkjs_accepts_a_constant_work_proof: no artifacts");
+        resources::skip("snarkjs_accepts_a_constant_work_proof: no artifacts");
         return;
     };
     let out = scratch("snarkjs-constant-work");
@@ -271,7 +278,7 @@ fn verify_rejects_a_tampered_public_input() {
 fn bench_writes_a_verified_csv() {
     let found = variants();
     let Some(v) = found.first() else {
-        eprintln!("SKIPPED bench_writes_a_verified_csv: no artifacts");
+        resources::skip("bench_writes_a_verified_csv: no artifacts");
         return;
     };
     let out = scratch("bench");
@@ -388,7 +395,7 @@ fn bench_rejects_an_unknown_variant() {
 fn metal_without_the_feature_fails_with_a_clear_message() {
     let found = variants();
     let Some(v) = found.first() else {
-        eprintln!("SKIPPED metal_without_the_feature: no artifacts");
+        resources::skip("metal_without_the_feature: no artifacts");
         return;
     };
     let out = scratch("metal");

@@ -6,6 +6,13 @@
 //! the real binary, because the exit status, the message and the absence of a proof.json are
 //! all part of the contract.
 
+mod resources {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-support/resources.rs"
+    ));
+}
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -57,7 +64,7 @@ fn said(o: &Output) -> String {
 #[test]
 fn a_matching_vkey_proves_and_a_foreign_one_is_refused_before_proving() {
     let (Some(tiny), Some(other)) = (artifact("tiny_mul"), artifact("js_1x1_d8")) else {
-        eprintln!("SKIPPED prove_vkey: needs tiny_mul and js_1x1_d8");
+        resources::skip("prove_vkey: needs tiny_mul and js_1x1_d8");
         return;
     };
     let out = scratch("match");
@@ -89,7 +96,7 @@ fn a_matching_vkey_proves_and_a_foreign_one_is_refused_before_proving() {
 #[test]
 fn a_key_that_calls_every_wire_public_is_refused_without_a_vkey() {
     let Some(tiny) = artifact("tiny_mul") else {
-        eprintln!("SKIPPED all_public: no tiny_mul");
+        resources::skip("all_public: no tiny_mul");
         return;
     };
     let out = scratch("all-public");
@@ -163,7 +170,7 @@ fn join(head: &[u8], sections: &[(u32, Vec<u8>)]) -> Vec<u8> {
 #[test]
 fn constant_work_proves_on_every_enabled_backend() {
     let Some(tiny) = artifact("tiny_mul") else {
-        eprintln!("SKIPPED constant_work: no tiny_mul");
+        resources::skip("constant_work: no tiny_mul");
         return;
     };
     let out = scratch("constant-work");

@@ -12,6 +12,13 @@
 //! without it. The pinned-RNG test also needs the package directory, found by resolving
 //! the binary's symlink to `snarkjs/build/cli.cjs`.
 
+mod resources {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-support/resources.rs"
+    ));
+}
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -35,11 +42,11 @@ fn os_bytes(seed: u8) -> [u8; 64] {
 fn snarkjs_bin() -> Option<String> {
     let bin = std::env::var("SNARKJS").unwrap_or_else(|_| "snarkjs".to_owned());
     let Ok(out) = Command::new(&bin).arg("--help").output() else {
-        eprintln!("SKIPPED: snarkjs is not installed");
+        resources::skip("snarkjs is not installed");
         return None;
     };
     if !String::from_utf8_lossy(&out.stdout).contains("snarkjs@0.7.6") {
-        eprintln!("SKIPPED: {bin} is not snarkjs 0.7.6; set SNARKJS");
+        resources::skip(format_args!("{bin} is not snarkjs 0.7.6; set SNARKJS"));
         return None;
     }
     Some(bin)
@@ -188,7 +195,7 @@ fn contribute_and_import_are_byte_identical_to_snarkjs() {
     assert_eq!(resp.power, POWER);
 
     match snarkjs_pkg(&bin) {
-        None => eprintln!("snarkjs package directory not found: response bytes not compared"),
+        None => resources::skip("snarkjs package directory not found: response bytes not compared"),
         Some(pkg) => {
             let r1_theirs = dir.join("r1.snarkjs.response");
             let script = dir.join("contribute.mjs");

@@ -4,6 +4,13 @@
 //! Everything before this unit checked a stage. This file checks the thing the project is
 //! for. Native only, for the reason in `tests/device.rs`.
 
+mod resources {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-support/resources.rs"
+    ));
+}
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
@@ -165,7 +172,7 @@ fn artifacts() -> Vec<Artifact> {
 fn for_each_artifact(test: &str, f: impl Fn(&Artifact)) {
     let found = artifacts();
     if found.is_empty() {
-        eprintln!("SKIPPED {test}: no artifacts under bench/artifacts");
+        resources::skip(format_args!("{test}: no artifacts under bench/artifacts"));
         return;
     }
     let mut ran = 0usize;
@@ -389,8 +396,8 @@ fn a_submission_cut_short_at_every_dispatch_is_retried_exactly() {
         .filter(|a| picked.contains(&a.name.as_str()))
         .collect();
     if found.is_empty() {
-        eprintln!(
-            "SKIPPED a_submission_cut_short_at_every_dispatch_is_retried_exactly: no artifacts"
+        resources::skip(
+            "a_submission_cut_short_at_every_dispatch_is_retried_exactly: no artifacts",
         );
         return;
     }
@@ -589,7 +596,7 @@ fn the_gpu_section_of_a_proof_is_behind_the_device_guard() {
 
     let found = artifacts();
     let Some(a) = found.iter().min_by_key(|a| a.witness().len()) else {
-        eprintln!("SKIPPED the_gpu_section_of_a_proof_is_behind_the_device_guard: no artifacts");
+        resources::skip("the_gpu_section_of_a_proof_is_behind_the_device_guard: no artifacts");
         return;
     };
     eprintln!(
@@ -938,9 +945,9 @@ fn a_whole_proof_submits_once_for_h_then_per_msm_slab_and_the_readback_is_bounde
 
     let found = artifacts();
     if found.is_empty() {
-        eprintln!(
-            "SKIPPED a_whole_proof_submits_once_for_h_then_per_msm_slab: no artifacts under \
-             bench/artifacts"
+        resources::skip(
+            "a_whole_proof_submits_once_for_h_then_per_msm_slab: no artifacts under \
+             bench/artifacts",
         );
         return;
     }
@@ -1586,7 +1593,7 @@ fn the_msm_stage_timing_is_not_charged_for_another_proofs_gpu_section() {
 
     let found = artifacts();
     let Some(a) = found.iter().min_by_key(|a| a.witness().len()) else {
-        eprintln!("SKIPPED the_msm_stage_timing_is_not_charged_for_another_proofs_gpu_section");
+        resources::skip("the_msm_stage_timing_is_not_charged_for_another_proofs_gpu_section");
         return;
     };
     eprintln!(
@@ -1656,7 +1663,7 @@ fn a_key_whose_sections_disagree_with_its_header_is_refused_at_prepare() {
     let _one_at_a_time = exclusive();
     let found = artifacts();
     let Some(a) = found.iter().min_by_key(|a| a.witness().len()) else {
-        eprintln!("SKIPPED a_key_whose_sections_disagree_with_its_header_is_refused_at_prepare");
+        resources::skip("a_key_whose_sections_disagree_with_its_header_is_refused_at_prepare");
         return;
     };
     eprintln!(
@@ -1727,7 +1734,7 @@ fn an_off_curve_base_is_no_worse_on_the_device_than_on_the_cpu() {
     let _one_at_a_time = exclusive();
     let found = artifacts();
     let Some(a) = found.iter().min_by_key(|a| a.witness().len()) else {
-        eprintln!("SKIPPED an_off_curve_base_is_no_worse_on_the_device_than_on_the_cpu");
+        resources::skip("an_off_curve_base_is_no_worse_on_the_device_than_on_the_cpu");
         return;
     };
     eprintln!(

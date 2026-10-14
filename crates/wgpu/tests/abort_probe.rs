@@ -19,6 +19,13 @@
 //! verifies it. One line per iteration says which of those held. `ARTIFACT` picks the key,
 //! default `railgun-13x01`, the one the CLI runs used.
 
+mod resources {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-support/resources.rs"
+    ));
+}
+
 use std::path::Path;
 use std::sync::Arc;
 
@@ -47,7 +54,9 @@ fn stages_0_to_4_retried_after_a_real_abort_are_exact() {
         .join("../../bench/artifacts")
         .join(&name);
     if !dir.join("circuit.zkey").is_file() {
-        eprintln!("SKIPPED stages_0_to_4_retried_after_a_real_abort_are_exact: no {name}");
+        resources::skip(format_args!(
+            "stages_0_to_4_retried_after_a_real_abort_are_exact: no {name}"
+        ));
         return;
     }
     let witness = Witness::load(&dir.join("circuit.wtns"))

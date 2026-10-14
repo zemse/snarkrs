@@ -33,6 +33,13 @@
 
 #![cfg(feature = "cuda")]
 
+mod resources {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-support/resources.rs"
+    ));
+}
+
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -346,7 +353,9 @@ static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 fn for_each(test: &str, f: impl Fn(&World, &Fixture)) {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(w) = world() else {
-        eprintln!("SKIPPED {test}");
+        resources::skip(format_args!(
+            "{test}: no usable device or no artifacts, see the line above"
+        ));
         return;
     };
     for fx in &w.fixtures {
@@ -361,7 +370,7 @@ fn on_device(test: &str, f: impl Fn(&Cuda)) {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     match Cuda::new(0) {
         Ok(cuda) => f(&cuda),
-        Err(e) => eprintln!("SKIPPED {test}, no usable device: {e}"),
+        Err(e) => resources::skip(format_args!("{test}, no usable device: {e}")),
     }
 }
 
@@ -1087,7 +1096,9 @@ fn every_domain_size_agrees_with_the_cpu() {
     let backend = match CudaBackend::new() {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("SKIPPED every_domain_size_agrees_with_the_cpu, no usable device: {e}");
+            resources::skip(format_args!(
+                "every_domain_size_agrees_with_the_cpu, no usable device: {e}"
+            ));
             return;
         }
     };

@@ -34,6 +34,13 @@
 //! Everything runs against the checked-in artifacts and skips loudly when they are
 //! absent, so a fresh clone without `gen-artifacts.sh` cannot report false green.
 
+mod resources {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-support/resources.rs"
+    ));
+}
+
 use std::path::{Path, PathBuf};
 
 use num_bigint::BigUint;
@@ -92,7 +99,7 @@ fn load(name: &str) -> Option<Fixture> {
         .iter()
         .all(|f| dir.join(f).is_file());
     if !complete {
-        eprintln!("SKIPPED {name}: no artifacts under {}", dir.display());
+        resources::skip(format_args!("{name}: no artifacts under {}", dir.display()));
         return None;
     }
     let pk = ProvingKey::load(&dir.join("circuit.zkey")).unwrap();
@@ -112,7 +119,7 @@ fn load(name: &str) -> Option<Fixture> {
 fn each(test: &str, f: impl Fn(&Fixture)) {
     let found: Vec<Fixture> = VARIANTS.iter().filter_map(|n| load(n)).collect();
     if found.is_empty() {
-        eprintln!("SKIPPED {test}: no artifacts at all");
+        resources::skip(format_args!("{test}: no artifacts at all"));
         return;
     }
     for fx in &found {
@@ -626,7 +633,9 @@ fn wrong_public_inputs_are_rejected() {
 fn a_proof_for_one_statement_does_not_verify_against_another() {
     let (a_name, b_name) = SAME_ARITY_SIBLING;
     let (Some(x), Some(y)) = (load(a_name), load(b_name)) else {
-        eprintln!("SKIPPED a_proof_for_one_statement: need both {a_name} and {b_name}");
+        resources::skip(format_args!(
+            "a_proof_for_one_statement: need both {a_name} and {b_name}"
+        ));
         return;
     };
     assert_eq!(

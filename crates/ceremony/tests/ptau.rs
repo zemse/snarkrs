@@ -13,6 +13,13 @@
 //! test is not optional: `g2_sp` is the single field in a record that is recomputed rather
 //! than read, so nothing else here would notice it being derived off the wrong challenge.
 
+mod resources {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-support/resources.rs"
+    ));
+}
+
 use std::path::{Path, PathBuf};
 
 use snarkrs_ceremony::ptau::*;
@@ -93,7 +100,12 @@ fn present() -> Vec<(&'static Expected, PathBuf)> {
     FILES
         .iter()
         .map(|e| (e, ptau_dir().join(e.name)))
-        .filter(|(_, p)| p.is_file())
+        .filter(|(_, p)| {
+            p.is_file() || {
+                resources::skip(format_args!("missing {}", p.display()));
+                false
+            }
+        })
         .collect()
 }
 
@@ -155,6 +167,7 @@ fn every_shipped_file_is_complete_and_prepared() {
 fn section_table_matches_the_formulas() {
     let path = ptau_dir().join("local_13.ptau");
     if !path.is_file() {
+        resources::skip(format_args!("missing {}", path.display()));
         return;
     }
     let file = Ptau::open(&path).expect("local_13 opens");
@@ -201,6 +214,7 @@ fn section_table_matches_the_formulas() {
 fn point_sections_start_at_the_generator() {
     let path = ptau_dir().join("local_13.ptau");
     if !path.is_file() {
+        resources::skip(format_args!("missing {}", path.display()));
         return;
     }
     let file = Ptau::open(&path).expect("local_13 opens");
@@ -223,6 +237,7 @@ fn point_sections_start_at_the_generator() {
 fn section_12_carries_one_block_more_than_the_rest() {
     let path = ptau_dir().join("local_13.ptau");
     if !path.is_file() {
+        resources::skip(format_args!("missing {}", path.display()));
         return;
     }
     let file = Ptau::open(&path).expect("local_13 opens");
@@ -243,6 +258,7 @@ fn section_12_carries_one_block_more_than_the_rest() {
 fn reads_past_a_section_are_refused() {
     let path = ptau_dir().join("local_13.ptau");
     if !path.is_file() {
+        resources::skip(format_args!("missing {}", path.display()));
         return;
     }
     let file = Ptau::open(&path).expect("local_13 opens");
@@ -271,6 +287,7 @@ fn last_challenge_walks_the_whole_chain() {
     for (name, want) in cases {
         let path = ptau_dir().join(name);
         if !path.is_file() {
+            resources::skip(format_args!("missing {}", path.display()));
             continue;
         }
         let file = Ptau::open(&path).expect("opens");
@@ -293,6 +310,8 @@ fn contribution_summaries_carry_names_and_kinds() {
             snarkrs_ceremony::ContributionKind::Contribute
         );
         assert_eq!(info.summaries[0].param_bytes, 7);
+    } else {
+        resources::skip(format_args!("missing {}", path.display()));
     }
 
     let path = ptau_dir().join("ppot_0080_15.ptau");
@@ -309,6 +328,8 @@ fn contribution_summaries_carry_names_and_kinds() {
         assert_eq!(last.kind, snarkrs_ceremony::ContributionKind::Beacon);
         assert_eq!(last.param_bytes, 100);
         assert_eq!(last.name, None);
+    } else {
+        resources::skip(format_args!("missing {}", path.display()));
     }
 }
 
@@ -319,6 +340,7 @@ fn contribution_summaries_carry_names_and_kinds() {
 fn a_truncated_download_is_reported_not_rejected() {
     let path = ptau_dir().join("local_13.ptau");
     if !path.is_file() {
+        resources::skip(format_args!("missing {}", path.display()));
         return;
     }
     let full = std::fs::read(&path).expect("read local_13");
@@ -369,6 +391,7 @@ fn a_truncated_download_is_reported_not_rejected() {
 fn pick_names_the_smallest_sufficient_file() {
     let dir = ptau_dir();
     if !dir.is_dir() {
+        resources::skip(format_args!("missing {}", dir.display()));
         return;
     }
     let candidates = scan_dir(&dir).expect("scan");

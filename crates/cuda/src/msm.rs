@@ -1922,6 +1922,13 @@ const _: () = {
 
 #[cfg(test)]
 mod tests {
+    mod resources {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test-support/resources.rs"
+        ));
+    }
+
     use super::*;
     use snarkrs_gpu_layout::{FQ_MODULUS, FQ_N0};
 
@@ -2978,7 +2985,7 @@ mod tests {
                 Some(c)
             }
             Err(e) => {
-                eprintln!("SKIPPING cuda MSM test, no usable device: {e}");
+                resources::skip(format_args!("cuda MSM test, no usable device: {e}"));
                 None
             }
         }

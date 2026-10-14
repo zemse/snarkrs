@@ -5,6 +5,13 @@
 //! ceremony and proof driven by the lines snarkjs' own README uses. Phase 1 needs nothing
 //! on disk; phase 2 needs `tiny_mul` from `bench/artifacts` and skips loudly without it.
 
+mod resources {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-support/resources.rs"
+    ));
+}
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -164,7 +171,7 @@ fn a_ceremony_and_a_proof_run_on_snarkjs_lines() {
     assert!(out.contains("prepared       true"), "{out}");
 
     let Some(tiny) = tiny_mul() else {
-        eprintln!("SKIPPED phase 2 of a_ceremony_and_a_proof_run_on_snarkjs_lines: no tiny_mul");
+        resources::skip("phase 2 of a_ceremony_and_a_proof_run_on_snarkjs_lines: no tiny_mul");
         std::fs::remove_dir_all(&dir).ok();
         return;
     };
@@ -238,11 +245,11 @@ fn a_ceremony_and_a_proof_run_on_snarkjs_lines() {
 fn snarkjs_bin() -> Option<String> {
     let bin = std::env::var("SNARKJS").unwrap_or_else(|_| "snarkjs".to_owned());
     let Ok(out) = Command::new(&bin).arg("--help").output() else {
-        eprintln!("SKIPPED: snarkjs is not installed");
+        resources::skip("snarkjs is not installed");
         return None;
     };
     if !String::from_utf8_lossy(&out.stdout).contains("snarkjs@0.7.6") {
-        eprintln!("SKIPPED: {bin} is not snarkjs 0.7.6; set SNARKJS");
+        resources::skip(format_args!("{bin} is not snarkjs 0.7.6; set SNARKJS"));
         return None;
     }
     Some(bin)
@@ -405,7 +412,7 @@ fn bellman_and_solidity_match_snarkjs() {
         return;
     };
     let Some(tiny) = tiny_mul() else {
-        eprintln!("SKIPPED bellman_and_solidity_match_snarkjs: no tiny_mul");
+        resources::skip("bellman_and_solidity_match_snarkjs: no tiny_mul");
         return;
     };
     let dir = scratch("bellman");

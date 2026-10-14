@@ -5,6 +5,13 @@
 //! The byte-for-byte check over every artifact's wasm is `snarkrs-witness`'s own test; this
 //! one is about what a script sees: exit codes, stdout, stderr, and which files appear.
 
+mod resources {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-support/resources.rs"
+    ));
+}
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
@@ -63,11 +70,11 @@ fn expect(o: &Output, code: i32, line: &str) {
 fn snarkjs_bin() -> Option<String> {
     let bin = std::env::var("SNARKJS").unwrap_or_else(|_| "snarkjs".to_owned());
     let Ok(o) = Command::new(&bin).arg("--help").output() else {
-        eprintln!("SKIPPED: snarkjs is not installed");
+        resources::skip("snarkjs is not installed");
         return None;
     };
     if !String::from_utf8_lossy(&o.stdout).contains("snarkjs@0.7.6") {
-        eprintln!("SKIPPED: {bin} is not snarkjs 0.7.6; set SNARKJS");
+        resources::skip(format_args!("{bin} is not snarkjs 0.7.6; set SNARKJS"));
         return None;
     }
     Some(bin)
@@ -126,7 +133,7 @@ fn tiny_mul() -> Option<PathBuf> {
     .iter()
     .all(|f| dir.join(f).is_file());
     if !ok {
-        eprintln!("SKIPPED: no bench/artifacts/tiny_mul");
+        resources::skip("no bench/artifacts/tiny_mul");
     }
     ok.then_some(dir)
 }
@@ -156,7 +163,7 @@ component main {public [a]} = T();
     match o {
         Ok(o) if o.status.success() => Some(dir.join("t_js/t.wasm")),
         _ => {
-            eprintln!("SKIPPED: circom is not installed or failed");
+            resources::skip("circom is not installed or failed");
             None
         }
     }

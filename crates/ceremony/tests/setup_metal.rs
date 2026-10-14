@@ -41,6 +41,13 @@
 //! several GB of resident ptau on one machine. `metal-profile/setup-metal-timings.md` holds
 //! the numbers taken standalone.
 
+mod resources {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-support/resources.rs"
+    ));
+}
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -160,21 +167,21 @@ fn has_metal(bin: &Path) -> bool {
 /// and the four production cases together would leave 1.6 GB in the temp directory.
 fn compare(cases: &[Case], builds: &Path, label: &str) -> usize {
     let Some(bin) = g16_bin() else {
-        eprintln!("skipping: no `snarkrs` binary; run `cargo build --release --features metal`");
+        resources::skip("no `snarkrs` binary; run `cargo build --release --features metal`");
         return 0;
     };
     if !has_metal(&bin) {
-        eprintln!(
-            "skipping: {} was built without the `metal` feature",
+        resources::skip(format_args!(
+            "{} was built without the `metal` feature",
             bin.display()
-        );
+        ));
         return 0;
     }
     let dir = tmp_dir(label);
     let mut ran = 0;
     for case in cases {
         let Some((r1cs, ptau)) = inputs(case, builds) else {
-            eprintln!("skipping {}: artifact missing", case.dir);
+            resources::skip(format_args!("{}: artifact missing", case.dir));
             continue;
         };
         let cpu = dir.join(format!("{}-cpu.zkey", case.dir));

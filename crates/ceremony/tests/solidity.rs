@@ -11,6 +11,13 @@
 //! Skips with a message when `solc`, `anvil`, `cast` or the artifacts are absent.
 //! `SNARKJS` names the snarkjs binary, as in `phase2.rs`.
 
+mod resources {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-support/resources.rs"
+    ));
+}
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
@@ -26,9 +33,11 @@ fn artifacts() -> Vec<(String, PathBuf)> {
         .iter()
         .map(|n| ((*n).to_owned(), root.join(n)))
         .filter(|(_, d)| {
-            ["circuit.zkey", "proof.json", "public.json"]
-                .iter()
-                .all(|f| d.join(f).is_file())
+            resources::complete_files(
+                d,
+                &["circuit.zkey", "proof.json", "public.json"],
+                "solidity artifacts",
+            )
         })
         .collect()
 }
@@ -294,17 +303,17 @@ fn cases(valid: &Calldata) -> Vec<(&'static str, Calldata, bool)> {
 #[test]
 fn generated_verifier_accepts_the_proof_and_refuses_tampering_like_snarkjs() {
     if !(have("solc") && have("anvil") && have("cast")) {
-        eprintln!("SKIPPED: solc, anvil or cast is not installed");
+        resources::skip("solc, anvil or cast is not installed");
         return;
     }
     let found = artifacts();
     if found.is_empty() {
-        eprintln!("SKIPPED: no artifacts under bench/artifacts");
+        resources::skip("no artifacts under bench/artifacts");
         return;
     }
     let snarkjs = snarkjs_bin();
     if snarkjs.is_none() {
-        eprintln!("snarkjs not installed: checking our verifier alone");
+        resources::skip("snarkjs not installed: checking our verifier alone");
     }
     let dir = tmp_dir("verify");
     let anvil = Anvil::start();

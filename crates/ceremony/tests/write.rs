@@ -18,6 +18,13 @@
 //! Everything runs against the checked-in artifacts and skips with a message when they
 //! are absent, so a fresh clone without `gen-artifacts.sh` does not report false green.
 
+mod resources {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-support/resources.rs"
+    ));
+}
+
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -458,7 +465,7 @@ fn section_len_counts_the_open_payload_only() {
 fn the_encoders_reproduce_snarkjs_bytes_on_a_real_zkey() {
     let found = artifacts();
     if found.is_empty() {
-        eprintln!("SKIPPED the_encoders_reproduce_snarkjs_bytes_on_a_real_zkey: no artifacts");
+        resources::skip("the_encoders_reproduce_snarkjs_bytes_on_a_real_zkey: no artifacts");
         return;
     }
     for (name, dir) in found {
@@ -550,9 +557,7 @@ fn the_encoders_reproduce_snarkjs_bytes_on_a_real_zkey() {
 fn a_real_zkey_rewritten_through_the_writer_is_byte_identical() {
     let found = artifacts();
     if found.is_empty() {
-        eprintln!(
-            "SKIPPED a_real_zkey_rewritten_through_the_writer_is_byte_identical: no artifacts"
-        );
+        resources::skip("a_real_zkey_rewritten_through_the_writer_is_byte_identical: no artifacts");
         return;
     }
     let dir = tmp_dir("zkey-verbatim");
@@ -572,8 +577,8 @@ fn a_real_zkey_rewritten_through_the_writer_is_byte_identical() {
 fn a_real_ptau_rewritten_through_the_writer_is_byte_identical() {
     let found = ptaus();
     if found.is_empty() {
-        eprintln!(
-            "SKIPPED a_real_ptau_rewritten_through_the_writer_is_byte_identical: no bench/ptau"
+        resources::skip(
+            "a_real_ptau_rewritten_through_the_writer_is_byte_identical: no bench/ptau",
         );
         return;
     }

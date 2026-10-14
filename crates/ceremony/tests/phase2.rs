@@ -14,6 +14,13 @@
 //! The snarkjs half needs `snarkjs` on `PATH`; without it the comparison tests skip with a
 //! message rather than reporting green.
 
+mod resources {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-support/resources.rs"
+    ));
+}
+
 mod common;
 
 /// The beacon every comparison here uses. Any hex string would do; what matters is that
@@ -63,7 +70,7 @@ fn tmp_dir(test: &str) -> PathBuf {
 fn exported_vkey_is_byte_identical_to_snarkjs() {
     let artifacts = artifacts();
     if artifacts.is_empty() {
-        eprintln!("no artifacts with a vkey.json, skipping");
+        resources::skip("no artifacts with a vkey.json");
         return;
     }
     let dir = tmp_dir("vkey");
@@ -148,7 +155,12 @@ fn small_inputs() -> Vec<(String, PathBuf)> {
     ]
     .iter()
     .map(|(name, rel)| ((*name).to_owned(), root.join(rel)))
-    .filter(|(_, p)| p.is_file())
+    .filter(|(_, p)| {
+        p.is_file() || {
+            resources::skip(format_args!("missing {}", p.display()));
+            false
+        }
+    })
     .collect()
 }
 
@@ -163,7 +175,7 @@ const TINY_MUL_BEACON_HASH: &str = "eaf0a5fa0f5ebf1e0fc2db7aff0f3fc47c602b5344f2
 #[test]
 fn beacon_output_is_byte_identical_to_snarkjs() {
     let Some(bin) = snarkjs_bin() else {
-        eprintln!("SKIPPED beacon_output_is_byte_identical_to_snarkjs: no snarkjs on PATH");
+        resources::skip("beacon_output_is_byte_identical_to_snarkjs: no snarkjs on PATH");
         return;
     };
     let inputs = small_inputs();
@@ -226,7 +238,7 @@ fn hex(d: &[u8]) -> String {
 #[test]
 fn a_contribution_is_pinned_by_the_beacon_that_follows_it() {
     let Some(bin) = snarkjs_bin() else {
-        eprintln!("SKIPPED a_contribution_is_pinned_by_the_beacon_that_follows_it: no snarkjs");
+        resources::skip("a_contribution_is_pinned_by_the_beacon_that_follows_it: no snarkjs");
         return;
     };
     let inputs = small_inputs();
@@ -339,11 +351,11 @@ fn swap_two_points(path: &Path, id: u32) {
 #[test]
 fn both_verifiers_accept_every_chain_and_reject_a_tampered_one() {
     let Some(bin) = snarkjs_bin() else {
-        eprintln!("SKIPPED both_verifiers_accept_every_chain_...: no snarkjs on PATH");
+        resources::skip("both_verifiers_accept_every_chain_...: no snarkjs on PATH");
         return;
     };
     let Some((r1cs, ptau)) = verify_fixture() else {
-        eprintln!("SKIPPED both_verifiers_accept_every_chain_...: no js_1x1_d8 or local_19.ptau");
+        resources::skip("both_verifiers_accept_every_chain_...: no js_1x1_d8 or local_19.ptau");
         return;
     };
     let dir = tmp_dir("verify");
@@ -491,7 +503,7 @@ fn a_checked_in_contribution_hashes_to_what_snarkjs_printed() {
     let zkey =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/artifacts/js_1x1_d8/circuit.zkey");
     if !zkey.is_file() {
-        eprintln!("SKIPPED a_checked_in_contribution_hashes_...: no js_1x1_d8");
+        resources::skip("a_checked_in_contribution_hashes_...: no js_1x1_d8");
         return;
     }
     let file = snarkrs_formats::binfile::BinFile::open(&zkey, b"zkey", 2).unwrap();
@@ -514,7 +526,7 @@ fn a_header_whose_counts_cannot_be_computed_with_is_refused() {
     let zkey =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/artifacts/tiny_mul/circuit.zkey");
     if !zkey.is_file() {
-        eprintln!("SKIPPED a_header_whose_counts_...: no tiny_mul");
+        resources::skip("a_header_whose_counts_...: no tiny_mul");
         return;
     }
     let file = snarkrs_formats::binfile::BinFile::open(&zkey, b"zkey", 2).unwrap();
@@ -546,7 +558,7 @@ fn an_uncontributed_key_does_not_verify_against_itself() {
         dir.join("ptau/local_13.ptau"),
     );
     if !r1cs.is_file() || !ptau.is_file() {
-        eprintln!("SKIPPED an_uncontributed_key_...: no tiny_mul or local_13");
+        resources::skip("an_uncontributed_key_...: no tiny_mul or local_13");
         return;
     }
     let msm = CpuMsm::new();
@@ -570,7 +582,7 @@ fn a_header_point_off_the_curve_or_off_the_subgroup_is_refused() {
     let zkey =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/artifacts/tiny_mul/circuit.zkey");
     if !zkey.is_file() {
-        eprintln!("SKIPPED a_header_point_off_...: no tiny_mul");
+        resources::skip("a_header_point_off_...: no tiny_mul");
         return;
     }
     let file = snarkrs_formats::binfile::BinFile::open(&zkey, b"zkey", 2).unwrap();
@@ -659,7 +671,7 @@ fn a_beacon_record_with_an_unbounded_exponent_is_refused_by_the_verifier() {
         bench.join("ptau/local_13.ptau"),
     );
     if !r1cs.is_file() || !ptau.is_file() {
-        eprintln!("SKIPPED a_beacon_record_with_an_unbounded_exponent_...: no tiny_mul or ptau");
+        resources::skip("a_beacon_record_with_an_unbounded_exponent_...: no tiny_mul or ptau");
         return;
     }
     let dir = tmp_dir("hostile-beacon");

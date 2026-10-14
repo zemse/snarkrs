@@ -31,6 +31,13 @@
 
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
+mod resources {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-support/resources.rs"
+    ));
+}
+
 mod common;
 
 use common::beacon_bytes;
@@ -73,7 +80,7 @@ fn metal(min_block: Option<usize>, budget: Option<usize>) -> Option<MetalGroupFf
             })
         }
         Err(e) => {
-            eprintln!("SKIPPED: no Metal backend: {e}");
+            resources::skip(format_args!("no Metal backend: {e}"));
             None
         }
     }
@@ -150,6 +157,8 @@ fn inputs(dir: &Path) -> Vec<(String, PathBuf)> {
     let local = bench_path("ptau/local_13.ptau");
     if local.is_file() {
         out.push(("local_13".to_owned(), local));
+    } else {
+        resources::skip(format_args!("missing {}", local.display()));
     }
     out
 }
@@ -193,7 +202,10 @@ fn prepare_is_byte_identical_at_the_powers_that_matter() {
     for power in [15u32, 16] {
         let ptau = bench_path(&format!("ptau/ppot_0080_{power}.ptau"));
         if !ptau.is_file() {
-            eprintln!("SKIPPED power {power}: {} is not there", ptau.display());
+            resources::skip(format_args!(
+                "power {power}: {} is not there",
+                ptau.display()
+            ));
             continue;
         }
         compare(&dir, &format!("ppot_{power}"), "shipped", &ptau, &fft);
@@ -248,7 +260,7 @@ fn snarkjs_bin() -> Option<String> {
 #[test]
 fn snarkjs_verifies_a_metal_prepared_ptau() {
     let Some(bin) = snarkjs_bin() else {
-        eprintln!("SKIPPED snarkjs_verifies_a_metal_prepared_ptau: no snarkjs on PATH");
+        resources::skip("snarkjs_verifies_a_metal_prepared_ptau: no snarkjs on PATH");
         return;
     };
     let Some(fft) = metal(Some(1), None) else {
@@ -256,7 +268,7 @@ fn snarkjs_verifies_a_metal_prepared_ptau() {
     };
     let ptau = bench_path("ptau/local_13.ptau");
     if !ptau.is_file() {
-        eprintln!("SKIPPED snarkjs_verifies_a_metal_prepared_ptau: no local_13.ptau");
+        resources::skip("snarkjs_verifies_a_metal_prepared_ptau: no local_13.ptau");
         return;
     }
     let dir = tmp_dir("snarkjs");

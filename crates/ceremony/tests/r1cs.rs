@@ -9,6 +9,13 @@
 //! on the first record, which is the whole point: the wrong decoder parses cleanly and
 //! only fails much later, at proof verification.
 
+mod resources {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-support/resources.rs"
+    ));
+}
+
 use snarkrs_ceremony::r1cs::{Matrix, R1cs, SignalIndex, TERM_BYTES};
 use snarkrs_ceremony::Groth16Header;
 use snarkrs_field::Fr;
@@ -23,6 +30,7 @@ const COEF_RECORD: usize = 12 + FR_BYTES;
 fn artifacts() -> Vec<(String, PathBuf, PathBuf)> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/artifacts");
     let Ok(entries) = std::fs::read_dir(&root) else {
+        resources::skip(format_args!("missing {}", root.display()));
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -45,6 +53,9 @@ fn artifacts() -> Vec<(String, PathBuf, PathBuf)> {
         }
     }
     out.sort();
+    if out.is_empty() {
+        resources::skip("no artifact under bench/artifacts carries an r1cs and r1cs-info.txt");
+    }
     out
 }
 

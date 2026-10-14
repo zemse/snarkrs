@@ -10,6 +10,13 @@
 //! artifacts, and `bench/ptau/local_13.ptau` for the verify half; skips with a message
 //! when any is absent.
 
+mod resources {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-support/resources.rs"
+    ));
+}
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -34,11 +41,11 @@ fn os_bytes(seed: u8) -> [u8; 64] {
 fn snarkjs_bin() -> Option<String> {
     let bin = std::env::var("SNARKJS").unwrap_or_else(|_| "snarkjs".to_owned());
     let Ok(out) = Command::new(&bin).arg("--help").output() else {
-        eprintln!("SKIPPED: snarkjs is not installed");
+        resources::skip("snarkjs is not installed");
         return None;
     };
     if !String::from_utf8_lossy(&out.stdout).contains("snarkjs@0.7.6") {
-        eprintln!("SKIPPED: {bin} is not snarkjs 0.7.6; set SNARKJS");
+        resources::skip(format_args!("{bin} is not snarkjs 0.7.6; set SNARKJS"));
         return None;
     }
     Some(bin)
@@ -113,7 +120,7 @@ fn fixtures(dir: &Path) -> Option<(PathBuf, PathBuf, PathBuf)> {
     let r1cs = bench().join("artifacts/tiny_mul/circuit.r1cs");
     let ptau = bench().join("ptau/local_13.ptau");
     if !r1cs.is_file() || !ptau.is_file() {
-        eprintln!("SKIPPED: no tiny_mul r1cs or local_13 ptau");
+        resources::skip("no tiny_mul r1cs or local_13 ptau");
         return None;
     }
     let init = dir.join("init.zkey");
@@ -153,11 +160,17 @@ fn export_bellman_is_byte_identical_to_snarkjs() {
         "artifacts/js_1x1_d8/circuit.zkey",
     ]
     .iter()
+    .filter(|p| {
+        resources::complete_files(
+            &bench(),
+            &[p],
+            "export_bellman_is_byte_identical_to_snarkjs",
+        )
+    })
     .map(|p| bench().join(p))
-    .filter(|p| p.is_file())
     .collect();
     if inputs.is_empty() {
-        eprintln!("SKIPPED: no artifacts");
+        resources::skip("no artifacts");
         return;
     }
     let dir = tmp_dir("export");
@@ -193,7 +206,7 @@ fn contribute_and_import_are_byte_identical_to_snarkjs() {
     .unwrap();
 
     match snarkjs_pkg(&bin) {
-        None => eprintln!("snarkjs package directory not found: response bytes not compared"),
+        None => resources::skip("snarkjs package directory not found: response bytes not compared"),
         Some(pkg) => {
             let theirs = dir.join("resp.snarkjs.mpcparams");
             let script = dir.join("contribute.mjs");

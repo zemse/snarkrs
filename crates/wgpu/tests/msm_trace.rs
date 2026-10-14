@@ -17,6 +17,13 @@
 //! point stage it is timed next to; a kernel timed three times runs its second and third
 //! over what its first left, which changes no kernel's cost.
 
+mod resources {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-support/resources.rs"
+    ));
+}
+
 mod gpulock;
 mod msmcommon;
 
@@ -678,10 +685,10 @@ fn where_a_large_msm_stage_goes() {
         root().join(dir)
     };
     if !dir.join("circuit.zkey").is_file() {
-        eprintln!(
-            "SKIPPED where_a_large_msm_stage_goes: no circuit.zkey under {}",
+        resources::skip(format_args!(
+            "where_a_large_msm_stage_goes: no circuit.zkey under {}",
             dir.display()
-        );
+        ));
         return;
     }
     let profile = LimitsProfile::from_env().expect("G16_WGPU_LIMITS");

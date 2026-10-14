@@ -11,6 +11,13 @@
 //! The circom-compiled cases additionally need `circom` on `PATH`, since the artifacts
 //! carry no `.sym` and no custom gates.
 
+mod resources {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-support/resources.rs"
+    ));
+}
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -52,14 +59,14 @@ fn have_snarkjs(test: &str) -> bool {
         Ok(o) if String::from_utf8_lossy(&o.stdout).starts_with("snarkjs@0.7.6") => true,
         Ok(o) => {
             let banner = String::from_utf8_lossy(&o.stdout);
-            eprintln!(
-                "SKIPPED {test}: found {}, need snarkjs@0.7.6 (point $SNARKJS at its cli.js)",
+            resources::skip(format_args!(
+                "{test}: found {}, need snarkjs@0.7.6 (point $SNARKJS at its cli.js)",
                 banner.lines().next().unwrap_or("an unknown snarkjs")
-            );
+            ));
             false
         }
         Err(_) => {
-            eprintln!("SKIPPED {test}: snarkjs not found");
+            resources::skip(format_args!("{test}: snarkjs not found"));
             false
         }
     }
@@ -69,10 +76,10 @@ fn variants(test: &str) -> Vec<PathBuf> {
     let dirs: Vec<PathBuf> = VARIANTS
         .iter()
         .map(|v| artifacts_root().join(v))
-        .filter(|d| d.join("circuit.r1cs").is_file())
+        .filter(|d| resources::complete_files(d, &["circuit.r1cs"], test))
         .collect();
     if dirs.is_empty() {
-        eprintln!("SKIPPED {test}: no artifacts under bench/artifacts");
+        resources::skip(format_args!("{test}: no artifacts under bench/artifacts"));
     }
     dirs
 }
@@ -168,13 +175,16 @@ component main {public [a]} = Main();
 /// circuit. Empty, with a message, when circom is not installed.
 fn circom_circuits(test: &str, out: &Path) -> Vec<(PathBuf, PathBuf)> {
     if Command::new("circom").arg("--version").output().is_err() {
-        eprintln!("{test}: circom not found, skipping the compiled circuits");
+        resources::skip(format_args!(
+            "{test}: circom not found, skipping the compiled circuits"
+        ));
         return Vec::new();
     }
     let mut sources = vec![("custom_gate".to_string(), CUSTOM_GATE_CIRCOM.to_string())];
     let tiny = artifacts_root().join("tiny_mul/circuit.circom");
-    if let Ok(src) = std::fs::read_to_string(tiny) {
-        sources.push(("tiny_mul".to_string(), src));
+    match std::fs::read_to_string(&tiny) {
+        Ok(src) => sources.push(("tiny_mul".to_string(), src)),
+        Err(_) => resources::skip(format_args!("{test}: missing {}", tiny.display())),
     }
     sources
         .into_iter()
@@ -438,7 +448,9 @@ fn ptau_fixtures(test: &str, out: &Path) -> Vec<PathBuf> {
     if local.is_file() {
         files.push(local);
     } else {
-        eprintln!("{test}: no bench/ptau/local_13.ptau, running the power-4 file only");
+        resources::skip(format_args!(
+            "{test}: no bench/ptau/local_13.ptau, running the power-4 file only"
+        ));
     }
     files
 }

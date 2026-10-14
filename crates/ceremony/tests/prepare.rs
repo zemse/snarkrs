@@ -21,6 +21,13 @@
 //! The unit tests in `src/prepare.rs` cover the one thing neither oracle can reach: the
 //! two-coset split at `bits == Fr::TWO_ADICITY + 1`, which only a power-28 file triggers.
 
+mod resources {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-support/resources.rs"
+    ));
+}
+
 mod common;
 
 use common::beacon_bytes;
@@ -173,7 +180,7 @@ fn the_pinned_chain_reproduces_snarkjs_byte_for_byte() {
 #[test]
 fn local_13_prepare_reproduces_the_snarkjs_file_byte_for_byte() {
     let Some(prepared) = bench_ptau("local_13.ptau") else {
-        eprintln!("skipping: bench/ptau/local_13.ptau is absent");
+        resources::skip("bench/ptau/local_13.ptau is absent");
         return;
     };
     let dir = tmp_dir("local13");
@@ -213,7 +220,7 @@ fn local_13_prepare_reproduces_the_snarkjs_file_byte_for_byte() {
 fn prepared_element_counts_match_the_shipped_files() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/ptau");
     let Ok(entries) = std::fs::read_dir(&root) else {
-        eprintln!("skipping: bench/ptau is absent");
+        resources::skip("bench/ptau is absent");
         return;
     };
     let mut seen = 0;

@@ -35,6 +35,13 @@
 //! digest does not is an encoding or framing bug; a response hash that does not match is
 //! the point arithmetic or the RNG.
 
+mod resources {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-support/resources.rs"
+    ));
+}
+
 mod common;
 
 use common::{beacon_bytes, BEACON_HEX};
@@ -621,7 +628,10 @@ fn verify_catches_a_rewritten_contribution_record() {
 fn verify_checks_the_lagrange_sections_of_a_prepared_file() {
     let local = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/ptau/local_13.ptau");
     if !local.exists() {
-        eprintln!("skipping: {} is not present", local.display());
+        resources::skip(format_args!(
+            "verify_checks_the_lagrange_sections_of_a_prepared_file: missing {}",
+            local.display()
+        ));
         return;
     }
     let report = phase1::verify(&local).unwrap();
@@ -641,7 +651,10 @@ fn verify_checks_the_lagrange_sections_of_a_prepared_file() {
 fn a_truncated_ceremony_refuses_both_commands() {
     let ppot = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/ptau/ppot_0080_15.ptau");
     if !ppot.exists() {
-        eprintln!("skipping: {} is not present", ppot.display());
+        resources::skip(format_args!(
+            "a_truncated_ceremony_refuses_both_commands: missing {}",
+            ppot.display()
+        ));
         return;
     }
     let dir = tmp_dir("truncated");

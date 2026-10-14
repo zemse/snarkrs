@@ -3,6 +3,13 @@
 //! `snarkjs wtns calculate` writes today. Skips loudly without the artifacts or snarkjs.
 #![cfg(feature = "wasm")]
 
+mod resources {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-support/resources.rs"
+    ));
+}
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -56,12 +63,12 @@ fn snarkjs_bin() -> Option<String> {
 fn every_artifact_matches_its_wtns_and_snarkjs() {
     let all = circuits();
     if all.is_empty() {
-        eprintln!("SKIPPED every_artifact_matches_its_wtns_and_snarkjs: no bench/artifacts");
+        resources::skip("every_artifact_matches_its_wtns_and_snarkjs: no bench/artifacts");
         return;
     }
     let js = snarkjs_bin();
     if js.is_none() {
-        eprintln!("SKIPPED the snarkjs half: set SNARKJS to snarkjs 0.7.6");
+        resources::skip("the snarkjs half: set SNARKJS to snarkjs 0.7.6");
     }
     let scratch =
         std::env::temp_dir().join(format!("snarkrs-witness-artifacts-{}", std::process::id()));
@@ -110,7 +117,7 @@ fn every_artifact_matches_its_wtns_and_snarkjs() {
 fn circom_1_is_refused_clearly() {
     let wasm = artifacts().join("tornado/circuit.wasm");
     if !wasm.is_file() {
-        eprintln!("SKIPPED circom_1_is_refused_clearly: no tornado artifact");
+        resources::skip("circom_1_is_refused_clearly: no tornado artifact");
         return;
     }
     let e = WitnessCalculator::from_file(&wasm)

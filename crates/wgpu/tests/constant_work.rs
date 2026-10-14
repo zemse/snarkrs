@@ -3,6 +3,13 @@
 //! one produce is the same, and the retry paths hold in this mode too. Native only, for the
 //! reason in `tests/device.rs`.
 
+mod resources {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-support/resources.rs"
+    ));
+}
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
@@ -112,7 +119,7 @@ fn artifacts() -> Vec<Artifact> {
 fn for_each_artifact(test: &str, f: impl Fn(&Artifact)) {
     let found = artifacts();
     if found.is_empty() {
-        eprintln!("SKIPPED {test}: no artifacts under bench/artifacts");
+        resources::skip(format_args!("{test}: no artifacts under bench/artifacts"));
         return;
     }
     for a in &found {
@@ -537,7 +544,7 @@ fn a_constant_work_submission_cut_short_at_every_dispatch_is_retried_exactly() {
         .find(|a| a.name == "js_1x1_d8")
         .or_else(|| found.iter().min_by_key(|a| a.witness().len()))
     else {
-        eprintln!("SKIPPED a_constant_work_submission_cut_short_at_every_dispatch: no artifacts");
+        resources::skip("a_constant_work_submission_cut_short_at_every_dispatch: no artifacts");
         return;
     };
     eprintln!(

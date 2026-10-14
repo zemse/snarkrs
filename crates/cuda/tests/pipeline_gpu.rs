@@ -38,6 +38,13 @@
 
 #![cfg(feature = "cuda")]
 
+mod resources {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-support/resources.rs"
+    ));
+}
+
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -330,7 +337,9 @@ fn for_each(test: &str, f: impl Fn(&Fixture)) {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     let Some(all) = fixtures() else {
-        eprintln!("SKIPPED {test}");
+        resources::skip(format_args!(
+            "{test}: no usable device or no artifacts, see the line above"
+        ));
         return;
     };
     for fx in all {

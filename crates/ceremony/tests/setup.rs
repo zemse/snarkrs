@@ -20,6 +20,13 @@
 //! Every ppot case below is an exact fit, which is how the shipped keys were built and is
 //! precisely the case that is easy to get wrong.
 
+mod resources {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-support/resources.rs"
+    ));
+}
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -110,7 +117,7 @@ fn matches_the_zkey_snarkjs_built() {
     let mut ran = 0;
     for case in CASES {
         let Some((_, _, shipped)) = inputs(case) else {
-            eprintln!("skipping {}: artifact missing", case.dir);
+            resources::skip(format_args!("{}: artifact missing", case.dir));
             continue;
         };
         let out = dir.join(format!("{}.zkey", case.dir));
@@ -181,7 +188,7 @@ fn matches_the_zkey_snarkjs_built() {
 fn derived_domain_matches_every_shipped_header() {
     let dirs = root().join("bench/artifacts");
     let Ok(entries) = std::fs::read_dir(&dirs) else {
-        eprintln!("skipping: no artifacts directory");
+        resources::skip("no artifacts directory");
         return;
     };
     let mut ran = 0;
@@ -231,7 +238,7 @@ fn derived_domain_matches_every_shipped_header() {
 fn refuses_a_ptau_it_cannot_use() {
     let case = &CASES[0];
     let Some((r1cs, _, _)) = inputs(case) else {
-        eprintln!("skipping: artifact missing");
+        resources::skip("artifact missing");
         return;
     };
     let dir = tmp_dir("refuse");
@@ -254,6 +261,8 @@ fn refuses_a_ptau_it_cannot_use() {
         // And the same ptau does serve a circuit that fits, so the rejection is about the
         // power and not about the file.
         setup::setup(&r1cs, &small, &dir.join("y.zkey"), &CpuMsm::new()).unwrap();
+    } else {
+        resources::skip(format_args!("missing {}", small.display()));
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -267,18 +276,19 @@ fn refuses_a_ptau_it_cannot_use() {
 ///
 /// Unset `G16_SNARKJS` and this reports itself as passing, which is the one way it can be
 /// green without having compared anything: absent artifacts are counted, and zero of them
-/// fails. A run that matters says so in its output.
+/// fails. A run that matters says so in its output. `G16_REQUIRE_TESTS=1` turns the unset
+/// variable into a failure.
 #[test]
 fn matches_snarkjs_bytes() {
     let Ok(cli) = std::env::var("G16_SNARKJS") else {
-        eprintln!("skipping: set G16_SNARKJS to a snarkjs cli.js to run this");
+        resources::skip("set G16_SNARKJS to a snarkjs cli.js to run this");
         return;
     };
     let dir = tmp_dir("snarkjs");
     let mut ran = 0;
     for case in CASES {
         let Some((r1cs, ptau, _)) = inputs(case) else {
-            eprintln!("skipping {}: artifact missing", case.dir);
+            resources::skip(format_args!("{}: artifact missing", case.dir));
             continue;
         };
         let ours = dir.join(format!("{}-ours.zkey", case.dir));

@@ -23,6 +23,13 @@
 //!
 //! Everything runs against the checked-in artifacts and skips loudly when they are absent.
 
+mod resources {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-support/resources.rs"
+    ));
+}
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -113,7 +120,7 @@ fn load(dir: &Path) -> Case {
 
 fn each(test: &str, list: Vec<Variant>, f: impl Fn(&str, &Case)) {
     if list.is_empty() {
-        eprintln!("SKIPPED {test}: no artifacts under bench/artifacts");
+        resources::skip(format_args!("{test}: no artifacts under bench/artifacts"));
         return;
     }
     for v in &list {
@@ -190,7 +197,7 @@ fn a_constant_one_wire_that_is_not_one_never_yields_a_verifying_proof() {
 fn the_wtns_loader_rejects_a_non_one_constant_wire() {
     let found = small_variants();
     let Some(v) = found.first() else {
-        eprintln!("SKIPPED the_wtns_loader_rejects_a_non_one_constant_wire: no artifacts");
+        resources::skip("the_wtns_loader_rejects_a_non_one_constant_wire: no artifacts");
         return;
     };
     let out = scratch("wtns-w0");
@@ -345,7 +352,7 @@ fn a_witness_of_the_wrong_length_is_a_clean_error() {
 fn the_cli_rejects_a_truncated_witness_without_panicking() {
     let found = small_variants();
     let Some(v) = found.first() else {
-        eprintln!("SKIPPED the_cli_rejects_a_truncated_witness: no artifacts");
+        resources::skip("the_cli_rejects_a_truncated_witness: no artifacts");
         return;
     };
     let out = scratch("short-wtns");

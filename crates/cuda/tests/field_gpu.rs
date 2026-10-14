@@ -7,6 +7,13 @@
 
 #![cfg(feature = "cuda")]
 
+mod resources {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-support/resources.rs"
+    ));
+}
+
 use ark_ff::{Field, One, Zero};
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use snarkrs_cuda::{as_words, from_words, Cuda};
@@ -28,7 +35,7 @@ fn device() -> Option<Cuda> {
             Some(c)
         }
         Err(e) => {
-            eprintln!("SKIPPING cuda field tests, no usable device: {e}");
+            resources::skip(format_args!("cuda field tests, no usable device: {e}"));
             None
         }
     }

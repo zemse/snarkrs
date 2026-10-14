@@ -156,6 +156,13 @@ fn leb128(out: &mut Vec<u8>, mut v: u32) {
 
 #[cfg(test)]
 mod tests {
+    mod resources {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test-support/resources.rs"
+        ));
+    }
+
     use super::*;
     use std::path::PathBuf;
 
@@ -190,7 +197,7 @@ mod tests {
             .next()
             .map(|p| std::fs::read(p).unwrap());
         if w.is_none() {
-            eprintln!("SKIPPED {test}: no bench/artifacts");
+            resources::skip(format_args!("{test}: no bench/artifacts"));
         }
         w
     }
@@ -208,7 +215,7 @@ mod tests {
     fn every_artifact_is_rewritten_and_validates() {
         let all = wasms();
         if all.is_empty() {
-            eprintln!("SKIPPED every_artifact_is_rewritten_and_validates: no bench/artifacts");
+            resources::skip("every_artifact_is_rewritten_and_validates: no bench/artifacts");
             return;
         }
         let engine = Engine::default();

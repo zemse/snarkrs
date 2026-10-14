@@ -20,6 +20,13 @@
 
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
+mod resources {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-support/resources.rs"
+    ));
+}
+
 mod common;
 
 use common::beacon_bytes;
@@ -73,7 +80,7 @@ fn metal(min_points: Option<usize>) -> Option<MetalKeyScale> {
             None => k,
         }),
         Err(e) => {
-            eprintln!("SKIPPED: no Metal backend: {e}");
+            resources::skip(format_args!("no Metal backend: {e}"));
             None
         }
     }
@@ -111,7 +118,12 @@ fn zkeys() -> Vec<(String, PathBuf)> {
     ]
     .iter()
     .map(|(name, rel)| ((*name).to_owned(), bench_path(rel)))
-    .filter(|(_, p)| p.is_file())
+    .filter(|(_, p)| {
+        p.is_file() || {
+            resources::skip(format_args!("missing {}", p.display()));
+            false
+        }
+    })
     .collect()
 }
 
@@ -166,6 +178,8 @@ fn ptau_inputs(dir: &Path) -> Vec<(String, PathBuf)> {
     let local = bench_path("ptau/local_13.ptau");
     if local.is_file() {
         out.push(("local_13".to_owned(), local));
+    } else {
+        resources::skip(format_args!("missing {}", local.display()));
     }
     out
 }
@@ -292,7 +306,7 @@ fn expect_snarkjs(bin: &str, args: &[&str]) {
 #[test]
 fn snarkjs_verifies_a_metal_ptau_chain() {
     let Some(bin) = snarkjs_bin() else {
-        eprintln!("SKIPPED snarkjs_verifies_a_metal_ptau_chain: no snarkjs on PATH");
+        resources::skip("snarkjs_verifies_a_metal_ptau_chain: no snarkjs on PATH");
         return;
     };
     let Some(key) = metal(Some(1)) else { return };
@@ -321,13 +335,13 @@ fn snarkjs_verifies_a_metal_ptau_chain() {
 #[test]
 fn snarkjs_verifies_a_metal_zkey_contribution() {
     let Some(bin) = snarkjs_bin() else {
-        eprintln!("SKIPPED snarkjs_verifies_a_metal_zkey_contribution: no snarkjs on PATH");
+        resources::skip("snarkjs_verifies_a_metal_zkey_contribution: no snarkjs on PATH");
         return;
     };
     let r1cs = bench_path("artifacts/js_1x1_d8/circuit.r1cs");
     let ptau = bench_path("ptau/local_19.ptau");
     if !r1cs.is_file() || !ptau.is_file() {
-        eprintln!("SKIPPED snarkjs_verifies_a_metal_zkey_contribution: no js_1x1_d8 or local_19");
+        resources::skip("snarkjs_verifies_a_metal_zkey_contribution: no js_1x1_d8 or local_19");
         return;
     }
     let Some(key) = metal(Some(1)) else { return };
