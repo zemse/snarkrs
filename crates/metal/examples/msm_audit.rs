@@ -11,7 +11,7 @@ mod audit {
     use std::path::Path;
 
     use snarkrs_field::{AffineRepr, BigInteger, Fr, One, PrimeField, Zero};
-    use snarkrs_formats::{wtns::Witness, ProvingKey};
+    use snarkrs_formats::{wtns::Witness, Matrix, ProvingKey};
     use snarkrs_groth16::{cpu::CpuBackend, Backend, StageTimings};
     use snarkrs_metal::msm::window_size_for;
 
@@ -122,7 +122,7 @@ mod audit {
     }
 
     fn gather(pk: &ProvingKey, witness: &[Fr]) {
-        for m in 0..2 {
+        for m in Matrix::BOTH.map(Matrix::index) {
             let ptr = &pk.coeffs.row_ptr[m];
             let lengths: Vec<_> = ptr.windows(2).map(|p| (p[1] - p[0]) as usize).collect();
             // Loop slots with one row per lane and 32 lanes per SIMD group. A slot

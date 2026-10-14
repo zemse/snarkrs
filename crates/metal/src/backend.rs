@@ -615,7 +615,7 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use snarkrs_formats::{wtns::Witness, VerifyingKey};
+    use snarkrs_formats::{wtns::Witness, Matrix, VerifyingKey};
     use snarkrs_groth16::prove::prove_with_blinders;
     use snarkrs_groth16::verify::verify;
     use std::path::{Path, PathBuf};
@@ -691,7 +691,7 @@ mod tests {
             ],
             [0; 5]
         );
-        for m in 0..2 {
+        for m in Matrix::BOTH.map(Matrix::index) {
             assert_eq!(
                 [
                     key.coeffs.row_ptr[m].len(),
