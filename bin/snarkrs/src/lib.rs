@@ -13,7 +13,9 @@ pub mod json;
 pub mod log;
 
 use anyhow::Result;
+use snarkrs_ceremony::{CpuGroupFft, CpuKeyScale};
 use snarkrs_groth16::{cpu::CpuBackend, Backend};
+use snarkrs_msm::{CpuMsm, GroupFft, KeyScale, MsmBackend};
 
 /// Whether CPUID reports BMI2 (leaf 7 EBX bit 8) and ADX (bit 19), given the highest
 /// basic leaf and leaf 7 subleaf 0's EBX.
@@ -60,6 +62,25 @@ impl BackendKind {
     }
 }
 
+/// A compiled backend that failed to open its device or build its kernels.
+#[cfg(any(
+    feature = "wgpu",
+    feature = "cuda",
+    all(feature = "metal", target_os = "macos")
+))]
+fn unavailable(kind: BackendKind, e: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::anyhow!("backend `{}` is unavailable: {e}", kind.as_str())
+}
+
+/// The backend's feature is off. Each backend's feature has the backend's own name.
+fn not_built(kind: BackendKind) -> anyhow::Error {
+    let k = kind.as_str();
+    anyhow::anyhow!(
+        "backend `{k}` is unavailable: this binary was built WITHOUT the `{k}` \
+         feature. Rebuild with `cargo build --release --features {k}`."
+    )
+}
+
 /// Construct a backend, or explain precisely why it cannot exist in this binary.
 ///
 /// Three failure modes, and they need three different fixes, so they get three different
@@ -92,7 +113,7 @@ pub fn make_constant_work_backend(kind: BackendKind) -> Result<Box<dyn Backend>>
 fn cuda_constant_work_backend() -> Result<Box<dyn Backend>> {
     Ok(Box::new(
         snarkrs_cuda::CudaBackend::constant_work()
-            .map_err(|e| anyhow::anyhow!("backend `cuda` is unavailable: {e}"))?,
+            .map_err(|e| unavailable(BackendKind::Cuda, e))?,
     ))
 }
 
@@ -104,8 +125,7 @@ fn cuda_constant_work_backend() -> Result<Box<dyn Backend>> {
 #[cfg(feature = "wgpu")]
 fn wgpu_constant_work_backend() -> Result<Box<dyn Backend>> {
     Ok(Box::new(
-        snarkrs_wgpu::WgpuProver::constant_work()
-            .map_err(|e| anyhow::anyhow!("backend `wgpu` is unavailable: {e}"))?,
+        snarkrs_wgpu::WgpuProver::constant_work().map_err(|e| unavailable(BackendKind::Wgpu, e))?,
     ))
 }
 
@@ -119,7 +139,7 @@ fn wgpu_constant_work_backend() -> Result<Box<dyn Backend>> {
 fn metal_constant_work_backend() -> Result<Box<dyn Backend>> {
     Ok(Box::new(
         snarkrs_metal::MetalBackend::constant_work()
-            .map_err(|e| anyhow::anyhow!("backend `metal` is unavailable: {e}"))?,
+            .map_err(|e| unavailable(BackendKind::Metal, e))?,
     ))
 }
 
@@ -143,42 +163,28 @@ fn metal_constant_work_backend() -> Result<Box<dyn Backend>> {
 /// every base vector, is in `prepare`.
 #[cfg(feature = "wgpu")]
 fn wgpu_backend() -> Result<Box<dyn Backend>> {
-    Ok(Box::new(snarkrs_wgpu::WgpuProver::new().map_err(|e| {
-        anyhow::anyhow!("backend `wgpu` is unavailable: {e}")
-    })?))
+    Ok(Box::new(
+        snarkrs_wgpu::WgpuProver::new().map_err(|e| unavailable(BackendKind::Wgpu, e))?,
+    ))
 }
 
 #[cfg(not(feature = "wgpu"))]
 fn wgpu_backend() -> Result<Box<dyn Backend>> {
-    anyhow::bail!(
-        "backend `wgpu` is unavailable: this binary was built WITHOUT the `wgpu` \
-         feature. Rebuild with `cargo build --release --features wgpu`."
-    )
+    Err(not_built(BackendKind::Wgpu))
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 fn metal_backend() -> Result<Box<dyn Backend>> {
     // `MetalBackend::new` is the expensive constructor: it compiles the MSL and builds
     // every pipeline state, so it belongs here, once, and never on a proving path.
-    Ok(Box::new(snarkrs_metal::MetalBackend::new().map_err(
-        |e| anyhow::anyhow!("backend `metal` is unavailable: {e}"),
-    )?))
+    Ok(Box::new(
+        snarkrs_metal::MetalBackend::new().map_err(|e| unavailable(BackendKind::Metal, e))?,
+    ))
 }
 
-#[cfg(all(feature = "metal", not(target_os = "macos")))]
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
 fn metal_backend() -> Result<Box<dyn Backend>> {
-    anyhow::bail!(
-        "backend `metal` is unavailable: the `metal` feature is enabled but this target \
-         is not macOS, so snarkrs-metal compiled to nothing"
-    )
-}
-
-#[cfg(not(feature = "metal"))]
-fn metal_backend() -> Result<Box<dyn Backend>> {
-    anyhow::bail!(
-        "backend `metal` is unavailable: this binary was built WITHOUT the `metal` \
-         feature. Rebuild with `cargo build --release --features metal`."
-    )
+    Err(no_metal())
 }
 
 /// CUDA has one fewer failure mode than Metal, and it is worth saying why.
@@ -193,16 +199,167 @@ fn metal_backend() -> Result<Box<dyn Backend>> {
 fn cuda_backend() -> Result<Box<dyn Backend>> {
     // The expensive constructor: NVRTC compiles every kernel here, once, never on a
     // proving path.
-    Ok(Box::new(snarkrs_cuda::CudaBackend::new().map_err(|e| {
-        anyhow::anyhow!("backend `cuda` is unavailable: {e}")
-    })?))
+    Ok(Box::new(
+        snarkrs_cuda::CudaBackend::new().map_err(|e| unavailable(BackendKind::Cuda, e))?,
+    ))
 }
 
 #[cfg(not(feature = "cuda"))]
 fn cuda_backend() -> Result<Box<dyn Backend>> {
-    anyhow::bail!(
-        "backend `cuda` is unavailable: this binary was built WITHOUT the `cuda` \
-         feature. Rebuild with `cargo build --release --features cuda`."
+    Err(not_built(BackendKind::Cuda))
+}
+
+/// The feature is off, or it is on and the target is not macOS. Two different fixes, so
+/// two different messages, for [`make_backend`] and the ceremony constructors alike.
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn no_metal() -> anyhow::Error {
+    if cfg!(feature = "metal") {
+        anyhow::anyhow!(
+            "backend `metal` is unavailable: the `metal` feature is enabled but this target \
+             is not macOS, so snarkrs-metal compiled to nothing"
+        )
+    } else {
+        not_built(BackendKind::Metal)
+    }
+}
+
+/// The primitive a ceremony command needs, which decides which backends can serve it.
+#[derive(Clone, Copy, Debug)]
+pub enum CeremonySeam {
+    Msm,
+    GroupFft,
+    KeyScale,
+}
+
+/// Selection without opening a device. A compiled backend can still fail to initialise.
+pub fn ceremony_backend_kind(kind: BackendKind, seam: CeremonySeam) -> Result<BackendKind> {
+    match kind {
+        BackendKind::Cpu => Ok(kind),
+        BackendKind::Wgpu => Err(no_wgpu()),
+        BackendKind::Cuda if matches!(seam, CeremonySeam::GroupFft) && cfg!(feature = "cuda") => {
+            Ok(kind)
+        }
+        BackendKind::Cuda => Err(no_cuda()),
+        BackendKind::Metal => {
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            {
+                Ok(kind)
+            }
+            #[cfg(not(all(feature = "metal", target_os = "macos")))]
+            {
+                Err(no_metal())
+            }
+        }
+    }
+}
+
+/// The MSM behind `setup` and the two same-ratio checks.
+///
+/// The three constructors below are `make_backend` for the ceremony: same three failure
+/// modes, same three messages, same refusal to fall back to the CPU when the asked-for
+/// backend is not there. A benchmark that silently measures the other backend is worse than
+/// no number, and a `.zkey` that silently came from the other backend is worse than no key.
+pub fn msm_backend(kind: BackendKind) -> Result<Box<dyn MsmBackend>> {
+    match ceremony_backend_kind(kind, CeremonySeam::Msm)? {
+        BackendKind::Cpu => Ok(Box::new(CpuMsm::new())),
+        BackendKind::Wgpu => Err(no_wgpu()),
+        BackendKind::Metal => metal_msm(),
+        BackendKind::Cuda => Err(no_cuda()),
+    }
+}
+
+/// The group inverse FFT behind `ptau prepare`.
+pub fn fft_backend(kind: BackendKind) -> Result<Box<dyn GroupFft>> {
+    match ceremony_backend_kind(kind, CeremonySeam::GroupFft)? {
+        BackendKind::Cpu => Ok(Box::new(CpuGroupFft)),
+        BackendKind::Wgpu => Err(no_wgpu()),
+        BackendKind::Metal => metal_fft(),
+        BackendKind::Cuda => cuda_fft(),
+    }
+}
+
+/// The batch apply-key behind every contribute and beacon command.
+pub fn key_backend(kind: BackendKind) -> Result<Box<dyn KeyScale>> {
+    match ceremony_backend_kind(kind, CeremonySeam::KeyScale)? {
+        BackendKind::Cpu => Ok(Box::new(CpuKeyScale)),
+        BackendKind::Wgpu => Err(no_wgpu()),
+        BackendKind::Metal => metal_key(),
+        BackendKind::Cuda => Err(no_cuda()),
+    }
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn metal_msm() -> Result<Box<dyn MsmBackend>> {
+    Ok(Box::new(
+        snarkrs_metal::MetalMsmBackend::new().map_err(|e| unavailable(BackendKind::Metal, e))?,
+    ))
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn metal_fft() -> Result<Box<dyn GroupFft>> {
+    Ok(Box::new(
+        snarkrs_metal::MetalGroupFft::new().map_err(|e| unavailable(BackendKind::Metal, e))?,
+    ))
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn metal_key() -> Result<Box<dyn KeyScale>> {
+    Ok(Box::new(
+        snarkrs_metal::MetalKeyScale::new().map_err(|e| unavailable(BackendKind::Metal, e))?,
+    ))
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn metal_msm() -> Result<Box<dyn MsmBackend>> {
+    Err(no_metal())
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn metal_fft() -> Result<Box<dyn GroupFft>> {
+    Err(no_metal())
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn metal_key() -> Result<Box<dyn KeyScale>> {
+    Err(no_metal())
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_fft() -> Result<Box<dyn GroupFft>> {
+    Ok(Box::new(
+        snarkrs_cuda::CudaGroupFft::new().map_err(|e| unavailable(BackendKind::Cuda, e))?,
+    ))
+}
+
+#[cfg(not(feature = "cuda"))]
+fn cuda_fft() -> Result<Box<dyn GroupFft>> {
+    Err(no_cuda())
+}
+
+/// CUDA has kernels for the prover and for `ptau prepare`'s group FFT, and none for the
+/// two ceremony seams this message now covers. Saying "not built in" when the feature
+/// *is* on would send someone to rebuild a binary that already has everything it is
+/// going to get.
+fn no_cuda() -> anyhow::Error {
+    if cfg!(feature = "cuda") {
+        anyhow::anyhow!(
+            "backend `cuda` is unavailable for this ceremony command: snarkrs-cuda implements \
+             the prover and the `ptau prepare` group FFT; the ceremony MSM and apply-key \
+             have no CUDA kernels yet"
+        )
+    } else {
+        not_built(BackendKind::Cuda)
+    }
+}
+
+/// Unlike the other two this is not a "yet". A ceremony kernel is a point scalar
+/// multiplication, which inlines the point operations three or more times over a 256-byte
+/// `Xyzz<Fq2>`, and that is exactly the shape WebKit 323560 miscompiles on iOS.
+fn no_wgpu() -> anyhow::Error {
+    anyhow::anyhow!(
+        "backend `wgpu` is unavailable for the ceremony: these kernels are Metal and CUDA \
+         only, because a scalar-multiplication ladder is the shape WebKit 323560 \
+         miscompiles. Use `--backend cpu` or `--backend metal`."
     )
 }
 
@@ -336,6 +493,112 @@ mod tests {
         assert!(e.contains("--features metal"), "{e}");
     }
 
+    /// Every seam needs a CPU implementation under the same spelling, because
+    /// `--backend cpu` is the file every accelerated run is `cmp`'d against and the only
+    /// one already held against snarkjs byte for byte.
+    #[test]
+    fn every_ceremony_seam_has_a_cpu_backend() {
+        assert_eq!(msm_backend(BackendKind::Cpu).unwrap().name(), "cpu");
+        assert_eq!(fft_backend(BackendKind::Cpu).unwrap().name(), "cpu");
+        assert_eq!(key_backend(BackendKind::Cpu).unwrap().name(), "cpu");
+    }
+
+    fn backend_error<T>(result: Result<T>) -> String {
+        match result {
+            Ok(_) => panic!("selected an unavailable ceremony backend"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// All three real constructors must reject WebGPU, even when its feature is on.
+    #[test]
+    fn wgpu_rejects_every_ceremony_seam() {
+        for e in [
+            backend_error(msm_backend(BackendKind::Wgpu)),
+            backend_error(fft_backend(BackendKind::Wgpu)),
+            backend_error(key_backend(BackendKind::Wgpu)),
+        ] {
+            assert!(
+                e.contains("backend `wgpu` is unavailable for the ceremony"),
+                "{e}"
+            );
+            assert!(e.contains("--backend cpu"), "{e}");
+        }
+    }
+
+    #[test]
+    fn cuda_rejects_ceremony_msm_and_key_scaling() {
+        for e in [
+            backend_error(msm_backend(BackendKind::Cuda)),
+            backend_error(key_backend(BackendKind::Cuda)),
+        ] {
+            assert!(e.contains("backend `cuda` is unavailable"), "{e}");
+            if cfg!(feature = "cuda") {
+                assert!(e.contains("MSM and apply-key"), "{e}");
+                assert!(e.contains("no CUDA kernels"), "{e}");
+                assert!(!e.contains("WITHOUT"), "{e}");
+            } else {
+                assert!(e.contains("WITHOUT the `cuda` feature"), "{e}");
+                assert!(e.contains("--features cuda"), "{e}");
+            }
+        }
+    }
+
+    #[test]
+    fn cuda_group_fft_selection_respects_the_feature() {
+        if cfg!(feature = "cuda") {
+            // Selection only: this test must not load a CUDA driver.
+            assert!(matches!(
+                ceremony_backend_kind(BackendKind::Cuda, CeremonySeam::GroupFft),
+                Ok(BackendKind::Cuda)
+            ));
+        } else {
+            let e = backend_error(fft_backend(BackendKind::Cuda));
+            assert!(e.contains("WITHOUT the `cuda` feature"), "{e}");
+            assert!(e.contains("--features cuda"), "{e}");
+        }
+    }
+
+    #[test]
+    fn supported_ceremony_selection_keeps_the_requested_backend() {
+        for seam in [
+            CeremonySeam::Msm,
+            CeremonySeam::GroupFft,
+            CeremonySeam::KeyScale,
+        ] {
+            assert!(matches!(
+                ceremony_backend_kind(BackendKind::Cpu, seam),
+                Ok(BackendKind::Cpu)
+            ));
+            if cfg!(all(feature = "metal", target_os = "macos")) {
+                assert!(matches!(
+                    ceremony_backend_kind(BackendKind::Metal, seam),
+                    Ok(BackendKind::Metal)
+                ));
+            } else {
+                assert!(ceremony_backend_kind(BackendKind::Metal, seam).is_err());
+            }
+        }
+    }
+
+    /// Feature and target failures need different fixes, and both must name Metal.
+    #[cfg(not(all(feature = "metal", target_os = "macos")))]
+    #[test]
+    fn unavailable_metal_reports_the_feature_or_target() {
+        for e in [
+            backend_error(msm_backend(BackendKind::Metal)),
+            backend_error(fft_backend(BackendKind::Metal)),
+            backend_error(key_backend(BackendKind::Metal)),
+        ] {
+            assert!(e.contains("backend `metal` is unavailable"), "{e}");
+            if cfg!(feature = "metal") {
+                assert!(e.contains("not macOS"), "{e}");
+            } else {
+                assert!(e.contains("WITHOUT the `metal` feature"), "{e}");
+                assert!(e.contains("--features metal"), "{e}");
+            }
+        }
+    }
     #[test]
     fn host_info_is_populated() {
         let h = HostInfo::detect();
