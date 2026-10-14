@@ -254,6 +254,18 @@ pub struct MsmParams {
 
 const _: () = assert!(core::mem::size_of::<MsmParams>() == 80);
 
+impl MsmParams {
+    /// The block for a kernel that reads only `n` and `lo` (`zero_u32`, `fr_mont_to_std`),
+    /// so no plan is needed to fill the rest.
+    pub fn range(n: u32, lo: u32) -> Self {
+        Self {
+            n,
+            lo,
+            ..Self::default()
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // One digit pipeline's shape
 // ---------------------------------------------------------------------------
@@ -1020,39 +1032,40 @@ impl MsmDigits {
         ring: &mut ParamRing,
     ) -> Result<SortOffsets, ProveError> {
         Ok(SortOffsets {
-            zero: self.push_range(ring, plan, plan.rows(), self.wg.zero)?,
-            count: self.push_range(ring, plan, plan.n, self.wg.count)?,
+            zero: self.push_range(ring, plan.rows(), self.wg.zero, |lo| {
+                plan.params(plan.rows(), lo)
+            })?,
+            count: self.push_range(ring, plan.n, self.wg.count, |lo| plan.params(plan.n, lo))?,
             // One workgroup per window, always one dispatch: n_windows is at most 128 at
             // c = 2 and the limit is 65535.
             scan: vec![ring.push(&plan.params(plan.n, 0))?],
-            scatter: self.push_range(ring, plan, plan.n, self.wg.scatter)?,
+            scatter: self
+                .push_range(ring, plan.n, self.wg.scatter, |lo| plan.params(plan.n, lo))?,
         })
     }
 
     /// Parameter blocks for `fr_mont_to_std` over `n` elements.
     pub fn plan_mont(&self, n: u32, ring: &mut ParamRing) -> Result<Vec<u32>, ProveError> {
-        let plan = DigitPlan::new(n.max(1), 0, None)?;
-        self.push_range(ring, &plan, n, self.wg.mont)
+        self.push_range(ring, n, self.wg.mont, |lo| MsmParams::range(n, lo))
     }
 
     /// Parameter blocks for `zero_u32` over `n` words of any buffer.
     pub fn plan_zero(&self, n: u32, ring: &mut ParamRing) -> Result<Vec<u32>, ProveError> {
-        let plan = DigitPlan::new(n.max(1), 0, None)?;
-        self.push_range(ring, &plan, n, self.wg.zero)
+        self.push_range(ring, n, self.wg.zero, |lo| MsmParams::range(n, lo))
     }
 
     fn push_range(
         &self,
         ring: &mut ParamRing,
-        plan: &DigitPlan,
         n: u32,
         wg: u32,
+        params: impl Fn(u32) -> MsmParams,
     ) -> Result<Vec<u32>, ProveError> {
         let span = self.span(wg);
         let mut offsets = Vec::with_capacity(self.dispatches(n, wg) as usize);
         let mut lo = 0u32;
         loop {
-            offsets.push(ring.push(&plan.params(n, lo))?);
+            offsets.push(ring.push(&params(lo))?);
             lo = lo.saturating_add(span);
             if lo >= n {
                 break;
