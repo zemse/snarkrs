@@ -24,6 +24,7 @@ pub mod json_out;
 pub mod wtns;
 
 use binfile::*;
+use rayon::prelude::*;
 use snarkrs_field::*;
 
 /// Everything needed to prove, as parsed from a `.zkey`.
@@ -593,8 +594,7 @@ fn read_coefficients(
     let n_coefs = c.u32()? as usize;
     expect_records(&data[4..], n_coefs, COEF_RECORD, 4)?;
 
-    let mut counts = [vec![0u32; domain_size + 1], vec![0u32; domain_size + 1]];
-    for i in 0..n_coefs {
+    let check_record = |i: usize| -> Result<(usize, usize), ZkeyError> {
         let (m, constraint, _, _) = coef_indices(data, i)?;
         if constraint >= domain_size {
             return Err(ZkeyError::Malformed {
@@ -602,6 +602,19 @@ fn read_coefficients(
                 reason: format!("constraint {constraint} is outside domain size {domain_size}"),
             });
         }
+        Ok((m, constraint))
+    };
+    // The same checks the counting pass makes, first in parallel: the first touch of the
+    // mapped section is page faults, and this spreads them over every core.
+    if let Some(err) = (0..n_coefs)
+        .into_par_iter()
+        .find_map_first(|i| check_record(i).err())
+    {
+        return Err(err);
+    }
+    let mut counts = [vec![0u32; domain_size + 1], vec![0u32; domain_size + 1]];
+    for i in 0..n_coefs {
+        let (m, constraint) = check_record(i)?;
         counts[m][constraint + 1] += 1;
     }
 
@@ -618,33 +631,55 @@ fn read_coefficients(
         row_ptr[1][domain_size] as usize,
     ];
     let mut signal = [vec![0u32; totals[0]], vec![0u32; totals[1]]];
-    let mut value = [vec![Fr::zero(); totals[0]], vec![Fr::zero(); totals[1]]];
+    // The record each slot came from. The placement pass stays serial and only moves
+    // indices; the Montgomery decode of each value then runs in parallel per slot.
+    let mut source = [vec![0u32; totals[0]], vec![0u32; totals[1]]];
 
     let r_inv = r_inv();
+    let value_of = |i: usize| {
+        let off = 4 + i * COEF_RECORD + 12;
+        fr_double_montgomery(&data[off..off + FR_BYTES], &r_inv)
+    };
+    // The serial loop decoded values in record order, so a bad value before a bad index
+    // was the error reported. Keep that order.
+    let index_error = |i: usize, err: ZkeyError| match (0..i).find_map(|j| value_of(j).err()) {
+        Some(value_err) => value_err,
+        None => err,
+    };
     let mut cursor = [row_ptr[0].clone(), row_ptr[1].clone()];
     for i in 0..n_coefs {
-        let (m, constraint, sig, off) = coef_indices(data, i)?;
+        let (m, constraint, sig, _) = coef_indices(data, i)?;
         if sig >= n_vars {
-            return Err(ZkeyError::Malformed {
-                section: 4,
-                reason: format!("signal {sig} is outside n_vars {n_vars}"),
-            });
+            return Err(index_error(
+                i,
+                ZkeyError::Malformed {
+                    section: 4,
+                    reason: format!("signal {sig} is outside n_vars {n_vars}"),
+                },
+            ));
         }
         // Pass 1 checked `constraint`, but on the mmap path this is a second read of a file
         // someone else may be writing, and a record that changed in between indexed past
         // the end: SIGABRT on `js_16x16_d32` in 4 of 6 live races. Re-check both indices
         // so a changed record is an error rather than an abort or a silently wrong CSR.
         if constraint >= domain_size || cursor[m][constraint] >= row_ptr[m][constraint + 1] {
-            return Err(ZkeyError::Malformed {
-                section: 4,
-                reason: format!("record {i} changed between the two passes over section 4"),
-            });
+            return Err(index_error(
+                i,
+                ZkeyError::Malformed {
+                    section: 4,
+                    reason: format!("record {i} changed between the two passes over section 4"),
+                },
+            ));
         }
         let slot = cursor[m][constraint] as usize;
         cursor[m][constraint] += 1;
         signal[m][slot] = sig as u32;
-        value[m][slot] = fr_double_montgomery(&data[off..off + FR_BYTES], &r_inv)?;
+        source[m][slot] = i as u32;
     }
+
+    let [a, b] = source
+        .map(|src| collect_records(src.par_iter().map(|&i| value_of(i as usize)), Fr::zero()));
+    let value = [a?, b?];
 
     Ok(Coefficients {
         row_ptr,
