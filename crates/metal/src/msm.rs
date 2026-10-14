@@ -163,12 +163,24 @@ const MSM_NO_ROW: u32 = u32::MAX;
 /// slices to begin with. Override with `G16_METAL_MSM_L` to sweep it.
 const SLICE_LEN: usize = 64;
 
-fn slice_len() -> usize {
+/// The `G16_METAL_MSM_L` override: unparsable or zero is ignored, and anything past
+/// `u32::MAX` is clamped, because the shader takes the slice length as a `u32` and a
+/// truncation to zero would leave every bucket at the identity.
+fn parse_slice_override(v: &str) -> Option<usize> {
+    v.parse::<usize>()
+        .ok()
+        .filter(|v| *v > 0)
+        .map(|v| v.min(u32::MAX as usize))
+}
+
+fn forced_slice_len() -> Option<usize> {
     std::env::var("G16_METAL_MSM_L")
         .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(SLICE_LEN)
+        .and_then(|v| parse_slice_override(&v))
+}
+
+fn slice_len() -> usize {
+    forced_slice_len().unwrap_or(SLICE_LEN)
 }
 
 /// Slice length the segmented accumulation actually dispatches with, per plan.
@@ -185,11 +197,7 @@ fn slice_len() -> usize {
 const SEG_TARGET_THREADS: usize = 4096;
 
 fn slice_len_for(n_windows: usize, cap: usize) -> usize {
-    let forced = std::env::var("G16_METAL_MSM_L")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|v| *v > 0);
-    if let Some(l) = forced {
+    if let Some(l) = forced_slice_len() {
         return l;
     }
     let mut l = SLICE_LEN;
@@ -2739,6 +2747,21 @@ mod gpu_probes;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn slice_override_never_zero_or_past_u32() {
+        assert_eq!(parse_slice_override("128"), Some(128));
+        assert_eq!(parse_slice_override("0"), None);
+        assert_eq!(parse_slice_override("x"), None);
+        assert_eq!(parse_slice_override(""), None);
+        assert_eq!(parse_slice_override("-4"), None);
+        // low 32 bits zero: would truncate to 0 under `as u32`
+        assert_eq!(parse_slice_override("4294967296"), Some(u32::MAX as usize));
+        assert_eq!(
+            parse_slice_override("18446744073709551615"),
+            Some(u32::MAX as usize)
+        );
+    }
+
     use super::*;
     use crate::layout::as_bytes;
     use snarkrs_field::CurveGroup;
