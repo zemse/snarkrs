@@ -140,15 +140,47 @@ impl Domain {
     }
 }
 
+/// Tables shorter than this are built serially; above it the chunks run on rayon.
+const POWERS_PARALLEL_THRESHOLD: usize = 1 << 14;
+
+/// Smallest chunk worth a task of its own.
+const POWERS_MIN_CHUNK: usize = 1 << 12;
+
 /// Running product rather than `pow` per index: one multiplication per twiddle instead
 /// of a full square-and-multiply ladder, which matters at 2^24 points.
 fn powers(base: Fr, n: usize) -> Vec<Fr> {
+    if n < POWERS_PARALLEL_THRESHOLD {
+        return powers_serial(base, n);
+    }
+    powers_chunked(base, n)
+}
+
+fn powers_serial(base: Fr, n: usize) -> Vec<Fr> {
     let mut out = Vec::with_capacity(n);
     let mut acc = Fr::ONE;
     for _ in 0..n {
         out.push(acc);
         acc *= base;
     }
+    out
+}
+
+/// The running product is a serial dependency chain, so each chunk re-enters it at its own
+/// `base^(chunk_start)`: one ladder per chunk instead of one per element.
+fn powers_chunked(base: Fr, n: usize) -> Vec<Fr> {
+    use rayon::prelude::*;
+
+    let mut out = vec![Fr::ONE; n];
+    let chunk = n
+        .div_ceil(rayon::current_num_threads().max(1))
+        .max(POWERS_MIN_CHUNK);
+    out.par_chunks_mut(chunk).enumerate().for_each(|(c, part)| {
+        let mut acc = base.pow([(c * chunk) as u64]);
+        for x in part.iter_mut() {
+            *x = acc;
+            acc *= base;
+        }
+    });
     out
 }
 
@@ -226,6 +258,36 @@ mod tests {
                 );
             }
             assert_eq!(d.group_gen * d.group_gen_inv, Fr::ONE);
+        }
+    }
+
+    #[test]
+    fn chunked_powers_match_the_serial_chain() {
+        let bases = [
+            Fr::from(0u64),
+            Fr::ONE,
+            Fr::from(7u64),
+            Domain::new(1 << 12).unwrap().group_gen(),
+            Domain::new(1 << 12).unwrap().group_gen_inv(),
+        ];
+        let chunk = POWERS_MIN_CHUNK;
+        for base in bases {
+            for n in [
+                0,
+                1,
+                2,
+                chunk - 1,
+                chunk,
+                chunk + 1,
+                2 * chunk,
+                3 * chunk + 5,
+                POWERS_PARALLEL_THRESHOLD - 1,
+                POWERS_PARALLEL_THRESHOLD,
+                POWERS_PARALLEL_THRESHOLD + 3,
+            ] {
+                assert_eq!(powers_chunked(base, n), powers_serial(base, n), "n = {n}");
+                assert_eq!(powers(base, n), powers_serial(base, n), "n = {n}");
+            }
         }
     }
 

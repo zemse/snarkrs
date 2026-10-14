@@ -20,6 +20,7 @@ ark-ec.workspace = true
 ark-std.workspace = true
 ark-serialize.workspace = true
 thiserror.workspace = true
+rayon.workspace = true
 
 # ark-ff's hand-written assembly, declared where it can actually be target gated. All eight
 # other workspace crates depend on snarkrs-field directly, so cargo's feature unification carries
