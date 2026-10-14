@@ -190,7 +190,11 @@ impl RawCurve for snarkrs_field::g1::Config {
         f.to_fq()
     }
     fn raw_inv(f: RawFq) -> RawFq {
-        RawFq::from_fq(&f.to_fq().inverse().expect("inverse of zero"))
+        RawFq::from_fq(
+            &f.to_fq()
+                .inverse()
+                .expect("raw_inv is only called on a nonzero denominator"),
+        )
     }
 }
 
@@ -205,7 +209,11 @@ impl RawCurve for snarkrs_field::g2::Config {
         f.to_fq2()
     }
     fn raw_inv(f: RawFq2) -> RawFq2 {
-        RawFq2::from_fq2(&f.to_fq2().inverse().expect("inverse of zero"))
+        RawFq2::from_fq2(
+            &f.to_fq2()
+                .inverse()
+                .expect("raw_inv is only called on a nonzero denominator"),
+        )
     }
 }
 

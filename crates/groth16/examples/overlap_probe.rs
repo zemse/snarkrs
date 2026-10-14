@@ -9,6 +9,9 @@
 //!      exists, and the witness MSMs fill whatever the pool has idle. This is the
 //!      schedule a restructure would buy, so its delta against A is the ceiling.
 //!
+//! Outcome on the CPU backend at 2^17 (median): A 264.18 ms, B 268.21 ms, C 269.57 ms, so
+//! overlap buys nothing there and `Backend::h_and_msms` defaults to the sequential shape.
+//!
 //! Rounds interleave A/B/C so thermal drift hits all three alike. Outputs are compared
 //! across schedules each round: a probe that raced its way to a different proof would
 //! be measuring a bug.

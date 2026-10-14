@@ -607,9 +607,9 @@ fn read_coefficients(
 
     // Prefix sum in place turns the histogram into the row offsets.
     let mut row_ptr = counts;
-    for m in 0..2 {
+    for ptr in &mut row_ptr {
         for i in 0..domain_size {
-            row_ptr[m][i + 1] += row_ptr[m][i];
+            ptr[i + 1] += ptr[i];
         }
     }
 

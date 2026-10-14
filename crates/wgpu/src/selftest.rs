@@ -1001,7 +1001,7 @@ mod tests {
         // The case the whole file exists for: on a browser where every pipeline is invalid
         // and every dispatch a no-op, the readback is the zeroed buffer. That is one word
         // wrong like any other and the message has to say which shape it is.
-        let e = compare(&vec![0u32; 8], &got).unwrap_err();
+        let e = compare(&[0u32; 8], &got).unwrap_err();
         assert!(e.contains("8 of 8 words are zero"), "{e}");
 
         // A short read is its own message rather than an index panic in library code.

@@ -71,6 +71,7 @@ fn forward_transform_matches_ffjavascript() {
         assert_eq!(input.len(), 1usize << log);
 
         let d = Domain::new(1usize << log).unwrap();
+        assert_eq!(want.len(), input.len());
         let mut got = input.clone();
         ntt.ntt(&d, &mut got, Direction::Forward);
         for (i, (g, w)) in got.iter().zip(&want).enumerate() {

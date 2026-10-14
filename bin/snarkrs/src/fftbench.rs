@@ -198,6 +198,7 @@ pub fn run(args: Args) -> Result<()> {
     // sweep only the cheap shipped unit, is respected.
     let wants_gated = args.variants.is_empty() || args.variants.iter().any(|v| v != "c5");
     if wants_gated && std::env::var_os("G16_CUDA_FFT_VARIANTS").is_none() {
+        // `set_var` is `unsafe` from edition 2024; this is the only call outside tests.
         std::env::set_var("G16_CUDA_FFT_VARIANTS", "1");
     }
 

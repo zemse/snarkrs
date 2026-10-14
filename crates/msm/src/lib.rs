@@ -894,9 +894,8 @@ where
     // anon-aadhaar's H (2^21 points, c = 16, M2 Max) one chunk a window measured 588 ms,
     // two 535, three 531, four 537: past that each chunk is another bucket reduction.
     // Signed digits land in [-2^(c-1), 2^(c-1)] and index as `d - 1` when positive and
-    // `-d - 1` when negative, so the highest reachable index is 2^(c-1) - 1. Allocating
-    // 2^(c-1) + 1 left a bucket that is never written and still walked by the running-sum
-    // reduction, costing two Jacobian additions per window per point chunk.
+    // `-d - 1` when negative, so the highest reachable index is 2^(c-1) - 1 and 2^(c-1)
+    // buckets cover every digit.
     let n_buckets = 1usize << (c - 1);
     let point_chunks = (2 * threads.max(1))
         .div_ceil(n_windows)

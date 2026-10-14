@@ -748,8 +748,8 @@ mod tests {
             let got = aggregate_public(&vk, &public).unwrap();
 
             let mut want = vk.ic[0].into_group();
-            for i in 0..public.len() {
-                want += vk.ic[i + 1] * public[i];
+            for (ic, x) in vk.ic[1..].iter().zip(&public) {
+                want += *ic * x;
             }
             assert_eq!(got, want);
             assert!(aggregate_public(&vk, &public[..public.len() - 1]).is_err());
