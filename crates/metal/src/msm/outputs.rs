@@ -33,7 +33,7 @@ pub(super) struct Outputs {
     pub(super) fold: Option<(Buffer, Buffer)>,
     pub(super) base_off: usize,
     /// Leading scalars of the plan's range this job does not cover, when it rides a wider
-    /// job's plan (see [`SHARE_MAX_SKIP`]); 0 otherwise.
+    /// job's plan (see [`SHARE_MAX_SKIP`](super::plan::SHARE_MAX_SKIP)); 0 otherwise.
     pub(super) skip: usize,
     pub(super) is_g2: bool,
 }

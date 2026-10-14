@@ -508,7 +508,7 @@ impl MetalMsm {
     /// the A, B-in-G2 and B-in-G1 MSMs all run over the whole witness, so the counting
     /// sort runs once for the three of them and only the point stages are repeated. L
     /// reads the witness past its public prefix and rides the same plan (see
-    /// [`SHARE_MAX_SKIP`]). A plan costs four dispatches (`zero`, `count`, `scan`,
+    /// [`SHARE_MAX_SKIP`](plan::SHARE_MAX_SKIP)). A plan costs four dispatches (`zero`, `count`, `scan`,
     /// `scatter`), so collapsing the five proving jobs to two plans removes twelve of
     /// the twenty and, more to the point, three of the four witness scatters' memory
     /// traffic. A bucket array past `SCATTER_SPLIT_ROWS` splits the scatter in two,

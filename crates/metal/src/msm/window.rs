@@ -49,7 +49,7 @@ const _: () = assert!(DUMMY_ROWS.is_power_of_two());
 
 /// Mixed additions, G1-weighted, that one command buffer of a split batch may hold in
 /// its accumulation piece: about 14 ms at `MADD_US`, the size of a transform buffer.
-/// See [`Submission`].
+/// See [`Submission`](super::Submission).
 pub(super) const SPLIT_BUDGET: usize = 1 << 22;
 
 /// Threads per threadgroup in the reduction and the ones kernel. Must equal `REDUCE_TG`
@@ -162,7 +162,7 @@ pub(super) fn reduce_groups_for(n_windows: usize, n_buckets: usize) -> usize {
 }
 
 /// Buckets at or below which a one-window plan skips the GPU merge and reduce and
-/// finishes in [`Outputs::combine`] instead.
+/// finishes in [`Outputs::combine`](super::Outputs::combine) instead.
 ///
 /// A one-window witness plan on the csp keccak circuits has 256 buckets holding a few
 /// hundred entries, and its reduce dispatches `reduce_groups * REDUCE_TG` threads, 128
@@ -313,7 +313,7 @@ pub fn window_size(m: usize) -> u32 {
 }
 
 /// [`window_size`] with the recoding laid out over `recode_bits` instead of the full
-/// 255. A plan whose scalars are provably short (see [`ScalarBuf::bits_in`]) prices its
+/// 255. A plan whose scalars are provably short (see [`ScalarBuf::bits_in`](super::ScalarBuf::bits_in)) prices its
 /// windows over the bits it will actually dispatch, so the `windows * m` term stops
 /// charging for digit rows that hold nothing: at sha256_128 the four witness plans use
 /// 8 of the 51 windows a full-width layout would emit at c = 5.

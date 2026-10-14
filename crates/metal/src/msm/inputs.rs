@@ -16,7 +16,7 @@ use super::window::{window_size_for, Work, RECODE_BITS};
 /// `inf` remembers which bases are the point at infinity. A zkey is full of them: the B
 /// queries of the csp keys are 61% infinity, because a wire that appears in no B
 /// constraint still owns a slot. An infinity base contributes nothing whatever its
-/// scalar, so the ones gather (see [`Outputs::alloc`]) drops those indices on the host
+/// scalar, so the ones gather (see [`Outputs::alloc`](super::Outputs::alloc)) drops those indices on the host
 /// instead of paying a device load and a dead branch per point per proof.
 pub struct G1Bases {
     pub(super) buf: Buffer,
@@ -48,7 +48,7 @@ impl G2Bases {
     }
 }
 
-/// Chunk width of the classification pass in [`MetalMsm::upload_scalars`], and hence
+/// Chunk width of the classification pass in [`MetalMsm::upload_scalars`](super::MetalMsm::upload_scalars), and hence
 /// the granularity of [`ScalarBuf::bits_in`].
 pub(super) const CLASSIFY_CHUNK: usize = 4096;
 
@@ -65,7 +65,7 @@ pub(super) fn scalar_bits(v: &[u32; 8]) -> u32 {
 ///
 /// `general_prefix[i]` is how many of the first `i` scalars are neither 0 nor 1. It is
 /// built during the pack, which already walks every scalar, so it is free, and it is
-/// what lets [`MetalMsm::msm_batch`] size the window and the entry array for the work
+/// what lets [`MetalMsm::msm_batch`](super::MetalMsm::msm_batch) size the window and the entry array for the work
 /// that actually reaches the buckets rather than for the input length. A witness is
 /// typically over 99% zeros and ones, so the difference is two orders of magnitude.
 pub struct ScalarBuf {
@@ -74,7 +74,7 @@ pub struct ScalarBuf {
     pub(super) general_prefix: Option<Vec<u32>>,
     /// Ascending indices of the scalars that are exactly 1, from the same
     /// classification pass. Host-only: what reaches the device is the per-job gather
-    /// list [`Outputs::alloc`] filters from it, since which of these indices matter
+    /// list [`Outputs::alloc`](super::Outputs::alloc) filters from it, since which of these indices matter
     /// also depends on the job's bases. `None` when the buffer was never classified.
     pub(super) ones_idx: Option<Vec<u32>>,
     /// Per-[`CLASSIFY_CHUNK`] maximum scalar bit length, from the same pass. This is
@@ -164,7 +164,7 @@ impl Drop for Lent {
 }
 
 /// Bytes of digit entries a plan over `n` unclassified scalars takes, which is what
-/// [`Plan::alloc`] asks for over a device-resident H. Stage 4 sizes the buffer it lends
+/// [`Plan::alloc`](super::Plan::alloc) asks for over a device-resident H. Stage 4 sizes the buffer it lends
 /// with this; a lent buffer that turns out smaller is not used, so a disagreement costs
 /// the saving and nothing else.
 pub(crate) fn dense_entries_bytes(n: usize) -> usize {

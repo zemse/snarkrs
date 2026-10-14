@@ -9,7 +9,7 @@ use super::MetalMsm;
 
 /// How a batch reaches the device: one command buffer with a memory barrier between
 /// phases, or split, one command buffer per phase with the accumulation cut into
-/// pieces of at most [`SPLIT_BUDGET`] mixed additions.
+/// pieces of at most [`SPLIT_BUDGET`](super::window::SPLIT_BUDGET) mixed additions.
 ///
 /// macOS kills a command buffer that holds the GPU too long while the display wants it
 /// (`ImpactingInteractivity`; `fft.rs` measured 350 ms buffers losing five runs in six
