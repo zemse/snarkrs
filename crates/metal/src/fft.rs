@@ -20,9 +20,7 @@
 //! this file and there is nothing to keep in step.
 
 use ark_ec::scalar_mul::glv::GLVConfig;
-use metal::{
-    Buffer, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLDispatchType,
-};
+use metal::{Buffer, CompileOptions, ComputePipelineState, Device, MTLDispatchType};
 use rayon::prelude::*;
 use snarkrs_field::raw::{RawFq, RawFq2};
 use snarkrs_field::{FftField, Field, Fr};
@@ -30,9 +28,10 @@ use snarkrs_gpu_layout::glv::twiddle_table;
 use snarkrs_groth16::ProveError;
 use snarkrs_msm::xyzz::Xyzz;
 
-use crate::ceremony::{cer_err, cer_read_back, dispatch_1d, env_window, window_index, CER_WINDOWS};
+use crate::ceremony::{cer_err, env_window, window_index, CER_WINDOWS};
+use crate::enc::{dispatch_1d, read_back, set_params};
 use crate::kernels::{CEREMONY_MSL, FFT_MSL, FR_MSL, MSM_MSL, SEAL_MSL};
-use crate::layout::{as_bytes, Packed, PackedFq, PackedFq2};
+use crate::layout::{Packed, PackedFq, PackedFq2};
 use crate::msm::{PackedXyzzG1, PackedXyzzG2};
 
 /// Ladder window for G1, and one wider than the ceremony ladders take.
@@ -595,7 +594,7 @@ impl FftKernels {
             // SAFETY: the command buffer completed, `n` points of this type is exactly
             // what the last pass wrote into what is now `src`, and `PackedPoint` is
             // `Packed`, so every bit pattern is valid.
-            let got: &[G::PackedPoint] = unsafe { cer_read_back(&b.src, b.n) };
+            let got: &[G::PackedPoint] = unsafe { read_back(&b.src, b.n) };
 
             // The `a[1..].reverse()` that finishes the inverse (prepare.rs:340), folded
             // into the read back: `ifft(a)[0] = X[0]/n` and `ifft(a)[i] = X[n-i]/n`.
@@ -722,11 +721,7 @@ impl FftKernels {
     }
 
     fn buffer<T: Packed>(&self, items: &[T]) -> Result<Buffer, ProveError> {
-        let bytes = as_bytes(items);
-        if bytes.is_empty() {
-            return crate::alloc::shared(&self.device, 4);
-        }
-        crate::alloc::shared_with_data(&self.device, bytes.as_ptr().cast(), bytes.len())
+        crate::enc::buffer(&self.device, items)
     }
 }
 
@@ -760,16 +755,6 @@ fn env_usize(var: &str) -> Option<usize> {
     std::env::var(var)
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-}
-
-/// `setBytes` for the params struct. `FftParams` is `repr(C)` and all-`u32`, so its bytes
-/// are exactly what the shader's `constant FftParams&` reads.
-fn set_params(enc: &ComputeCommandEncoderRef, index: u64, p: &FftParams) {
-    enc.set_bytes(
-        index,
-        core::mem::size_of::<FftParams>() as u64,
-        (p as *const FftParams).cast(),
-    );
 }
 
 #[cfg(test)]

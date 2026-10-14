@@ -25,6 +25,8 @@
 pub(crate) mod alloc;
 #[cfg(target_os = "macos")]
 pub(crate) mod cb;
+#[cfg(target_os = "macos")]
+pub(crate) mod enc;
 /// The packed structs that cross into MSL. Host-side only, so it builds everywhere;
 /// its definitions are mirrored by `src/shaders/bn254_fr.metal` and the two must be
 /// changed together.

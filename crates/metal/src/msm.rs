@@ -73,6 +73,7 @@ use metal::{
 use snarkrs_field::{Fr, G1Affine, G1Projective, G2Affine, G2Projective};
 use snarkrs_groth16::ProveError;
 
+use crate::enc::{dispatch_1d, packed_buffer, read_back, set_params};
 use crate::kernels::{FR_MSL, MSM_MSL, SEAL_MSL};
 use crate::layout::{Packed, PackedFq, PackedFq2, PackedG1Affine, PackedG2Affine, PackedScalar};
 
@@ -1071,31 +1072,9 @@ impl MetalMsm {
         &self.device
     }
 
-    /// `items` packed by `pack` straight into a shared buffer. Packing into a `Vec` and
-    /// copying that in held a third copy of the section at the peak of `prepare`.
-    fn packed_buffer<S, T: Packed>(
-        &self,
-        items: &[S],
-        pack: fn(&[S], &mut [T]),
-    ) -> Result<Buffer, ProveError> {
-        if items.is_empty() {
-            return crate::alloc::shared(&self.device, 4);
-        }
-        let buf = crate::alloc::shared(&self.device, items.len() * core::mem::size_of::<T>())?;
-        // SAFETY: the buffer was just allocated with room for `items.len()` packed values
-        // and nothing has been encoded against it, so no dispatch can be reading it.
-        let dst = unsafe { core::slice::from_raw_parts_mut(buf.contents().cast(), items.len()) };
-        pack(items, dst);
-        Ok(buf)
-    }
-
-    /// Repacks and uploads a G1 base vector. `ark_ec::G1Affine` is 72 bytes on this
-    /// arkworks and carries an infinity flag, so a byte cast would hand the GPU a 72-byte
-    /// stride where the shader reads 64. [`PackedG1Affine::from_affine`] reads the flag
-    /// and maps infinity onto the all-zero encoding the kernels test for.
     pub fn upload_g1_bases(&self, bases: &[G1Affine]) -> Result<G1Bases, ProveError> {
         Ok(G1Bases {
-            buf: self.packed_buffer(bases, PackedG1Affine::pack_into)?,
+            buf: packed_buffer(&self.device, bases, PackedG1Affine::pack_into)?,
             len: bases.len(),
             inf: bases.iter().map(|b| b.infinity).collect(),
         })
@@ -1103,7 +1082,7 @@ impl MetalMsm {
 
     pub fn upload_g2_bases(&self, bases: &[G2Affine]) -> Result<G2Bases, ProveError> {
         Ok(G2Bases {
-            buf: self.packed_buffer(bases, PackedG2Affine::pack_into)?,
+            buf: packed_buffer(&self.device, bases, PackedG2Affine::pack_into)?,
             len: bases.len(),
             inf: bases.iter().map(|b| b.infinity).collect(),
         })
@@ -2695,46 +2674,6 @@ fn mul_u64(p: G1Projective, k: u64) -> G1Projective {
         }
     }
     acc
-}
-
-fn set_params(enc: &ComputeCommandEncoderRef, index: u64, p: &MsmParams) {
-    enc.set_bytes(
-        index,
-        core::mem::size_of::<MsmParams>() as u64,
-        (p as *const MsmParams).cast(),
-    );
-}
-
-/// Threadgroup size is a preference clamped by what the pipeline will actually accept.
-///
-/// Never hardcode 1024: a kernel carrying one CIOS Montgomery multiply already reports
-/// 896 on this device from register pressure alone, and the XYZZ mixed-addition kernel
-/// measured 512. Both reference implementations query the pipeline; so does this.
-fn dispatch_1d(
-    enc: &ComputeCommandEncoderRef,
-    pso: &ComputePipelineState,
-    n: usize,
-    prefer: usize,
-) {
-    if n == 0 {
-        return;
-    }
-    let tg = prefer
-        .min(pso.max_total_threads_per_threadgroup() as usize)
-        .max(1);
-    crate::cb::dispatch_threads(
-        enc,
-        MTLSize::new(n as u64, 1, 1),
-        MTLSize::new(tg as u64, 1, 1),
-    );
-}
-
-/// # Safety
-///
-/// The buffer must hold at least `len` `T`s written by a completed command buffer, and
-/// `T` must be a `Packed` type, so every bit pattern is valid.
-unsafe fn read_back<T: Packed>(buf: &Buffer, len: usize) -> &[T] {
-    core::slice::from_raw_parts(buf.contents().cast::<T>(), len)
 }
 
 #[cfg(test)]

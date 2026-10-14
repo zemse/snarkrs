@@ -12,9 +12,7 @@
 //! shape WebKit 323560 (filed by this project) miscompiles on iOS.
 
 use metal::objc::rc::autoreleasepool;
-use metal::{
-    Buffer, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLSize,
-};
+use metal::{Buffer, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device};
 use snarkrs_field::raw::{RawFq, RawFq2};
 use snarkrs_field::{
     AffineRepr, CurveGroup, Field, Fq, Fq2, Fr, G1Affine, G1Projective, G2Affine, G2Projective,
@@ -23,10 +21,11 @@ use snarkrs_groth16::ProveError;
 use snarkrs_msm::xyzz::Xyzz;
 use snarkrs_msm::{AccelError, GroupFft, KeyScale, MsmBackend};
 
+use crate::enc::{dispatch_1d, read_back, set_params};
 use crate::fft::FftKernels;
 use crate::kernels::{CEREMONY_MSL, FR_MSL, MSM_MSL, SEAL_MSL};
 use crate::layout::{
-    as_bytes, Packed, PackedFq, PackedFq2, PackedFr, PackedG1Affine, PackedG2Affine, PackedScalar,
+    Packed, PackedFq, PackedFq2, PackedFr, PackedG1Affine, PackedG2Affine, PackedScalar,
 };
 use crate::msm::{MetalMsm, PackedXyzzG1, PackedXyzzG2};
 
@@ -737,11 +736,7 @@ impl CeremonyKernels {
     // -- the shared submission code --
 
     fn buffer<T: Packed>(&self, items: &[T]) -> Result<Buffer, ProveError> {
-        let bytes = as_bytes(items);
-        if bytes.is_empty() {
-            return crate::alloc::shared(&self.device, 4);
-        }
-        crate::alloc::shared_with_data(&self.device, bytes.as_ptr().cast(), bytes.len())
+        crate::enc::buffer(&self.device, items)
     }
 
     fn scratch<T>(&self, len: usize) -> Result<Buffer, ProveError> {
@@ -799,7 +794,7 @@ impl CeremonyKernels {
 
                 // SAFETY: the command buffer completed, and `n` points of this type is
                 // exactly what the kernel wrote.
-                let got: &[G::PackedPoint] = unsafe { cer_read_back(&out_buf, n) };
+                let got: &[G::PackedPoint] = unsafe { read_back(&out_buf, n) };
                 out.extend(got.iter().map(G::unpack_point));
                 Ok(())
             })?;
@@ -823,7 +818,7 @@ impl CeremonyKernels {
                 self.affine_from_device::<G>(&in_buf, &aff, n, None)?;
                 // SAFETY: as above, and `PackedAffine` is `Packed`, so every bit pattern
                 // is a valid value.
-                let got: &[G::PackedAffine] = unsafe { cer_read_back(&aff, n) };
+                let got: &[G::PackedAffine] = unsafe { read_back(&aff, n) };
                 out.extend(got.iter().map(G::unpack_affine));
                 Ok(())
             })?;
@@ -873,7 +868,7 @@ impl CeremonyKernels {
 
                 // SAFETY: the command buffer completed and `n` affine points is what the
                 // finish pass wrote.
-                let got: &[G::PackedAffine] = unsafe { cer_read_back(&aff, n) };
+                let got: &[G::PackedAffine] = unsafe { read_back(&aff, n) };
                 for (dst, src) in block.iter_mut().zip(got) {
                     *dst = G::unpack_affine(src);
                 }
@@ -930,7 +925,7 @@ impl CeremonyKernels {
 
         // SAFETY: the command buffer completed and the prefix pass wrote one field
         // element per segment.
-        let got: &[G::PackedField] = unsafe { cer_read_back(&segprod, segments) };
+        let got: &[G::PackedField] = unsafe { read_back(&segprod, segments) };
         let seeds = self.buffer(&build_seeds::<G>(got)?)?;
 
         crate::cb::with_retry(&self.queue, |queue| {
@@ -1009,46 +1004,6 @@ fn env_usize(var: &str, default: usize) -> usize {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(default)
-}
-
-/// `setBytes` for a params struct. `CerParams` is `repr(C)` and all-`u32`, so its bytes
-/// are exactly what the shader's `constant CerParams&` reads.
-fn set_params(enc: &ComputeCommandEncoderRef, index: u64, p: &CerParams) {
-    enc.set_bytes(
-        index,
-        core::mem::size_of::<CerParams>() as u64,
-        (p as *const CerParams).cast(),
-    );
-}
-
-/// A copy of `msm::dispatch_1d`, which is private to that module. Same contract: the
-/// preferred threadgroup size is clamped to what the pipeline reports, and the kernel
-/// bounds-checks its own index because `dispatch_threads` rounds the grid up.
-pub(crate) fn dispatch_1d(
-    enc: &ComputeCommandEncoderRef,
-    pso: &ComputePipelineState,
-    n: usize,
-    prefer: usize,
-) {
-    if n == 0 {
-        return;
-    }
-    let tg = prefer
-        .min(pso.max_total_threads_per_threadgroup() as usize)
-        .max(1);
-    crate::cb::dispatch_threads(
-        enc,
-        MTLSize::new(n as u64, 1, 1),
-        MTLSize::new(tg as u64, 1, 1),
-    );
-}
-
-/// # Safety
-///
-/// The buffer must hold at least `len` `T`s written by a completed command buffer, and
-/// `T` must be a `Packed` type, so every bit pattern is valid.
-pub(crate) unsafe fn cer_read_back<T: Packed>(buf: &Buffer, len: usize) -> &[T] {
-    core::slice::from_raw_parts(buf.contents().cast::<T>(), len)
 }
 
 #[cfg(test)]

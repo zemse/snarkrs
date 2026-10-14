@@ -237,10 +237,7 @@ impl HStages {
     }
 
     fn buf_u32(&self, data: &[u32]) -> Result<Buffer, ProveError> {
-        if data.is_empty() {
-            return crate::alloc::shared(&self.device, 4);
-        }
-        crate::alloc::shared_with_data(&self.device, data.as_ptr() as *const c_void, data.len() * 4)
+        crate::enc::buffer(&self.device, data)
     }
 
     fn empty(&self, elems: usize) -> Result<Buffer, ProveError> {
