@@ -37,10 +37,10 @@ pub enum AccelError {
     /// The backend exists on this machine but has no kernel for this primitive yet. The
     /// command has to stop rather than fall back, for the reason `make_backend` gives:
     /// silently running the other backend is worse than no answer.
-    #[error("backend `{backend}` has no {op} implementation yet")]
+    #[error("backend `{backend}` is unavailable for this ceremony command: {reason}")]
     Unimplemented {
         backend: &'static str,
-        op: &'static str,
+        reason: &'static str,
     },
     /// The device rejected the work, lost it, or handed back something unreadable.
     #[error("backend `{backend}` failed during {op}: {reason}")]
@@ -112,6 +112,59 @@ pub trait GroupFft: Send + Sync {
             self.ifft_g2(a)?;
         }
         Ok(())
+    }
+}
+
+/// A [`GroupFft`] that checks the block length before any backend sees it.
+///
+/// The trait states that `a.len()` is a power of two and nothing enforces it: a device
+/// kernel given another length would read past the twiddle table or return a transform of
+/// the wrong size. This wrapper is the one place that turns the precondition into
+/// [`AccelError::Shape`], for every backend.
+pub struct CheckedGroupFft<F: ?Sized>(pub Box<F>);
+
+fn check_block(op: &'static str, len: usize) -> Result<(), AccelError> {
+    if len.is_power_of_two() {
+        Ok(())
+    } else {
+        Err(AccelError::Shape {
+            op,
+            reason: format!("block length {len} is not a power of two"),
+        })
+    }
+}
+
+impl GroupFft for CheckedGroupFft<dyn GroupFft> {
+    fn name(&self) -> &'static str {
+        self.0.name()
+    }
+
+    fn min_block(&self) -> usize {
+        self.0.min_block()
+    }
+
+    fn ifft_g1(&self, a: &mut [Xyzz<RawFq>]) -> Result<(), AccelError> {
+        check_block("group ifft over G1", a.len())?;
+        self.0.ifft_g1(a)
+    }
+
+    fn ifft_g2(&self, a: &mut [Xyzz<RawFq2>]) -> Result<(), AccelError> {
+        check_block("group ifft over G2", a.len())?;
+        self.0.ifft_g2(a)
+    }
+
+    fn ifft_g1_many(&self, blocks: &mut [&mut [Xyzz<RawFq>]]) -> Result<(), AccelError> {
+        for b in blocks.iter() {
+            check_block("group ifft over G1", b.len())?;
+        }
+        self.0.ifft_g1_many(blocks)
+    }
+
+    fn ifft_g2_many(&self, blocks: &mut [&mut [Xyzz<RawFq2>]]) -> Result<(), AccelError> {
+        for b in blocks.iter() {
+            check_block("group ifft over G2", b.len())?;
+        }
+        self.0.ifft_g2_many(blocks)
     }
 }
 

@@ -32,7 +32,7 @@ pub mod xyzz;
 use snarkrs_field::raw::RawField;
 use xyzz::{to_projective, RawCurve, Xyzz};
 
-pub use accel::{AccelError, GroupFft, KeyScale};
+pub use accel::{AccelError, CheckedGroupFft, GroupFft, KeyScale};
 
 /// A backend for the five MSMs the proof is made of.
 ///
@@ -1014,6 +1014,47 @@ mod tests {
                 Err(AccelError::Shape { op: "msm_g2", .. })
             ));
         }
+    }
+
+    #[test]
+    fn checked_group_fft_rejects_non_power_of_two_blocks() {
+        use snarkrs_field::raw::{RawFq, RawFq2};
+        struct Noop;
+        impl GroupFft for Noop {
+            fn name(&self) -> &'static str {
+                "noop"
+            }
+            fn ifft_g1(&self, _: &mut [Xyzz<RawFq>]) -> Result<(), AccelError> {
+                Ok(())
+            }
+            fn ifft_g2(&self, _: &mut [Xyzz<RawFq2>]) -> Result<(), AccelError> {
+                Ok(())
+            }
+        }
+        let fft = CheckedGroupFft::<dyn GroupFft>(Box::new(Noop));
+        let mut g1 = [Xyzz::<RawFq>::ZERO; 8];
+        let mut g2 = [Xyzz::<RawFq2>::ZERO; 8];
+        for n in [0, 3, 5, 6, 7] {
+            assert!(matches!(
+                fft.ifft_g1(&mut g1[..n]),
+                Err(AccelError::Shape { .. })
+            ));
+            assert!(matches!(
+                fft.ifft_g2(&mut g2[..n]),
+                Err(AccelError::Shape { .. })
+            ));
+        }
+        for n in [1, 2, 4, 8] {
+            fft.ifft_g1(&mut g1[..n]).unwrap();
+            fft.ifft_g2(&mut g2[..n]).unwrap();
+        }
+        let (a, b) = g1.split_at_mut(4);
+        let (c, _) = b.split_at_mut(3);
+        assert!(matches!(
+            fft.ifft_g1_many(&mut [a, c]),
+            Err(AccelError::Shape { .. })
+        ));
+        assert_eq!(fft.name(), "noop");
     }
 
     #[test]

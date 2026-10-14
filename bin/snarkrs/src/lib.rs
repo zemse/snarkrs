@@ -15,7 +15,7 @@ pub mod log;
 use anyhow::Result;
 use snarkrs_ceremony::{CpuGroupFft, CpuKeyScale};
 use snarkrs_groth16::{cpu::CpuBackend, Backend};
-use snarkrs_msm::{CpuMsm, GroupFft, KeyScale, MsmBackend};
+use snarkrs_msm::{AccelError, CheckedGroupFft, CpuMsm, GroupFft, KeyScale, MsmBackend};
 
 /// Whether CPUID reports BMI2 (leaf 7 EBX bit 8) and ADX (bit 19), given the highest
 /// basic leaf and leaf 7 subleaf 0's EBX.
@@ -270,12 +270,13 @@ pub fn msm_backend(kind: BackendKind) -> Result<Box<dyn MsmBackend>> {
 
 /// The group inverse FFT behind `ptau prepare`.
 pub fn fft_backend(kind: BackendKind) -> Result<Box<dyn GroupFft>> {
-    match ceremony_backend_kind(kind, CeremonySeam::GroupFft)? {
-        BackendKind::Cpu => Ok(Box::new(CpuGroupFft)),
-        BackendKind::Wgpu => Err(no_wgpu()),
-        BackendKind::Metal => metal_fft(),
-        BackendKind::Cuda => cuda_fft(),
-    }
+    let fft: Box<dyn GroupFft> = match ceremony_backend_kind(kind, CeremonySeam::GroupFft)? {
+        BackendKind::Cpu => Box::new(CpuGroupFft),
+        BackendKind::Wgpu => return Err(no_wgpu()),
+        BackendKind::Metal => metal_fft()?,
+        BackendKind::Cuda => cuda_fft()?,
+    };
+    Ok(Box::new(CheckedGroupFft(fft)))
 }
 
 /// The batch apply-key behind every contribute and beacon command.
@@ -342,11 +343,12 @@ fn cuda_fft() -> Result<Box<dyn GroupFft>> {
 /// going to get.
 fn no_cuda() -> anyhow::Error {
     if cfg!(feature = "cuda") {
-        anyhow::anyhow!(
-            "backend `cuda` is unavailable for this ceremony command: snarkrs-cuda implements \
-             the prover and the `ptau prepare` group FFT; the ceremony MSM and apply-key \
-             have no CUDA kernels yet"
-        )
+        AccelError::Unimplemented {
+            backend: "cuda",
+            reason: "snarkrs-cuda implements the prover and the `ptau prepare` group FFT; \
+                     the ceremony MSM and apply-key have no CUDA kernels yet",
+        }
+        .into()
     } else {
         not_built(BackendKind::Cuda)
     }
