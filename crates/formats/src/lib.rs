@@ -53,6 +53,32 @@ pub struct ProvingKey {
     pub vk: VerifyingKey,
 }
 
+/// One of the two constraint matrices a zkey holds. `index` is the position in
+/// [`Coefficients`]' per-matrix arrays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Matrix {
+    A,
+    B,
+}
+
+impl Matrix {
+    pub const BOTH: [Matrix; 2] = [Matrix::A, Matrix::B];
+
+    pub const fn index(self) -> usize {
+        match self {
+            Matrix::A => 0,
+            Matrix::B => 1,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Matrix::A => "A",
+            Matrix::B => "B",
+        }
+    }
+}
+
 /// Section 4 in CSR form: `A[c] = sum over row c of coef * w[s]`.
 ///
 /// snarkjs stores an unordered `(matrix, constraint, signal, coef)` list, which on CPU
@@ -70,7 +96,7 @@ pub struct ProvingKey {
 /// [`Coefficients::check_structure`] because a key built by hand is still reachable.
 pub struct Coefficients {
     /// `row_ptr[m][c]..row_ptr[m][c+1]` indexes into `signal`/`value`, for matrix `m`,
-    /// which is 0 for A and 1 for B. Transposing them is silent and produces a proof
+    /// indexed by [`Matrix::index`]. Transposing them is silent and produces a proof
     /// that does not verify.
     pub row_ptr: [Vec<u32>; 2],
     pub signal: [Vec<u32>; 2],
@@ -85,7 +111,8 @@ impl Coefficients {
         let rows_plus_one = domain_size
             .checked_add(1)
             .ok_or_else(|| bad(format!("domain size {domain_size} overflows CSR row count")))?;
-        for (m, name) in [(0usize, "A"), (1usize, "B")] {
+        for matrix in Matrix::BOTH {
+            let (m, name) = (matrix.index(), matrix.name());
             let rp = &self.row_ptr[m];
             if rp.len() != rows_plus_one {
                 return Err(bad(format!(

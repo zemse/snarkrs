@@ -5,7 +5,7 @@ use std::{env, error::Error, mem::size_of, path::PathBuf};
 
 use serde_json::{json, Value};
 use snarkrs_field::{AffineRepr, Fr, G1Affine, G2Affine, One, PrimeField, Zero};
-use snarkrs_formats::{wtns::Witness, ProvingKey};
+use snarkrs_formats::{wtns::Witness, Matrix, ProvingKey};
 use snarkrs_msm::{window_size, RECODE_BITS};
 
 fn msm<A: AffineRepr>(name: &str, bases: &[A], scalars: &[Fr]) -> Value {
@@ -55,7 +55,8 @@ fn trace(pk: &ProvingKey, witness: &[Fr]) -> Result<Value, Box<dyn Error>> {
         return Err("domain must be a nonzero power of two".into());
     }
     let mut gathers = Vec::new();
-    for m in 0..2 {
+    for matrix in Matrix::BOTH {
+        let m = matrix.index();
         let signals = &pk.coeffs.signal[m];
         let mut zeros = 0usize;
         let mut ones = 0usize;

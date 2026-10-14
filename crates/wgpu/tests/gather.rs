@@ -35,7 +35,7 @@ use std::sync::OnceLock;
 
 use ark_ff::Zero as _;
 use snarkrs_field::Fr;
-use snarkrs_formats::{wtns::Witness, Coefficients, ProvingKey};
+use snarkrs_formats::{wtns::Witness, Coefficients, Matrix, ProvingKey};
 use snarkrs_gpu_layout::testrng::SplitMix64;
 use snarkrs_gpu_layout::LIMBS;
 use snarkrs_groth16::cpu::CpuCircuit;
@@ -309,8 +309,8 @@ fn the_gather_matches_the_cpu_backend_on_every_artifact() {
         let run = run_gather(&pk.coeffs, &w, domain_size, None, None, None);
 
         let cpu = CpuCircuit::new(pk).expect("cpu circuit");
-        let want_a = cpu.gather(0, &w);
-        let want_b = cpu.gather(1, &w);
+        let want_a = cpu.gather(Matrix::A, &w);
+        let want_b = cpu.gather(Matrix::B, &w);
         let want_c: Vec<Fr> = want_a.iter().zip(&want_b).map(|(x, y)| *x * y).collect();
 
         compare(&format!("{name} out_a"), &run.a, &want_a);
@@ -625,8 +625,8 @@ fn the_gather_matches_the_cpu_backend_with_the_csr_in_chunks() {
         );
 
         let cpu = CpuCircuit::new(pk).expect("cpu circuit");
-        let want_a = cpu.gather(0, &w);
-        let want_b = cpu.gather(1, &w);
+        let want_a = cpu.gather(Matrix::A, &w);
+        let want_b = cpu.gather(Matrix::B, &w);
         let want_c: Vec<Fr> = want_a.iter().zip(&want_b).map(|(x, y)| *x * y).collect();
         compare(&format!("{name} chunked out_a"), &run.a, &want_a);
         compare(&format!("{name} chunked out_b"), &run.b, &want_b);
@@ -857,8 +857,8 @@ fn sweep_once() -> (f64, String, usize) {
         let w = Witness::load(&dir.join("circuit.wtns")).expect("wtns").0;
         let domain_size = pk.domain_size;
         let cpu = CpuCircuit::new(pk).expect("cpu circuit");
-        let want_a = cpu.gather(0, &w);
-        let want_b = cpu.gather(1, &w);
+        let want_a = cpu.gather(Matrix::A, &w);
+        let want_b = cpu.gather(Matrix::B, &w);
 
         let mut rows = Vec::new();
         let mut usable = true;

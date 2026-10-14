@@ -10,7 +10,7 @@ use web_time::Instant;
 use crate::{Backend, HPoly, MsmOutputs, PreparedCircuit, ProveError, StageTimings};
 use rayon::prelude::*;
 use snarkrs_field::*;
-use snarkrs_formats::ProvingKey;
+use snarkrs_formats::{Matrix, ProvingKey};
 use snarkrs_msm::{CpuMsm, MsmBackend};
 use snarkrs_ntt::CpuNtt;
 
@@ -144,8 +144,8 @@ impl CpuCircuit {
     /// If `m` is not 0 (A) or 1 (B). There are only two matrices in a zkey: snarkjs filters
     /// the C matrix out of section 4 before writing it, which is why stage 0 computes C
     /// rather than gathering it.
-    pub fn gather(&self, m: usize, witness: &[Fr]) -> Vec<Fr> {
-        assert!(m < 2, "matrix index {m}: a zkey holds only A and B");
+    pub fn gather(&self, matrix: Matrix, witness: &[Fr]) -> Vec<Fr> {
+        let m = matrix.index();
         let row_ptr = &self.pk.coeffs.row_ptr[m];
         let signal = &self.pk.coeffs.signal[m];
         let value = &self.pk.coeffs.value[m];
@@ -215,7 +215,10 @@ impl PreparedCircuit for CpuCircuit {
         let start = Instant::now();
         let (mut a, mut b) = stage!(
             "s0 gather A and B (concurrent)",
-            rayon::join(|| self.gather(0, witness), || self.gather(1, witness))
+            rayon::join(
+                || self.gather(Matrix::A, witness),
+                || self.gather(Matrix::B, witness)
+            )
         );
         let mut c: Vec<Fr> = stage!(
             "s0 build C = A*B pointwise",
@@ -578,7 +581,7 @@ mod tests {
     fn csr_accepts_empty_rows() {
         let circuit = CpuCircuit::new(csr_key()).unwrap();
         let witness = [Fr::from(2u64), Fr::from(3u64)];
-        for m in 0..2 {
+        for m in Matrix::BOTH {
             assert_eq!(
                 circuit.gather(m, &witness),
                 vec![witness[0], Fr::zero(), witness[1], Fr::zero()]
@@ -648,7 +651,8 @@ mod tests {
         let mut rng = ark_std::test_rng();
         for value in [Fr::zero(), Fr::one(), -Fr::one(), Fr::rand(&mut rng)] {
             let witness = vec![value; circuit.n_vars()];
-            for m in 0..2 {
+            for matrix in Matrix::BOTH {
+                let m = matrix.index();
                 let coeffs = &circuit.pk.coeffs;
                 let want: Vec<Fr> = coeffs.row_ptr[m]
                     .windows(2)
@@ -658,7 +662,7 @@ mod tests {
                             .sum()
                     })
                     .collect();
-                assert_eq!(circuit.gather(m, &witness), want);
+                assert_eq!(circuit.gather(matrix, &witness), want);
             }
         }
     }

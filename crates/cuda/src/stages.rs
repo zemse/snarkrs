@@ -50,7 +50,7 @@ use cudarc::driver::{
     DriverError, LaunchConfig, PinnedHostSlice, PushKernelArg,
 };
 use snarkrs_field::{Domain, Field, Fr};
-use snarkrs_formats::ProvingKey;
+use snarkrs_formats::{Matrix, ProvingKey};
 use snarkrs_gpu_layout::{PackedFr, PackedScalar};
 use snarkrs_groth16::{HPoly, ProveError, StageTimings};
 
@@ -418,12 +418,13 @@ impl CudaStages {
         // and the struct moves it.
         let up_u32 = |data: &[u32]| upload_u32(&stream, data);
         let up_fr = |data: &[Fr]| upload_u32(&stream, as_words(&PackedFr::pack_slice(data)));
+        let (a, b) = (Matrix::A.index(), Matrix::B.index());
         let row_ptr = [
-            up_u32(&pk.coeffs.row_ptr[0])?,
-            up_u32(&pk.coeffs.row_ptr[1])?,
+            up_u32(&pk.coeffs.row_ptr[a])?,
+            up_u32(&pk.coeffs.row_ptr[b])?,
         ];
-        let signal = [up_u32(&pk.coeffs.signal[0])?, up_u32(&pk.coeffs.signal[1])?];
-        let value = [up_fr(&pk.coeffs.value[0])?, up_fr(&pk.coeffs.value[1])?];
+        let signal = [up_u32(&pk.coeffs.signal[a])?, up_u32(&pk.coeffs.signal[b])?];
+        let value = [up_fr(&pk.coeffs.value[a])?, up_fr(&pk.coeffs.value[b])?];
         let tw_fwd = up_fr(&domain.twiddles())?;
         let tw_inv = up_fr(&domain.twiddles_inv())?;
         let coset_pows = up_fr(&pows)?;

@@ -27,7 +27,7 @@
 
 use bytemuck::{Pod, Zeroable};
 use snarkrs_field::Fr;
-use snarkrs_formats::Coefficients;
+use snarkrs_formats::{Coefficients, Matrix};
 use snarkrs_gpu_layout::{PackedFr, LIMBS};
 use snarkrs_groth16::ProveError;
 
@@ -129,7 +129,8 @@ impl CsrHost {
 
         let mut row_ptr = Vec::with_capacity(2 * rows_plus_one);
         let mut nnz = [0u32; 2];
-        for m in 0..2 {
+        for matrix in Matrix::BOTH {
+            let m = matrix.index();
             let rp = &coeffs.row_ptr[m];
             nnz[m] = rp[domain_size];
             row_ptr.extend_from_slice(rp);
@@ -143,7 +144,8 @@ impl CsrHost {
 
         let mut signal = Vec::with_capacity(total_nz);
         let mut value = Vec::with_capacity(total_nz * LIMBS);
-        for m in 0..2 {
+        for matrix in Matrix::BOTH {
+            let m = matrix.index();
             signal.extend_from_slice(&coeffs.signal[m]);
             push_fr_words(&coeffs.value[m], &mut value);
         }
