@@ -172,13 +172,33 @@ struct Kernel<'a> {
 
 impl Kernel<'_> {
     async fn go(self, backend: &WgpuBackend) -> Result<Vec<u32>, String> {
+        let built = self.build(backend, None).await?;
+        let mut enc = backend
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some(self.label),
+            });
+        built.dispatch(&mut enc, &[(self.groups, &[])]);
+        let got = read_back(backend, self.label, enc, &built.buf, self.words).await?;
+        built.close(backend).await?;
+        Ok(got)
+    }
+
+    /// Compiles, binds and seeds the kernel, leaving the validation scope open in the result.
+    ///
+    /// `uniform` adds a dynamic-offset uniform buffer at `@binding(1)`, as its bytes and the
+    /// size of the window each dispatch sees.
+    async fn build(
+        &self,
+        backend: &WgpuBackend,
+        uniform: Option<(&[u8], u64)>,
+    ) -> Result<Built, String> {
         let device = backend.device();
         // One scope for compile, bind and submit together. Popping it after the readback
         // would also catch anything the map raised, but a map error is already a `Result`
         // and folding the two would make the message ambiguous about which failed.
         let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
 
-        let bytes = (self.words * 4) as u64;
         let mut init = self.seed.clone();
         init.resize(self.words, 0);
         let buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -188,19 +208,51 @@ impl Kernel<'_> {
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST,
         });
+        let ubo = uniform.map(|(bytes, _)| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(self.label),
+                contents: bytes,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            })
+        });
 
-        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some(self.label),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
+        let mut layout_entries = vec![wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }];
+        let mut bind_entries = vec![wgpu::BindGroupEntry {
+            binding: 0,
+            resource: buf.as_entire_binding(),
+        }];
+        if let (Some((_, size)), Some(ubo)) = (uniform, ubo.as_ref()) {
+            layout_entries.push(wgpu::BindGroupLayoutEntry {
+                binding: 1,
                 visibility: wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: false },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: true,
+                    min_binding_size: wgpu::BufferSize::new(size),
                 },
                 count: None,
-            }],
+            });
+            bind_entries.push(wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: ubo,
+                    offset: 0,
+                    size: wgpu::BufferSize::new(size),
+                }),
+            });
+        }
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some(self.label),
+            entries: &layout_entries,
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some(self.label),
@@ -243,62 +295,88 @@ impl Kernel<'_> {
         let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(self.label),
             layout: &bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: buf.as_entire_binding(),
-            }],
+            entries: &bind_entries,
         });
+        Ok(Built {
+            scope,
+            buf,
+            pipeline,
+            bind,
+        })
+    }
+}
 
-        let staging = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some(self.label),
-            size: bytes,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
+/// A [`Kernel`] that has compiled and bound, with its validation scope still open.
+struct Built {
+    scope: wgpu::ErrorScopeGuard,
+    buf: wgpu::Buffer,
+    pipeline: wgpu::ComputePipeline,
+    bind: wgpu::BindGroup,
+}
+
+impl Built {
+    /// One compute pass with one dispatch per `(groups, dynamic offsets)` entry.
+    fn dispatch(&self, enc: &mut wgpu::CommandEncoder, dispatches: &[(u32, &[u32])]) {
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
         });
-        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some(self.label),
-        });
-        {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some(self.label),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&pipeline);
-            pass.set_bind_group(0, &bind, &[]);
-            pass.dispatch_workgroups(self.groups, 1, 1);
+        pass.set_pipeline(&self.pipeline);
+        for (groups, offsets) in dispatches {
+            pass.set_bind_group(0, &self.bind, offsets);
+            pass.dispatch_workgroups(*groups, 1, 1);
         }
-        enc.copy_buffer_to_buffer(&buf, 0, &staging, 0, bytes);
+    }
 
-        let (tx, rx) = flume::bounded(1);
-        enc.map_buffer_on_submit(&staging, wgpu::MapMode::Read, 0..bytes, move |r| {
-            let _ = tx.send(r);
-        });
-        backend.submit([enc.finish()]);
-        backend
-            .device()
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|e| format!("poll: {e}"))?;
-        rx.recv_async()
-            .await
-            .map_err(|_| "the map callback was dropped".to_string())?
-            .map_err(|e| format!("map: {e}"))?;
-
-        let view = staging
-            .slice(0..bytes)
-            .get_mapped_range()
-            .map_err(|e| format!("mapped range: {e}"))?;
-        let got: Vec<u32> = bytemuck::cast_slice(&view).to_vec();
-        drop(view);
-        staging.unmap();
-
-        if let Some(e) = scope.pop().await {
+    /// Pops the validation scope, then checks for anything the device reported unscoped.
+    async fn close(self, backend: &WgpuBackend) -> Result<(), String> {
+        if let Some(e) = self.scope.pop().await {
             return Err(format!("validation: {}", condense(&e.to_string())));
         }
         if let Some(e) = backend.take_error() {
             return Err(format!("uncaptured: {}", condense(&e.to_string())));
         }
-        Ok(got)
+        Ok(())
     }
+}
+
+/// Appends a copy of `src` into a mappable buffer to `enc`, submits it and waits for the words.
+async fn read_back(
+    backend: &WgpuBackend,
+    label: &str,
+    mut enc: wgpu::CommandEncoder,
+    src: &wgpu::Buffer,
+    words: usize,
+) -> Result<Vec<u32>, String> {
+    let bytes = (words * 4) as u64;
+    let staging = backend.device().create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: bytes,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    enc.copy_buffer_to_buffer(src, 0, &staging, 0, bytes);
+    let (tx, rx) = flume::bounded(1);
+    enc.map_buffer_on_submit(&staging, wgpu::MapMode::Read, 0..bytes, move |r| {
+        let _ = tx.send(r);
+    });
+    backend.submit([enc.finish()]);
+    backend
+        .device()
+        .poll(wgpu::PollType::wait_indefinitely())
+        .map_err(|e| format!("poll: {e}"))?;
+    rx.recv_async()
+        .await
+        .map_err(|_| "the map callback was dropped".to_string())?
+        .map_err(|e| format!("map: {e}"))?;
+    let view = staging
+        .slice(0..bytes)
+        .get_mapped_range()
+        .map_err(|e| format!("mapped range: {e}"))?;
+    let got: Vec<u32> = bytemuck::cast_slice(&view).to_vec();
+    drop(view);
+    staging.unmap();
+    Ok(got)
 }
 
 /// Trims a device error down to something a page can show.
@@ -403,9 +481,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// nothing in the prover is ordered against GPU completion.
 async fn fence_is_a_fence(backend: &WgpuBackend) -> Check {
     let t0 = web_time::Instant::now();
-    let device = backend.device();
     let n = 1024usize;
-    let bytes = (n * 4) as u64;
     let source = r#"
 @group(0) @binding(0) var<storage, read_write> out: array<u32>;
 @compute @workgroup_size(64)
@@ -422,63 +498,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
     let run = async {
-        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("selftest fence"),
-            size: bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("selftest fence"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: false },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("selftest fence"),
-            bind_group_layouts: &[Some(&bgl)],
-            immediate_size: 0,
-        });
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("selftest fence"),
-            source: wgpu::ShaderSource::Wgsl(source.into()),
-        });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("selftest fence"),
-            layout: Some(&layout),
-            module: &module,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("selftest fence"),
-            layout: &bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: buf.as_entire_binding(),
-            }],
-        });
+        let k = Kernel {
+            label: "selftest fence",
+            source: source.to_string(),
+            words: n,
+            seed: Vec::new(),
+            groups: (n / 64) as u32,
+        };
+        let built = k.build(backend, None).await?;
+        let device = backend.device();
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("selftest fence"),
         });
-        {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("selftest fence"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&pipeline);
-            pass.set_bind_group(0, &bind, &[]);
-            pass.dispatch_workgroups((n / 64) as u32, 1, 1);
-        }
+        built.dispatch(&mut enc, &[(k.groups, &[])]);
         let t = web_time::Instant::now();
         backend.submit([enc.finish()]);
         backend
@@ -490,39 +522,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // Now read it back through a second submit, and time that too. The map cannot resolve
         // before the copy has run, so this number is a lower bound on the real GPU time
         // whatever the fence says.
-        let staging = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("selftest fence readback"),
-            size: bytes,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        let enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("selftest fence readback"),
         });
-        enc.copy_buffer_to_buffer(&buf, 0, &staging, 0, bytes);
-        let (tx, rx) = flume::bounded(1);
-        enc.map_buffer_on_submit(&staging, wgpu::MapMode::Read, 0..bytes, move |r| {
-            let _ = tx.send(r);
-        });
-        backend.submit([enc.finish()]);
-        backend
-            .device()
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|e| format!("poll: {e}"))?;
-        rx.recv_async()
-            .await
-            .map_err(|_| "the map callback was dropped".to_string())?
-            .map_err(|e| format!("map: {e}"))?;
-        let view = staging
-            .slice(0..bytes)
-            .get_mapped_range()
-            .map_err(|e| format!("mapped range: {e}"))?;
-        let got: Vec<u32> = bytemuck::cast_slice(&view).to_vec();
-        drop(view);
-        staging.unmap();
-        if let Some(e) = scope.pop().await {
-            return Err(format!("validation: {}", condense(&e.to_string())));
-        }
+        let got = read_back(backend, "selftest fence readback", enc, &built.buf, n).await?;
+        built.close(backend).await?;
 
         let want: Vec<u32> = (0..n as u32).map(xorshift_200k).collect();
         compare(&got, &want)?;
@@ -779,9 +783,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
 /// validation error, and an answer that is wrong in a way nothing else here would catch.
 async fn dynamic_uniform_offsets(backend: &WgpuBackend) -> Check {
     let t0 = web_time::Instant::now();
-    let device = backend.device();
     let run = async {
-        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         // 256 is `minUniformBufferOffsetAlignment` at every tier of every browser, per the
         // module docs on `crate::device`.
         let stride = 256usize;
@@ -792,55 +794,11 @@ async fn dynamic_uniform_offsets(backend: &WgpuBackend) -> Check {
             chunk[0..4].copy_from_slice(&((b * 4) as u32).to_le_bytes());
             chunk[4..8].copy_from_slice(&(0xa5a50000u32 + b as u32).to_le_bytes());
         }
-        let ubo = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("selftest ring"),
-            contents: &ring,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
 
         let words = blocks * 4;
-        let bytes = (words * 4) as u64;
-        let out = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("selftest ring out"),
-            size: bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
-        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("selftest ring"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: true,
-                        min_binding_size: wgpu::BufferSize::new(8),
-                    },
-                    count: None,
-                },
-            ],
-        });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("selftest ring"),
-            bind_group_layouts: &[Some(&bgl)],
-            immediate_size: 0,
-        });
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("selftest ring"),
-            source: wgpu::ShaderSource::Wgsl(
-                r#"
+        let k = Kernel {
+            label: "selftest ring",
+            source: r#"
 struct P { base: u32, value: u32 }
 @group(0) @binding(0) var<storage, read_write> out: array<u32>;
 @group(0) @binding(1) var<uniform> p: P;
@@ -849,80 +807,22 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     out[p.base + lid.x] = p.value + lid.x;
 }
 "#
-                .into(),
-            ),
-        });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("selftest ring"),
-            layout: Some(&layout),
-            module: &module,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("selftest ring"),
-            layout: &bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: out.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &ubo,
-                        offset: 0,
-                        size: wgpu::BufferSize::new(8),
-                    }),
-                },
-            ],
-        });
-
-        let staging = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("selftest ring staging"),
-            size: bytes,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("selftest ring"),
-        });
-        {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("selftest ring"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&pipeline);
-            for b in 0..blocks {
-                pass.set_bind_group(0, &bind, &[(b * stride) as u32]);
-                pass.dispatch_workgroups(1, 1, 1);
-            }
-        }
-        enc.copy_buffer_to_buffer(&out, 0, &staging, 0, bytes);
-        let (tx, rx) = flume::bounded(1);
-        enc.map_buffer_on_submit(&staging, wgpu::MapMode::Read, 0..bytes, move |r| {
-            let _ = tx.send(r);
-        });
-        backend.submit([enc.finish()]);
-        backend
+            .to_string(),
+            words,
+            seed: Vec::new(),
+            groups: 1,
+        };
+        let built = k.build(backend, Some((&ring, 8))).await?;
+        let mut enc = backend
             .device()
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|e| format!("poll: {e}"))?;
-        rx.recv_async()
-            .await
-            .map_err(|_| "the map callback was dropped".to_string())?
-            .map_err(|e| format!("map: {e}"))?;
-        let view = staging
-            .slice(0..bytes)
-            .get_mapped_range()
-            .map_err(|e| format!("mapped range: {e}"))?;
-        let got: Vec<u32> = bytemuck::cast_slice(&view).to_vec();
-        drop(view);
-        staging.unmap();
-        if let Some(e) = scope.pop().await {
-            return Err(format!("validation: {}", condense(&e.to_string())));
-        }
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("selftest ring"),
+            });
+        let offsets: Vec<[u32; 1]> = (0..blocks).map(|b| [(b * stride) as u32]).collect();
+        let dispatches: Vec<(u32, &[u32])> = offsets.iter().map(|o| (1, &o[..])).collect();
+        built.dispatch(&mut enc, &dispatches);
+        let got = read_back(backend, "selftest ring", enc, &built.buf, words).await?;
+        built.close(backend).await?;
 
         let mut want = vec![0u32; words];
         for b in 0..blocks {
