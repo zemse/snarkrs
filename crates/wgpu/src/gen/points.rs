@@ -1069,7 +1069,15 @@ fn pt_from_affine_{sfx}(p: {aff}) -> {pt} {{
     return {pt}(p.x, p.y, {f}_one(), {f}_one());
 }}
 
-// mdbl-2008-s: doubling an affine point straight into XYZZ. BN254 has a = 0 on both G1 and
+"
+    );
+    // The straight-line spellings call the doublers; the microcoded `pt_madd_*` and `pt_add_*`
+    // inline them, and `pt_mul_small_*` (only emitted at `REDUCE_BODY` 1) calls `pt_dbl_*` only
+    // at `MUL_SMALL_BODY` 1.
+    if !microcoded() {
+        let _ = write!(
+            s,
+            "// mdbl-2008-s: doubling an affine point straight into XYZZ. BN254 has a = 0 on both G1 and
 // G2, so the a*ZZ^2 term of the general doubling disappears.
 fn pt_dbl_affine_{sfx}(p: {aff}) -> {pt} {{
     if ({f}_is_zero(p.y)) {{
@@ -1088,7 +1096,13 @@ fn pt_dbl_affine_{sfx}(p: {aff}) -> {pt} {{
     return {pt}(rx, ry, v, w);
 }}
 
-// dbl-2008-s-1 with a = 0.
+"
+        );
+    }
+    if !microcoded() || (REDUCE_BODY.get() == 1 && MUL_SMALL_BODY.get() == 1) {
+        let _ = write!(
+            s,
+            "// dbl-2008-s-1 with a = 0.
 fn pt_dbl_{sfx}(p: {pt}) -> {pt} {{
     if (pt_is_zero_{sfx}(p) || {f}_is_zero(p.y)) {{
         return pt_zero_{sfx}();
@@ -1105,7 +1119,8 @@ fn pt_dbl_{sfx}(p: {pt}) -> {pt} {{
 }}
 
 "
-    );
+        );
+    }
     s.push_str(&pt_madd(c));
     s.push_str(&pt_add(c));
     // k * P for a small k: here k is a bucket index inside one window, so it is below 2^15.
@@ -1127,6 +1142,9 @@ fn pt_dbl_{sfx}(p: {pt}) -> {pt} {{
     // `MUL_SMALL_BODY`
     // keeps the failing spelling reachable, because a workaround for a compiler nobody can
     // inspect should not also be the only record of what was tried.
+    if REDUCE_BODY.get() != 1 {
+        return s;
+    }
     if MUL_SMALL_BODY.get() == 1 {
         let _ = write!(
             s,

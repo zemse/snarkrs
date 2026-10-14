@@ -878,22 +878,24 @@ fn the_g1_module_carries_no_fq2_it_never_calls() {
     );
     assert!(!g1.contains("struct Fq2"), "the G1 module declares Fq2");
     assert!(g2.contains("fn fq2_mul("), "the G2 module lost fq2_mul");
-    // And every point routine is there under the right prefix. The last three are not
-    // reachable at the shipped knobs: `pt_dbl_affine_g1` and `pt_dbl_g1` are the straight-line
-    // spellings `gen::points::POINT_BODY` 0 calls, and `pt_mul_small_g1` is called only from
-    // `REDUCE_BODY` 1. They are emitted unconditionally, which REV-11 owns; what is pinned
-    // here is the naming, not the reachability.
+    // And every point routine this build reaches is there under the right prefix. The
+    // doublers and `pt_mul_small_g1` are gated on the knobs that call them (see
+    // `gen::points::point_ops`), so the shipped defaults emit none of the three.
     for f in [
         "fn fq_mul(",
         "fn fq_sqr(",
         "fn fq_neg(",
         "fn pt_madd_g1(",
         "fn pt_add_g1(",
+    ] {
+        assert!(g1.contains(f), "the G1 module is missing {f}");
+    }
+    for f in [
         "fn pt_dbl_g1(",
         "fn pt_dbl_affine_g1(",
         "fn pt_mul_small_g1(",
     ] {
-        assert!(g1.contains(f), "the G1 module is missing {f}");
+        assert!(!g1.contains(f), "the G1 module carries unreachable {f}");
     }
     for e in wgsl::G1.entries() {
         assert!(g1.contains(&format!("fn {e}(")), "no entry point {e}");
