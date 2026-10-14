@@ -1505,8 +1505,8 @@ fn run_prove(
         println!("msm         us {:>10}", t.msm_us);
         println!("assemble    us {:>10}", t.assemble_us);
         println!("verify      us {:>10}", t.verify_us);
-        // Inside `msm` above, and overlapping each other, so not in `attributed`. Absent
-        // when the backend submits the five MSMs as one batch.
+        // Only under `G16_MSM_SERIAL=1` on the cpu backend, where `msm` above is their sum,
+        // so they are not added to `attributed` again.
         if let Some(m) = t.msm_split {
             println!("msm a       us {:>10}", m.a_us);
             println!("msm b_g2    us {:>10}", m.b_g2_us);

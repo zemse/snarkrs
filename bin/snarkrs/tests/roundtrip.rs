@@ -322,7 +322,8 @@ fn bench_writes_a_verified_csv() {
             "msm_b_g2_us",
             "msm_b_g1_us",
             "msm_l_us",
-            "msm_h_us"
+            "msm_h_us",
+            "msm_serial"
         ]
     );
     let rows: Vec<Vec<&str>> = lines.map(|l| l.split(',').collect()).collect();
@@ -336,19 +337,12 @@ fn bench_writes_a_verified_csv() {
         assert_eq!(col(r, "backend"), "cpu");
         assert!(col(r, "ms").parse::<f64>().unwrap() > 0.0);
         assert!(col(r, "prepare_ms").parse::<f64>().unwrap() > 0.0);
-        // The CPU backend times each MSM on its own.
-        for m in [
-            "msm_a_us",
-            "msm_b_g2_us",
-            "msm_b_g1_us",
-            "msm_l_us",
-            "msm_h_us",
-        ] {
-            assert!(col(r, m).parse::<u64>().is_ok(), "{m} empty on cpu");
-        }
+        // Overlapped by default, so there is no per-MSM split to report.
+        assert_eq!(col(r, "msm_serial"), "no");
+        assert_eq!(col(r, "msm_h_us"), "");
     }
     let modes: Vec<String> = rows.iter().map(|r| col(r, "mode")).collect();
-    assert_eq!(modes, ["cold", "cold", "warm", "warm"]);
+    assert_eq!(modes, ["cold-inprocess", "cold-inprocess", "warm", "warm"]);
 
     // Cold has to be slower than warm by construction: it pays the same prepare inside
     // the timed region. Compared on the minimum of each, because a loaded machine can
@@ -359,14 +353,14 @@ fn bench_writes_a_verified_csv() {
             .map(|r| col(r, "ms").parse::<f64>().unwrap())
             .fold(f64::INFINITY, f64::min)
     };
-    let (cold, warm) = (best("cold"), best("warm"));
+    let (cold, warm) = (best("cold-inprocess"), best("warm"));
     assert!(
         cold > warm,
         "cold {cold} ms was not slower than warm {warm} ms"
     );
 
     // Warm reports setup out of band; cold folds it into `ms`.
-    for r in rows.iter().filter(|r| col(r, "mode") == "cold") {
+    for r in rows.iter().filter(|r| col(r, "mode") == "cold-inprocess") {
         assert!(
             col(r, "ms").parse::<f64>().unwrap() > col(r, "prepare_ms").parse::<f64>().unwrap()
         );

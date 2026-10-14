@@ -79,7 +79,7 @@ pub struct Args {
     pub snarkjs: Option<PathBuf>,
 }
 
-pub const CSV_HEADER: &str = "host,os,arch,cores,variant,constraints,prover,backend,mode,rep,ms,prepare_ms,gather_us,ntt_us,pointwise_us,msm_us,assemble_us,verified,adx_bmi2,msm_a_us,msm_b_g2_us,msm_b_g1_us,msm_l_us,msm_h_us";
+pub const CSV_HEADER: &str = "host,os,arch,cores,variant,constraints,prover,backend,mode,rep,ms,prepare_ms,gather_us,ntt_us,pointwise_us,msm_us,assemble_us,verified,adx_bmi2,msm_a_us,msm_b_g2_us,msm_b_g1_us,msm_l_us,msm_h_us,msm_serial";
 
 /// One proof and what it cost. `prepare_ms` is setup only, and for a cold-inprocess rep it
 /// is the part of `ms` spent before `prove()` was entered. A cold-process rep sees only
@@ -107,7 +107,12 @@ impl Row {
                 t.gather_us, t.ntt_us, t.pointwise_us, t.msm_us, t.assemble_us
             )
         });
-        // Empty when the backend could not time the five MSMs apart, see `MsmSplit`.
+        // Filled only by a cpu proof under `G16_MSM_SERIAL=1`, see `MsmSplit`. `msm_serial`
+        // says which kind of row this is, since `msm_us` means a sum under it and an
+        // overlapped wall time without; empty when the timings themselves are.
+        let serial = self
+            .timings
+            .map_or("", |t| if t.msm_split.is_some() { "yes" } else { "no" });
         let split = self
             .timings
             .and_then(|t| t.msm_split)
@@ -118,7 +123,7 @@ impl Row {
                 )
             });
         format!(
-            "{},{},{},{},{},{},ours,{},{},{},{:.3},{},{},yes,{},{}",
+            "{},{},{},{},{},{},ours,{},{},{},{:.3},{},{},yes,{},{},{}",
             host.host,
             host.os,
             host.arch,
@@ -133,6 +138,7 @@ impl Row {
             stages,
             if ADX_BMI2 { "yes" } else { "no" },
             split,
+            serial,
         )
     }
 }
@@ -515,7 +521,7 @@ fn report(rows: &[Row]) {
         median(&splits.iter().map(|m| f(m) as f64).collect::<Vec<_>>()) / 1000.0
     };
     println!(
-        "         msms (median ms, overlapping): a {:.2}  b_g2 {:.2}  b_g1 {:.2}  l {:.2}  h {:.2}",
+        "         msms (median ms, serial): a {:.2}  b_g2 {:.2}  b_g1 {:.2}  l {:.2}  h {:.2}",
         msm(|m| m.a_us),
         msm(|m| m.b_g2_us),
         msm(|m| m.b_g1_us),
@@ -622,7 +628,7 @@ mod tests {
         // with no way to see which stage owns it.
         assert!(line.contains(",1,2,3,4,5,yes,"), "{line}");
         let adx = if ADX_BMI2 { "yes" } else { "no" };
-        assert!(line.ends_with(&format!(",{adx},6,7,8,9,10")), "{line}");
+        assert!(line.ends_with(&format!(",{adx},6,7,8,9,10,yes")), "{line}");
         assert!(line.contains(",ours,cpu,warm,3,1.500,2.250,"), "{line}");
     }
 
@@ -649,7 +655,7 @@ mod tests {
             line.contains(",ours,cpu,cold-process,1,1.500,,,,,,,yes,"),
             "{line}"
         );
-        assert!(line.ends_with(",,,,,"), "{line}");
+        assert!(line.ends_with(",,,,,,"), "{line}");
     }
 
     #[test]

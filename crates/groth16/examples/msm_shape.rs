@@ -1,8 +1,8 @@
 //! What the five MSMs are actually made of, and what each one costs.
 //!
-//! `StageTimings` reports `msm_us` for all five and, on the CPU, `msm_split` with each
-//! one's latency inside the overlapped nest. Neither says what an MSM is made of or what
-//! it costs alone. Two questions this answers that they cannot:
+//! `StageTimings` reports one `msm_us` for all five, and `msm_split` only under
+//! `G16_MSM_SERIAL=1`. Neither says what an MSM is made of. Two questions this answers that
+//! they cannot:
 //!
 //!   * **The 0/1 share.** `snarkrs-msm`'s module docs built the prescan fast path on "in
 //!     bit-decomposition-heavy circuits over 99% of witness scalars are 0 or 1", and then

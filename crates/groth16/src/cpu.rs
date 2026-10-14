@@ -340,6 +340,34 @@ impl PreparedCircuit for CpuCircuit {
             });
         }
 
+        // `G16_MSM_SERIAL` trades the overlap below for a per-MSM cost: the five run one
+        // after another, each still parallel over the pool, and `msm_us` becomes their sum.
+        // Overlapped, every MSM's thread steals the others' chunks while it waits, so all
+        // five finish near the end and no per-MSM number would mean anything.
+        if std::env::var_os("G16_MSM_SERIAL").is_some_and(|v| v == "1") {
+            let (a_g1, a_us) = timed(|| self.msm.msm_g1(&self.pk.a_query, witness));
+            let (b_g2, b_g2_us) = timed(|| self.msm.msm_g2(&self.pk.b_g2_query, witness));
+            let (b_g1, b_g1_us) = timed(|| self.msm.msm_g1(&self.pk.b_g1_query, witness));
+            let (l_g1, l_us) = timed(|| self.msm.msm_g1(&self.pk.l_query, l_scalars));
+            let (h_g1, h_us) = timed(|| self.msm.msm_g1(&self.pk.h_query, h));
+            let split = MsmSplit {
+                a_us,
+                b_g2_us,
+                b_g1_us,
+                l_us,
+                h_us,
+            };
+            t.msm_us += a_us + b_g2_us + b_g1_us + l_us + h_us;
+            MsmSplit::accumulate(&mut t.msm_split, split);
+            return Ok(MsmOutputs {
+                a_g1,
+                b_g2,
+                b_g1,
+                l_g1,
+                h_g1,
+            });
+        }
+
         let start = Instant::now();
         // The five MSMs overlap through nested joins. Not because four of them are cheap:
         // only 1.80% of witness scalars are 0 or 1 on the two largest circuits, 4.12% at
@@ -348,68 +376,44 @@ impl PreparedCircuit for CpuCircuit {
         // and 1.77x at 2, and it lifts occupancy on a pool that otherwise idles: a proof
         // measures 9.41 busy cores out of 12. `examples/msm_shape.rs` times them one at a
         // time.
-        //
-        // Each leaf times itself for `msm_split`. The leaves overlap, so their times are
-        // per-MSM latencies under contention, not shares of `msm_us` (see `MsmSplit`).
-        let (((a_g1, a_us), (b_g2, b_g2_us)), (((b_g1, b_g1_us), (l_g1, l_us)), (h_g1, h_us))) =
-            rayon::join(
-                || {
-                    rayon::join(
-                        || {
-                            timed(|| {
-                                stage!("s5 MSM A -> G1", self.msm.msm_g1(&self.pk.a_query, witness))
-                            })
-                        },
-                        || {
-                            timed(|| {
+        let ((a_g1, b_g2), ((b_g1, l_g1), h_g1)) = rayon::join(
+            || {
+                rayon::join(
+                    || stage!("s5 MSM A -> G1", self.msm.msm_g1(&self.pk.a_query, witness)),
+                    || {
+                        stage!(
+                            "s6 MSM B -> G2",
+                            self.msm.msm_g2(&self.pk.b_g2_query, witness)
+                        )
+                    },
+                )
+            },
+            || {
+                rayon::join(
+                    || {
+                        rayon::join(
+                            || {
                                 stage!(
-                                    "s6 MSM B -> G2",
-                                    self.msm.msm_g2(&self.pk.b_g2_query, witness)
+                                    "s7 MSM B -> G1",
+                                    self.msm.msm_g1(&self.pk.b_g1_query, witness)
                                 )
-                            })
-                        },
-                    )
-                },
-                || {
-                    rayon::join(
-                        || {
-                            rayon::join(
-                                || {
-                                    timed(|| {
-                                        stage!(
-                                            "s7 MSM B -> G1",
-                                            self.msm.msm_g1(&self.pk.b_g1_query, witness)
-                                        )
-                                    })
-                                },
-                                || {
-                                    timed(|| {
-                                        stage!(
-                                            "s8 MSM L -> G1",
-                                            self.msm.msm_g1(&self.pk.l_query, l_scalars)
-                                        )
-                                    })
-                                },
-                            )
-                        },
-                        // Every one of the `domain_size` bases is used. The "only n-1 are
-                        // nonzero" rule belongs to the coefficient-form convention; in
-                        // snarkjs' evaluation form all n entries are generically nonzero.
-                        || timed(|| stage!("s9 MSM H -> G1", self.msm.msm_g1(&self.pk.h_query, h))),
-                    )
-                },
-            );
-        t.msm_us += start.elapsed().as_micros() as u64;
-        MsmSplit::accumulate(
-            &mut t.msm_split,
-            MsmSplit {
-                a_us,
-                b_g2_us,
-                b_g1_us,
-                l_us,
-                h_us,
+                            },
+                            || {
+                                stage!(
+                                    "s8 MSM L -> G1",
+                                    self.msm.msm_g1(&self.pk.l_query, l_scalars)
+                                )
+                            },
+                        )
+                    },
+                    // Every one of the `domain_size` bases is used. The "only n-1 are
+                    // nonzero" rule belongs to the coefficient-form convention; in
+                    // snarkjs' evaluation form all n entries are generically nonzero.
+                    || stage!("s9 MSM H -> G1", self.msm.msm_g1(&self.pk.h_query, h)),
+                )
             },
         );
+        t.msm_us += start.elapsed().as_micros() as u64;
 
         Ok(MsmOutputs {
             a_g1,

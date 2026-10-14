@@ -314,24 +314,22 @@ pub struct StageTimings {
     pub gather_us: u64,
     pub ntt_us: u64,
     pub pointwise_us: u64,
-    /// Measured wall time of stages 5-9 as a whole. Not the sum of [`Self::msm_split`]:
-    /// the CPU backend runs the five concurrently.
+    /// Measured wall time of stages 5-9. The CPU backend overlaps the five MSMs; under
+    /// `G16_MSM_SERIAL=1` it runs them one after another and this is their sum.
     pub msm_us: u64,
     pub assemble_us: u64,
     /// The check of the result in [`prove::prove`]. Zero from [`prove::prove_unchecked`].
     pub verify_us: u64,
-    /// Stages 5-9 one MSM at a time, where the backend can time them separately. Only the
-    /// CPU backend fills it. Metal, CUDA and wgpu submit the five as one batch with shared
-    /// digit passes, so any split would be invented and they leave it `None`.
+    /// Each MSM's cost under serial execution. Filled only by the CPU backend with
+    /// `G16_MSM_SERIAL=1`; default proving overlaps the five and leaves it `None`, because
+    /// overlapped they all finish near the end and no per-MSM time means anything. Metal,
+    /// CUDA and wgpu submit the five as one batch and always leave it `None`.
     pub msm_split: Option<MsmSplit>,
 }
 
-/// Wall time of each MSM in stages 5-9, in microseconds, from the moment that MSM starts
-/// to the moment it finishes while the others share the pool. This is latency, not cost:
-/// a thread waiting on its own MSM's chunks steals the others', so on the CPU all five
-/// finish near the end of the region and each reads close to [`StageTimings::msm_us`]
-/// (225 ms each against 225 ms at js_16x16_d32). What one MSM costs alone is
-/// `examples/msm_shape.rs`.
+/// Wall time of each MSM in stages 5-9 when the five run one after another, each still
+/// parallel over the whole pool, in microseconds. A per-MSM cost, not a share of an
+/// overlapped proof's `msm_us`.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MsmSplit {
     /// Stage 5, A in G1.

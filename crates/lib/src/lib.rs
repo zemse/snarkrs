@@ -77,5 +77,5 @@ pub use snarkrs_groth16::{
     cpu::CpuBackend,
     prove::prove,
     verify::{verify, VerifyError},
-    Backend, PreparedCircuit, Proof, ProveError, StageTimings,
+    Backend, MsmSplit, PreparedCircuit, Proof, ProveError, StageTimings,
 };
