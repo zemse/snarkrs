@@ -233,6 +233,10 @@ represent anything.
 10 reps, medians with min and max. Medians rather than means because these runs are short
 enough that one scheduler hiccup is likely, and it moves a mean but not a median.
 
+The `cores` column of rows written by `snarkrs bench` is the rayon pool size the proofs ran on
+(`--threads N`, else `RAYON_NUM_THREADS`, else the machine's logical cores), not the machine's core
+count. Older rows hold the logical core count whatever pool they used.
+
 **Every timing belongs to a proof that was verified before it was recorded.** A benchmark
 that times a broken prover is worse than no benchmark. Verification is by rapidsnark's C++
 verifier in the loop, plus our own verifier and `snarkjs groth16 verify` as cross-checks

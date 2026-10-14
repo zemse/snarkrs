@@ -375,7 +375,23 @@ pub struct HostInfo {
     pub host: String,
     pub os: &'static str,
     pub arch: &'static str,
+    /// The size of the rayon pool proving runs on, which is the machine's logical cores
+    /// unless `--threads` or `RAYON_NUM_THREADS` says otherwise.
     pub cores: usize,
+}
+
+/// Builds the global rayon pool with `n` threads. Must run before anything has used the
+/// pool, since rayon cannot resize one that exists.
+pub fn set_threads(n: usize) -> anyhow::Result<()> {
+    if n == 0 {
+        anyhow::bail!("--threads must be at least 1");
+    }
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(n)
+        .build_global()
+        .map_err(|e| {
+            anyhow::anyhow!("--threads {n}: the rayon thread pool was already built ({e})")
+        })
 }
 
 impl HostInfo {
@@ -398,9 +414,7 @@ impl HostInfo {
                 "aarch64" => "arm64",
                 other => other,
             },
-            cores: std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1),
+            cores: rayon::current_num_threads(),
         }
     }
 }

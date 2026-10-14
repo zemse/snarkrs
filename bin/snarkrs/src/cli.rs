@@ -368,7 +368,7 @@ pub const EXTRAS: &[(&str, &str)] = &[
 
 /// Our options that take their value as the next token. Everything else is a flag or
 /// `key=value`, as in snarkjs.
-pub const VALUE_OPTIONS: &[&str] = &["backend", "self-verify", "fallback", "vkey"];
+pub const VALUE_OPTIONS: &[&str] = &["backend", "self-verify", "fallback", "vkey", "threads"];
 
 /// snarkjs' short option names (`-verbose|v`, `-entropy|e`, `-name|n`, and `wtns debug`'s
 /// `-get|g`, `-set|s`, `-trigger|t`) and `-h`.

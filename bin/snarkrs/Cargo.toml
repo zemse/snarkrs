@@ -49,6 +49,7 @@ ark-serialize.workspace = true
 # scope, and the zero-knowledge blinders have nowhere trustworthy to come from.
 ark-std = { workspace = true, features = ["std", "getrandom"] }
 clap.workspace = true
+rayon.workspace = true
 dhat = { workspace = true, optional = true }
 anyhow.workspace = true
 serde.workspace = true

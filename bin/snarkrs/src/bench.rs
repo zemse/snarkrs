@@ -77,6 +77,10 @@ pub struct Args {
     /// curve and pairing code with the prover; snarkjs shares none of it.
     #[arg(long, value_name = "PATH")]
     pub snarkjs: Option<PathBuf>,
+    /// Size of the rayon pool proving runs on, recorded in the CSV `cores` column.
+    /// Default: RAYON_NUM_THREADS, else the machine's logical cores.
+    #[arg(long, value_name = "N")]
+    pub threads: Option<usize>,
 }
 
 pub const CSV_HEADER: &str = "host,os,arch,cores,variant,constraints,prover,backend,mode,rep,ms,prepare_ms,gather_us,ntt_us,pointwise_us,msm_us,assemble_us,verified,adx_bmi2,msm_a_us,msm_b_g2_us,msm_b_g1_us,msm_l_us,msm_h_us,msm_serial";
@@ -146,6 +150,9 @@ impl Row {
 pub fn run(args: Args) -> Result<()> {
     if args.reps == 0 {
         bail!("--reps must be at least 1");
+    }
+    if let Some(n) = args.threads {
+        crate::set_threads(n)?;
     }
     let host = HostInfo::detect();
     let variants = artifacts::selected(&args.artifacts, &args.variant)?;
@@ -406,6 +413,9 @@ fn prove_command(
         .args(["--backend", args.backend.as_str(), "--self-verify", "false"]);
     if args.constant_work {
         cmd.arg("--constant-work");
+    }
+    if let Some(n) = args.threads {
+        cmd.args(["--threads", &n.to_string()]);
     }
     cmd
 }

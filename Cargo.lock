@@ -2033,6 +2033,7 @@ dependencies = [
  "hex",
  "libc",
  "num-bigint",
+ "rayon",
  "serde",
  "serde_json",
  "snarkrs-ceremony",

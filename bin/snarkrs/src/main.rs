@@ -33,14 +33,15 @@
 //!
 //!   snarkrs bench  --artifacts DIR [--variant NAME]... [--reps 15] [--backend cpu|wgpu|...]
 //!                  [--mode cold-inprocess|cold-process|warm|both] [--csv out.csv]
+//!                  [--threads N]
 //!   snarkrs trace  --zkey c.zkey --witness c.wtns [--backend cpu|wgpu|...] [--out t.txt]
 //!   snarkrs fft-bench --power N [--variants NAME,...] [--block-size N,...]  (cuda only)
 //!
 //! The snarkjs commands take snarkjs' words, aliases, positionals, defaults and options;
 //! `cli.rs` turns that line into one clap parses, and has the table. Our own options sit on
 //! top as `--` flags: `groth16 prove` and `fullprove` take `--backend cpu|wgpu|metal|cuda`,
-//! `--stage-timings`, `--self-verify true|false`, `--vkey vkey.json`, `--fallback` and
-//! `--constant-work`, and the ceremony commands take `--backend cpu|metal`.
+//! `--stage-timings`, `--self-verify true|false`, `--vkey vkey.json`, `--fallback`,
+//! `--constant-work` and `--threads N`, and the ceremony commands take `--backend cpu|metal`.
 //!
 //! Exit codes are snarkjs': 0 for success, 1 for a failure or a proof or file that does not
 //! verify, 99 for a line that names no command or gives it the wrong parameters. The log
@@ -328,6 +329,10 @@ struct ProveOpts {
     /// constant-time guarantee.
     #[arg(long)]
     constant_work: bool,
+    /// Size of the rayon pool to prove on. Default: RAYON_NUM_THREADS, else the
+    /// machine's logical cores.
+    #[arg(long, value_name = "N")]
+    threads: Option<usize>,
 }
 
 #[derive(Subcommand)]
@@ -1328,7 +1333,11 @@ fn run_prove(
         ref vkey,
         fallback,
         constant_work,
+        threads,
     } = *opts;
+    if let Some(n) = threads {
+        snarkrs_cli::set_threads(n)?;
+    }
     // Before the key is read: a backend this binary cannot run, or one that cannot keep
     // --constant-work's promise, is refused without the load.
     let backend_of = |kind| {
