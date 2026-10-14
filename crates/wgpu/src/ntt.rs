@@ -210,7 +210,7 @@ impl NttTables {
     /// shorten every gather.
     pub fn new(backend: &WgpuBackend, domain_size: usize) -> Result<Self, ProveError> {
         let domain = Domain::new(domain_size).map_err(|e| bad(e.to_string()))?;
-        if domain.size != domain_size {
+        if domain.size() != domain_size {
             return Err(bad(format!(
                 "domain size {domain_size} is not a power of two"
             )));
@@ -221,21 +221,21 @@ impl NttTables {
         // evaluations against the wrong Lagrange polynomials.
         let coset_shift = Domain::new(
             domain
-                .size
+                .size()
                 .checked_mul(2)
                 .ok_or_else(|| bad("domain size overflows"))?,
         )
         .map_err(|e| bad(format!("no 2n-th root of unity: {e}")))?
-        .group_gen;
+        .group_gen();
 
         // Reject the unchunked tables before building any host vectors or uploading twiddles.
-        check_table_capacity(domain.size, &backend.granted_limits())?;
+        check_table_capacity(domain.size(), &backend.granted_limits())?;
 
         // A running product, one multiply per entry, rather than a square-and-multiply
         // ladder per index. At 2^18 that is 262,144 multiplies against about 4.7 million.
-        let mut pows = Vec::with_capacity(domain.size);
+        let mut pows = Vec::with_capacity(domain.size());
         let mut acc = Fr::ONE;
-        for _ in 0..domain.size {
+        for _ in 0..domain.size() {
             pows.push(acc);
             acc *= coset_shift;
         }
@@ -580,10 +580,11 @@ impl Ntt {
         ring: &mut ParamRing,
         tf: &Transform<'_>,
     ) -> Result<Planned, ProveError> {
-        if tables.domain.log_size != self.log_n {
+        if tables.domain.log_size() != self.log_n {
             return Err(bad(format!(
                 "the tables are a 2^{} domain and these pipelines are a 2^{} one",
-                tables.domain.log_size, self.log_n
+                tables.domain.log_size(),
+                self.log_n
             )));
         }
         let join = matches!(tf.epilogue, Epilogue::Join { .. });
@@ -602,7 +603,7 @@ impl Ntt {
             .transpose()?;
 
         let kscale = match tf.scale {
-            Scale::SizeInv => PackedFr::from_fr(&tables.domain.size_inv).v,
+            Scale::SizeInv => PackedFr::from_fr(&tables.domain.size_inv()).v,
             _ => [0u32; LIMBS],
         };
         let scale_mode = match tf.scale {

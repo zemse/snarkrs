@@ -718,13 +718,13 @@ fn check_h_section(
     let domain = Domain::new(domain_size)
         .map_err(|_| CeremonyError::CircuitTooBig(crate::floor_log2(domain_size as u64)))?;
     let double = Domain::new(domain_size * 2)
-        .map_err(|_| CeremonyError::CircuitTooBig(domain.log_size + 1))?;
+        .map_err(|_| CeremonyError::CircuitTooBig(domain.log_size() + 1))?;
     let mut shifted = coeffs;
     let first = -Fr::from(2u64);
     let mut t = first;
     for c in shifted.iter_mut() {
         *c *= t;
-        t *= double.group_gen;
+        t *= double.group_gen();
     }
     let ntt = CpuNtt::new();
     ntt.ntt(&domain, &mut shifted, Direction::Forward);

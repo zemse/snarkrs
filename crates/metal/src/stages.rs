@@ -422,7 +422,7 @@ pub struct HResident {
 impl HResident {
     fn new(st: &HStages, pk: &ProvingKey) -> Result<Self, ProveError> {
         let domain = Domain::new(pk.domain_size).map_err(|e| bad(e.to_string()))?;
-        if domain.size != pk.domain_size {
+        if domain.size() != pk.domain_size {
             return Err(bad(format!(
                 "domain size {} is not a power of two",
                 pk.domain_size
@@ -434,23 +434,23 @@ impl HResident {
         // against the wrong Lagrange polynomials.
         let coset_shift = Domain::new(
             domain
-                .size
+                .size()
                 .checked_mul(2)
                 .ok_or_else(|| bad("domain size overflows"))?,
         )
         .map_err(|e| bad(format!("no 2n-th root of unity: {e}")))?
-        .group_gen;
+        .group_gen();
 
         pk.coeffs
-            .check_structure(domain.size, pk.n_vars)
+            .check_structure(domain.size(), pk.n_vars)
             .map_err(|e| bad(e.to_string()))?;
 
         // shift^j for j in [0, n). Not the twiddles: the twiddles are powers of the
         // domain's own root of unity and this is a primitive 2n-th root, so no table
         // snarkrs-field builds can be reused. A running product, one multiply per entry.
-        let mut pows = Vec::with_capacity(domain.size);
+        let mut pows = Vec::with_capacity(domain.size());
         let mut acc = Fr::ONE;
-        for _ in 0..domain.size {
+        for _ in 0..domain.size() {
             pows.push(acc);
             acc *= coset_shift;
         }
@@ -466,7 +466,7 @@ impl HResident {
 
         Ok(Self {
             n_vars: pk.n_vars,
-            batches: split_passes(domain.log_size, st.max_fused),
+            batches: split_passes(domain.log_size(), st.max_fused),
             row_ptr: [
                 st.buf_u32(&pk.coeffs.row_ptr[0])?,
                 st.buf_u32(&pk.coeffs.row_ptr[1])?,
@@ -485,7 +485,7 @@ impl HResident {
     }
 
     pub fn domain_size(&self) -> usize {
-        self.domain.size
+        self.domain.size()
     }
 
     /// Dispatches encoded for one call to [`Self::compute_h`], for reporting.
@@ -502,7 +502,7 @@ impl HResident {
         if let Some(s) = self.pool.lock().unwrap_or_else(|e| e.into_inner()).pop() {
             return Ok(s);
         }
-        let n = self.domain.size;
+        let n = self.domain.size();
         let stride = n * core::mem::size_of::<PackedFr>();
         let bytes = (4 * stride).max(crate::msm::dense_entries_bytes(n));
         Ok(Scratch {
@@ -549,7 +549,7 @@ impl HResident {
                 want: self.n_vars,
             });
         }
-        let n = self.domain.size;
+        let n = self.domain.size();
         let sc = self.take_scratch(st)?;
 
         // The pack writes straight into the buffer's contents pointer. On unified memory
@@ -788,9 +788,9 @@ impl HResident {
         vi: usize,
         fuse_h: bool,
     ) {
-        let log_n = self.domain.log_size;
+        let log_n = self.domain.log_size();
         let last = self.batches.len() - 1;
-        let size_inv = PackedFr::from_fr(&self.domain.size_inv);
+        let size_inv = PackedFr::from_fr(&self.domain.size_inv());
 
         {
             let v = [sc.a(), sc.b(), sc.c()][vi];
@@ -1211,7 +1211,7 @@ mod tests {
         let domain = Domain::new(n).unwrap();
         let res = HResident {
             n_vars: n,
-            batches: split_passes(domain.log_size, st.max_fused),
+            batches: split_passes(domain.log_size(), st.max_fused),
             row_ptr: std::array::from_fn(|m| st.buf_u32(&rows[m]).unwrap()),
             signal: std::array::from_fn(|m| st.buf_u32(&signals[m]).unwrap()),
             value: std::array::from_fn(|m| st.buf(&values[m]).unwrap()),
@@ -1325,7 +1325,7 @@ mod tests {
             .0;
         let st = HStages::new().expect("Metal device");
         let res = st.prepare(&pk).unwrap();
-        let n = res.domain.size;
+        let n = res.domain.size();
         let mut seed = 0x9e37_79b9_7f4a_7c15u64;
         let dense: Vec<Fr> = (0..own.len())
             .map(|_| {

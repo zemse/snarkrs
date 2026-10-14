@@ -27,15 +27,17 @@ pub const ADX_BMI2: bool = cfg!(all(
 /// `CpuCircuit::new` in snarkrs-groth16 for the full argument). A shift built from
 /// `Fr::GENERATOR` is a mathematically valid coset that snarkjs rejects: paired with the
 /// section-9 H bases it produces proofs that fail to verify.
+///
+/// The fields are private so every `Domain` comes out of [`Domain::new`]: `size` is a
+/// power of two, `log_size` is its log, and the three field elements are the ones derived
+/// from it. Consumers rely on that instead of re-checking it.
 #[derive(Clone, Debug)]
 pub struct Domain {
-    pub size: usize,
-    pub log_size: u32,
-    /// Primitive `size`-th root of unity.
-    pub group_gen: Fr,
-    pub group_gen_inv: Fr,
-    /// `Fr::from(size).inverse()`, the iNTT normalisation factor.
-    pub size_inv: Fr,
+    size: usize,
+    log_size: u32,
+    group_gen: Fr,
+    group_gen_inv: Fr,
+    size_inv: Fr,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -81,6 +83,36 @@ impl Domain {
                 .inverse()
                 .expect("domain size is nonzero mod r"),
         })
+    }
+
+    /// Number of points, a power of two.
+    #[inline]
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// `log2(size)`.
+    #[inline]
+    pub fn log_size(&self) -> u32 {
+        self.log_size
+    }
+
+    /// Primitive `size`-th root of unity.
+    #[inline]
+    pub fn group_gen(&self) -> Fr {
+        self.group_gen
+    }
+
+    /// Inverse of [`Self::group_gen`].
+    #[inline]
+    pub fn group_gen_inv(&self) -> Fr {
+        self.group_gen_inv
+    }
+
+    /// `Fr::from(size).inverse()`, the iNTT normalisation factor.
+    #[inline]
+    pub fn size_inv(&self) -> Fr {
+        self.size_inv
     }
 
     /// Forward twiddles: `[1, g, g^2, ..., g^(size/2 - 1)]`.

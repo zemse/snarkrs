@@ -52,9 +52,8 @@ const MIN_BUTTERFLIES_PER_TASK: usize = 64;
 /// L1d with room for the twiddle lines and leaves 32 blocks at 2^16 for a 12-thread pool.
 const CACHE_BLOCK: usize = 1 << 11;
 
-/// Twiddle tables are keyed by `(size, root)` rather than by size alone because `Domain`
-/// exposes its fields publicly, so a hand-built `Domain` could carry a root that is not
-/// the one `Domain::new` derives for that size.
+/// Twiddle tables are keyed by `(size, root)`: forward and inverse tables share the map,
+/// and [`CpuNtt::stride_twiddles`] names a smaller transform's table by the root it samples.
 type TwiddleCache = RwLock<HashMap<(usize, Fr), Arc<Vec<Fr>>>>;
 
 /// Multi-threaded CPU NTT, and the only slice-shaped transform in the workspace. The GPU
@@ -67,9 +66,8 @@ pub struct CpuNtt {
     /// six transforms per proof over the same two tables. The cache has to live here:
     /// [`Self::ntt`] receives a `&Domain`, not a prepared table.
     twiddles: TwiddleCache,
-    /// Tables for [`Self::coset_scale_bitrev`], keyed by size, shift and `size_inv`.
-    /// The scale is public on `Domain`, so two same-sized domains can differ in it.
-    coset_tables: RwLock<HashMap<(usize, Fr, Fr), Arc<Vec<Fr>>>>,
+    /// Tables for [`Self::coset_scale_bitrev`], keyed by size and shift.
+    coset_tables: RwLock<HashMap<(usize, Fr), Arc<Vec<Fr>>>>,
 }
 
 impl CpuNtt {
@@ -91,10 +89,10 @@ impl CpuNtt {
     /// copied nor held under the lock while the transform runs.
     fn twiddles(&self, domain: &Domain, dir: Direction) -> Arc<Vec<Fr>> {
         let root = match dir {
-            Direction::Forward => domain.group_gen,
-            Direction::Inverse => domain.group_gen_inv,
+            Direction::Forward => domain.group_gen(),
+            Direction::Inverse => domain.group_gen_inv(),
         };
-        let key = (domain.size, root);
+        let key = (domain.size(), root);
 
         // A poisoned lock here would mean a panic inside a HashMap lookup, which cannot
         // leave the map torn, so recovering beats poisoning every later proof.
@@ -155,12 +153,12 @@ impl CpuNtt {
         }
 
         let twiddles = self.twiddles(domain, dir);
-        bit_reverse_permute(a, domain.log_size);
+        bit_reverse_permute(a, domain.log_size());
         self.dit_passes(a, &twiddles, parallel);
 
         if dir == Direction::Inverse {
             // The Domain hands out `1/n` but never applies it; the iNTT owns that.
-            let scale = domain.size_inv;
+            let scale = domain.size_inv();
             if parallel {
                 let chunk = chunk_len(n, self.tasks());
                 a.par_chunks_mut(chunk)
@@ -260,7 +258,7 @@ impl CpuNtt {
         }
     }
 
-    /// In-place radix-2 NTT. `a.len()` must equal `domain.size`.
+    /// In-place radix-2 NTT. `a.len()` must equal `domain.size()`.
     pub fn ntt(&self, domain: &Domain, a: &mut [Fr], dir: Direction) {
         self.transform(domain, a, dir, a.len() >= PARALLEL_THRESHOLD);
     }
@@ -378,7 +376,7 @@ impl CpuNtt {
     /// Cached `[shift^bitrev(p) / n]` table for [`Self::coset_scale_bitrev`], built and
     /// raced exactly like [`Self::twiddles`].
     fn coset_table(&self, domain: &Domain, shift: Fr) -> Arc<Vec<Fr>> {
-        let key = (domain.size, shift, domain.size_inv);
+        let key = (domain.size(), shift);
         if let Some(hit) = self
             .coset_tables
             .read()
@@ -388,7 +386,7 @@ impl CpuNtt {
             return Arc::clone(hit);
         }
 
-        let n = domain.size;
+        let n = domain.size();
         let mut table = vec![Fr::ONE; n];
         let chunk = chunk_len(n, self.tasks());
         table
@@ -397,13 +395,13 @@ impl CpuNtt {
             .for_each(|(c, part)| {
                 // The same per-chunk ladder re-entry as `distribute`, seeded with `1/n` so
                 // the scale costs nothing extra.
-                let mut acc = domain.size_inv * shift.pow([(c * chunk) as u64]);
+                let mut acc = domain.size_inv() * shift.pow([(c * chunk) as u64]);
                 for x in part.iter_mut() {
                     *x = acc;
                     acc *= shift;
                 }
             });
-        bit_reverse_permute(&mut table, domain.log_size);
+        bit_reverse_permute(&mut table, domain.log_size());
 
         let built = Arc::new(table);
         let mut guard = self.coset_tables.write().unwrap_or_else(|e| e.into_inner());
@@ -447,20 +445,12 @@ impl Default for CpuNtt {
     }
 }
 
-/// Public domain fields must still describe the radix-2 layout before any mutation.
+/// `Domain::new` guarantees the radix-2 layout; only the input length is the caller's.
 fn check_domain(domain: &Domain, len: usize) {
     assert_eq!(
-        len, domain.size,
+        len,
+        domain.size(),
         "ntt input length must equal the domain size"
-    );
-    assert!(
-        domain.size.is_power_of_two(),
-        "ntt domain size must be a power of two"
-    );
-    assert_eq!(
-        domain.log_size,
-        domain.size.trailing_zeros(),
-        "ntt domain log_size must match its size"
     );
 }
 
@@ -906,14 +896,14 @@ mod tests {
 
             let mut fwd = x.clone();
             ntt.ntt(&d, &mut fwd, Direction::Forward);
-            assert_eq!(fwd, naive_dft(&x, d.group_gen), "forward, n = {n}");
+            assert_eq!(fwd, naive_dft(&x, d.group_gen()), "forward, n = {n}");
 
             // The iNTT is the same sum over the inverse root, scaled by 1/n.
             let mut inv = x.clone();
             ntt.ntt(&d, &mut inv, Direction::Inverse);
-            let want: Vec<Fr> = naive_dft(&x, d.group_gen_inv)
+            let want: Vec<Fr> = naive_dft(&x, d.group_gen_inv())
                 .into_iter()
-                .map(|v| v * d.size_inv)
+                .map(|v| v * d.size_inv())
                 .collect();
             assert_eq!(inv, want, "inverse, n = {n}");
         }
@@ -940,15 +930,15 @@ mod tests {
             ntt.ntt(&d, &mut fwd, Direction::Forward);
             assert_eq!(
                 fwd,
-                impulse_transform(d.group_gen, j, n),
+                impulse_transform(d.group_gen(), j, n),
                 "forward, n = {n}"
             );
 
             let mut inv = x.clone();
             ntt.ntt(&d, &mut inv, Direction::Inverse);
-            let want: Vec<Fr> = impulse_transform(d.group_gen_inv, j, n)
+            let want: Vec<Fr> = impulse_transform(d.group_gen_inv(), j, n)
                 .into_iter()
-                .map(|v| v * d.size_inv)
+                .map(|v| v * d.size_inv())
                 .collect();
             assert_eq!(inv, want, "inverse, n = {n}");
 
@@ -956,8 +946,8 @@ mod tests {
             // the 1/n, so its output is the unscaled inverse table permuted.
             let mut bitrev = x;
             ntt.intt_to_bitrev(&d, &mut bitrev);
-            let mut want = impulse_transform(d.group_gen_inv, j, n);
-            bit_reverse_permute(&mut want, d.log_size);
+            let mut want = impulse_transform(d.group_gen_inv(), j, n);
+            bit_reverse_permute(&mut want, d.log_size());
             assert_eq!(bitrev, want, "intt_to_bitrev, n = {n}");
         }
     }
@@ -1049,7 +1039,7 @@ mod tests {
             let d = domain(n);
             // The shift the real caller uses: the 2n-th root whose square is the
             // domain's own generator.
-            let shift = domain(2 * n).group_gen;
+            let shift = domain(2 * n).group_gen();
             let x = sample(n, 0xC05E7 + log as u64);
 
             let mut want = x.clone();
@@ -1081,7 +1071,7 @@ mod tests {
         for log in [4u32, 10, 11, 12, 14, 15] {
             let n = 1usize << log;
             let d = domain(n);
-            let shift = domain(2 * n).group_gen;
+            let shift = domain(2 * n).group_gen();
             let x = sample(n, 0xF05E + log as u64);
 
             let mut want = x.clone();
@@ -1109,7 +1099,7 @@ mod tests {
             ntt.ntt(&d, &mut want, Direction::Inverse);
             let n_as_fr = Fr::from(n as u64);
             want.iter_mut().for_each(|v| *v *= n_as_fr);
-            bit_reverse_permute(&mut want, d.log_size);
+            bit_reverse_permute(&mut want, d.log_size());
 
             let mut got = x.clone();
             ntt.intt_to_bitrev(&d, &mut got);
@@ -1138,18 +1128,14 @@ mod tests {
     }
 
     #[test]
-    fn block_twiddle_cache_tracks_the_sampled_root() {
+    fn block_twiddles_share_the_block_domains_entry() {
         let ntt = CpuNtt::new();
-        for exponent in [1u64, 3, 1] {
-            let mut block_domain = domain(CACHE_BLOCK);
-            block_domain.group_gen = block_domain.group_gen.pow([exponent]);
-            block_domain.group_gen_inv = block_domain.group_gen_inv.pow([exponent]);
+        for _ in 0..2 {
+            let block_domain = domain(CACHE_BLOCK);
             for dir in [Direction::Forward, Direction::Inverse] {
                 let want = ntt.twiddles(&block_domain, dir);
                 for n in [CACHE_BLOCK * 2, CACHE_BLOCK * 4, CACHE_BLOCK * 8] {
-                    let mut d = domain(n);
-                    d.group_gen = d.group_gen.pow([exponent]);
-                    d.group_gen_inv = d.group_gen_inv.pow([exponent]);
+                    let d = domain(n);
                     let full = ntt.twiddles(&d, dir);
                     let local = ntt.block_twiddles(&full, n);
                     assert_eq!(local.len(), CACHE_BLOCK / 2);
@@ -1164,7 +1150,7 @@ mod tests {
         let fresh = CpuNtt::new();
         let d = domain(CACHE_BLOCK * 4);
         let full = fresh.twiddles(&d, Direction::Forward);
-        let local = fresh.block_twiddles(&full, d.size);
+        let local = fresh.block_twiddles(&full, d.size());
         let want = fresh.twiddles(&domain(CACHE_BLOCK), Direction::Forward);
         assert!(Arc::ptr_eq(&local, &want));
         assert_eq!(*local, domain(CACHE_BLOCK).twiddles());
@@ -1178,14 +1164,14 @@ mod tests {
         let d = domain(1 << 14);
         for dir in [Direction::Forward, Direction::Inverse] {
             let full = ntt.twiddles(&d, dir);
-            assert!(Arc::ptr_eq(&ntt.stride_twiddles(&full, d.size, 1), &full));
+            assert!(Arc::ptr_eq(&ntt.stride_twiddles(&full, d.size(), 1), &full));
             for s in [2usize, 4, 64, 256] {
-                let packed = ntt.stride_twiddles(&full, d.size, s);
+                let packed = ntt.stride_twiddles(&full, d.size(), s);
                 let want: Vec<Fr> = full.iter().step_by(s).copied().collect();
                 assert_eq!(*packed, want, "stride {s}");
                 assert!(Arc::ptr_eq(
                     &packed,
-                    &ntt.twiddles(&domain(d.size / s), dir)
+                    &ntt.twiddles(&domain(d.size() / s), dir)
                 ));
             }
         }
@@ -1197,7 +1183,7 @@ mod tests {
         // has to survive several threads hitting a cold domain at once.
         let ntt = CpuNtt::new();
         let d = domain(512);
-        let x = sample(d.size, 0x1234);
+        let x = sample(d.size(), 0x1234);
         let mut want = x.clone();
         ntt.transform(&d, &mut want, Direction::Forward, false);
 
@@ -1218,28 +1204,29 @@ mod tests {
     fn coset_cache_tracks_the_domain_and_shift() {
         let ntt = CpuNtt::new();
         for n in [1, 2, 4096, 8192, 4096] {
-            let mut d = domain(n);
-            for shift in [Fr::ZERO, Fr::ONE, Fr::from(7u64), domain(2 * n).group_gen] {
-                for scale in [d.size_inv, Fr::from(3u64), d.size_inv] {
-                    d.size_inv = scale;
-                    let mut got = vec![Fr::ONE; n];
-                    ntt.coset_scale_bitrev(&d, &mut got, shift);
-                    let mut want: Vec<_> = (0..n).map(|i| scale * shift.pow([i as u64])).collect();
-                    bit_reverse_permute(&mut want, d.log_size);
-                    assert_eq!(got, want, "n = {n}, shift = {shift}, scale = {scale}");
-                }
+            let d = domain(n);
+            for shift in [Fr::ZERO, Fr::ONE, Fr::from(7u64), domain(2 * n).group_gen()] {
+                let mut got = vec![Fr::ONE; n];
+                ntt.coset_scale_bitrev(&d, &mut got, shift);
+                let mut want: Vec<_> = (0..n)
+                    .map(|i| d.size_inv() * shift.pow([i as u64]))
+                    .collect();
+                bit_reverse_permute(&mut want, d.log_size());
+                assert_eq!(got, want, "n = {n}, shift = {shift}");
             }
         }
     }
 
     #[test]
-    fn changed_roots_and_cold_concurrent_cosets_match_serial() {
+    fn changed_shifts_and_cold_concurrent_cosets_match_serial() {
         let ntt = CpuNtt::new();
-        let mut d = domain(4096);
-        for _ in 0..3 {
-            std::mem::swap(&mut d.group_gen, &mut d.group_gen_inv);
-            let shift = d.group_gen + Fr::ONE;
-            let x = sample(d.size, 42);
+        let d = domain(4096);
+        for shift in [
+            d.group_gen() + Fr::ONE,
+            d.group_gen_inv() + Fr::ONE,
+            domain(8192).group_gen(),
+        ] {
+            let x = sample(d.size(), 42);
             let mut want = x.clone();
             ntt.transform(&d, &mut want, Direction::Inverse, false);
             ntt.distribute(&mut want, shift, false);
@@ -1253,7 +1240,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_domains_are_rejected_before_mutation() {
+    fn mismatched_lengths_are_rejected_before_mutation() {
         type Entry = fn(&CpuNtt, &Domain, &mut [Fr]);
         let entries: [Entry; 6] = [
             |ntt, d, a| ntt.ntt(d, a, Direction::Forward),
@@ -1264,24 +1251,16 @@ mod tests {
             |ntt, d, a| ntt.intt_coset_ntt(d, a, Fr::ONE),
         ];
         let ntt = CpuNtt::new();
-        // 3072 would leave a partial fused block; 1024 and 2048 are handled without
-        // block fusion. CACHE_BLOCK divides every valid larger radix-2 domain exactly.
-        assert!(CACHE_BLOCK.is_power_of_two());
-        for (size, log_size, len) in [(0, 0, 0), (3, 2, 3), (3072, 12, 3072), (8, 2, 8), (8, 3, 7)]
-        {
-            let mut d = domain(8);
-            d.size = size;
-            d.log_size = log_size;
+        // 3072 would leave a partial fused block if it reached the 4096 transform.
+        for (size, len) in [(1, 0), (8, 0), (8, 7), (8, 9), (4096, 3072)] {
+            let d = domain(size);
             for entry in entries {
                 let original = sample(len, 17);
                 let mut a = original.clone();
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     entry(&ntt, &d, &mut a);
                 }));
-                assert!(
-                    result.is_err(),
-                    "accepted size {size}, log {log_size}, len {len}"
-                );
+                assert!(result.is_err(), "accepted size {size}, len {len}");
                 assert_eq!(a, original, "mutated invalid input");
             }
         }

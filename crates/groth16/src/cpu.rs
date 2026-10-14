@@ -78,7 +78,7 @@ impl CpuCircuit {
         let domain = Domain::new(pk.domain_size).map_err(|e| bad(e.to_string()))?;
         // The CSR rows are indexed by evaluation point, so a domain that rounded up would
         // silently shorten every gather. Better to refuse the key than to prove garbage.
-        if domain.size != pk.domain_size {
+        if domain.size() != pk.domain_size {
             return Err(bad(format!(
                 "domain size {} is not a power of two",
                 pk.domain_size
@@ -91,20 +91,20 @@ impl CpuCircuit {
         // Lagrange basis of that same 2n domain restricted to its odd indices (see
         // `writeHs` in zkey_new.js, which takes `sTauG1[2i+1]`). The bases are tied to
         // that specific point set, so any other coset would pair evaluations against the
-        // wrong Lagrange polynomials. `Domain::new(2n).group_gen` squares to
-        // `domain.group_gen` by construction, which is exactly the relation
+        // wrong Lagrange polynomials. `Domain::new(2n).group_gen()` squares to
+        // `domain.group_gen()` by construction, which is exactly the relation
         // `Fr.w[power] == inc^2` that makes evaluation index i land on `inc^(2i+1)`.
         let coset_shift = Domain::new(
             domain
-                .size
+                .size()
                 .checked_mul(2)
                 .ok_or_else(|| bad("domain size overflows".into()))?,
         )
         .map_err(|e| bad(format!("no 2n-th root of unity: {e}")))?
-        .group_gen;
+        .group_gen();
 
         pk.coeffs
-            .check_structure(domain.size, pk.n_vars)
+            .check_structure(domain.size(), pk.n_vars)
             .map_err(|e| bad(e.to_string()))?;
 
         // `msms` slices the private witness as `witness[n_public + 1..]`, which past
@@ -150,7 +150,7 @@ impl CpuCircuit {
         let signal = &self.pk.coeffs.signal[m];
         let value = &self.pk.coeffs.value[m];
 
-        (0..self.domain.size)
+        (0..self.domain.size())
             .into_par_iter()
             .map(|c| {
                 let lo = row_ptr[c] as usize;
@@ -200,7 +200,7 @@ impl PreparedCircuit for CpuCircuit {
         self.pk.n_public
     }
     fn domain_size(&self) -> usize {
-        self.domain.size
+        self.domain.size()
     }
     fn key(&self) -> &ProvingKey {
         &self.pk
@@ -298,13 +298,13 @@ impl PreparedCircuit for CpuCircuit {
             backend: "cpu",
             reason: "compute_h output came from another backend".to_string(),
         })?;
-        if h.len() != self.domain.size {
+        if h.len() != self.domain.size() {
             return Err(ProveError::Backend {
                 backend: "cpu",
                 reason: format!(
                     "h has {} entries, domain size is {}",
                     h.len(),
-                    self.domain.size
+                    self.domain.size()
                 ),
             });
         }
@@ -328,13 +328,13 @@ impl PreparedCircuit for CpuCircuit {
                 });
             }
         }
-        if self.pk.h_query.len() != self.domain.size {
+        if self.pk.h_query.len() != self.domain.size() {
             return Err(ProveError::Backend {
                 backend: "cpu",
                 reason: format!(
                     "h_query has {} bases, domain size is {}",
                     self.pk.h_query.len(),
-                    self.domain.size
+                    self.domain.size()
                 ),
             });
         }
@@ -677,8 +677,8 @@ mod tests {
         for log_n in 0..12u32 {
             let n = 1usize << log_n;
             let domain = Domain::new(n).unwrap();
-            let shift = Domain::new(2 * n).unwrap().group_gen;
-            assert_eq!(shift * shift, domain.group_gen, "n = {n}");
+            let shift = Domain::new(2 * n).unwrap().group_gen();
+            assert_eq!(shift * shift, domain.group_gen(), "n = {n}");
             assert_eq!(shift.pow([n as u64]), -Fr::one(), "n = {n}");
             // And therefore the coset misses the domain entirely, which is what makes
             // A*B - C nonzero on it.

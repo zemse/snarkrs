@@ -33,16 +33,16 @@ fn median(mut v: Vec<f64>) -> f64 {
 /// `w^j / (z - w^j) * (z^n - 1) / n` for every `j`: the barycentric weights at `z`, so
 /// `P(z)` for the polynomial through `(w^j, v_j)` is their dot product with `v`.
 fn weights(d: &Domain, z: Fr) -> Vec<Fr> {
-    let n = d.size;
+    let n = d.size();
     let mut pw = Vec::with_capacity(n);
     let mut acc = Fr::ONE;
     for _ in 0..n {
         pw.push(acc);
-        acc *= d.group_gen;
+        acc *= d.group_gen();
     }
     let mut den: Vec<Fr> = pw.iter().map(|w| z - w).collect();
     batch_inversion(&mut den);
-    let c = (z.pow([n as u64]) - Fr::ONE) * d.size_inv;
+    let c = (z.pow([n as u64]) - Fr::ONE) * d.size_inv();
     pw.iter().zip(&den).map(|(w, i)| *w * i * c).collect()
 }
 
@@ -54,7 +54,7 @@ struct Check {
 
 impl Check {
     fn new(d: &Domain, shift: Fr, k: [usize; 2]) -> Self {
-        let z = |k: usize| shift * d.group_gen.pow([k as u64]);
+        let z = |k: usize| shift * d.group_gen().pow([k as u64]);
         Check {
             k,
             w: [weights(d, z(k[0])), weights(d, z(k[1]))],
@@ -72,7 +72,7 @@ impl Check {
 fn run(log_n: u32, reps: usize) {
     let n = 1usize << log_n;
     let d = Domain::new(n).unwrap();
-    let shift = Domain::new(2 * n).unwrap().group_gen;
+    let shift = Domain::new(2 * n).unwrap().group_gen();
     let ins: Vec<Vec<Fr>> = (0..3).map(|i| sample(n, 0x5eed + i)).collect();
     let check = Check::new(&d, shift, [1, n - 3]);
     let ntt = CpuNtt::new();

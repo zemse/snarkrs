@@ -77,7 +77,7 @@ fn main() {
         let fwd = best(reps, &mut || ntt.ntt(&domain, &mut v, Direction::Forward));
         let inv = best(reps, &mut || ntt.ntt(&domain, &mut v, Direction::Inverse));
         let shift = best(reps, &mut || {
-            ntt.distribute_powers(&mut v, domain.group_gen)
+            ntt.distribute_powers(&mut v, domain.group_gen())
         });
         let bitrev = best(reps, &mut || bit_reverse_permute(&mut v, log_n));
 
@@ -91,7 +91,7 @@ fn main() {
         );
 
         // The prover's own shift: the 2n-th root whose square is the domain's generator.
-        let coset_shift = Domain::new(2 * n).unwrap().group_gen;
+        let coset_shift = Domain::new(2 * n).unwrap().group_gen();
         // Warm the coset table, which is built once per (size, shift) and kept for the
         // life of the circuit.
         ntt.intt_coset_ntt(&domain, &mut v, coset_shift);

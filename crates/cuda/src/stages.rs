@@ -373,7 +373,7 @@ impl CudaStages {
         let block = PREFERRED_BLOCK.min(max_threads).max(1);
 
         let domain = Domain::new(pk.domain_size).map_err(|e| bad(e.to_string()))?;
-        if domain.size != pk.domain_size {
+        if domain.size() != pk.domain_size {
             return Err(bad(format!(
                 "domain size {} is not a power of two",
                 pk.domain_size
@@ -381,10 +381,11 @@ impl CudaStages {
         }
         // Every kernel indexes with a 32-bit `gid` and a grid dimension is a u32. A domain
         // that did not fit would not fail, it would wrap and gather the wrong rows.
-        if u32::try_from(domain.size).is_err() || u32::try_from(pk.n_vars).is_err() {
+        if u32::try_from(domain.size()).is_err() || u32::try_from(pk.n_vars).is_err() {
             return Err(bad(format!(
                 "domain {} / n_vars {} exceeds the u32 indexing the kernels use",
-                domain.size, pk.n_vars
+                domain.size(),
+                pk.n_vars
             )));
         }
 
@@ -393,23 +394,23 @@ impl CudaStages {
         // the wrong Lagrange polynomials.
         let coset_shift = Domain::new(
             domain
-                .size
+                .size()
                 .checked_mul(2)
                 .ok_or_else(|| bad("domain size overflows"))?,
         )
         .map_err(|e| bad(format!("no 2n-th root of unity: {e}")))?
-        .group_gen;
+        .group_gen();
 
         pk.coeffs
-            .check_structure(domain.size, pk.n_vars)
+            .check_structure(domain.size(), pk.n_vars)
             .map_err(|e| bad(e.to_string()))?;
 
         // shift^j for j in [0, n). Not the twiddles: the twiddles are powers of the domain's
         // own root of unity and this is a primitive 2n-th root, so no table snarkrs-field builds
         // can be reused. A running product, one multiply per entry.
-        let mut pows = Vec::with_capacity(domain.size);
+        let mut pows = Vec::with_capacity(domain.size());
         let mut acc = Fr::ONE;
-        for _ in 0..domain.size {
+        for _ in 0..domain.size() {
             pows.push(acc);
             acc *= coset_shift;
         }
@@ -439,7 +440,7 @@ impl CudaStages {
             coset_pows,
 
             n_vars: pk.n_vars,
-            batches: split_passes(domain.log_size, max_fused),
+            batches: split_passes(domain.log_size(), max_fused),
             coset_shift,
             domain,
 
@@ -459,7 +460,7 @@ impl CudaStages {
     }
 
     pub fn domain_size(&self) -> usize {
-        self.domain.size
+        self.domain.size()
     }
 
     pub fn n_vars(&self) -> usize {
@@ -545,7 +546,7 @@ impl CudaStages {
                 want: self.n_vars,
             });
         }
-        let n = self.domain.size;
+        let n = self.domain.size();
         let mut sc = self.take_scratch()?;
 
         // The repack, straight into page-locked staging. On Metal this write is the whole
@@ -705,9 +706,9 @@ impl CudaStages {
     /// their coset evaluations are exactly what `H = A*B - C` needs. It saves a whole write
     /// of C and a whole read of A, B and C.
     fn launch_transforms(&self, sc: &Scratch, n: usize, fuse_h: bool) -> Result<(), ProveError> {
-        let log_n = self.domain.log_size;
+        let log_n = self.domain.log_size();
         let last = self.batches.len() - 1;
-        let size_inv = PackedFr::from_fr(&self.domain.size_inv);
+        let size_inv = PackedFr::from_fr(&self.domain.size_inv());
 
         for (vi, v) in [&sc.a, &sc.b, &sc.c].into_iter().enumerate() {
             // Stage 1, the iNTT. Out of place v -> t for the head, then in place on t. The
@@ -888,7 +889,7 @@ impl CudaStages {
         if let Some(s) = self.pool.lock().unwrap_or_else(|e| e.into_inner()).pop() {
             return Ok(s);
         }
-        let n = self.domain.size;
+        let n = self.domain.size();
         let words = |elems: usize| -> Result<CudaSlice<u32>, ProveError> {
             // alloc_zeros, not alloc. Nothing in this stage group reads a buffer before
             // writing it: the gather writes every row of A, B and C, batch 0 of every

@@ -248,12 +248,12 @@ fn run_chain(
 ///   asserts that agreement directly rather than trusting this comment.
 fn cpu_chain(domain: &Domain, coset_shift: Fr, x: &[Fr], steps: &[Step]) -> Vec<Fr> {
     let ntt = CpuNtt::new();
-    let n = Fr::from(domain.size as u64);
+    let n = Fr::from(domain.size() as u64);
     let mut v = x.to_vec();
     for s in steps {
         match s.1 {
             Scale::None => {}
-            Scale::SizeInv => v.iter_mut().for_each(|e| *e *= domain.size_inv),
+            Scale::SizeInv => v.iter_mut().for_each(|e| *e *= domain.size_inv()),
             Scale::CosetPowers => ntt.distribute_powers(&mut v, coset_shift),
         }
         let dir = match s.0 {
@@ -367,7 +367,7 @@ fn the_coset_shift_path_matches_the_cpu_coset_shift() {
     for log_n in [3u32, 4, 7, 10, 13, 16, 18] {
         let n = 1usize << log_n;
         let domain = Domain::new(n).unwrap();
-        let coset_shift = Domain::new(2 * n).unwrap().group_gen;
+        let coset_shift = Domain::new(2 * n).unwrap().group_gen();
         let x = sample(n, 0xC05E7 ^ log_n as u64);
 
         // Stages 1 to 3 for one vector: iNTT with 1/n on the load, then the coset shift on
@@ -399,7 +399,7 @@ fn the_coset_shift_path_matches_the_cpu_coset_shift() {
         );
 
         // The tables really are a primitive 2n-th root's powers and not the domain's own.
-        assert_eq!(coset_shift * coset_shift, domain.group_gen, "2^{log_n}");
+        assert_eq!(coset_shift * coset_shift, domain.group_gen(), "2^{log_n}");
 
         println!(
             "2^{log_n}: coset chain over {n} points, {dispatches} dispatches, shift^2 == group_gen"
@@ -416,7 +416,7 @@ fn every_pass_split_computes_the_same_transform() {
     let log_n = 10u32;
     let n = 1usize << log_n;
     let domain = Domain::new(n).unwrap();
-    let coset_shift = Domain::new(2 * n).unwrap().group_gen;
+    let coset_shift = Domain::new(2 * n).unwrap().group_gen();
     let x = sample(n, 0x59117);
     let steps = [
         Step(Direction::Inverse, Scale::SizeInv),
@@ -457,7 +457,7 @@ fn the_fused_join_epilogue_writes_h_in_both_encodings() {
         let n = 1usize << log_n;
         let nn = n as u32;
         let domain = Domain::new(n).unwrap();
-        let coset_shift = Domain::new(2 * n).unwrap().group_gen;
+        let coset_shift = Domain::new(2 * n).unwrap().group_gen();
 
         // Deliberately three different vectors. The last round's Fq2 bug survived because
         // every test input had a == b.

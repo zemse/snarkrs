@@ -236,7 +236,7 @@ impl HStages {
         let domain = Domain::new(pk.domain_size).map_err(|e| bad(e.to_string()))?;
         // The CSR rows are indexed by evaluation point, so a domain that rounded up would
         // silently shorten every gather. Refuse the key instead of proving garbage.
-        if domain.size != pk.domain_size {
+        if domain.size() != pk.domain_size {
             return Err(bad(format!(
                 "domain size {} is not a power of two",
                 pk.domain_size
@@ -246,10 +246,10 @@ impl HStages {
             return Err(bad("the proving key has no variables"));
         }
 
-        let csr = CsrTables::from_coefficients(backend, &pk.coeffs, domain.size, pk.n_vars)?;
-        let tables = NttTables::new(backend, domain.size)?;
+        let csr = CsrTables::from_coefficients(backend, &pk.coeffs, domain.size(), pk.n_vars)?;
+        let tables = NttTables::new(backend, domain.size())?;
         let gather = GatherAbc::new(backend)?;
-        let ntt = Ntt::new(backend, domain.log_size)?;
+        let ntt = Ntt::new(backend, domain.log_size())?;
         let join = HJoin::new(backend)?;
 
         Ok(Self {
@@ -265,7 +265,7 @@ impl HStages {
     }
 
     pub fn domain_size(&self) -> usize {
-        self.domain.size
+        self.domain.size()
     }
 
     pub fn n_vars(&self) -> usize {
@@ -291,7 +291,7 @@ impl HStages {
     /// 2^24 one (128 threads against 256), but both are computed rather than assumed so the
     /// number stays right when a bigger artifact arrives.
     pub fn dispatches(&self, mode: Stage4) -> u32 {
-        let n = self.domain.size as u32;
+        let n = self.domain.size() as u32;
         let joins = match mode {
             Stage4::Fused => 0,
             Stage4::Standalone => self.join.dispatches(n),
@@ -314,7 +314,7 @@ impl HStages {
         if let Some(s) = self.pool.lock().unwrap_or_else(|e| e.into_inner()).pop() {
             return Ok(s);
         }
-        let n = self.domain.size as u32;
+        let n = self.domain.size() as u32;
         Ok(Scratch {
             witness: fr_buffer(backend, "g16 witness", self.n_vars as u32)?,
             witness_std: fr_buffer(backend, "g16 witness std", self.n_vars as u32)?,
@@ -333,7 +333,7 @@ impl HStages {
     /// Device bytes one pooled scratch set holds: six domain vectors plus the witness in
     /// both encodings, at 32 bytes an element. 56.6 MiB at `js_16x16_d32`.
     pub fn scratch_bytes(&self) -> u64 {
-        (6 * self.domain.size as u64 + 2 * self.n_vars as u64) * FR_BYTES
+        (6 * self.domain.size() as u64 + 2 * self.n_vars as u64) * FR_BYTES
     }
 
     /// Stages 0 to 4 in one submit, at [`Stage4::default`]. `H` stays on the device.
@@ -381,7 +381,7 @@ impl HStages {
                 want: self.n_vars,
             });
         }
-        let n = self.domain.size as u32;
+        let n = self.domain.size() as u32;
         let mut sc = self.take_scratch(backend)?;
 
         // Host work, and all of it: a limb split per entry into a reused staging vector,
@@ -526,11 +526,11 @@ impl HStages {
 
         Ok(HPoly::Device {
             tag: TAG,
-            len: self.domain.size,
+            len: self.domain.size(),
             data: Arc::new(WgpuHandle {
                 scratch: Some(sc),
                 pool: Arc::clone(&self.pool),
-                len: self.domain.size,
+                len: self.domain.size(),
             }),
         })
     }

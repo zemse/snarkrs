@@ -238,7 +238,7 @@ fn the_transform_matches_a_term_by_term_dft_at_every_small_domain() {
         compare(
             &format!("2^{log_n} forward"),
             &fwd,
-            &naive_dft(&x, domain.group_gen),
+            &naive_dft(&x, domain.group_gen()),
         );
         assert!(
             slack.iter().all(|&w| w == SENTINEL),
@@ -249,7 +249,7 @@ fn the_transform_matches_a_term_by_term_dft_at_every_small_domain() {
         compare(
             &format!("2^{log_n} inverse"),
             &inv,
-            &naive_dft(&x, domain.group_gen_inv),
+            &naive_dft(&x, domain.group_gen_inv()),
         );
         assert!(
             slack.iter().all(|&w| w == SENTINEL),
@@ -286,21 +286,21 @@ fn the_coset_chain_evaluates_the_interpolant_on_the_shifted_domain() {
         // the latter the coset would be the domain and this test would be vacuous.
         assert_eq!(
             shift * shift,
-            domain.group_gen,
+            domain.group_gen(),
             "2^{log_n}: wrong coset shift"
         );
 
         let y = sample(n, 0xc0_5e70_0000 + log_n as u64);
 
         // Coefficients of the interpolant, by the definition: c[i] = (1/n) sum_j y[j] g^-ij.
-        let mut coeffs = naive_dft(&y, domain.group_gen_inv);
+        let mut coeffs = naive_dft(&y, domain.group_gen_inv());
         for c in &mut coeffs {
-            *c *= domain.size_inv;
+            *c *= domain.size_inv();
         }
         // Evaluated on the shifted domain, also by the definition.
         let want: Vec<Fr> = (0..n)
             .map(|j| {
-                let pt = shift * domain.group_gen.pow([j as u64]);
+                let pt = shift * domain.group_gen().pow([j as u64]);
                 let mut acc = Fr::zero();
                 let mut p = Fr::one();
                 for c in &coeffs {

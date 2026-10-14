@@ -461,11 +461,11 @@ mod tests {
             Fr::from_le_bytes_mod_order(&n.to_bytes_le())
         };
         assert_eq!(
-            Domain::new(1 << 28).unwrap().group_gen,
+            Domain::new(1 << 28).unwrap().group_gen(),
             w("19103219067921713944291392827692070036145651957329286315305642004821462161904")
         );
         assert_eq!(
-            Domain::new(16).unwrap().group_gen,
+            Domain::new(16).unwrap().group_gen(),
             w("14940766826517323942636479241147756311199852622225275649687664389641784935947")
         );
     }
