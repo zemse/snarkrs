@@ -295,6 +295,11 @@ for b in $BACKENDS; do
                  --mode both --reps "$REPS" --csv "$TMP/${b}-${c}.csv" \
                  ${SNARKJS:+--snarkjs "$SNARKJS"} || \
       echo "    $c on $b failed, leaving it out of the table"
+    # `both` is cold-inprocess and warm. The table's cold column is one fresh process per
+    # proof, the only cold rapidsnark and snarkjs have, so ours is measured that way too.
+    "$G16" bench --artifacts "$ARTIFACTS" --variant "$c" --backend "$b" \
+                 --mode cold-process --reps "$REPS" --csv "$TMP/${b}-${c}-process.csv" || \
+      echo "    $c on $b cold-process failed, leaving it out of the table"
   done
 done
 

@@ -215,7 +215,7 @@ def cmd_render(args):
         L.append("")
         L.append(f"`{arch}`, {cores} logical cores, accelerator: {gpu}")
         L.append("")
-        for mode in ("warm", "cold"):
+        for mode in ("warm", "cold", "cold-inprocess", "cold-process"):
             mrows = [r for r in rows if r["mode"] == mode]
             if not mrows:
                 continue

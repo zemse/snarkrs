@@ -26,9 +26,9 @@ import argparse, csv, glob, os, statistics
 # `prover` is the CSV column that separates the tools: `snarkrs bench` stamps `ours`,
 # bench_external.py stamps `rapidsnark` or `snarkjs`.
 COLUMNS = [
-    ("gpu-snark cpu",   "ours",       "cpu",   ("cold", "warm")),
-    ("gpu-snark metal", "ours",       "metal", ("cold", "warm")),
-    ("gpu-snark cuda",  "ours",       "cuda",  ("cold", "warm")),
+    ("gpu-snark cpu",   "ours",       "cpu",   ("cold", "cold-inprocess", "warm")),
+    ("gpu-snark metal", "ours",       "metal", ("cold", "cold-inprocess", "warm")),
+    ("gpu-snark cuda",  "ours",       "cuda",  ("cold", "cold-inprocess", "warm")),
     # rapidsnark's stock CLI reparses the zkey every call and can only ever report cold;
     # warm comes from the rapidsnark-warm harness, which drives its object API in a loop.
     ("rapidsnark",      "rapidsnark", None,    ("cold", "warm")),
@@ -37,6 +37,14 @@ COLUMNS = [
 ]
 
 OUR_BACKENDS = ["cpu", "metal", "cuda"]
+
+# The CSV `mode` values a section reads, per prover. The external tools have only ever
+# written `cold`, one fresh process per proof. `snarkrs bench` wrote `cold` for its
+# in-process cold until it named the two apart; those older files still render under
+# `cold` as they always did, and bench/results/README.md says what that column held.
+SECTION_MODES = {
+    ("ours", "cold"): ("cold-process", "cold"),
+}
 
 
 def load(csv_dir):
@@ -49,10 +57,12 @@ def load(csv_dir):
     return [r for r in rows if r.get("verified", "yes") in ("yes", "na", "")]
 
 
-def med(rows, **filt):
+def med(rows, modes=None, **filt):
     v = []
     for r in rows:
         if any(r.get(k) != x for k, x in filt.items()):
+            continue
+        if modes is not None and r.get("mode") not in modes:
             continue
         try:
             v.append(float(r["ms"]))
@@ -150,11 +160,18 @@ def main():
     L.append("")
 
     headers = [h for h, _, _, _ in COLUMNS]
-    for mode, blurb in (
+    sections = [
         ("warm", "Setup paid once, then proving in a loop. What a resident service sees."),
         ("cold", "One fresh process per proof, so key parse and GPU upload are inside the "
                  "timed region. What a CLI does."),
-    ):
+    ]
+    # Only `snarkrs bench` can measure this one, so it is rendered only when a run did.
+    if any(r.get("mode") == "cold-inprocess" for r in rows):
+        sections.append(
+            ("cold-inprocess", "Key parse, backend construction and GPU upload per proof, "
+                               "inside one process: cold without process startup. What a "
+                               "worker that re-prepares per job sees."))
+    for mode, blurb in sections:
         L.append(f"## {mode}")
         L.append("")
         L.append(blurb)
@@ -167,10 +184,10 @@ def main():
                 if not available(prover, backend, mode, modes):
                     cells.append("")
                     continue
-                filt = {"variant": variant, "prover": prover, "mode": mode}
+                filt = {"variant": variant, "prover": prover}
                 if backend is not None:
                     filt["backend"] = backend
-                v = med(rows, **filt)
+                v = med(rows, SECTION_MODES.get((prover, mode), (mode,)), **filt)
                 cells.append(f"{v:.1f}" if v is not None else "-")
             count = f"{n:,}" if n >= 0 else ""
             L.append(f"| `{variant}` | {count} | " + " | ".join(cells) + " |")

@@ -14,8 +14,9 @@ Two numbers answer two different questions and they do not have the same winner:
 
 Both are reported cold and warm, because they are not the same workload:
 
-  cold  one fresh process per proof. Key parse and, on a GPU, module load and upload are
-        inside the timed region. This is a CLI invocation or a lambda-style one-shot.
+  cold  `snarkrs bench --mode cold-inprocess`: key parse, backend construction and, on a
+        GPU, module load and upload are inside the timed region, per proof, in one
+        process. A fresh process per proof (`cold-process`) adds process startup on top.
   warm  setup paid once, then prove in a loop. This is a resident service.
 
 Neither is "the" number. A GPU looks good warm and bad cold, and any benchmark that
@@ -28,6 +29,8 @@ GPUs, which is large enough to reorder the ranking.
 import argparse, csv, json, statistics
 from collections import defaultdict
 from pathlib import Path
+
+from report_data import sweep_mode
 
 ROOT = Path(__file__).resolve().parent.parent
 SWEEP = ROOT / "results" / "sweep"
@@ -72,7 +75,7 @@ def load_sweep():
                 # A rep whose proof did not verify is not a timing. Dropping it silently
                 # would be the single most misleading thing this script could do, so it is
                 # counted and surfaced instead.
-                key = (d.name, r.get("backend") or f.stem, r["mode"], r["variant"])
+                key = (d.name, r.get("backend") or f.stem, sweep_mode(r["mode"]), r["variant"])
                 rows[key].append((float(r["ms"]), r.get("verified", "yes"), r.get("constraints")))
             for k, v in rows.items():
                 good = [x[0] for x in v if x[1] in ("yes", "true", "True", "1")]

@@ -7,8 +7,9 @@
 #   1. hyperfine times the whole `snarkrs groth16 prove` PROCESS. That is what a CLI user pays:
 #      exec, dyld, zkey parse, witness parse, prepare, prove, JSON write, exit. It is the
 #      only number here that includes the parts of the cost nobody instruments.
-#   2. `snarkrs bench` times the inside: cold (parse + prepare + prove, per rep) and warm
-#      (prove only, key resident), with the five-stage split from StageTimings.
+#   2. `snarkrs bench` times the inside: cold-inprocess (parse + prepare + prove, per
+#      rep) and warm (prove only, key resident), with the five-stage split from
+#      StageTimings.
 #
 # Reporting only (2) flatters us by the whole parse; reporting only (1) hides which stage
 # owns the time. Both get written, and the report is expected to quote the gap.

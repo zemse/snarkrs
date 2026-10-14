@@ -32,7 +32,7 @@
 //!   snarkrs file info <file>                                               (fi)
 //!
 //!   snarkrs bench  --artifacts DIR [--variant NAME]... [--reps 15] [--backend cpu|wgpu|...]
-//!                  [--mode cold|warm|both] [--csv out.csv]
+//!                  [--mode cold-inprocess|cold-process|warm|both] [--csv out.csv]
 //!   snarkrs trace  --zkey c.zkey --witness c.wtns [--backend cpu|wgpu|...] [--out t.txt]
 //!   snarkrs fft-bench --power N [--variants NAME,...] [--block-size N,...]  (cuda only)
 //!

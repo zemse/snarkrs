@@ -12,6 +12,12 @@ ROOT = Path(__file__).resolve().parent.parent
 SWEEP = ROOT / "results" / "sweep"
 
 
+def sweep_mode(mode):
+    """The sweep's `cold` has always been `snarkrs bench`'s in-process cold, which now
+    names itself `cold-inprocess`; folding it back keeps old and new sweeps one series."""
+    return "cold" if mode == "cold-inprocess" else mode
+
+
 def load():
     od, spot = {}, {}
     for r in csv.DictReader((ROOT / "aws" / "machines.csv").open()):
@@ -45,7 +51,8 @@ def load():
             for r in csv.DictReader(f.open()):
                 if not r.get("ms") or r.get("verified") not in ("yes", "true", "True", "1"):
                     continue
-                by[(r["backend"], r["mode"], r["variant"], int(r["constraints"]))].append(
+                by[(r["backend"], sweep_mode(r["mode"]), r["variant"],
+                    int(r["constraints"]))].append(
                     (float(r["ms"]), float(r.get("prepare_ms") or 0)))
             for (b, mode, v, nc), vals in by.items():
                 ms = statistics.median(x[0] for x in vals)

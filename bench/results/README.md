@@ -163,6 +163,15 @@ second is what a worker that re-prepares per job costs. They are just not the sa
 measurement, and quoting one against the other would invent a 1.5x improvement that does
 not exist.
 
+`snarkrs bench` now names the two apart, and the CSV `mode` column says which one a row
+measured: `cold-process` is round 1's fresh process per rep, `cold-inprocess` is round 2's.
+`--mode cold` still selects `cold-inprocess`, and `--mode both` is still that plus warm.
+CSVs written before the split say `cold` for either: for `ours` rows from `snarkrs bench`
+(`bench-machine.sh`, `run-benchmark.sh`, the sweep) it is in-process, from
+`run-comparison.py` it is a fresh process, and for rapidsnark and snarkjs it has only ever
+been a fresh process. `run-benchmark.sh` now also runs `cold-process`, so a machine table's
+cold column compares like with like, and `cold-inprocess` gets a section of its own.
+
 The warm numbers give a second, sharper reading of the same pair of runs. Between the two
 rounds, on the same instance type, **CUDA warm differed by 0.9 ms (0.6%) and CPU warm by
 118 ms (5.4%)**. The GPU is a passthrough device; the host CPU shares a socket with

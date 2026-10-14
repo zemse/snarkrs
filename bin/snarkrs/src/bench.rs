@@ -1,13 +1,18 @@
 //! `snarkrs bench`: cold and warm proving timings, with every proof verified first.
 //!
-//! Cold and warm each mean exactly one thing here, and the difference is the whole point
-//! of the subcommand:
+//! Each mode means exactly one thing here, and its name is what the CSV `mode` column says,
+//! so a row never has to be read against the command line that produced it:
 //!
-//! * **cold** - every rep pays the full cost. The zkey parse, the witness parse, backend
-//!   construction and `PreparedCircuit::prepare` all sit inside the timed region and
-//!   everything is dropped afterwards, so no rep can inherit a warm cache from the one
-//!   before it. This is what a CLI prover actually does, and on a GPU it is where the
-//!   key upload shows up.
+//! * **cold-inprocess** (`--mode cold` is the old name for it) - every rep pays the full
+//!   cost inside this process. The zkey parse, the witness parse, backend construction and
+//!   `PreparedCircuit::prepare` all sit inside the timed region and everything is dropped
+//!   afterwards, so no rep can inherit a warm cache from the one before it. This is what a
+//!   worker that re-prepares per job does, and on a GPU it is where the key upload shows up.
+//! * **cold-process** - one fresh `snarkrs groth16 prove` process per rep, timed around the
+//!   whole invocation: process start, dynamic linking, key parse, prove, JSON write, exit.
+//!   This is what a CLI prover costs, and what round 1 and `run-comparison.py` call cold.
+//!   `bench/results/README.md` measured it about 200 ms above cold-inprocess at 140,261
+//!   constraints on both cpu and cuda, which is process startup.
 //! * **warm** - setup is paid once outside the timed region and only `prove()` is timed.
 //!   This is what a resident service does, and it is the only mode in which a GPU can
 //!   look good, which is exactly why vendor charts prefer it. The setup cost is still
@@ -22,7 +27,7 @@
 //! Timings are reported as median with min/max. Means over 15 reps on a laptop measure
 //! whatever else the OS decided to do during the run.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
@@ -35,8 +40,14 @@ use crate::{BackendKind, HostInfo};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum Mode {
-    Cold,
+    /// Parse, prepare and prove inside this process, per rep.
+    #[value(name = "cold-inprocess", alias = "cold")]
+    ColdInprocess,
+    /// One fresh `snarkrs groth16 prove` process per rep.
+    #[value(name = "cold-process")]
+    ColdProcess,
     Warm,
+    /// cold-inprocess and warm.
     Both,
 }
 
@@ -70,8 +81,9 @@ pub struct Args {
 
 pub const CSV_HEADER: &str = "host,os,arch,cores,variant,constraints,prover,backend,mode,rep,ms,prepare_ms,gather_us,ntt_us,pointwise_us,msm_us,assemble_us,verified,adx_bmi2";
 
-/// One proof and what it cost. `prepare_ms` is setup only, and for a cold rep it is the
-/// part of `ms` spent before `prove()` was entered.
+/// One proof and what it cost. `prepare_ms` is setup only, and for a cold-inprocess rep it
+/// is the part of `ms` spent before `prove()` was entered. A cold-process rep sees only
+/// the child's wall clock, so it has neither, and its CSV cells are empty rather than zero.
 pub struct Row {
     pub variant: String,
     pub constraints: i64,
@@ -79,8 +91,8 @@ pub struct Row {
     pub mode: &'static str,
     pub rep: usize,
     pub ms: f64,
-    pub prepare_ms: f64,
-    pub timings: StageTimings,
+    pub prepare_ms: Option<f64>,
+    pub timings: Option<StageTimings>,
 }
 
 impl Row {
@@ -88,9 +100,15 @@ impl Row {
     /// leaves through `?` and is never recorded, and `bench/scripts/bench_external.py`
     /// refuses the same way. The column is schema parity with that writer.
     fn to_csv(&self, host: &HostInfo) -> String {
-        let t = self.timings;
+        let prepare = self.prepare_ms.map_or(String::new(), |p| format!("{p:.3}"));
+        let stages = self.timings.map_or(",,,,".to_string(), |t| {
+            format!(
+                "{},{},{},{},{}",
+                t.gather_us, t.ntt_us, t.pointwise_us, t.msm_us, t.assemble_us
+            )
+        });
         format!(
-            "{},{},{},{},{},{},ours,{},{},{},{:.3},{:.3},{},{},{},{},{},yes,{}",
+            "{},{},{},{},{},{},ours,{},{},{},{:.3},{},{},yes,{}",
             host.host,
             host.os,
             host.arch,
@@ -101,12 +119,8 @@ impl Row {
             self.mode,
             self.rep,
             self.ms,
-            self.prepare_ms,
-            t.gather_us,
-            t.ntt_us,
-            t.pointwise_us,
-            t.msm_us,
-            t.assemble_us,
+            prepare,
+            stages,
             if ADX_BMI2 { "yes" } else { "no" },
         )
     }
@@ -119,9 +133,10 @@ pub fn run(args: Args) -> Result<()> {
     let host = HostInfo::detect();
     let variants = artifacts::selected(&args.artifacts, &args.variant)?;
     let modes: &[Mode] = match args.mode {
-        Mode::Cold => &[Mode::Cold],
+        Mode::ColdInprocess => &[Mode::ColdInprocess],
+        Mode::ColdProcess => &[Mode::ColdProcess],
         Mode::Warm => &[Mode::Warm],
-        Mode::Both => &[Mode::Cold, Mode::Warm],
+        Mode::Both => &[Mode::ColdInprocess, Mode::Warm],
     };
 
     // Which x86 build this is, so a baseline build is never read as an adx+bmi2 one.
@@ -137,7 +152,8 @@ pub fn run(args: Args) -> Result<()> {
         println!("\n=== {} ({constraints} constraints{work}) ===", v.name);
         for mode in modes {
             let got = match mode {
-                Mode::Cold => cold(v, constraints, &args)?,
+                Mode::ColdInprocess => cold_inprocess(v, constraints, &args)?,
+                Mode::ColdProcess => cold_process(v, constraints, &args)?,
                 Mode::Warm => warm(v, constraints, &args)?,
                 Mode::Both => unreachable!("expanded above"),
             };
@@ -229,7 +245,7 @@ fn check_foreign_verify_output(out: &std::process::Output) -> Result<()> {
     Ok(())
 }
 
-fn cold(v: &Variant, constraints: i64, args: &Args) -> Result<Vec<Row>> {
+fn cold_inprocess(v: &Variant, constraints: i64, args: &Args) -> Result<Vec<Row>> {
     // The verifying key is not part of proving, so it is loaded once and stays out of
     // every timed region in both modes.
     let vk = VerifyingKey::from_json(&v.vkey())
@@ -262,28 +278,119 @@ fn cold(v: &Variant, constraints: i64, args: &Args) -> Result<Vec<Row>> {
         // to the prover, and rapidsnark and snarkjs, the columns beside ours, run none.
         verify(&vk, &public, &proof).with_context(|| {
             format!(
-                "{} cold rep {rep}: our own verifier rejected the proof",
+                "{} cold-inprocess rep {rep}: our own verifier rejected the proof",
                 v.name
             )
         })?;
         if rep == 1 {
-            foreign_verify(args, v, &proof, &public, "cold")?;
+            foreign_verify(args, v, &proof, &public, "cold-inprocess")?;
         }
 
         rows.push(Row {
             variant: v.name.clone(),
             constraints,
             backend: args.backend.as_str(),
-            mode: "cold",
+            mode: "cold-inprocess",
             rep,
             ms: total_ms,
-            prepare_ms,
-            timings: t,
+            prepare_ms: Some(prepare_ms),
+            timings: Some(t),
         });
-        // Explicit, because the whole meaning of "cold" is that nothing survives a rep.
+        // Explicit, because the whole meaning of cold is that nothing survives a rep.
         drop(circuit);
     }
     Ok(rows)
+}
+
+fn cold_process(v: &Variant, constraints: i64, args: &Args) -> Result<Vec<Row>> {
+    let vk = VerifyingKey::from_json(&v.vkey())
+        .with_context(|| format!("{}: loading vkey.json", v.name))?;
+    // The expected public signals come from the witness, read once outside the timed
+    // region: the child has to prove this witness, not merely produce a valid proof.
+    let witness = Witness::load(&v.wtns())
+        .with_context(|| format!("{}: loading circuit.wtns", v.name))?
+        .0;
+    let public = public_of(&witness, vk.ic.len().saturating_sub(1))?;
+    let exe = std::env::current_exe().context("locating the snarkrs binary")?;
+    let dir = std::env::temp_dir().join(format!("g16-bench-process-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let (proof_path, public_path) = (dir.join("proof.json"), dir.join("public.json"));
+
+    let mut rows = Vec::with_capacity(args.reps);
+    for rep in 1..=args.reps {
+        for f in [&proof_path, &public_path] {
+            std::fs::remove_file(f).ok();
+        }
+        let start = Instant::now();
+        let out = prove_command(&exe, v, args, &proof_path, &public_path)
+            .output()
+            .with_context(|| format!("running {}", exe.display()))?;
+        let total_ms = ms(start);
+        if !out.status.success() {
+            bail!(
+                "{} cold-process rep {rep}: {} exited {}; stderr: {}",
+                v.name,
+                exe.display(),
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        let proof = crate::json::read_proof(&proof_path)
+            .with_context(|| format!("{} cold-process rep {rep}: reading proof.json", v.name))?;
+        let written = crate::json::read_public(&public_path)
+            .with_context(|| format!("{} cold-process rep {rep}: reading public.json", v.name))?;
+        if written != public {
+            bail!(
+                "{} cold-process rep {rep}: public.json differs from the witness",
+                v.name
+            );
+        }
+        verify(&vk, &public, &proof).with_context(|| {
+            format!(
+                "{} cold-process rep {rep}: our own verifier rejected the proof",
+                v.name
+            )
+        })?;
+        if rep == 1 {
+            foreign_verify(args, v, &proof, &public, "cold-process")?;
+        }
+
+        rows.push(Row {
+            variant: v.name.clone(),
+            constraints,
+            backend: args.backend.as_str(),
+            mode: "cold-process",
+            rep,
+            ms: total_ms,
+            prepare_ms: None,
+            timings: None,
+        });
+    }
+    std::fs::remove_dir_all(&dir).ok();
+    Ok(rows)
+}
+
+/// The child a cold-process rep times. Self-verify is off for the same reason the
+/// in-process modes call `prove_unchecked`: the check runs here, outside the timed region.
+fn prove_command(
+    exe: &Path,
+    v: &Variant,
+    args: &Args,
+    proof: &Path,
+    public: &Path,
+) -> std::process::Command {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(["groth16", "prove"])
+        .arg(v.zkey())
+        .arg(v.wtns())
+        .arg(proof)
+        .arg(public)
+        .args(["--backend", args.backend.as_str(), "--self-verify", "false"]);
+    if args.constant_work {
+        cmd.arg("--constant-work");
+    }
+    cmd
 }
 
 fn warm(v: &Variant, constraints: i64, args: &Args) -> Result<Vec<Row>> {
@@ -326,8 +433,8 @@ fn warm(v: &Variant, constraints: i64, args: &Args) -> Result<Vec<Row>> {
             mode: "warm",
             rep,
             ms: prove_ms,
-            prepare_ms,
-            timings: t,
+            prepare_ms: Some(prepare_ms),
+            timings: Some(t),
         });
     }
     Ok(rows)
@@ -358,23 +465,28 @@ fn report(rows: &[Row]) {
     let ms: Vec<f64> = rows.iter().map(|r| r.ms).collect();
     let lo = ms.iter().cloned().fold(f64::INFINITY, f64::min);
     let hi = ms.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    // One call reports one mode, so either every row has the split or none does.
+    let prepare: Vec<f64> = rows.iter().filter_map(|r| r.prepare_ms).collect();
+    let prepare = if prepare.is_empty() {
+        String::new()
+    } else {
+        format!("  prepare {:.1} ms", median(&prepare))
+    };
     println!(
-        "  {:6} {:5}  median {:8.1} ms (min {:.1} max {:.1})  prepare {:.1} ms  n={}",
+        "  {:6} {:14}  median {:8.1} ms (min {:.1} max {:.1}){prepare}  n={}",
         first.backend,
         first.mode,
         median(&ms),
         lo,
         hi,
-        median(&rows.iter().map(|r| r.prepare_ms).collect::<Vec<_>>()),
         rows.len(),
     );
+    let timings: Vec<StageTimings> = rows.iter().filter_map(|r| r.timings).collect();
+    if timings.is_empty() {
+        return;
+    }
     let stage = |f: fn(&StageTimings) -> u64| {
-        median(
-            &rows
-                .iter()
-                .map(|r| f(&r.timings) as f64)
-                .collect::<Vec<_>>(),
-        ) / 1000.0
+        median(&timings.iter().map(|t| f(t) as f64).collect::<Vec<_>>()) / 1000.0
     };
     println!(
         "         stages (median ms): gather {:.2}  ntt {:.2}  pointwise {:.2}  msm {:.2}  assemble {:.2}",
@@ -457,15 +569,15 @@ mod tests {
             mode: "warm",
             rep: 3,
             ms: 1.5,
-            prepare_ms: 2.25,
-            timings: StageTimings {
+            prepare_ms: Some(2.25),
+            timings: Some(StageTimings {
                 gather_us: 1,
                 ntt_us: 2,
                 pointwise_us: 3,
                 msm_us: 4,
                 assemble_us: 5,
                 verify_us: 0,
-            },
+            }),
         };
         let line = row.to_csv(&host);
         assert_eq!(
@@ -481,5 +593,41 @@ mod tests {
             "{line}"
         );
         assert!(line.contains(",ours,cpu,warm,3,1.500,2.250,"), "{line}");
+    }
+
+    #[test]
+    fn cold_process_row_leaves_what_it_cannot_see_empty() {
+        let host = HostInfo::detect();
+        let row = Row {
+            variant: "v".into(),
+            constraints: 42,
+            backend: "cpu",
+            mode: "cold-process",
+            rep: 1,
+            ms: 1.5,
+            prepare_ms: None,
+            timings: None,
+        };
+        let line = row.to_csv(&host);
+        assert_eq!(
+            line.split(',').count(),
+            CSV_HEADER.split(',').count(),
+            "{line}"
+        );
+        assert!(
+            line.contains(",ours,cpu,cold-process,1,1.500,,,,,,,yes,"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn cold_is_still_the_in_process_mode() {
+        use clap::ValueEnum;
+        assert_eq!(Mode::from_str("cold", false), Ok(Mode::ColdInprocess));
+        assert_eq!(
+            Mode::from_str("cold-inprocess", false),
+            Ok(Mode::ColdInprocess)
+        );
+        assert_eq!(Mode::from_str("cold-process", false), Ok(Mode::ColdProcess));
     }
 }
