@@ -8,7 +8,7 @@ validation. Historical benchmark tables are not current conformance evidence.
 | backend | proving NTT | G1/G2 MSM | H storage | host bulk key retained | work modes | runtime |
 | --- | --- | --- | --- | --- | --- | --- |
 | CPU | CPU | CPU | host | yes | variable, constant | native Rust |
-| Metal | GPU | GPU | device | no | variable, constant | Apple Metal, feature-gated |
+| Metal | GPU | G1 GPU, G2 CPU (see below) | device | B-in-G2 bases only | variable, constant | Apple Metal, feature-gated |
 | CUDA | GPU | GPU | device | yes | variable, constant | NVIDIA CUDA/NVRTC, feature-gated |
 | WGPU | GPU | GPU | device | yes | variable, constant | native WGPU or browser WebGPU, feature-gated |
 
@@ -28,7 +28,14 @@ separate sealed command buffers, not one command buffer for all stages. See the 
 `PreparedCircuit::key()` guarantees `n_vars`, `n_public`, `domain_size`, the full `vk`
 (including `ic`), and `alpha_g1`, `beta_g1`, `beta_g2`, `delta_g1`, `delta_g2`. Dimensions
 agree with the circuit accessors. Bulk coefficients and the five query vectors are
-backend-dependent: Metal releases them after upload. Retain or reload the original key
+backend-dependent: Metal releases them after upload, except the B-in-G2 bases when that
+MSM runs on the CPU.
+
+Metal runs the B-in-G2 MSM on the CPU, on its own rayon pool sized like the global one,
+while the GPU runs the other four MSMs. Variable work always does; constant work does
+only when the key's finite G2 bases are at most 5/8 of the domain (a property of the key,
+not the witness), and the CPU side then uses the CPU constant-work MSM.
+`G16_METAL_G2_CPU=0` or `=1` forces the route. Retain or reload the original key
 to prepare another backend; `key()` is not a re-preparation contract.
 
 Variable work is the default. Constant work fixes scalar-dependent MSM sizing and
