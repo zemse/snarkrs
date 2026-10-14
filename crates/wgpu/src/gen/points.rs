@@ -1781,6 +1781,15 @@ fn {entry}(@builtin(global_invocation_id) gid: vec3<u32>) {{
 /// question is what Metal is asked to compile. Native runs seed it from `G16_WGPU_REDUCE_BODY`.
 pub static REDUCE_BODY: GenKnob = GenKnob::new("REDUCE_BODY", "G16_WGPU_REDUCE_BODY", 0, 1);
 
+/// Whether a knob is at a level that is the known-bad spelling on purpose (`REDUCE_BODY` 1,
+/// `MERGE_BODY` 5), so the inlined point-operation budget cannot hold. Those levels are
+/// reachable from a browser (`set_reduce_body`) to ask a future Safari whether the bug is
+/// still there, which is why they are not refused on wasm32 and the budget test steps aside
+/// for them instead.
+pub fn knobs_reproduce_known_miscompile() -> bool {
+    REDUCE_BODY.get() == 1 || MERGE_BODY.get() == 5
+}
+
 /// The reduce, on the XYZZ shortcuts (`constant` false) or on the complete formulas over
 /// projective points for a constant-work plan (`constant` true, `msm_reduce_constant_*`).
 /// Same state machine over one call site either way; the constant one converts what it

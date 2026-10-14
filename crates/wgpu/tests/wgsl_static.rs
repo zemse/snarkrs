@@ -835,6 +835,14 @@ fn worst_loop(body: &str, weight: &dyn Fn(&str) -> usize) -> usize {
 /// this is a ratchet: if a change needs more, the phone is what says whether it may have it.
 #[test]
 fn no_entry_point_inlines_more_point_operations_than_the_device_survives() {
+    // A knob at its known-bad level must keep reproducing the bug in the entry points it
+    // rewrites, and every other entry point stays inside the budget.
+    let bad = pointsgen::knobs_reproduce_known_miscompile();
+    let affected = |name: &str| {
+        bad && ((pointsgen::REDUCE_BODY.get() == 1 && name.starts_with("msm_reduce_g"))
+            || (pointsgen::MERGE_BODY.get() == 5 && name.starts_with("msm_merge_g")))
+    };
+    let mut reproduced_g2 = false;
     let v = Variant::default();
     let mut checked = 0usize;
     for c in pointsgen::CURVES {
@@ -861,6 +869,20 @@ fn no_entry_point_inlines_more_point_operations_than_the_device_survives() {
             };
             for e in m.entry_points() {
                 let total = weight(&e.name);
+                let worst_loop_sites = m
+                    .reachable(&e.name)
+                    .iter()
+                    .map(|f| worst_loop(&f.body, &weight))
+                    .max()
+                    .unwrap_or(0);
+                if affected(&e.name) {
+                    if c.suffix == "g2"
+                        && (total > MAX_SITES_PER_ENTRY || worst_loop_sites > MAX_SITES_PER_LOOP)
+                    {
+                        reproduced_g2 = true;
+                    }
+                    continue;
+                }
                 assert!(
                     total <= MAX_SITES_PER_ENTRY,
                     "{label}: {} inlines {total} point-operation call sites, over the {} the \
@@ -870,24 +892,24 @@ fn no_entry_point_inlines_more_point_operations_than_the_device_survives() {
                     e.name,
                     MAX_SITES_PER_ENTRY
                 );
-                for f in m.reachable(&e.name) {
-                    let worst = worst_loop(&f.body, &weight);
-                    assert!(
-                        worst <= MAX_SITES_PER_LOOP,
-                        "{label}: {} reaches {}, which has a loop enclosing {worst} \
-                         point-operation call sites, over the {}. That is the shape that \
-                         loses an iPhone 15 Pro's device every time; see \
-                         gen::points::MERGE_BODY level 5, which keeps it reachable on \
-                         purpose.",
-                        e.name,
-                        f.name,
-                        MAX_SITES_PER_LOOP
-                    );
-                }
+                assert!(
+                    worst_loop_sites <= MAX_SITES_PER_LOOP,
+                    "{label}: {} reaches a function with a loop enclosing {worst_loop_sites} \
+                     point-operation call sites, over the {}. That is the shape that loses \
+                     an iPhone 15 Pro's device every time; see gen::points::MERGE_BODY \
+                     level 5, which keeps it reachable on purpose.",
+                    e.name,
+                    MAX_SITES_PER_LOOP
+                );
                 checked += 1;
             }
         }
     }
+    assert!(
+        !bad || reproduced_g2,
+        "a knob is at its known-bad level but no G2 entry point exceeds the budget any more, \
+         so the probe no longer reproduces WebKit 323560"
+    );
     assert!(
         checked >= 10,
         "only {checked} entry points checked; both curves emit five each at two widths, so \
