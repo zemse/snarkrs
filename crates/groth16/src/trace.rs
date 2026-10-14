@@ -256,14 +256,42 @@ impl Trace {
     }
 }
 
-/// The rows where two traces disagree, as `(name, left, right)`. Empty means the two runs
-/// computed the same proof.
-pub fn diff<'a>(a: &'a Trace, b: &'a Trace) -> Vec<(&'static str, &'a str, &'a str)> {
-    a.rows()
-        .zip(b.rows())
-        .filter(|((_, x), (_, y))| x != y)
-        .map(|((name, x), (_, y))| (name, x, y))
-        .collect()
+/// Where two traces disagree, as `(name, left, right)`. Empty means the two runs computed the
+/// same proof. Shape rows come first and are named `shape.<name>`: a hit there means the runs
+/// were not given the same problem. Rows follow, then the H chunks as `h_chunk[NN]`, or one
+/// `h_chunks` entry when only one side carries them or they are cut differently.
+pub fn diff(a: &Trace, b: &Trace) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    for (x, y) in a.shape.iter().zip(&b.shape) {
+        if x.value != y.value {
+            out.push((
+                format!("shape.{}", x.name),
+                x.value.clone(),
+                y.value.clone(),
+            ));
+        }
+    }
+    for ((name, x), (_, y)) in a.rows().zip(b.rows()) {
+        if x != y {
+            out.push((name.to_string(), x.to_string(), y.to_string()));
+        }
+    }
+    match (&a.h_chunks, &b.h_chunks) {
+        (Some(x), Some(y)) if x.len() == y.len() => {
+            for (i, (dx, dy)) in x.iter().zip(y).enumerate() {
+                if dx != dy {
+                    out.push((format!("h_chunk[{i:02}]"), hex64(*dx), hex64(*dy)));
+                }
+            }
+        }
+        (None, None) => {}
+        (x, y) => {
+            let count =
+                |c: &Option<Vec<u64>>| c.as_ref().map_or("-".into(), |c| c.len().to_string());
+            out.push(("h_chunks".to_string(), count(x), count(y)));
+        }
+    }
+    out
 }
 
 fn chunk_digests(h: &[Fr]) -> Vec<u64> {
@@ -315,5 +343,46 @@ fn affine2(p: &G2Affine) -> String {
             crate::json::dec(y.c1)
         ),
         None => "infinity".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(name: &'static str, value: &str) -> Row {
+        Row {
+            name,
+            value: value.into(),
+        }
+    }
+
+    fn trace(n_vars: &str, h_chunks: Vec<u64>) -> Trace {
+        Trace {
+            backend: "test",
+            shape: vec![row("n_vars", n_vars)],
+            rows: vec![row("h_len", "8")],
+            h_chunks: Some(h_chunks),
+        }
+    }
+
+    #[test]
+    fn identical_traces_do_not_differ() {
+        assert!(diff(&trace("4", vec![1, 2]), &trace("4", vec![1, 2])).is_empty());
+    }
+
+    #[test]
+    fn a_shape_only_difference_is_reported() {
+        let d = diff(&trace("4", vec![1, 2]), &trace("5", vec![1, 2]));
+        assert_eq!(
+            d,
+            vec![("shape.n_vars".to_string(), "4".to_string(), "5".to_string())]
+        );
+    }
+
+    #[test]
+    fn an_h_chunk_only_difference_names_the_chunk() {
+        let d = diff(&trace("4", vec![1, 2]), &trace("4", vec![1, 3]));
+        assert_eq!(d, vec![("h_chunk[01]".to_string(), hex64(2), hex64(3))]);
     }
 }

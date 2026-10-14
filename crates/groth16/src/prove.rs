@@ -661,12 +661,12 @@ mod tests {
             // most of them do not: the last wire of `railgun-01x01` leaves `h_digest`
             // untouched. Asserting on the first differing row would be asserting on the
             // fixture rather than on the trace.
-            let names: Vec<&str> = crate::trace::diff(&good, &bad)
-                .iter()
-                .map(|(n, _, _)| *n)
+            let names: Vec<String> = crate::trace::diff(&good, &bad)
+                .into_iter()
+                .map(|(n, _, _)| n)
                 .collect();
-            assert!(names.contains(&"msm_l_g1"), "{names:?}");
-            assert!(names.contains(&"proof_c"), "{names:?}");
+            assert!(names.iter().any(|n| n == "msm_l_g1"), "{names:?}");
+            assert!(names.iter().any(|n| n == "proof_c"), "{names:?}");
         });
     }
 
