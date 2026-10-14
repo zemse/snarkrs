@@ -697,6 +697,51 @@ fn a_lying_domain_size_is_refused_before_anything_is_allocated() {
     );
 }
 
+/// The prover needs `Domain::new(2n)` for its coset shift, so 2^27 is the largest domain
+/// it can handle and 2^28 must be refused at load, not at prepare with "no 2n-th root".
+#[test]
+fn the_domain_size_gate_sits_at_the_largest_provable_domain() {
+    assert_eq!(MAX_LOG_DOMAIN_SIZE, 27);
+    check_domain_size(1 << 27).expect("2^27 is provable and must pass the gate");
+    assert!(Domain::new(2 << 27).is_ok(), "2^27 must have a 2n-th root");
+    let msg = check_domain_size(1 << 28)
+        .expect_err("2^28 has no 2n-th root and must be refused")
+        .to_string();
+    assert!(msg.contains("two-adicity"), "unhelpful error: {msg}");
+    assert!(
+        Domain::new(2 << 28).is_err(),
+        "2^28 must have no 2n-th root"
+    );
+    for bad in [0, 3, (1 << 27) + 1] {
+        check_domain_size(bad).expect_err(&format!("{bad} is not a power of two"));
+    }
+}
+
+/// The same boundary through the full parse. 2^27 passes the two-adicity gate and is
+/// refuted by the section 9 length, 2^28 never gets that far.
+#[test]
+fn a_zkey_one_bit_past_the_provable_domain_is_refused_at_load() {
+    for_each_artifact(
+        "a_zkey_one_bit_past_the_provable_domain_is_refused_at_load",
+        |a| {
+            for (log, two_adic) in [(27u32, false), (28, true)] {
+                let err = load_mutated("boundary", &a.dir, |b| {
+                    let at = locate(b).domain_size_at;
+                    b[at..at + 4].copy_from_slice(&(1u32 << log).to_le_bytes());
+                })
+                .expect_err(&format!("{}: domainSize 2^{log} must be rejected", a.name));
+                let msg = err.to_string();
+                assert_eq!(
+                    msg.contains("two-adicity"),
+                    two_adic,
+                    "{}: domainSize 2^{log} hit the wrong gate: {msg}",
+                    a.name
+                );
+            }
+        },
+    );
+}
+
 /// `nPublic + 1` used to be an unchecked add on a `usize` that came straight from an
 /// attacker-supplied `u64`. In release, where overflow checks are off, `usize::MAX + 1`
 /// wraps to 0, so `"nPublic": 18446744073709551615` paired with `"IC": []` satisfied the

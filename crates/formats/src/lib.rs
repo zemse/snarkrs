@@ -265,12 +265,6 @@ impl ProvingKey {
             });
         }
 
-        if domain_size == 0 || !domain_size.is_power_of_two() {
-            return Err(ZkeyError::Malformed {
-                section: 2,
-                reason: format!("domain size {domain_size} is not a power of two"),
-            });
-        }
         // Bound `domain_size` here, before a single byte is allocated from it.
         //
         // Two independent gates, because the header is attacker-controlled and everything
@@ -280,20 +274,8 @@ impl ProvingKey {
         // afterwards. A 4 KB file claiming 2^31 therefore cost 34 GB and 11.5 seconds
         // before erroring. Same class as CVE-2024-50354 in gnark.
         //
-        // 1. Two-adicity. The NTT needs a 2^log_size-th root of unity, and Fr has one only
-        //    up to 2^TWO_ADICITY (28 for BN254). A larger domain cannot be transformed at
-        //    all, so accepting it buys nothing and costs an allocation.
-        let log_size = domain_size.trailing_zeros();
-        if log_size > Fr::TWO_ADICITY {
-            return Err(ZkeyError::Malformed {
-                section: 2,
-                reason: format!(
-                    "domain size 2^{log_size} exceeds the two-adicity of Fr (2^{}), so no \
-                     root of unity of that order exists",
-                    Fr::TWO_ADICITY
-                ),
-            });
-        }
+        // 1. Shape and two-adicity, see `check_domain_size`.
+        check_domain_size(domain_size)?;
         // 2. Cross-check against the file that is actually present. Section 9 holds exactly
         //    `domain_size` G1 points, so its length refutes a lying header for the cost of
         //    a slice lookup, with nothing allocated yet.
@@ -451,6 +433,38 @@ impl ProvingKey {
 }
 
 /// Reads `u32 n8, modulus[n8]` and rejects anything but the expected BN254 prime.
+/// The largest `log2(domainSize)` a key can have and still be proved.
+///
+/// Every prover builds its coset shift from `Domain::new(2 * domain_size)`, because
+/// snarkjs evaluates on the odd 2n-th roots of unity. So the binding constraint is a
+/// 2n-th root, not the n-th root the NTT needs, and Fr has one only up to
+/// 2^TWO_ADICITY (28 for BN254). That leaves 2^27.
+const MAX_LOG_DOMAIN_SIZE: u32 = Fr::TWO_ADICITY - 1;
+
+/// Refuses a header `domainSize` that is not a power of two, or that no prover can handle.
+/// A larger domain has no 2n-th root of unity, so accepting it buys nothing and costs an
+/// allocation, and would only fail later at prepare with a less useful message.
+fn check_domain_size(domain_size: usize) -> Result<(), ZkeyError> {
+    if domain_size == 0 || !domain_size.is_power_of_two() {
+        return Err(ZkeyError::Malformed {
+            section: 2,
+            reason: format!("domain size {domain_size} is not a power of two"),
+        });
+    }
+    let log_size = domain_size.trailing_zeros();
+    if log_size > MAX_LOG_DOMAIN_SIZE {
+        return Err(ZkeyError::Malformed {
+            section: 2,
+            reason: format!(
+                "domain size 2^{log_size} exceeds 2^{MAX_LOG_DOMAIN_SIZE}: the prover needs a \
+                 2n-th root of unity and the two-adicity of Fr is {}",
+                Fr::TWO_ADICITY
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn check_modulus(c: &mut Cursor<'_>, want: &[u8]) -> Result<(), ZkeyError> {
     let n8 = c.u32()? as usize;
     if n8 != want.len() {
