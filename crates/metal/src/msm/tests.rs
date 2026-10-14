@@ -15,7 +15,7 @@ fn slice_override_never_zero_or_past_u32() {
     );
 }
 
-use super::window::{parse_slice_override, MERGE_TG, MSM_NO_ROW};
+use super::window::{parse_slice_override, DUMMY_ROWS, MERGE_TG, MSM_NO_ROW, RECODE_BITS, SCAN_TG};
 use super::*;
 use crate::layout::as_bytes;
 use snarkrs_field::CurveGroup;
