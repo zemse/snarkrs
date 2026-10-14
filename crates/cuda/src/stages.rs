@@ -274,9 +274,7 @@ pub struct CudaStages {
 
     domain: Domain,
     n_vars: usize,
-    /// snarkjs' `inc`, a primitive 2n-th root of unity. Not `Domain::coset_gen`; see
-    /// `snarkrs_groth16::cpu::CpuCircuit::new` for the argument, which is a contract with the
-    /// section 9 bases in the zkey and not a free choice.
+    /// snarkjs' `inc`, from `Domain::proving_coset_shift`.
     coset_shift: Fr,
     batches: Vec<Batch>,
 
@@ -389,17 +387,10 @@ impl CudaStages {
             )));
         }
 
-        // Same derivation as the CPU backend, and it must stay the same: the coset is fixed
-        // by the zkey's section 9 bases, so any other shift pairs the evaluations against
-        // the wrong Lagrange polynomials.
-        let coset_shift = Domain::new(
-            domain
-                .size()
-                .checked_mul(2)
-                .ok_or_else(|| bad("domain size overflows"))?,
-        )
-        .map_err(|e| bad(format!("no 2n-th root of unity: {e}")))?
-        .group_gen();
+        // See `Domain::proving_coset_shift` for why this shift and not another.
+        let coset_shift = domain
+            .proving_coset_shift()
+            .map_err(|e| bad(format!("no 2n-th root of unity: {e}")))?;
 
         pk.coeffs
             .check_structure(domain.size(), pk.n_vars)

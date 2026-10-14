@@ -21,12 +21,8 @@ pub const ADX_BMI2: bool = cfg!(all(
 /// A radix-2 evaluation domain over `Fr`.
 ///
 /// The prover needs the `size`-th roots of unity for the NTT and their inverses for the
-/// iNTT. It does NOT get a coset generator from here, on purpose: the snarkjs-compatible
-/// H coset is the odd half of the `2*size`-th roots of unity, so each backend derives its
-/// shift as a primitive `2*size`-th root whose square is `group_gen` (see
-/// `CpuCircuit::new` in snarkrs-groth16 for the full argument). A shift built from
-/// `Fr::GENERATOR` is a mathematically valid coset that snarkjs rejects: paired with the
-/// section-9 H bases it produces proofs that fail to verify.
+/// iNTT. The coset shift comes from [`Domain::proving_coset_shift`], not from a coset
+/// generator such as `Fr::GENERATOR`: that is a valid coset which snarkjs rejects.
 ///
 /// The fields are private so every `Domain` comes out of [`Domain::new`]: `size` is a
 /// power of two, `log_size` is its log, and the three field elements are the ones derived
@@ -115,6 +111,24 @@ impl Domain {
         self.size_inv
     }
 
+    /// The shift of the coset the prover evaluates A, B and C on: snarkjs' `inc`, a primitive
+    /// `2*size`-th root of unity whose square is [`Self::group_gen`].
+    ///
+    /// snarkjs evaluates on the odd points of the `2*size`-th roots of unity (`inc =
+    /// Fr.w[power+1]` in groth16_prove.js), and section 9 of the zkey holds the Lagrange
+    /// basis of that same `2*size` domain restricted to its odd indices (`writeHs` in
+    /// zkey_new.js takes `sTauG1[2i+1]`). Evaluation index `i` must land on `inc^(2i+1)`,
+    /// which needs `Fr.w[power] == inc^2`. A shift built from `Fr::GENERATOR` is a valid
+    /// coset but pairs the evaluations with the wrong Lagrange polynomials, so the proof
+    /// fails to verify.
+    pub fn proving_coset_shift(&self) -> Result<Fr, DomainError> {
+        let doubled = self
+            .size
+            .checked_mul(2)
+            .ok_or(DomainError::TooLarge(self.size))?;
+        Ok(Domain::new(doubled)?.group_gen)
+    }
+
     /// Forward twiddles: `[1, g, g^2, ..., g^(size/2 - 1)]`.
     pub fn twiddles(&self) -> Vec<Fr> {
         powers(self.group_gen, self.size / 2)
@@ -147,6 +161,25 @@ mod tests {
             .iter()
             .map(|&n| Domain::new(n).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn proving_coset_shift_is_the_2n_th_root_and_squares_to_group_gen() {
+        for d in domains() {
+            let shift = d.proving_coset_shift().unwrap();
+            let doubled = Domain::new(2 * d.size()).unwrap();
+            assert_eq!(shift, doubled.group_gen(), "n = {}", d.size());
+            assert_eq!(shift * shift, d.group_gen(), "n = {}", d.size());
+        }
+    }
+
+    #[test]
+    fn proving_coset_shift_fails_past_the_two_adicity() {
+        let d = Domain::new(1 << Fr::TWO_ADICITY).unwrap();
+        assert!(matches!(
+            d.proving_coset_shift(),
+            Err(DomainError::TooLarge(_))
+        ));
     }
 
     #[test]

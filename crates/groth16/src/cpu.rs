@@ -55,8 +55,7 @@ impl Backend for CpuBackend {
 pub struct CpuCircuit {
     pk: ProvingKey,
     domain: Domain,
-    /// snarkjs' `inc`: a primitive `2 * domain_size`-th root of unity. See
-    /// [`CpuCircuit::new`] for why this and not `domain.coset_gen`.
+    /// snarkjs' `inc`, from [`Domain::proving_coset_shift`].
     coset_shift: Fr,
     /// One instance for the life of the circuit: the twiddle cache is per instance, and
     /// a fresh one would rebuild the size/2 table on every one of the six transforms.
@@ -85,23 +84,10 @@ impl CpuCircuit {
             )));
         }
 
-        // Why a 2n-th root of unity rather than `domain.coset_gen` (= Fr::GENERATOR):
-        // snarkjs evaluates A, B and C on the *odd* points of the 2n-th roots of unity,
-        // `inc = Fr.w[power+1]` in groth16_prove.js, and section 9 of the zkey holds the
-        // Lagrange basis of that same 2n domain restricted to its odd indices (see
-        // `writeHs` in zkey_new.js, which takes `sTauG1[2i+1]`). The bases are tied to
-        // that specific point set, so any other coset would pair evaluations against the
-        // wrong Lagrange polynomials. `Domain::new(2n).group_gen()` squares to
-        // `domain.group_gen()` by construction, which is exactly the relation
-        // `Fr.w[power] == inc^2` that makes evaluation index i land on `inc^(2i+1)`.
-        let coset_shift = Domain::new(
-            domain
-                .size()
-                .checked_mul(2)
-                .ok_or_else(|| bad("domain size overflows".into()))?,
-        )
-        .map_err(|e| bad(format!("no 2n-th root of unity: {e}")))?
-        .group_gen();
+        // See `Domain::proving_coset_shift` for why this shift and not another.
+        let coset_shift = domain
+            .proving_coset_shift()
+            .map_err(|e| bad(format!("no 2n-th root of unity: {e}")))?;
 
         pk.coeffs
             .check_structure(domain.size(), pk.n_vars)
@@ -677,7 +663,7 @@ mod tests {
         for log_n in 0..12u32 {
             let n = 1usize << log_n;
             let domain = Domain::new(n).unwrap();
-            let shift = Domain::new(2 * n).unwrap().group_gen();
+            let shift = domain.proving_coset_shift().unwrap();
             assert_eq!(shift * shift, domain.group_gen(), "n = {n}");
             assert_eq!(shift.pow([n as u64]), -Fr::one(), "n = {n}");
             // And therefore the coset misses the domain entirely, which is what makes

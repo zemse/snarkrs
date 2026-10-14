@@ -216,17 +216,10 @@ impl NttTables {
             )));
         }
 
-        // The same derivation as the CPU and Metal backends, and it has to stay the same:
-        // the coset is fixed by the zkey's section 9 bases, so any other shift pairs the
-        // evaluations against the wrong Lagrange polynomials.
-        let coset_shift = Domain::new(
-            domain
-                .size()
-                .checked_mul(2)
-                .ok_or_else(|| bad("domain size overflows"))?,
-        )
-        .map_err(|e| bad(format!("no 2n-th root of unity: {e}")))?
-        .group_gen();
+        // See `Domain::proving_coset_shift` for why this shift and not another.
+        let coset_shift = domain
+            .proving_coset_shift()
+            .map_err(|e| bad(format!("no 2n-th root of unity: {e}")))?;
 
         // Reject the unchunked tables before building any host vectors or uploading twiddles.
         check_table_capacity(domain.size(), &backend.granted_limits())?;
@@ -277,7 +270,7 @@ impl NttTables {
         &self.domain
     }
 
-    /// snarkjs' `inc`, a primitive `2n`-th root of unity. Not `Domain::coset_gen`.
+    /// snarkjs' `inc`, from `Domain::proving_coset_shift`.
     pub fn coset_shift(&self) -> Fr {
         self.coset_shift
     }

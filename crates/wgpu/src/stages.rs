@@ -272,9 +272,7 @@ impl HStages {
         self.n_vars
     }
 
-    /// snarkjs' `inc`, a primitive `2n`-th root of unity. Not `Domain::coset_gen`; see
-    /// `snarkrs_groth16::cpu::CpuCircuit::new` for why, which is a contract with the zkey's section
-    /// 9 bases rather than a free choice.
+    /// snarkjs' `inc`, from `Domain::proving_coset_shift`.
     pub fn coset_shift(&self) -> Fr {
         self.tables.coset_shift()
     }
