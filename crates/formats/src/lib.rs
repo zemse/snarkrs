@@ -432,7 +432,6 @@ impl ProvingKey {
     }
 }
 
-/// Reads `u32 n8, modulus[n8]` and rejects anything but the expected BN254 prime.
 /// The largest `log2(domainSize)` a key can have and still be proved.
 ///
 /// Every prover builds its coset shift from `Domain::new(2 * domain_size)`, because
@@ -465,6 +464,7 @@ fn check_domain_size(domain_size: usize) -> Result<(), ZkeyError> {
     Ok(())
 }
 
+/// Reads `u32 n8, modulus[n8]` and rejects anything but the expected BN254 prime.
 fn check_modulus(c: &mut Cursor<'_>, want: &[u8]) -> Result<(), ZkeyError> {
     let n8 = c.u32()? as usize;
     if n8 != want.len() {
