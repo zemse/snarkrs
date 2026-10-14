@@ -24,14 +24,21 @@
 //! would mean `snarkrs groth16 prove --backend metal` reported a number that belongs to the
 //! other backend, which is the exact failure this crate is meant to avoid. The crossover is
 //! a measurement to report, not a thing to hide.
+//!
+//! The one stage the CPU does take is stage 6, B in G2, and not as a fallback: it runs
+//! on the rayon pool at the same time as the GPU runs the other four, because the pool
+//! is otherwise idle for the whole proof and G2 is the MSM this GPU is worst at. The
+//! GPU still runs every other stage, so the proof's time is still the GPU's. See
+//! [`g2_on_cpu`].
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use metal::Device;
-use snarkrs_field::Fr;
+use snarkrs_field::{Fr, G1Projective, G2Affine, G2Projective};
 use snarkrs_formats::{Coefficients, ProvingKey};
 use snarkrs_groth16::{Backend, HPoly, MsmOutputs, PreparedCircuit, ProveError, StageTimings};
+use snarkrs_msm::{CpuMsm, MsmBackend};
 
 use crate::msm::{G1Bases, G2Bases, Job, JobG1, JobG2, MetalMsm, ScalarBuf, Work};
 use crate::stages::{HHandle, HResident, HStages};
@@ -184,7 +191,7 @@ pub struct MetalCircuit {
     resident: HResident,
     a_bases: G1Bases,
     b_g1_bases: G1Bases,
-    b_g2_bases: G2Bases,
+    b_g2: BG2,
     l_bases: G1Bases,
     h_bases: G1Bases,
     cost: PrepareCost,
@@ -265,11 +272,20 @@ impl MetalCircuit {
         };
         let a_bases = g1(std::mem::take(&mut pk.a_query))?;
         let b_g1_bases = g1(std::mem::take(&mut pk.b_g1_query))?;
-        let b_g2_bases = {
+        let b_g2 = {
             let v = std::mem::take(&mut pk.b_g2_query);
-            let bases = msm.upload_g2_bases(&v);
-            crate::alloc::release(v);
-            bases?
+            if g2_on_cpu(&v, pk.domain_size, work) {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(rayon::current_num_threads())
+                    .thread_name(|i| format!("metal-g2-{i}"))
+                    .build()
+                    .map_err(|e| bad(format!("stage 6 thread pool: {e}")))?;
+                BG2::Cpu { bases: v, pool }
+            } else {
+                let bases = msm.upload_g2_bases(&v);
+                crate::alloc::release(v);
+                BG2::Gpu(bases?)
+            }
         };
         let l_bases = g1(std::mem::take(&mut pk.l_query))?;
         let h_bases = g1(std::mem::take(&mut pk.h_query))?;
@@ -294,7 +310,7 @@ impl MetalCircuit {
             resident,
             a_bases,
             b_g1_bases,
-            b_g2_bases,
+            b_g2,
             l_bases,
             h_bases,
             cost,
@@ -322,40 +338,88 @@ impl MetalCircuit {
     /// short suffix of it, is what makes all four share a single counting sort inside
     /// `msm_batch`; a second upload would silently cost more digit pipelines as well as
     /// the copy.
-    fn witness_jobs<'a>(&'a self, w: &'a ScalarBuf) -> [Job<'a>; 4] {
-        [
-            Job::G1(JobG1 {
-                bases: &self.a_bases,
+    fn witness_jobs<'a>(&'a self, w: &'a ScalarBuf) -> Vec<Job<'a>> {
+        let mut jobs = vec![Job::G1(JobG1 {
+            bases: &self.a_bases,
+            base_off: 0,
+            scalars: w,
+            scalar_off: 0,
+            n: self.pk.n_vars,
+        })];
+        if let BG2::Gpu(bases) = &self.b_g2 {
+            jobs.push(Job::G2(JobG2 {
+                bases,
                 base_off: 0,
                 scalars: w,
                 scalar_off: 0,
                 n: self.pk.n_vars,
-            }),
-            Job::G2(JobG2 {
-                bases: &self.b_g2_bases,
-                base_off: 0,
-                scalars: w,
-                scalar_off: 0,
-                n: self.pk.n_vars,
-            }),
-            Job::G1(JobG1 {
-                bases: &self.b_g1_bases,
-                base_off: 0,
-                scalars: w,
-                scalar_off: 0,
-                n: self.pk.n_vars,
-            }),
-            Job::G1(JobG1 {
-                bases: &self.l_bases,
-                base_off: 0,
-                scalars: w,
-                // Section 8 covers the private wires only: witness[0] is the constant 1
-                // and witness[1..=n_public] are the public inputs, which the verifier
-                // folds in through IC instead.
-                scalar_off: self.pk.n_public + 1,
-                n: self.l_bases.len(),
-            }),
-        ]
+            }));
+        }
+        jobs.push(Job::G1(JobG1 {
+            bases: &self.b_g1_bases,
+            base_off: 0,
+            scalars: w,
+            scalar_off: 0,
+            n: self.pk.n_vars,
+        }));
+        jobs.push(Job::G1(JobG1 {
+            bases: &self.l_bases,
+            base_off: 0,
+            scalars: w,
+            // Section 8 covers the private wires only: witness[0] is the constant 1
+            // and witness[1..=n_public] are the public inputs, which the verifier
+            // folds in through IC instead.
+            scalar_off: self.pk.n_public + 1,
+            n: self.l_bases.len(),
+        }));
+        jobs
+    }
+
+    /// Stage 6 on the CPU pool, started from `s` so it runs while the GPU has the other
+    /// four; `None` when B in G2 is one of the [`Self::witness_jobs`].
+    fn b_g2_on_cpu<'s>(
+        &'s self,
+        s: &'s std::thread::Scope<'s, '_>,
+        witness: &'s [Fr],
+    ) -> Option<std::thread::ScopedJoinHandle<'s, G2Projective>> {
+        let BG2::Cpu { bases, pool } = &self.b_g2 else {
+            return None;
+        };
+        Some(s.spawn(move || {
+            pool.install(|| {
+                let cpu = match self.work {
+                    Work::Constant => CpuMsm::constant_work(),
+                    Work::Variable => CpuMsm::new(),
+                };
+                cpu.msm_g2(bases, witness)
+            })
+        }))
+    }
+
+    /// A, B in G2, B in G1 and L, from the [`Self::witness_jobs`] results in job order
+    /// and stage 6's CPU result when it ran there.
+    fn witness_results(
+        &self,
+        out: Vec<crate::msm::MsmResult>,
+        cpu_b_g2: Option<std::thread::ScopedJoinHandle<'_, G2Projective>>,
+    ) -> Result<(G1Projective, G2Projective, G1Projective, G1Projective), ProveError> {
+        let want = 3 + usize::from(cpu_b_g2.is_none());
+        if out.len() != want {
+            return Err(bad(format!(
+                "msm_batch returned {} witness results, want {want}",
+                out.len()
+            )));
+        }
+        let mut out = out.into_iter();
+        let mut next = || out.next().expect("length checked above");
+        let a_g1 = next().g1()?;
+        let b_g2 = match cpu_b_g2 {
+            Some(h) => h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)),
+            None => next().g2()?,
+        };
+        let b_g1 = next().g1()?;
+        let l_g1 = next().g1()?;
+        Ok((a_g1, b_g2, b_g1, l_g1))
     }
 
     /// Stage 9's scalars. The normal path is the device buffer stage 4 wrote, which
@@ -443,10 +507,61 @@ fn overlap_pays(domain_size: usize) -> bool {
     }
 }
 
+/// Where stage 6, B in G2, runs for one key.
+enum BG2 {
+    Gpu(G2Bases),
+    /// The key's host bases, for [`CpuMsm`] on a pool of its own.
+    Cpu {
+        bases: Vec<G2Affine>,
+        pool: rayon::ThreadPool,
+    },
+}
+
+/// Whether stage 6 runs on the CPU, on a pool of its own, while the GPU runs stages 5, 7,
+/// 8 and 9.
+///
+/// The G2 MSM is the one this GPU is worst at (three Fq products per Fq2 product and a
+/// 256-byte reduce entry), and the CPU pool is otherwise idle for the whole proof. The
+/// pool is its own rather than the global one because stages 0 to 4 and the MSM's
+/// scalar classify and combine run on the global pool, and behind a busy G2 MSM they
+/// waited: rsa2048 constant-work's ntt went from 19 ms to 132.
+///
+/// Variable work moves it everywhere. Warm on the M2 Max, interleaved medians against the
+/// GPU-only batch: js_16x16_d32 90.8 ms to 67.6, anon-aadhaar 186.1 to 175.3,
+/// js_384x384_d32 1436 to 1125, railgun-13x01 90.2 to 52.4, js_8x8_d32 54.9 to 39.0,
+/// js_2x2_d16 14.8 to 8.9, rsa2048 35.1 to 31.6, sha256 even. keccak256 is the one that
+/// does not gain: 27.3 to 27.9 at the median, 26.8 to 26.1 at the minimum. Its B query is
+/// half infinity and its witness mostly bits, so the GPU's G2 job was nearly free, and
+/// what is left is the pool's contention with stages 0 to 4 (ntt 9.1 to 9.8 ms).
+///
+/// Constant work makes the CPU pay for every finite base, so the decision is the key's
+/// finite G2 bases against the domain, both fixed by the key and not the witness. It won
+/// at 0.23 of the domain (anon-aadhaar, 636 ms to 416), 0.35 (js_16x16_d32, 115 to 88),
+/// 0.47 (keccak256, 154 to 111), 0.55 (js_1x1_d8, 18.7 to 11.6) and 0.57 (tornado, 40.9
+/// to 33.7), and lost at 0.71 (rsa2048, 129 to 164), so the line sits at 5/8.
+///
+/// `G16_METAL_G2_CPU=0` or `=1` forces it either way, for re-measuring.
+fn g2_on_cpu(bases: &[G2Affine], domain_size: usize, work: Work) -> bool {
+    match std::env::var("G16_METAL_G2_CPU")
+        .ok()
+        .and_then(|v| v.parse::<u8>().ok())
+    {
+        Some(0) => false,
+        Some(_) => true,
+        None => match work {
+            Work::Variable => true,
+            Work::Constant => {
+                let finite = bases.iter().filter(|p| !p.infinity).count();
+                finite * 8 <= domain_size * 5
+            }
+        },
+    }
+}
+
 impl PreparedCircuit for MetalCircuit {
     /// Always [`crate::stages::TAG`] ("metal"), and that is a claim about what ran: no stage
     /// in this backend has a CPU fallback, so the name cannot be describing a proof the CPU
-    /// did.
+    /// did. Stage 6 on the pool is concurrent with the GPU's four, not instead of them.
     fn backend_name(&self) -> &'static str {
         crate::stages::TAG
     }
@@ -485,28 +600,24 @@ impl PreparedCircuit for MetalCircuit {
 
         let start = Instant::now();
 
-        let w = self.msm.upload_scalars_with(witness, self.work)?;
-        let h_scalars = self.h_scalars(h)?;
+        let (a_g1, b_g2, b_g1, l_g1, h_g1) = std::thread::scope(|s| {
+            let cpu_b_g2 = self.b_g2_on_cpu(s, witness);
+            let w = self.msm.upload_scalars_with(witness, self.work)?;
+            let h_scalars = self.h_scalars(h)?;
 
-        // One command buffer for all five. Order matches the stage numbering, and
-        // `msm_batch` returns results in job order.
-        let [j5, j6, j7, j8] = self.witness_jobs(&w);
-        let jobs = [j5, j6, j7, j8, self.h_job(&h_scalars)];
-        let out = self.msm.msm_batch(&jobs)?;
-        if out.len() != jobs.len() {
-            return Err(bad(format!(
-                "msm_batch returned {} results for {} jobs",
-                out.len(),
-                jobs.len()
-            )));
-        }
-
-        let a_g1 = out[0].g1()?;
-        let b_g2 = out[1].g2()?;
-        let b_g1 = out[2].g1()?;
-        let l_g1 = out[3].g1()?;
-        let h_g1 = out[4].g1()?;
-        // One command buffer for all five, so `msm_split` stays `None`.
+            // One command buffer for all of them. Order matches the stage numbering,
+            // and `msm_batch` returns results in job order.
+            let mut jobs = self.witness_jobs(&w);
+            jobs.push(self.h_job(&h_scalars));
+            let mut out = self.msm.msm_batch(&jobs)?;
+            let h_g1 = out
+                .pop()
+                .ok_or_else(|| bad("msm_batch returned no results"))?
+                .g1()?;
+            let (a_g1, b_g2, b_g1, l_g1) = self.witness_results(out, cpu_b_g2)?;
+            Ok::<_, ProveError>((a_g1, b_g2, b_g1, l_g1, h_g1))
+        })?;
+        // One command buffer for the GPU's share, so `msm_split` stays `None`.
         t.msm_us += start.elapsed().as_micros() as u64;
 
         Ok(MsmOutputs {
@@ -555,6 +666,7 @@ impl PreparedCircuit for MetalCircuit {
 
         let mut compute_h_us = 0u64;
         let (h_out, wit_out) = std::thread::scope(|s| {
+            let cpu_b_g2 = self.b_g2_on_cpu(s, witness);
             let wit = s.spawn(|| {
                 let w = self.msm.upload_scalars_with(witness, self.work)?;
                 self.msm.msm_batch(&self.witness_jobs(&w))
@@ -568,22 +680,17 @@ impl PreparedCircuit for MetalCircuit {
                 // the buffer `h_scalars` reads.
                 self.msm.msm_batch(&[self.h_job(&h_scalars)])
             })();
-            (h_out, wit.join())
+            let wit_out = wit
+                .join()
+                .unwrap_or_else(|e| std::panic::resume_unwind(e))
+                .and_then(|out| self.witness_results(out, cpu_b_g2));
+            (h_out, wit_out)
         });
-        let wit_out = wit_out.unwrap_or_else(|e| std::panic::resume_unwind(e))?;
+        let (a_g1, b_g2, b_g1, l_g1) = wit_out?;
         let h_out = h_out?;
-        if wit_out.len() != 4 || h_out.len() != 1 {
-            return Err(bad(format!(
-                "msm_batch returned {} witness results and {} h results",
-                wit_out.len(),
-                h_out.len()
-            )));
+        if h_out.len() != 1 {
+            return Err(bad(format!("msm_batch returned {} h results", h_out.len())));
         }
-
-        let a_g1 = wit_out[0].g1()?;
-        let b_g2 = wit_out[1].g2()?;
-        let b_g1 = wit_out[2].g1()?;
-        let l_g1 = wit_out[3].g1()?;
         let h_g1 = h_out[0].g1()?;
         // The witness batch overlaps stages 0-4 here, so the MSMs no longer have a wall
         // window of their own. `msm_us` takes what they add beyond `compute_h`, which
