@@ -87,7 +87,7 @@ pub enum Work {
     /// and the field prelude reduces with `select`.
     ///
     /// What it costs is what the zeros and ones were saving, so it is priced per circuit
-    /// on [`crate::backend::WgpuProver::constant_work`]: about half again on a dense
+    /// on `crate::backend::WgpuProver::constant_work`: about half again on a dense
     /// witness, 3.5x to 10x on a bit-heavy one.
     Constant,
     /// Zero scalars are dropped, one scalars go to the ones pass, the window is sized for

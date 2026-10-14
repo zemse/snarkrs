@@ -71,6 +71,8 @@
 //! offers. A kernel that only fits native Metal's headroom is a kernel that fails in a stock
 //! browser, and native `cargo test` will not tell you.
 
+#![deny(rustdoc::broken_intra_doc_links)]
+
 /// The circuit, the five MSM jobs and the `snarkrs_groth16::Backend` implementation. The async
 /// halves compile everywhere; the blocking `PreparedCircuit` impl over them is native only.
 pub mod backend;

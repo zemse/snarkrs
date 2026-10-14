@@ -77,7 +77,7 @@ use crate::stages::Stage4;
 #[cfg(not(target_arch = "wasm32"))]
 use snarkrs_groth16::{Backend, PreparedCircuit};
 
-/// Where the time in [`WgpuProver::prepare`] went, in microseconds.
+/// Where the time in `WgpuProver::prepare` went, in microseconds.
 ///
 /// Kept per circuit rather than printed, so a caller can report it without re-running the
 /// preparation to time it. `G16_WGPU_PREPARE=1` prints it as well.
@@ -94,7 +94,7 @@ pub struct CircuitCost {
 /// One device, one queue, and the three MSM shader modules, built once per process.
 ///
 /// Cloning is not offered: what makes this expensive is the pipeline compiles hanging off it,
-/// and [`Self::prepare`] hands them to every circuit through an `Arc` rather than duplicating
+/// and `Self::prepare` hands them to every circuit through an `Arc` rather than duplicating
 /// anything.
 pub struct WgpuProver {
     device: Arc<WgpuBackend>,
@@ -263,7 +263,7 @@ pub struct WgpuCircuit {
 
 impl WgpuCircuit {
     /// Uploads everything witness independent. `pub` because `crate::wasm` builds a circuit
-    /// without going through [`Backend::prepare`], whose return type is a boxed
+    /// without going through `Backend::prepare`, whose return type is a boxed
     /// `PreparedCircuit` and therefore native only.
     pub fn new(
         device: Arc<WgpuBackend>,
@@ -273,7 +273,7 @@ impl WgpuCircuit {
         Self::with_work(device, msm, pk, Work::Variable)
     }
 
-    /// Same, with the work mode [`PreparedCircuit::msms`] proves under.
+    /// Same, with the work mode `PreparedCircuit::msms` proves under.
     pub fn with_work(
         device: Arc<WgpuBackend>,
         msm: Arc<MsmBatch>,
@@ -405,7 +405,7 @@ impl WgpuCircuit {
     /// that then proved wrong had `H` zero at every entry and all five MSMs wrong, which is
     /// a gather over a CSR and MSMs over bases the cut copy never delivered. The epoch's
     /// copy is the last one queued, so a blit encoder cut anywhere before it leaves the
-    /// token missing and this refuses it; [`WgpuProver::prepare`] then uploads the key
+    /// token missing and this refuses it; `WgpuProver::prepare` then uploads the key
     /// again.
     pub async fn key_landed(&self) -> Result<(), ProveError> {
         let seal = Seal::new(&self.device, "g16 key upload")?;
@@ -440,7 +440,7 @@ impl WgpuCircuit {
         Ok(())
     }
 
-    /// What [`WgpuProver::prepare`] cost for this key.
+    /// What `WgpuProver::prepare` cost for this key.
     pub fn prepare_cost(&self) -> CircuitCost {
         self.cost
     }
