@@ -313,10 +313,11 @@ pub fn window_size(m: usize) -> u32 {
 }
 
 /// [`window_size`] with the recoding laid out over `recode_bits` instead of the full
-/// 255. A plan whose scalars are provably short (see [`ScalarBuf::bits_in`](super::ScalarBuf::bits_in)) prices its
-/// windows over the bits it will actually dispatch, so the `windows * m` term stops
-/// charging for digit rows that hold nothing: at sha256_128 the four witness plans use
-/// 8 of the 51 windows a full-width layout would emit at c = 5.
+/// 255. A plan whose scalars are provably short
+/// (see [`ScalarBuf::bits_in`](super::ScalarBuf::bits_in)) prices its windows over the
+/// bits it will actually dispatch, so the `windows * m` term stops charging for digit
+/// rows that hold nothing: at sha256_128 the four witness plans use 8 of the 51 windows
+/// a full-width layout would emit at c = 5.
 ///
 /// A layout is at least one bit wide; 0 is read as 1.
 pub fn window_size_for(m: usize, recode_bits: usize) -> u32 {

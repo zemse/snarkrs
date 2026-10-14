@@ -67,7 +67,8 @@ pub(super) struct Plan<'a> {
     /// Top-window rows the wide merge owns; 0 keeps everything on `msm_merge_*`.
     pub(super) merge_wide_rows: usize,
     /// Serial window-range dispatches of the scatter; 2 caps the live tail-line set
-    /// on row-heavy plans (see [`SCATTER_SPLIT_ROWS`](super::window::SCATTER_SPLIT_ROWS)), 1 everywhere else.
+    /// on row-heavy plans (see [`SCATTER_SPLIT_ROWS`](super::window::SCATTER_SPLIT_ROWS)),
+    /// 1 everywhere else.
     pub(super) scatter_parts: usize,
     pub(super) host_tail: bool,
     /// Classified inputs have an exact ones gather. Unclassified inputs instead
