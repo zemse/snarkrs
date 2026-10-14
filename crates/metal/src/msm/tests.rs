@@ -15,6 +15,7 @@ fn slice_override_never_zero_or_past_u32() {
     );
 }
 
+use super::window::parse_slice_override;
 use super::*;
 use crate::layout::as_bytes;
 use snarkrs_field::CurveGroup;
