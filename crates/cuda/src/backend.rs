@@ -361,10 +361,10 @@ impl CudaCircuit {
 }
 
 impl PreparedCircuit for CudaCircuit {
-    /// Always "cuda", and that is a claim about what ran: no stage in this backend has a
-    /// CPU fallback, so the name cannot be describing a proof the CPU did.
+    /// Always [`TAG`] ("cuda"), and that is a claim about what ran: no stage in this backend
+    /// has a CPU fallback, so the name cannot be describing a proof the CPU did.
     fn backend_name(&self) -> &'static str {
-        "cuda"
+        TAG
     }
     fn n_vars(&self) -> usize {
         self.pk.n_vars

@@ -551,10 +551,11 @@ fn general_counts(witness: &[Fr], private_from: usize) -> (u32, u32) {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl PreparedCircuit for WgpuCircuit {
-    /// Always "wgpu", and that is a claim about what ran: no stage in this backend has a CPU
-    /// fallback, so the name cannot be describing a proof the CPU did.
+    /// Always [`crate::stages::TAG`] ("wgpu"), and that is a claim about what ran: no stage
+    /// in this backend has a CPU fallback, so the name cannot be describing a proof the CPU
+    /// did.
     fn backend_name(&self) -> &'static str {
-        "wgpu"
+        crate::stages::TAG
     }
     fn n_vars(&self) -> usize {
         self.pk.n_vars
@@ -734,10 +735,9 @@ impl WgpuCircuit {
 
         // The normal path: `H` is the buffer stage 4 wrote and the witness is the one stage 0
         // uploaded, so nothing crosses the host boundary and stage 9's scalars never exist in
-        // host memory at all. `HPoly::device_handle` returns `None` for a handle from another
-        // backend, so a Metal handle reaching here is a fallback rather than a reinterpreted
-        // pointer.
-        let handle = h.device_handle::<WgpuHandle>(crate::stages::TAG);
+        // host memory at all. `HPoly::require_handle` refuses a handle from another backend,
+        // so a Metal handle reaching here is an error rather than a reinterpreted pointer.
+        let handle = h.require_handle::<WgpuHandle>(crate::stages::TAG)?;
         let host_h = h.to_host();
         let (mont, groups) = match handle {
             Some(handle) => {

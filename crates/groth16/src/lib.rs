@@ -267,6 +267,34 @@ impl HPoly {
             _ => None,
         }
     }
+
+    /// [`Self::device_handle`] for a backend that has to refuse what it cannot read.
+    /// `Ok(None)` for a host vector, which the caller can still upload. An error for another
+    /// backend's handle, and for one carrying `want` over a payload that is not a `T`; the
+    /// error is attributed to `want`, which is the backend's name as well as its tag.
+    pub fn require_handle<T: std::any::Any + Send + Sync>(
+        &self,
+        want: &'static str,
+    ) -> Result<Option<&T>, ProveError> {
+        let bad = |reason: String| ProveError::Backend {
+            backend: want,
+            reason,
+        };
+        match self {
+            HPoly::Host(_) => Ok(None),
+            HPoly::Device { tag, data, .. } if *tag == want => {
+                data.downcast_ref::<T>().map(Some).ok_or_else(|| {
+                    bad(format!(
+                        "H carries the \"{want}\" tag but not the backend's own handle type"
+                    ))
+                })
+            }
+            HPoly::Device { tag, .. } => Err(bad(format!(
+                "H is a device handle tagged \"{tag}\", which this backend cannot read; \
+                 it came from another backend's compute_h"
+            ))),
+        }
+    }
 }
 
 /// The five MSM results, stages 5-9.
@@ -355,5 +383,41 @@ pub trait PreparedCircuit: Send + Sync {
     /// [`crate::trace`] is the only caller.
     fn h_to_host(&self, h: &HPoly) -> Option<Vec<Fr>> {
         h.to_host().map(<[Fr]>::to_vec)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn device(tag: &'static str, data: Arc<dyn std::any::Any + Send + Sync>) -> HPoly {
+        HPoly::Device { tag, len: 4, data }
+    }
+
+    #[test]
+    fn require_handle_refuses_another_backends_handle() {
+        let foreign = device("metal", Arc::new(7u32));
+        match foreign.require_handle::<u32>("cuda").unwrap_err() {
+            ProveError::Backend { backend, reason } => {
+                assert_eq!(backend, "cuda");
+                assert!(reason.contains("\"metal\""), "{reason}");
+            }
+            other => panic!("wrong error: {other}"),
+        }
+    }
+
+    #[test]
+    fn require_handle_accepts_own_handle_and_host_vectors() {
+        let own = device("cuda", Arc::new(7u32));
+        assert_eq!(own.require_handle::<u32>("cuda").unwrap(), Some(&7));
+        let host = HPoly::Host(vec![]);
+        assert!(host.require_handle::<u32>("cuda").unwrap().is_none());
+    }
+
+    #[test]
+    fn require_handle_refuses_own_tag_over_the_wrong_payload() {
+        let wrong = device("cuda", Arc::new("not a u32"));
+        assert!(wrong.require_handle::<u32>("cuda").is_err());
     }
 }

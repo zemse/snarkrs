@@ -359,15 +359,15 @@ impl MetalCircuit {
     }
 
     /// Stage 9's scalars. The normal path is the device buffer stage 4 wrote, which
-    /// never touches the host. `HPoly::device_handle` returns `None` for a handle from
-    /// some other backend, and in that case the only thing left is a host vector, so
-    /// a CPU `compute_h` can still be finished on the GPU rather than rejected.
+    /// never touches the host. `HPoly::require_handle` refuses a handle from some other
+    /// backend and returns `None` for a host vector, so a CPU `compute_h` can still be
+    /// finished on the GPU rather than rejected.
     ///
     /// The returned `ScalarBuf` reads the buffer `h` owns, so `h` (and with it the
     /// scratch behind the handle) must outlive the `msm_batch` that consumes it; that
     /// is the lifetime `scalars_from_device_std` requires.
     fn h_scalars(&self, h: &HPoly) -> Result<ScalarBuf, ProveError> {
-        match h.device_handle::<HHandle>(crate::stages::TAG) {
+        match h.require_handle::<HHandle>(crate::stages::TAG)? {
             Some(handle) => {
                 if handle.len() != self.pk.domain_size {
                     return Err(bad(format!(
@@ -444,10 +444,11 @@ fn overlap_pays(domain_size: usize) -> bool {
 }
 
 impl PreparedCircuit for MetalCircuit {
-    /// Always "metal", and that is a claim about what ran: no stage in this backend has a
-    /// CPU fallback, so the name cannot be describing a proof the CPU did.
+    /// Always [`crate::stages::TAG`] ("metal"), and that is a claim about what ran: no stage
+    /// in this backend has a CPU fallback, so the name cannot be describing a proof the CPU
+    /// did.
     fn backend_name(&self) -> &'static str {
-        "metal"
+        crate::stages::TAG
     }
     fn n_vars(&self) -> usize {
         self.pk.n_vars

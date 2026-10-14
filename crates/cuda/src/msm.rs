@@ -1352,25 +1352,19 @@ impl CudaMsm {
         };
         // Held only so the borrow in `h_scalars` outlives the batch.
         let h_owned: Option<ScalarBuf>;
-        let h_scalars = match h {
-            HPoly::Host(v) => {
+        let h_scalars = match h.require_handle::<HHandle>(TAG)? {
+            None => {
+                let HPoly::Host(v) = h else {
+                    unreachable!("require_handle returns None only for a host vector")
+                };
                 h_owned = Some(self.upload_scalars(v)?);
                 h_owned.as_ref().expect("just assigned Some").as_scalars()
             }
-            HPoly::Device { tag, len, .. } => {
-                if *tag != TAG {
-                    return Err(bad(format!(
-                        "H is a device handle tagged \"{tag}\", which this backend cannot \
-                         read; it came from another backend's compute_h"
-                    )));
-                }
-                let handle = h
-                    .device_handle::<HHandle>(TAG)
-                    .ok_or_else(|| bad("H carries the \"cuda\" tag but not a stages::HHandle"))?;
+            Some(handle) => {
                 // `h_std`, never `h_mont`. A window digit of a Montgomery representative is
                 // a digit of `a*R mod r`, a different number, and the proof would be wrong
                 // by a factor of R with nothing else to go on.
-                Scalars::device_std(handle.h_std(), *len)?
+                Scalars::device_std(handle.h_std(), h.len())?
             }
         };
         let upload_us = t0.elapsed().as_micros() as u64;
