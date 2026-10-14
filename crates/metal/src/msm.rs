@@ -75,9 +75,10 @@ use snarkrs_groth16::ProveError;
 
 use crate::enc::{dispatch_1d, packed_buffer, read_back, set_params};
 use crate::kernels::{FR_MSL, MSM_MSL, SEAL_MSL};
-use crate::layout::{Packed, PackedFq, PackedFq2, PackedG1Affine, PackedG2Affine, PackedScalar};
+use crate::layout::{PackedG1Affine, PackedG2Affine, PackedScalar};
 
 mod window;
+mod wire;
 
 use window::{
     fold_len, legacy_accumulate, merge_wide_min_span, ones_groups_for, reduce_groups_for,
@@ -85,6 +86,12 @@ use window::{
     RECODE_BITS, REDUCE_TG, SCAN_TG, SPLIT_BUDGET,
 };
 pub use window::{window_size, window_size_for, Work};
+use wire::MsmParams;
+pub use wire::{PackedXyzzG1, PackedXyzzG2};
+
+// Read by msm_cpu_tests.rs and msm_gpu_probes.rs through `super::*`.
+#[cfg(test)]
+use crate::layout::{PackedFq, PackedFq2};
 
 fn err(reason: impl Into<String>) -> ProveError {
     ProveError::Backend {
@@ -128,99 +135,6 @@ fn plan_starts(jobs: &[(usize, usize, usize)]) -> Vec<usize> {
             }
         })
         .collect()
-}
-
-// ---------------------------------------------------------------------------
-// Device-side structs
-// ---------------------------------------------------------------------------
-
-/// Mirrors `struct MsmParams` in `msm.metal`. All counts, no pointers, passed by
-/// `setBytes` so it never needs a buffer.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct MsmParams {
-    n: u32,
-    c: u32,
-    n_windows: u32,
-    n_buckets: u32,
-    cap: u32,
-    scalar_off: u32,
-    base_off: u32,
-    ones_groups: u32,
-    slice_len: u32,
-    slices: u32,
-    reduce_groups: u32,
-    merge_wide_base: u32,
-    merge_wide_rows: u32,
-    separate_ones: u32,
-    dummy_rows: u32,
-    seg_first: u32,
-    skip: u32,
-}
-
-/// A G1 point in extended Jacobian coordinates, as the kernels write it: 128 bytes,
-/// `x`, `y`, `zz`, `zzz`, with `x/zz` and `y/zzz` the affine coordinates.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct PackedXyzzG1 {
-    pub x: PackedFq,
-    pub y: PackedFq,
-    pub zz: PackedFq,
-    pub zzz: PackedFq,
-}
-
-/// The G2 twin, 256 bytes.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct PackedXyzzG2 {
-    pub x: PackedFq2,
-    pub y: PackedFq2,
-    pub zz: PackedFq2,
-    pub zzz: PackedFq2,
-}
-
-const _: () = {
-    assert!(core::mem::size_of::<MsmParams>() == 68);
-    assert!(core::mem::size_of::<PackedXyzzG1>() == 128);
-    assert!(core::mem::size_of::<PackedXyzzG2>() == 256);
-};
-
-unsafe impl Packed for PackedXyzzG1 {}
-unsafe impl Packed for PackedXyzzG2 {}
-
-/// XYZZ to arkworks' Jacobian, with no field inversion.
-///
-/// XYZZ carries the invariant `ZZ^3 = ZZZ^2`, so setting the Jacobian `Z = ZZZ` gives
-/// `Z^2 = ZZ^3` and the point `(X * ZZ^2, Y * ZZ^3, ZZZ)` has
-/// `x = X*ZZ^2 / ZZ^3 = X/ZZ` and `y = Y*ZZ^3 / ZZZ^3 = Y/ZZZ`, which is exactly the
-/// XYZZ point. Three multiplications, versus two inversions if this went through affine,
-/// and there are hundreds of these per proof.
-impl PackedXyzzG1 {
-    pub fn to_projective(&self) -> G1Projective {
-        let zz = self.zz.to_fq();
-        if zz.is_zero() {
-            return G1Projective::zero();
-        }
-        let x = self.x.to_fq();
-        let y = self.y.to_fq();
-        let zzz = self.zzz.to_fq();
-        let zz2 = zz * zz;
-        G1Projective::new_unchecked(x * zz2, y * zz2 * zz, zzz)
-    }
-}
-
-impl PackedXyzzG2 {
-    pub fn to_projective(&self) -> G2Projective {
-        let zz = self.zz.to_fq2();
-        if zz.is_zero() {
-            return G2Projective::zero();
-        }
-        let x = self.x.to_fq2();
-        let y = self.y.to_fq2();
-        let zzz = self.zzz.to_fq2();
-        let zz2 = zz * zz;
-        G2Projective::new_unchecked(x * zz2, y * zz2 * zz, zzz)
-    }
 }
 
 // ---------------------------------------------------------------------------
