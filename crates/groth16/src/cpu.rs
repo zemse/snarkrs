@@ -7,7 +7,7 @@
 // native number changes.
 use web_time::Instant;
 
-use crate::{Backend, HPoly, MsmOutputs, PreparedCircuit, ProveError, StageTimings};
+use crate::{Backend, HPoly, MsmOutputs, MsmSplit, PreparedCircuit, ProveError, StageTimings};
 use rayon::prelude::*;
 use snarkrs_field::*;
 use snarkrs_formats::{Matrix, ProvingKey};
@@ -348,44 +348,68 @@ impl PreparedCircuit for CpuCircuit {
         // and 1.77x at 2, and it lifts occupancy on a pool that otherwise idles: a proof
         // measures 9.41 busy cores out of 12. `examples/msm_shape.rs` times them one at a
         // time.
-        let ((a_g1, b_g2), ((b_g1, l_g1), h_g1)) = rayon::join(
-            || {
-                rayon::join(
-                    || stage!("s5 MSM A -> G1", self.msm.msm_g1(&self.pk.a_query, witness)),
-                    || {
-                        stage!(
-                            "s6 MSM B -> G2",
-                            self.msm.msm_g2(&self.pk.b_g2_query, witness)
-                        )
-                    },
-                )
-            },
-            || {
-                rayon::join(
-                    || {
-                        rayon::join(
-                            || {
+        //
+        // Each leaf times itself for `msm_split`. The leaves overlap, so their times are
+        // per-MSM latencies under contention, not shares of `msm_us` (see `MsmSplit`).
+        let (((a_g1, a_us), (b_g2, b_g2_us)), (((b_g1, b_g1_us), (l_g1, l_us)), (h_g1, h_us))) =
+            rayon::join(
+                || {
+                    rayon::join(
+                        || {
+                            timed(|| {
+                                stage!("s5 MSM A -> G1", self.msm.msm_g1(&self.pk.a_query, witness))
+                            })
+                        },
+                        || {
+                            timed(|| {
                                 stage!(
-                                    "s7 MSM B -> G1",
-                                    self.msm.msm_g1(&self.pk.b_g1_query, witness)
+                                    "s6 MSM B -> G2",
+                                    self.msm.msm_g2(&self.pk.b_g2_query, witness)
                                 )
-                            },
-                            || {
-                                stage!(
-                                    "s8 MSM L -> G1",
-                                    self.msm.msm_g1(&self.pk.l_query, l_scalars)
-                                )
-                            },
-                        )
-                    },
-                    // Every one of the `domain_size` bases is used. The "only n-1 are
-                    // nonzero" rule belongs to the coefficient-form convention; in
-                    // snarkjs' evaluation form all n entries are generically nonzero.
-                    || stage!("s9 MSM H -> G1", self.msm.msm_g1(&self.pk.h_query, h)),
-                )
+                            })
+                        },
+                    )
+                },
+                || {
+                    rayon::join(
+                        || {
+                            rayon::join(
+                                || {
+                                    timed(|| {
+                                        stage!(
+                                            "s7 MSM B -> G1",
+                                            self.msm.msm_g1(&self.pk.b_g1_query, witness)
+                                        )
+                                    })
+                                },
+                                || {
+                                    timed(|| {
+                                        stage!(
+                                            "s8 MSM L -> G1",
+                                            self.msm.msm_g1(&self.pk.l_query, l_scalars)
+                                        )
+                                    })
+                                },
+                            )
+                        },
+                        // Every one of the `domain_size` bases is used. The "only n-1 are
+                        // nonzero" rule belongs to the coefficient-form convention; in
+                        // snarkjs' evaluation form all n entries are generically nonzero.
+                        || timed(|| stage!("s9 MSM H -> G1", self.msm.msm_g1(&self.pk.h_query, h))),
+                    )
+                },
+            );
+        t.msm_us += start.elapsed().as_micros() as u64;
+        MsmSplit::accumulate(
+            &mut t.msm_split,
+            MsmSplit {
+                a_us,
+                b_g2_us,
+                b_g1_us,
+                l_us,
+                h_us,
             },
         );
-        t.msm_us += start.elapsed().as_micros() as u64;
 
         Ok(MsmOutputs {
             a_g1,
@@ -395,6 +419,13 @@ impl PreparedCircuit for CpuCircuit {
             h_g1,
         })
     }
+}
+
+/// `f`'s result and its wall time in microseconds.
+fn timed<T>(f: impl FnOnce() -> T) -> (T, u64) {
+    let t0 = Instant::now();
+    let out = f();
+    (out, t0.elapsed().as_micros() as u64)
 }
 
 #[cfg(test)]

@@ -314,10 +314,49 @@ pub struct StageTimings {
     pub gather_us: u64,
     pub ntt_us: u64,
     pub pointwise_us: u64,
+    /// Measured wall time of stages 5-9 as a whole. Not the sum of [`Self::msm_split`]:
+    /// the CPU backend runs the five concurrently.
     pub msm_us: u64,
     pub assemble_us: u64,
     /// The check of the result in [`prove::prove`]. Zero from [`prove::prove_unchecked`].
     pub verify_us: u64,
+    /// Stages 5-9 one MSM at a time, where the backend can time them separately. Only the
+    /// CPU backend fills it. Metal, CUDA and wgpu submit the five as one batch with shared
+    /// digit passes, so any split would be invented and they leave it `None`.
+    pub msm_split: Option<MsmSplit>,
+}
+
+/// Wall time of each MSM in stages 5-9, in microseconds, from the moment that MSM starts
+/// to the moment it finishes while the others share the pool. This is latency, not cost:
+/// a thread waiting on its own MSM's chunks steals the others', so on the CPU all five
+/// finish near the end of the region and each reads close to [`StageTimings::msm_us`]
+/// (225 ms each against 225 ms at js_16x16_d32). What one MSM costs alone is
+/// `examples/msm_shape.rs`.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MsmSplit {
+    /// Stage 5, A in G1.
+    pub a_us: u64,
+    /// Stage 6, B in G2.
+    pub b_g2_us: u64,
+    /// Stage 7, B in G1.
+    pub b_g1_us: u64,
+    /// Stage 8, L (the C query) in G1.
+    pub l_us: u64,
+    /// Stage 9, H in G1.
+    pub h_us: u64,
+}
+
+impl MsmSplit {
+    /// Adds `other` into `slot`, starting from zero if it is empty, the way the backends
+    /// `+=` the other stage fields.
+    pub fn accumulate(slot: &mut Option<Self>, other: Self) {
+        let s = slot.get_or_insert_with(Self::default);
+        s.a_us += other.a_us;
+        s.b_g2_us += other.b_g2_us;
+        s.b_g1_us += other.b_g1_us;
+        s.l_us += other.l_us;
+        s.h_us += other.h_us;
+    }
 }
 
 /// Creates [`PreparedCircuit`]s. One per accelerator.

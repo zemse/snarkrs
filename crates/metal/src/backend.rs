@@ -506,6 +506,7 @@ impl PreparedCircuit for MetalCircuit {
         let b_g1 = out[2].g1()?;
         let l_g1 = out[3].g1()?;
         let h_g1 = out[4].g1()?;
+        // One command buffer for all five, so `msm_split` stays `None`.
         t.msm_us += start.elapsed().as_micros() as u64;
 
         Ok(MsmOutputs {

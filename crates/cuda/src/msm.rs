@@ -1418,7 +1418,8 @@ impl CudaMsm {
 
         // Host launch time is not added: the launches are asynchronous, so it overlaps the
         // device work the event pair already counted. What is added is the two things that
-        // genuinely happen with the device idle.
+        // genuinely happen with the device idle. One event pair over the whole batch, and
+        // A and both B jobs share a digit plan, so `msm_split` stays `None`.
         t.msm_us += upload_us + self.last_device_us() + self.last_combine_us();
 
         Ok(MsmOutputs {

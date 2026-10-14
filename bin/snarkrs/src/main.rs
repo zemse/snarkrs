@@ -1505,6 +1505,15 @@ fn run_prove(
         println!("msm         us {:>10}", t.msm_us);
         println!("assemble    us {:>10}", t.assemble_us);
         println!("verify      us {:>10}", t.verify_us);
+        // Inside `msm` above, and overlapping each other, so not in `attributed`. Absent
+        // when the backend submits the five MSMs as one batch.
+        if let Some(m) = t.msm_split {
+            println!("msm a       us {:>10}", m.a_us);
+            println!("msm b_g2    us {:>10}", m.b_g2_us);
+            println!("msm b_g1    us {:>10}", m.b_g1_us);
+            println!("msm l       us {:>10}", m.l_us);
+            println!("msm h       us {:>10}", m.h_us);
+        }
         // Attributed and total are printed separately rather than one being derived from
         // the other, so any stage that forgets to report shows up as a gap.
         println!("attributed  us {:>10}", known);

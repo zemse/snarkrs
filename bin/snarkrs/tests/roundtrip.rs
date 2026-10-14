@@ -317,7 +317,12 @@ fn bench_writes_a_verified_csv() {
             "msm_us",
             "assemble_us",
             "verified",
-            "adx_bmi2"
+            "adx_bmi2",
+            "msm_a_us",
+            "msm_b_g2_us",
+            "msm_b_g1_us",
+            "msm_l_us",
+            "msm_h_us"
         ]
     );
     let rows: Vec<Vec<&str>> = lines.map(|l| l.split(',').collect()).collect();
@@ -331,6 +336,16 @@ fn bench_writes_a_verified_csv() {
         assert_eq!(col(r, "backend"), "cpu");
         assert!(col(r, "ms").parse::<f64>().unwrap() > 0.0);
         assert!(col(r, "prepare_ms").parse::<f64>().unwrap() > 0.0);
+        // The CPU backend times each MSM on its own.
+        for m in [
+            "msm_a_us",
+            "msm_b_g2_us",
+            "msm_b_g1_us",
+            "msm_l_us",
+            "msm_h_us",
+        ] {
+            assert!(col(r, m).parse::<u64>().is_ok(), "{m} empty on cpu");
+        }
     }
     let modes: Vec<String> = rows.iter().map(|r| col(r, "mode")).collect();
     assert_eq!(modes, ["cold", "cold", "warm", "warm"]);

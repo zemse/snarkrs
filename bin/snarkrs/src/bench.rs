@@ -33,7 +33,7 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 use snarkrs_field::{Fr, ADX_BMI2};
 use snarkrs_formats::{wtns::Witness, ProvingKey, VerifyingKey};
-use snarkrs_groth16::{prove::prove_unchecked, verify::verify, StageTimings};
+use snarkrs_groth16::{prove::prove_unchecked, verify::verify, MsmSplit, StageTimings};
 
 use crate::artifacts::{self, Variant};
 use crate::{BackendKind, HostInfo};
@@ -79,7 +79,7 @@ pub struct Args {
     pub snarkjs: Option<PathBuf>,
 }
 
-pub const CSV_HEADER: &str = "host,os,arch,cores,variant,constraints,prover,backend,mode,rep,ms,prepare_ms,gather_us,ntt_us,pointwise_us,msm_us,assemble_us,verified,adx_bmi2";
+pub const CSV_HEADER: &str = "host,os,arch,cores,variant,constraints,prover,backend,mode,rep,ms,prepare_ms,gather_us,ntt_us,pointwise_us,msm_us,assemble_us,verified,adx_bmi2,msm_a_us,msm_b_g2_us,msm_b_g1_us,msm_l_us,msm_h_us";
 
 /// One proof and what it cost. `prepare_ms` is setup only, and for a cold-inprocess rep it
 /// is the part of `ms` spent before `prove()` was entered. A cold-process rep sees only
@@ -107,8 +107,18 @@ impl Row {
                 t.gather_us, t.ntt_us, t.pointwise_us, t.msm_us, t.assemble_us
             )
         });
+        // Empty when the backend could not time the five MSMs apart, see `MsmSplit`.
+        let split = self
+            .timings
+            .and_then(|t| t.msm_split)
+            .map_or(",,,,".to_string(), |m| {
+                format!(
+                    "{},{},{},{},{}",
+                    m.a_us, m.b_g2_us, m.b_g1_us, m.l_us, m.h_us
+                )
+            });
         format!(
-            "{},{},{},{},{},{},ours,{},{},{},{:.3},{},{},yes,{}",
+            "{},{},{},{},{},{},ours,{},{},{},{:.3},{},{},yes,{},{}",
             host.host,
             host.os,
             host.arch,
@@ -122,6 +132,7 @@ impl Row {
             prepare,
             stages,
             if ADX_BMI2 { "yes" } else { "no" },
+            split,
         )
     }
 }
@@ -496,6 +507,21 @@ fn report(rows: &[Row]) {
         stage(|t| t.msm_us),
         stage(|t| t.assemble_us),
     );
+    let splits: Vec<_> = timings.iter().filter_map(|t| t.msm_split).collect();
+    if splits.is_empty() {
+        return;
+    }
+    let msm = |f: fn(&MsmSplit) -> u64| {
+        median(&splits.iter().map(|m| f(m) as f64).collect::<Vec<_>>()) / 1000.0
+    };
+    println!(
+        "         msms (median ms, overlapping): a {:.2}  b_g2 {:.2}  b_g1 {:.2}  l {:.2}  h {:.2}",
+        msm(|m| m.a_us),
+        msm(|m| m.b_g2_us),
+        msm(|m| m.b_g1_us),
+        msm(|m| m.l_us),
+        msm(|m| m.h_us),
+    );
 }
 
 #[cfg(test)]
@@ -577,6 +603,13 @@ mod tests {
                 msm_us: 4,
                 assemble_us: 5,
                 verify_us: 0,
+                msm_split: Some(MsmSplit {
+                    a_us: 6,
+                    b_g2_us: 7,
+                    b_g1_us: 8,
+                    l_us: 9,
+                    h_us: 10,
+                }),
             }),
         };
         let line = row.to_csv(&host);
@@ -588,10 +621,8 @@ mod tests {
         // The stage split has to survive into the CSV, otherwise `bench` reports a total
         // with no way to see which stage owns it.
         assert!(line.contains(",1,2,3,4,5,yes,"), "{line}");
-        assert!(
-            line.ends_with(if ADX_BMI2 { ",yes" } else { ",no" }),
-            "{line}"
-        );
+        let adx = if ADX_BMI2 { "yes" } else { "no" };
+        assert!(line.ends_with(&format!(",{adx},6,7,8,9,10")), "{line}");
         assert!(line.contains(",ours,cpu,warm,3,1.500,2.250,"), "{line}");
     }
 
@@ -618,6 +649,7 @@ mod tests {
             line.contains(",ours,cpu,cold-process,1,1.500,,,,,,,yes,"),
             "{line}"
         );
+        assert!(line.ends_with(",,,,,"), "{line}");
     }
 
     #[test]

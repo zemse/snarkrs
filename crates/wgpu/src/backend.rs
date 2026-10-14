@@ -846,6 +846,7 @@ impl WgpuCircuit {
             l_g1: out[3].g1()?,
             h_g1: out[4].g1()?,
         };
+        // One batched submission for all five, so `msm_split` stays `None`.
         t.msm_us += start.elapsed().as_micros() as u64;
         Ok(outputs)
     }
