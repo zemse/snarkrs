@@ -73,7 +73,7 @@ TARGET_RUSTFLAGS = $(if $(findstring x86_64,$(TARGET)), -C target-feature=+adx$(
 VERSION_CMD := cargo metadata --format-version 1 --no-deps --offline | $(PYTHON) -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "snarkrs"))'
 comma := ,
 
-.PHONY: release bump version release-build release-matrix check-tag publish-dry-run github-release publish-crates
+.PHONY: release bump version release-build release-matrix check-tag publish-dry-run github-release publish-crates lint test
 
 # Crates go first and the tag last, so a tag on GitHub always means the crates are out.
 # Safe to run again after a failure: published crates are skipped and the tag is only
@@ -157,3 +157,31 @@ publish-crates:
 		if [ "$$code" = 200 ]; then echo "$$p $$v is already on crates.io"; skip="$$skip --exclude $$p"; fi; \
 	done; \
 	$(CARGO) publish --workspace --locked $$skip
+
+# The CI gate, .github/workflows/ci.yml. Warnings are errors on the pinned toolchain only, so
+# a new clippy lint lands with a deliberate toolchain bump rather than a red build.
+#
+#   make lint                       clippy on every target, native and wasm32, no warnings
+#   make test                       every crate's unit tests, no warnings
+#
+# `block` (under the `metal` crate) trips a future-incompat report nothing here can fix.
+WORKSPACE_FEATURES := $(subst $(comma),$(comma)snarkrs/,snarkrs/$(FEATURES))
+WASM_CRATES := snarkrs-field snarkrs-formats snarkrs-gpu-layout snarkrs-groth16 snarkrs-msm snarkrs-ntt snarkrs-wgpu snarkrs-web
+CI_LOG := target/ci.log
+NO_WARNINGS = 2>&1 | tee $(CI_LOG) && ! grep '^warning' $(CI_LOG)
+export CARGO_FUTURE_INCOMPAT_REPORT_FREQUENCY := never
+
+lint:
+	rustup toolchain install $(RUST_TOOLCHAIN) --profile minimal --component clippy --target wasm32-unknown-unknown --no-self-update
+	@mkdir -p target
+	set -o pipefail; $(CARGO) clippy --locked --workspace --all-targets --features $(WORKSPACE_FEATURES) -- -D warnings $(NO_WARNINGS)
+	set -o pipefail; $(CARGO) clippy --locked --target wasm32-unknown-unknown $(addprefix -p ,$(WASM_CRATES)) -- -D warnings $(NO_WARNINGS)
+
+# Unit tests only: most integration tests fail on purpose without bench/artifacts, which CI
+# does not generate. Release because debug field arithmetic is too slow to test with, but
+# without fat LTO, which buys a test binary nothing and costs minutes per binary.
+test:
+	rustup toolchain install $(RUST_TOOLCHAIN) --profile minimal --no-self-update
+	@mkdir -p target
+	set -o pipefail; RUSTFLAGS="-D warnings" CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+		$(CARGO) test --locked --release --no-fail-fast --workspace --lib --features $(WORKSPACE_FEATURES) $(NO_WARNINGS)

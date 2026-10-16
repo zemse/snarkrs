@@ -1,0 +1,38 @@
+# Lints and tests every push to main and every pull request. Every step is a make target, so
+# `make lint test` on a laptop runs exactly what this does.
+#
+# Lint runs on macOS too because the Metal backend compiles to nothing anywhere else. Tests
+# run on Linux only, as a CPU smoke test: unit tests, which need no GPU and no artifacts.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-26.04, macos-26]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: make lint
+
+  test:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: make test
