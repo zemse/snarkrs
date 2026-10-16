@@ -15,6 +15,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use objc2_metal::MTLDevice;
 use snarkrs_field::Fr;
 use snarkrs_formats::{wtns::Witness, ProvingKey};
 use snarkrs_groth16::{cpu::CpuBackend, Backend, HPoly, StageTimings};
@@ -70,7 +71,7 @@ fn gpu_compute_h_matches_the_cpu_backend() {
         "DEVICE  {}  maxFusedPasses={}  threadgroupMem={}",
         stages.device().name(),
         stages.max_fused_passes(),
-        stages.device().max_threadgroup_memory_length(),
+        stages.device().maxThreadgroupMemoryLength(),
     );
 
     let mut total = 0usize;

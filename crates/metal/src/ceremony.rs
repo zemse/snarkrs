@@ -11,8 +11,8 @@
 //! point operations three or more times over a 256-byte `Xyzz<Fq2>`, which is exactly the
 //! shape WebKit 323560 (filed by this project) miscompiles on iOS.
 
-use metal::objc::rc::autoreleasepool;
-use metal::{Buffer, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device};
+use objc2::rc::autoreleasepool;
+use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder};
 use snarkrs_field::raw::{RawFq, RawFq2};
 use snarkrs_field::{
     AffineRepr, CurveGroup, Field, Fq, Fq2, Fr, G1Affine, G1Projective, G2Affine, G2Projective,
@@ -28,6 +28,7 @@ use crate::layout::{
     Packed, PackedFq, PackedFq2, PackedFr, PackedG1Affine, PackedG2Affine, PackedScalar,
 };
 use crate::msm::{MetalMsm, PackedXyzzG1, PackedXyzzG2};
+use crate::mtl::{self, Buffer, ComputeCommandEncoderRef, ComputePipelineState, Device};
 
 /// The name every error and every `name()` on this side reports, and the spelling
 /// `--backend metal` uses.
@@ -600,7 +601,7 @@ pub struct CeremonyKernels {
 
 impl CeremonyKernels {
     pub fn new() -> Result<Self, ProveError> {
-        let device = Device::system_default()
+        let device = mtl::system_default()
             .ok_or_else(|| cer_err("no Metal device; this machine cannot run the metal backend"))?;
         Self::with_device(device)
     }
@@ -610,18 +611,13 @@ impl CeremonyKernels {
         // arithmetic, then this file, which adds no curve math of its own. Each has its
         // own header guard, so the concatenation is the include.
         let source = format!("{FR_MSL}\n{MSM_MSL}\n{CEREMONY_MSL}\n{SEAL_MSL}\n");
-        let opts = CompileOptions::new();
-        let library = device
-            .new_library_with_source(&source, &opts)
+        let library = mtl::library(&device, &source)
             .map_err(|e| cer_err(format!("MSL compilation failed: {e}")))?;
 
         let pso = |name: &str| -> Result<ComputePipelineState, ProveError> {
-            let f = library
-                .get_function(name, None)
+            let f = mtl::function(&library, name)
                 .map_err(|e| cer_err(format!("kernel {name} not found: {e}")))?;
-            device
-                .new_compute_pipeline_state_with_function(&f)
-                .map_err(|e| cer_err(format!("pipeline {name}: {e}")))
+            mtl::pipeline(&device, &f).map_err(|e| cer_err(format!("pipeline {name}: {e}")))
         };
 
         let group = |g: &str| -> Result<GroupPipelines, ProveError> {
@@ -765,7 +761,7 @@ impl CeremonyKernels {
             // Rust binary drains nothing on its own; see the longer note in
             // `stages::HResident::compute_h`. A `ptau prepare` submits one of these per
             // chunk of a multi-gigabyte section, so the leak is not a rounding error.
-            autoreleasepool(|| -> Result<(), ProveError> {
+            autoreleasepool(|_| -> Result<(), ProveError> {
                 let n = pts.len();
                 let packed: Vec<G::PackedPoint> = pts.iter().map(G::pack_point).collect();
                 let in_buf = self.buffer(&packed)?;
@@ -778,18 +774,18 @@ impl CeremonyKernels {
 
                 crate::cb::with_retry(&self.queue, |queue| {
                     let cb = crate::cb::command_buffer(queue);
-                    let enc = cb.new_compute_command_encoder();
-                    enc.set_compute_pipeline_state(pso);
-                    enc.set_buffer(0, Some(&in_buf), 0);
-                    enc.set_buffer(1, Some(&sc_buf), 0);
-                    enc.set_buffer(2, Some(&out_buf), 0);
-                    set_params(enc, 3, &p);
-                    dispatch_1d(enc, pso, n, 64);
-                    let token = self.seal.encode(enc);
-                    enc.end_encoding();
+                    let enc = mtl::encoder(&cb);
+                    enc.setComputePipelineState(pso);
+                    mtl::set_buffer(&enc, 0, &in_buf, 0);
+                    mtl::set_buffer(&enc, 1, &sc_buf, 0);
+                    mtl::set_buffer(&enc, 2, &out_buf, 0);
+                    set_params(&enc, 3, &p);
+                    dispatch_1d(&enc, pso, n, 64);
+                    let token = self.seal.encode(&enc);
+                    enc.endEncoding();
                     cb.commit();
                     self.seal
-                        .wait(cb, token, "ceremony point scalar multiplication")
+                        .wait(&cb, token, "ceremony point scalar multiplication")
                 })?;
 
                 // SAFETY: the command buffer completed, and `n` points of this type is
@@ -810,7 +806,7 @@ impl CeremonyKernels {
         for pts in points.chunks(self.chunk) {
             // As in `point_mul`: the pool has to wrap both of `affine_from_device`'s
             // submissions, so it sits outside the call rather than inside it.
-            autoreleasepool(|| -> Result<(), ProveError> {
+            autoreleasepool(|_| -> Result<(), ProveError> {
                 let n = pts.len();
                 let packed: Vec<G::PackedPoint> = pts.iter().map(G::pack_point).collect();
                 let in_buf = self.buffer(&packed)?;
@@ -838,7 +834,7 @@ impl CeremonyKernels {
 
         for (ci, block) in points.chunks_mut(chunk).enumerate() {
             // As in `point_mul`, and outside `affine_from_device` for the same reason.
-            autoreleasepool(|| -> Result<(), ProveError> {
+            autoreleasepool(|_| -> Result<(), ProveError> {
                 let n = block.len();
                 let packed: Vec<G::PackedAffine> = block.iter().map(G::pack_affine).collect();
                 let in_buf = self.buffer(&packed)?;
@@ -858,9 +854,9 @@ impl CeremonyKernels {
                 // coherent, so the prefix pass reads what the ladder wrote with no
                 // barrier and no second submission.
                 let ladder = |enc: &ComputeCommandEncoderRef| {
-                    enc.set_compute_pipeline_state(pso);
-                    enc.set_buffer(0, Some(&in_buf), 0);
-                    enc.set_buffer(1, Some(&xyzz), 0);
+                    enc.setComputePipelineState(pso);
+                    mtl::set_buffer(enc, 0, &in_buf, 0);
+                    mtl::set_buffer(enc, 1, &xyzz, 0);
                     set_params(enc, 2, &p);
                     dispatch_1d(enc, pso, n, 64);
                 };
@@ -906,21 +902,21 @@ impl CeremonyKernels {
 
         crate::cb::with_retry(&self.queue, |queue| {
             let cb = crate::cb::command_buffer(queue);
-            let enc = cb.new_compute_command_encoder();
+            let enc = mtl::encoder(&cb);
             if let Some(pre) = pre {
-                pre(enc);
+                pre(&enc);
             }
-            enc.set_compute_pipeline_state(&pipelines.affine_prefix);
-            enc.set_buffer(0, Some(pts), 0);
-            enc.set_buffer(1, Some(&prefix), 0);
-            enc.set_buffer(2, Some(&segprod), 0);
-            set_params(enc, 3, &p);
-            dispatch_1d(enc, &pipelines.affine_prefix, segments, 64);
-            let token = self.seal.encode(enc);
-            enc.end_encoding();
+            enc.setComputePipelineState(&pipelines.affine_prefix);
+            mtl::set_buffer(&enc, 0, pts, 0);
+            mtl::set_buffer(&enc, 1, &prefix, 0);
+            mtl::set_buffer(&enc, 2, &segprod, 0);
+            set_params(&enc, 3, &p);
+            dispatch_1d(&enc, &pipelines.affine_prefix, segments, 64);
+            let token = self.seal.encode(&enc);
+            enc.endEncoding();
             cb.commit();
             self.seal
-                .wait(cb, token, "ceremony batch-to-affine, prefix pass")
+                .wait(&cb, token, "ceremony batch-to-affine, prefix pass")
         })?;
 
         // SAFETY: the command buffer completed and the prefix pass wrote one field
@@ -930,19 +926,19 @@ impl CeremonyKernels {
 
         crate::cb::with_retry(&self.queue, |queue| {
             let cb = crate::cb::command_buffer(queue);
-            let enc = cb.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&pipelines.affine_finish);
-            enc.set_buffer(0, Some(pts), 0);
-            enc.set_buffer(1, Some(&prefix), 0);
-            enc.set_buffer(2, Some(&seeds), 0);
-            enc.set_buffer(3, Some(out), 0);
-            set_params(enc, 4, &p);
-            dispatch_1d(enc, &pipelines.affine_finish, segments, 64);
-            let token = self.seal.encode(enc);
-            enc.end_encoding();
+            let enc = mtl::encoder(&cb);
+            enc.setComputePipelineState(&pipelines.affine_finish);
+            mtl::set_buffer(&enc, 0, pts, 0);
+            mtl::set_buffer(&enc, 1, &prefix, 0);
+            mtl::set_buffer(&enc, 2, &seeds, 0);
+            mtl::set_buffer(&enc, 3, out, 0);
+            set_params(&enc, 4, &p);
+            dispatch_1d(&enc, &pipelines.affine_finish, segments, 64);
+            let token = self.seal.encode(&enc);
+            enc.endEncoding();
             cb.commit();
             self.seal
-                .wait(cb, token, "ceremony batch-to-affine, finish pass")
+                .wait(&cb, token, "ceremony batch-to-affine, finish pass")
         })?;
         Ok(())
     }
@@ -1170,7 +1166,7 @@ mod tests {
     fn kernels() -> Option<CeremonyKernels> {
         // No device on a headless builder is a skip, not a failure, the same way the
         // artifact-gated tests in `msm.rs` skip.
-        Device::system_default()?;
+        mtl::system_default()?;
         Some(CeremonyKernels::new().expect("ceremony kernels"))
     }
 

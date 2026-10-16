@@ -32,7 +32,23 @@ ark-ec.workspace = true
 thiserror.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
-metal = "0.29"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSDictionary", "NSError", "NSString"] }
+objc2-metal = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2-core-foundation",
+    "MTLAllocation",
+    "MTLBuffer",
+    "MTLCommandBuffer",
+    "MTLCommandEncoder",
+    "MTLCommandQueue",
+    "MTLComputeCommandEncoder",
+    "MTLComputePipeline",
+    "MTLDevice",
+    "MTLLibrary",
+    "MTLResource",
+    "MTLTypes",
+] }
 
 [dev-dependencies]
 # `prove_with_blinders`, for the tests that compare proofs bit for bit at pinned blinders.
@@ -47,13 +63,6 @@ snarkrs-ceremony = { path = "../ceremony" }
 
 [features]
 default = []
-
-[lints.rust]
-# objc 0.2's `sel_impl!` expands to a `cfg(feature = "cargo-clippy")` test, which stopped
-# being a real cfg in Rust 1.78. Declaring it expected keeps the lint on for everything
-# else rather than switching it off crate-wide; the selector calls in src/cb.rs are the
-# only place the macro is used.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
 
 # Everything but `layout` is macOS only, so docs.rs's default Linux build shows an empty crate.
 [package.metadata.docs.rs]

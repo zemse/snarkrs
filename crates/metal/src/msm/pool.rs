@@ -3,8 +3,10 @@
 
 use std::sync::Mutex;
 
-use metal::{Buffer, Device};
+use objc2_metal::MTLBuffer;
 use snarkrs_groth16::ProveError;
+
+use crate::mtl::{Buffer, Device};
 
 /// Scratch buffers, kept between calls.
 ///
@@ -29,7 +31,7 @@ impl Pool {
         // for every small request and then be unavailable for the one that needs it.
         let mut best: Option<usize> = None;
         for (i, b) in free.iter().enumerate() {
-            if (b.length() as usize) >= bytes {
+            if b.length() >= bytes {
                 match best {
                     Some(j) if free[j].length() <= b.length() => {}
                     _ => best = Some(i),

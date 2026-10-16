@@ -18,6 +18,7 @@ fn slice_override_never_zero_or_past_u32() {
 use super::window::{parse_slice_override, DUMMY_ROWS, MERGE_TG, MSM_NO_ROW, RECODE_BITS, SCAN_TG};
 use super::*;
 use crate::layout::as_bytes;
+use objc2_metal::{MTLBuffer, MTLCommandQueue};
 use snarkrs_field::CurveGroup;
 use snarkrs_formats::{wtns::Witness, ProvingKey};
 use snarkrs_groth16::{cpu::CpuBackend, Backend, StageTimings};
@@ -210,19 +211,15 @@ fn the_library_compiles_and_every_kernel_has_a_pipeline() {
     eprintln!(
         "max threads/threadgroup: count {} scatter {} accumulate_g1 {} accumulate_g2 {} \
          reduce_g1 {} reduce_g2 {} (simd width {})",
-        m.pipelines.count.max_total_threads_per_threadgroup(),
-        m.pipelines.scatter.max_total_threads_per_threadgroup(),
-        m.pipelines
-            .accumulate_g1
-            .max_total_threads_per_threadgroup(),
-        m.pipelines
-            .accumulate_g2
-            .max_total_threads_per_threadgroup(),
-        m.pipelines.reduce_g1.max_total_threads_per_threadgroup(),
-        m.pipelines.reduce_g2.max_total_threads_per_threadgroup(),
-        m.pipelines.count.thread_execution_width(),
+        m.pipelines.count.maxTotalThreadsPerThreadgroup(),
+        m.pipelines.scatter.maxTotalThreadsPerThreadgroup(),
+        m.pipelines.accumulate_g1.maxTotalThreadsPerThreadgroup(),
+        m.pipelines.accumulate_g2.maxTotalThreadsPerThreadgroup(),
+        m.pipelines.reduce_g1.maxTotalThreadsPerThreadgroup(),
+        m.pipelines.reduce_g2.maxTotalThreadsPerThreadgroup(),
+        m.pipelines.count.threadExecutionWidth(),
     );
-    assert!(m.pipelines.reduce_g2.max_total_threads_per_threadgroup() >= 1);
+    assert!(m.pipelines.reduce_g2.maxTotalThreadsPerThreadgroup() >= 1);
 }
 
 /// A handful of scalars against a naive sum, before anything the size of a real
@@ -709,17 +706,17 @@ fn constant_work_geometry_ignores_the_witness() {
         let out = Outputs::alloc(&m, &mut keep, &job, &plan, 0).expect("outputs");
         assert_eq!(out.ones_groups, 0);
         assert!(out.ones_idx.is_none());
-        let bytes: Vec<u64> = keep.iter().map(|b| b.length()).collect();
+        let bytes: Vec<usize> = keep.iter().map(|b| b.length()).collect();
 
         // The digit pipeline, then the histogram it built: every scalar is in
         // every window exactly once, in a real row or a dummy one.
         let queue = m.queue.get();
-        let cb = queue.new_command_buffer();
-        let enc = cb.new_compute_command_encoder();
-        plan.encode(&m, enc);
-        enc.end_encoding();
+        let cb = queue.commandBuffer().unwrap();
+        let enc = mtl::encoder(&cb);
+        plan.encode(&m, &enc);
+        enc.endEncoding();
         cb.commit();
-        crate::cb::wait_ok(cb, "constant-work digits").unwrap();
+        crate::cb::wait_ok(&cb, "constant-work digits").unwrap();
         // SAFETY: `alloc` sized both at `rows()` u32s and the batch has completed.
         let counts: &[u32] = unsafe { read_back(plan.counts.as_ref().unwrap(), plan.rows()) };
         let cursor: &[u32] = unsafe { read_back(plan.cursor.as_ref().unwrap(), plan.rows()) };

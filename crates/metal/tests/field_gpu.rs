@@ -11,13 +11,17 @@
 
 #![cfg(target_os = "macos")]
 
-use std::ffi::c_void;
+use std::ptr::NonNull;
 use std::time::Instant;
 
-use metal::{Buffer, CompileOptions, ComputePipelineState, Device, MTLResourceOptions, MTLSize};
+use objc2_metal::{
+    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+    MTLComputePipelineState, MTLDevice, MTLResourceOptions,
+};
 use snarkrs_field::{Field, Fr, One, PrimeField, Zero};
 use snarkrs_metal::kernels::FR_MSL;
 use snarkrs_metal::layout::{as_bytes, Packed, PackedFr, FR_MODULUS, LIMBS};
+use snarkrs_metal::mtl::{self, Buffer, ComputePipelineState, Device};
 
 /// Test-only kernels. Deliberately *not* in `src/shaders/`: nothing in the prover
 /// dispatches these, and shipping them in the production library would mean paying their
@@ -107,20 +111,19 @@ impl SplitMix64 {
 
 struct Gpu {
     device: Device,
-    queue: metal::CommandQueue,
-    library: metal::Library,
+    queue: mtl::CommandQueue,
+    library: mtl::Library,
 }
 
 impl Gpu {
     fn new() -> Self {
-        let device = Device::system_default().expect("no Metal device");
+        let device = mtl::system_default().expect("no Metal device");
         let src = format!("{FR_MSL}\n{TEST_MSL}");
-        let library = device
-            .new_library_with_source(&src, &CompileOptions::new())
+        let library = mtl::library(&device, &src)
             // The compiler's diagnostics are the only thing that tells you which line of
             // MSL is wrong, so they are propagated verbatim rather than summarised.
             .unwrap_or_else(|e| panic!("MSL compile failed:\n{e}"));
-        let queue = device.new_command_queue();
+        let queue = mtl::command_queue(&device).unwrap();
         Self {
             device,
             queue,
@@ -129,27 +132,27 @@ impl Gpu {
     }
 
     fn pipeline(&self, name: &str) -> ComputePipelineState {
-        let f = self
-            .library
-            .get_function(name, None)
-            .unwrap_or_else(|e| panic!("no kernel {name}: {e}"));
-        self.device
-            .new_compute_pipeline_state_with_function(&f)
-            .unwrap_or_else(|e| panic!("pipeline {name}: {e}"))
+        let f =
+            mtl::function(&self.library, name).unwrap_or_else(|e| panic!("no kernel {name}: {e}"));
+        mtl::pipeline(&self.device, &f).unwrap_or_else(|e| panic!("pipeline {name}: {e}"))
     }
 
     fn shared<T: Packed>(&self, data: &[T]) -> Buffer {
         let bytes = as_bytes(data);
-        self.device.new_buffer_with_data(
-            bytes.as_ptr() as *const c_void,
-            bytes.len() as u64,
-            MTLResourceOptions::StorageModeShared,
-        )
+        // SAFETY: `bytes` is readable for its length.
+        unsafe {
+            mtl::buffer_with_data(
+                &self.device,
+                NonNull::from(bytes).cast(),
+                bytes.len(),
+                MTLResourceOptions::StorageModeShared,
+            )
+        }
+        .expect("buffer")
     }
 
     fn empty(&self, bytes: usize) -> Buffer {
-        self.device
-            .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared)
+        mtl::buffer(&self.device, bytes, MTLResourceOptions::StorageModeShared).expect("buffer")
     }
 
     /// One binary kernel, one command buffer, one wait. Returns the outputs.
@@ -165,20 +168,20 @@ impl Gpu {
         let bb = self.shared(b);
         let out = self.empty(std::mem::size_of_val(a));
 
-        let cb = self.queue.new_command_buffer();
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(pso);
-        enc.set_buffer(0, Some(&ba), 0);
-        enc.set_buffer(1, Some(&bb), 0);
-        enc.set_buffer(2, Some(&out), 0);
+        let cb = self.queue.commandBuffer().unwrap();
+        let enc = mtl::encoder(&cb);
+        enc.setComputePipelineState(pso);
+        mtl::set_buffer(&enc, 0, &ba, 0);
+        mtl::set_buffer(&enc, 1, &bb, 0);
+        mtl::set_buffer(&enc, 2, &out, 0);
         // Never hardcode 1024. A kernel carrying a Montgomery multiply reports a lower
         // maximum than the device advertises, because of register pressure, and Metal
         // rejects a threadgroup larger than the pipeline's own limit.
-        let tg = pso.max_total_threads_per_threadgroup().min(256);
-        enc.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(tg, 1, 1));
-        enc.end_encoding();
+        let tg = pso.maxTotalThreadsPerThreadgroup().min(256);
+        enc.dispatchThreads_threadsPerThreadgroup(mtl::size(n), mtl::size(tg));
+        enc.endEncoding();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
 
         read_back(&out, n)
     }
@@ -188,7 +191,7 @@ fn read_back<T: Copy>(b: &Buffer, n: usize) -> Vec<T> {
     // SAFETY: the buffer was allocated with exactly `n * size_of::<T>()` bytes in shared
     // storage, the GPU work that wrote it has completed, and `T` here is always a packed
     // POD with no invalid bit patterns.
-    unsafe { std::slice::from_raw_parts(b.contents() as *const T, n) }.to_vec()
+    unsafe { std::slice::from_raw_parts(b.contents().as_ptr() as *const T, n) }.to_vec()
 }
 
 fn pack(xs: &[Fr]) -> Vec<PackedFr> {
@@ -320,17 +323,17 @@ fn gpu_field_matches_ark_ff() {
     let ba = gpu.shared(&pa);
     let bb = gpu.shared(&pb);
     let out = gpu.empty(n * 4);
-    let cb = gpu.queue.new_command_buffer();
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pso);
-    enc.set_buffer(0, Some(&ba), 0);
-    enc.set_buffer(1, Some(&bb), 0);
-    enc.set_buffer(2, Some(&out), 0);
-    let tg = pso.max_total_threads_per_threadgroup().min(256);
-    enc.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(tg, 1, 1));
-    enc.end_encoding();
+    let cb = gpu.queue.commandBuffer().unwrap();
+    let enc = mtl::encoder(&cb);
+    enc.setComputePipelineState(&pso);
+    mtl::set_buffer(&enc, 0, &ba, 0);
+    mtl::set_buffer(&enc, 1, &bb, 0);
+    mtl::set_buffer(&enc, 2, &out, 0);
+    let tg = pso.maxTotalThreadsPerThreadgroup().min(256);
+    enc.dispatchThreads_threadsPerThreadgroup(mtl::size(n), mtl::size(tg));
+    enc.endEncoding();
     cb.commit();
-    cb.wait_until_completed();
+    cb.waitUntilCompleted();
     let flags: Vec<u32> = read_back(&out, n);
     let mut pred_matched = 0usize;
     let mut saw_zero = 0usize;
@@ -481,17 +484,17 @@ fn gpu_field_multiply_throughput() {
     println!(
         "DEVICE  {}  unified={}  maxThreadsPerThreadgroup={}  threadgroupMem={}",
         gpu.device.name(),
-        gpu.device.has_unified_memory(),
-        gpu.device.max_threads_per_threadgroup().width,
-        gpu.device.max_threadgroup_memory_length(),
+        gpu.device.hasUnifiedMemory(),
+        gpu.device.maxThreadsPerThreadgroup().width,
+        gpu.device.maxThreadgroupMemoryLength(),
     );
 
     // ---- ALU-bound: dependent multiply chain, one per lane ----
     let chain = gpu.pipeline("bench_chain");
     println!(
         "PIPELINE bench_chain maxTotalThreadsPerThreadgroup={}  (device advertises {})",
-        chain.max_total_threads_per_threadgroup(),
-        gpu.device.max_threads_per_threadgroup().width
+        chain.maxTotalThreadsPerThreadgroup(),
+        gpu.device.maxThreadsPerThreadgroup().width
     );
 
     const THREADS: usize = 1 << 20;
@@ -504,25 +507,26 @@ fn gpu_field_multiply_throughput() {
     // CIOS on this machine without saying at what threadgroup size, and the reference
     // implementations disagree with each other (lambdaworks prefers 256, zkonduit clamps
     // to 64), so the only honest thing is to try them and print the table.
-    let cap = chain.max_total_threads_per_threadgroup();
-    let mut best = (0f64, 0u64);
-    for tg in [32u64, 64, 128, 256, 512, 1024] {
+    let cap = chain.maxTotalThreadsPerThreadgroup();
+    let mut best = (0f64, 0usize);
+    for tg in [32usize, 64, 128, 256, 512, 1024] {
         if tg > cap {
             continue;
         }
         let mut times = Vec::new();
         for rep in 0..7 {
             let t0 = Instant::now();
-            let cb = gpu.queue.new_command_buffer();
-            let enc = cb.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&chain);
-            enc.set_buffer(0, Some(&bseeds), 0);
-            enc.set_buffer(1, Some(&out), 0);
-            enc.set_bytes(2, 4, &ITERS as *const u32 as *const c_void);
-            enc.dispatch_threads(MTLSize::new(THREADS as u64, 1, 1), MTLSize::new(tg, 1, 1));
-            enc.end_encoding();
+            let cb = gpu.queue.commandBuffer().unwrap();
+            let enc = mtl::encoder(&cb);
+            enc.setComputePipelineState(&chain);
+            mtl::set_buffer(&enc, 0, &bseeds, 0);
+            mtl::set_buffer(&enc, 1, &out, 0);
+            // SAFETY: a `u32` is readable for 4 bytes.
+            unsafe { mtl::set_bytes(&enc, 2, 4, (&ITERS as *const u32).cast()) };
+            enc.dispatchThreads_threadsPerThreadgroup(mtl::size(THREADS), mtl::size(tg));
+            enc.endEncoding();
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
             let dt = t0.elapsed().as_secs_f64();
             if rep > 1 {
                 times.push(dt);
@@ -564,7 +568,7 @@ fn gpu_field_multiply_throughput() {
         let ba = gpu.shared(&pack(&xs));
         let bb = gpu.shared(&pack(&ys));
         let bo = gpu.empty(n * std::mem::size_of::<PackedFr>());
-        let tg = stream.max_total_threads_per_threadgroup().min(256);
+        let tg = stream.maxTotalThreadsPerThreadgroup().min(256);
 
         // 15 reps with the first 5 dropped. A freshly allocated shared buffer is faulted
         // in on first touch, which the scouting phase measured at 3.6x the warm cost, so
@@ -572,16 +576,16 @@ fn gpu_field_multiply_throughput() {
         let mut times = Vec::new();
         for rep in 0..15 {
             let t0 = Instant::now();
-            let cb = gpu.queue.new_command_buffer();
-            let enc = cb.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&stream);
-            enc.set_buffer(0, Some(&ba), 0);
-            enc.set_buffer(1, Some(&bb), 0);
-            enc.set_buffer(2, Some(&bo), 0);
-            enc.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(tg, 1, 1));
-            enc.end_encoding();
+            let cb = gpu.queue.commandBuffer().unwrap();
+            let enc = mtl::encoder(&cb);
+            enc.setComputePipelineState(&stream);
+            mtl::set_buffer(&enc, 0, &ba, 0);
+            mtl::set_buffer(&enc, 1, &bb, 0);
+            mtl::set_buffer(&enc, 2, &bo, 0);
+            enc.dispatchThreads_threadsPerThreadgroup(mtl::size(n), mtl::size(tg));
+            enc.endEncoding();
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
             let dt = t0.elapsed().as_secs_f64();
             if rep >= 5 {
                 times.push(dt);
@@ -604,16 +608,16 @@ fn gpu_field_multiply_throughput() {
     let mut times = Vec::new();
     for _ in 0..64 {
         let t0 = Instant::now();
-        let cb = gpu.queue.new_command_buffer();
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&stream);
-        enc.set_buffer(0, Some(&bseeds), 0);
-        enc.set_buffer(1, Some(&bseeds), 0);
-        enc.set_buffer(2, Some(&out), 0);
-        enc.dispatch_threads(MTLSize::new(32, 1, 1), MTLSize::new(32, 1, 1));
-        enc.end_encoding();
+        let cb = gpu.queue.commandBuffer().unwrap();
+        let enc = mtl::encoder(&cb);
+        enc.setComputePipelineState(&stream);
+        mtl::set_buffer(&enc, 0, &bseeds, 0);
+        mtl::set_buffer(&enc, 1, &bseeds, 0);
+        mtl::set_buffer(&enc, 2, &out, 0);
+        enc.dispatchThreads_threadsPerThreadgroup(mtl::size(32), mtl::size(32));
+        enc.endEncoding();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
         times.push(t0.elapsed().as_secs_f64());
     }
     times.sort_by(|x, y| x.partial_cmp(y).unwrap());
@@ -631,16 +635,14 @@ fn gpu_field_multiply_throughput() {
 /// report a reassuring number that no first run will ever see.
 #[test]
 fn msl_runtime_compile_cost() {
-    let device = Device::system_default().expect("no Metal device");
+    let device = mtl::system_default().expect("no Metal device");
     let salt = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
     let src = format!("// cache salt {salt}\n{FR_MSL}\n{TEST_MSL}");
     let t0 = Instant::now();
-    let library = device
-        .new_library_with_source(&src, &CompileOptions::new())
-        .expect("MSL compile failed");
+    let library = mtl::library(&device, &src).expect("MSL compile failed");
     let compile = t0.elapsed();
 
     let names = [
@@ -656,8 +658,8 @@ fn msl_runtime_compile_cost() {
     ];
     let t0 = Instant::now();
     for n in names {
-        let f = library.get_function(n, None).unwrap();
-        let _ = device.new_compute_pipeline_state_with_function(&f).unwrap();
+        let f = mtl::function(&library, n).unwrap();
+        let _ = mtl::pipeline(&device, &f).unwrap();
     }
     let pipelines = t0.elapsed();
 

@@ -1,6 +1,6 @@
 //! Committing a command buffer and finding out whether it worked.
 //!
-//! `wait_until_completed` blocks until the GPU is done, and returns exactly the same way
+//! `waitUntilCompleted` blocks until the GPU is done, and returns exactly the same way
 //! whether the work succeeded or the command buffer faulted. Every commit site in this
 //! crate used to call it and then read the output buffers regardless. Those buffers come
 //! from a pool ([`crate::backend`]'s scratch reuse), so on a fault the next statement reads
@@ -22,70 +22,36 @@
 //! by a later encoder or a blit passes). `examples/cb_seal_probe.rs` measures the same
 //! question against this crate's own submissions; its numbers are in the commit that added
 //! the seal. A matching token is a completion check, not arithmetic verification.
-//!
-//! `metal-rs` 0.29 binds `status()` but not `error()`, so the NSError has to be read with a
-//! raw `msg_send!`. That is safe here because the crate marks `CommandBufferRef` as
-//! `objc::Message`, which is the same mechanism its own `status()` uses. The `objc` macros
-//! come from `metal::objc`, which `metal` re-exports as `pub extern crate objc`: taking them
-//! from there rather than from a separate dependency guarantees the two cannot resolve to
-//! different versions of the runtime, which would make these selector calls unsound.
 
-use std::ffi::CStr;
-use std::os::raw::c_char;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
-use metal::objc::runtime::Object;
-use metal::objc::{class, msg_send, sel, sel_impl};
-use metal::{
-    Buffer, CommandBufferRef, CommandQueue, CommandQueueRef, ComputeCommandEncoderRef,
-    ComputePipelineState, Device, Library, MTLCommandBufferStatus, MTLSize,
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_foundation::NSArray;
+use objc2_metal::{
+    MTLBuffer, MTLCommandBuffer, MTLCommandBufferDescriptor, MTLCommandBufferEncoderInfo,
+    MTLCommandBufferEncoderInfoErrorKey, MTLCommandBufferErrorOption, MTLCommandBufferStatus,
+    MTLCommandEncoderErrorState, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
 };
 use snarkrs_groth16::ProveError;
 
-#[link(name = "Metal", kind = "framework")]
-extern "C" {
-    /// The NSError user-info key under which Metal 3 files one
-    /// `MTLCommandBufferEncoderInfo` per encoder of a failed buffer, when the buffer was
-    /// made with [`command_buffer`].
-    static MTLCommandBufferEncoderInfoErrorKey: *mut Object;
-}
-
-/// A Rust `String` from an NSString, empty for nil.
-///
-/// # Safety
-///
-/// `s` is nil or a live NSString.
-unsafe fn nsstring(s: *mut Object) -> String {
-    if s.is_null() {
-        return String::new();
-    }
-    let utf8: *const c_char = msg_send![s, UTF8String];
-    if utf8.is_null() {
-        return String::new();
-    }
-    CStr::from_ptr(utf8).to_string_lossy().into_owned()
-}
+use crate::mtl::{
+    Buffer, CommandBuffer, CommandBufferRef, CommandQueue, CommandQueueRef,
+    ComputeCommandEncoderRef, ComputePipelineState, Device, DeviceRef, Library,
+};
 
 /// A command buffer whose NSError, should it fail, names the execution state of every
 /// encoder in it (`MTLCommandBufferErrorOptionEncoderExecutionStatus`). Every proving
-/// submission is made here rather than with `new_command_buffer`, so that a fault says
-/// which encoder faulted and which ones never ran. Priced at nothing measurable: see the
+/// submission is made here rather than with `commandBuffer`, so that a fault says which
+/// encoder faulted and which ones never ran. Priced at nothing measurable: see the
 /// commit that added it.
-pub(crate) fn command_buffer(queue: &CommandQueueRef) -> &CommandBufferRef {
-    // SAFETY: `CommandQueueRef` is `objc::Message`. `MTLCommandBufferDescriptor` is
-    // created at +1 and released once the queue has copied it, and
-    // `commandBufferWithDescriptor:` returns the same autoreleased `+0` buffer as
-    // `commandBuffer`, which is what metal-rs's `new_command_buffer` hands out as a
-    // borrowed ref.
-    unsafe {
-        let desc: *mut Object = msg_send![class!(MTLCommandBufferDescriptor), new];
-        // MTLCommandBufferErrorOptionEncoderExecutionStatus.
-        let () = msg_send![desc, setErrorOptions: 1u64];
-        let cb: &CommandBufferRef = msg_send![queue, commandBufferWithDescriptor: desc];
-        let () = msg_send![desc, release];
-        cb
-    }
+pub(crate) fn command_buffer(queue: &CommandQueueRef) -> CommandBuffer {
+    let desc = MTLCommandBufferDescriptor::new();
+    desc.setErrorOptions(MTLCommandBufferErrorOption::EncoderExecutionStatus);
+    queue
+        .commandBufferWithDescriptor(&desc)
+        .expect("a command queue gives a command buffer")
 }
 
 /// Every dispatch on the proving path goes through this pair rather than the encoder's
@@ -94,93 +60,76 @@ pub(crate) fn command_buffer(queue: &CommandQueueRef) -> &CommandBufferRef {
 pub(crate) fn dispatch_threads(enc: &ComputeCommandEncoderRef, grid: MTLSize, tg: MTLSize) {
     #[cfg(test)]
     let grid = match inject::cut_dispatch(grid.width) {
-        Some(width) => MTLSize::new(width, grid.height, grid.depth),
+        Some(width) => MTLSize { width, ..grid },
         None => return,
     };
-    enc.dispatch_threads(grid, tg);
+    enc.dispatchThreads_threadsPerThreadgroup(grid, tg);
 }
 
 pub(crate) fn dispatch_thread_groups(enc: &ComputeCommandEncoderRef, groups: MTLSize, tg: MTLSize) {
     #[cfg(test)]
     let groups = match inject::cut_dispatch(groups.width) {
-        Some(width) => MTLSize::new(width, groups.height, groups.depth),
+        Some(width) => MTLSize { width, ..groups },
         None => return,
     };
-    enc.dispatch_thread_groups(groups, tg);
+    enc.dispatchThreadgroups_threadsPerThreadgroup(groups, tg);
 }
 
 /// The NSError text hanging off a failed command buffer, empty when there is none, with
 /// the per-encoder execution states after it when the buffer was made with
 /// [`command_buffer`] and Metal filed them.
 fn error_text(cb: &CommandBufferRef) -> String {
-    // SAFETY: `CommandBufferRef` is `objc::Message` (metal-rs asserts this for every
-    // foreign object type it defines), `error` is a documented MTLCommandBuffer property
-    // returning an autoreleased NSError or nil, `userInfo` an NSDictionary, the encoder
-    // infos an NSArray of MTLCommandBufferEncoderInfo, and every result is null-checked
-    // before it is followed. Nothing is retained or released, so there is no ownership
-    // to get wrong.
-    unsafe {
-        let err: *mut Object = msg_send![cb, error];
-        if err.is_null() {
-            return String::new();
-        }
-        let desc: *mut Object = msg_send![err, localizedDescription];
-        let mut text = format!(": {}", nsstring(desc));
-        let info: *mut Object = msg_send![err, userInfo];
-        if info.is_null() {
-            return text;
-        }
-        let infos: *mut Object = msg_send![info, objectForKey: MTLCommandBufferEncoderInfoErrorKey];
-        if infos.is_null() {
-            return text;
-        }
-        let n: usize = msg_send![infos, count];
-        for i in 0..n {
-            let e: *mut Object = msg_send![infos, objectAtIndex: i];
-            let label: *mut Object = msg_send![e, label];
-            let state: i64 = msg_send![e, errorState];
-            // MTLCommandEncoderErrorState.
-            let state = match state {
-                0 => "unknown",
-                1 => "completed",
-                2 => "affected",
-                3 => "pending",
-                4 => "faulted",
-                _ => "?",
-            };
-            text.push_str(if i == 0 { " (encoders: " } else { ", " });
-            text.push_str(&nsstring(label));
-            text.push_str(": ");
-            text.push_str(state);
-        }
-        if n > 0 {
-            text.push(')');
-        }
-        text
+    let Some(err) = cb.error() else {
+        return String::new();
+    };
+    let mut text = format!(": {}", err.localizedDescription());
+    // SAFETY: a constant NSString Metal exports.
+    let key = unsafe { MTLCommandBufferEncoderInfoErrorKey };
+    let Some(infos) = err.userInfo().objectForKey(key) else {
+        return text;
+    };
+    let Ok(infos) = infos.downcast::<NSArray>() else {
+        return text;
+    };
+    let n = infos.count();
+    for i in 0..n {
+        // SAFETY: the array under this key holds one MTLCommandBufferEncoderInfo per
+        // encoder.
+        let e: Retained<ProtocolObject<dyn MTLCommandBufferEncoderInfo>> =
+            unsafe { Retained::cast_unchecked(infos.objectAtIndex(i)) };
+        let state = match e.errorState() {
+            MTLCommandEncoderErrorState::Unknown => "unknown",
+            MTLCommandEncoderErrorState::Completed => "completed",
+            MTLCommandEncoderErrorState::Affected => "affected",
+            MTLCommandEncoderErrorState::Pending => "pending",
+            MTLCommandEncoderErrorState::Faulted => "faulted",
+            _ => "?",
+        };
+        text.push_str(if i == 0 { " (encoders: " } else { ", " });
+        text.push_str(&e.label().to_string());
+        text.push_str(": ");
+        text.push_str(state);
     }
+    if n > 0 {
+        text.push(')');
+    }
+    text
 }
 
 /// Commit already done by the caller: wait, then refuse to continue unless the GPU actually
 /// completed the work. `context` names the dispatch, so a fault says which one died.
 pub(crate) fn wait_ok(cb: &CommandBufferRef, context: &str) -> Result<(), ProveError> {
     let submitted = std::time::Instant::now();
-    cb.wait_until_completed();
+    cb.waitUntilCompleted();
     // `G16_METAL_CB_TIMES=1` prints the driver's own GPU-busy window next to the wall
     // time the host waited. The gap between them is submission latency and host work,
     // which no amount of kernel tuning will remove, so the two numbers have to be read
     // together before anything is attributed to the kernels.
     if std::env::var_os("G16_METAL_CB_TIMES").is_some() {
-        // SAFETY: same mechanism and same justification as `error_text` above. All four
-        // are documented MTLCommandBuffer properties returning a CFTimeInterval, valid
-        // once the buffer has completed, which `wait_until_completed` has just ensured.
-        // metal-rs 0.29 binds none of them.
-        let (gpu, kern) = unsafe {
-            let gs: f64 = msg_send![cb, GPUStartTime];
-            let ge: f64 = msg_send![cb, GPUEndTime];
-            let ks: f64 = msg_send![cb, kernelStartTime];
-            let ke: f64 = msg_send![cb, kernelEndTime];
-            ((ge - gs) * 1e3, (ke - ks) * 1e3)
-        };
+        // All four are valid once the buffer has completed, which `waitUntilCompleted`
+        // has just ensured.
+        let gpu = (cb.GPUEndTime() - cb.GPUStartTime()) * 1e3;
+        let kern = (cb.kernelEndTime() - cb.kernelStartTime()) * 1e3;
         eprintln!(
             "[cb] {context}: wall {:.2} ms  gpu {:.2} ms  kernel {:.2} ms",
             submitted.elapsed().as_secs_f64() * 1e3,
@@ -193,7 +142,10 @@ pub(crate) fn wait_ok(cb: &CommandBufferRef, context: &str) -> Result<(), ProveE
     if inject::fires() {
         return Err(ProveError::Device {
             backend: "metal",
-            reason: format!("{context}: injected fault (status {status:?})"),
+            reason: format!(
+                "{context}: injected fault (status {})",
+                crate::mtl::status_name(status)
+            ),
         });
     }
     #[cfg(test)]
@@ -209,7 +161,8 @@ pub(crate) fn wait_ok(cb: &CommandBufferRef, context: &str) -> Result<(), ProveE
     Err(ProveError::Device {
         backend: "metal",
         reason: format!(
-            "{context}: command buffer did not complete (status {status:?}){}",
+            "{context}: command buffer did not complete (status {}){}",
+            crate::mtl::status_name(status),
             error_text(cb)
         ),
     })
@@ -281,11 +234,16 @@ pub(crate) struct Queue {
     current: Mutex<CommandQueue>,
 }
 
+/// A fresh queue on `device`.
+fn new_queue(device: &DeviceRef) -> CommandQueue {
+    crate::mtl::command_queue(device).expect("a Metal device gives a command queue")
+}
+
 impl Queue {
     pub(crate) fn new(device: &Device) -> Self {
         Self {
             device: device.clone(),
-            current: Mutex::new(device.new_command_queue()),
+            current: Mutex::new(new_queue(device)),
         }
     }
 
@@ -302,7 +260,7 @@ impl Queue {
     fn renew(&self, refused: &CommandQueueRef) {
         let mut current = self.current.lock().unwrap_or_else(|p| p.into_inner());
         if std::ptr::eq::<CommandQueueRef>(&**current, refused) {
-            *current = self.device.new_command_queue();
+            *current = new_queue(&self.device);
         }
     }
 }
@@ -396,19 +354,15 @@ pub(crate) struct Seal {
 
 impl Seal {
     /// From a library that has `seal.metal` in it.
-    pub(crate) fn new(device: &Device, library: &Library) -> Result<Self, ProveError> {
-        let f = library
-            .get_function("g16_seal", None)
-            .map_err(|e| ProveError::Backend {
-                backend: "metal",
-                reason: format!("kernel g16_seal missing: {e}"),
-            })?;
-        let pipeline = device
-            .new_compute_pipeline_state_with_function(&f)
-            .map_err(|e| ProveError::Backend {
-                backend: "metal",
-                reason: format!("pipeline g16_seal: {e}"),
-            })?;
+    pub(crate) fn new(device: &DeviceRef, library: &Library) -> Result<Self, ProveError> {
+        let f = crate::mtl::function(library, "g16_seal").map_err(|e| ProveError::Backend {
+            backend: "metal",
+            reason: format!("kernel g16_seal missing: {e}"),
+        })?;
+        let pipeline = crate::mtl::pipeline(device, &f).map_err(|e| ProveError::Backend {
+            backend: "metal",
+            reason: format!("pipeline g16_seal: {e}"),
+        })?;
         let slots = crate::alloc::shared(device, SEAL_SLOTS as usize * 4)?;
         Ok(Self {
             pipeline,
@@ -438,11 +392,11 @@ impl Seal {
         if inject::cut_token() || inject::missing_token_fires() {
             return;
         }
-        enc.set_compute_pipeline_state(&self.pipeline);
-        enc.set_buffer(0, Some(&self.slots), 0);
+        enc.setComputePipelineState(&self.pipeline);
+        crate::mtl::set_buffer(enc, 0, &self.slots, 0);
         let words = [token.slot, token.epoch];
-        enc.set_bytes(1, 8, words.as_ptr().cast());
-        enc.dispatch_threads(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
+        crate::enc::set_params(enc, 1, &words);
+        enc.dispatchThreads_threadsPerThreadgroup(crate::mtl::size(1), crate::mtl::size(1));
     }
 
     /// [`Self::next`] and [`Self::encode_token`] in one.
@@ -463,7 +417,14 @@ impl Seal {
         wait_ok(cb, context)?;
         // SAFETY: `slots` is a shared buffer of `SEAL_SLOTS` u32s and `slot` is below
         // that; the buffer that wrote it has completed.
-        let got = unsafe { *(self.slots.contents() as *const u32).add(token.slot as usize) };
+        let got = unsafe {
+            *self
+                .slots
+                .contents()
+                .cast::<u32>()
+                .as_ptr()
+                .add(token.slot as usize)
+        };
         #[cfg(test)]
         let got = if inject::stale_fires() { !got } else { got };
         if got == token.epoch {
@@ -472,10 +433,10 @@ impl Seal {
         Err(ProveError::Device {
             backend: "metal",
             reason: format!(
-                "{context}: command buffer completed (status {:?}) but its completion \
+                "{context}: command buffer completed (status {}) but its completion \
                  token is {got:#x}, this submission's is {:#x}: the GPU did not run it to \
                  its end{}",
-                cb.status(),
+                crate::mtl::status_name(cb.status()),
                 token.epoch,
                 error_text(cb)
             ),
@@ -661,7 +622,7 @@ pub(crate) mod inject {
 
     /// The width a dispatch of `width` threads or groups is encoded at, or `None` for
     /// not at all.
-    pub(super) fn cut_dispatch(width: u64) -> Option<u64> {
+    pub(super) fn cut_dispatch(width: usize) -> Option<usize> {
         let n = DISPATCHES.get();
         DISPATCHES.set(n + 1);
         if CUTTING.get().is_some() {
@@ -732,30 +693,30 @@ pub(crate) mod inject {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use objc2_metal::MTLCommandEncoder;
 
     /// The check on the real device, without the injector: a sealed buffer passes, and a
     /// token whose dispatch never ran is refused as a device fault.
     #[test]
     fn a_token_that_was_never_written_is_refused() {
-        let device = Device::system_default().expect("no Metal device");
-        let library = device
-            .new_library_with_source(crate::kernels::SEAL_MSL, &metal::CompileOptions::new())
+        let device = crate::mtl::system_default().expect("no Metal device");
+        let library = crate::mtl::library(&device, crate::kernels::SEAL_MSL)
             .unwrap_or_else(|e| panic!("MSL compile failed:\n{e}"));
         let seal = Seal::new(&device, &library).unwrap();
-        let queue = device.new_command_queue();
-        metal::objc::rc::autoreleasepool(|| {
+        let queue = new_queue(&device);
+        objc2::rc::autoreleasepool(|_| {
             let cb = command_buffer(&queue);
-            let enc = cb.new_compute_command_encoder();
-            let written = seal.encode(enc);
-            enc.end_encoding();
+            let enc = crate::mtl::encoder(&cb);
+            let written = seal.encode(&enc);
+            enc.endEncoding();
             cb.commit();
-            seal.wait(cb, written, "sealed").unwrap();
+            seal.wait(&cb, written, "sealed").unwrap();
             // The next epoch, which no dispatch has written.
             let skipped = Token {
                 slot: (written.epoch + 1) % SEAL_SLOTS,
                 epoch: written.epoch + 1,
             };
-            let err = seal.wait(cb, skipped, "unsealed").unwrap_err();
+            let err = seal.wait(&cb, skipped, "unsealed").unwrap_err();
             assert!(err.is_device_fault(), "{err}");
             assert!(err.to_string().contains("completion token"), "{err}");
         });
@@ -800,7 +761,7 @@ mod tests {
     /// and backs off.
     #[test]
     fn an_ignored_submission_is_retried_on_a_new_queue() {
-        let device = Device::system_default().expect("no Metal device");
+        let device = crate::mtl::system_default().expect("no Metal device");
         let queue = Queue::new(&device);
         for (status, renews) in [
             (

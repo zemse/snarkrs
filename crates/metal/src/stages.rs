@@ -38,20 +38,24 @@
 //! tables, the coset power table) is witness independent and is packed once in
 //! [`HStages::prepare`].
 
-use std::ffi::c_void;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use metal::objc::rc::autoreleasepool;
-use metal::{Buffer, CompileOptions, ComputePipelineState, Device, Library, MTLSize};
+use objc2::rc::autoreleasepool;
+use objc2_metal::{
+    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder,
+    MTLComputePipelineState, MTLDevice,
+};
 use snarkrs_field::{Domain, Field, Fr};
 use snarkrs_formats::ProvingKey;
 use snarkrs_groth16::{HPoly, ProveError, StageTimings};
 
+use crate::enc::set_params;
 use crate::kernels::{FR_MSL, GATHER_MSL, NTT_MSL, POINTWISE_MSL, SEAL_MSL};
 use crate::layout::{PackedFr, PackedScalar, FR_MODULUS};
 use crate::msm::Work;
+use crate::mtl::{self, Buffer, ComputeCommandEncoderRef, ComputePipelineState, Device, Library};
 
 /// The tag on [`snarkrs_groth16::HPoly::Device`] values produced here. A handle carrying any
 /// other tag came from a different backend and must not be dereferenced as an [`HHandle`].
@@ -63,8 +67,8 @@ pub const TAG: &str = "metal";
 /// kernel carrying a CIOS Montgomery multiply reports less because of register pressure:
 /// 896 was measured for a bare multiply kernel on this machine and 512 for a kernel doing
 /// point arithmetic. Metal rejects a threadgroup larger than the pipeline's limit, so the
-/// preference is always `min`ed against `max_total_threads_per_threadgroup`.
-const PREFERRED_THREADS: u64 = 256;
+/// preference is always `min`ed against `maxTotalThreadsPerThreadgroup`.
+const PREFERRED_THREADS: usize = 256;
 
 /// A, B and C: the three witness-evaluation vectors that go round the transform pipeline
 /// together. Named rather than written as a bare 3 because it is also the number of
@@ -145,13 +149,12 @@ impl HStages {
 
     /// Picks the system default device and compiles the MSL for stages 0 to 4.
     pub fn new() -> Result<Self, ProveError> {
-        let device = Device::system_default().ok_or_else(|| bad("no Metal device"))?;
+        let device = mtl::system_default().ok_or_else(|| bad("no Metal device"))?;
         Self::with_device(device)
     }
 
     pub fn with_device(device: Device) -> Result<Self, ProveError> {
-        let library = device
-            .new_library_with_source(&Self::source(), &CompileOptions::new())
+        let library = mtl::library(&device, &Self::source())
             // The compiler diagnostic names the offending line of MSL and is the only
             // thing that does, so it is propagated verbatim rather than summarised.
             .map_err(|e| bad(format!("MSL compile failed:\n{e}")))?;
@@ -167,12 +170,9 @@ impl HStages {
         library: Library,
     ) -> Result<Self, ProveError> {
         let pso = |name: &str| -> Result<ComputePipelineState, ProveError> {
-            let f = library
-                .get_function(name, None)
+            let f = mtl::function(&library, name)
                 .map_err(|e| bad(format!("kernel {name} missing: {e}")))?;
-            device
-                .new_compute_pipeline_state_with_function(&f)
-                .map_err(|e| bad(format!("pipeline {name}: {e}")))
+            mtl::pipeline(&device, &f).map_err(|e| bad(format!("pipeline {name}: {e}")))
         };
         let gather = pso("g16_gather_abc")?;
         let head = pso("g16_ntt_head")?;
@@ -184,7 +184,7 @@ impl HStages {
         // M2 Max maxThreadgroupMemoryLength is 32768, so 1024 elements and 10 passes.
         // Querying costs nothing and hardcoding 32768, as lambdaworks does, is a device
         // property written down as a constant.
-        let budget = device.max_threadgroup_memory_length() as usize;
+        let budget = device.maxThreadgroupMemoryLength();
         let elems = budget / core::mem::size_of::<PackedFr>();
         if elems < 2 {
             return Err(bad(format!(
@@ -230,8 +230,9 @@ impl HStages {
         let buf = self.empty(data.len())?;
         // SAFETY: the buffer was just allocated with room for `data.len()` packed values
         // and nothing has been encoded against it, so no dispatch can be reading it.
-        let dst =
-            unsafe { core::slice::from_raw_parts_mut(buf.contents() as *mut PackedFr, data.len()) };
+        let dst = unsafe {
+            core::slice::from_raw_parts_mut(buf.contents().as_ptr() as *mut PackedFr, data.len())
+        };
         PackedFr::pack_into(data, dst);
         Ok(buf)
     }
@@ -249,8 +250,8 @@ impl HStages {
 
     /// Threadgroup width for a pipeline: the preference, clamped by what the pipeline
     /// will actually accept and by how much work there is.
-    fn threads(&self, pso: &ComputePipelineState, work: u64) -> u64 {
-        pso.max_total_threads_per_threadgroup()
+    fn threads(&self, pso: &ComputePipelineState, work: usize) -> usize {
+        pso.maxTotalThreadsPerThreadgroup()
             .min(PREFERRED_THREADS)
             .min(work.max(1))
             .max(1)
@@ -312,12 +313,12 @@ struct Scratch {
     witness: Buffer,
     vectors: Buffer,
     /// Bytes between consecutive vectors in `vectors`.
-    stride: u64,
+    stride: usize,
     h_std: Buffer,
 }
 
 /// A domain vector: its buffer and the byte offset it starts at.
-type Slot<'a> = (&'a Buffer, u64);
+type Slot<'a> = (&'a Buffer, usize);
 
 impl Scratch {
     fn a(&self) -> Slot<'_> {
@@ -335,8 +336,8 @@ impl Scratch {
     }
 }
 
-fn bind(enc: &metal::ComputeCommandEncoderRef, index: u64, (buf, off): Slot<'_>) {
-    enc.set_buffer(index, Some(buf), off);
+fn bind(enc: &ComputeCommandEncoderRef, index: usize, (buf, off): Slot<'_>) {
+    mtl::set_buffer(enc, index, buf, off);
 }
 
 /// How many of the `n` words of `h_std` lie outside `[0, r)`, and the index of the first,
@@ -352,7 +353,8 @@ fn h_off_field(buf: &Buffer, n: usize) -> Option<(usize, usize)> {
     const CHUNK: usize = 1 << 16;
     // SAFETY: the buffer holds `n` `PackedScalar` in shared storage and every command
     // buffer that wrote it has completed.
-    let words = unsafe { core::slice::from_raw_parts(buf.contents() as *const PackedScalar, n) };
+    let words =
+        unsafe { core::slice::from_raw_parts(buf.contents().as_ptr() as *const PackedScalar, n) };
     words
         .par_chunks(CHUNK)
         .enumerate()
@@ -501,7 +503,7 @@ impl HResident {
         Ok(Scratch {
             witness: st.empty(self.n_vars)?,
             vectors: crate::alloc::shared(&st.device, bytes)?,
-            stride: stride as u64,
+            stride,
             h_std: st.empty(n)?,
         })
     }
@@ -554,7 +556,10 @@ impl HResident {
         // command buffer that used it has completed), and `PackedFr` has no invalid bit
         // patterns.
         let dst = unsafe {
-            core::slice::from_raw_parts_mut(sc.witness.contents() as *mut PackedFr, self.n_vars)
+            core::slice::from_raw_parts_mut(
+                sc.witness.contents().as_ptr() as *mut PackedFr,
+                self.n_vars,
+            )
         };
         PackedFr::pack_into(witness, dst);
         let pack_us = start.elapsed().as_micros() as u64;
@@ -562,14 +567,13 @@ impl HResident {
         let profile = std::env::var_os("G16_METAL_PROFILE").is_some();
         // One autorelease pool per proof, around every submission below.
         //
-        // `commandBuffer` and `computeCommandEncoder` are both `+0` autoreleased, and
-        // metal-rs hands back a borrowed `&CommandBufferRef` that neither retains nor
-        // releases. A Rust binary has no ambient pool and no run loop, so with none here
-        // the objc runtime installs a page nothing ever drains and every submission leaks
-        // its command buffer and its encoder for the life of the process;
-        // `OBJC_DEBUG_MISSING_POOLS=YES` names both classes. The pool closes after the
-        // waits rather than after each commit, because the refs the waits read are its.
-        autoreleasepool(|| -> Result<(), ProveError> {
+        // `commandBuffer` and `computeCommandEncoder` both return `+0` autoreleased
+        // objects; objc2 retains its own reference, and the autoreleased one stays in the
+        // innermost pool. A Rust binary has no ambient pool and no run loop, so with none
+        // here the objc runtime installs a page nothing ever drains and every submission
+        // leaks its command buffer and its encoder for the life of the process;
+        // `OBJC_DEBUG_MISSING_POOLS=YES` names both classes.
+        autoreleasepool(|_| -> Result<(), ProveError> {
             if profile {
                 return self.run_profiled(st, &sc, n, work, t, pack_us);
             }
@@ -608,21 +612,21 @@ impl HResident {
                 let mut cbs = Vec::with_capacity(1 + N_DOMAIN_VECTORS);
 
                 let cb = crate::cb::command_buffer(queue);
-                let enc = cb.new_compute_command_encoder();
-                enc.set_label("stages 0-1 (gather)");
-                self.encode_gather(st, enc, &sc, n, work);
-                let token = st.seal.encode(enc);
-                enc.end_encoding();
+                let enc = mtl::encoder(&cb);
+                mtl::set_label(&enc, "stages 0-1 (gather)");
+                self.encode_gather(st, &enc, &sc, n, work);
+                let token = st.seal.encode(&enc);
+                enc.endEncoding();
                 cb.commit();
                 cbs.push(("stages 0-1 (gather)", cb, token));
 
                 for vi in 0..N_DOMAIN_VECTORS {
                     let cb = crate::cb::command_buffer(queue);
-                    let enc = cb.new_compute_command_encoder();
-                    enc.set_label("stages 2-4 (transforms)");
-                    self.encode_transforms_vector(st, enc, &sc, n, vi, true);
-                    let token = st.seal.encode(enc);
-                    enc.end_encoding();
+                    let enc = mtl::encoder(&cb);
+                    mtl::set_label(&enc, "stages 2-4 (transforms)");
+                    self.encode_transforms_vector(st, &enc, &sc, n, vi, true);
+                    let token = st.seal.encode(&enc);
+                    enc.endEncoding();
                     cb.commit();
                     cbs.push(("stages 2-4 (transforms)", cb, token));
                 }
@@ -633,7 +637,7 @@ impl HResident {
                 // is the first that happened.
                 let mut first = Ok(());
                 for (context, cb, token) in cbs {
-                    let r = st.seal.wait(cb, token, context);
+                    let r = st.seal.wait(&cb, token, context);
                     if first.is_ok() {
                         first = r;
                     }
@@ -683,13 +687,13 @@ impl HResident {
         let queue = st.queue.get();
         let start = Instant::now();
         let cb = crate::cb::command_buffer(&queue);
-        let enc = cb.new_compute_command_encoder();
-        enc.set_label("stage 0-1 gather (profiled)");
-        self.encode_gather(st, enc, sc, n, work);
-        let token = st.seal.encode(enc);
-        enc.end_encoding();
+        let enc = mtl::encoder(&cb);
+        mtl::set_label(&enc, "stage 0-1 gather (profiled)");
+        self.encode_gather(st, &enc, sc, n, work);
+        let token = st.seal.encode(&enc);
+        enc.endEncoding();
         cb.commit();
-        st.seal.wait(cb, token, "stage 0-1 gather (profiled)")?;
+        st.seal.wait(&cb, token, "stage 0-1 gather (profiled)")?;
         t.gather_us += pack_us + start.elapsed().as_micros() as u64;
 
         // Split per domain vector here too, and for the reason `compute_h` gives: all six
@@ -700,37 +704,37 @@ impl HResident {
         let mut cbs = Vec::with_capacity(N_DOMAIN_VECTORS);
         for vi in 0..N_DOMAIN_VECTORS {
             let cb = crate::cb::command_buffer(&queue);
-            let enc = cb.new_compute_command_encoder();
-            enc.set_label("stages 2-3 transforms (profiled)");
-            self.encode_transforms_vector(st, enc, sc, n, vi, false);
-            let token = st.seal.encode(enc);
-            enc.end_encoding();
+            let enc = mtl::encoder(&cb);
+            mtl::set_label(&enc, "stages 2-3 transforms (profiled)");
+            self.encode_transforms_vector(st, &enc, sc, n, vi, false);
+            let token = st.seal.encode(&enc);
+            enc.endEncoding();
             cb.commit();
             cbs.push((cb, token));
         }
         for (cb, token) in cbs {
             st.seal
-                .wait(cb, token, "stages 2-3 transforms (profiled)")?;
+                .wait(&cb, token, "stages 2-3 transforms (profiled)")?;
         }
         t.ntt_us += start.elapsed().as_micros() as u64;
 
         let start = Instant::now();
         let cb = crate::cb::command_buffer(&queue);
-        let enc = cb.new_compute_command_encoder();
-        enc.set_label("stage 4 h_join (profiled)");
-        enc.set_compute_pipeline_state(&st.h_join);
-        bind(enc, 0, sc.a());
-        bind(enc, 1, sc.b());
-        bind(enc, 2, sc.c());
-        enc.set_buffer(3, Some(&sc.h_std), 0);
+        let enc = mtl::encoder(&cb);
+        mtl::set_label(&enc, "stage 4 h_join (profiled)");
+        enc.setComputePipelineState(&st.h_join);
+        bind(&enc, 0, sc.a());
+        bind(&enc, 1, sc.b());
+        bind(&enc, 2, sc.c());
+        mtl::set_buffer(&enc, 3, &sc.h_std, 0);
         let nn = n as u32;
-        enc.set_bytes(4, 4, &nn as *const u32 as *const c_void);
-        let tg = st.threads(&st.h_join, n as u64);
-        crate::cb::dispatch_threads(enc, MTLSize::new(n as u64, 1, 1), MTLSize::new(tg, 1, 1));
-        let token = st.seal.encode(enc);
-        enc.end_encoding();
+        set_params(&enc, 4, &nn);
+        let tg = st.threads(&st.h_join, n);
+        crate::cb::dispatch_threads(&enc, mtl::size(n), mtl::size(tg));
+        let token = st.seal.encode(&enc);
+        enc.endEncoding();
         cb.commit();
-        st.seal.wait(cb, token, "stage 4 h_join (profiled)")?;
+        st.seal.wait(&cb, token, "stage 4 h_join (profiled)")?;
         if let Some((count, at)) = h_off_field(&sc.h_std, n) {
             return Err(off_field_error("stage 4 h_join (profiled)", count, n, at));
         }
@@ -741,28 +745,28 @@ impl HResident {
     fn encode_gather(
         &self,
         st: &HStages,
-        enc: &metal::ComputeCommandEncoderRef,
+        enc: &ComputeCommandEncoderRef,
         sc: &Scratch,
         n: usize,
         work: Work,
     ) {
-        enc.set_compute_pipeline_state(&st.gather);
-        enc.set_buffer(0, Some(&self.row_ptr[0]), 0);
-        enc.set_buffer(1, Some(&self.signal[0]), 0);
-        enc.set_buffer(2, Some(&self.value[0]), 0);
-        enc.set_buffer(3, Some(&self.row_ptr[1]), 0);
-        enc.set_buffer(4, Some(&self.signal[1]), 0);
-        enc.set_buffer(5, Some(&self.value[1]), 0);
-        enc.set_buffer(6, Some(&sc.witness), 0);
+        enc.setComputePipelineState(&st.gather);
+        mtl::set_buffer(enc, 0, &self.row_ptr[0], 0);
+        mtl::set_buffer(enc, 1, &self.signal[0], 0);
+        mtl::set_buffer(enc, 2, &self.value[0], 0);
+        mtl::set_buffer(enc, 3, &self.row_ptr[1], 0);
+        mtl::set_buffer(enc, 4, &self.signal[1], 0);
+        mtl::set_buffer(enc, 5, &self.value[1], 0);
+        mtl::set_buffer(enc, 6, &sc.witness, 0);
         bind(enc, 7, sc.a());
         bind(enc, 8, sc.b());
         bind(enc, 9, sc.c());
         let nn = n as u32;
-        enc.set_bytes(10, 4, &nn as *const u32 as *const c_void);
+        set_params(enc, 10, &nn);
         let constant = u32::from(work == Work::Constant);
-        enc.set_bytes(11, 4, &constant as *const u32 as *const c_void);
-        let tg = st.threads(&st.gather, n as u64);
-        crate::cb::dispatch_threads(enc, MTLSize::new(n as u64, 1, 1), MTLSize::new(tg, 1, 1));
+        set_params(enc, 11, &constant);
+        let tg = st.threads(&st.gather, n);
+        crate::cb::dispatch_threads(enc, mtl::size(n), mtl::size(tg));
     }
 
     /// The iNTT, the coset shift and the forward NTT for one of the three domain vectors,
@@ -775,7 +779,7 @@ impl HResident {
     fn encode_transforms_vector(
         &self,
         st: &HStages,
-        enc: &metal::ComputeCommandEncoderRef,
+        enc: &ComputeCommandEncoderRef,
         sc: &Scratch,
         n: usize,
         vi: usize,
@@ -831,7 +835,7 @@ impl HResident {
     fn encode_head(
         &self,
         st: &HStages,
-        enc: &metal::ComputeCommandEncoderRef,
+        enc: &ComputeCommandEncoderRef,
         p: &NttParams,
         src: Slot<'_>,
         dst: Slot<'_>,
@@ -839,22 +843,18 @@ impl HResident {
         sc: &Scratch,
         n: usize,
     ) {
-        enc.set_compute_pipeline_state(&st.head);
+        enc.setComputePipelineState(&st.head);
         bind(enc, 0, src);
         bind(enc, 1, dst);
-        enc.set_buffer(2, Some(tw), 0);
-        enc.set_buffer(3, Some(&self.coset_pows), 0);
+        mtl::set_buffer(enc, 2, tw, 0);
+        mtl::set_buffer(enc, 3, &self.coset_pows, 0);
         // Every declared argument is bound even when the dispatch-uniform mode means the
         // kernel never reads it: Metal's validation layer objects to a null binding for a
         // declared buffer, whether or not the shader touches it on this path.
         bind(enc, 4, sc.a());
         bind(enc, 5, sc.b());
-        enc.set_buffer(6, Some(&sc.h_std), 0);
-        enc.set_bytes(
-            7,
-            core::mem::size_of::<NttParams>() as u64,
-            p as *const NttParams as *const c_void,
-        );
+        mtl::set_buffer(enc, 6, &sc.h_std, 0);
+        set_params(enc, 7, p);
         self.dispatch_batch(st, enc, &st.head, p, n);
     }
 
@@ -862,42 +862,42 @@ impl HResident {
     fn encode_tail(
         &self,
         st: &HStages,
-        enc: &metal::ComputeCommandEncoderRef,
+        enc: &ComputeCommandEncoderRef,
         p: &NttParams,
         a: Slot<'_>,
         tw: &Buffer,
         sc: &Scratch,
         n: usize,
     ) {
-        enc.set_compute_pipeline_state(&st.tail);
+        enc.setComputePipelineState(&st.tail);
         bind(enc, 0, a);
-        enc.set_buffer(2, Some(tw), 0);
+        mtl::set_buffer(enc, 2, tw, 0);
         bind(enc, 4, sc.a());
         bind(enc, 5, sc.b());
-        enc.set_buffer(6, Some(&sc.h_std), 0);
-        enc.set_bytes(
-            7,
-            core::mem::size_of::<NttParams>() as u64,
-            p as *const NttParams as *const c_void,
-        );
+        mtl::set_buffer(enc, 6, &sc.h_std, 0);
+        set_params(enc, 7, p);
         self.dispatch_batch(st, enc, &st.tail, p, n);
     }
 
     fn dispatch_batch(
         &self,
         st: &HStages,
-        enc: &metal::ComputeCommandEncoderRef,
+        enc: &ComputeCommandEncoderRef,
         pso: &ComputePipelineState,
         p: &NttParams,
         n: usize,
     ) {
         let blk = 1usize << p.k;
-        let groups = (n / blk).max(1) as u64;
+        let groups = (n / blk).max(1);
         // The slice, and nothing else. Held to the device's own reported limit rather
         // than to a constant.
-        enc.set_threadgroup_memory_length(0, (blk * core::mem::size_of::<PackedFr>()) as u64);
-        let tg = st.threads(pso, blk as u64);
-        crate::cb::dispatch_thread_groups(enc, MTLSize::new(groups, 1, 1), MTLSize::new(tg, 1, 1));
+        // SAFETY: index 0 is the kernel's one threadgroup argument, and `blk` elements fit
+        // in the device's threadgroup memory by `max_fused`.
+        unsafe {
+            enc.setThreadgroupMemoryLength_atIndex(blk * core::mem::size_of::<PackedFr>(), 0)
+        };
+        let tg = st.threads(pso, blk);
+        crate::cb::dispatch_thread_groups(enc, mtl::size(groups), mtl::size(tg));
     }
 }
 
@@ -961,7 +961,10 @@ impl HHandle {
         // SAFETY: the buffer holds exactly `len` `PackedScalar` in shared storage and the
         // command buffer that wrote it was waited on before `compute_h` returned.
         let s = unsafe {
-            core::slice::from_raw_parts(self.sc().h_std.contents() as *const PackedScalar, self.len)
+            core::slice::from_raw_parts(
+                self.sc().h_std.contents().as_ptr() as *const PackedScalar,
+                self.len,
+            )
         };
         s.iter().map(PackedScalar::to_fr).collect()
     }
@@ -988,9 +991,10 @@ impl Drop for HHandle {
 }
 
 /// Everything a `PreparedCircuit` carries from this module has to be `Send + Sync`, and
-/// all four of these are, by derivation rather than by assertion: `metal-rs` declares
-/// every handle it defines `Sync + Send`, and MTLDevice, MTLCommandQueue, MTLLibrary,
-/// MTLComputePipelineState and MTLBuffer are documented thread-safe. The two Metal types
+/// all four of these are, by derivation rather than by assertion: objc2-metal declares
+/// MTLDevice, MTLCommandQueue, MTLLibrary and MTLComputePipelineState `Send + Sync`,
+/// [`mtl::Buffer`] does the same for MTLBuffer, and all five are documented
+/// thread-safe. The two Metal types
 /// that are *not*, `MTLCommandBuffer` and `MTLComputeCommandEncoder`, are created inside
 /// `compute_h` on the calling thread and never stored.
 ///
@@ -1070,17 +1074,17 @@ mod tests {
             let mut live_bytes = 0;
             for _ in 0..5 {
                 let sc = res.take_scratch(&st).unwrap();
-                assert_eq!(sc.witness.length() as usize, res.n_vars * scalar_bytes);
-                assert_eq!(sc.vectors.length() as usize, vector_bytes);
-                assert_eq!(sc.stride as usize, n * scalar_bytes);
-                assert_eq!(sc.h_std.length() as usize, n * scalar_bytes);
+                assert_eq!(sc.witness.length(), res.n_vars * scalar_bytes);
+                assert_eq!(sc.vectors.length(), vector_bytes);
+                assert_eq!(sc.stride, n * scalar_bytes);
+                assert_eq!(sc.h_std.length(), n * scalar_bytes);
                 for b in [&sc.witness, &sc.vectors, &sc.h_std] {
-                    assert!(addresses.insert(b.contents() as usize));
-                    live_bytes += b.length() as usize;
+                    assert!(addresses.insert(b.contents().as_ptr() as usize));
+                    live_bytes += b.length();
                     // SAFETY: this set is exclusively owned, shared, and has no GPU
                     // submission in flight. Every byte belongs to its buffer.
                     unsafe {
-                        core::ptr::write_bytes(b.contents() as *mut u8, 0xa5, b.length() as usize);
+                        core::ptr::write_bytes(b.contents().as_ptr() as *mut u8, 0xa5, b.length());
                     }
                 }
                 handles.push(HHandle {
@@ -1107,7 +1111,7 @@ mod tests {
                     // SAFETY: the handle has scrubbed and returned this set, no other
                     // caller takes from the pool, and this clone keeps the buffer alive.
                     let bytes = unsafe {
-                        core::slice::from_raw_parts(b.contents() as *const u8, b.length() as usize)
+                        core::slice::from_raw_parts(b.contents().as_ptr() as *const u8, b.length())
                     };
                     assert!(bytes.iter().all(|&v| v == 0));
                 }
@@ -1117,12 +1121,12 @@ mod tests {
             let retained_bytes: usize = pool
                 .iter()
                 .map(|s| s.witness.length() + s.vectors.length() + s.h_std.length())
-                .sum::<u64>() as usize;
+                .sum();
             assert_eq!(retained_bytes, 4 * set_bytes);
             drop(pool);
             let reused = res.take_scratch(&st).unwrap();
             for b in [&reused.witness, &reused.vectors, &reused.h_std] {
-                assert!(addresses.contains(&(b.contents() as usize)));
+                assert!(addresses.contains(&(b.contents().as_ptr() as usize)));
             }
             assert_eq!(res.pool.lock().unwrap().len(), 3);
             eprintln!("domain {n}: set {set_bytes} B, five live {live_bytes} B, idle pool {retained_bytes} B");
@@ -1172,10 +1176,7 @@ mod tests {
         let multiply = "fr_mul(value[k], w)";
         assert_eq!(source.matches(multiply).count(), 1);
         let probe_source = source.replace(multiply, "fr_one()");
-        let library = st
-            .device
-            .new_library_with_source(&probe_source, &CompileOptions::new())
-            .expect("multiply-site probe MSL");
+        let library = mtl::library(&st.device, &probe_source).expect("multiply-site probe MSL");
         let probe = HStages::new_with_library(
             st.device.clone(),
             crate::cb::Queue::new(&st.device),
@@ -1233,19 +1234,19 @@ mod tests {
         for (label, witness) in cases {
             // SAFETY: scratch owns n packed witness elements and has no submission in flight.
             let dst = unsafe {
-                core::slice::from_raw_parts_mut(sc.witness.contents() as *mut PackedFr, n)
+                core::slice::from_raw_parts_mut(sc.witness.contents().as_ptr() as *mut PackedFr, n)
             };
             PackedFr::pack_into(&witness, dst);
             for work in [Work::Variable, Work::Constant] {
                 for (driver, counting) in [(&st, false), (&probe, true)] {
                     let queue = driver.queue.get();
                     let cb = crate::cb::command_buffer(&queue);
-                    let enc = cb.new_compute_command_encoder();
-                    res.encode_gather(driver, enc, &sc, n, work);
-                    let token = driver.seal.encode(enc);
-                    enc.end_encoding();
+                    let enc = mtl::encoder(&cb);
+                    res.encode_gather(driver, &enc, &sc, n, work);
+                    let token = driver.seal.encode(&enc);
+                    enc.endEncoding();
                     cb.commit();
-                    driver.seal.wait(cb, token, "gather oracle").unwrap();
+                    driver.seal.wait(&cb, token, "gather oracle").unwrap();
                     let expected: [Vec<Fr>; 2] = std::array::from_fn(|m| {
                         (0..n)
                             .map(|r| {
@@ -1284,7 +1285,7 @@ mod tests {
                         // SAFETY: each slot holds n PackedFr and the sealed submission completed.
                         let got = unsafe {
                             core::slice::from_raw_parts(
-                                (slot.0.contents() as *const u8).add(slot.1 as usize)
+                                (slot.0.contents().as_ptr() as *const u8).add(slot.1)
                                     as *const PackedFr,
                                 n,
                             )
@@ -1339,7 +1340,7 @@ mod tests {
                 // SAFETY: as in `compute_h`; nothing is in flight against this scratch.
                 let dst = unsafe {
                     core::slice::from_raw_parts_mut(
-                        sc.witness.contents() as *mut PackedFr,
+                        sc.witness.contents().as_ptr() as *mut PackedFr,
                         res.n_vars,
                     )
                 };
@@ -1349,12 +1350,12 @@ mod tests {
                 for rep in 0..25 {
                     let t = Instant::now();
                     let cb = crate::cb::command_buffer(&queue);
-                    let enc = cb.new_compute_command_encoder();
-                    res.encode_gather(&st, enc, &sc, n, work);
-                    let token = st.seal.encode(enc);
-                    enc.end_encoding();
+                    let enc = mtl::encoder(&cb);
+                    res.encode_gather(&st, &enc, &sc, n, work);
+                    let token = st.seal.encode(&enc);
+                    enc.endEncoding();
                     cb.commit();
-                    st.seal.wait(cb, token, "gather probe").unwrap();
+                    st.seal.wait(&cb, token, "gather probe").unwrap();
                     if rep >= 5 {
                         samples.push(t.elapsed().as_secs_f64() * 1e3);
                     }
@@ -1378,8 +1379,9 @@ mod tests {
         let buf = st.empty(n).unwrap();
         assert_eq!(h_off_field(&buf, n), None, "zeros are canonical");
         // SAFETY: shared storage, `n` words, nothing in flight.
-        let words =
-            unsafe { core::slice::from_raw_parts_mut(buf.contents() as *mut PackedScalar, n) };
+        let words = unsafe {
+            core::slice::from_raw_parts_mut(buf.contents().as_ptr() as *mut PackedScalar, n)
+        };
         let mut below = FR_MODULUS;
         below[0] -= 1;
         words[7] = PackedScalar { v: below };
@@ -1404,8 +1406,9 @@ mod tests {
             let n = 1usize << log_n;
             let buf = st.empty(n).unwrap();
             // SAFETY: as above.
-            let words =
-                unsafe { core::slice::from_raw_parts_mut(buf.contents() as *mut PackedScalar, n) };
+            let words = unsafe {
+                core::slice::from_raw_parts_mut(buf.contents().as_ptr() as *mut PackedScalar, n)
+            };
             for (i, w) in words.iter_mut().enumerate() {
                 *w = PackedScalar::from_fr(&Fr::from(i as u64 + 1));
             }

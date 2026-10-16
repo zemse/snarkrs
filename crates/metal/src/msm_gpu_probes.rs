@@ -3,7 +3,7 @@
 //! correctness suite.
 
 use super::*;
-use metal::objc::{msg_send, sel, sel_impl};
+use objc2_metal::{MTLBuffer, MTLCommandQueue};
 use snarkrs_field::{CurveGroup, PrimeField, PrimeGroup};
 use snarkrs_msm::MsmBackend;
 use std::time::Instant;
@@ -132,20 +132,12 @@ PROBE_KERNEL(probe_total, 2u)
 #[ignore = "GPU measurement; run explicitly on the measurement machine"]
 fn review_reduce_body() {
     let m = MetalMsm::new().unwrap();
-    let library = m
-        .device
-        .new_library_with_source(
-            &format!("{FR_MSL}\n{MSM_MSL}\n{REDUCE_PROBE}"),
-            &CompileOptions::new(),
-        )
-        .unwrap();
+    let library = mtl::library(&m.device, &format!("{FR_MSL}\n{MSM_MSL}\n{REDUCE_PROBE}")).unwrap();
     let pipelines: Vec<_> = ["probe_load", "probe_run", "probe_total"]
         .iter()
         .map(|name| {
-            let f = library.get_function(name, None).unwrap();
-            m.device
-                .new_compute_pipeline_state_with_function(&f)
-                .unwrap()
+            let f = mtl::function(&library, name).unwrap();
+            mtl::pipeline(&m.device, &f).unwrap()
         })
         .collect();
     for (windows, buckets) in [(20usize, 4096usize), (17, 16384)] {
@@ -181,31 +173,27 @@ fn review_reduce_body() {
         for rep in 0..8 {
             for mode in 0..3 {
                 let pso = &pipelines[mode];
-                assert!(pso.max_total_threads_per_threadgroup() >= threads as u64);
+                assert!(pso.maxTotalThreadsPerThreadgroup() >= threads);
                 let queue = m.queue.get();
-                let cb = queue.new_command_buffer();
-                let enc = cb.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(pso);
-                enc.set_buffer(0, Some(&input), 0);
-                enc.set_buffer(1, Some(&output), 0);
-                enc.set_bytes(2, 16, shape.as_ptr().cast());
+                let cb = queue.commandBuffer().unwrap();
+                let enc = mtl::encoder(&cb);
+                enc.setComputePipelineState(pso);
+                mtl::set_buffer(&enc, 0, &input, 0);
+                mtl::set_buffer(&enc, 1, &output, 0);
+                set_params(&enc, 2, &shape);
                 // Repeated dispatches amortize a single submission floor. This is a
                 // warm-cache diagnostic, not an estimate of end-to-end proof time.
                 for _ in 0..16 {
-                    enc.dispatch_thread_groups(
-                        MTLSize::new((windows * groups) as u64, 1, 1),
-                        MTLSize::new(threads as u64, 1, 1),
+                    enc.dispatchThreadgroups_threadsPerThreadgroup(
+                        mtl::size(windows * groups),
+                        mtl::size(threads),
                     );
                 }
-                enc.end_encoding();
+                enc.endEncoding();
                 cb.commit();
-                crate::cb::wait_ok(cb, "reduce body probe").unwrap();
-                // SAFETY: documented timestamps, read only after successful completion.
-                let elapsed = unsafe {
-                    let start: f64 = msg_send![cb, GPUStartTime];
-                    let end: f64 = msg_send![cb, GPUEndTime];
-                    (end - start) * 1e3 / 16.0
-                };
+                crate::cb::wait_ok(&cb, "reduce body probe").unwrap();
+                // Read only after successful completion.
+                let elapsed = (cb.GPUEndTime() - cb.GPUStartTime()) * 1e3 / 16.0;
                 if rep >= 2 {
                     samples[mode].push(elapsed);
                 }
@@ -240,8 +228,8 @@ fn review_reduce_body() {
             println!(
                 "  mode={mode} gpu_ms={:.4} max_threads={} simd={}",
                 median(values),
-                pipelines[mode].max_total_threads_per_threadgroup(),
-                pipelines[mode].thread_execution_width()
+                pipelines[mode].maxTotalThreadsPerThreadgroup(),
+                pipelines[mode].threadExecutionWidth()
             );
         }
     }
@@ -269,47 +257,37 @@ kernel void probe_touch(device const uint* in [[buffer(0)]],
 #[ignore = "GPU measurement; run explicitly on the measurement machine"]
 fn lane_first_cb_cost() {
     let m = MetalMsm::new().unwrap();
-    let library = m
-        .device
-        .new_library_with_source(TOUCH_PROBE, &CompileOptions::new())
-        .unwrap();
-    let f = library.get_function("probe_touch", None).unwrap();
-    let pso = m
-        .device
-        .new_compute_pipeline_state_with_function(&f)
-        .unwrap();
+    let library = mtl::library(&m.device, TOUCH_PROBE).unwrap();
+    let f = mtl::function(&library, "probe_touch").unwrap();
+    let pso = mtl::pipeline(&m.device, &f).unwrap();
     let n: usize = 131072;
     let bytes = n * 32;
     let out = crate::alloc::shared(&m.device, n * 4).unwrap();
     let reused = crate::alloc::shared(&m.device, bytes).unwrap();
     let run = |buf: &Buffer| -> (f64, f64) {
         let queue = m.queue.get();
-        let cb = queue.new_command_buffer();
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pso);
-        enc.set_buffer(0, Some(buf), 0);
-        enc.set_buffer(1, Some(&out), 0);
+        let cb = queue.commandBuffer().unwrap();
+        let enc = mtl::encoder(&cb);
+        enc.setComputePipelineState(&pso);
+        mtl::set_buffer(&enc, 0, buf, 0);
+        mtl::set_buffer(&enc, 1, &out, 0);
         let len = n as u32;
-        enc.set_bytes(2, 4, (&len as *const u32).cast());
-        dispatch_1d(enc, &pso, n, 64);
-        enc.end_encoding();
+        set_params(&enc, 2, &len);
+        dispatch_1d(&enc, &pso, n, 64);
+        enc.endEncoding();
         let t = Instant::now();
         cb.commit();
-        crate::cb::wait_ok(cb, "touch probe").unwrap();
+        crate::cb::wait_ok(&cb, "touch probe").unwrap();
         let wall = t.elapsed().as_secs_f64() * 1e3;
-        // SAFETY: documented timestamps, read only after successful completion.
-        let gpu = unsafe {
-            let s: f64 = msg_send![cb, GPUStartTime];
-            let e: f64 = msg_send![cb, GPUEndTime];
-            (e - s) * 1e3
-        };
+        // Read only after successful completion.
+        let gpu = (cb.GPUEndTime() - cb.GPUStartTime()) * 1e3;
         (wall, gpu)
     };
     let cpu_write = |buf: &Buffer| -> f64 {
         let t = Instant::now();
         // SAFETY: shared-mode buffer of `bytes` bytes, no dispatch in flight.
         unsafe {
-            core::ptr::write_bytes(buf.contents().cast::<u8>(), 0x5a, bytes);
+            core::ptr::write_bytes(buf.contents().cast::<u8>().as_ptr(), 0x5a, bytes);
         }
         t.elapsed().as_secs_f64() * 1e3
     };
@@ -433,13 +411,8 @@ kernel void probe_scatter_span(device const uint* scalars [[buffer(0)]],
 #[ignore = "GPU measurement; run explicitly on the measurement machine"]
 fn lane_scatter_body() {
     let m = MetalMsm::new().unwrap();
-    let library = m
-        .device
-        .new_library_with_source(
-            &format!("{FR_MSL}\n{MSM_MSL}\n{SCATTER_PROBE}"),
-            &CompileOptions::new(),
-        )
-        .unwrap();
+    let library =
+        mtl::library(&m.device, &format!("{FR_MSL}\n{MSM_MSL}\n{SCATTER_PROBE}")).unwrap();
     let names = [
         "probe_scatter_prod",
         "probe_scatter_dense",
@@ -451,20 +424,16 @@ fn lane_scatter_body() {
     let mut pipelines: Vec<_> = names
         .iter()
         .map(|name| {
-            let f = library.get_function(name, None).unwrap();
-            m.device
-                .new_compute_pipeline_state_with_function(&f)
-                .unwrap()
+            let f = mtl::function(&library, name).unwrap();
+            mtl::pipeline(&m.device, &f).unwrap()
         })
         .collect();
     // The shipped pipeline on the same inputs, to anchor the probe against the
     // production phase numbers.
     pipelines.push(m.pipelines.scatter.clone());
     let span_pso = {
-        let f = library.get_function("probe_scatter_span", None).unwrap();
-        m.device
-            .new_compute_pipeline_state_with_function(&f)
-            .unwrap()
+        let f = mtl::function(&library, "probe_scatter_span").unwrap();
+        mtl::pipeline(&m.device, &f).unwrap()
     };
     let mut labels: Vec<&str> = names.to_vec();
     labels.push("production msm_scatter");
@@ -499,68 +468,60 @@ fn lane_scatter_body() {
         const ROUNDS: usize = 8;
         let time_cb = |encode_scatter: Option<&ComputePipelineState>| -> f64 {
             let queue = m.queue.get();
-            let cb = queue.new_command_buffer();
-            let enc = cb.new_compute_command_encoder();
+            let cb = queue.commandBuffer().unwrap();
+            let enc = mtl::encoder(&cb);
             for _ in 0..ROUNDS {
-                plan.encode_zero(&m, enc);
-                plan.encode_count(&m, enc);
-                plan.encode_scan(&m, enc);
+                plan.encode_zero(&m, &enc);
+                plan.encode_count(&m, &enc);
+                plan.encode_scan(&m, &enc);
                 if let Some(pso) = encode_scatter {
-                    enc.set_compute_pipeline_state(pso);
-                    enc.set_buffer(0, Some(plan.scalars), 0);
-                    enc.set_buffer(1, Some(plan.cursor.as_ref().unwrap()), 0);
-                    enc.set_buffer(2, Some(plan.entries.as_ref().unwrap()), 0);
-                    set_params(enc, 3, &params);
+                    enc.setComputePipelineState(pso);
+                    mtl::set_buffer(&enc, 0, plan.scalars, 0);
+                    mtl::set_buffer(&enc, 1, plan.cursor.as_ref().unwrap(), 0);
+                    mtl::set_buffer(&enc, 2, plan.entries.as_ref().unwrap(), 0);
+                    set_params(&enc, 3, &params);
                     // The production kernel takes a window span; the probe bodies
                     // ignore this slot.
                     let span = [0u32, plan.n_windows as u32];
-                    enc.set_bytes(4, 8, span.as_ptr().cast());
-                    dispatch_1d(enc, pso, n, 64);
+                    set_params(&enc, 4, &span);
+                    dispatch_1d(&enc, pso, n, 64);
                 }
             }
-            enc.end_encoding();
+            enc.endEncoding();
             cb.commit();
-            crate::cb::wait_ok(cb, "scatter probe").unwrap();
-            // SAFETY: documented timestamps, read only after successful completion.
-            unsafe {
-                let st: f64 = msg_send![cb, GPUStartTime];
-                let en: f64 = msg_send![cb, GPUEndTime];
-                (en - st) * 1e3
-            }
+            crate::cb::wait_ok(&cb, "scatter probe").unwrap();
+            // Read only after successful completion.
+            (cb.GPUEndTime() - cb.GPUStartTime()) * 1e3
         };
         // The span variant, dispatched over `parts` serial window ranges per round.
         let time_span = |parts: usize| -> f64 {
             let queue = m.queue.get();
-            let cb = queue.new_command_buffer();
-            let enc = cb.new_compute_command_encoder();
+            let cb = queue.commandBuffer().unwrap();
+            let enc = mtl::encoder(&cb);
             for _ in 0..ROUNDS {
-                plan.encode_zero(&m, enc);
-                plan.encode_count(&m, enc);
-                plan.encode_scan(&m, enc);
+                plan.encode_zero(&m, &enc);
+                plan.encode_count(&m, &enc);
+                plan.encode_scan(&m, &enc);
                 let step = plan.n_windows.div_ceil(parts);
                 let mut lo = 0usize;
                 while lo < plan.n_windows {
                     let hi = (lo + step).min(plan.n_windows);
-                    enc.set_compute_pipeline_state(&span_pso);
-                    enc.set_buffer(0, Some(plan.scalars), 0);
-                    enc.set_buffer(1, Some(plan.cursor.as_ref().unwrap()), 0);
-                    enc.set_buffer(2, Some(plan.entries.as_ref().unwrap()), 0);
-                    set_params(enc, 3, &params);
+                    enc.setComputePipelineState(&span_pso);
+                    mtl::set_buffer(&enc, 0, plan.scalars, 0);
+                    mtl::set_buffer(&enc, 1, plan.cursor.as_ref().unwrap(), 0);
+                    mtl::set_buffer(&enc, 2, plan.entries.as_ref().unwrap(), 0);
+                    set_params(&enc, 3, &params);
                     let span = [lo as u32, hi as u32];
-                    enc.set_bytes(4, 8, span.as_ptr().cast());
-                    dispatch_1d(enc, &span_pso, n, 64);
+                    set_params(&enc, 4, &span);
+                    dispatch_1d(&enc, &span_pso, n, 64);
                     lo = hi;
                 }
             }
-            enc.end_encoding();
+            enc.endEncoding();
             cb.commit();
-            crate::cb::wait_ok(cb, "scatter span probe").unwrap();
-            // SAFETY: documented timestamps, read only after successful completion.
-            unsafe {
-                let st: f64 = msg_send![cb, GPUStartTime];
-                let en: f64 = msg_send![cb, GPUEndTime];
-                (en - st) * 1e3
-            }
+            crate::cb::wait_ok(&cb, "scatter span probe").unwrap();
+            // Read only after successful completion.
+            (cb.GPUEndTime() - cb.GPUStartTime()) * 1e3
         };
         let span_parts = [2usize, 3, 4];
         let mut prep_samples = Vec::new();
@@ -650,12 +611,12 @@ fn constant_work_phase_occupancy() {
     let time = |f: &mut dyn FnMut(&ComputeCommandEncoderRef)| -> f64 {
         let t = Instant::now();
         let queue = m.queue.get();
-        let cb = queue.new_command_buffer();
-        let enc = cb.new_compute_command_encoder();
-        f(enc);
-        enc.end_encoding();
+        let cb = queue.commandBuffer().unwrap();
+        let enc = mtl::encoder(&cb);
+        f(&enc);
+        enc.endEncoding();
         cb.commit();
-        crate::cb::wait_ok(cb, "occupancy probe").unwrap();
+        crate::cb::wait_ok(&cb, "occupancy probe").unwrap();
         t.elapsed().as_secs_f64() * 1e3
     };
     for group in ["g1", "g2"] {

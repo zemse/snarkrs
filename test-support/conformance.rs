@@ -47,6 +47,7 @@ pub fn backend(s: Selection<'_>) -> Box<dyn Backend> {
     }
     #[cfg(all(feature = "metal", target_os = "macos"))]
     if s.backend == "metal" {
+        use snarkrs_metal::objc2_metal::MTLDevice;
         let p = if s.work == "constant" {
             snarkrs_metal::MetalBackend::constant_work()
         } else {

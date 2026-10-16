@@ -17,7 +17,7 @@ use std::time::Instant;
 #[test]
 fn first_device_in_process_dominates_the_prepare_floor() {
     let t0 = Instant::now();
-    let device = metal::Device::system_default().expect("no Metal device");
+    let device = snarkrs_metal::mtl::system_default().expect("no Metal device");
     let device_ms = t0.elapsed().as_secs_f64() * 1e3;
 
     let t1 = Instant::now();
@@ -26,7 +26,7 @@ fn first_device_in_process_dominates_the_prepare_floor() {
 
     // A second device handle, to show the first call is the one that pays.
     let t2 = Instant::now();
-    let _d2 = metal::Device::system_default().expect("device");
+    let _d2 = snarkrs_metal::mtl::system_default().expect("device");
     let device2_ms = t2.elapsed().as_secs_f64() * 1e3;
 
     // A second backend, to separate cached-shader compile from runtime init.

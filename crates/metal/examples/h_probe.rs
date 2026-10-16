@@ -21,6 +21,7 @@ mod probe {
     use std::sync::Mutex;
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+    use objc2_metal::MTLBuffer;
     use snarkrs_field::Fr;
     use snarkrs_formats::{wtns::Witness, ProvingKey};
     use snarkrs_groth16::{cpu::CpuBackend, Backend, MsmOutputs, PreparedCircuit, StageTimings};
@@ -81,8 +82,9 @@ mod probe {
     }
 
     /// The words of `buf`, copied. Nothing is in flight against it: `compute_h` waited.
-    fn words(buf: &metal::Buffer, n: usize) -> Vec<[u32; 8]> {
-        unsafe { core::slice::from_raw_parts(buf.contents() as *const [u32; 8], n) }.to_vec()
+    fn words(buf: &snarkrs_metal::mtl::Buffer, n: usize) -> Vec<[u32; 8]> {
+        unsafe { core::slice::from_raw_parts(buf.contents().as_ptr() as *const [u32; 8], n) }
+            .to_vec()
     }
 
     struct Reference {
@@ -306,7 +308,7 @@ mod probe {
                                     };
                                     let h_ms = t0.elapsed().as_secs_f64() * 1e3;
                                     let handle = h.device_handle::<HHandle>(TAG).unwrap();
-                                    let base = handle.h_std().contents() as usize;
+                                    let base = handle.h_std().contents().as_ptr() as usize;
                                     let raw1 = words(handle.h_std(), n);
                                     let to_host_ok = handle.to_host().is_some();
                                     let mut msm_text = String::new();

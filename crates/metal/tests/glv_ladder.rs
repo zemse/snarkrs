@@ -16,16 +16,18 @@
 
 use ark_ec::scalar_mul::glv::GLVConfig;
 use ark_ff::{BigInt, Field};
-use metal::{
-    CommandQueue, CompileOptions, ComputePipelineState, Device, Library, MTLCommandBufferStatus,
-    MTLResourceOptions, MTLSize,
+use objc2_metal::{
+    MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
+    MTLComputeCommandEncoder, MTLResourceOptions,
 };
 use snarkrs_field::{AffineRepr, CurveGroup, Fq, Fq2, Fr, G1Affine, G2Affine};
 use snarkrs_metal::kernels::{CEREMONY_MSL, FFT_MSL, FR_MSL, MSM_MSL};
 use snarkrs_metal::layout::{as_bytes, PackedFq, PackedFq2, PackedGlv};
 use snarkrs_metal::msm::{PackedXyzzG1, PackedXyzzG2};
+use snarkrs_metal::mtl::{self, CommandQueue, ComputePipelineState, Device, Library};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::ptr::NonNull;
 
 /// Mirrors `struct FftParams`; only `n` is read by `fft_mix_scale`.
 #[repr(C)]
@@ -84,12 +86,10 @@ struct Harness {
 
 impl Harness {
     fn new() -> Option<Self> {
-        let device = Device::system_default()?;
+        let device = mtl::system_default()?;
         let src = format!("{FR_MSL}\n{MSM_MSL}\n{CEREMONY_MSL}\n{FFT_MSL}\n");
-        let lib = device
-            .new_library_with_source(&src, &CompileOptions::new())
-            .expect("MSL compiles");
-        let queue = device.new_command_queue();
+        let lib = mtl::library(&device, &src).expect("MSL compiles");
+        let queue = mtl::command_queue(&device).unwrap();
         Some(Self {
             device,
             lib,
@@ -102,11 +102,8 @@ impl Harness {
         if let Some(p) = self.psos.borrow().get(name) {
             return p.clone();
         }
-        let f = self.lib.get_function(name, None).expect("kernel");
-        let p = self
-            .device
-            .new_compute_pipeline_state_with_function(&f)
-            .expect("pipeline");
+        let f = mtl::function(&self.lib, name).expect("kernel");
+        let p = mtl::pipeline(&self.device, &f).expect("pipeline");
         self.psos.borrow_mut().insert(name.to_owned(), p.clone());
         p
     }
@@ -124,37 +121,49 @@ impl Harness {
         let mut input = zero[..core::mem::size_of::<T>()].to_vec();
         input.extend_from_slice(as_bytes(core::slice::from_ref(&p)));
         let buf = |b: &[u8]| {
-            self.device.new_buffer_with_data(
-                b.as_ptr().cast(),
-                b.len() as u64,
-                MTLResourceOptions::StorageModeShared,
-            )
+            // SAFETY: `b` is readable for its length.
+            unsafe {
+                mtl::buffer_with_data(
+                    &self.device,
+                    NonNull::from(b).cast(),
+                    b.len(),
+                    MTLResourceOptions::StorageModeShared,
+                )
+            }
+            .expect("buffer")
         };
         let src = buf(&input);
-        let dst = self
-            .device
-            .new_buffer(input.len() as u64, MTLResourceOptions::StorageModeShared);
+        let dst = mtl::buffer(
+            &self.device,
+            input.len(),
+            MTLResourceOptions::StorageModeShared,
+        )
+        .expect("buffer");
         let stw = buf(as_bytes(tbl));
         let params = FftParams {
             n: 2,
             ..Default::default()
         };
 
-        let cb = self.queue.new_command_buffer();
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pso);
-        enc.set_buffer(0, Some(&src), 0);
-        enc.set_buffer(1, Some(&dst), 0);
-        enc.set_buffer(2, Some(&stw), 0);
-        enc.set_bytes(
-            3,
-            core::mem::size_of::<FftParams>() as u64,
-            core::ptr::addr_of!(params).cast(),
-        );
-        enc.dispatch_threads(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
-        enc.end_encoding();
+        let cb = self.queue.commandBuffer().unwrap();
+        let enc = mtl::encoder(&cb);
+        enc.setComputePipelineState(&pso);
+        mtl::set_buffer(&enc, 0, &src, 0);
+        mtl::set_buffer(&enc, 1, &dst, 0);
+        mtl::set_buffer(&enc, 2, &stw, 0);
+        // SAFETY: `params` is readable for its size.
+        unsafe {
+            mtl::set_bytes(
+                &enc,
+                3,
+                core::mem::size_of::<FftParams>(),
+                core::ptr::addr_of!(params).cast(),
+            )
+        };
+        enc.dispatchThreads_threadsPerThreadgroup(mtl::size(1), mtl::size(1));
+        enc.endEncoding();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
         // A dispatch that did not run leaves `dst` zeroed, which reads back as the point
         // at infinity. Checked so that it is reported as what it is.
         assert_eq!(
@@ -163,7 +172,7 @@ impl Harness {
             "{kernel}: command buffer did not complete"
         );
         // SAFETY: the command buffer completed and the kernel wrote two points of this type.
-        unsafe { *dst.contents().cast::<T>() }
+        unsafe { *dst.contents().cast::<T>().as_ptr() }
     }
 }
 

@@ -2,11 +2,12 @@
 //! dispatches that fill them, and the host combine that reads them back.
 
 use ark_ff::{AdditiveGroup, Zero};
-use metal::{Buffer, ComputeCommandEncoderRef, MTLSize};
+use objc2_metal::{MTLBuffer, MTLComputeCommandEncoder, MTLComputePipelineState};
 use snarkrs_field::{G1Projective, G2Projective};
 use snarkrs_groth16::ProveError;
 
 use crate::enc::{dispatch_1d, read_back, set_params};
+use crate::mtl::{self, Buffer, ComputeCommandEncoderRef};
 
 use super::jobs::{Job, MsmResult};
 use super::submit::barrier;
@@ -91,7 +92,7 @@ impl Outputs {
                     unsafe {
                         core::ptr::copy_nonoverlapping(
                             gather.as_ptr(),
-                            buf.contents().cast::<u32>(),
+                            buf.contents().cast::<u32>().as_ptr(),
                             gather.len(),
                         );
                     }
@@ -199,8 +200,8 @@ impl Outputs {
             Job::G1(_) => &msm.pipelines.clear_g1,
             Job::G2(_) => &msm.pipelines.clear_g2,
         };
-        enc.set_compute_pipeline_state(clear_pso);
-        enc.set_buffer(0, Some(&self.buckets), 0);
+        enc.setComputePipelineState(clear_pso);
+        mtl::set_buffer(enc, 0, &self.buckets, 0);
         set_params(enc, 1, &p);
         dispatch_1d(enc, clear_pso, plan.n_windows * plan.n_buckets, 256);
     }
@@ -235,12 +236,12 @@ impl Outputs {
                 Job::G1(j) => (&msm.pipelines.accumulate_g1, &j.bases.buf),
                 Job::G2(j) => (&msm.pipelines.accumulate_g2, &j.bases.buf),
             };
-            enc.set_compute_pipeline_state(acc_pso);
-            enc.set_buffer(0, Some(plan.entries.as_ref().unwrap()), 0);
-            enc.set_buffer(1, Some(bases), 0);
-            enc.set_buffer(2, Some(plan.counts.as_ref().unwrap()), 0);
-            enc.set_buffer(3, Some(plan.cursor.as_ref().unwrap()), 0);
-            enc.set_buffer(4, Some(&self.buckets), 0);
+            enc.setComputePipelineState(acc_pso);
+            mtl::set_buffer(enc, 0, plan.entries.as_ref().unwrap(), 0);
+            mtl::set_buffer(enc, 1, bases, 0);
+            mtl::set_buffer(enc, 2, plan.counts.as_ref().unwrap(), 0);
+            mtl::set_buffer(enc, 3, plan.cursor.as_ref().unwrap(), 0);
+            mtl::set_buffer(enc, 4, &self.buckets, 0);
             set_params(enc, 5, &p);
             dispatch_1d(enc, acc_pso, rows, 64);
         } else {
@@ -248,13 +249,13 @@ impl Outputs {
                 Job::G1(j) => (&msm.pipelines.segmented_g1, &j.bases.buf),
                 Job::G2(j) => (&msm.pipelines.segmented_g2, &j.bases.buf),
             };
-            enc.set_compute_pipeline_state(seg_pso);
-            enc.set_buffer(0, Some(plan.entries.as_ref().unwrap()), 0);
-            enc.set_buffer(1, Some(bases), 0);
-            enc.set_buffer(2, Some(plan.cursor.as_ref().unwrap()), 0);
-            enc.set_buffer(3, Some(&self.buckets), 0);
-            enc.set_buffer(4, Some(&self.spill_pts), 0);
-            enc.set_buffer(5, Some(&self.spill_rows), 0);
+            enc.setComputePipelineState(seg_pso);
+            mtl::set_buffer(enc, 0, plan.entries.as_ref().unwrap(), 0);
+            mtl::set_buffer(enc, 1, bases, 0);
+            mtl::set_buffer(enc, 2, plan.cursor.as_ref().unwrap(), 0);
+            mtl::set_buffer(enc, 3, &self.buckets, 0);
+            mtl::set_buffer(enc, 4, &self.spill_pts, 0);
+            mtl::set_buffer(enc, 5, &self.spill_rows, 0);
             set_params(enc, 6, &p);
             dispatch_1d(enc, seg_pso, count, 64);
         }
@@ -303,14 +304,14 @@ impl Outputs {
                 Job::G1(_) => &msm.pipelines.fold_g1,
                 Job::G2(_) => &msm.pipelines.fold_g2,
             };
-            enc.set_compute_pipeline_state(pso);
-            enc.set_buffer(0, Some(src.0), 0);
-            enc.set_buffer(1, Some(src.1), 0);
-            enc.set_buffer(2, Some(dst.0), 0);
-            enc.set_buffer(3, Some(dst.1), 0);
-            enc.set_buffer(4, Some(&self.buckets), 0);
+            enc.setComputePipelineState(pso);
+            mtl::set_buffer(enc, 0, src.0, 0);
+            mtl::set_buffer(enc, 1, src.1, 0);
+            mtl::set_buffer(enc, 2, dst.0, 0);
+            mtl::set_buffer(enc, 3, dst.1, 0);
+            mtl::set_buffer(enc, 4, &self.buckets, 0);
             set_params(enc, 5, &self.params_for(plan));
-            enc.set_bytes(6, 16, f.as_ptr().cast());
+            set_params(enc, 6, &f);
             dispatch_1d(enc, pso, plan.n_windows * groups, 64);
             return !last;
         }
@@ -322,12 +323,12 @@ impl Outputs {
             Job::G1(_) => &msm.pipelines.merge_g1,
             Job::G2(_) => &msm.pipelines.merge_g2,
         };
-        enc.set_compute_pipeline_state(merge_pso);
-        enc.set_buffer(0, Some(&self.buckets), 0);
-        enc.set_buffer(1, Some(&self.spill_pts), 0);
-        enc.set_buffer(2, Some(&self.spill_rows), 0);
-        enc.set_buffer(3, Some(plan.counts.as_ref().unwrap()), 0);
-        enc.set_buffer(4, Some(plan.cursor.as_ref().unwrap()), 0);
+        enc.setComputePipelineState(merge_pso);
+        mtl::set_buffer(enc, 0, &self.buckets, 0);
+        mtl::set_buffer(enc, 1, &self.spill_pts, 0);
+        mtl::set_buffer(enc, 2, &self.spill_rows, 0);
+        mtl::set_buffer(enc, 3, plan.counts.as_ref().unwrap(), 0);
+        mtl::set_buffer(enc, 4, plan.cursor.as_ref().unwrap(), 0);
         set_params(enc, 5, &p);
         dispatch_1d(enc, merge_pso, plan.n_windows * plan.n_buckets, 64);
 
@@ -338,19 +339,15 @@ impl Outputs {
                 Job::G1(_) => &msm.pipelines.merge_wide_g1,
                 Job::G2(_) => &msm.pipelines.merge_wide_g2,
             };
-            enc.set_compute_pipeline_state(wide_pso);
-            enc.set_buffer(0, Some(&self.buckets), 0);
-            enc.set_buffer(1, Some(&self.spill_pts), 0);
-            enc.set_buffer(2, Some(&self.spill_rows), 0);
-            enc.set_buffer(3, Some(plan.counts.as_ref().unwrap()), 0);
-            enc.set_buffer(4, Some(plan.cursor.as_ref().unwrap()), 0);
+            enc.setComputePipelineState(wide_pso);
+            mtl::set_buffer(enc, 0, &self.buckets, 0);
+            mtl::set_buffer(enc, 1, &self.spill_pts, 0);
+            mtl::set_buffer(enc, 2, &self.spill_rows, 0);
+            mtl::set_buffer(enc, 3, plan.counts.as_ref().unwrap(), 0);
+            mtl::set_buffer(enc, 4, plan.cursor.as_ref().unwrap(), 0);
             set_params(enc, 5, &p);
-            let tg = MERGE_TG.min(wide_pso.max_total_threads_per_threadgroup() as usize);
-            crate::cb::dispatch_thread_groups(
-                enc,
-                MTLSize::new(plan.merge_wide_rows as u64, 1, 1),
-                MTLSize::new(tg as u64, 1, 1),
-            );
+            let tg = MERGE_TG.min(wide_pso.maxTotalThreadsPerThreadgroup());
+            crate::cb::dispatch_thread_groups(enc, mtl::size(plan.merge_wide_rows), mtl::size(tg));
         }
         false
     }
@@ -367,15 +364,15 @@ impl Outputs {
         }
         let p = self.params_for(plan);
         let is_g2 = matches!(job, Job::G2(_));
-        enc.set_compute_pipeline_state(msm.reduce_pso(is_g2, plan));
-        enc.set_buffer(0, Some(&self.buckets), 0);
-        enc.set_buffer(1, Some(&self.window_sums), 0);
+        enc.setComputePipelineState(msm.reduce_pso(is_g2, plan));
+        mtl::set_buffer(enc, 0, &self.buckets, 0);
+        mtl::set_buffer(enc, 1, &self.window_sums, 0);
         set_params(enc, 2, &p);
         let tg = msm.reduce_tg(is_g2, plan);
         crate::cb::dispatch_thread_groups(
             enc,
-            MTLSize::new((plan.n_windows * plan.reduce_groups) as u64, 1, 1),
-            MTLSize::new(tg as u64, 1, 1),
+            mtl::size(plan.n_windows * plan.reduce_groups),
+            mtl::size(tg),
         );
     }
 
@@ -406,17 +403,13 @@ impl Outputs {
             // The gather kernel reads its length from `n`; the plan's other counts do
             // not apply to it.
             p.n = *count as u32;
-            enc.set_compute_pipeline_state(pso);
-            enc.set_buffer(0, Some(idx), 0);
-            enc.set_buffer(1, Some(bases), 0);
-            enc.set_buffer(2, Some(&self.ones), 0);
+            enc.setComputePipelineState(pso);
+            mtl::set_buffer(enc, 0, idx, 0);
+            mtl::set_buffer(enc, 1, bases, 0);
+            mtl::set_buffer(enc, 2, &self.ones, 0);
             set_params(enc, 3, &p);
-            let tg = REDUCE_TG.min(pso.max_total_threads_per_threadgroup() as usize);
-            crate::cb::dispatch_thread_groups(
-                enc,
-                MTLSize::new(self.ones_groups as u64, 1, 1),
-                MTLSize::new(tg as u64, 1, 1),
-            );
+            let tg = REDUCE_TG.min(pso.maxTotalThreadsPerThreadgroup());
+            crate::cb::dispatch_thread_groups(enc, mtl::size(self.ones_groups), mtl::size(tg));
             return;
         }
         let (ones_pso, bases) = match job {
@@ -426,17 +419,13 @@ impl Outputs {
         // The scan walks the job's own range, not the plan's.
         p.n = (plan.n - self.skip) as u32;
         p.scalar_off = (plan.scalar_off + self.skip) as u32;
-        enc.set_compute_pipeline_state(ones_pso);
-        enc.set_buffer(0, Some(plan.scalars), 0);
-        enc.set_buffer(1, Some(bases), 0);
-        enc.set_buffer(2, Some(&self.ones), 0);
+        enc.setComputePipelineState(ones_pso);
+        mtl::set_buffer(enc, 0, plan.scalars, 0);
+        mtl::set_buffer(enc, 1, bases, 0);
+        mtl::set_buffer(enc, 2, &self.ones, 0);
         set_params(enc, 3, &p);
-        let tg = REDUCE_TG.min(ones_pso.max_total_threads_per_threadgroup() as usize);
-        crate::cb::dispatch_thread_groups(
-            enc,
-            MTLSize::new(self.ones_groups as u64, 1, 1),
-            MTLSize::new(tg as u64, 1, 1),
-        );
+        let tg = REDUCE_TG.min(ones_pso.maxTotalThreadsPerThreadgroup());
+        crate::cb::dispatch_thread_groups(enc, mtl::size(self.ones_groups), mtl::size(tg));
     }
 
     pub(super) fn combine(&self, msm: &MetalMsm, plan: &Plan<'_>) -> MsmResult {

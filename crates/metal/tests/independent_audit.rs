@@ -15,6 +15,7 @@
 
 use std::path::{Path, PathBuf};
 
+use objc2_metal::MTLBuffer;
 use snarkrs_field::{CurveGroup, Fr};
 use snarkrs_formats::{wtns::Witness, ProvingKey, VerifyingKey};
 use snarkrs_groth16::{
@@ -228,7 +229,7 @@ fn gpu_output_is_load_bearing() {
             // SAFETY: shared storage, no GPU work in flight against this scratch, and a
             // u32 has no invalid bit patterns.
             unsafe {
-                let p = buf.contents() as *mut u32;
+                let p = buf.contents().as_ptr() as *mut u32;
                 *p ^= 1;
             }
         }

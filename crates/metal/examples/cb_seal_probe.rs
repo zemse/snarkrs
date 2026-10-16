@@ -21,19 +21,24 @@
 
 #[cfg(target_os = "macos")]
 mod probe {
-    use std::ffi::CStr;
-    use std::os::raw::c_char;
     use std::time::Instant;
 
-    use metal::objc::runtime::Object;
-    use metal::objc::{class, msg_send, sel, sel_impl};
-    use metal::{
-        Buffer, CommandBufferRef, CommandQueue, CompileOptions, ComputeCommandEncoderRef,
-        ComputePipelineState, Device, MTLCommandBufferStatus, MTLResourceOptions, MTLSize,
+    use objc2::rc::Retained;
+    use objc2::runtime::ProtocolObject;
+    use objc2_foundation::NSArray;
+    use objc2_metal::{
+        MTLBuffer, MTLCommandBuffer, MTLCommandBufferDescriptor, MTLCommandBufferEncoderInfo,
+        MTLCommandBufferEncoderInfoErrorKey, MTLCommandBufferErrorOption, MTLCommandBufferStatus,
+        MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLComputePipelineState,
+        MTLResourceOptions,
     };
     use snarkrs_field::{Field, Fr};
     use snarkrs_metal::kernels::FR_MSL;
     use snarkrs_metal::layout::PackedFr;
+    use snarkrs_metal::mtl::{
+        self, Buffer, CommandBuffer, CommandBufferRef, CommandQueue, ComputeCommandEncoderRef,
+        ComputePipelineState, Device,
+    };
 
     /// Fresh inputs and their CPU reference, computed before the timed submission.
     fn prepare_data(data: &mut [PackedFr], epoch: u32, iters: u32) -> [PackedFr; 2] {
@@ -96,61 +101,36 @@ kernel void seal(device uint* word [[buffer(0)]],
 
     const BUSY_THREADS: usize = 1 << 18;
 
-    #[link(name = "Metal", kind = "framework")]
-    extern "C" {
-        static MTLCommandBufferEncoderInfoErrorKey: *mut Object;
-    }
-
-    unsafe fn nsstring(s: *mut Object) -> String {
-        if s.is_null() {
-            return String::new();
-        }
-        let utf8: *const c_char = msg_send![s, UTF8String];
-        if utf8.is_null() {
-            return String::new();
-        }
-        CStr::from_ptr(utf8).to_string_lossy().into_owned()
-    }
-
     fn error_text(cb: &CommandBufferRef) -> String {
-        unsafe {
-            let err: *mut Object = msg_send![cb, error];
-            if err.is_null() {
-                return String::new();
-            }
-            let desc: *mut Object = msg_send![err, localizedDescription];
-            nsstring(desc)
-        }
+        cb.error()
+            .map(|e| e.localizedDescription().to_string())
+            .unwrap_or_default()
     }
 
     /// `(label, errorState)` per encoder, from the NSError's user info. The states are
     /// MTLCommandEncoderErrorState: 0 unknown, 1 completed, 2 affected, 3 pending,
     /// 4 faulted.
     fn encoder_status(cb: &CommandBufferRef) -> Vec<(String, i64)> {
-        unsafe {
-            let err: *mut Object = msg_send![cb, error];
-            if err.is_null() {
-                return Vec::new();
-            }
-            let info: *mut Object = msg_send![err, userInfo];
-            if info.is_null() {
-                return Vec::new();
-            }
-            let key = MTLCommandBufferEncoderInfoErrorKey;
-            let arr: *mut Object = msg_send![info, objectForKey: key];
-            if arr.is_null() {
-                return Vec::new();
-            }
-            let n: usize = msg_send![arr, count];
-            (0..n)
-                .map(|i| {
-                    let e: *mut Object = msg_send![arr, objectAtIndex: i];
-                    let label: *mut Object = msg_send![e, label];
-                    let state: i64 = msg_send![e, errorState];
-                    (nsstring(label), state)
-                })
-                .collect()
-        }
+        let Some(err) = cb.error() else {
+            return Vec::new();
+        };
+        // SAFETY: a constant NSString Metal exports.
+        let key = unsafe { MTLCommandBufferEncoderInfoErrorKey };
+        let Some(arr) = err.userInfo().objectForKey(key) else {
+            return Vec::new();
+        };
+        let Ok(arr) = arr.downcast::<NSArray>() else {
+            return Vec::new();
+        };
+        (0..arr.count())
+            .map(|i| {
+                // SAFETY: the array under this key holds MTLCommandBufferEncoderInfo
+                // objects.
+                let e: Retained<ProtocolObject<dyn MTLCommandBufferEncoderInfo>> =
+                    unsafe { Retained::cast_unchecked(arr.objectAtIndex(i)) };
+                (e.label().to_string(), e.errorState().0 as i64)
+            })
+            .collect()
     }
 
     fn state_name(s: i64) -> &'static str {
@@ -165,19 +145,13 @@ kernel void seal(device uint* word [[buffer(0)]],
     }
 
     /// A command buffer with per-encoder error reporting on, or a plain one.
-    fn command_buffer(queue: &CommandQueue, encoder_status: bool) -> &CommandBufferRef {
+    fn command_buffer(queue: &CommandQueue, encoder_status: bool) -> CommandBuffer {
         if !encoder_status {
-            return queue.new_command_buffer();
+            return queue.commandBuffer().unwrap();
         }
-        unsafe {
-            let desc: *mut Object = msg_send![class!(MTLCommandBufferDescriptor), new];
-            // MTLCommandBufferErrorOptionEncoderExecutionStatus = 1 << 0.
-            let () = msg_send![desc, setErrorOptions: 1u64];
-            let queue: &metal::CommandQueueRef = queue;
-            let cb: &CommandBufferRef = msg_send![queue, commandBufferWithDescriptor: desc];
-            let () = msg_send![desc, release];
-            cb
-        }
+        let desc = MTLCommandBufferDescriptor::new();
+        desc.setErrorOptions(MTLCommandBufferErrorOption::EncoderExecutionStatus);
+        queue.commandBufferWithDescriptor(&desc).unwrap()
     }
 
     struct Gpu {
@@ -189,20 +163,17 @@ kernel void seal(device uint* word [[buffer(0)]],
 
     impl Gpu {
         fn new() -> Self {
-            let device = Device::system_default().expect("no Metal device");
+            let device = mtl::system_default().expect("no Metal device");
             let src = format!("{FR_MSL}\n{PROBE_MSL}");
-            let library = device
-                .new_library_with_source(&src, &CompileOptions::new())
-                .unwrap_or_else(|e| panic!("MSL compile failed:\n{e}"));
+            let library =
+                mtl::library(&device, &src).unwrap_or_else(|e| panic!("MSL compile failed:\n{e}"));
             let pso = |name: &str| {
-                let f = library.get_function(name, None).expect(name);
-                device
-                    .new_compute_pipeline_state_with_function(&f)
-                    .expect(name)
+                let f = mtl::function(&library, name).expect(name);
+                mtl::pipeline(&device, &f).expect(name)
             };
             let busy = pso("busy");
             let seal = pso("seal");
-            let queue = device.new_command_queue();
+            let queue = mtl::command_queue(&device).unwrap();
             Self {
                 device,
                 queue,
@@ -212,8 +183,7 @@ kernel void seal(device uint* word [[buffer(0)]],
         }
 
         fn buffer(&self, bytes: usize) -> Buffer {
-            self.device
-                .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared)
+            mtl::buffer(&self.device, bytes, MTLResourceOptions::StorageModeShared).unwrap()
         }
 
         #[allow(clippy::too_many_arguments)]
@@ -226,35 +196,35 @@ kernel void seal(device uint* word [[buffer(0)]],
             count: &Buffer,
             epoch: u32,
         ) {
-            enc.set_compute_pipeline_state(&self.busy);
-            enc.set_buffer(0, Some(data), 0);
-            enc.set_bytes(1, 4, (&iters as *const u32).cast());
-            enc.set_buffer(2, Some(marker), 0);
-            enc.set_buffer(3, Some(count), 0);
-            enc.set_bytes(4, 4, (&epoch as *const u32).cast());
-            let tg = self.busy.max_total_threads_per_threadgroup().min(256);
-            enc.dispatch_threads(
-                MTLSize::new(BUSY_THREADS as u64, 1, 1),
-                MTLSize::new(tg, 1, 1),
-            );
+            enc.setComputePipelineState(&self.busy);
+            mtl::set_buffer(enc, 0, data, 0);
+            // SAFETY: a `u32` is readable for 4 bytes.
+            unsafe { mtl::set_bytes(enc, 1, 4, (&iters as *const u32).cast()) };
+            mtl::set_buffer(enc, 2, marker, 0);
+            mtl::set_buffer(enc, 3, count, 0);
+            // SAFETY: as above.
+            unsafe { mtl::set_bytes(enc, 4, 4, (&epoch as *const u32).cast()) };
+            let tg = self.busy.maxTotalThreadsPerThreadgroup().min(256);
+            enc.dispatchThreads_threadsPerThreadgroup(mtl::size(BUSY_THREADS), mtl::size(tg));
         }
 
         fn encode_seal(&self, enc: &ComputeCommandEncoderRef, word: &Buffer, tok: u32) {
-            enc.set_compute_pipeline_state(&self.seal);
-            enc.set_buffer(0, Some(word), 0);
-            enc.set_bytes(1, 4, (&tok as *const u32).cast());
-            enc.dispatch_threads(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
+            enc.setComputePipelineState(&self.seal);
+            mtl::set_buffer(enc, 0, word, 0);
+            // SAFETY: a `u32` is readable for 4 bytes.
+            unsafe { mtl::set_bytes(enc, 1, 4, (&tok as *const u32).cast()) };
+            enc.dispatchThreads_threadsPerThreadgroup(mtl::size(1), mtl::size(1));
         }
     }
 
     fn read_word(b: &Buffer) -> u32 {
         // SAFETY: a 4-byte shared buffer, read after the command buffer completed.
-        unsafe { *(b.contents() as *const u32) }
+        unsafe { *(b.contents().as_ptr() as *const u32) }
     }
 
     fn write_word(b: &Buffer, v: u32) {
         // SAFETY: a 4-byte shared buffer with nothing in flight against it.
-        unsafe { *(b.contents() as *mut u32) = v }
+        unsafe { *(b.contents().as_ptr() as *mut u32) = v }
     }
 
     pub fn main() {
@@ -285,7 +255,10 @@ kernel void seal(device uint* word [[buffer(0)]],
         {
             // SAFETY: freshly allocated shared buffer of BUSY_THREADS Fr.
             let words = unsafe {
-                std::slice::from_raw_parts_mut(data.contents() as *mut u32, BUSY_THREADS * 8)
+                std::slice::from_raw_parts_mut(
+                    data.contents().as_ptr() as *mut u32,
+                    BUSY_THREADS * 8,
+                )
             };
             for (i, w) in words.iter_mut().enumerate() {
                 *w = if i % 8 == 0 { 1 } else { 0 };
@@ -299,8 +272,11 @@ kernel void seal(device uint* word [[buffer(0)]],
         // between command buffers.
         let (markers, counts) = unsafe {
             (
-                std::slice::from_raw_parts_mut(marker.contents() as *mut u32, BUSY_THREADS),
-                std::slice::from_raw_parts_mut(count.contents() as *mut u32, BUSY_THREADS),
+                std::slice::from_raw_parts_mut(
+                    marker.contents().as_ptr() as *mut u32,
+                    BUSY_THREADS,
+                ),
+                std::slice::from_raw_parts_mut(count.contents().as_ptr() as *mut u32, BUSY_THREADS),
             )
         };
         markers.fill(0);
@@ -312,13 +288,13 @@ kernel void seal(device uint* word [[buffer(0)]],
         loop {
             let mut ms = f64::MAX;
             for _ in 0..3 {
-                let cb = gpu.queue.new_command_buffer();
-                let enc = cb.new_compute_command_encoder();
-                gpu.encode_busy(enc, &data, iters, &marker, &count, 0);
-                enc.end_encoding();
+                let cb = gpu.queue.commandBuffer().unwrap();
+                let enc = mtl::encoder(&cb);
+                gpu.encode_busy(&enc, &data, iters, &marker, &count, 0);
+                enc.endEncoding();
                 let t = Instant::now();
                 cb.commit();
-                cb.wait_until_completed();
+                cb.waitUntilCompleted();
                 ms = ms.min(t.elapsed().as_secs_f64() * 1e3);
             }
             if ms >= target_ms * 0.8 || iters >= 1 << 24 {
@@ -347,24 +323,27 @@ kernel void seal(device uint* word [[buffer(0)]],
             // command buffer finished and the next one not yet committed.
             let expected = prepare_data(
                 unsafe {
-                    std::slice::from_raw_parts_mut(data.contents().cast::<PackedFr>(), BUSY_THREADS)
+                    std::slice::from_raw_parts_mut(
+                        data.contents().cast::<PackedFr>().as_ptr(),
+                        BUSY_THREADS,
+                    )
                 },
                 epoch,
                 iters,
             );
             let cb = command_buffer(&gpu.queue, with_status);
-            let enc = cb.new_compute_command_encoder();
-            enc.set_label("busy+sealA");
-            gpu.encode_busy(enc, &data, iters, &marker, &count, epoch);
-            gpu.encode_seal(enc, &word_a, epoch);
-            enc.end_encoding();
-            let enc = cb.new_compute_command_encoder();
-            enc.set_label("sealB");
-            gpu.encode_seal(enc, &word_b, epoch);
-            enc.end_encoding();
+            let enc = mtl::encoder(&cb);
+            mtl::set_label(&enc, "busy+sealA");
+            gpu.encode_busy(&enc, &data, iters, &marker, &count, epoch);
+            gpu.encode_seal(&enc, &word_a, epoch);
+            enc.endEncoding();
+            let enc = mtl::encoder(&cb);
+            mtl::set_label(&enc, "sealB");
+            gpu.encode_seal(&enc, &word_b, epoch);
+            enc.endEncoding();
             let t = Instant::now();
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
             let wall_ms = t.elapsed().as_secs_f64() * 1e3;
             let status = cb.status();
             let a = read_word(&word_a) == epoch;
@@ -377,7 +356,10 @@ kernel void seal(device uint* word [[buffer(0)]],
             // the command buffer that wrote them has completed.
             let (wrong, first_wrong) = wrong_data(
                 unsafe {
-                    std::slice::from_raw_parts(data.contents().cast::<PackedFr>(), BUSY_THREADS)
+                    std::slice::from_raw_parts(
+                        data.contents().cast::<PackedFr>().as_ptr(),
+                        BUSY_THREADS,
+                    )
                 },
                 &expected,
             );
@@ -387,7 +369,8 @@ kernel void seal(device uint* word [[buffer(0)]],
                 format!("stale={stale} skipped={skipped} twice={twice}")
             };
             let key = format!(
-                "status={status:?} A={} B={} busy={busy} wrong={wrong}",
+                "status={} A={} B={} busy={busy} wrong={wrong}",
+                mtl::status_name(status),
                 if a { "ok" } else { "MISSING" },
                 if b { "ok" } else { "MISSING" }
             );
@@ -415,13 +398,13 @@ kernel void seal(device uint* word [[buffer(0)]],
                 }
             }
             if anomaly {
-                let enc_states: Vec<String> = encoder_status(cb)
+                let enc_states: Vec<String> = encoder_status(&cb)
                     .into_iter()
                     .map(|(l, s)| format!("{l}:{}", state_name(s)))
                     .collect();
                 eprintln!(
                     "[{i}] {key} first_wrong={first_wrong:?} wall {wall_ms:.1} ms error \"{}\" encoders [{}]",
-                    error_text(cb),
+                    error_text(&cb),
                     enc_states.join(", ")
                 );
             } else if i % 25 == 0 {
@@ -468,7 +451,7 @@ kernel void seal(device uint* word [[buffer(0)]],
         /// and demonstrates that current markers and counts alone miss a wrong store.
         #[test]
         fn sealed_arithmetic_matches_cpu_and_corruption_is_detected() {
-            metal::objc::rc::autoreleasepool(|| {
+            objc2::rc::autoreleasepool(|_| {
                 let gpu = Gpu::new();
                 let data = gpu.buffer(BUSY_THREADS * 32);
                 let marker = gpu.buffer(BUSY_THREADS * 4);
@@ -479,13 +462,19 @@ kernel void seal(device uint* word [[buffer(0)]],
                 // SAFETY: fresh shared buffers, no work in flight. Each is sized for
                 // BUSY_THREADS elements of its respective type.
                 let expected = unsafe {
-                    std::slice::from_raw_parts_mut(count.contents().cast::<u32>(), BUSY_THREADS)
-                        .fill(0);
-                    std::slice::from_raw_parts_mut(marker.contents().cast::<u32>(), BUSY_THREADS)
-                        .fill(0);
+                    std::slice::from_raw_parts_mut(
+                        count.contents().cast::<u32>().as_ptr(),
+                        BUSY_THREADS,
+                    )
+                    .fill(0);
+                    std::slice::from_raw_parts_mut(
+                        marker.contents().cast::<u32>().as_ptr(),
+                        BUSY_THREADS,
+                    )
+                    .fill(0);
                     prepare_data(
                         std::slice::from_raw_parts_mut(
-                            data.contents().cast::<PackedFr>(),
+                            data.contents().cast::<PackedFr>().as_ptr(),
                             BUSY_THREADS,
                         ),
                         epoch,
@@ -493,22 +482,26 @@ kernel void seal(device uint* word [[buffer(0)]],
                     )
                 };
                 let cb = command_buffer(&gpu.queue, true);
-                let enc = cb.new_compute_command_encoder();
+                let enc = mtl::encoder(&cb);
                 gpu.encode_busy(enc, &data, 2, &marker, &count, epoch);
                 gpu.encode_seal(enc, &token, epoch);
-                enc.end_encoding();
+                enc.endEncoding();
                 cb.commit();
-                cb.wait_until_completed();
+                cb.waitUntilCompleted();
                 assert_eq!(cb.status(), MTLCommandBufferStatus::Completed);
                 assert_eq!(read_word(&token), epoch);
                 // SAFETY: correctly sized shared buffers, command buffer completed.
                 unsafe {
-                    let markers =
-                        std::slice::from_raw_parts(marker.contents().cast::<u32>(), BUSY_THREADS);
-                    let counts =
-                        std::slice::from_raw_parts(count.contents().cast::<u32>(), BUSY_THREADS);
+                    let markers = std::slice::from_raw_parts(
+                        marker.contents().cast::<u32>().as_ptr(),
+                        BUSY_THREADS,
+                    );
+                    let counts = std::slice::from_raw_parts(
+                        count.contents().cast::<u32>().as_ptr(),
+                        BUSY_THREADS,
+                    );
                     let words = std::slice::from_raw_parts_mut(
-                        data.contents().cast::<PackedFr>(),
+                        data.contents().cast::<PackedFr>().as_ptr(),
                         BUSY_THREADS,
                     );
                     assert!(markers.iter().all(|&m| m == epoch));

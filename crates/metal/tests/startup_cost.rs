@@ -18,7 +18,7 @@
 
 #![cfg(target_os = "macos")]
 
-use metal::{CompileOptions, Device};
+use snarkrs_metal::mtl;
 use snarkrs_metal::MetalBackend;
 use std::time::Instant;
 
@@ -46,33 +46,29 @@ fn salted() -> String {
 /// The two halves of a cold compile, then the same source again warm.
 #[test]
 fn cold_and_warm_compile_are_different_regimes() {
-    let device = Device::system_default().expect("no Metal device");
+    let device = mtl::system_default().expect("no Metal device");
     let src = salted();
 
     let t = Instant::now();
-    let lib = device
-        .new_library_with_source(&src, &CompileOptions::new())
-        .expect("compile failed");
+    let lib = mtl::library(&device, &src).expect("compile failed");
     let cold_lib = t.elapsed().as_secs_f64() * 1e3;
 
     let t = Instant::now();
     for n in ["k0", "k1"] {
-        let f = lib.get_function(n, None).unwrap();
-        device.new_compute_pipeline_state_with_function(&f).unwrap();
+        let f = mtl::function(&lib, n).unwrap();
+        mtl::pipeline(&device, &f).unwrap();
     }
     let cold_pso = t.elapsed().as_secs_f64() * 1e3;
 
     // Byte-identical source, same process: both layers should now hit the cache.
     let t = Instant::now();
-    let lib2 = device
-        .new_library_with_source(&src, &CompileOptions::new())
-        .expect("recompile failed");
+    let lib2 = mtl::library(&device, &src).expect("recompile failed");
     let warm_lib = t.elapsed().as_secs_f64() * 1e3;
 
     let t = Instant::now();
     for n in ["k0", "k1"] {
-        let f = lib2.get_function(n, None).unwrap();
-        device.new_compute_pipeline_state_with_function(&f).unwrap();
+        let f = mtl::function(&lib2, n).unwrap();
+        mtl::pipeline(&device, &f).unwrap();
     }
     let warm_pso = t.elapsed().as_secs_f64() * 1e3;
 

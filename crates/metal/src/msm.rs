@@ -16,7 +16,7 @@
 //! submit one command buffer per stage, four or more per MSM; at this prover's domain
 //! sizes that alone would cost more than the arithmetic. [`MetalMsm::msm_batch`]
 //! therefore encodes every job it is handed into ONE command buffer with ONE
-//! `wait_until_completed`, and reads back a few hundred points at the end. The proving
+//! `waitUntilCompleted`, and reads back a few hundred points at the end. The proving
 //! path hands it all five MSMs below a 2^17 domain; at and above it `MetalCircuit`
 //! splits them into two batches so the witness four can run while `compute_h` is still
 //! on the other queue (see `backend::overlap_pays`).
@@ -62,14 +62,18 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use ark_ff::{One, Zero};
-use metal::{Buffer, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device};
+use objc2_metal::{
+    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder,
+    MTLComputePipelineState,
+};
 
 use snarkrs_field::{Fr, G1Affine, G1Projective, G2Affine, G2Projective};
 use snarkrs_groth16::ProveError;
 
-use crate::enc::{dispatch_1d, packed_buffer};
+use crate::enc::{dispatch_1d, packed_buffer, set_params};
 use crate::kernels::{FR_MSL, MSM_MSL, SEAL_MSL};
 use crate::layout::{PackedG1Affine, PackedG2Affine, PackedScalar};
+use crate::mtl::{self, Buffer, ComputeCommandEncoderRef, ComputePipelineState, Device};
 
 mod inputs;
 mod jobs;
@@ -95,11 +99,9 @@ pub use wire::{PackedXyzzG1, PackedXyzzG2};
 
 // Read by msm_cpu_tests.rs and msm_gpu_probes.rs through `super::*`.
 #[cfg(test)]
-use crate::enc::{read_back, set_params};
+use crate::enc::read_back;
 #[cfg(test)]
 use crate::layout::{PackedFq, PackedFq2};
-#[cfg(test)]
-use metal::MTLSize;
 
 fn err(reason: impl Into<String>) -> ProveError {
     ProveError::Backend {
@@ -163,7 +165,7 @@ impl MetalMsm {
     /// `prepare`, and never on a proving path. A prover that constructs this per proof
     /// is measuring the Metal compiler.
     pub fn new() -> Result<Self, ProveError> {
-        let device = Device::system_default()
+        let device = mtl::system_default()
             .ok_or_else(|| err("no Metal device; this machine cannot run the metal backend"))?;
         Self::with_device(device)
     }
@@ -173,18 +175,13 @@ impl MetalMsm {
         // include path for a runtime-compiled source string, so the concatenation is the
         // include, and the prelude's header guard is what makes it safe.
         let source = format!("{FR_MSL}\n{MSM_MSL}\n{SEAL_MSL}\n");
-        let opts = CompileOptions::new();
-        let library = device
-            .new_library_with_source(&source, &opts)
+        let library = mtl::library(&device, &source)
             .map_err(|e| err(format!("MSL compilation failed: {e}")))?;
 
         let pso = |name: &str| -> Result<ComputePipelineState, ProveError> {
-            let f = library
-                .get_function(name, None)
+            let f = mtl::function(&library, name)
                 .map_err(|e| err(format!("kernel {name} not found: {e}")))?;
-            device
-                .new_compute_pipeline_state_with_function(&f)
-                .map_err(|e| err(format!("pipeline {name}: {e}")))
+            mtl::pipeline(&device, &f).map_err(|e| err(format!("pipeline {name}: {e}")))
         };
 
         let pipelines = Pipelines {
@@ -244,10 +241,7 @@ impl MetalMsm {
     /// recomputes the G1 kernel's simdgroup slots from it, so the two must agree.
     fn reduce_tg(&self, is_g2: bool, plan: &Plan<'_>) -> usize {
         REDUCE_TG
-            .min(
-                self.reduce_pso(is_g2, plan)
-                    .max_total_threads_per_threadgroup() as usize,
-            )
+            .min(self.reduce_pso(is_g2, plan).maxTotalThreadsPerThreadgroup())
             .max(1)
     }
 
@@ -256,7 +250,7 @@ impl MetalMsm {
             plan.n_buckets,
             plan.reduce_groups,
             self.reduce_tg(false, plan),
-            self.reduce_pso(false, plan).thread_execution_width() as usize,
+            self.reduce_pso(false, plan).threadExecutionWidth(),
         )
     }
 
@@ -307,7 +301,7 @@ impl MetalMsm {
         if n > 0 && work == Work::Constant {
             // SAFETY: as below.
             let slots: &mut [PackedScalar] =
-                unsafe { core::slice::from_raw_parts_mut(buf.contents().cast(), n) };
+                unsafe { core::slice::from_raw_parts_mut(buf.contents().cast().as_ptr(), n) };
             slots
                 .par_chunks_mut(CLASSIFY_CHUNK)
                 .zip_eq(scalars.par_chunks(CLASSIFY_CHUNK))
@@ -335,7 +329,7 @@ impl MetalMsm {
             // SAFETY: the buffer was just allocated with room for `n` packed scalars
             // and nothing has been encoded against it, so no dispatch can be reading it.
             let slots: &mut [PackedScalar] =
-                unsafe { core::slice::from_raw_parts_mut(buf.contents().cast(), n) };
+                unsafe { core::slice::from_raw_parts_mut(buf.contents().cast().as_ptr(), n) };
             let parts: Vec<(u32, Vec<u32>, u32)> = slots
                 .par_chunks_mut(CLASSIFY_CHUNK)
                 .zip_eq(scalars.par_chunks(CLASSIFY_CHUNK))
@@ -399,18 +393,18 @@ impl MetalMsm {
         crate::cb::with_retry(&self.queue, |queue| {
             let context = "stage 9 scalar conversion (mont_to_std)";
             let cb = crate::cb::command_buffer(queue);
-            let enc = cb.new_compute_command_encoder();
-            enc.set_label(context);
-            enc.set_compute_pipeline_state(&self.pipelines.mont_to_std);
-            enc.set_buffer(0, Some(mont), 0);
-            enc.set_buffer(1, Some(&out), 0);
+            let enc = mtl::encoder(&cb);
+            mtl::set_label(&enc, context);
+            enc.setComputePipelineState(&self.pipelines.mont_to_std);
+            mtl::set_buffer(&enc, 0, mont, 0);
+            mtl::set_buffer(&enc, 1, &out, 0);
             let n = len as u32;
-            enc.set_bytes(2, 4, (&n as *const u32).cast());
-            dispatch_1d(enc, &self.pipelines.mont_to_std, len, 64);
-            let token = self.seal.encode(enc);
-            enc.end_encoding();
+            set_params(&enc, 2, &n);
+            dispatch_1d(&enc, &self.pipelines.mont_to_std, len, 64);
+            let token = self.seal.encode(&enc);
+            enc.endEncoding();
             cb.commit();
-            self.seal.wait(cb, token, context)
+            self.seal.wait(&cb, token, context)
         })?;
         Ok(ScalarBuf {
             buf: out,
@@ -502,7 +496,7 @@ impl MetalMsm {
         out[0].g2()
     }
 
-    /// Every MSM in one command buffer, one `wait_until_completed`, one readback.
+    /// Every MSM in one command buffer, one `waitUntilCompleted`, one readback.
     ///
     /// Jobs that share a scalar buffer, offset and length share their digit pipeline:
     /// the A, B-in-G2 and B-in-G1 MSMs all run over the whole witness, so the counting
@@ -612,18 +606,18 @@ impl MetalMsm {
              -> Result<(), ProveError> {
                 let t = std::time::Instant::now();
                 let cb = crate::cb::command_buffer(&queue);
-                let enc = cb.new_compute_command_encoder();
-                enc.set_label(&label);
-                f(enc);
-                let token = self.seal.encode(enc);
-                enc.end_encoding();
+                let enc = mtl::encoder(&cb);
+                mtl::set_label(&enc, &label);
+                f(&enc);
+                let token = self.seal.encode(&enc);
+                enc.endEncoding();
                 cb.commit();
                 // The production path below checks status and token; this one must too.
                 // A timing read off a faulted command buffer is not a slow result, it is
                 // a measurement of how long the GPU took to fail, reported as if it were
                 // work. This path exists to explain timings, so a wrong one is worse here
                 // than anywhere.
-                self.seal.wait(cb, token, "MSM phase")?;
+                self.seal.wait(&cb, token, "MSM phase")?;
                 eprintln!(
                     "[msm-phase] {label}: {:.2} ms",
                     t.elapsed().as_secs_f64() * 1e3
@@ -702,9 +696,7 @@ impl MetalMsm {
             // one phase is independent of every other dispatch of that phase (disjoint
             // outputs; shared inputs are read-only), and each phase reads only what
             // earlier phases wrote, so one full barrier between phases is both
-            // necessary and sufficient. metal-rs 0.29 does not bind
-            // memoryBarrierWithScope:, so it is called the way `cb` reads the
-            // unbound timing properties.
+            // necessary and sufficient.
             //
             // The ones scans have no dependency at all (scalars and bases in, own
             // buffer out) and are encoded into the accumulation phase, the widest one.
@@ -803,7 +795,7 @@ impl MetalMsm {
         };
 
         // Buffers go home. Anything the plan and the outputs still reference is dead
-        // now: `wait_until_completed` returned, so the GPU is finished with all of it.
+        // now: `waitUntilCompleted` returned, so the GPU is finished with all of it.
         drop(plans);
         drop(outs);
         self.pool.give(scratch);
@@ -826,10 +818,10 @@ mod tests;
 #[cfg(test)]
 mod thread_safety {
     /// `PreparedCircuit` must be `Send + Sync`, so anything the Metal backend stores on
-    /// one has to be too. Checked rather than assumed: `metal-rs` declares its handles
-    /// `Send + Sync`, and MTLDevice, MTLBuffer, MTLComputePipelineState and
-    /// MTLCommandQueue are documented thread-safe. Command buffers and encoders are not,
-    /// and none of them outlive a `msm_batch` call.
+    /// one has to be too. Checked rather than assumed: objc2-metal declares MTLDevice,
+    /// MTLComputePipelineState and MTLCommandQueue `Send + Sync`, `mtl::Buffer` does the
+    /// same for MTLBuffer, and all four are documented thread-safe. Command buffers and
+    /// encoders are not, and none of them outlive a `msm_batch` call.
     const fn assert_send_sync<T: Send + Sync>() {}
     const _: () = {
         assert_send_sync::<super::MetalMsm>();

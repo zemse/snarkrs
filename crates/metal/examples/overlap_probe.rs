@@ -21,10 +21,10 @@ mod probe {
     use std::path::Path;
     use std::time::Instant;
 
-    use metal::Device;
     use snarkrs_formats::{wtns::Witness, ProvingKey};
     use snarkrs_groth16::StageTimings;
     use snarkrs_metal::msm::{G1Bases, G2Bases, Job, JobG1, JobG2, MetalMsm, MsmResult};
+    use snarkrs_metal::mtl;
     use snarkrs_metal::stages::{HResident, HStages};
 
     const ROUNDS: usize = 9;
@@ -181,7 +181,7 @@ mod probe {
     pub fn run() {
         let dirs: Vec<_> = std::env::args_os().skip(1).collect();
         assert!(!dirs.is_empty(), "pass one or more circuit directories");
-        let device = Device::system_default().expect("no Metal device");
+        let device = mtl::system_default().expect("no Metal device");
         let stages = HStages::with_device(device.clone()).unwrap();
         let msm = MetalMsm::with_device(device).unwrap();
         for dir in dirs {

@@ -19,8 +19,14 @@
 //! `cmp` of a `--backend cpu` output against a `--backend metal` one is a total check on
 //! this file and there is nothing to keep in step.
 
+use std::ptr::NonNull;
+
 use ark_ec::scalar_mul::glv::GLVConfig;
-use metal::{Buffer, CompileOptions, ComputePipelineState, Device, MTLDispatchType};
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{
+    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder, MTLDispatchType,
+    MTLResource,
+};
 use rayon::prelude::*;
 use snarkrs_field::raw::{RawFq, RawFq2};
 use snarkrs_field::{FftField, Field, Fr};
@@ -33,6 +39,7 @@ use crate::enc::{dispatch_1d, read_back, set_params};
 use crate::kernels::{CEREMONY_MSL, FFT_MSL, FR_MSL, MSM_MSL, SEAL_MSL};
 use crate::layout::{Packed, PackedFq, PackedFq2};
 use crate::msm::{PackedXyzzG1, PackedXyzzG2};
+use crate::mtl::{self, Buffer, ComputePipelineState, Device};
 
 /// Ladder window for G1, and one wider than the ceremony ladders take.
 ///
@@ -314,7 +321,7 @@ pub struct FftKernels {
 
 impl FftKernels {
     pub fn new() -> Result<Self, ProveError> {
-        let device = Device::system_default()
+        let device = mtl::system_default()
             .ok_or_else(|| cer_err("no Metal device; this machine cannot run the metal backend"))?;
         Self::with_device(device)
     }
@@ -324,18 +331,13 @@ impl FftKernels {
         // arithmetic, the ladder, then this file. Each has its own header guard, so the
         // concatenation is the include, and `fft.metal` adds no curve math of its own.
         let source = format!("{FR_MSL}\n{MSM_MSL}\n{CEREMONY_MSL}\n{FFT_MSL}\n{SEAL_MSL}\n");
-        let opts = CompileOptions::new();
-        let library = device
-            .new_library_with_source(&source, &opts)
+        let library = mtl::library(&device, &source)
             .map_err(|e| cer_err(format!("MSL compilation failed: {e}")))?;
 
         let pso = |name: &str| -> Result<ComputePipelineState, ProveError> {
-            let f = library
-                .get_function(name, None)
+            let f = mtl::function(&library, name)
                 .map_err(|e| cer_err(format!("kernel {name} not found: {e}")))?;
-            device
-                .new_compute_pipeline_state_with_function(&f)
-                .map_err(|e| cer_err(format!("pipeline {name}: {e}")))
+            mtl::pipeline(&device, &f).map_err(|e| cer_err(format!("pipeline {name}: {e}")))
         };
 
         let group = |g: &str| -> Result<FftPipelines, ProveError> {
@@ -498,7 +500,7 @@ impl FftKernels {
             // SAFETY: the buffer was just allocated with room for `n` of this type and
             // nothing has been encoded against it, so no dispatch can be reading it.
             let slots: &mut [G::PackedPoint] =
-                unsafe { core::slice::from_raw_parts_mut(src.contents().cast(), n) };
+                unsafe { core::slice::from_raw_parts_mut(src.contents().cast().as_ptr(), n) };
             slots
                 .par_iter_mut()
                 .enumerate()
@@ -687,9 +689,9 @@ impl FftKernels {
     /// Destinations are disjoint from sources and every attempt is waited on before
     /// the next one writes them; `cb::with_retry` also replaces an ignored queue.
     fn dispatch_with_retry(&self, batch: &[(&Pass, FftParams, usize)]) -> Result<(), ProveError> {
-        let outputs: Vec<&metal::ResourceRef> = batch
+        let outputs: Vec<NonNull<ProtocolObject<dyn MTLResource>>> = batch
             .iter()
-            .map(|(pass, _, _)| -> &metal::ResourceRef { pass.dst })
+            .map(|(pass, _, _)| NonNull::from(ProtocolObject::from_ref(&**pass.dst)))
             .collect();
         crate::cb::with_retry(&self.queue, |queue| {
             let cb = crate::cb::command_buffer(queue);
@@ -698,21 +700,27 @@ impl FftKernels {
             // for the implicit serial barrier to protect, and with the barrier in place
             // the co-dispatched blocks would run one after another, which is exactly the
             // underfill co-dispatching exists to remove.
-            let enc = cb.compute_command_encoder_with_dispatch_type(MTLDispatchType::Concurrent);
+            let enc = mtl::encoder_with(&cb, MTLDispatchType::Concurrent);
             for (pass, p, threads) in batch {
-                enc.set_compute_pipeline_state(pass.pso);
-                enc.set_buffer(0, Some(pass.src), 0);
-                enc.set_buffer(1, Some(pass.dst), 0);
-                enc.set_buffer(2, Some(pass.third), 0);
-                set_params(enc, 3, p);
-                dispatch_1d(enc, pass.pso, *threads, THREADGROUP);
+                enc.setComputePipelineState(pass.pso);
+                mtl::set_buffer(&enc, 0, pass.src, 0);
+                mtl::set_buffer(&enc, 1, pass.dst, 0);
+                mtl::set_buffer(&enc, 2, pass.third, 0);
+                set_params(&enc, 3, p);
+                dispatch_1d(&enc, pass.pso, *threads, THREADGROUP);
             }
             // All concurrent pieces must complete before the token in this encoder.
-            enc.memory_barrier_with_resources(&outputs);
-            let token = self.seal.encode(enc);
-            enc.end_encoding();
+            // SAFETY: `outputs` holds `outputs.len()` buffers, which `batch` keeps alive.
+            unsafe {
+                enc.memoryBarrierWithResources_count(
+                    NonNull::from(outputs.as_slice()).cast(),
+                    outputs.len(),
+                )
+            };
+            let token = self.seal.encode(&enc);
+            enc.endEncoding();
             cb.commit();
-            self.seal.wait(cb, token, "ceremony group inverse fft")
+            self.seal.wait(&cb, token, "ceremony group inverse fft")
         })
     }
 
@@ -904,7 +912,7 @@ mod tests {
     fn kernels() -> Option<FftKernels> {
         // No device on a headless builder is a skip, not a failure, the same way the
         // artifact-gated tests in `msm.rs` skip.
-        Device::system_default()?;
+        mtl::system_default()?;
         Some(FftKernels::new().expect("fft kernels"))
     }
 
@@ -1069,7 +1077,7 @@ mod tests {
     #[test]
     fn every_window_gives_the_same_points() {
         let Some(_) = kernels() else { return };
-        let device = Device::system_default().expect("device");
+        let device = mtl::system_default().expect("device");
         let n = 512;
         let base_g1 = block_g1(0x5eed_3001, n);
         let base_g2 = block_g2(0x5eed_3002, n);
@@ -1104,7 +1112,7 @@ mod tests {
     #[test]
     fn a_pass_split_across_command_buffers_agrees() {
         let Some(_) = kernels() else { return };
-        let device = Device::system_default().expect("device");
+        let device = mtl::system_default().expect("device");
         // 2^10 rather than the 2^12 the size sweep uses, because a budget of 1 means one
         // command buffer per butterfly and 2^12 would be 30,000 of them.
         let n = 1 << 10;

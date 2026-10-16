@@ -34,13 +34,13 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use metal::Device;
 use snarkrs_field::{Fr, G1Projective, G2Affine, G2Projective};
 use snarkrs_formats::{Coefficients, ProvingKey};
 use snarkrs_groth16::{Backend, HPoly, MsmOutputs, PreparedCircuit, ProveError, StageTimings};
 use snarkrs_msm::{CpuMsm, MsmBackend};
 
 use crate::msm::{G1Bases, G2Bases, Job, JobG1, JobG2, MetalMsm, ScalarBuf, Work};
+use crate::mtl::{self, Device};
 use crate::stages::{HHandle, HResident, HStages};
 
 fn bad(reason: impl Into<String>) -> ProveError {
@@ -80,7 +80,7 @@ impl MetalBackend {
     /// Fails on a machine with no Metal device rather than silently falling back to CPU:
     /// a benchmark that quietly measures the wrong backend is worse than an error.
     pub fn new() -> Result<Self, ProveError> {
-        let device = Device::system_default().ok_or_else(|| {
+        let device = mtl::system_default().ok_or_else(|| {
             bad("no Metal device on this machine, so the metal backend cannot run")
         })?;
         Self::with_device(device)
@@ -168,7 +168,7 @@ impl Backend for MetalBackend {
 /// in two separate pools that each kernel module owns: `crate::stages`' pool hands out
 /// the witness, A, B, C, transform temporary and the two H buffers, and takes them back
 /// when the [`HHandle`] inside the [`HPoly`] is dropped; `crate::msm`'s pool hands out
-/// the counting-sort and bucket scratch and takes it back after `wait_until_completed`.
+/// the counting-sort and bucket scratch and takes it back after `waitUntilCompleted`.
 /// Neither pool is reachable from this struct, so two concurrent `prove` calls against
 /// one `MetalCircuit` cannot be handed the same buffer. Command buffers and encoders,
 /// the two Metal objects that are not thread safe, are created and destroyed inside a

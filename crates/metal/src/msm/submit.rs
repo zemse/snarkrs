@@ -1,11 +1,15 @@
 //! How an encoded batch reaches the device: whole or split into command buffers,
 //! with the memory barrier a concurrent encoder needs between phases.
 
-use metal::objc::{msg_send, sel, sel_impl};
-use metal::{CommandBufferRef, CommandQueueRef, ComputeCommandEncoderRef, MTLDispatchType};
+use objc2_metal::{
+    MTLBarrierScope, MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder, MTLDispatchType,
+};
 use snarkrs_groth16::ProveError;
 
 use super::MetalMsm;
+use crate::mtl::{
+    self, CommandBuffer, CommandQueueRef, ComputeCommandEncoder, ComputeCommandEncoderRef,
+};
 
 /// How a batch reaches the device: one command buffer with a memory barrier between
 /// phases, or split, one command buffer per phase with the accumulation cut into
@@ -34,8 +38,8 @@ pub(super) struct Submission<'q> {
     queue: &'q CommandQueueRef,
     seal: &'q crate::cb::Seal,
     split: bool,
-    cbs: Vec<(&'q CommandBufferRef, crate::cb::Token)>,
-    enc: Option<&'q ComputeCommandEncoderRef>,
+    cbs: Vec<(CommandBuffer, crate::cb::Token)>,
+    enc: Option<ComputeCommandEncoder>,
 }
 
 impl<'q> Submission<'q> {
@@ -50,22 +54,24 @@ impl<'q> Submission<'q> {
     }
 
     /// The open encoder, opening a command buffer if none is.
-    pub(super) fn enc(&mut self) -> &'q ComputeCommandEncoderRef {
-        if let Some(enc) = self.enc {
-            return enc;
+    pub(super) fn enc(&mut self) -> &ComputeCommandEncoderRef {
+        if self.enc.is_none() {
+            let cb = crate::cb::command_buffer(self.queue);
+            let enc = mtl::encoder_with(&cb, MTLDispatchType::Concurrent);
+            mtl::set_label(
+                &enc,
+                if self.split {
+                    "MSM batch piece"
+                } else {
+                    "MSM batch"
+                },
+            );
+            self.enc = Some(enc);
+            // The token is taken here rather than at `close` so the pair is pushed
+            // together; the dispatch that writes it is encoded last, in `close`.
+            self.cbs.push((cb, self.seal.next()));
         }
-        let cb = crate::cb::command_buffer(self.queue);
-        let enc = cb.compute_command_encoder_with_dispatch_type(MTLDispatchType::Concurrent);
-        enc.set_label(if self.split {
-            "MSM batch piece"
-        } else {
-            "MSM batch"
-        });
-        self.enc = Some(enc);
-        // The token is taken here rather than at `close` so the pair is pushed together;
-        // the dispatch that writes it is encoded last, in `close`.
-        self.cbs.push((cb, self.seal.next()));
-        enc
+        self.enc.as_deref().expect("opened above")
     }
 
     /// Everything encoded after this reads what came before.
@@ -83,16 +89,16 @@ impl<'q> Submission<'q> {
         let Some(enc) = self.enc.take() else {
             return Ok(());
         };
-        let (cb, token) = *self
+        let (cb, token) = self
             .cbs
             .last()
             .expect("an open encoder has a command buffer");
-        barrier(enc);
-        self.seal.encode_token(enc, token);
-        enc.end_encoding();
+        barrier(&enc);
+        self.seal.encode_token(&enc, *token);
+        enc.endEncoding();
         cb.commit();
         if self.split {
-            self.seal.wait(cb, token, "MSM batch piece")?;
+            self.seal.wait(cb, *token, "MSM batch piece")?;
         }
         Ok(())
     }
@@ -110,11 +116,5 @@ impl<'q> Submission<'q> {
 
 /// Everything encoded after this on a concurrent encoder reads what came before.
 pub(super) fn barrier(enc: &ComputeCommandEncoderRef) {
-    // SAFETY: `ComputeCommandEncoderRef` is `objc::Message`, and
-    // memoryBarrierWithScope: is a documented MTLComputeCommandEncoder method taking
-    // MTLBarrierScope; MTLBarrierScopeBuffers is 1 << 0. metal-rs 0.29 does not bind
-    // it, so it is called the way `cb` reads the unbound timing properties.
-    unsafe {
-        let () = msg_send![enc, memoryBarrierWithScope: 1u64];
-    }
+    enc.memoryBarrierWithScope(MTLBarrierScope::Buffers);
 }

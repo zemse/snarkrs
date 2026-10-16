@@ -5,7 +5,7 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use metal::Buffer;
+use crate::mtl::Buffer;
 
 use super::window::{window_size_for, Work, RECODE_BITS};
 

@@ -3,10 +3,11 @@
 
 use std::collections::HashMap;
 
-use metal::{Buffer, ComputeCommandEncoderRef, MTLSize};
+use objc2_metal::{MTLBuffer, MTLComputeCommandEncoder, MTLComputePipelineState};
 use snarkrs_groth16::ProveError;
 
 use crate::enc::{dispatch_1d, set_params};
+use crate::mtl::{self, Buffer, ComputeCommandEncoderRef};
 
 use super::inputs::ScalarBuf;
 use super::pool::Pool;
@@ -234,7 +235,7 @@ impl<'a> Plan<'a> {
         // 8 bytes an entry: the bucket row travels with the point index so the
         // segmented accumulation can find run boundaries without recomputing digits.
         let bytes = self.n_windows * self.cap * 8;
-        let entries = match self.lent.filter(|b| b.length() as usize >= bytes) {
+        let entries = match self.lent.filter(|b| b.length() >= bytes) {
             // Not kept: it goes back to its owner, not into the pool.
             Some(b) => b.clone(),
             None => {
@@ -263,50 +264,30 @@ impl<'a> Plan<'a> {
     /// the pool hands back used buffers.
     pub(super) fn encode_zero(&self, msm: &MetalMsm, enc: &ComputeCommandEncoderRef) {
         let rows = self.rows();
-        enc.set_compute_pipeline_state(&msm.pipelines.zero_u32);
-        enc.set_buffer(
-            0,
-            Some(self.counts.as_ref().expect("plan not allocated")),
-            0,
-        );
+        enc.setComputePipelineState(&msm.pipelines.zero_u32);
+        mtl::set_buffer(enc, 0, self.counts.as_ref().expect("plan not allocated"), 0);
         let len = rows as u32;
-        enc.set_bytes(1, 4, (&len as *const u32).cast());
+        set_params(enc, 1, &len);
         dispatch_1d(enc, &msm.pipelines.zero_u32, rows, 256);
     }
 
     pub(super) fn encode_count(&self, msm: &MetalMsm, enc: &ComputeCommandEncoderRef) {
         let p = self.params();
-        enc.set_compute_pipeline_state(&msm.pipelines.count);
-        enc.set_buffer(0, Some(self.scalars), 0);
-        enc.set_buffer(
-            1,
-            Some(self.counts.as_ref().expect("plan not allocated")),
-            0,
-        );
+        enc.setComputePipelineState(&msm.pipelines.count);
+        mtl::set_buffer(enc, 0, self.scalars, 0);
+        mtl::set_buffer(enc, 1, self.counts.as_ref().expect("plan not allocated"), 0);
         set_params(enc, 2, &p);
         dispatch_1d(enc, &msm.pipelines.count, self.n, 64);
     }
 
     pub(super) fn encode_scan(&self, msm: &MetalMsm, enc: &ComputeCommandEncoderRef) {
         let p = self.params();
-        enc.set_compute_pipeline_state(&msm.pipelines.scan);
-        enc.set_buffer(
-            0,
-            Some(self.counts.as_ref().expect("plan not allocated")),
-            0,
-        );
-        enc.set_buffer(
-            1,
-            Some(self.cursor.as_ref().expect("plan not allocated")),
-            0,
-        );
+        enc.setComputePipelineState(&msm.pipelines.scan);
+        mtl::set_buffer(enc, 0, self.counts.as_ref().expect("plan not allocated"), 0);
+        mtl::set_buffer(enc, 1, self.cursor.as_ref().expect("plan not allocated"), 0);
         set_params(enc, 2, &p);
-        let scan_tg = SCAN_TG.min(msm.pipelines.scan.max_total_threads_per_threadgroup() as usize);
-        crate::cb::dispatch_thread_groups(
-            enc,
-            MTLSize::new(self.n_windows as u64, 1, 1),
-            MTLSize::new(scan_tg as u64, 1, 1),
-        );
+        let scan_tg = SCAN_TG.min(msm.pipelines.scan.maxTotalThreadsPerThreadgroup());
+        crate::cb::dispatch_thread_groups(enc, mtl::size(self.n_windows), mtl::size(scan_tg));
     }
 
     /// The scatter, or the `part`-th of its window-range dispatches. The parts write
@@ -325,21 +306,18 @@ impl<'a> Plan<'a> {
         let lo = part * step;
         let hi = (lo + step).min(self.n_windows);
         let p = self.params();
-        enc.set_compute_pipeline_state(&msm.pipelines.scatter);
-        enc.set_buffer(0, Some(self.scalars), 0);
-        enc.set_buffer(
-            1,
-            Some(self.cursor.as_ref().expect("plan not allocated")),
-            0,
-        );
-        enc.set_buffer(
+        enc.setComputePipelineState(&msm.pipelines.scatter);
+        mtl::set_buffer(enc, 0, self.scalars, 0);
+        mtl::set_buffer(enc, 1, self.cursor.as_ref().expect("plan not allocated"), 0);
+        mtl::set_buffer(
+            enc,
             2,
-            Some(self.entries.as_ref().expect("plan not allocated")),
+            self.entries.as_ref().expect("plan not allocated"),
             0,
         );
         set_params(enc, 3, &p);
         let span = [lo as u32, hi as u32];
-        enc.set_bytes(4, 8, span.as_ptr().cast());
+        set_params(enc, 4, &span);
         dispatch_1d(enc, &msm.pipelines.scatter, self.n, 64);
     }
 

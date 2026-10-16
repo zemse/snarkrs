@@ -45,6 +45,8 @@ pub mod fft;
 pub mod kernels;
 #[cfg(target_os = "macos")]
 pub mod msm;
+#[cfg(target_os = "macos")]
+pub mod mtl;
 /// Stages 0 to 4 on the GPU: the CSR gather, the six NTTs, the coset shift and
 /// `H = A*B - C`, thirteen dispatches across four command buffers with the domain
 /// vectors kept resident.
@@ -55,3 +57,6 @@ pub mod stages;
 pub use backend::{MetalBackend, MetalCircuit, PrepareCost};
 #[cfg(target_os = "macos")]
 pub use ceremony::{MetalGroupFft, MetalKeyScale, MetalMsmBackend};
+/// The Metal bindings [`mtl`]'s handles come from, for a caller that builds or inspects one.
+#[cfg(target_os = "macos")]
+pub use objc2_metal;

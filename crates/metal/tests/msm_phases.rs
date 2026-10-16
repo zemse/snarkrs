@@ -12,9 +12,9 @@
 
 use std::time::Instant;
 
-use metal::Device;
 use snarkrs_field::{AffineRepr, CurveGroup, Fr};
 use snarkrs_metal::msm::{Job, JobG1, JobG2, MetalMsm};
+use snarkrs_metal::mtl;
 
 fn median(mut v: Vec<f64>) -> f64 {
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -27,7 +27,7 @@ fn ms(t: Instant) -> f64 {
 
 #[test]
 fn msm_stage_intercept() {
-    let msm = MetalMsm::with_device(Device::system_default().unwrap()).unwrap();
+    let msm = MetalMsm::with_device(mtl::system_default().unwrap()).unwrap();
 
     println!(
         "{:>8}  {:>8}  {:>9}  {:>9}  {:>9}  {:>9}",
