@@ -163,13 +163,10 @@ publish-crates:
 #
 #   make lint                       clippy on every target, native and wasm32, no warnings
 #   make test                       every crate's unit tests, no warnings
-#
-# `block` (under the `metal` crate) trips a future-incompat report nothing here can fix.
 WORKSPACE_FEATURES := $(subst $(comma),$(comma)snarkrs/,snarkrs/$(FEATURES))
 WASM_CRATES := snarkrs-field snarkrs-formats snarkrs-gpu-layout snarkrs-groth16 snarkrs-msm snarkrs-ntt snarkrs-wgpu snarkrs-web
 CI_LOG := target/ci.log
 NO_WARNINGS = 2>&1 | tee $(CI_LOG) && ! grep '^warning' $(CI_LOG)
-export CARGO_FUTURE_INCOMPAT_REPORT_FREQUENCY := never
 
 lint:
 	rustup toolchain install $(RUST_TOOLCHAIN) --profile minimal --component clippy --target wasm32-unknown-unknown --no-self-update
