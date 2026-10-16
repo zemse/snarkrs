@@ -100,7 +100,6 @@ panic = "abort"
 
 [profile.bench]
 inherits = "release"
-panic = "unwind"
 
 [profile.profiling]
 inherits = "release"

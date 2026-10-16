@@ -67,6 +67,7 @@ pub struct CpuNtt {
     /// [`Self::ntt`] receives a `&Domain`, not a prepared table.
     twiddles: TwiddleCache,
     /// Tables for [`Self::coset_scale_bitrev`], keyed by size and shift.
+    #[allow(clippy::type_complexity)]
     coset_tables: RwLock<HashMap<(usize, Fr), Arc<Vec<Fr>>>>,
 }
 
@@ -837,7 +838,7 @@ mod tests {
         // The threshold falls inside this range, so `ntt` takes both of its path choices
         // here. Each path is also driven directly, because `ntt` alone would leave the
         // serial one covering nothing but the bottom of the loop.
-        assert!(2 < PARALLEL_THRESHOLD && PARALLEL_THRESHOLD <= 1usize << 12);
+        const { assert!(2 < PARALLEL_THRESHOLD && PARALLEL_THRESHOLD <= 1usize << 12) };
         let ntt = CpuNtt::new();
         for log in 1..=12u32 {
             let n = 1usize << log;

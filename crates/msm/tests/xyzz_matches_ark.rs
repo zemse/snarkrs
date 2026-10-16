@@ -126,10 +126,10 @@ fn check_group<P: RawCurve>(
 
 #[test]
 fn xyzz_g1_matches_ark() {
-    check_group::<snarkrs_field::g1::Config>("g1", |rng| G1Projective::rand(rng));
+    check_group::<snarkrs_field::g1::Config>("g1", G1Projective::rand);
 }
 
 #[test]
 fn xyzz_g2_matches_ark() {
-    check_group::<snarkrs_field::g2::Config>("g2", |rng| G2Projective::rand(rng));
+    check_group::<snarkrs_field::g2::Config>("g2", G2Projective::rand);
 }

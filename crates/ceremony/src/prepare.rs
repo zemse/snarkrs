@@ -320,6 +320,7 @@ fn mix_pass<F: GlvField>(a: &mut [Xyzz<F>], exp: u32, w: Fr, scale: Option<Fr>) 
     } else {
         SINGLE_PER_TASK
     };
+    #[allow(clippy::type_complexity)]
     let run = |st: &mut glv::BatchState<F>, runs: Vec<(&mut [Xyzz<F>], &mut [Xyzz<F>], usize)>| {
         if batched {
             butterflies(st, runs, w, scale)
@@ -407,6 +408,7 @@ fn butterflies_each<F: GlvField>(
 ///
 /// Every multiplication of the call goes through one [`glv::mul_batch_xyzz`], whose
 /// outputs are affine, so the sum and difference are mixed additions.
+#[allow(clippy::type_complexity)]
 fn butterflies<F: GlvField>(
     st: &mut glv::BatchState<F>,
     mut runs: Vec<(&mut [Xyzz<F>], &mut [Xyzz<F>], usize)>,
@@ -1016,6 +1018,7 @@ fn process_section<P: PrepareCurve>(
 /// The worker's blocks together are smaller than one backend block, so in practice it
 /// finishes during the first backend block or two and `held` never grows to much of the
 /// section.
+#[allow(clippy::type_complexity)]
 fn emit_block<'scope, P: PrepareCurve>(
     cpu: &mut Option<
         std::thread::ScopedJoinHandle<'scope, Result<Vec<Vec<Affine<P>>>, CeremonyError>>,

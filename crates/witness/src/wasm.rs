@@ -427,8 +427,8 @@ impl Session {
                                 "the shared buffer lies outside the module's memory".into(),
                             )
                         })?;
-                    for (l, b) in limbs.iter_mut().zip(bytes.chunks_exact(4)) {
-                        *l = u32::from_le_bytes(b.try_into().unwrap());
+                    for (l, b) in limbs.iter_mut().zip(bytes.as_chunks::<4>().0) {
+                        *l = u32::from_le_bytes(*b);
                     }
                 }
                 _ => {

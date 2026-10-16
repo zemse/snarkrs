@@ -2714,6 +2714,7 @@ mod tests {
         let mut expected_counts = vec![0u32; p.rows()];
         let mut dummy_sums = vec![0i64; p.n_windows * p.dummy_rows];
         let real_rows = p.n_windows * p.n_buckets;
+        #[allow(clippy::needless_range_loop)]
         for w in 0..p.n_windows {
             for (i, scalar) in values.iter().enumerate() {
                 let digit = digits[i][w];

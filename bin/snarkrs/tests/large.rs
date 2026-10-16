@@ -125,16 +125,15 @@ fn every_backend_proves_the_large_artifacts() {
             "UNAVAILABLE: WGPU request must match selected profile"
         );
     }
-    assert!(
-        match s.backend {
-            "cpu" => true,
-            "metal" => cfg!(all(feature = "metal", target_os = "macos")),
-            "wgpu" => cfg!(feature = "wgpu"),
-            "cuda" => cfg!(feature = "cuda"),
-            _ => false,
-        },
-        "UNAVAILABLE: backend not built for this target"
-    );
+    #[allow(clippy::match_like_matches_macro)]
+    let built = match s.backend {
+        "cpu" => true,
+        "metal" => cfg!(all(feature = "metal", target_os = "macos")),
+        "wgpu" => cfg!(feature = "wgpu"),
+        "cuda" => cfg!(feature = "cuda"),
+        _ => false,
+    };
+    assert!(built, "UNAVAILABLE: backend not built for this target");
     let root = std::env::var_os("G16_CONFORMANCE_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/artifacts"));

@@ -271,12 +271,10 @@ pub fn fr_from_words(words: &[u32]) -> Option<Vec<Fr>> {
     }
     Some(
         words
-            .chunks_exact(LIMBS)
-            .map(|c| {
-                let mut v = [0u32; LIMBS];
-                v.copy_from_slice(c);
-                PackedFr { v }.to_fr()
-            })
+            .as_chunks::<LIMBS>()
+            .0
+            .iter()
+            .map(|&v| PackedFr { v }.to_fr())
             .collect(),
     )
 }
@@ -870,6 +868,24 @@ impl GatherAbc {
     }
 }
 
+/// The layout entry for one storage binding.
+///
+/// `pub(crate)` so `crate::pointwise` builds its layout from the same helper: a
+/// `read_only: false` entry and a `var<storage, read>` declaration are not interchangeable
+/// in WebGPU, and having one helper is one fewer place for the two to disagree.
+pub(crate) fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -929,23 +945,5 @@ mod tests {
             assert_eq!(host.signal.len(), 2);
             assert_eq!(host.value.len(), 2 * LIMBS);
         }
-    }
-}
-
-/// The layout entry for one storage binding.
-///
-/// `pub(crate)` so `crate::pointwise` builds its layout from the same helper: a
-/// `read_only: false` entry and a `var<storage, read>` declaration are not interchangeable
-/// in WebGPU, and having one helper is one fewer place for the two to disagree.
-pub(crate) fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::COMPUTE,
-        ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Storage { read_only },
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
-        count: None,
     }
 }

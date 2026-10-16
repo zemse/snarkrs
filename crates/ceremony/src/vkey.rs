@@ -103,7 +103,9 @@ fn fields(zkey: &Path) -> Result<Vec<(&'static str, Value)>, CeremonyError> {
     let n_ic = header.n_public as usize + 1;
     snarkrs_formats::binfile::expect_records(ic_bytes, n_ic, SG1, S_IC)?;
     let ic: Vec<Value> = ic_bytes
-        .chunks_exact(SG1)
+        .as_chunks::<SG1>()
+        .0
+        .iter()
         .map(|b| Ok(g1_json(&snarkrs_formats::binfile::g1(b)?)))
         .collect::<Result<_, CeremonyError>>()?;
 

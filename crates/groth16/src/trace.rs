@@ -96,6 +96,7 @@ impl Trace {
     /// in device memory and reading it down is a deliberate extra round trip, so this takes
     /// an `Option` rather than forcing every caller to pay for it: without it the trace still
     /// carries `h_g1`, which is a digest of the same data through the MSM.
+    #[allow(clippy::too_many_arguments)]
     pub fn build(
         backend: &'static str,
         n_vars: usize,

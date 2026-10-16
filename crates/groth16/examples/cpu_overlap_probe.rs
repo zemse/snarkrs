@@ -16,7 +16,7 @@
 //! across schedules each round: a probe that raced its way to a different proof would
 //! be measuring a bug.
 //!
-//! `cargo run --release -p snarkrs-groth16 --example overlap_probe -- bench/artifacts/csp/sha256_128 ...`
+//! `cargo run --release -p snarkrs-groth16 --example cpu_overlap_probe -- bench/artifacts/csp/sha256_128 ...`
 
 use std::path::Path;
 use std::time::Instant;

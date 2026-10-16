@@ -250,8 +250,10 @@ fn compare(what: &str, got: &[u32], want: &[Fr]) {
         want.len()
     );
     for (i, (g, w)) in got
-        .chunks_exact(LIMBS)
-        .zip(want.chunks_exact(LIMBS))
+        .as_chunks::<LIMBS>()
+        .0
+        .iter()
+        .zip(want.as_chunks::<LIMBS>().0)
         .enumerate()
     {
         assert_eq!(

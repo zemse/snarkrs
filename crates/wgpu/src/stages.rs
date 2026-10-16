@@ -690,12 +690,10 @@ impl WgpuHandle {
             return Err(bad("h_std is not a whole number of elements"));
         }
         Ok(words
-            .chunks_exact(LIMBS)
-            .map(|c| {
-                let mut v = [0u32; LIMBS];
-                v.copy_from_slice(c);
-                PackedScalar { v }.to_fr()
-            })
+            .as_chunks::<LIMBS>()
+            .0
+            .iter()
+            .map(|&v| PackedScalar { v }.to_fr())
             .collect())
     }
 
@@ -716,8 +714,10 @@ impl WgpuHandle {
         // Not `bytemuck::cast_slice`: a `Vec<u8>` is 4-aligned only by the allocator's
         // choice, and `cast_slice` panics if it ever is not. Same allocation either way.
         Ok(raw
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes(c.try_into().expect("chunks_exact(4)")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| u32::from_le_bytes(c))
             .collect())
     }
 }

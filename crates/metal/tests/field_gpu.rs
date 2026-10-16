@@ -163,7 +163,7 @@ impl Gpu {
         let n = a.len();
         let ba = self.shared(a);
         let bb = self.shared(b);
-        let out = self.empty(n * std::mem::size_of::<PackedFr>());
+        let out = self.empty(std::mem::size_of_val(a));
 
         let cb = self.queue.new_command_buffer();
         let enc = cb.new_compute_command_encoder();

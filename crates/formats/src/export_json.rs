@@ -151,7 +151,7 @@ fn write_zkey<W: Write>(file: &BinFile, w: &mut JsonWriter<W>) -> Result<(), Zke
     let s7 = file.unique_section(7)?;
     binfile::expect_records(s7, n_vars, G2_BYTES, 7)?;
     w.begin_array()?;
-    for p in s7.chunks_exact(G2_BYTES) {
+    for p in s7.as_chunks::<G2_BYTES>().0 {
         g2_object(w, p)?;
     }
     w.end()?;
@@ -228,7 +228,7 @@ fn g1_section<W: Write>(
     for _ in 0..holes {
         w.raw("null")?;
     }
-    for p in data.chunks_exact(G1_BYTES) {
+    for p in data.as_chunks::<G1_BYTES>().0 {
         g1_object(w, p)?;
     }
     w.end()?;

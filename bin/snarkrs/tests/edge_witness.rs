@@ -296,7 +296,7 @@ fn a_witness_of_the_wrong_length_is_a_clean_error() {
         let mut too_long = case.witness.clone();
         too_long.push(Fr::one());
         let mut way_too_long = case.witness.clone();
-        way_too_long.extend(std::iter::repeat(Fr::zero()).take(n));
+        way_too_long.extend(std::iter::repeat_n(Fr::zero(), n));
 
         let bad: Vec<(&str, Vec<Fr>)> = vec![
             ("empty", Vec::new()),

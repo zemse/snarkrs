@@ -316,6 +316,7 @@ fn lane_first_cb_cost() {
     for _ in 0..3 {
         run(&reused);
     }
+    #[allow(clippy::type_complexity)]
     let mut rows: Vec<(&str, Vec<f64>, Vec<f64>, Vec<f64>)> =
         ["fresh+write", "reused+write", "reused", "fresh"]
             .into_iter()

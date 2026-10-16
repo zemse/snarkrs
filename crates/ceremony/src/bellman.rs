@@ -482,7 +482,7 @@ pub fn import_bellman(
 
     expect(r.u32()?, domain - 1, "H")?;
     let mut h = Vec::with_capacity(domain);
-    for chunk in r.bytes(SG1 * (domain - 1))?.chunks_exact(SG1) {
+    for chunk in r.bytes(SG1 * (domain - 1))?.as_chunks::<SG1>().0 {
         h.push(g1_from_uncompressed(chunk)?);
     }
     h.push(G1Affine::identity());

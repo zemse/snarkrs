@@ -720,6 +720,7 @@ fn trace_json(trace: snarkrs_groth16::trace::Trace, started: Instant, extra: &st
 /// The `busy` handshake every non-reentrant entry point does. `what` is the caller's own
 /// name, because "a proof is already running" with no name is the least useful thing a
 /// worker with five entry points can say.
+#[allow(clippy::type_complexity)]
 fn claim(what: &str) -> Result<(Rc<WgpuCircuit>, Rc<zeroize::Zeroizing<Vec<Fr>>>), JsError> {
     with_state(|s| {
         if s.busy {

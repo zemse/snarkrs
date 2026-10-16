@@ -115,6 +115,6 @@ fn main() {
     if batches.is_empty() {
         batches = vec![64, 256, 1024, 2048, 4096];
     }
-    run::<snarkrs_field::g1::Config>("G1", &batches, reps, |r| G1Projective::rand(r));
-    run::<snarkrs_field::g2::Config>("G2", &batches, reps, |r| G2Projective::rand(r));
+    run::<snarkrs_field::g1::Config>("G1", &batches, reps, G1Projective::rand);
+    run::<snarkrs_field::g2::Config>("G2", &batches, reps, G2Projective::rand);
 }

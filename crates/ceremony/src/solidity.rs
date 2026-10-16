@@ -52,8 +52,10 @@ pub fn solidity_verifier(zkey: &Path) -> Result<String, CeremonyError> {
     let n_ic = header.n_public as usize + 1;
     snarkrs_formats::binfile::expect_records(ic_bytes, n_ic, SG1, S_IC)?;
     let ic = ic_bytes
-        .chunks_exact(SG1)
-        .map(snarkrs_formats::binfile::g1)
+        .as_chunks::<SG1>()
+        .0
+        .iter()
+        .map(|b| snarkrs_formats::binfile::g1(b))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(render(&header, &ic))
 }

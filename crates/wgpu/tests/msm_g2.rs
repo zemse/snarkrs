@@ -202,8 +202,10 @@ fn run_msm(
         buckets: read_words(b, &pts.buckets),
         spill_rows: read_words(b, &pts.spill_rows),
         results: raw
-            .chunks_exact(4)
-            .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&w| u32::from_le_bytes(w))
             .collect(),
         entries: dplan.entries(),
         rows: dplan.rows(),

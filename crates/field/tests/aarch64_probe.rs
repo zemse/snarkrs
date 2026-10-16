@@ -49,18 +49,18 @@ fn borrowing_sub(a: u64, b: u64, borrow: bool) -> (u64, bool) {
 #[inline(always)]
 fn mont_mul_u128(a: [u64; 4], b: [u64; 4]) -> [u64; 4] {
     let mut t = [0u64; 4];
-    for i in 0..4 {
-        let bi = b[i] as u128;
+    for bi in b {
+        let bi = bi as u128;
         let mut aa = t[0] as u128 + a[0] as u128 * bi;
         let t0 = aa as u64;
         aa >>= 64;
         let m = t0.wrapping_mul(FR_N0);
         let mut c = (t0 as u128 + (m as u128) * (FR_MOD[0] as u128)) >> 64;
         for j in 1..4 {
-            aa = t[j] as u128 + a[j] as u128 * bi + aa;
+            aa += t[j] as u128 + a[j] as u128 * bi;
             let tj = aa as u64;
             aa >>= 64;
-            c = tj as u128 + (m as u128) * (FR_MOD[j] as u128) + c;
+            c += tj as u128 + (m as u128) * (FR_MOD[j] as u128);
             t[j - 1] = c as u64;
             c >>= 64;
         }

@@ -82,12 +82,12 @@ fn check<P: RawCurve + ark_ec::CurveConfig<ScalarField = Fr>>(
 
 #[test]
 fn g1_matches_ark() {
-    check::<snarkrs_field::g1::Config>("G1", |r| G1Projective::rand(r));
+    check::<snarkrs_field::g1::Config>("G1", G1Projective::rand);
 }
 
 #[test]
 fn g2_matches_ark() {
-    check::<snarkrs_field::g2::Config>("G2", |r| G2Projective::rand(r));
+    check::<snarkrs_field::g2::Config>("G2", G2Projective::rand);
 }
 
 fn check_batch<P: RawCurve + ark_ec::CurveConfig<ScalarField = Fr>>(
@@ -144,12 +144,12 @@ fn check_batch<P: RawCurve + ark_ec::CurveConfig<ScalarField = Fr>>(
 
 #[test]
 fn g1_batch_matches_ark() {
-    check_batch::<snarkrs_field::g1::Config>("G1", |r| G1Projective::rand(r));
+    check_batch::<snarkrs_field::g1::Config>("G1", G1Projective::rand);
 }
 
 #[test]
 fn g2_batch_matches_ark() {
-    check_batch::<snarkrs_field::g2::Config>("G2", |r| G2Projective::rand(r));
+    check_batch::<snarkrs_field::g2::Config>("G2", G2Projective::rand);
 }
 
 /// `mul_sum_batch_xyzz_in` over sums of one to three terms: every edge scalar beside random
@@ -257,20 +257,20 @@ fn check_sums<P: RawCurve + ark_ec::CurveConfig<ScalarField = Fr>>(
 
 #[test]
 fn g1_sums_match_ark() {
-    check_sums::<snarkrs_field::g1::Config>("G1", |r| G1Projective::rand(r));
+    check_sums::<snarkrs_field::g1::Config>("G1", G1Projective::rand);
 }
 
 #[test]
 fn g2_sums_match_ark() {
-    check_sums::<snarkrs_field::g2::Config>("G2", |r| G2Projective::rand(r));
+    check_sums::<snarkrs_field::g2::Config>("G2", G2Projective::rand);
 }
 
 #[test]
 fn g1_sum_batch_matches_ark() {
-    check_sum::<snarkrs_field::g1::Config>("G1", |r| G1Projective::rand(r));
+    check_sum::<snarkrs_field::g1::Config>("G1", G1Projective::rand);
 }
 
 #[test]
 fn g2_sum_batch_matches_ark() {
-    check_sum::<snarkrs_field::g2::Config>("G2", |r| G2Projective::rand(r));
+    check_sum::<snarkrs_field::g2::Config>("G2", G2Projective::rand);
 }

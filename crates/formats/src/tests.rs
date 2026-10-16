@@ -229,18 +229,18 @@ fn flatten(c: &Coefficients) -> Vec<(u32, u32, u32, Fr)> {
 }
 
 fn assert_row_ptr(c: &Coefficients, domain_size: usize, totals: &[usize; 2]) {
-    for m in 0..2usize {
+    for (m, &total) in totals.iter().enumerate() {
         assert_eq!(c.row_ptr[m].len(), domain_size + 1, "matrix {m}");
         assert_eq!(c.row_ptr[m][0], 0, "matrix {m}");
         for w in c.row_ptr[m].windows(2) {
             assert!(w[0] <= w[1], "matrix {m} row_ptr is not monotonic");
         }
         assert_eq!(
-            c.row_ptr[m][domain_size] as usize, totals[m],
+            c.row_ptr[m][domain_size] as usize, total,
             "matrix {m} row_ptr tail"
         );
-        assert_eq!(c.signal[m].len(), totals[m], "matrix {m}");
-        assert_eq!(c.value[m].len(), totals[m], "matrix {m}");
+        assert_eq!(c.signal[m].len(), total, "matrix {m}");
+        assert_eq!(c.value[m].len(), total, "matrix {m}");
     }
 }
 
@@ -493,7 +493,7 @@ fn snarkjs_reference_proof_verifies_under_the_parsed_key() {
         }
 
         let out = Bn254::multi_pairing(
-            [(-pi_a).into(), vk.alpha_g1, vk_x.into_affine(), pi_c],
+            [(-pi_a), vk.alpha_g1, vk_x.into_affine(), pi_c],
             [pi_b, vk.beta_g2, vk.gamma_g2, vk.delta_g2],
         );
         assert_eq!(out, PairingOutput::zero(), "{}: pairing check", a.name);

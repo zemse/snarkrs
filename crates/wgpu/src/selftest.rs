@@ -115,6 +115,7 @@ pub enum Battery {
 }
 
 /// The battery, in the order that makes a failure diagnostic.
+#[allow(clippy::await_holding_lock)]
 pub async fn run(backend: &WgpuBackend, battery: Battery) -> Vec<Check> {
     // The guard the module docs rest on, taken here and not in [`guard`] or [`run_json`]:
     // both reach the device through this function, and `exclusive` is a plain

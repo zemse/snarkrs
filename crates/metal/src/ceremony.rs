@@ -1174,6 +1174,7 @@ mod tests {
         Some(CeremonyKernels::new().expect("ceremony kernels"))
     }
 
+    #[allow(clippy::type_complexity)]
     fn check_sealed_ceremony<G: CerGroup>(
         points: &[Xyzz<G::Raw>],
         scalars: &[Fr],

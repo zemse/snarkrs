@@ -79,7 +79,7 @@ mod words {
     /// truncating there would turn a launch-geometry bug into a wrong proof.
     pub fn from_words<T: Packed + Default>(w: &[u32]) -> Option<Vec<T>> {
         let per = core::mem::size_of::<T>() / 4;
-        if w.len() % per != 0 {
+        if !w.len().is_multiple_of(per) {
             return None;
         }
         let mut out = vec![T::default(); w.len() / per];

@@ -204,18 +204,18 @@ fn sub_mod(a: [u64; 4], b: [u64; 4], m: &[u64; 4]) -> [u64; 4] {
 #[inline(always)]
 fn mont_mul(a: [u64; 4], b: [u64; 4], m: &[u64; 4], n0: u64) -> [u64; 4] {
     let mut t = [0u64; 4];
-    for i in 0..4 {
-        let bi = b[i] as u128;
+    for bi in b {
+        let bi = bi as u128;
         let mut aa = t[0] as u128 + a[0] as u128 * bi;
         let t0 = aa as u64;
         aa >>= 64;
         let mm = t0.wrapping_mul(n0);
         let mut c = (t0 as u128 + (mm as u128) * (m[0] as u128)) >> 64;
         for j in 1..4 {
-            aa = t[j] as u128 + a[j] as u128 * bi + aa;
+            aa += t[j] as u128 + a[j] as u128 * bi;
             let tj = aa as u64;
             aa >>= 64;
-            c = tj as u128 + (mm as u128) * (m[j] as u128) + c;
+            c += tj as u128 + (mm as u128) * (m[j] as u128);
             t[j - 1] = c as u64;
             c >>= 64;
         }
@@ -373,6 +373,7 @@ pub trait RawField: Copy + PartialEq + Send + Sync {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RawFq(pub [u64; 4]);
 
+#[allow(clippy::should_implement_trait)]
 impl RawFq {
     pub const ZERO: RawFq = RawFq([0; 4]);
     /// R mod q, the Montgomery representative of 1. Pinned against ark in tests.
@@ -487,6 +488,7 @@ pub struct RawFq2 {
     pub c1: RawFq,
 }
 
+#[allow(clippy::should_implement_trait)]
 impl RawFq2 {
     pub const ZERO: RawFq2 = RawFq2 {
         c0: RawFq::ZERO,
@@ -666,6 +668,7 @@ impl RawField for RawFq2 {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RawFr(pub [u64; 4]);
 
+#[allow(clippy::should_implement_trait)]
 impl RawFr {
     pub const ZERO: RawFr = RawFr([0; 4]);
 

@@ -10,7 +10,7 @@
 //! `h - 1` additions. Under GLV it costs the longer wNAF of the two halves in doublings,
 //! their nonzero digits less one in additions, and the odd-multiple table it builds.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use snarkrs_ceremony::r1cs::R1cs;
 use snarkrs_ceremony::setup::{process_constraints, PointTerm};
@@ -102,7 +102,7 @@ fn line(label: &str, ark: Cost, glv: Cost) {
     );
 }
 
-fn setup(path: &PathBuf) {
+fn setup(path: &Path) {
     let r1cs = R1cs::open(path).expect("r1cs");
     let h = r1cs.header();
     let domain = h.domain_size();

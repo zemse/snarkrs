@@ -186,7 +186,7 @@ mod audit {
             let h = cpu
                 .compute_h(&witness, &mut StageTimings::default())
                 .unwrap();
-            plan("H_g1", &h_bases, &h.to_host().unwrap(), 0, true);
+            plan("H_g1", &h_bases, h.to_host().unwrap(), 0, true);
         }
     }
 }

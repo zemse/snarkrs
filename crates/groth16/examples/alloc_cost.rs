@@ -38,6 +38,7 @@ fn main() {
         .unwrap_or(10);
 
     // (label, general scalars, domain) for the two circuits the profile covers.
+    #[allow(clippy::single_element_loop)]
     for (name, generals, domain) in [("js_8x8_d32", 69372usize, 131072usize)] {
         let c = window_size(generals);
         let ch = window_size(domain);

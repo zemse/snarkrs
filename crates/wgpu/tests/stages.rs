@@ -175,8 +175,10 @@ fn compare(what: &str, got: &[u32], want: &[u32]) {
         want.len()
     );
     for (i, (g, w)) in got
-        .chunks_exact(LIMBS)
-        .zip(want.chunks_exact(LIMBS))
+        .as_chunks::<LIMBS>()
+        .0
+        .iter()
+        .zip(want.as_chunks::<LIMBS>().0)
         .enumerate()
     {
         assert_eq!(
@@ -211,8 +213,10 @@ fn check_both_encodings(what: &str, run: &Run, want: &[Fr], expect_nonzero: bool
     // both pass on an implementation that wrote the same thing into both buffers, and a
     // proof from that is wrong by R and fails verification with nothing else to go on.
     let differ = want_mont
-        .chunks_exact(LIMBS)
-        .zip(want_std.chunks_exact(LIMBS))
+        .as_chunks::<LIMBS>()
+        .0
+        .iter()
+        .zip(want_std.as_chunks::<LIMBS>().0)
         .filter(|(m, s)| m != s)
         .count();
     assert_eq!(

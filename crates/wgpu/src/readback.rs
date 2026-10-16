@@ -299,6 +299,8 @@ impl Seal {
     /// Encodes the copy out to the mappable word and registers its map. Last in `enc`,
     /// before `finish`. A submission whose pass did not call [`Self::dispatch`] gets a pass
     /// of its own here holding only the token, which is what a blit-only readback needs.
+    // `fetch_update` is deprecated for `try_update`, which needs Rust 1.95, above the MSRV.
+    #[allow(deprecated)]
     pub fn close(&self, backend: &WgpuBackend, enc: &mut wgpu::CommandEncoder) -> Sealed {
         let mut epoch = self.armed.swap(0, Ordering::Relaxed);
         if epoch == 0 {

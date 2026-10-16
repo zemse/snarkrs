@@ -275,7 +275,7 @@ fn mixed_probes(cfg: &Config) -> ProbeResult {
 }
 
 fn memory_layout(bytes: usize, passes: usize) -> ProbeResult<(usize, usize, usize)> {
-    if bytes == 0 || bytes % 8 != 0 || passes == 0 {
+    if bytes == 0 || !bytes.is_multiple_of(8) || passes == 0 {
         return Err(
             "memory buffers require positive multiples of eight and positive passes".into(),
         );

@@ -474,7 +474,7 @@ pub fn as_bytes<T: Packed>(items: &[T]) -> &[u8] {
     // the slice is initialised and readable. The result borrows `items`, so the lifetime
     // is the source's.
     unsafe {
-        core::slice::from_raw_parts(items.as_ptr().cast::<u8>(), size_of::<T>() * items.len())
+        core::slice::from_raw_parts(items.as_ptr().cast::<u8>(), std::mem::size_of_val(items))
     }
 }
 
@@ -620,7 +620,7 @@ pub(crate) mod tests {
     fn packed_slices_have_the_declared_stride() {
         assert_eq!(as_bytes(&vec![PackedG1Affine::INFINITY; 5]).len(), 5 * 64);
         assert_eq!(as_bytes(&vec![PackedG2Affine::INFINITY; 5]).len(), 5 * 128);
-        assert_eq!(as_bytes(&vec![PackedFr::ZERO; 5]).len(), 5 * 32);
+        assert_eq!(as_bytes(&[PackedFr::ZERO; 5]).len(), 5 * 32);
         // and the bytes really are the limbs, low word first
         let x = PackedFr::from_fr(&Fr::one());
         assert_eq!(&as_bytes(&[x])[..4], &FR_R_MOD_N[0].to_le_bytes());

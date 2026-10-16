@@ -483,6 +483,7 @@ fn cpu_seconds_per_stage() {
         );
     }
 
+    #[allow(clippy::single_element_loop)]
     for log in [18u32] {
         let n = 1usize << log;
         let domain = Domain::new(n).unwrap();
@@ -496,6 +497,7 @@ fn cpu_seconds_per_stage() {
         );
     }
 
+    #[allow(clippy::single_element_loop)]
     for log in [18u32] {
         let n = 1usize << log;
         let bases: Vec<G1Affine> = walk_points(n, &mut rng);

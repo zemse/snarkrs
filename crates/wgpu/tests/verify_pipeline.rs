@@ -123,8 +123,10 @@ fn compare(what: &str, got: &[u32], want: &[Fr]) {
     let want = fr_words(want);
     assert_eq!(got.len(), want.len(), "{what}: wrong length");
     for (i, (g, w)) in got
-        .chunks_exact(LIMBS)
-        .zip(want.chunks_exact(LIMBS))
+        .as_chunks::<LIMBS>()
+        .0
+        .iter()
+        .zip(want.as_chunks::<LIMBS>().0)
         .enumerate()
     {
         assert_eq!(
@@ -378,8 +380,10 @@ fn h_std_is_h_mont_divided_by_r_in_an_independent_arithmetic() {
 
             let mut differed = 0usize;
             for (i, (m, s)) in mont
-                .chunks_exact(LIMBS)
-                .zip(std.chunks_exact(LIMBS))
+                .as_chunks::<LIMBS>()
+                .0
+                .iter()
+                .zip(std.as_chunks::<LIMBS>().0)
                 .enumerate()
             {
                 let mb = to_big(m);
@@ -546,7 +550,9 @@ fn h_is_a_times_b_minus_c_against_the_three_buffers_the_kernel_was_bound_to() {
         assert_ne!(a, c, "{name}: A and C coincide on the coset");
         assert_ne!(bv, c, "{name}: B and C coincide on the coset");
         let nonzero = a
-            .chunks_exact(LIMBS)
+            .as_chunks::<LIMBS>()
+            .0
+            .iter()
             .filter(|e| e.iter().any(|&x| x != 0))
             .count();
         assert!(

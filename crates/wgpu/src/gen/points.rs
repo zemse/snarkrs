@@ -600,6 +600,7 @@ pub struct GenKnob {
     cell: std::sync::atomic::AtomicU32,
     seed: std::sync::OnceLock<()>,
     name: &'static str,
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     env: &'static str,
     max: u32,
 }

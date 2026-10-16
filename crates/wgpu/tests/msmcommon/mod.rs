@@ -61,8 +61,10 @@ pub fn read_bytes(b: &WgpuBackend, buf: &wgpu::Buffer, bytes: u64) -> Vec<u8> {
 
 pub fn read_words(b: &WgpuBackend, buf: &wgpu::Buffer) -> Vec<u32> {
     read_bytes(b, buf, buf.size())
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&c| u32::from_le_bytes(c))
         .collect()
 }
 

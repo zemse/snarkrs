@@ -812,8 +812,10 @@ fn fr_mont_to_std_matches_the_host_encoder() {
     // which is the swap `tests/stages.rs` documents as producing a proof wrong by a factor
     // of R and nothing else to go on.
     let differ = mont
-        .chunks_exact(LIMBS)
-        .zip(want.chunks_exact(LIMBS))
+        .as_chunks::<LIMBS>()
+        .0
+        .iter()
+        .zip(want.as_chunks::<LIMBS>().0)
         .filter(|(a, c)| a != c)
         .count();
     assert!(

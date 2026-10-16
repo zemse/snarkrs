@@ -139,8 +139,10 @@ fn compare(what: &str, got: &[u32], want: &[Fr]) {
         want.len()
     );
     for (i, (g, w)) in got
-        .chunks_exact(LIMBS)
-        .zip(want.chunks_exact(LIMBS))
+        .as_chunks::<LIMBS>()
+        .0
+        .iter()
+        .zip(want.as_chunks::<LIMBS>().0)
         .enumerate()
     {
         assert_eq!(
@@ -542,7 +544,7 @@ fn the_fused_join_epilogue_writes_h_in_both_encodings() {
         // h_std is the same value out of Montgomery form, which is what a window digit of a
         // Pippenger scalar has to be taken from. Compared against arkworks' own
         // `into_bigint`, not against a second device kernel.
-        for (i, (w, got)) in want_mont.iter().zip(std.chunks_exact(LIMBS)).enumerate() {
+        for (i, (w, got)) in want_mont.iter().zip(std.as_chunks::<LIMBS>().0).enumerate() {
             let want: Vec<u32> = snarkrs_gpu_layout::PackedScalar::from_fr(w).v.to_vec();
             assert_eq!(
                 got,
