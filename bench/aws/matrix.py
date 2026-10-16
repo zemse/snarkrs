@@ -37,13 +37,13 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
-PROFILE = "bench"
+PROFILE = os.environ.get("G16_AWS_PROFILE", "bench")
 REGION = "us-east-1"
-OWNER = "bench-runner"
-KEY_NAME = "agent-us-east-1"
-KEY = Path.home() / ".claude/skills/aws/keys/agent-us-east-1.pem"
-SG = "sg-0123456789abcdef0"
-STOP_ROLE = "arn:aws:iam::123456789012:role/g16-benchmark-stop"
+OWNER = os.environ.get("G16_AWS_OWNER", "bench-runner")
+KEY_NAME = os.environ.get("G16_AWS_KEY", "agent-us-east-1")
+KEY = Path.home() / f".claude/skills/aws/keys/{KEY_NAME}.pem"
+SG = os.environ.get("G16_AWS_SG_ID", "sg-0123456789abcdef0")
+STOP_ROLE = os.environ.get("G16_AWS_STOP_ROLE_ARN", "arn:aws:iam::123456789012:role/g16-benchmark-stop")
 # Canonical's Ubuntu images: 22.04 on x86, 24.04 on Graviton, whose bundle is built on 24.04.
 UBUNTU_OWNER = "099720109477"
 UBUNTU_NAME = {"x86_64": "ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*",

@@ -86,8 +86,8 @@ const LOCAL: &[Case] = &[
 /// quarters of the terms through the device.
 #[rustfmt::skip]
 const PRODUCTION: &[Case] = &[
-    Case { dir: "prod_small_O1",      r1cs: "prod_small.r1cs",      ptau: "ppot_0080_17.ptau", msm_share: "3.8%" },
-    Case { dir: "prod_small_O2",      r1cs: "prod_small.r1cs",      ptau: "ppot_0080_16.ptau", msm_share: "75.8%" },
+    Case { dir: "prod_small_O1", r1cs: "prod_small.r1cs", ptau: "ppot_0080_17.ptau", msm_share: "3.8%" },
+    Case { dir: "prod_small_O2", r1cs: "prod_small.r1cs", ptau: "ppot_0080_16.ptau", msm_share: "75.8%" },
     Case { dir: "prod_large_O1", r1cs: "prod_large.r1cs", ptau: "ppot_0080_20.ptau", msm_share: "4.8%" },
     Case { dir: "prod_large_O2", r1cs: "prod_large.r1cs", ptau: "ppot_0080_18.ptau", msm_share: "74.2%" },
 ];
@@ -241,6 +241,9 @@ fn cpu_and_metal_agree_on_the_production_circuits() {
     };
     let ran = compare(PRODUCTION, Path::new(&builds), "production");
     if g16_bin().is_some_and(|b| has_metal(&b)) {
-        assert!(ran > 0, "G16_PRODUCTION_BUILDS holds none of the four circuits");
+        assert!(
+            ran > 0,
+            "G16_PRODUCTION_BUILDS holds none of the four circuits"
+        );
     }
 }

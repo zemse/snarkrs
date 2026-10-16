@@ -9,7 +9,8 @@ import subprocess
 import time
 
 
-EXPECTED_IDENTITY = "arn:aws:iam::123456789012:user/bench-runner"
+EXPECTED_IDENTITY = (f"arn:aws:iam::{os.environ.get('G16_AWS_ACCOUNT', '123456789012')}"
+                     f":user/{os.environ.get('G16_AWS_OWNER', 'bench-runner')}")
 
 
 def runner_alive(pid):

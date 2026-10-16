@@ -144,7 +144,7 @@ ID=$(aws_ ec2 run-instances --image-id "$AMI" --instance-type "$TYPE" \
   --key-name "$KEY_NAME" --security-group-ids "$SG" \
   --block-device-mappings "[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"VolumeSize\":$VOL_GB,\"VolumeType\":\"gp3\",\"DeleteOnTermination\":true}}]" \
   --instance-initiated-shutdown-behavior stop --user-data "file://$UD" \
-  --tag-specifications "ResourceType=instance,Tags=[{Key=Owner,Value=bench-runner},{Key=Name,Value=g16-cuda-EPHEMERAL},{Key=purpose,Value=$PURPOSE},{Key=idle-minutes,Value=$IDLE_MIN},{Key=max-minutes,Value=$MAX_MIN}]" \
+  --tag-specifications "ResourceType=instance,Tags=[{Key=Owner,Value=$OWNER},{Key=Name,Value=g16-cuda-EPHEMERAL},{Key=purpose,Value=$PURPOSE},{Key=idle-minutes,Value=$IDLE_MIN},{Key=max-minutes,Value=$MAX_MIN}]" \
   --query 'Instances[0].InstanceId' --output text)
 echo "launched: $ID in $REGION"
 RESULT_DIR="$REPO_ROOT/bench/results/aws-$ID"
@@ -161,7 +161,7 @@ if [[ -f "$REPO_ROOT/bench/scripts/watch_aws_bench.py" ]]; then
     > "$RESULT_DIR/local-watchdog.log" 2>&1 < /dev/null &
 fi
 aws_ ec2 wait instance-running --instance-ids "$ID"
-[[ "$(aws_ ec2 describe-instances --instance-ids "$ID" --query "Reservations[0].Instances[0].Tags[?Key=='Owner'].Value | [0]" --output text)" == bench-runner ]]
+[[ "$(aws_ ec2 describe-instances --instance-ids "$ID" --query "Reservations[0].Instances[0].Tags[?Key=='Owner'].Value | [0]" --output text)" == "$OWNER" ]]
 IP=$(aws_ ec2 describe-instances --instance-ids "$ID" --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
 for attempt in {1..60}; do
   if rsh "$IP" 'test -f ~/BOOTSTRAP_DONE && sudo systemctl is-active --quiet g16-watchdog.timer'; then

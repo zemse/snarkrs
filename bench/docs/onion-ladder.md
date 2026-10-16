@@ -27,7 +27,7 @@ Domain = ceil_pow2(constraints + public inputs + outputs + 1). Target about 75% 
 
 ## ptau access
 
-Archive: `/path/to/ppot-archive/ptau`.
+Archive: `$G16_PPOT_ARCHIVE`, default `~/workspace/ppot-archive/ptau`.
 
 - p21/p22 use `ppot_0080_21.ptau` and `ppot_0080_22.ptau`.
 - p23/p24 use prepared `ppot_0080_final.ptau`, power 28, directly.

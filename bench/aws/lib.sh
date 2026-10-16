@@ -19,6 +19,7 @@ BUCKET="${G16_S3_BUCKET:-gpu-snark-bench}"
 KEY_NAME="${G16_AWS_KEY:-g16-cuda-bench}"
 KEY_PATH="$HOME/.ssh/${KEY_NAME}.pem"
 SG_NAME="${G16_AWS_SG:-g16-cuda-bench-sg}"
+OWNER="${G16_AWS_OWNER:-bench-runner}"
 PURPOSE=groth16-cuda-benchmark
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

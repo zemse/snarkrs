@@ -10,8 +10,8 @@ import subprocess
 import sys
 
 
-ACCOUNT = "123456789012"
-EXPECTED_IDENTITY = f"arn:aws:iam::{ACCOUNT}:user/bench-runner"
+ACCOUNT = os.environ.get("G16_AWS_ACCOUNT", "123456789012")
+EXPECTED_IDENTITY = f"arn:aws:iam::{ACCOUNT}:user/{os.environ.get('G16_AWS_OWNER', 'bench-runner')}"
 TARGET = "arn:aws:scheduler:::aws-sdk:ec2:stopInstances"
 COMMAND_TIMEOUT = 30
 

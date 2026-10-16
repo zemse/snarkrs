@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Opt-in real EC2 shutdown tests. Preserve the instance and its EBS volume."""
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -11,8 +12,11 @@ import aws_stop_deadline as deadline
 
 ROOT = Path(__file__).resolve().parents[2]
 REGION = "us-east-1"
-ROLE = "arn:aws:iam::123456789012:role/g16-benchmark-stop"
-KEY = Path.home() / ".claude/skills/aws/keys/agent-us-east-1.pem"
+ROLE = os.environ.get("G16_AWS_STOP_ROLE_ARN", f"arn:aws:iam::{deadline.ACCOUNT}:role/g16-benchmark-stop")
+OWNER = os.environ.get("G16_AWS_OWNER", "bench-runner")
+KEY_NAME = os.environ.get("G16_AWS_KEY", "agent-us-east-1")
+SG = os.environ.get("G16_AWS_SG_ID", "sg-0123456789abcdef0")
+KEY = Path.home() / f".claude/skills/aws/keys/{KEY_NAME}.pem"
 OUT = ROOT / "target/aws-bundles/shutdown-live"
 
 
@@ -84,23 +88,23 @@ def main():
             observed = aws("ec2", "describe-instances", "--instance-ids", candidate)["Reservations"][0]["Instances"][0]
             tags = {t["Key"]: t["Value"] for t in observed.get("Tags", [])}
             if (observed["State"]["Name"] != "stopped" or observed["InstanceType"] != "t3.micro" or
-                    tags.get("Owner") != "bench-runner" or tags.get("Name") != "g16-shutdown-test-EPHEMERAL"):
+                    tags.get("Owner") != OWNER or tags.get("Name") != "g16-shutdown-test-EPHEMERAL"):
                 raise RuntimeError("resume requires a stopped owned t3.micro shutdown-test instance")
             instance = candidate
             aws("ec2", "start-instances", "--instance-ids", instance)
         else:
             launched = aws("ec2", "run-instances", "--image-id", "ami-062944a84867f2386",
-                           "--instance-type", "t3.micro", "--key-name", "agent-us-east-1",
-                           "--security-group-ids", "sg-0123456789abcdef0",
+                           "--instance-type", "t3.micro", "--key-name", KEY_NAME,
+                           "--security-group-ids", SG,
                            "--instance-initiated-shutdown-behavior", "stop",
                            "--block-device-mappings", '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":8,"VolumeType":"gp3","DeleteOnTermination":false}}]',
-                           "--tag-specifications", "ResourceType=instance,Tags=[{Key=Owner,Value=bench-runner},{Key=Name,Value=g16-shutdown-test-EPHEMERAL}]")
+                           "--tag-specifications", f"ResourceType=instance,Tags=[{{Key=Owner,Value={OWNER}}},{{Key=Name,Value=g16-shutdown-test-EPHEMERAL}}]")
             instance = launched["Instances"][0]["InstanceId"]
             (OUT / "instance.json").write_text(json.dumps(launched, indent=2))
         arm(8 if guest_only else 4, "initial" if guest_only else "cloud")
         wait("running")
         ready()
-        assert {t["Key"]: t["Value"] for t in state()["Tags"]}["Owner"] == "bench-runner"
+        assert {t["Key"]: t["Value"] for t in state()["Tags"]}["Owner"] == OWNER
         if not guest_only:
             ssh("systemctl is-active g16-watchdog.timer || true; test ! -e /run/systemd/shutdown/scheduled")
             wait("stopped", 420)
