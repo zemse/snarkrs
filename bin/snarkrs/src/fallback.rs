@@ -123,6 +123,13 @@ pub fn prove_with_fallback<R: ark_std::rand::RngCore + ark_std::rand::CryptoRng>
 
 #[cfg(test)]
 mod tests {
+    mod resources {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test-support/resources.rs"
+        ));
+    }
+
     use super::*;
     use ark_std::rand::{rngs::StdRng, SeedableRng};
     use snarkrs_field::{G1Projective, PrimeGroup};
@@ -208,18 +215,20 @@ mod tests {
         }
     }
 
-    fn tiny() -> PathBuf {
+    fn tiny(test: &str) -> Option<PathBuf> {
         let dir = std::env::var_os("G16_ARTIFACTS")
             .map(|root| PathBuf::from(root).join("tiny_mul"))
             .unwrap_or_else(|| {
                 Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/artifacts/tiny_mul")
             });
-        assert!(
-            dir.join("circuit.zkey").is_file(),
-            "tiny_mul fixture required: {}",
-            dir.display()
-        );
-        dir
+        if !dir.join("circuit.zkey").is_file() {
+            resources::skip(format_args!(
+                "{test}: no tiny_mul fixture at {}",
+                dir.display()
+            ));
+            return None;
+        }
+        Some(dir)
     }
 
     fn cpu(dir: &Path) -> Box<dyn PreparedCircuit> {
@@ -275,7 +284,9 @@ mod tests {
 
     #[test]
     fn replacement_must_be_cpu_and_bind_the_original_statement() {
-        let dir = tiny();
+        let Some(dir) = tiny("replacement_must_be_cpu_and_bind_the_original_statement") else {
+            return;
+        };
         let w = Witness::load(&dir.join("circuit.wtns")).unwrap().0;
         for case in 0..17 {
             let circuit = faulty(&dir, "faulty", 2);
@@ -329,7 +340,10 @@ mod tests {
 
     #[test]
     fn factory_and_cpu_proof_errors_never_report_success_or_retry_cpu() {
-        let dir = tiny();
+        let Some(dir) = tiny("factory_and_cpu_proof_errors_never_report_success_or_retry_cpu")
+        else {
+            return;
+        };
         let w = Witness::load(&dir.join("circuit.wtns")).unwrap().0;
         for case in 0..3 {
             let circuit = faulty(&dir, "faulty", 2);
@@ -377,7 +391,9 @@ mod tests {
 
     #[test]
     fn one_fault_is_absorbed_by_the_retry_and_two_by_the_cpu() {
-        let dir = tiny();
+        let Some(dir) = tiny("one_fault_is_absorbed_by_the_retry_and_two_by_the_cpu") else {
+            return;
+        };
         let w = Witness::load(&dir.join("circuit.wtns")).unwrap().0;
         let backend = "faulty";
 
@@ -424,7 +440,9 @@ mod tests {
     /// again on a retry, so it fails at once and the CPU is never built.
     #[test]
     fn a_deterministic_error_is_not_retried() {
-        let dir = tiny();
+        let Some(dir) = tiny("a_deterministic_error_is_not_retried") else {
+            return;
+        };
         let mut w = Witness::load(&dir.join("circuit.wtns")).unwrap().0;
         let (out, steps, built) = run(Fault::Key, 1, &w, &dir);
         let e = out.unwrap_err();
@@ -455,7 +473,10 @@ mod tests {
     /// too and the device is not blamed.
     #[test]
     fn an_unsatisfying_witness_fails_on_the_cpu_too_and_blames_no_device() {
-        let dir = tiny();
+        let Some(dir) = tiny("an_unsatisfying_witness_fails_on_the_cpu_too_and_blames_no_device")
+        else {
+            return;
+        };
         let mut w = Witness::load(&dir.join("circuit.wtns")).unwrap().0;
         let last = w.len() - 1;
         w[last] += Fr::from(1u64);
