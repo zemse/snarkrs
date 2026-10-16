@@ -8,7 +8,7 @@
 //
 // Compiled at run time by NVRTC, concatenated after `bn254_fr.cuh`, which supplies the
 // u32/u64 typedefs and, behind `G16_FF_PTX`, the inline-PTX Montgomery round. NVRTC has
-// no filesystem, so there is no `#include` anywhere here; snarkrs_gpu_kernels assembles the
+// no filesystem, so there is no `#include` anywhere here; `kernels.rs` assembles the
 // units and the `#ifndef` guards make the concatenation safe.
 //
 // ============================================================================

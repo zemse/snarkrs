@@ -8,7 +8,6 @@ members = [
     "crates/groth16",
     "crates/ceremony",
     "crates/gpu-layout",
-    "crates/gpu-kernels",
     "crates/metal",
     "crates/cuda",
     "crates/wgpu",
@@ -84,7 +83,6 @@ snarkrs-msm   = { path = "crates/msm", version = "0.1.0" }
 snarkrs-groth16  = { path = "crates/groth16", version = "0.1.0" }
 snarkrs-ceremony = { path = "crates/ceremony", version = "0.1.0" }
 snarkrs-gpu-layout = { path = "crates/gpu-layout", version = "0.1.0" }
-snarkrs-gpu-kernels = { path = "crates/gpu-kernels", version = "0.1.0" }
 snarkrs-metal = { path = "crates/metal", version = "0.1.0" }
 snarkrs-cuda  = { path = "crates/cuda", version = "0.1.0" }
 snarkrs-wgpu  = { path = "crates/wgpu", version = "0.1.0" }

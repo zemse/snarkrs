@@ -868,7 +868,7 @@ mod tests {
     }
 
     /// The FFT unit must never carry the MSM entry points, which is the whole reason it
-    /// exists as a unit; see `snarkrs_gpu_kernels::unit_fft`.
+    /// exists as a unit; see `kernels::unit_fft`.
     #[test]
     fn the_fft_unit_compiles_no_msm_kernels() {
         let unit = kernels::unit_fft();

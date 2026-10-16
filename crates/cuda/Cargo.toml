@@ -30,7 +30,6 @@ snarkrs-field.workspace = true
 snarkrs-formats.workspace = true
 snarkrs-groth16.workspace = true
 snarkrs-gpu-layout.workspace = true
-snarkrs-gpu-kernels.workspace = true
 # Direct because `ceremony` implements one of its traits, the same reason snarkrs-metal
 # declares it.
 snarkrs-msm.workspace = true

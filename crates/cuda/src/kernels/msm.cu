@@ -7,7 +7,7 @@
 // This file is compiled at run time by NVRTC, concatenated AFTER `bn254_fr.cuh` and
 // `bn254_curve.cuh`, which supply `Fr`, the two curve fields and the point arithmetic.
 // NVRTC has no filesystem, so there is no `#include` anywhere here;
-// snarkrs_gpu_kernels::unit_msm pastes the three sources together and the `#ifndef` guards
+// kernels::unit_msm pastes the three sources together and the `#ifndef` guards
 // make that safe.
 //
 // WHAT THIS FILE DECIDES, AND WHY

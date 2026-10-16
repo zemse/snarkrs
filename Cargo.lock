@@ -2083,7 +2083,6 @@ dependencies = [
  "rayon",
  "snarkrs-field",
  "snarkrs-formats",
- "snarkrs-gpu-kernels",
  "snarkrs-gpu-layout",
  "snarkrs-groth16",
  "snarkrs-msm",
@@ -2117,10 +2116,6 @@ dependencies = [
  "thiserror",
  "zeroize",
 ]
-
-[[package]]
-name = "snarkrs-gpu-kernels"
-version = "0.1.0"
 
 [[package]]
 name = "snarkrs-gpu-layout"

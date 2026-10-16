@@ -4,7 +4,7 @@
 //! that splits `k` is the host's problem: the twiddles are powers of a fixed root, so the
 //! whole table is decomposed here and a thread never runs the lattice at all. The kernel
 //! twins that read the layout are `pt_mul_glv` in `crates/metal/src/shaders/fft.metal` and in
-//! `crates/gpu-kernels/src/kernels/fft.cu`, and each backend keeps a test that greps its own
+//! `crates/cuda/src/kernels/fft.cu`, and each backend keeps a test that greps its own
 //! kernel source for `GLV_WORDS`, `GLV_RECODE_BITS` and `FQ_BETA`, so the three copies of
 //! the constants cannot drift silently.
 //!

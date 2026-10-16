@@ -3,7 +3,7 @@
 //! # One definition, four languages
 //!
 //! Rust here, MSL in `crates/metal/src/shaders/bn254_fr.metal`, CUDA C in
-//! `crates/gpu-kernels/src/kernels/bn254_fr.cuh`, and the WGSL that `crates/wgpu/src/gen`
+//! `crates/cuda/src/kernels/bn254_fr.cuh`, and the WGSL that `crates/wgpu/src/gen`
 //! emits. Every `#[repr(C)]` type below has a byte-for-byte twin on each of those sides.
 //! Metal and CUDA retype the constants as kernel text, so each kernel side carries a
 //! `static_assert` on `sizeof` and each of those two backends keeps a test that greps its

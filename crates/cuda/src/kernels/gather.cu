@@ -1,7 +1,7 @@
 // Stage 0: the CSR coefficient gather, plus the C matrix that snarkjs never stores.
 //
 // Twin of crates/metal/src/shaders/gather.metal. Depends on bn254_fr.cuh being
-// concatenated ahead of this file by snarkrs_gpu_kernels::unit_stages; it carries no
+// concatenated ahead of this file by kernels::unit_stages; it carries no
 // #include of its own because NVRTC has no filesystem.
 //
 // ============================================================================
