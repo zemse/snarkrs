@@ -13,18 +13,20 @@
 //! gigabyte of scratch for one job, on a machine that may have 8 GB for everything.
 //!
 //! A zero-byte request is not a valid `MTLBuffer` either, so a buffer whose `length` is 0
-//! is refused the same way.
+//! is refused the same way. A request above the device's `maxBufferLength` is refused
+//! before it reaches the driver, so the error names the limit rather than only the size.
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
-use objc2_metal::{MTLBuffer, MTLResourceOptions};
+use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 use snarkrs_groth16::ProveError;
 
 use crate::mtl::{Buffer, DeviceRef};
 
 /// `bytes` of shared storage, zeroed by the driver.
 pub(crate) fn shared(device: &DeviceRef, bytes: usize) -> Result<Buffer, ProveError> {
+    fits(device, bytes)?;
     checked(
         crate::mtl::buffer(device, bytes, MTLResourceOptions::StorageModeShared),
         bytes,
@@ -38,6 +40,7 @@ pub(crate) fn shared_with_data(
     src: *const c_void,
     bytes: usize,
 ) -> Result<Buffer, ProveError> {
+    fits(device, bytes)?;
     let src = NonNull::new(src.cast_mut()).expect("a buffer copied from a null pointer");
     // SAFETY: the caller's contract above.
     let buf = unsafe {
@@ -67,6 +70,17 @@ pub(crate) fn scrub(buf: &Buffer) {
         unsafe { core::ptr::write_bytes((at + lo) as *mut u8, 0, n) };
     });
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
+fn fits(device: &DeviceRef, bytes: usize) -> Result<(), ProveError> {
+    let max = device.maxBufferLength();
+    if bytes > max {
+        return Err(ProveError::Backend {
+            backend: "metal",
+            reason: format!("a {bytes}-byte shared buffer is over the device's {max}-byte limit"),
+        });
+    }
+    Ok(())
 }
 
 fn checked(buf: Option<Buffer>, bytes: usize) -> Result<Buffer, ProveError> {
@@ -124,4 +138,55 @@ pub(crate) fn release<T: Copy>(mut v: Vec<T>) {
         }
     }
     drop(v);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_request_over_max_buffer_length_is_refused() {
+        let device = crate::mtl::system_default().expect("no Metal device");
+        let max = device.maxBufferLength();
+        for bytes in [max + 1, usize::MAX] {
+            let err = shared(&device, bytes).err().expect("refused");
+            assert!(
+                matches!(
+                    err,
+                    ProveError::Backend {
+                        backend: "metal",
+                        ..
+                    }
+                ),
+                "{err}"
+            );
+            // Never read: the size check refuses first.
+            let src = [0u8; 4];
+            let err = shared_with_data(&device, src.as_ptr().cast(), bytes)
+                .err()
+                .expect("refused");
+            assert!(
+                matches!(
+                    err,
+                    ProveError::Backend {
+                        backend: "metal",
+                        ..
+                    }
+                ),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ordinary_request_is_allocated() {
+        let device = crate::mtl::system_default().expect("no Metal device");
+        assert_eq!(shared(&device, 4096).unwrap().length(), 4096);
+        let src = [7u8; 64];
+        let buf = shared_with_data(&device, src.as_ptr().cast(), src.len()).unwrap();
+        assert_eq!(buf.length(), 64);
+        // SAFETY: a fresh shared buffer of 64 bytes, which no command buffer holds.
+        let got = unsafe { core::slice::from_raw_parts(buf.contents().cast::<u8>().as_ptr(), 64) };
+        assert_eq!(got, src);
+    }
 }
