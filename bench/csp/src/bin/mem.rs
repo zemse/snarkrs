@@ -1,9 +1,9 @@
 //! One proof, one process, then exit: the shape `/usr/bin/time -l` can measure.
 //!
 //! Peak RSS is a property of the whole process, so anything else this binary did would be
-//! folded into the number. It therefore parses three arguments, proves once, and drops
-//! the proof on the floor without verifying it - the bench driver already established
-//! that the same proof verifies.
+//! folded into the number. It therefore parses its arguments, proves once and exits. The
+//! prove is the checked one, so the proof is self-verified inside the measured process,
+//! the same as in the timing driver's `prove_ms`.
 
 use anyhow::Result;
 use clap::Parser;

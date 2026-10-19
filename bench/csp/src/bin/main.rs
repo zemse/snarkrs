@@ -52,6 +52,10 @@ struct BenchArgs {
     /// Restrict to one input size. Default: every size the target defines.
     #[arg(long)]
     input_size: Option<usize>,
+    /// Also check each warm-up proof with `snarkjs groth16 verify` at this path, against
+    /// the `vkey.json` and `public.json` that `artifacts` writes. A reject fails the run.
+    #[arg(long, value_name = "BIN")]
+    snarkjs: Option<PathBuf>,
 }
 
 #[derive(clap::Args)]
@@ -110,6 +114,7 @@ fn bench(a: BenchArgs) -> Result<()> {
         out_dir: &a.out_dir,
         mem_reps: a.mem_reps,
         mem_bin: &mem_bin,
+        snarkjs: a.snarkjs.as_deref(),
     };
 
     println!(

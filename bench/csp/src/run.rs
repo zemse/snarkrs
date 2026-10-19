@@ -30,6 +30,8 @@ pub struct Config<'a> {
     pub mem_reps: usize,
     /// The single-shot prover `mem_reps` runs. Beside this binary unless overridden.
     pub mem_bin: &'a Path,
+    /// A `snarkjs` to check each warm-up proof with, outside the timed region. None skips it.
+    pub snarkjs: Option<&'a Path>,
 }
 
 /// One timed iteration, split by phase.
@@ -170,6 +172,50 @@ fn tempdir(variant: Variant) -> Result<std::path::PathBuf> {
     Ok(dir)
 }
 
+/// `snarkjs groth16 verify` on `proof`, against the `vkey.json` and `public.json` that
+/// `snarkrs-csp artifacts` wrote. Our verifier shares our encoders, so it cannot see an
+/// encoding error made the same way on both sides; snarkjs can. A rejected proof is left
+/// on disk and its path is in the error.
+fn snarkjs_verify(
+    bin: &Path,
+    variant: Variant,
+    artifacts: &Path,
+    proof: &snarkrs_groth16::Proof,
+) -> Result<()> {
+    let dir = artifacts.join(variant.name());
+    let (vkey, public) = (dir.join("vkey.json"), dir.join("public.json"));
+    for f in [&vkey, &public] {
+        anyhow::ensure!(
+            f.is_file(),
+            "{} missing; run snarkrs-csp artifacts",
+            f.display()
+        );
+    }
+    let tmp = tempdir(variant)?;
+    let proof_path = tmp.join("proof.json");
+    std::fs::write(&proof_path, snarkrs_groth16::json::proof_to_string(proof))?;
+    let out = std::process::Command::new(bin)
+        .args(["groth16", "verify"])
+        .arg(&vkey)
+        .arg(&public)
+        .arg(&proof_path)
+        .output()
+        .with_context(|| format!("{}: running {}", variant.name(), bin.display()))?;
+    // snarkjs 0.7 exits 1 on a reject, but only the `OK!` line says it actually checked.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    anyhow::ensure!(
+        out.status.success() && stdout.contains("OK!"),
+        "{}: snarkjs did not accept {} ({}): {}{}",
+        variant.name(),
+        proof_path.display(),
+        out.status,
+        stdout.trim(),
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    std::fs::remove_dir_all(&tmp).ok();
+    Ok(())
+}
+
 fn mean(xs: &[Duration]) -> Duration {
     Duration::from_nanos((xs.iter().map(|d| d.as_nanos()).sum::<u128>() / xs.len() as u128) as u64)
 }
@@ -195,6 +241,9 @@ pub fn variant(variant: Variant, cfg: &Config) -> Result<(Metrics, Breakdown)> {
     let pk = ProvingKey::load(&zkey)?;
     verify(&pk.vk, &public, &proof)
         .with_context(|| format!("{}: our own verifier rejected the proof", variant.name()))?;
+    if let Some(snarkjs) = cfg.snarkjs {
+        snarkjs_verify(snarkjs, variant, cfg.artifacts, &proof)?;
+    }
     let n_constraints = num_constraints(&pk);
     let proof_size = snarkrs_groth16::json::proof_to_string(&proof).len()
         + snarkrs_groth16::json::public_to_string(&public).len();

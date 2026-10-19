@@ -15,7 +15,11 @@ Upstream: <https://github.com/ethereum/csp-benchmarks>.
 bench/scripts/csp-fetch.sh      # once: 3.6 GB of published zkeys, checksum verified
 bench/scripts/csp-bench.sh      # every backend this build has, then the comparison
 bench/scripts/csp-bench.sh --backend cpu --reps 5 --mem-reps 3     # a quicker pass
+SNARKJS_VERIFY=1 bench/scripts/csp-bench.sh --target sha256 --input-size 128
 ```
+
+`--target` and `--input-size` restrict the run to matching variants. `SNARKJS_VERIFY=1`
+adds the independent check described under submission readiness.
 
 `csp-fetch.sh` also clones the upstream circuit sources into `bench/vendor`, which is where
 `build.rs` reads the witness generators from. Nothing under `bench/vendor` or
@@ -72,6 +76,7 @@ Record the actual arithmetic mode of the binary that produced the row.
 `prove`, so point/key validation is inside `zkey_load_ms` and proof self-verification is
 inside `prove_ms`. The memory binary also uses checked `prove`. The driver separately
 verifies the warm-up proof before reporting timings; that is not an independent oracle.
+`SNARKJS_VERIFY=1` adds one, outside the timed region.
 
 **The macOS allocator.** `snarkrs-csp-mem` attempts to re-exec with `MallocLargeCache=0`
 before generating the witness. An existing value of `MallocLargeCache` is respected, and
@@ -107,11 +112,15 @@ keys. Historical end-to-end results do not establish current readiness.
   `feat` for the backend. Do not put `metal` into `acceleration` or reuse a zkVM value to
   imply GPU support. Agree GPU reporting with upstream before submitting; no schema
   acceptance is established here.
-* **Independent verification is still manual.** There is no CSP snarkjs hook. The backlog
-  records manual acceptance for `poseidon_2`, `sha256_128` and `keccak_128` during bring-up,
-  not oracle coverage of all sixteen current variants. A future hook should check a fresh
-  proof against the published vkey, outside the timed region, and fail closed on verifier
-  errors. Exporting `vkey.json` from the zkey is not itself an independent proof check.
+* **Independent verification is opt-in.** With `SNARKJS_VERIFY=1`, `csp-bench.sh` fails
+  up front if `snarkjs` is not on PATH, runs `snarkrs-csp artifacts` for the selected
+  variants, then passes `--snarkjs` to `bench`. Each variant's warm-up proof is written
+  as snarkjs JSON and checked with `snarkjs groth16 verify` against that variant's
+  `vkey.json` and `public.json`, after our own verifier and before any timed iteration.
+  A reject, a nonzero exit or a missing `OK!` fails the run, names the variant and leaves
+  the proof on disk. The `vkey.json` is exported from the zkey by our ceremony code, not
+  by snarkjs, so the check is independent of our verifier and proof encoder but not of
+  our key decoding. It is off by default; a row without it has only the internal checks.
 * **Hardware and protocol need disclosure.** Keep the machine, revision, build features,
   key release/checksums, witness arithmetic mode, sampling counts, validation policy and
   effective allocator settings beside any submitted rows. Laptop results are not
