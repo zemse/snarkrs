@@ -474,24 +474,7 @@ impl FftKernels {
     /// own last round and no scaling round follows.
     fn ifft_many<G: FftGroup>(&self, blocks: &mut [&mut [Xyzz<G::Raw>]]) -> Result<(), ProveError> {
         for a in blocks.iter() {
-            let n = a.len();
-            if n <= 1 {
-                continue;
-            }
-            if !n.is_power_of_two() {
-                return Err(bad(format!(
-                    "group ifft over {}: {n} points is not a power of two",
-                    G::OP
-                )));
-            }
-            if n.trailing_zeros() > Fr::TWO_ADICITY {
-                return Err(bad(format!(
-                    "group ifft over {}: 2^{} is past the {}-bit two-adic subgroup",
-                    G::OP,
-                    n.trailing_zeros(),
-                    Fr::TWO_ADICITY
-                )));
-            }
+            check_block_len(G::OP, a.len())?;
         }
 
         let pair = G::kernels(self);
@@ -717,6 +700,27 @@ impl FftKernels {
     }
 }
 
+/// Refuses a block length the transform has no subgroup for, before anything touches the
+/// device. 0 and 1 pass: those blocks are their own transform and are skipped.
+fn check_block_len(op: &str, n: usize) -> Result<(), ProveError> {
+    if n <= 1 {
+        return Ok(());
+    }
+    if !n.is_power_of_two() {
+        return Err(bad(format!(
+            "group ifft over {op}: {n} points is not a power of two"
+        )));
+    }
+    if n.trailing_zeros() > Fr::TWO_ADICITY {
+        return Err(bad(format!(
+            "group ifft over {op}: 2^{} is past the {}-bit two-adic subgroup",
+            n.trailing_zeros(),
+            Fr::TWO_ADICITY
+        )));
+    }
+    Ok(())
+}
+
 /// `i` with its low `bits` bits reversed, the permutation `bit_reverse` (prepare.rs:256)
 /// applies by swapping in place.
 #[inline]
@@ -878,5 +882,27 @@ mod tests {
             unit.contains("jac_dbl"),
             "the FFT unit is missing the Jac family"
         );
+    }
+
+    /// The host-side arms of `ifft_many`, which need no device: 0 and 1 points pass
+    /// through, anything else must be a power of two inside Fr's two-adic subgroup.
+    #[test]
+    fn a_bad_block_length_is_refused() {
+        for n in [0, 1, 2, 4, 1 << Fr::TWO_ADICITY] {
+            assert!(check_block_len("G1", n).is_ok(), "{n} points was refused");
+        }
+        for n in [3, 6, 12, (1 << 20) + 1] {
+            let Err(ProveError::Backend { backend, reason }) = check_block_len("G1", n) else {
+                panic!("{n} points was accepted");
+            };
+            assert_eq!(backend, "cuda");
+            assert!(reason.contains("not a power of two"), "{reason}");
+        }
+        let n = 1usize << (Fr::TWO_ADICITY + 1);
+        let Err(ProveError::Backend { reason, .. }) = check_block_len("G2", n) else {
+            panic!("2^{} points was accepted", Fr::TWO_ADICITY + 1);
+        };
+        assert!(reason.contains("G2"), "{reason}");
+        assert!(reason.contains("two-adic subgroup"), "{reason}");
     }
 }
