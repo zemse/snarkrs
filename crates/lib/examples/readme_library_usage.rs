@@ -3,9 +3,15 @@
 //! A README example that does not build is worse than no example: it is read as a promise
 //! about the API. This is an example rather than a doctest because it needs the `metal`
 //! feature, and it exists so `cargo build --examples --features metal` fails the moment a
-//! snippet and the real API disagree. The witness snippet also needs `witness-wasm`.
+//! snippet and the real API disagree. The witness snippet also needs `witness-wasm`. Off macOS
+//! `metal` is empty, so there it compiles to nothing.
+#[cfg(target_os = "macos")]
 use snarkrs_lib::{prove, verify, Backend, ProvingKey, StageTimings, Witness};
 
+#[cfg(not(target_os = "macos"))]
+fn main() {}
+
+#[cfg(target_os = "macos")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse once. On a GPU backend `prepare` is also where the key is uploaded, so hold the
     // prepared circuit and prove against it repeatedly: that is exactly the difference
@@ -36,7 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// "witness from memory": the witness goes from the calculator to the prover as `Vec<Fr>`,
 /// with no `.wtns` in between.
-#[cfg(feature = "witness-wasm")]
+#[cfg(all(target_os = "macos", feature = "witness-wasm"))]
 fn witness_from_memory() -> Result<(), Box<dyn std::error::Error>> {
     use snarkrs_lib::witness::{Input, WitnessCalculator};
 
