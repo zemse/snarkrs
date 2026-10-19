@@ -7,8 +7,8 @@
 //!
 //! # What `prepare` costs, and where it goes
 //!
-//! On unified memory there is no PCIe hop, so "upload" here means one `memcpy` into a
-//! `StorageModeShared` buffer, at whatever rate a cold page walk allows. The cost that
+//! On unified memory there is no PCIe hop, so "upload" here means one pack straight into
+//! a `StorageModeShared` buffer, at whatever rate a cold page walk allows. The cost that
 //! actually dominates is not the copy, it is the two runtime MSL compiles: the field
 //! prelude plus the stage kernels, and the field prelude again plus the MSM kernels.
 //! Both are paid once per process in [`MetalBackend::new`], never per key and never per

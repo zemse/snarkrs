@@ -6,11 +6,12 @@
 //! 1. **MSL compiles at runtime.** `MTLDevice::newLibraryWithSource` uses the Metal
 //!    runtime compiler that ships with the OS, so no offline `metal` toolchain download
 //!    is needed. Kernels are embedded as source strings and compiled once at `prepare`.
-//! 2. **Memory is unified.** `newBufferWithBytesNoCopy` wraps an mmap'd zkey with zero
-//!    copies, but it needs a page-aligned pointer and page-multiple length at Apple's
-//!    16 KB pages. Wrap the whole mapping once and pass per-section offsets as kernel
-//!    arguments; wrapping sections individually will fail alignment. There is no PCIe
-//!    hop to amortise here, so the CPU-vs-GPU "transfer cost" story does not apply.
+//! 2. **Memory is unified.** A `StorageModeShared` buffer is host memory the GPU reads
+//!    directly, so `prepare` packs each resident vector straight into its buffer's
+//!    contents: one write per element, no host staging copy and no PCIe hop. The zkey is
+//!    not wrapped in place. `newBufferWithBytesNoCopy` would need a page-aligned pointer
+//!    and a page-multiple length at Apple's 16 KB pages, so only a wrap of the whole
+//!    mapping with per-section offsets could work, and nothing here does that yet.
 //! 3. **Threadgroup memory is 32 KB, SIMD width 32, max 1024 threads/threadgroup.**
 //!    A BN254 `Fr` is 32 bytes, so at most 1024 field elements fit in threadgroup
 //!    memory: an NTT can keep only 2^10 points local per pass and must go back to
