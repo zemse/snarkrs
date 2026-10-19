@@ -59,9 +59,8 @@ fn field_ops_match_ark() {
     let mut rng = test_rng();
     let mut vals: Vec<Fq> = vec![Fq::ZERO, Fq::ONE, -Fq::ONE, Fq::from(2u64), -Fq::from(2u64)];
     vals.extend((0..4091).map(|_| Fq::rand(&mut rng)));
-    for (ch, other) in vals.chunks_exact(8).zip(vals.chunks_exact(8).rev()) {
-        let a: [Fq; 8] = ch.try_into().unwrap();
-        let b: [Fq; 8] = other.try_into().unwrap();
+    let chunks = vals.as_chunks::<8>().0;
+    for (&a, &b) in chunks.iter().zip(chunks.iter().rev()) {
         let (va, vb) = (lanes(&a), lanes(&b));
         let want = |f: fn(Fq, Fq) -> Fq| -> [Fq; 8] { core::array::from_fn(|l| f(a[l], b[l])) };
         unsafe {
@@ -70,8 +69,8 @@ fn field_ops_match_ark() {
             assert_eq!(unlanes(&sub(&va, &vb)), want(|x, y| x - y));
             assert_eq!(unlanes(&sub(&va, &va)), [Fq::ZERO; 8]);
             let z = is_zero(&va);
-            for l in 0..8 {
-                assert_eq!(z >> l & 1 != 0, a[l].is_zero());
+            for (l, x) in a.iter().enumerate() {
+                assert_eq!(z >> l & 1 != 0, x.is_zero());
             }
             // A lazy-range input: va + va is in [0, 2p) but rarely canonical.
             assert_eq!(is_zero(&sub(&add(&va, &va), &add(&va, &va))), 0xff);

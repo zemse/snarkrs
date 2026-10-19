@@ -24,14 +24,13 @@ pub use snarkrs_gpu_layout::{
     PackedScalar, FQ_MODULUS, FQ_N0, FR_MODULUS, FR_N0, LIMBS,
 };
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
 
     /// The drift guard. The shader carries the same constants as literal text; if either
     /// side is edited alone this fails. The packing itself is tested in `snarkrs-gpu-layout`,
     /// where it is written.
-    #[cfg(target_os = "macos")]
     #[test]
     fn msl_declares_the_same_constants() {
         let src = crate::kernels::FR_MSL;

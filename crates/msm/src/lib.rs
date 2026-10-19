@@ -817,6 +817,7 @@ trait FastFill: RawCurve {
 }
 
 /// No replacement: `prepare` always declines, so `window_chunk` is never reached.
+#[cfg(not(target_arch = "x86_64"))]
 macro_rules! no_fast_fill {
     ($cfg:ty) => {
         impl FastFill for $cfg {

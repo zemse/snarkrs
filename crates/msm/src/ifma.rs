@@ -176,8 +176,7 @@ fn mul(a: &V, b: &V) -> V {
     let k0 = _mm512_set1_epi64(K0 as i64);
     let p = splat(&P);
     let mut t = [z; 6];
-    for i in 0..5 {
-        let bi = b[i];
+    for &bi in b {
         for j in 0..5 {
             t[j] = _mm512_madd52lo_epu64(t[j], a[j], bi);
         }
@@ -755,7 +754,12 @@ impl<'a, P: IfmaCurve> Fill<'a, P> {
         } else {
             // 2p - y per Fq component, and 0 for a zero component (an Fq2 y can have
             // one), so the result stays in [0, 2p).
-            for (d, s) in dst[w..].chunks_exact_mut(5).zip(src[w..].chunks_exact(5)) {
+            for (d, s) in dst[w..]
+                .as_chunks_mut::<5>()
+                .0
+                .iter_mut()
+                .zip(src[w..].as_chunks::<5>().0)
+            {
                 if s.iter().all(|&l| l == 0) {
                     d.fill(0);
                     continue;
