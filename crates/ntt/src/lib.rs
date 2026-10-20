@@ -118,10 +118,10 @@ impl CpuNtt {
     }
 
     /// `twiddles[i * stride]` packed, which is the table of the transform `stride` times
-    /// smaller, its `w^(n/2)` included, and is cached under its key. A pass reading the full table at a stride puts
-    /// every twiddle on a cache line of its own, and at a power-of-two stride of kilobytes
-    /// on a few of L1's sets: at 2^21 the two outer passes next to the fused block, stride
-    /// 8 KB, took 1.5x the others' time.
+    /// smaller, its `w^(n/2)` included, and is cached under its key. A pass reading the
+    /// full table at a stride puts every twiddle on a cache line of its own, and at a
+    /// power-of-two stride of kilobytes on a few of L1's sets: at 2^21 the two outer passes
+    /// next to the fused block, stride 8 KB, took 1.5x the others' time.
     fn stride_twiddles(&self, twiddles: &[Fr], n: usize, stride: usize) -> Arc<Vec<Fr>> {
         let key = (n / stride, twiddles[stride]);
         if let Some(hit) = self
