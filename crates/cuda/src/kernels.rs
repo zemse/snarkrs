@@ -48,17 +48,18 @@ pub const FIELD_PROBE_CU: &str = include_str!("kernels/field_probe.cu");
 /// `G16_CUDA_FFT_VARIANTS=1` defines `G16_FFT_VARIANTS`, which instantiates the FFT
 /// experiment entry points (`kernels/fft.cu`, bottom) alongside the shipped pair. One
 /// define covering the whole candidate set is the point: the sweep costs one compile,
-/// and a machine that never sweeps never pays for it.
+/// and a machine that never sweeps never pays for it. `fft_variants` carries that switch
+/// so a caller can request it without the env; [`unit_fft_with`] is that caller's seam.
 ///
 /// Going through the source text rather than an NVRTC `-D` option is deliberate: the PTX
 /// cache key in `context.rs` hashes the source, so a define spliced into the source can
 /// never collide with a cached portable build.
-fn defines() -> String {
+fn defines(fft_variants: bool) -> String {
     let mut d = String::new();
     if std::env::var("G16_CUDA_FF_PTX").as_deref() == Ok("1") {
         d.push_str("#define G16_FF_PTX 1\n");
     }
-    if fft_variants_enabled() {
+    if fft_variants {
         d.push_str("#define G16_FFT_VARIANTS 1\n");
     }
     d
@@ -79,14 +80,17 @@ pub(crate) fn fft_variants_enabled() -> bool {
 pub fn unit_stages() -> String {
     format!(
         "{}{FR_CUH}\n{GATHER_CU}\n{NTT_CU}\n{POINTWISE_CU}",
-        defines()
+        defines(fft_variants_enabled())
     )
 }
 
 /// Stages 5 to 9. Separate from the stages unit because it is by far the largest and
 /// compiling it is most of the prepare cost.
 pub fn unit_msm() -> String {
-    format!("{}{FR_CUH}\n{CURVE_CUH}\n{MSM_CU}", defines())
+    format!(
+        "{}{FR_CUH}\n{CURVE_CUH}\n{MSM_CU}",
+        defines(fft_variants_enabled())
+    )
 }
 
 /// The ceremony group FFT. Its own unit rather than a rider on the MSM one: a unit
@@ -96,10 +100,35 @@ pub fn unit_msm() -> String {
 /// twice on a box that runs both the prover and the ceremony, once per unit, which the
 /// on-disk PTX cache pays only on the first run of each.
 pub fn unit_fft() -> String {
-    format!("{}{FR_CUH}\n{CURVE_CUH}\n{FFT_CU}", defines())
+    unit_fft_with(fft_variants_enabled())
+}
+
+/// [`unit_fft`] with the experiment set chosen by the caller instead of
+/// `G16_CUDA_FFT_VARIANTS`.
+pub fn unit_fft_with(fft_variants: bool) -> String {
+    format!("{}{FR_CUH}\n{CURVE_CUH}\n{FFT_CU}", defines(fft_variants))
 }
 
 /// The `fr_probe` / `fr_constants` translation unit.
 pub fn unit_field_probe() -> String {
-    format!("{}{FR_CUH}\n{FIELD_PROBE_CU}", defines())
+    format!(
+        "{}{FR_CUH}\n{FIELD_PROBE_CU}",
+        defines(fft_variants_enabled())
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The explicit switch alone decides the FFT experiment define, whatever the env says,
+    /// so `fft-bench` can request the set without `set_var`.
+    #[test]
+    fn the_fft_variants_define_follows_the_explicit_switch() {
+        const DEFINE: &str = "#define G16_FFT_VARIANTS 1\n";
+        assert!(defines(true).contains(DEFINE));
+        assert!(!defines(false).contains(DEFINE));
+        assert!(unit_fft_with(true).starts_with(&defines(true)));
+        assert!(!unit_fft_with(false).contains(DEFINE));
+    }
 }

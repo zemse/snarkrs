@@ -3,7 +3,7 @@
 //! The economics this command exists for: any edit to `kernels/fft.cu` costs a full
 //! NVRTC + ptxas rebuild on the measuring machine, minutes of billed GPU time, because
 //! the PTX cache keys on the source. So the candidate kernels are all instantiated in
-//! one translation unit (`G16_CUDA_FFT_VARIANTS=1`, which `crates/cuda/src/kernels.rs`
+//! one translation unit (`FftKernels::compile_with`, which `crates/cuda/src/kernels.rs`
 //! turns into the `#define`; `crates/cuda/src/fft.rs` `VARIANTS` is the table of names) and
 //! this command pays one compile, one context, and one input generation for the whole
 //! table. Every row after the first costs only its own kernel time.
@@ -191,16 +191,15 @@ pub fn run(args: Args) -> Result<()> {
     if args.copies == 0 || args.iters == 0 {
         bail!("--copies and --iters must be at least 1");
     }
-    // The gated variants exist in the unit only when the define is in the source, and
-    // `kernels::defines` reads this env when it assembles the NVRTC source, so setting it
-    // here, before `FftKernels::compile`, is what puts the define in the unit. Anything
-    // beyond the shipped `c5` needs it, so default it on; an explicit value, e.g. `0` to
-    // sweep only the cheap shipped unit, is respected.
+    // The gated variants exist in the unit only when the define is in the source.
+    // Anything beyond the shipped `c5` needs them, so default them on; an explicit
+    // `G16_CUDA_FFT_VARIANTS`, e.g. `0` to sweep only the cheap shipped unit, is respected
+    // with the same `== "1"` reading `kernels::defines` gives it.
     let wants_gated = args.variants.is_empty() || args.variants.iter().any(|v| v != "c5");
-    if wants_gated && std::env::var_os("G16_CUDA_FFT_VARIANTS").is_none() {
-        // `set_var` is `unsafe` from edition 2024; this is the only call outside tests.
-        std::env::set_var("G16_CUDA_FFT_VARIANTS", "1");
-    }
+    let gated = match std::env::var_os("G16_CUDA_FFT_VARIANTS") {
+        Some(v) => v == "1",
+        None => wants_gated,
+    };
 
     let ordinal = match std::env::var("G16_CUDA_DEVICE") {
         Ok(v) => v
@@ -221,19 +220,19 @@ pub fn run(args: Args) -> Result<()> {
     println!(
         "fft-bench: G16_CUDA_FF_PTX={}, G16_CUDA_FFT_VARIANTS={}",
         std::env::var("G16_CUDA_FF_PTX").unwrap_or_else(|_| "unset".into()),
-        std::env::var("G16_CUDA_FFT_VARIANTS").unwrap_or_else(|_| "unset".into()),
+        u8::from(gated),
     );
 
     // The one compile of the run. Cold on a fresh source hash this is the long pole,
     // by design paid here once; set G16_CUDA_TIME=1 for the nvrtc/load split.
     let t = Instant::now();
-    let module = FftKernels::compile(&cuda)?;
+    let module = FftKernels::compile_with(&cuda, gated)?;
     println!(
         "fft-bench: unit compile+load {:.1} ms",
         t.elapsed().as_secs_f64() * 1e3
     );
 
-    let probe = FftKernels::from_module(&cuda, module.clone())?;
+    let probe = FftKernels::from_module_with(&cuda, module.clone(), gated)?;
     let available = probe.variant_names();
     let selected: Vec<String> = if args.variants.is_empty() {
         available.iter().map(|s| s.to_string()).collect()
@@ -261,7 +260,7 @@ pub fn run(args: Args) -> Result<()> {
     // instance it makes shares the one compiled module, so a row costs a function bind
     // and nothing else.
     let mk = |variant: &str, block: u32| -> Result<FftKernels> {
-        Ok(FftKernels::from_module(&cuda, module.clone())?
+        Ok(FftKernels::from_module_with(&cuda, module.clone(), gated)?
             .with_variant(variant)
             .map_err(|e| anyhow!("{e}"))?
             .with_min_block(1)

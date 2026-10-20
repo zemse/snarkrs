@@ -314,6 +314,8 @@ pub struct FftKernels {
     #[allow(dead_code)]
     module: Arc<CudaModule>,
     variants: Vec<Variant>,
+    /// Whether the gated rows were loaded, so a refused name can say why.
+    gated: bool,
     active: usize,
     min_block: usize,
     block: u32,
@@ -332,7 +334,14 @@ impl FftKernels {
     /// Compile the FFT translation unit on its own, so a caller holding several
     /// commands' worth of work pays NVRTC once. Same split as `CudaMsm::compile`.
     pub fn compile(cuda: &Cuda) -> Result<Arc<CudaModule>, ProveError> {
-        cuda.compile("fft", &kernels::unit_fft())
+        Self::compile_with(cuda, kernels::fft_variants_enabled())
+    }
+
+    /// [`Self::compile`] with the gated experiment set chosen by the caller instead of
+    /// `G16_CUDA_FFT_VARIANTS`. Bind the result with [`Self::from_module_with`] and the
+    /// same `variants`.
+    pub fn compile_with(cuda: &Cuda, variants: bool) -> Result<Arc<CudaModule>, ProveError> {
+        cuda.compile("fft", &kernels::unit_fft_with(variants))
             .map_err(ProveError::from)
     }
 
@@ -344,11 +353,18 @@ impl FftKernels {
     /// gated rows exactly when `G16_CUDA_FFT_VARIANTS=1`, because that same env decided
     /// whether their entry points exist in the module at all (`kernels::defines`).
     pub fn from_module(cuda: &Cuda, module: Arc<CudaModule>) -> Result<Self, ProveError> {
+        Self::from_module_with(cuda, module, kernels::fft_variants_enabled())
+    }
+
+    /// [`Self::from_module`] for a module from [`Self::compile_with`]: `gated` must be the
+    /// `variants` it was compiled with.
+    pub fn from_module_with(
+        cuda: &Cuda,
+        module: Arc<CudaModule>,
+        gated: bool,
+    ) -> Result<Self, ProveError> {
         let mut variants = Vec::new();
-        for def in VARIANTS
-            .iter()
-            .filter(|d| !d.gated || kernels::fft_variants_enabled())
-        {
+        for def in VARIANTS.iter().filter(|d| !d.gated || gated) {
             variants.push(Variant {
                 name: def.name,
                 g1: FftPair {
@@ -366,6 +382,7 @@ impl FftKernels {
             stream: cuda.stream().clone(),
             module,
             variants,
+            gated,
             active: 0,
             min_block: env_min_block(),
             block: env_block(),
@@ -392,7 +409,7 @@ impl FftKernels {
                     .map(|v| v.name)
                     .collect::<Vec<_>>()
                     .join(", "),
-                if kernels::fft_variants_enabled() {
+                if self.gated {
                     ""
                 } else {
                     "; the experiment set needs G16_CUDA_FFT_VARIANTS=1 at compile"
