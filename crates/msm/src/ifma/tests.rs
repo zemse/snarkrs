@@ -148,7 +148,7 @@ where
     Projective::normalize_batch(&proj)
 }
 
-fn scan_of<P: RawCurve>(scalars: &[Fr]) -> Prescan<P> {
+fn scan_of<P: RawCurve>(scalars: &[Fr]) -> Prescan<'static, P> {
     Prescan {
         idx: (0..scalars.len() as u32).collect(),
         bigints: scalars.iter().map(|s| s.into_bigint()).collect(),
