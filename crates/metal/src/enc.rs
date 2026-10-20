@@ -69,7 +69,8 @@ pub(crate) fn packed_buffer<S, T: Packed>(
     if items.is_empty() {
         return crate::alloc::shared(device, 4);
     }
-    let buf = crate::alloc::shared(device, items.len() * core::mem::size_of::<T>())?;
+    let bytes = crate::alloc::bytes(&[items.len(), core::mem::size_of::<T>()])?;
+    let buf = crate::alloc::shared(device, bytes)?;
     // SAFETY: the buffer was just allocated with room for `items.len()` packed values
     // and nothing has been encoded against it, so no dispatch can be reading it.
     let dst =

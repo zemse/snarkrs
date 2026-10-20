@@ -21,11 +21,13 @@ pub(super) struct Pool {
 }
 
 impl Pool {
+    /// A buffer of at least the product of `factors` bytes, through [`crate::alloc::bytes`].
+    ///
     /// The lock is taken back from a poisoned mutex rather than panicked on, the same as
     /// `stages::HResident`'s pool: the vector holds plain buffer handles, so a panic
     /// while it was held leaves nothing half-updated for the next caller to trip over.
-    pub(super) fn take(&self, bytes: usize) -> Result<Buffer, ProveError> {
-        let bytes = bytes.max(4);
+    pub(super) fn take(&self, factors: &[usize]) -> Result<Buffer, ProveError> {
+        let bytes = crate::alloc::bytes(factors)?.max(4);
         let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
         // Smallest buffer that fits, so a single huge allocation cannot be handed out
         // for every small request and then be unavailable for the one that needs it.

@@ -85,7 +85,7 @@ impl Outputs {
                     .map(|&e| (base_off + (e as usize - scalar_off)) as u32)
                     .filter(|&b| !inf[b as usize])
                     .collect();
-                let buf = pool.take(gather.len() * 4)?;
+                let buf = pool.take(&[gather.len(), 4])?;
                 if !gather.is_empty() {
                     // SAFETY: the pooled buffer holds at least `gather.len()` u32s and
                     // the batch that could read it has not been committed yet.
@@ -108,17 +108,17 @@ impl Outputs {
         };
         // The dummy rows are written by the accumulation like any interior run, and
         // never read; the clear covers the real rows only.
-        let buckets = pool.take(plan.rows() * point_bytes)?;
+        let buckets = pool.take(&[plan.rows(), point_bytes])?;
         // At most one run of a slice continues backwards, into a bucket an earlier slice
         // owns. See [`Plan::spill_per_slice`] for the second slot.
         let spill_slots = plan.spill_per_slice() * plan.n_windows * plan.slices;
-        let spill_pts = pool.take(spill_slots * point_bytes)?;
-        let spill_rows = pool.take(spill_slots * 4)?;
+        let spill_pts = pool.take(&[spill_slots, point_bytes])?;
+        let spill_rows = pool.take(&[spill_slots, 4])?;
         let fold = match plan.fold_levels().first() {
             Some(&(_, groups)) => {
                 let slots = 2 * plan.n_windows * groups;
-                let pts = pool.take(slots * point_bytes)?;
-                let rows = pool.take(slots * 4)?;
+                let pts = pool.take(&[slots, point_bytes])?;
+                let rows = pool.take(&[slots, 4])?;
                 keep.push(pts.clone());
                 keep.push(rows.clone());
                 Some((pts, rows))
@@ -132,9 +132,13 @@ impl Outputs {
         } else {
             2 * msm.reduce_layout(plan).simdgroups
         };
-        let window_sums =
-            pool.take(plan.n_windows * plan.reduce_groups * sums_per_group * point_bytes)?;
-        let ones = pool.take(ones_groups * point_bytes)?;
+        let window_sums = pool.take(&[
+            plan.n_windows,
+            plan.reduce_groups,
+            sums_per_group,
+            point_bytes,
+        ])?;
+        let ones = pool.take(&[ones_groups, point_bytes])?;
         keep.push(buckets.clone());
         keep.push(spill_pts.clone());
         keep.push(spill_rows.clone());

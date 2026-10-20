@@ -230,16 +230,16 @@ impl<'a> Plan<'a> {
 
     pub(super) fn alloc(&mut self, pool: &Pool, keep: &mut Vec<Buffer>) -> Result<(), ProveError> {
         let rows = self.rows();
-        let counts = pool.take(rows * 4)?;
-        let cursor = pool.take(rows * 4)?;
+        let counts = pool.take(&[rows, 4])?;
+        let cursor = pool.take(&[rows, 4])?;
         // 8 bytes an entry: the bucket row travels with the point index so the
         // segmented accumulation can find run boundaries without recomputing digits.
-        let bytes = self.n_windows * self.cap * 8;
+        let bytes = crate::alloc::bytes(&[self.n_windows, self.cap, 8])?;
         let entries = match self.lent.filter(|b| b.length() >= bytes) {
             // Not kept: it goes back to its owner, not into the pool.
             Some(b) => b.clone(),
             None => {
-                let e = pool.take(bytes)?;
+                let e = pool.take(&[bytes])?;
                 keep.push(e.clone());
                 e
             }

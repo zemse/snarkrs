@@ -5,6 +5,8 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use snarkrs_groth16::ProveError;
+
 use crate::mtl::Buffer;
 
 use super::window::{window_size_for, Work, RECODE_BITS};
@@ -170,7 +172,7 @@ impl Drop for Lent {
 /// [`Plan::alloc`](super::Plan::alloc) asks for over a device-resident H. Stage 4 sizes the
 /// buffer it lends with this; a lent buffer that turns out smaller is not used, so a
 /// disagreement costs the saving and nothing else.
-pub(crate) fn dense_entries_bytes(n: usize) -> usize {
+pub(crate) fn dense_entries_bytes(n: usize) -> Result<usize, ProveError> {
     let c = window_size_for(n, RECODE_BITS);
-    RECODE_BITS.div_ceil(c as usize) * n.max(1) * 8
+    crate::alloc::bytes(&[RECODE_BITS.div_ceil(c as usize), n.max(1), 8])
 }

@@ -242,10 +242,8 @@ impl HStages {
     }
 
     fn empty(&self, elems: usize) -> Result<Buffer, ProveError> {
-        crate::alloc::shared(
-            &self.device,
-            elems.max(1) * core::mem::size_of::<PackedFr>(),
-        )
+        let bytes = crate::alloc::bytes(&[elems.max(1), core::mem::size_of::<PackedFr>()])?;
+        crate::alloc::shared(&self.device, bytes)
     }
 
     /// Threadgroup width for a pipeline: the preference, clamped by what the pipeline
@@ -498,8 +496,8 @@ impl HResident {
             return Ok(s);
         }
         let n = self.domain.size();
-        let stride = n * core::mem::size_of::<PackedFr>();
-        let bytes = (4 * stride).max(crate::msm::dense_entries_bytes(n));
+        let stride = crate::alloc::bytes(&[n, core::mem::size_of::<PackedFr>()])?;
+        let bytes = crate::alloc::bytes(&[4, stride])?.max(crate::msm::dense_entries_bytes(n)?);
         Ok(Scratch {
             witness: st.empty(self.n_vars)?,
             vectors: crate::alloc::shared(&st.device, bytes)?,
@@ -1067,7 +1065,8 @@ mod tests {
             res.domain = Domain::new(n).unwrap();
             res.n_vars = n / 2;
             let scalar_bytes = core::mem::size_of::<PackedFr>();
-            let vector_bytes = (4 * n * scalar_bytes).max(crate::msm::dense_entries_bytes(n));
+            let vector_bytes =
+                (4 * n * scalar_bytes).max(crate::msm::dense_entries_bytes(n).unwrap());
             let set_bytes = (res.n_vars + n) * scalar_bytes + vector_bytes;
             let mut handles = Vec::new();
             let mut addresses = std::collections::HashSet::new();

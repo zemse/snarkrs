@@ -15,6 +15,8 @@
 //! A zero-byte request is not a valid `MTLBuffer` either, so a buffer whose `length` is 0
 //! is refused the same way. A request above the device's `maxBufferLength` is refused
 //! before it reaches the driver, so the error names the limit rather than only the size.
+//! A size is the product of its `factors` through [`bytes`], so a product that wraps is
+//! refused the same way rather than slipping under that check as a small request.
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
@@ -23,6 +25,18 @@ use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 use snarkrs_groth16::ProveError;
 
 use crate::mtl::{Buffer, DeviceRef};
+
+/// The product of `factors`, the byte count of a buffer of that shape. One that does not
+/// fit in a `usize` is refused with the error an oversized request gets.
+pub(crate) fn bytes(factors: &[usize]) -> Result<usize, ProveError> {
+    factors
+        .iter()
+        .try_fold(1usize, |acc, &f| acc.checked_mul(f))
+        .ok_or_else(|| ProveError::Backend {
+            backend: "metal",
+            reason: format!("a shared buffer of {factors:?} bytes overflows a usize"),
+        })
+}
 
 /// `bytes` of shared storage, zeroed by the driver.
 pub(crate) fn shared(device: &DeviceRef, bytes: usize) -> Result<Buffer, ProveError> {
@@ -176,6 +190,30 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    #[test]
+    fn a_wrapping_byte_count_is_refused() {
+        assert_eq!(bytes(&[3, 32, 8]).unwrap(), 768);
+        assert_eq!(bytes(&[]).unwrap(), 1);
+        assert_eq!(bytes(&[usize::MAX, 0]).unwrap(), 0);
+        // 2^60 x 32 wraps to 0, and 2^62 + 1 x 4 to 4: both would pass the size check
+        // as small requests if multiplied with `*`.
+        for factors in [[1usize << 60, 32], [(1 << 62) + 1, 4], [usize::MAX, 2]] {
+            let err = bytes(&factors).expect_err("refused");
+            assert!(
+                matches!(
+                    err,
+                    ProveError::Backend {
+                        backend: "metal",
+                        ..
+                    }
+                ),
+                "{err}"
+            );
+        }
+        assert_eq!(bytes(&[1 << 30, 1 << 30, 1 << 3]).unwrap(), 1 << 63);
+        assert!(bytes(&[1 << 30, 1 << 30, 1 << 3, 2]).is_err());
     }
 
     #[test]

@@ -138,6 +138,24 @@ fn msl_declares_the_same_spill_sentinel() {
     assert_eq!(MSM_NO_ROW, u32::MAX);
 }
 
+/// A count whose byte size wraps is refused before anything is allocated or encoded.
+/// With `*`, 2^59 + 1 scalars of 32 bytes asked for a 32-byte buffer and the conversion
+/// would have been dispatched over the whole count.
+#[test]
+fn a_wrapping_scalar_count_is_refused() {
+    let m = MetalMsm::new().expect("Metal device");
+    let mont = crate::alloc::shared(&m.device, 32).unwrap();
+    let len = (1usize << 59) + 1;
+    assert!(matches!(
+        m.scalars_from_device_mont(&mont, len),
+        Err(ProveError::Backend {
+            backend: "metal",
+            ..
+        })
+    ));
+    assert!(dense_entries_bytes(usize::MAX / 8).is_err());
+}
+
 /// Stage 4 sizes the buffer it lends H's plan with `dense_entries_bytes`. If that
 /// drifted below what `Plan::alloc` asks for, the loan would be refused on every proof
 /// and the entries would come from the pool again, which nothing else would notice.
@@ -152,7 +170,7 @@ fn a_lent_buffer_fits_the_dense_plan_it_is_lent_to() {
             let plan = Plan::new(&h, 0, n);
             assert_eq!(
                 plan.n_windows * plan.cap * 8,
-                dense_entries_bytes(n),
+                dense_entries_bytes(n).unwrap(),
                 "2^{log_n} {work:?}"
             );
         }

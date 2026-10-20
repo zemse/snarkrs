@@ -483,8 +483,8 @@ impl FftKernels {
                 continue;
             }
             let bits = n.trailing_zeros();
-            let src = self.scratch(n * G::SCRATCH)?;
-            let dst = self.scratch(n * G::SCRATCH)?;
+            let src = self.scratch(&[n, G::SCRATCH])?;
+            let dst = self.scratch(&[n, G::SCRATCH])?;
 
             // The input goes straight into the buffer rather than into a `Vec` that is
             // then copied in. Metal buffers here are `StorageModeShared` (msm.rs:460), so
@@ -724,8 +724,8 @@ impl FftKernels {
         })
     }
 
-    fn scratch(&self, bytes: usize) -> Result<Buffer, ProveError> {
-        crate::alloc::shared(&self.device, bytes.max(1))
+    fn scratch(&self, factors: &[usize]) -> Result<Buffer, ProveError> {
+        crate::alloc::shared(&self.device, crate::alloc::bytes(factors)?.max(1))
     }
 
     fn buffer<T: Packed>(&self, items: &[T]) -> Result<Buffer, ProveError> {

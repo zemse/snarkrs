@@ -736,7 +736,8 @@ impl CeremonyKernels {
     }
 
     fn scratch<T>(&self, len: usize) -> Result<Buffer, ProveError> {
-        crate::alloc::shared(&self.device, len.max(1) * core::mem::size_of::<T>())
+        let bytes = crate::alloc::bytes(&[len.max(1), core::mem::size_of::<T>()])?;
+        crate::alloc::shared(&self.device, bytes)
     }
 
     fn point_mul<G: CerGroup>(

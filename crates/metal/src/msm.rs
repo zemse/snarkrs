@@ -296,7 +296,7 @@ impl MetalMsm {
         use rayon::prelude::*;
 
         let n = scalars.len();
-        let bytes = n.max(1) * core::mem::size_of::<PackedScalar>();
+        let bytes = crate::alloc::bytes(&[n.max(1), core::mem::size_of::<PackedScalar>()])?;
         let buf = crate::alloc::shared(&self.device, bytes)?;
         if n > 0 && work == Work::Constant {
             // SAFETY: as below.
@@ -388,7 +388,7 @@ impl MetalMsm {
         mont: &Buffer,
         len: usize,
     ) -> Result<ScalarBuf, ProveError> {
-        let out = crate::alloc::shared(&self.device, len.max(1) * 32)?;
+        let out = crate::alloc::shared(&self.device, crate::alloc::bytes(&[len.max(1), 32])?)?;
         // Reads `mont`, which nothing here writes, so a killed attempt re-runs whole.
         crate::cb::with_retry(&self.queue, |queue| {
             let context = "stage 9 scalar conversion (mont_to_std)";
