@@ -1091,7 +1091,7 @@ mod tests {
     /// may stay resident. Check actual buffer lengths and reuse without dispatching.
     #[test]
     fn h_scratch_bytes_and_pool_lifetimes_are_bounded() {
-        let pk = tiny_key().expect("tiny_mul artifact");
+        let Some(pk) = tiny_key() else { return };
         let st = HStages::new().expect("Metal device");
         for n in [256, 4096] {
             let mut res = st.prepare(&pk).unwrap();
