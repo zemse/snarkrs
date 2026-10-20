@@ -47,7 +47,7 @@ use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder,
     MTLComputePipelineState, MTLDevice,
 };
-use snarkrs_field::{Domain, Field, Fr};
+use snarkrs_field::{Domain, Fr};
 use snarkrs_formats::ProvingKey;
 use snarkrs_groth16::{HPoly, ProveError, StageTimings};
 
@@ -439,14 +439,9 @@ impl HResident {
             .map_err(|e| bad(e.to_string()))?;
 
         // shift^j for j in [0, n). Not the twiddles: the twiddles are powers of the
-        // domain's own root of unity and this is a primitive 2n-th root, so no table
-        // snarkrs-field builds can be reused. A running product, one multiply per entry.
-        let mut pows = Vec::with_capacity(domain.size());
-        let mut acc = Fr::ONE;
-        for _ in 0..domain.size() {
-            pows.push(acc);
-            acc *= coset_shift;
-        }
+        // domain's own root of unity and this is a primitive 2n-th root, so it is a table
+        // of its own, built in chunks over the thread pool like theirs.
+        let pows = snarkrs_field::powers(coset_shift, domain.size());
         // Host tables, released once packed so they do not sit in malloc's large cache.
         let table = |data: Vec<Fr>| {
             let buf = st.buf(&data);
@@ -1012,6 +1007,39 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use snarkrs_field::Field;
+
+    /// The coset table is built in chunks, each from its own `shift^start`. It must be
+    /// the running product exactly, including a short last chunk and a single entry.
+    #[test]
+    fn the_chunked_coset_table_is_the_serial_chain() {
+        for log_n in [0u32, 14, 18] {
+            let shift = Domain::new(1 << log_n)
+                .unwrap()
+                .proving_coset_shift()
+                .unwrap();
+            for n in [
+                1,
+                2,
+                (1 << 12) + 1,
+                (1 << 14) + 3,
+                3 * (1 << 14) + 5,
+                1 << 18,
+            ] {
+                let mut serial = Vec::with_capacity(n);
+                let mut acc = Fr::ONE;
+                for _ in 0..n {
+                    serial.push(acc);
+                    acc *= shift;
+                }
+                assert_eq!(
+                    snarkrs_field::powers(shift, n),
+                    serial,
+                    "2^{log_n} shift, n = {n}"
+                );
+            }
+        }
+    }
 
     /// The split must cover every pass exactly once, in order, with no batch wider than
     /// the threadgroup budget. Everything downstream indexes twiddles off `s0`, so an

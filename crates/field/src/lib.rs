@@ -148,7 +148,7 @@ const POWERS_MIN_CHUNK: usize = 1 << 12;
 
 /// Running product rather than `pow` per index: one multiplication per twiddle instead
 /// of a full square-and-multiply ladder, which matters at 2^24 points.
-fn powers(base: Fr, n: usize) -> Vec<Fr> {
+pub fn powers(base: Fr, n: usize) -> Vec<Fr> {
     if n < POWERS_PARALLEL_THRESHOLD {
         return powers_serial(base, n);
     }
