@@ -638,6 +638,19 @@ mod tests {
         });
     }
 
+    /// The CPU backend's `h_and_msms` owns `H` and runs stage 9 over it in place; the
+    /// trace path borrows it through `msms`. Both must give the same five points.
+    #[test]
+    fn h_and_msms_matches_compute_h_then_msms() {
+        for_each_artifact("h_and_msms_matches_compute_h_then_msms", |a| {
+            let (circuit, witness) = prepared(&a.dir);
+            let mut t = StageTimings::default();
+            let h = circuit.compute_h(&witness, &mut t).unwrap();
+            let split = circuit.msms(&witness, &h, &mut t).unwrap();
+            assert_eq!(circuit.h_and_msms(&witness, &mut t).unwrap(), split);
+        });
+    }
+
     /// A trace that could not tell two different executions apart would report "no
     /// difference" for the bug it exists to find.
     #[test]

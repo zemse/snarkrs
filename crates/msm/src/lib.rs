@@ -23,6 +23,7 @@
 use ark_ec::short_weierstrass::{Affine, Projective, SWCurveConfig};
 use ark_ff::{AdditiveGroup, One, PrimeField, Zero};
 use rayon::prelude::*;
+use std::borrow::Cow;
 
 use snarkrs_field::{Fr, G1Affine, G1Projective, G2Affine, G2Projective};
 
@@ -213,6 +214,32 @@ impl Default for CpuMsm {
     }
 }
 
+impl CpuMsm {
+    /// [`MsmBackend::msm_g1`] for a caller that is done with `scalars`: the scan converts
+    /// them in place instead of beside them, so the MSM holds no second scalar vector. On
+    /// return `scalars` no longer holds the field elements it was given, and still holds
+    /// everything they reveal; scrubbing it is the caller's job.
+    pub fn msm_g1_in_place(&self, bases: &[G1Affine], scalars: &mut [Fr]) -> G1Projective {
+        assert_eq!(
+            bases.len(),
+            scalars.len(),
+            "MSM length mismatch: {} bases, {} scalars",
+            bases.len(),
+            scalars.len()
+        );
+        if bases.is_empty() {
+            return G1Projective::zero();
+        }
+        let work = self.work();
+        pippenger_scanned(
+            bases,
+            prescan_in_place(bases, scalars, work),
+            self.threads,
+            work,
+        )
+    }
+}
+
 impl MsmBackend for CpuMsm {
     fn name(&self) -> &'static str {
         "cpu"
@@ -288,13 +315,16 @@ fn signed_digit(limbs: &[u64], i: usize, c: u32) -> i64 {
 /// and only `idx`/`bigints` reach the bucket loop. `idx[k]` is the base that `bigints[k]`
 /// multiplies, so the bucket loop walks both vectors in order and hits the bases through
 /// one indirection.
-struct Prescan<P: SWCurveConfig> {
+struct Prescan<'a, P: SWCurveConfig> {
     /// `u32` to halve the footprint of a witness-length vector; a key with more than
     /// `2^32` bases is not representable and is asserted against in `prescan`.
     idx: Vec<u32>,
-    bigints: Vec<<Fr as PrimeField>::BigInt>,
+    /// Borrowed only by [`prescan_in_place`], from the caller's own scalar buffer.
+    bigints: Cow<'a, [BigInt]>,
     ones_sum: Projective<P>,
 }
+
+type BigInt = <Fr as PrimeField>::BigInt;
 
 /// Splits the scalars into zero / one / general, once, before any window runs.
 ///
@@ -326,7 +356,12 @@ struct Prescan<P: SWCurveConfig> {
 ///
 /// [`Work::Constant`] processes every scalar through the general path and gives up both
 /// fast paths and the compaction.
-fn prescan<P: RawCurve>(bases: &[Affine<P>], scalars: &[Fr], n: usize, work: Work) -> Prescan<P>
+fn prescan<P: RawCurve>(
+    bases: &[Affine<P>],
+    scalars: &[Fr],
+    n: usize,
+    work: Work,
+) -> Prescan<'static, P>
 where
     P::BaseField: Send + Sync,
 {
@@ -365,7 +400,7 @@ where
         }
         Prescan {
             idx,
-            bigints,
+            bigints: Cow::Owned(bigints),
             ones_sum: to_projective(&ones_sum),
         }
     };
@@ -382,17 +417,94 @@ where
         .collect();
 
     let total: usize = parts.iter().map(|p| p.idx.len()).sum();
-    let mut out = Prescan {
-        idx: Vec::with_capacity(total),
-        bigints: Vec::with_capacity(total),
-        ones_sum: Projective::<P>::zero(),
-    };
+    let mut idx = Vec::with_capacity(total);
+    let mut bigints = Vec::with_capacity(total);
+    let mut ones_sum = Projective::<P>::zero();
     for p in parts {
-        out.idx.extend_from_slice(&p.idx);
-        out.bigints.extend_from_slice(&p.bigints);
-        out.ones_sum += &p.ones_sum;
+        idx.extend_from_slice(&p.idx);
+        bigints.extend_from_slice(&p.bigints);
+        ones_sum += &p.ones_sum;
     }
-    out
+    Prescan {
+        idx,
+        bigints: Cow::Owned(bigints),
+        ones_sum,
+    }
+}
+
+/// [`prescan`] without the second copy of the scalars: each general scalar's standard
+/// form is written over the front of `scalars` itself, in order, and the scan borrows it
+/// from there. Same classes, same order, same `idx`, so the MSM it feeds is the same sum.
+///
+/// Each chunk compacts into its own front in parallel, then the chunks are moved down one
+/// after another. A chunk lands at or below where it starts, which is what makes the
+/// serial order safe; on a dense vector like H no chunk moves at all.
+fn prescan_in_place<'a, P: RawCurve>(
+    bases: &[Affine<P>],
+    scalars: &'a mut [Fr],
+    work: Work,
+) -> Prescan<'a, P>
+where
+    P::BaseField: Send + Sync,
+{
+    // The borrowed `[BigInt]` below is read through the `Fr` storage it was written into.
+    const {
+        assert!(size_of::<Fr>() == size_of::<BigInt>());
+        assert!(align_of::<Fr>() == align_of::<BigInt>());
+        assert!(core::mem::offset_of!(Fr, 0) == 0);
+    }
+    let n = scalars.len();
+    debug_assert!(n <= u32::MAX as usize);
+    let run = |lo: usize, chunk: &mut [Fr]| {
+        let mut idx = Vec::new();
+        let mut ones_sum = Xyzz::<P::RF>::ZERO;
+        for j in 0..chunk.len() {
+            let s = chunk[j];
+            let i = lo + j;
+            // The same three filters as `prescan`, in the same order.
+            if work == Work::Variable && s.is_zero() {
+                continue;
+            }
+            if bases[i].infinity {
+                continue;
+            }
+            if work == Work::Variable && s.is_one() {
+                let (x, y) = P::raw_xy(&bases[i]);
+                ones_sum.madd(x, y);
+                continue;
+            }
+            chunk[idx.len()].0 = s.into_bigint();
+            idx.push(i as u32);
+        }
+        (idx, to_projective(&ones_sum))
+    };
+    let parts: Vec<(Vec<u32>, Projective<P>)> = scalars
+        .par_chunks_mut(SCAN_CHUNK)
+        .enumerate()
+        .map(|(ci, chunk)| run(ci * SCAN_CHUNK, chunk))
+        .collect();
+
+    let total: usize = parts.iter().map(|p| p.0.len()).sum();
+    let mut idx = Vec::with_capacity(total);
+    let mut ones_sum = Projective::<P>::zero();
+    for (ci, (part, sum)) in parts.into_iter().enumerate() {
+        let (from, to) = (ci * SCAN_CHUNK, idx.len());
+        if from != to {
+            scalars.copy_within(from..from + part.len(), to);
+        }
+        idx.extend_from_slice(&part);
+        ones_sum += &sum;
+    }
+    let front = &scalars[..total];
+    // SAFETY: the const block above pins `Fr` to a `BigInt` at offset 0 with the same size
+    // and alignment, so the slice has the same stride and every element's first 32 bytes
+    // are the `BigInt` written into it above.
+    let bigints = unsafe { core::slice::from_raw_parts(front.as_ptr().cast::<BigInt>(), total) };
+    Prescan {
+        idx,
+        bigints: Cow::Borrowed(bigints),
+        ones_sum,
+    }
 }
 
 /// Bucket accumulation and reduction for one window over one contiguous slice of the
@@ -870,8 +982,19 @@ where
     if n == 0 {
         return Projective::zero();
     }
+    pippenger_scanned(bases, prescan(bases, scalars, n, work), threads, work)
+}
 
-    let scan = prescan(bases, scalars, n, work);
+/// [`pippenger`] from a finished prescan.
+fn pippenger_scanned<P: FastFill>(
+    bases: &[Affine<P>],
+    scan: Prescan<'_, P>,
+    threads: usize,
+    work: Work,
+) -> Projective<P>
+where
+    P::BaseField: Send + Sync,
+{
     let m = scan.idx.len();
     // Nothing reached the general path: every scalar was 0 or 1, or its base was
     // infinity. Skip Pippenger rather than allocate W bucket arrays for nothing.
@@ -1295,6 +1418,40 @@ mod tests {
         // Every base at infinity is still identity, whatever the scalars are.
         let all_inf = vec![G1Affine::identity(); n];
         assert!(msm.msm_g1(&all_inf, &s).is_zero());
+    }
+
+    /// The in-place scan against the copying one, across chunk boundaries: a dense vector
+    /// where no chunk moves, a witness-like one where every chunk after the first does,
+    /// and bases at infinity dropping entries mid-chunk.
+    #[test]
+    fn in_place_scan_matches_the_copying_scan() {
+        let mut rng = test_rng();
+        for n in [7, 300, 3 * SCAN_CHUNK + 123] {
+            let mut g1: Vec<G1Affine> = walk_points(n, &mut rng);
+            for i in (5..n).step_by(4099) {
+                g1[i] = G1Affine::identity();
+            }
+            let all_zero = vec![Fr::zero(); n];
+            for s in [
+                rand_scalars(n, &mut rng),
+                witness_like_scalars(n, &mut rng),
+                all_zero,
+            ] {
+                for work in [Work::Variable, Work::Constant] {
+                    let want = prescan(&g1, &s, n, work);
+                    let mut buf = s.clone();
+                    let got = prescan_in_place(&g1, &mut buf, work);
+                    assert_eq!(got.idx, want.idx, "n = {n}");
+                    assert_eq!(got.bigints[..], want.bigints[..], "n = {n}");
+                    assert_eq!(got.ones_sum, want.ones_sum, "n = {n}");
+                }
+                for msm in [CpuMsm::new(), CpuMsm::constant_work()] {
+                    let mut buf = s.clone();
+                    assert_eq!(msm.msm_g1_in_place(&g1, &mut buf), msm.msm_g1(&g1, &s));
+                }
+            }
+        }
+        assert!(CpuMsm::new().msm_g1_in_place(&[], &mut []).is_zero());
     }
 
     /// Drives the batch-affine fill against the XYZZ fill window by window, at windows

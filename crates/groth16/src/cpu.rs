@@ -284,12 +284,45 @@ impl PreparedCircuit for CpuCircuit {
             backend: "cpu",
             reason: "compute_h output came from another backend".to_string(),
         })?;
-        if h.len() != self.domain.size() {
+        let h_msm = || stage!("s9 MSM H -> G1", self.msm.msm_g1(&self.pk.h_query, h));
+        self.msms_with(witness, h.len(), h_msm, t)
+    }
+
+    /// Stages 0-9 with `H` owned here, so stage 9 converts it in place rather than holding
+    /// a standard-form copy beside it for the whole MSM: 64 MiB on a 2^21 domain. What is
+    /// left in the buffer is still witness-derived, and the `HPoly` scrubs it on drop.
+    fn h_and_msms(&self, witness: &[Fr], t: &mut StageTimings) -> Result<MsmOutputs, ProveError> {
+        let mut h = stage!("stages 0-4 compute_h", self.compute_h(witness, t))?;
+        let HPoly::Host(h) = &mut h else {
+            unreachable!("the CPU backend's compute_h returns H on the host");
+        };
+        let len = h.len();
+        let h_msm = || {
+            stage!(
+                "s9 MSM H -> G1",
+                self.msm.msm_g1_in_place(&self.pk.h_query, h)
+            )
+        };
+        stage!("stages 5-9 msms", self.msms_with(witness, len, h_msm, t))
+    }
+}
+
+impl CpuCircuit {
+    /// Stages 5-9 once the caller has `H` in hand. `h_msm` is stage 9's MSM over the
+    /// `h_len` coefficients, run only after every length below has been checked.
+    fn msms_with(
+        &self,
+        witness: &[Fr],
+        h_len: usize,
+        h_msm: impl FnOnce() -> G1Projective + Send,
+        t: &mut StageTimings,
+    ) -> Result<MsmOutputs, ProveError> {
+        if h_len != self.domain.size() {
             return Err(ProveError::Backend {
                 backend: "cpu",
                 reason: format!(
                     "h has {} entries, domain size is {}",
-                    h.len(),
+                    h_len,
                     self.domain.size()
                 ),
             });
@@ -349,7 +382,7 @@ impl PreparedCircuit for CpuCircuit {
             let (b_g2, b_g2_us) = timed(|| self.msm.msm_g2(&self.pk.b_g2_query, witness));
             let (b_g1, b_g1_us) = timed(|| self.msm.msm_g1(&self.pk.b_g1_query, witness));
             let (l_g1, l_us) = timed(|| self.msm.msm_g1(&self.pk.l_query, l_scalars));
-            let (h_g1, h_us) = timed(|| self.msm.msm_g1(&self.pk.h_query, h));
+            let (h_g1, h_us) = timed(h_msm);
             let split = MsmSplit {
                 a_us,
                 b_g2_us,
@@ -409,7 +442,7 @@ impl PreparedCircuit for CpuCircuit {
                     // Every one of the `domain_size` bases is used. The "only n-1 are
                     // nonzero" rule belongs to the coefficient-form convention; in
                     // snarkjs' evaluation form all n entries are generically nonzero.
-                    || stage!("s9 MSM H -> G1", self.msm.msm_g1(&self.pk.h_query, h)),
+                    h_msm,
                 )
             },
         );
