@@ -324,6 +324,30 @@ struct Prescan<'a, P: SWCurveConfig> {
     ones_sum: Projective<P>,
 }
 
+/// An owned `bigints` is the standard form of witness scalars, so it is zeroed when it goes.
+/// A borrowed one is its owner's to scrub.
+impl<P: SWCurveConfig> Drop for Prescan<'_, P> {
+    fn drop(&mut self) {
+        if let Cow::Owned(v) = &mut self.bigints {
+            scrub(v);
+        }
+    }
+}
+
+/// Zero `v` through volatile writes spread over the pool, then one fence. The same writes
+/// as `snarkrs_groth16::scrub`, over `BigInt` rather than `Fr`.
+fn scrub(v: &mut [BigInt]) {
+    v.par_chunks_mut(SCAN_CHUNK).for_each(|chunk| {
+        for x in chunk {
+            for limb in x.0.iter_mut() {
+                // SAFETY: `limb` is a valid, aligned, exclusive `&mut u64`.
+                unsafe { core::ptr::write_volatile(limb, 0) };
+            }
+        }
+    });
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
 type BigInt = <Fr as PrimeField>::BigInt;
 
 /// Splits the scalars into zero / one / general, once, before any window runs.
@@ -420,11 +444,13 @@ where
     let mut idx = Vec::with_capacity(total);
     let mut bigints = Vec::with_capacity(total);
     let mut ones_sum = Projective::<P>::zero();
-    for p in parts {
+    for p in &parts {
         idx.extend_from_slice(&p.idx);
         bigints.extend_from_slice(&p.bigints);
         ones_sum += &p.ones_sum;
     }
+    // Each part scrubs its chunk as it drops; in parallel, not inside the serial merge.
+    parts.into_par_iter().for_each(drop);
     Prescan {
         idx,
         bigints: Cow::Owned(bigints),
@@ -1452,6 +1478,26 @@ mod tests {
             }
         }
         assert!(CpuMsm::new().msm_g1_in_place(&[], &mut []).is_zero());
+    }
+
+    /// `scrub` zeroes every limb across chunk boundaries, and a borrowed scan leaves its
+    /// owner's buffer alone when it drops.
+    #[test]
+    fn scrub_zeroes_and_a_borrowed_scan_does_not() {
+        let mut rng = test_rng();
+        let n = 2 * SCAN_CHUNK + 5;
+        let mut v: Vec<BigInt> = rand_scalars(n, &mut rng)
+            .iter()
+            .map(|s| s.into_bigint())
+            .collect();
+        scrub(&mut v);
+        assert!(v.iter().all(|x| x.0 == [0; 4]));
+
+        let g1: Vec<G1Affine> = walk_points(n, &mut rng);
+        let mut buf = rand_scalars(n, &mut rng);
+        let want: Vec<BigInt> = buf.iter().map(|s| s.into_bigint()).collect();
+        drop(prescan_in_place(&g1, &mut buf, Work::Constant));
+        assert!(buf.iter().zip(&want).all(|(s, w)| s.0 == *w));
     }
 
     /// Drives the batch-affine fill against the XYZZ fill window by window, at windows
