@@ -14,9 +14,10 @@
 # rather than reported as a zero or an error, because a missing measurement and a
 # measurement of zero are not the same claim.
 #
-# The foreign CPU ceiling defaults to max(3x the median, highest + 50) over five samples
-# taken at startup, capped at 200% of a core. --max-foreign fixes it instead; --guard-only
-# prints the baseline and ceiling and exits.
+# The foreign CPU ceiling defaults to max(3x the median, highest + 50) over fifteen samples
+# taken at startup, capped at 200% of a core, and a run stops only when two checks in a row
+# are over it. --max-foreign fixes it instead; --guard-only prints the baseline and ceiling,
+# makes one check against them and exits.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -49,7 +50,7 @@ while [ $# -gt 0 ]; do
     --commit)       COMMIT_OVERRIDE="$2"; shift 2 ;;
     --no-build)     NO_BUILD=1; shift ;;
     --guard-only)   GUARD_ONLY=1; shift ;;
-    -h|--help)      sed -n '2,19p' "$0"; exit 0 ;;
+    -h|--help)      sed -n '2,20p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -77,24 +78,45 @@ log() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 #
 # A desktop is never actually at zero: the window server, the terminal and the editor
 # together idle around 70% of a core here, while a quiet Linux box sits near 5%. So the
-# default ceiling is relative to a baseline sampled at startup, the median of five samples
-# a second apart: three times the baseline or the highest sample plus half a core,
-# whichever is higher. An idle desktop wanders between about 25% and 150% here, so the
+# default ceiling is relative to a baseline sampled at startup, the median of fifteen
+# samples a second apart: three times the baseline or the highest sample plus half a core,
+# whichever is higher. An idle desktop wanders between about 25% and 175% here, so the
 # median alone can land low enough that an ordinary idle spike trips the ceiling; the
 # highest sample plus half a core sits over the spikes the window saw, and on a near-zero
-# box still catches any process that takes a whole core. It is capped at the old fixed 200, so it only ever
-# tightens: a baseline sampled while a parallel build is already running would otherwise
-# lift the ceiling over the very thing it exists to catch, which was a parallel build
-# sitting on ten of the twelve cores at over 1000%. An explicit --max-foreign skips the
-# sampling and wins.
+# box still catches any process that takes a whole core. It is capped at the old fixed 200,
+# so it only ever tightens: a baseline sampled while a parallel build is already running
+# would otherwise lift the ceiling over the very thing it exists to catch, which was a
+# parallel build sitting on ten of the twelve cores at over 1000%. An explicit
+# --max-foreign skips the sampling and wins.
+#
+# Fifteen samples still need not see the highest idle spike, so a check over the ceiling is
+# taken again one interval later and the run stops only if that one is over too. Idle
+# spikes here last a second or two; the competitors this exists for, a parallel build or a
+# second benchmark, hold the box for minutes.
 CORES="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
 ALLOW_LOADED="${ALLOW_LOADED:-0}"
 LOADED_ANYWAY=0
 MY_PGID="$(ps -o pgid= -p $$ | tr -d ' ')"
+INTERVAL="${G16_BASELINE_INTERVAL:-1}"
+PROC="${G16_PROC:-/proc}"
 
-foreign_cpu() {
-  ps -Ao pcpu=,pgid= | awk -v me="$MY_PGID" '$2 != me { s += $1 } END { printf "%.0f", s+0 }'
-}
+# procps reports lifetime CPU, so where /proc exists the sample is a delta over the
+# interval instead. macOS ps reports the scheduler's decaying recent average, which is
+# already current use.
+if [ -r "$PROC/stat" ]; then
+  FOREIGN_METHOD="utime+stime deltas from $PROC"
+  foreign_cpu() {
+    python3 "$BENCH/scripts/foreign_cpu.py" --pgid "$MY_PGID" --interval "$INTERVAL" --proc "$PROC"
+  }
+  # The delta already spans an interval.
+  sample_gap() { :; }
+else
+  FOREIGN_METHOD="ps %cpu"
+  foreign_cpu() {
+    ps -Ao pcpu=,pgid= | awk -v me="$MY_PGID" '$2 != me { s += $1 } END { printf "%.0f", s+0 }'
+  }
+  sample_gap() { sleep "$INTERVAL"; }
+fi
 
 foreign_ceiling() {
   local b="$1" peak="$2" c
@@ -104,37 +126,49 @@ foreign_ceiling() {
   echo "$c"
 }
 
+RULE="stops on two checks in a row over it, ${INTERVAL}s apart, measured as $FOREIGN_METHOD"
 if [ -n "${MAX_FOREIGN:-}" ]; then
   FOREIGN_BASELINE=""
-  GUARD_DESC="foreign CPU ceiling ${MAX_FOREIGN}% of a core, set explicitly"
+  GUARD_DESC="foreign CPU ceiling ${MAX_FOREIGN}% of a core, set explicitly; $RULE"
 else
   samples=""
-  for i in 1 2 3 4 5; do
+  for i in $(seq 15); do
     samples="$samples $(foreign_cpu)"
-    [ "$i" -eq 5 ] || sleep "${G16_BASELINE_INTERVAL:-1}"
+    [ "$i" -eq 15 ] || sample_gap
   done
-  FOREIGN_BASELINE="$(printf '%s\n' $samples | sort -n | sed -n 3p)"
+  FOREIGN_BASELINE="$(printf '%s\n' $samples | sort -n | sed -n 8p)"
   MAX_FOREIGN="$(foreign_ceiling "$FOREIGN_BASELINE" "$(printf '%s\n' $samples | sort -n | tail -1)")"
-  GUARD_DESC="foreign CPU baseline ${FOREIGN_BASELINE}% of a core (samples:${samples}), ceiling ${MAX_FOREIGN}%"
+  GUARD_DESC="foreign CPU baseline ${FOREIGN_BASELINE}% of a core (median of samples:${samples}), ceiling ${MAX_FOREIGN}% = max(3x median, highest + 50) capped at 200; $RULE"
 fi
 echo "    contention guard: $GUARD_DESC"
-[ "${GUARD_ONLY:-0}" = "1" ] && exit 0
 
 check_load() {
-  local fc; fc="$(foreign_cpu)"
-  [ "$fc" -gt "$MAX_FOREIGN" ] || return 0
+  local first fc
+  first="$(foreign_cpu)"
+  [ "$first" -gt "$MAX_FOREIGN" ] || return 0
+  sample_gap
+  fc="$(foreign_cpu)"
+  if [ "$fc" -le "$MAX_FOREIGN" ]; then
+    echo "    foreign CPU at ${first}% then ${fc}% (ceiling ${MAX_FOREIGN}%), a passing spike" >&2
+    return 0
+  fi
   if [ "$ALLOW_LOADED" = "1" ]; then
     LOADED_ANYWAY=1
-    echo "    WARNING: ${fc}% of a core in use by other processes during: $1" >&2
+    echo "    WARNING: ${first}% then ${fc}% of a core in use by other processes during: $1" >&2
     return 0
   fi
   echo >&2
-  echo "another process is using ${fc}% of a core (ceiling ${MAX_FOREIGN}%) on this ${CORES}-core box." >&2
+  echo "another process is using ${first}% then ${fc}% of a core (ceiling ${MAX_FOREIGN}%) on this ${CORES}-core box." >&2
   echo "Stopped during: $1" >&2
   echo "A timing taken now measures whatever else is running. Wait for the box to go" >&2
   echo "idle, or pass --allow-loaded to record anyway and mark the run as suspect." >&2
   exit 3
 }
+
+if [ "${GUARD_ONLY:-0}" = "1" ]; then
+  check_load "--guard-only"
+  exit 0
+fi
 
 # ---------------------------------------------------------------- machine identity
 # Same labels bench/scripts/run-comparison.py uses, so results from the two harnesses
