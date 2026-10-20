@@ -332,7 +332,7 @@ impl ProvingKey {
         // Unchecked here because every IC point gets the full check further down, in both
         // modes: there are `n_public + 1` of them and the verifier depends on them.
         let ic = read_g1_section(&file, 3, n_ic, Check::Unchecked)?;
-        let coeffs = read_coefficients(file.unique_section(4)?, n_vars, domain_size)?;
+        let coeffs = read_coefficients(&file.map_section(4)?, n_vars, domain_size)?;
         let a_query = read_g1_section(&file, 5, n_vars, check)?;
         let b_g1_query = read_g1_section(&file, 6, n_vars, check)?;
         let b_g2_query = read_g2_section(&file, 7, n_vars, check)?;
@@ -510,7 +510,8 @@ fn read_g1_section(
     n: usize,
     check: Check,
 ) -> Result<Vec<G1Affine>, ZkeyError> {
-    let data = file.unique_section(id)?;
+    let section = file.map_section(id)?;
+    let data = &*section;
     expect_records(data, n, G1_BYTES, id)?;
     // One pass over the mapped bytes straight into the output vector: the section is
     // never materialised as an intermediate buffer. The curve check rides in the same
@@ -531,7 +532,8 @@ fn read_g2_section(
     n: usize,
     check: Check,
 ) -> Result<Vec<G2Affine>, ZkeyError> {
-    let data = file.unique_section(id)?;
+    let section = file.map_section(id)?;
+    let data = &*section;
     expect_records(data, n, G2_BYTES, id)?;
     // On the curve only. See `ProvingKey::load` for why the subgroup is checked on the
     // proof rather than on each of these points.

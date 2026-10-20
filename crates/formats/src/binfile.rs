@@ -110,6 +110,9 @@ pub struct BinFile {
     /// `nSections` as the header claims, which `Lenient` may not have reached.
     declared_sections: usize,
     truncation: Option<Truncation>,
+    /// The mapped file, so [`BinFile::map_section`] can map one section on its own.
+    #[cfg(not(target_family = "wasm"))]
+    file: Option<std::fs::File>,
 }
 
 impl BinFile {
@@ -149,7 +152,9 @@ impl BinFile {
         // outlives them. A concurrent truncation of the file would be UB, which is the
         // standard and unavoidable caveat of mmap on any key file.
         let map = unsafe { memmap2::Mmap::map(&file)? };
-        Self::index(Backing::Mapped(map), magic, max_version, scan)
+        let mut bin = Self::index(Backing::Mapped(map), magic, max_version, scan)?;
+        bin.file = Some(file);
+        Ok(bin)
     }
 
     /// Index a binfile already in memory. Takes the `Vec` by value rather than a slice
@@ -261,6 +266,8 @@ impl BinFile {
             sections,
             declared_sections: n_sections,
             truncation,
+            #[cfg(not(target_family = "wasm"))]
+            file: None,
         })
     }
 
@@ -314,6 +321,49 @@ impl BinFile {
             }
         }
         found.ok_or(ZkeyError::MissingSection(id))
+    }
+
+    /// [`BinFile::unique_section`] for a section that is read once and then dropped. On a
+    /// mapped file the section gets a mapping of its own, so its pages leave the process
+    /// RSS when the returned value is dropped; through the whole-file mapping they stay
+    /// resident until the `BinFile` goes. At the end of a zkey parse that is the whole
+    /// file on top of everything decoded from it.
+    pub fn map_section(&self, id: u32) -> Result<SectionBytes<'_>, ZkeyError> {
+        let data = self.unique_section(id)?;
+        #[cfg(not(target_family = "wasm"))]
+        if let (Some(file), false) = (&self.file, data.is_empty()) {
+            let start = data.as_ptr() as usize - self.data.as_ptr() as usize;
+            // Safety: as for the whole-file map in `open_with`, and the range is one the
+            // index already bounded by that map's length.
+            let map = unsafe {
+                memmap2::MmapOptions::new()
+                    .offset(start as u64)
+                    .len(data.len())
+                    .map(file)?
+            };
+            return Ok(SectionBytes::Mapped(map));
+        }
+        Ok(SectionBytes::Borrowed(data))
+    }
+}
+
+/// One section from [`BinFile::map_section`], either a slice of the file's backing or a
+/// mapping of its own that is unmapped on drop.
+pub enum SectionBytes<'a> {
+    Borrowed(&'a [u8]),
+    #[cfg(not(target_family = "wasm"))]
+    Mapped(memmap2::Mmap),
+}
+
+impl core::ops::Deref for SectionBytes<'_> {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            SectionBytes::Borrowed(b) => b,
+            #[cfg(not(target_family = "wasm"))]
+            SectionBytes::Mapped(m) => m,
+        }
     }
 }
 
