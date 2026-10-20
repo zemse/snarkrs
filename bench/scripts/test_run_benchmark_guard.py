@@ -41,10 +41,19 @@ class ContentionGuardTests(unittest.TestCase):
         self.assertIn("baseline 73% of a core", out)
         self.assertIn("ceiling 200%", out)
 
-    def test_quiet_box_gets_half_a_core_over_its_baseline(self):
-        out, _ = self.guard([5, 4, 6, 5, 30])
+    def test_quiet_box_gets_half_a_core_over_its_highest_sample(self):
+        out, _ = self.guard([5, 4, 6, 5, 3])
         self.assertIn("baseline 5% of a core", out)
-        self.assertIn("ceiling 55%", out)
+        self.assertIn("ceiling 56%", out)
+
+    def test_low_median_desktop_clears_its_idle_spikes(self):
+        out, _ = self.guard([159, 51, 26, 41, 27])
+        self.assertIn("baseline 41% of a core", out)
+        self.assertIn("ceiling 200%", out)
+
+    def test_one_wakeup_on_a_quiet_box_lifts_the_ceiling_over_it(self):
+        out, _ = self.guard([5, 4, 6, 5, 30])
+        self.assertIn("ceiling 80%", out)
 
     def test_moderate_baseline_scales_by_three(self):
         out, _ = self.guard([40, 40, 40, 40, 40])
