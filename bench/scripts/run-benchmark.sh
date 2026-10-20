@@ -17,8 +17,9 @@
 # The foreign CPU ceiling defaults to max(3x the median, highest + 50) over fifteen samples
 # taken at startup, capped at 200% of a core, and a run stops only when two checks in a row
 # are over it. --max-foreign fixes it instead; --guard-only prints the baseline and ceiling,
-# makes one check against them and exits. A reading that is not a number stops the run at
-# startup (exit 4) and is written into the run record when it happens mid-run.
+# makes one check against them and exits. A reading that is not a number, or a process group
+# ps cannot report, stops the run at startup (exit 4); a bad reading mid-run is written into
+# the run record instead.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -51,7 +52,7 @@ while [ $# -gt 0 ]; do
     --commit)       COMMIT_OVERRIDE="$2"; shift 2 ;;
     --no-build)     NO_BUILD=1; shift ;;
     --guard-only)   GUARD_ONLY=1; shift ;;
-    -h|--help)      sed -n '2,21p' "$0"; exit 0 ;;
+    -h|--help)      sed -n '2,22p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -97,7 +98,16 @@ log() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 CORES="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
 ALLOW_LOADED="${ALLOW_LOADED:-0}"
 LOADED_ANYWAY=0
-MY_PGID="$(ps -o pgid= -p $$ | tr -d ' ')"
+# An empty group would count our own work as foreign, so a failed lookup stops here too.
+pgid_rc=0
+MY_PGID="$(ps -o pgid= -p $$ | tr -d ' ')" || pgid_rc=$?
+case "$pgid_rc:$MY_PGID" in
+  0:|0:*[!0-9]*|[!0]*)
+    echo "contention guard: could not read this script's process group, got '$MY_PGID' (exit $pgid_rc) from ps -o pgid=." >&2
+    echo "Without it there is no telling our own work from anyone else's, so no foreign CPU" >&2
+    echo "reading means anything. Fix ps before benchmarking." >&2
+    exit 4 ;;
+esac
 INTERVAL="${G16_BASELINE_INTERVAL:-1}"
 PROC="${G16_PROC:-/proc}"
 

@@ -10,10 +10,11 @@ import foreign_cpu
 SCRIPTS = Path(__file__).resolve().parent
 RUN = SCRIPTS / "run-benchmark.sh"
 
-# Answers `ps -o pgid= -p PID` with our own group and each `ps -Ao pcpu=,pgid=` with the
-# next foreign total from SAMPLES, plus a busy process in our own group that must not count.
+# Answers `ps -o pgid= -p PID` with our own group (or PGID and PGID_EXIT when set) and each
+# `ps -Ao pcpu=,pgid=` with the next foreign total from SAMPLES, plus a busy process in our
+# own group that must not count.
 PS = """#!/bin/bash
-if [ "$1" = "-o" ]; then echo " 4242"; exit 0; fi
+if [ "$1" = "-o" ]; then printf '%s\\n' "${PGID- 4242}"; exit "${PGID_EXIT:-0}"; fi
 n=$(cat "$COUNT" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$COUNT"
 echo "$(sed -n "${n}p" "$SAMPLES") 1"
 echo "900.0 4242"
@@ -32,7 +33,8 @@ QUIET = [5] * 13
 
 
 class ContentionGuardTests(unittest.TestCase):
-    def guard(self, samples, *args, status=0, proc=None, py_exit=None):
+    def guard(self, samples, *args, status=0, proc=None, py_exit=None, pgid=None,
+              pgid_exit=None):
         with tempfile.TemporaryDirectory() as directory:
             d = Path(directory)
             (d / "ps").write_text(PS)
@@ -50,6 +52,10 @@ class ContentionGuardTests(unittest.TestCase):
             env.pop("MAX_FOREIGN", None)
             if py_exit is not None:
                 env["PY_EXIT"] = str(py_exit)
+            if pgid is not None:
+                env["PGID"] = pgid
+            if pgid_exit is not None:
+                env["PGID_EXIT"] = str(pgid_exit)
             result = subprocess.run(["bash", str(RUN), "--guard-only", *args], env=env,
                                     capture_output=True, text=True, timeout=30)
             self.assertEqual(result.returncode, status, result.stderr)
@@ -150,6 +156,18 @@ class ContentionGuardTests(unittest.TestCase):
         self.assertEqual(calls, 2)
         self.assertNotIn("passing spike", err)
         self.assertIn("during: --guard-only, got '1.5e2'", err)
+
+    def test_a_failing_process_group_lookup_refuses_to_run(self):
+        out, calls, err = self.guard(QUIET, "--max-foreign", "100", status=4, pgid=" 4242",
+                                     pgid_exit=1)
+        self.assertEqual(calls, 0)
+        self.assertEqual(out, "")
+        self.assertIn("could not read this script's process group, got '4242' (exit 1)", err)
+
+    def test_an_empty_process_group_refuses_to_run(self):
+        _, calls, err = self.guard(QUIET, status=4, pgid="")
+        self.assertEqual(calls, 0)
+        self.assertIn("could not read this script's process group, got '' (exit 0)", err)
 
 
 STAT = ("77 (tmux: server (1)) S 1 {pgrp} 77 0 -1 4194560 3020 0 0 0 {utime} {stime} 0 0 20 "
