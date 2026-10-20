@@ -419,6 +419,13 @@ where
                 ones_sum.madd(x, y);
                 continue;
             }
+            if bigints.len() == bigints.capacity() {
+                // Grown by hand so the outgrown buffer is scrubbed rather than freed as is.
+                let mut grown = Vec::with_capacity((2 * bigints.len()).max(4));
+                grown.extend_from_slice(&bigints);
+                scrub(&mut bigints);
+                bigints = grown;
+            }
             idx.push(i as u32);
             bigints.push(s.into_bigint());
         }
