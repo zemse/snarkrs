@@ -506,7 +506,7 @@ pub async fn prepare() -> Result<String, JsError> {
     // rather than an accident, so the browser and the native path prepare identically.
     // Same scope discipline as `create_prover`: this builds the gather, NTT and h_join
     // modules, and a pipeline the browser rejects is only reported inside a scope.
-    let circuit = device
+    let mut circuit = device
         .scoped("building the stage 0 to 4 shader modules", || {
             WgpuCircuit::new(Arc::clone(&device), Arc::clone(&msm), pk)
         })
@@ -515,6 +515,7 @@ pub async fn prepare() -> Result<String, JsError> {
     // The key's uploads land under their own seal, so a refusal is the key's and not the
     // first proof's. One attempt: the browser has no thread to back off on.
     circuit.key_landed().await.map_err(js)?;
+    circuit.release_host_key();
     let total_us = t0.elapsed().as_micros() as u64;
     let cost = circuit.prepare_cost();
     let base_bytes = circuit.base_bytes();
@@ -1015,13 +1016,14 @@ async fn prove_cold_inner(
     // reported through no other channel, which is how a 3 ms cold row that snarkjs rejects
     // gets published as a measurement. `scoped` wants the device held exclusively for the
     // whole of `f`, which the `busy` handshake in `prove_cold` above is.
-    let circuit = device
+    let mut circuit = device
         .scoped("building the stage 0 to 4 shader modules", || {
             WgpuCircuit::new(Arc::clone(&device), Arc::clone(&msm), pk)
         })
         .await
         .map_err(js)?;
     circuit.key_landed().await.map_err(js)?;
+    circuit.release_host_key();
     extra.push_str(&format!(
         r#","prepare_us":{}"#,
         t0.elapsed().as_micros() as u64

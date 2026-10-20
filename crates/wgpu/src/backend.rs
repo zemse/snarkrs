@@ -53,8 +53,8 @@ use std::sync::Arc;
 use web_time::Instant;
 
 use snarkrs_field::{Fr, One, Zero};
-use snarkrs_formats::ProvingKey;
-use snarkrs_groth16::{HPoly, MsmOutputs, ProveError, StageTimings};
+use snarkrs_formats::{Coefficients, ProvingKey};
+use snarkrs_groth16::{malloc::release, HPoly, MsmOutputs, ProveError, StageTimings};
 
 use crate::batch::{G1Bases, G2Bases, Group, Job, MontConvert, MsmBatch, Source};
 use crate::device::{bad, WgpuBackend};
@@ -230,6 +230,7 @@ impl Backend for WgpuProver {
             first = false;
             pollster::block_on(circuit.key_landed())
         })?;
+        circuit.release_host_key();
         Ok(Box::new(circuit))
     }
 }
@@ -259,6 +260,8 @@ pub struct WgpuCircuit {
     cost: CircuitCost,
     /// What [`PreparedCircuit::msms`] proves under; the browser chooses per call instead.
     work: Work,
+    /// Set by [`Self::release_host_key`].
+    host_released: bool,
 }
 
 impl WgpuCircuit {
@@ -323,6 +326,7 @@ impl WgpuCircuit {
             h_bases: bases.4,
             cost,
             work,
+            host_released: false,
         })
     }
 
@@ -429,6 +433,9 @@ impl WgpuCircuit {
     /// Queues the key's uploads again, into fresh buffers, after [`Self::key_landed`]
     /// refused them.
     pub fn reupload(&mut self) -> Result<(), ProveError> {
+        if self.host_released {
+            return Err(bad("the key's host copy was released after it landed"));
+        }
         let (stages, bases, cost) = Self::upload(&self.device, &self.pk)?;
         self.stages = stages;
         self.a_bases = bases.0;
@@ -438,6 +445,34 @@ impl WgpuCircuit {
         self.h_bases = bases.4;
         self.cost = cost;
         Ok(())
+    }
+
+    /// Releases the host coefficients and the five queries, which every later read takes
+    /// from the device. Call it once [`Self::key_landed`] has accepted the upload: after
+    /// it, [`Self::reupload`] refuses. Released rather than dropped, for the reason
+    /// [`snarkrs_groth16::malloc::release`] gives.
+    pub fn release_host_key(&mut self) {
+        let pk = &mut self.pk;
+        let Coefficients {
+            row_ptr,
+            signal,
+            value,
+        } = std::mem::replace(
+            &mut pk.coeffs,
+            Coefficients {
+                row_ptr: Default::default(),
+                signal: Default::default(),
+                value: Default::default(),
+            },
+        );
+        row_ptr.into_iter().chain(signal).for_each(release);
+        value.into_iter().for_each(release);
+        release(std::mem::take(&mut pk.a_query));
+        release(std::mem::take(&mut pk.b_g1_query));
+        release(std::mem::take(&mut pk.b_g2_query));
+        release(std::mem::take(&mut pk.l_query));
+        release(std::mem::take(&mut pk.h_query));
+        self.host_released = true;
     }
 
     /// What `WgpuProver::prepare` cost for this key.
@@ -462,8 +497,8 @@ impl WgpuCircuit {
     /// [`snarkrs_groth16::PreparedCircuit::key`]. Inherent because that trait is native only
     /// and stage 11 in the browser needs it.
     ///
-    /// This backend also retains the bulk coefficients and queries for [`Self::reupload`];
-    /// other backends may release them after upload.
+    /// The bulk coefficients and queries are empty after [`Self::release_host_key`], which
+    /// `WgpuProver::prepare` calls once the key has landed.
     pub fn key(&self) -> &ProvingKey {
         &self.pk
     }
@@ -986,13 +1021,16 @@ const _: () = {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+    use snarkrs_formats::Matrix;
 
     #[test]
     #[ignore = "requires a native GPU and bench/artifacts/tiny_mul/circuit.zkey"]
-    fn key_retention_preserves_wgpu_host_storage() {
+    fn key_retention_releases_only_wgpu_bulk_storage() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../bench/artifacts/tiny_mul/circuit.zkey");
         let expected = ProvingKey::load(&path).expect("tiny_mul key");
+        assert!(!expected.a_query.is_empty());
+        assert!(!expected.vk.ic.is_empty());
         let circuit = WgpuProver::new()
             .expect("WebGPU device")
             .prepare(ProvingKey::load(&path).unwrap())
@@ -1037,28 +1075,62 @@ mod tests {
             )
         );
         assert_eq!(
-            (&key.coeffs.row_ptr, &key.coeffs.signal, &key.coeffs.value),
-            (
-                &expected.coeffs.row_ptr,
-                &expected.coeffs.signal,
-                &expected.coeffs.value
-            )
+            [
+                key.a_query.len(),
+                key.b_g1_query.len(),
+                key.b_g2_query.len(),
+                key.l_query.len(),
+                key.h_query.len()
+            ],
+            [0; 5]
         );
         assert_eq!(
-            (
-                &key.a_query,
-                &key.b_g1_query,
-                &key.b_g2_query,
-                &key.l_query,
-                &key.h_query
-            ),
-            (
-                &expected.a_query,
-                &expected.b_g1_query,
-                &expected.b_g2_query,
-                &expected.l_query,
-                &expected.h_query
-            )
+            [
+                key.a_query.capacity(),
+                key.b_g1_query.capacity(),
+                key.b_g2_query.capacity(),
+                key.l_query.capacity(),
+                key.h_query.capacity()
+            ],
+            [0; 5]
         );
+        for m in Matrix::BOTH.map(Matrix::index) {
+            assert_eq!(
+                [
+                    key.coeffs.row_ptr[m].len(),
+                    key.coeffs.signal[m].len(),
+                    key.coeffs.value[m].len()
+                ],
+                [0; 3]
+            );
+            assert_eq!(
+                [
+                    key.coeffs.row_ptr[m].capacity(),
+                    key.coeffs.signal[m].capacity(),
+                    key.coeffs.value[m].capacity()
+                ],
+                [0; 3]
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a native GPU and bench/artifacts/tiny_mul/circuit.zkey"]
+    fn reupload_refuses_once_the_host_key_is_released() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../bench/artifacts/tiny_mul/circuit.zkey");
+        let prover = WgpuProver::new().expect("WebGPU device");
+        let mut circuit = WgpuCircuit::new(
+            Arc::clone(&prover.device),
+            Arc::clone(&prover.msm),
+            ProvingKey::load(&path).expect("tiny_mul key"),
+        )
+        .unwrap();
+        pollster::block_on(circuit.key_landed()).unwrap();
+        circuit.reupload().expect("the host copy is still held");
+        pollster::block_on(circuit.key_landed()).unwrap();
+        circuit.release_host_key();
+        let e = circuit.reupload().unwrap_err();
+        assert!(e.to_string().contains("released"), "{e}");
     }
 }

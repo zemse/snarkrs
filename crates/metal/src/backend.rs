@@ -181,7 +181,7 @@ impl Backend for MetalBackend {
 /// are emptied as each one is uploaded. [`PreparedCircuit::key`] permits releasing this
 /// bulk storage; its result is not a complete key for preparing another backend.
 ///
-/// They go through [`crate::alloc::release`] rather than a plain drop, because macOS
+/// They go through [`snarkrs_groth16::malloc::release`] rather than a plain drop, because macOS
 /// malloc keeps freed large blocks resident in its large cache, and on js_384x384_d32
 /// that held 2.4 GB of the 9.1 GB peak.
 pub struct MetalCircuit {
@@ -256,8 +256,8 @@ impl MetalCircuit {
         row_ptr
             .into_iter()
             .chain(signal)
-            .for_each(crate::alloc::release);
-        value.into_iter().for_each(crate::alloc::release);
+            .for_each(snarkrs_groth16::malloc::release);
+        value.into_iter().for_each(snarkrs_groth16::malloc::release);
         let stages_us = t0.elapsed().as_micros() as u64;
 
         // Stages 5 to 9. Repacking, not casting: `ark_ec::G1Affine` is 72 bytes on this
@@ -267,7 +267,7 @@ impl MetalCircuit {
         let t1 = Instant::now();
         let g1 = |v: Vec<_>| {
             let bases = msm.upload_g1_bases(&v);
-            crate::alloc::release(v);
+            snarkrs_groth16::malloc::release(v);
             bases
         };
         let a_bases = g1(std::mem::take(&mut pk.a_query))?;
@@ -283,7 +283,7 @@ impl MetalCircuit {
                 BG2::Cpu { bases: v, pool }
             } else {
                 let bases = msm.upload_g2_bases(&v);
-                crate::alloc::release(v);
+                snarkrs_groth16::malloc::release(v);
                 BG2::Gpu(bases?)
             }
         };

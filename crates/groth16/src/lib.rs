@@ -64,7 +64,8 @@ pub mod cpu;
 /// benchmark rests on. Here rather than in the CLI because the browser prover has no
 /// filesystem and still has to hand `snarkjs.groth16.verify` exactly these bytes.
 pub mod json;
-/// Turning off macOS malloc's large cache, which otherwise keeps freed buffers in the peak.
+/// Turning off macOS malloc's large cache, which otherwise keeps freed buffers in the peak,
+/// or releasing one buffer past it.
 pub mod malloc;
 pub mod prove;
 /// A deterministic execution trace, for diffing one machine's intermediate values against

@@ -445,7 +445,7 @@ impl HResident {
         // Host tables, released once packed so they do not sit in malloc's large cache.
         let table = |data: Vec<Fr>| {
             let buf = st.buf(&data);
-            crate::alloc::release(data);
+            snarkrs_groth16::malloc::release(data);
             buf
         };
         let tw_fwd = table(domain.twiddles())?;

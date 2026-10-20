@@ -46,3 +46,70 @@ pub fn reexec_without_large_cache() {
         let _ = cmd.args(args).env("MallocLargeCache", "0").exec();
     }
 }
+
+/// Frees `v` with its pages handed back to the OS now, not whenever malloc reuses them.
+///
+/// Dropping is not enough for a key section in a process that keeps the large cache. On
+/// js_384x384_d32 the cache held 2.4 GB of dropped zkey sections for the rest of the
+/// process. Mapping fresh anonymous pages over the block's whole pages releases the old
+/// ones at once and leaves malloc owning an address range that costs nothing until it is
+/// touched again. Off Apple targets this is a plain drop.
+pub fn release<T: Copy>(mut v: Vec<T>) {
+    let (start, bytes) = (v.as_mut_ptr() as usize, v.capacity() * size_of::<T>());
+    #[cfg(target_vendor = "apple")]
+    darwin::replace_pages(start, bytes);
+    #[cfg(not(target_vendor = "apple"))]
+    let _ = (start, bytes);
+    drop(v);
+}
+
+#[cfg(target_vendor = "apple")]
+mod darwin {
+    use std::ffi::c_void;
+
+    // libSystem, which every process links. Declared here rather than taken from `libc` so
+    // this crate's dependency set does not change for two calls.
+    extern "C" {
+        fn mmap(
+            addr: *mut c_void,
+            len: usize,
+            prot: i32,
+            flags: i32,
+            fd: i32,
+            off: i64,
+        ) -> *mut c_void;
+    }
+    const PROT_READ: i32 = 0x1;
+    const PROT_WRITE: i32 = 0x2;
+    const MAP_PRIVATE: i32 = 0x2;
+    const MAP_FIXED: i32 = 0x10;
+    const MAP_ANON: i32 = 0x1000;
+    /// Apple silicon's page. Also a multiple of a 4 KB page, so the rounding stays valid on
+    /// a machine that has those.
+    const PAGE: usize = 16 << 10;
+
+    /// Maps fresh pages over the whole pages of the `bytes` at `start`, which must be a
+    /// `Vec` allocation that [`super::release`] drops next.
+    pub(super) fn replace_pages(start: usize, bytes: usize) {
+        let lo = start.next_multiple_of(PAGE);
+        let hi = (start + bytes) & !(PAGE - 1);
+        if hi > lo {
+            // SAFETY: `lo..hi` lies inside the `Vec`'s allocation, which nothing else
+            // references, and its element type is `Copy`, so the drop that follows reads
+            // none of it. The new pages are private, readable and writable, as malloc's were, so
+            // it can reuse or unmap the block as it would have. XNU puts the old mapping
+            // back if a fixed mapping fails, so a failure costs only the saving; nothing is
+            // checked because nothing changes.
+            unsafe {
+                mmap(
+                    lo as *mut c_void,
+                    hi - lo,
+                    PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_FIXED | MAP_ANON,
+                    -1,
+                    0,
+                );
+            }
+        }
+    }
+}
