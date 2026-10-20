@@ -42,7 +42,7 @@
 //! `snarkrs_groth16::cpu::CpuCircuit::new` for why that specific element and not `Fr::GENERATOR`.
 
 use bytemuck::{Pod, Zeroable};
-use snarkrs_field::{Domain, Field as _, Fr};
+use snarkrs_field::{Domain, Fr};
 use snarkrs_gpu_layout::{PackedFr, LIMBS};
 use snarkrs_groth16::ProveError;
 
@@ -224,14 +224,8 @@ impl NttTables {
         // Reject the unchunked tables before building any host vectors or uploading twiddles.
         check_table_capacity(domain.size(), &backend.granted_limits())?;
 
-        // A running product, one multiply per entry, rather than a square-and-multiply
-        // ladder per index. At 2^18 that is 262,144 multiplies against about 4.7 million.
-        let mut pows = Vec::with_capacity(domain.size());
-        let mut acc = Fr::ONE;
-        for _ in 0..domain.size() {
-            pows.push(acc);
-            acc *= coset_shift;
-        }
+        // A running product, built in chunks over the thread pool like the twiddles.
+        let pows = snarkrs_field::powers(coset_shift, domain.size());
 
         // Padded to one element when the domain is a single point, where `twiddles()` is
         // empty. A bare `array<Fr>` binding's minimum size is one 32-byte element, so a
