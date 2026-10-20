@@ -83,7 +83,9 @@ fn snarkjs_bin() -> Option<String> {
 /// snarkjs' exit code, stdout and stderr. Both streams go through files, because snarkjs
 /// calls `process.exit` before a pipe has drained. Colours and the stack trace of a thrown
 /// error are taken out: the trace names node_modules paths, and is not what a script
-/// matches on.
+/// matches on. Its log lines are put in our form: INFO bare on stdout, and a warning or an
+/// error moved to the end of stderr behind its label, without the `Error: ` its logger
+/// puts in front of a thrown error.
 fn snarkjs(bin: &str, dir: &Path, line: &str) -> (i32, String, String) {
     let (o, e) = (dir.join(".js.out"), dir.join(".js.err"));
     let status = Command::new(bin)
@@ -101,7 +103,28 @@ fn snarkjs(bin: &str, dir: &Path, line: &str) -> (i32, String, String) {
             .map(|l| format!("{l}\n"))
             .collect::<String>()
     };
-    (status.code().unwrap_or(-1), read(&o), read(&e))
+    // A message's continuation lines follow it to whichever stream it went to.
+    let (mut out, mut err, mut to_err) = (String::new(), read(&e), false);
+    for l in read(&o).lines() {
+        let line = match l.split_once(" snarkJS: ") {
+            Some(("[INFO] ", msg)) => {
+                to_err = false;
+                msg.to_string()
+            }
+            Some(("[WARN] ", msg)) => {
+                to_err = true;
+                format!("warning: {msg}")
+            }
+            Some(("[ERROR]", msg)) => {
+                to_err = true;
+                format!("error: {}", msg.strip_prefix("Error: ").unwrap_or(msg))
+            }
+            _ => l.to_string(),
+        };
+        let stream = if to_err { &mut err } else { &mut out };
+        stream.push_str(&format!("{line}\n"));
+    }
+    (status.code().unwrap_or(-1), out, err)
 }
 
 fn strip_colour(s: &str) -> String {
@@ -206,8 +229,8 @@ fn wtns_calculate_writes_snarkjs_bytes_and_tips_on_stderr() {
     let o = snarkrs(&dir, "wd circuit.wasm input.json debug.wtns");
     expect(&o, 1, "wd without a sym");
     assert_eq!(
-        out(&o),
-        "[ERROR] snarkJS: Error: ENOENT: no such file or directory, open 'circuit.sym'\n"
+        err(&o),
+        "error: ENOENT: no such file or directory, open 'circuit.sym'\n"
     );
     std::fs::write(dir.join("circuit.sym"), "1,1,0,main.out\n").unwrap();
     let o = snarkrs(
@@ -307,11 +330,11 @@ fn fullprove_from_wasm_verifies_and_writes_no_witness() {
 
     std::fs::copy(tiny.join("vkey.json"), dir.join("vkey.json")).unwrap();
     let o = snarkrs(&dir, "g16v vkey.json public.json proof.json");
-    assert_eq!(out(&o), "[INFO]  snarkJS: OK!\n");
+    assert_eq!(out(&o), "OK!\n");
     if let Some(js) = snarkjs_bin() {
         let (code, js_out, _) =
             snarkjs(&js, &dir, "groth16 verify vkey.json public.json proof.json");
-        assert_eq!((code, js_out.as_str()), (0, "[INFO]  snarkJS: OK!\n"));
+        assert_eq!((code, js_out.as_str()), (0, "OK!\n"));
     }
 
     // An input the circuit rejects is snarkjs' error line and exit 1, and nothing is
@@ -325,9 +348,9 @@ fn fullprove_from_wasm_verifies_and_writes_no_witness() {
     let o = snarkrs(&dir, &line);
     expect(&o, 1, &line);
     assert!(
-        out(&o).starts_with("[ERROR] snarkJS: Error: Not all inputs have been set."),
+        err(&o).starts_with("error: Not all inputs have been set."),
         "{}",
-        out(&o)
+        err(&o)
     );
     assert!(!err(&o).contains(TIP));
     assert!(!dir.join("p2.json").exists());
@@ -387,7 +410,7 @@ fn native_binaries_work_where_the_wasm_did() {
     );
     std::fs::copy(tiny.join("vkey.json"), dir.join("vkey.json")).unwrap();
     let o = snarkrs(&dir, "g16v vkey.json public.json proof.json");
-    assert_eq!(out(&o), "[INFO]  snarkJS: OK!\n");
+    assert_eq!(out(&o), "OK!\n");
 
     // A binary from another circuit: the witness has the wrong number of wires.
     let other = dir.join("other.wtns");
@@ -405,7 +428,7 @@ fn native_binaries_work_where_the_wasm_did() {
     );
     let o = snarkrs_env(&dir, &line, &[("TMPDIR", &tmp)]);
     expect(&o, 1, &line);
-    assert!(out(&o).contains("not the same circuit"), "{}", out(&o));
+    assert!(err(&o).contains("not the same circuit"), "{}", err(&o));
     assert!(!dir.join("p2.json").exists());
     assert_eq!(
         std::fs::read_dir(&tmp).unwrap().count(),
@@ -418,16 +441,16 @@ fn native_binaries_work_where_the_wasm_did() {
     let o = snarkrs(&dir, &line);
     expect(&o, 1, &line);
     assert!(
-        out(&o).contains("wasm witness calculator only"),
+        err(&o).contains("wasm witness calculator only"),
         "{}",
-        out(&o)
+        err(&o)
     );
 
     // Neither wasm nor executable.
     let line = format!("wc {} {} w.wtns", input.display(), input.display());
     let o = snarkrs(&dir, &line);
     expect(&o, 1, &line);
-    assert!(out(&o).contains("neither a wasm module"), "{}", out(&o));
+    assert!(err(&o).contains("neither a wasm module"), "{}", err(&o));
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -449,7 +472,7 @@ fn a_native_failure_forwards_its_stderr() {
     let o = snarkrs(&dir, "wc circuit input.json w.wtns");
     expect(&o, 1, "wc");
     assert!(err_less_tip(&o).contains("Only 0 out of 2"), "{}", err(&o));
-    assert!(out(&o).contains("killed by SIGABRT"), "{}", out(&o));
+    assert!(err(&o).contains("killed by SIGABRT"), "{}", err(&o));
     assert!(!err(&o).contains(TIP));
     assert!(!dir.join("w.wtns").exists());
     std::fs::remove_dir_all(&dir).ok();

@@ -44,8 +44,8 @@
 //! `--constant-work` and `--threads N`, and the ceremony commands take `--backend cpu|metal`.
 //!
 //! Exit codes are snarkjs': 0 for success, 1 for a failure or a proof or file that does not
-//! verify, 99 for a line that names no command or gives it the wrong parameters. The log
-//! lines are too (`log.rs`), on stdout, so a script that greps `snarkJS: OK!` keeps working.
+//! verify, 99 for a line that names no command or gives it the wrong parameters. Results
+//! such as `OK!` go to stdout bare, and warnings and errors to stderr (`log.rs`).
 //!
 //! `groth16 prove` writes snarkjs' `proof.json` and `public.json` verbatim, so the output is
 //! checkable by `snarkjs groth16 verify` and by rapidsnark's verifier, not only by ours.
@@ -640,8 +640,7 @@ fn main() -> ExitCode {
     match run(cli.cmd) {
         Ok(code) => ExitCode::from(code),
         Err(e) => {
-            // `logger.error(err)` in cli.js, which prints the thrown Error as `Error: msg`.
-            log::error(format!("Error: {e:#}"));
+            log::error(format!("{e:#}"));
             ExitCode::FAILURE
         }
     }
@@ -1175,10 +1174,13 @@ fn run_file_info(file: &Path) -> Result<()> {
     Ok(())
 }
 
-/// A witness that could not be computed is reported the way snarkjs reports it: its error
-/// class and message on an ERROR line, and exit 1.
+/// A witness that could not be computed is an error line and exit 1. The message is
+/// snarkjs', with its JavaScript class in front unless that is the plain `Error`.
 fn witness_failed(e: &WitnessError) -> u8 {
-    log::error(e.snarkjs_line());
+    match e.js_name() {
+        "Error" => log::error(e),
+        _ => log::error(e.snarkjs_line()),
+    }
     1
 }
 

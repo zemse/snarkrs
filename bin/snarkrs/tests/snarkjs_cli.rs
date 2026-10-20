@@ -58,6 +58,10 @@ fn stdout(o: &Output) -> String {
     String::from_utf8_lossy(&o.stdout).into_owned()
 }
 
+fn stderr(o: &Output) -> String {
+    String::from_utf8_lossy(&o.stderr).into_owned()
+}
+
 #[track_caller]
 fn expect(o: &Output, code: i32, line: &str) {
     assert_eq!(o.status.code(), Some(code), "`{line}`: {}", said(o));
@@ -96,14 +100,14 @@ fn exit_codes_follow_snarkjs() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// A missing file is an error line in snarkjs' form and exit 1, not a panic and not 99.
+/// A missing file is an error line on stderr and exit 1, not a panic and not 99.
 #[test]
 fn a_missing_file_is_an_error_line() {
     let dir = scratch("missing");
     let o = snarkrs(&dir, "groth16 verify");
     expect(&o, 1, "groth16 verify");
     assert!(
-        stdout(&o).starts_with("[ERROR] snarkJS: Error: loading verification_key.json"),
+        stderr(&o).starts_with("error: loading verification_key.json"),
         "{}",
         said(&o)
     );
@@ -128,10 +132,7 @@ fn a_ceremony_and_a_proof_run_on_snarkjs_lines() {
 
     // Phase 1. `ptn` names its output after the power when no name is given.
     let out = run("powersoftau new bn128 4 -v");
-    assert!(
-        out.starts_with("[INFO]  snarkJS: First Contribution Hash:\n\t\t"),
-        "{out}"
-    );
+    assert!(out.starts_with("First Contribution Hash:\n\t\t"), "{out}");
     assert!(dir.join("powersOfTau4_0000.ptau").is_file());
 
     // No `-e`: snarkjs asks on stdin, and so does this.
@@ -143,7 +144,7 @@ fn a_ceremony_and_a_proof_run_on_snarkjs_lines() {
         "{}",
         said(&o)
     );
-    assert!(stdout(&o).contains("[INFO]  snarkJS: Contribution Response Hash imported: "));
+    assert!(stdout(&o).contains("Contribution Response Hash imported: "));
     // With stdin closed there is nobody to ask: exit 1, not a hang.
     let line = "ptc powersOfTau4_0000.ptau never.ptau";
     let o = snarkrs_with_stdin(&dir, line, None);
@@ -151,21 +152,12 @@ fn a_ceremony_and_a_proof_run_on_snarkjs_lines() {
     assert!(!dir.join("never.ptau").exists());
 
     let out = run("powersOfTau CONTRIBUTE pot_0001.ptau pot_0002.ptau -e=more -n=Second");
-    assert!(
-        out.contains("[INFO]  snarkJS: Next Challenge Hash: \n\t\t"),
-        "{out}"
-    );
+    assert!(out.contains("Next Challenge Hash: \n\t\t"), "{out}");
     run("ptb pot_0002.ptau pot_beacon.ptau 0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f 10 -n=Final");
     run("powersoftau prepare phase2 pot_beacon.ptau powersoftau.ptau");
     let out = run("ptv powersoftau.ptau");
-    assert!(
-        out.contains("[INFO]  snarkJS: Powers Of tau file OK!"),
-        "{out}"
-    );
-    assert!(
-        out.ends_with("[INFO]  snarkJS: Powers of Tau Ok!\n"),
-        "{out}"
-    );
+    assert!(out.contains("Powers Of tau file OK!"), "{out}");
+    assert!(out.ends_with("Powers of Tau Ok!\n"), "{out}");
     assert_eq!(out.matches("Response Hash:").count(), 3, "{out}");
     let out = run("fi powersoftau.ptau");
     assert!(out.contains("prepared       true"), "{out}");
@@ -181,17 +173,11 @@ fn a_ceremony_and_a_proof_run_on_snarkjs_lines() {
     // Phase 2, on defaults: circuit.r1cs, powersoftau.ptau, circuit_0000.zkey,
     // circuit_final.zkey, circuit_vk.json, witness.wtns, proof.json and public.json.
     let out = run("groth16 setup");
-    assert!(
-        out.starts_with("[INFO]  snarkJS: Circuit hash: \n"),
-        "{out}"
-    );
+    assert!(out.starts_with("Circuit hash: \n"), "{out}");
     assert!(dir.join("circuit_0000.zkey").is_file());
     run("zkc circuit_0000.zkey circuit_0001.zkey -e=phase2 -n=One");
     let out = run("zkb circuit_0001.zkey circuit_final.zkey 0102 10");
-    assert!(
-        out.starts_with("[INFO]  snarkJS: Contribution Hash: \n"),
-        "{out}"
-    );
+    assert!(out.starts_with("Contribution Hash: \n"), "{out}");
     for line in [
         "zkey verify",
         "zkv",
@@ -201,16 +187,13 @@ fn a_ceremony_and_a_proof_run_on_snarkjs_lines() {
         "zkey verify init circuit_0000.zkey powersoftau.ptau circuit_final.zkey",
     ] {
         let out = run(line);
-        assert!(
-            out.ends_with("[INFO]  snarkJS: ZKey Ok!\n"),
-            "`{line}`: {out}"
-        );
+        assert!(out.ends_with("ZKey Ok!\n"), "`{line}`: {out}");
     }
     // A chain that does not start at the given initial key is a verdict: exit 1.
     let line = "zkvi circuit_0001.zkey powersoftau.ptau circuit_0001.zkey";
     let o = snarkrs(&dir, line);
     expect(&o, 1, line);
-    assert!(stdout(&o).starts_with("[ERROR] snarkJS: "), "{}", said(&o));
+    assert!(stderr(&o).starts_with("error: "), "{}", said(&o));
 
     let out = run("zkev");
     assert!(out.contains("EXPORT VERIFICATION KEY FINISHED"), "{out}");
@@ -219,9 +202,9 @@ fn a_ceremony_and_a_proof_run_on_snarkjs_lines() {
     run("g16p");
     assert!(dir.join("proof.json").is_file() && dir.join("public.json").is_file());
     let out = run("g16v circuit_vk.json");
-    assert_eq!(out, "[INFO]  snarkJS: OK!\n");
+    assert_eq!(out, "OK!\n");
     let out = run("groth16 verify circuit_vk.json public.json proof.json");
-    assert_eq!(out, "[INFO]  snarkJS: OK!\n");
+    assert_eq!(out, "OK!\n");
 
     // The first public signal plus one.
     let public: Vec<String> =
@@ -236,7 +219,10 @@ fn a_ceremony_and_a_proof_run_on_snarkjs_lines() {
     let line = "g16v circuit_vk.json tampered.json proof.json";
     let o = snarkrs(&dir, line);
     expect(&o, 1, line);
-    assert_eq!(stdout(&o), "[ERROR] snarkJS: Invalid proof\n");
+    assert_eq!(
+        (stdout(&o).as_str(), stderr(&o).as_str()),
+        ("", "error: Invalid proof\n")
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -256,8 +242,9 @@ fn snarkjs_bin() -> Option<String> {
 }
 
 /// One line through snarkjs in `dir`: its exit code and its stdout with logplease's colours
-/// taken out. Stdout goes through a file, because snarkjs calls `process.exit` before a
-/// pipe has drained and a long log comes back cut short.
+/// and `[LEVEL] snarkJS: ` frames taken out, as [`unframe`] words it. Stdout goes through a
+/// file, because snarkjs calls `process.exit` before a pipe has drained and a long log comes
+/// back cut short.
 fn snarkjs(bin: &str, dir: &Path, line: &str) -> (i32, String) {
     let log = dir.join(".snarkjs.log");
     let status = Command::new(bin)
@@ -269,7 +256,25 @@ fn snarkjs(bin: &str, dir: &Path, line: &str) -> (i32, String) {
         .status()
         .unwrap_or_else(|e| panic!("running snarkjs {line}: {e}"));
     let out = std::fs::read_to_string(&log).unwrap();
-    (status.code().unwrap_or(-1), strip_colour(&out))
+    (status.code().unwrap_or(-1), unframe(&strip_colour(&out)))
+}
+
+/// snarkjs' log lines in ours: INFO bare, the others behind a `warning:` or `error:` label,
+/// and without the `Error: ` its logger puts in front of a thrown error.
+fn unframe(log: &str) -> String {
+    log.lines()
+        .map(|l| {
+            let l = match l.split_once(" snarkJS: ") {
+                Some(("[INFO] ", msg)) => msg.to_string(),
+                Some(("[WARN] ", msg)) => format!("warning: {msg}"),
+                Some(("[ERROR]", msg)) => {
+                    format!("error: {}", msg.strip_prefix("Error: ").unwrap_or(msg))
+                }
+                _ => l.to_string(),
+            };
+            format!("{l}\n")
+        })
+        .collect()
 }
 
 fn strip_colour(s: &str) -> String {
@@ -305,7 +310,7 @@ fn head(log: &str, n: usize) -> String {
     let mut seen = 0;
     log.lines()
         .take_while(|l| {
-            if l.starts_with('[') {
+            if !l.starts_with('\t') {
                 seen += 1;
             }
             seen <= n
@@ -353,7 +358,7 @@ fn challenge_and_response_match_snarkjs() {
     let theirs = js_run("ptcc bn128 challenge_js challenge_js.response -e=two");
     assert_eq!(head(&ours, 2), head(&theirs, 2));
     assert!(
-        ours.contains("[INFO]  snarkJS: Contribution Response Hash: \n\t\t"),
+        ours.contains("Contribution Response Hash: \n\t\t"),
         "{ours}"
     );
     run("ptcc bn128 fresh.bin -e=three");
@@ -389,11 +394,7 @@ fn challenge_and_response_match_snarkjs() {
     let line = "ptir pot_0000.ptau challenge.response never.ptau";
     let o = snarkrs(&dir, line);
     expect(&o, 1, line);
-    assert!(
-        stdout(&o).starts_with("[ERROR] snarkJS: Error: "),
-        "{}",
-        said(&o)
-    );
+    assert!(stderr(&o).starts_with("error: "), "{}", said(&o));
     let line = "ptcc bls12381 challenge -e=x";
     let o = snarkrs(&dir, line);
     expect(&o, 1, line);
@@ -441,10 +442,7 @@ fn bellman_and_solidity_match_snarkjs() {
 
     let out =
         run("zkey bellman contribute bn128 circuit.mpcparams circuit_response.mpcparams -e=three");
-    assert!(
-        out.starts_with("[INFO]  snarkJS: Contribution Hash: \n\t\t"),
-        "{out}"
-    );
+    assert!(out.starts_with("Contribution Hash: \n\t\t"), "{out}");
     js_run("zkbc bn128 circuit.mpcparams js_response.mpcparams -e=four");
 
     // Import is deterministic given the response, whichever tool contributed.
@@ -473,7 +471,7 @@ fn bellman_and_solidity_match_snarkjs() {
     expect(&o, 1, line);
     let (code, theirs) = snarkjs(&js, &dir, line);
     assert_eq!(code, 1, "{theirs}");
-    assert_eq!(stdout(&o), theirs);
+    assert_eq!(said(&o), theirs);
     let line = "zkbc bls12381 circuit.mpcparams x.mpcparams -e=x";
     let o = snarkrs(&dir, line);
     expect(&o, 1, line);

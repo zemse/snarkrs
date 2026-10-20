@@ -1,13 +1,9 @@
-//! snarkjs' log lines: logplease's format under the `snarkJS` category, all on stdout.
+//! The CLI's log lines, in the shape of a Rust command line tool.
 //!
-//! The category is snarkjs' own spelling rather than ours, so a script that greps
-//! `snarkJS: OK!` or `[ERROR] snarkJS: Invalid proof` out of a snarkjs run reads the same
-//! line from this one. logplease writes every level with `console.log`, errors included,
-//! and so does this.
-//!
-//! One deliberate difference: logplease colours unconditionally under Node, which puts
-//! escape codes between `[INFO]` and `snarkJS` in a piped log and breaks exactly those
-//! greps. Here the colours follow the terminal, and `NO_COLOR` turns them off.
+//! An INFO line is the bare message on stdout, so a script that wants a verdict reads
+//! `OK!` and nothing else. Warnings, errors and `-v` debug lines go to stderr behind a
+//! `warning:`, `error:` or `debug:` label, which is coloured when stderr is a terminal and
+//! `NO_COLOR` is unset.
 
 use std::fmt::Display;
 use std::io::{IsTerminal, Write};
@@ -15,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 static VERBOSE: AtomicBool = AtomicBool::new(false);
 
-/// snarkjs' `-v`: `Logger.setLogLevel("DEBUG")`. INFO and above print regardless.
+/// `-v`: debug lines print too. INFO and above print regardless.
 pub fn set_verbose(on: bool) {
     VERBOSE.store(on, Ordering::Relaxed);
 }
@@ -33,42 +29,23 @@ pub enum Level {
 }
 
 impl Level {
-    fn name(self) -> &'static str {
+    /// The label and its SGR colour: cyan, yellow and red, bold. INFO has none.
+    fn label(self) -> Option<(&'static str, &'static str)> {
         match self {
-            Level::Debug => "DEBUG",
-            Level::Info => "INFO",
-            Level::Warn => "WARN",
-            Level::Error => "ERROR",
-        }
-    }
-
-    /// logplease's `loglevelColors`: cyan, green, yellow, red.
-    fn colour(self) -> u8 {
-        match self {
-            Level::Debug => 6,
-            Level::Info => 2,
-            Level::Warn => 3,
-            Level::Error => 1,
+            Level::Debug => Some(("debug", "36")),
+            Level::Info => None,
+            Level::Warn => Some(("warning", "33")),
+            Level::Error => Some(("error", "31")),
         }
     }
 }
 
-/// One line as logplease renders it. INFO and WARN are padded by a space so the category
-/// starts in the same column as after `[DEBUG]` and `[ERROR]`.
+/// One line as printed, without the newline.
 pub fn line(level: Level, msg: &str, colour: bool) -> String {
-    let pad = if matches!(level, Level::Info | Level::Warn) {
-        " "
-    } else {
-        ""
-    };
-    if colour {
-        format!(
-            "\x1b[3{};22m[{}]{pad} \x1b[39;1msnarkJS\x1b[0m: {msg}",
-            level.colour(),
-            level.name()
-        )
-    } else {
-        format!("[{}]{pad} snarkJS: {msg}", level.name())
+    match level.label() {
+        None => msg.to_string(),
+        Some((name, sgr)) if colour => format!("\x1b[{sgr};1m{name}:\x1b[0m {msg}"),
+        Some((name, _)) => format!("{name}: {msg}"),
     }
 }
 
@@ -76,11 +53,14 @@ fn write(level: Level, msg: &str) {
     if level == Level::Debug && !verbose() {
         return;
     }
-    let out = std::io::stdout();
-    let colour = out.is_terminal() && std::env::var_os("NO_COLOR").is_none();
-    let mut out = out.lock();
     // A closed pipe is not worth a panic: the verdict is in the exit code as well.
-    let _ = writeln!(out, "{}", line(level, msg, colour));
+    if level == Level::Info {
+        let _ = writeln!(std::io::stdout().lock(), "{msg}");
+        return;
+    }
+    let err = std::io::stderr();
+    let colour = err.is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    let _ = writeln!(err.lock(), "{}", line(level, msg, colour));
 }
 
 pub fn debug(msg: impl Display) {
@@ -105,7 +85,7 @@ use snarkrs as a library:\n     pass the witness from memory to snarkrs_groth16:
 takes &[Fr], and skip writing\n     and re-reading the .wtns. See \"witness from memory\" in \
 README.md. SNARKRS_NO_TIPS=1 hides this.";
 
-/// A tip for whoever is at the terminal. On stderr, so stdout stays exactly snarkjs', and
+/// A tip for whoever is at the terminal. On stderr, so stdout keeps only the result, and
 /// off when `SNARKRS_NO_TIPS` is set to anything but `0` or nothing.
 pub fn tip(msg: &str) {
     if std::env::var_os("SNARKRS_NO_TIPS").is_some_and(|v| !v.is_empty() && v != "0") {
@@ -154,27 +134,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn plain_lines_match_logplease_without_colour() {
-        assert_eq!(line(Level::Info, "OK!", false), "[INFO]  snarkJS: OK!");
+    fn plain_lines_are_bare_info_and_labelled_otherwise() {
+        assert_eq!(line(Level::Info, "OK!", false), "OK!");
         assert_eq!(
             line(Level::Error, "Invalid proof", false),
-            "[ERROR] snarkJS: Invalid proof"
+            "error: Invalid proof"
         );
-        assert_eq!(line(Level::Warn, "w", false), "[WARN]  snarkJS: w");
-        assert_eq!(line(Level::Debug, "d", false), "[DEBUG] snarkJS: d");
+        assert_eq!(line(Level::Warn, "w", false), "warning: w");
+        assert_eq!(line(Level::Debug, "d", false), "debug: d");
     }
 
-    /// Byte for byte what `snarkjs groth16 verify` 0.7.6 wrote to a pipe.
     #[test]
-    fn coloured_lines_match_logplease_byte_for_byte() {
-        assert_eq!(
-            line(Level::Info, "OK!", true),
-            "\x1b[32;22m[INFO]  \x1b[39;1msnarkJS\x1b[0m: OK!"
-        );
+    fn colour_is_on_the_label_only() {
+        assert_eq!(line(Level::Info, "OK!", true), "OK!");
         assert_eq!(
             line(Level::Error, "Invalid proof", true),
-            "\x1b[31;22m[ERROR] \x1b[39;1msnarkJS\x1b[0m: Invalid proof"
+            "\x1b[31;1merror:\x1b[0m Invalid proof"
         );
+        assert_eq!(line(Level::Warn, "w", true), "\x1b[33;1mwarning:\x1b[0m w");
     }
 
     /// `snarkjs ptn bn128 4`'s first challenge hash, as it printed it.

@@ -106,8 +106,9 @@ cargo install --path bin/snarkrs --features cuda     # + NVIDIA CUDA
 
 The package and the binary are both `snarkrs`, a drop-in for the snarkjs 0.7.6 command line on Groth16 and
 BN254: the same commands, aliases, positional file names and defaults, `-e=`/`-n=`/`-v`
-options, exit codes (0 ok, 1 failed or invalid, 99 bad usage) and `[INFO]  snarkJS: OK!`
-log lines. `snarkrs --help` lists what it runs; a snarkjs command it does not run yet
+options and exit codes (0 ok, 1 failed or invalid, 99 bad usage). Results such as `OK!`
+print bare on stdout, and warnings and errors go to stderr as `warning:` and `error:`
+lines. `snarkrs --help` lists what it runs; a snarkjs command it does not run yet
 fails with exit 1 and says so.
 
 ```sh
