@@ -91,6 +91,7 @@ CIRC
   node "$HERE/scripts/make-input.js" "$NIN" "$NOUT" "$DEPTH" > "$d/input.json"
   node "$d/circuit_js/generate_witness.js" "$d/circuit_js/circuit.wasm" \
        "$d/input.json" "$d/circuit.wtns"
+  "$HERE/scripts/check-witness.sh" "$NAME" "$d/circuit.r1cs" "$d/circuit.wtns"
 
   # Reference proof from snarkjs. This is the oracle: our prover must produce a
   # proof that verifies against the SAME vkey and public signals.

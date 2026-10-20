@@ -1,0 +1,46 @@
+diff --git a/circuits/mimcsponge.circom b/circuits/mimcsponge.circom
+index 11e313a..1c84445 100644
+--- a/circuits/mimcsponge.circom
++++ b/circuits/mimcsponge.circom
+@@ -42,7 +42,7 @@ template MiMCFeistel(nrounds) {
+     signal output xR_out;
+ 
+     // doesn't contain the first and last round constants, which are always zero
+-    var c_partial = [
++    var c_partial[218] = [
+       7120861356467848435263064379192047478074060781135320967663101236819528304084,
+       5024705281721889198577876690145313457398658950011302225525409148828000436681,
+       17980351014018068290387269214713820287804403312720763401943303895585469787384,
+diff --git a/circuits/pedersen.circom b/circuits/pedersen.circom
+index aca0d09..dc910fb 100644
+--- a/circuits/pedersen.circom
++++ b/circuits/pedersen.circom
+@@ -129,6 +129,9 @@ template Segment(nWindows) {
+     component adders[nWindows-1];
+     for (i=0; i<nWindows; i++) {
+         windows[i] = Window4();
++        for (j=0; j<4; j++) {
++            windows[i].in[j] <== in[4*i+j];
++        }
+         if (i==0) {
+             windows[i].base[0] <== e2m.out[0];
+             windows[i].base[1] <== e2m.out[1];
+@@ -154,9 +157,6 @@ template Segment(nWindows) {
+             adders[i-1].in2[0] <== windows[i].out[0];
+             adders[i-1].in2[1] <== windows[i].out[1];
+         }
+-        for (j=0; j<4; j++) {
+-            windows[i].in[j] <== in[4*i+j];
+-        }
+     }
+ 
+     component m2e = Montgomery2Edwards();
+@@ -177,7 +177,7 @@ template Pedersen(n) {
+     signal input in[n];
+     signal output out[2];
+ 
+-    var BASE = [
++    var BASE[10][2] = [
+         [10457101036533406547632367118273992217979173478358440826365724437999023779287,19824078218392094440610104313265183977899662750282163392862422243483260492317],
+         [2671756056509184035029146175565761955751135805354291559563293617232983272177,2663205510731142763556352975002641716101654201788071096152948830924149045094],
+         [5802099305472655231388284418920769829666717045250560929368476121199858275951,5980429700218124965372158798884772646841287887664001482443826541541529227896],

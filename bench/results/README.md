@@ -348,6 +348,7 @@ equivalent is 53.9 ms and needs no cache at all.
 
 ```sh
 bench/scripts/gen-artifacts.sh                  # circuits, keys, witnesses
+CIRCOM1=<circom 0.5.x> bench/scripts/gen-tornado.sh  # tornado (circom 1), patched circomlib
 bench/scripts/build-rapidsnark.sh               # baseline, macOS
 bench/scripts/build-rapidsnark-linux.sh         # baseline, Linux
 bench/aws/provision.sh                          # the NVIDIA box
