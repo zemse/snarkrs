@@ -131,12 +131,23 @@ fn batch_size(n_buckets: usize) -> usize {
 /// because there is no bucket-sort machinery to amortise.
 ///
 /// Rather than fit a closed form, minimise the cost model directly: `ceil(255/c)` windows,
-/// each doing `n` mixed additions into buckets plus `2 * 2^(c-1)` full Jacobian additions
-/// in the running-sum reduction. Signed digits are what put `2^(c-1)` there instead of
+/// each doing one bucket visit per point plus a running-sum reduction of two additions per
+/// bucket over `2^(c-1)` buckets. Signed digits are what put `2^(c-1)` there instead of
 /// `2^c`, which is worth roughly one extra bit of window. The weight of 3 on the bucket
-/// term is `2 * 1.5`: a full add is about 1.5 mixed adds (add-2007-bl is 11M+5S, the mixed
-/// madd-2007-bl is 7M+4S). The one
-/// extra bucket `signed_digit` needs is left out of the model, it moves nothing.
+/// term is the XYZZ fill's ratio: a visit is madd-2008-s (8M + 2S), a bucket two add-2008-s
+/// (12M + 2S each). Windows from c = 9 up take the batch-affine fill instead, a 5M + 1S
+/// visit and a madd plus an add per bucket, so their ratio is nearer 4. Weighting 4 would
+/// take one window off 2^15 and 2^16 and move 2^18 from c = 15 to 13 (an exact tie in that
+/// model); the sweep below measures 13 and 15 as tied at 2^18 and 3 best or tied at every
+/// size it covers, so the model is kept on 3. The one extra bucket `signed_digit` needs is
+/// left out of the model, it moves nothing.
+///
+/// A forced-window sweep (`sweep_forced_window`, plus the same over js_16x16_d32's real
+/// key and witness; M2 Max, 12 threads, medians of 7 to 9 interleaved reps, two runs) has
+/// the pick best or tied: dense 2^18 c = 15 at 69.6-71.1 ms against 70.9-72.2 at 13 and
+/// 14, 75-77 at 12, 78-79 at 16; dense 2^21 c = 16 at 434-439 ms against 437-444 at 15,
+/// 525-526 at 14; a_query (137105 general scalars) c = 13 at 39.6-39.9 ms against
+/// 39.4-40.7 for 12, 14 and 15, and 47 at 16.
 pub fn window_size(n: usize) -> u32 {
     let mut best = 3;
     let mut best_cost = u128::MAX;
@@ -1037,7 +1048,21 @@ where
 
     // The window is sized for the work that actually reaches the buckets, not for the
     // input length: a 2^20-long witness with 2^10 general scalars is a 2^10 problem.
-    let c = window_size(m);
+    pippenger_windowed(bases, scan, window_size(m), threads, work)
+}
+
+/// [`pippenger_scanned`] at a given window, which the forced-window sweep sets directly.
+fn pippenger_windowed<P: FastFill>(
+    bases: &[Affine<P>],
+    scan: Prescan<'_, P>,
+    c: u32,
+    threads: usize,
+    work: Work,
+) -> Projective<P>
+where
+    P::BaseField: Send + Sync,
+{
+    let m = scan.idx.len();
     let n_windows = RECODE_BITS.div_ceil(c as usize);
 
     // Windows are independent, so they are the first axis of parallelism, and at BN254
@@ -1050,6 +1075,8 @@ where
     // under half a performance core's pace the last task out sets the wall. On
     // anon-aadhaar's H (2^21 points, c = 16, M2 Max) one chunk a window measured 588 ms,
     // two 535, three 531, four 537: past that each chunk is another bucket reduction.
+    // Under this rule the forced-window sweep at [`window_size`] still has its pick best
+    // or tied.
     // Signed digits land in [-2^(c-1), 2^(c-1)] and index as `d - 1` when positive and
     // `-d - 1` when negative, so the highest reachable index is 2^(c-1) - 1 and 2^(c-1)
     // buckets cover every digit.
@@ -1694,6 +1721,49 @@ mod tests {
                 ark_ms / ours_ms,
                 ark_ms / ours_1t_ms,
             );
+        }
+    }
+
+    /// `cargo test -p snarkrs-msm --release -- --ignored --nocapture sweep_forced_window`
+    ///
+    /// Times the bucket phase at each window from 12 to 16 against what `window_size`
+    /// picks, on dense scalars (the H MSM's shape) at 2^18 and 2^21 points. The windows
+    /// take turns within each rep so drift on a shared machine lands on all of them; the
+    /// prescan is outside the clock because it does not depend on the window.
+    #[test]
+    #[ignore = "benchmark, meaningless in a debug build"]
+    fn sweep_forced_window() {
+        use std::time::Instant;
+        let mut rng = test_rng();
+        let threads = rayon::current_num_threads();
+        const REPS: usize = 7;
+        println!("rayon threads: {threads}");
+        for log in [18u32, 21] {
+            let n = 1usize << log;
+            let bases: Vec<G1Affine> = walk_points(n, &mut rng);
+            let scalars = rand_scalars(n, &mut rng);
+            let windows: Vec<u32> = (12..=MAX_WINDOW).collect();
+            let mut ms = vec![Vec::with_capacity(REPS); windows.len()];
+            let mut want = None;
+            for _ in 0..REPS {
+                for (i, &c) in windows.iter().enumerate() {
+                    let scan = prescan(&bases, &scalars, n, Work::Variable);
+                    let t = Instant::now();
+                    let got = pippenger_windowed(&bases, scan, c, threads, Work::Variable);
+                    ms[i].push(t.elapsed().as_secs_f64() * 1e3);
+                    assert_eq!(*want.get_or_insert(got), got, "c = {c}");
+                }
+            }
+            for (c, mut t) in windows.into_iter().zip(ms) {
+                t.sort_by(f64::total_cmp);
+                println!(
+                    "2^{log} G1  c={c:2}{}  median {:8.2} ms  min {:8.2}  max {:8.2}",
+                    if c == window_size(n) { "*" } else { " " },
+                    t[REPS / 2],
+                    t[0],
+                    t[REPS - 1],
+                );
+            }
         }
     }
 }
