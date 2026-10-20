@@ -17,7 +17,8 @@
 # The foreign CPU ceiling defaults to max(3x the median, highest + 50) over fifteen samples
 # taken at startup, capped at 200% of a core, and a run stops only when two checks in a row
 # are over it. --max-foreign fixes it instead; --guard-only prints the baseline and ceiling,
-# makes one check against them and exits.
+# makes one check against them and exits. A reading that is not a number stops the run at
+# startup (exit 4) and is written into the run record when it happens mid-run.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -50,7 +51,7 @@ while [ $# -gt 0 ]; do
     --commit)       COMMIT_OVERRIDE="$2"; shift 2 ;;
     --no-build)     NO_BUILD=1; shift ;;
     --guard-only)   GUARD_ONLY=1; shift ;;
-    -h|--help)      sed -n '2,20p' "$0"; exit 0 ;;
+    -h|--help)      sed -n '2,21p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -118,6 +119,17 @@ else
   sample_gap() { sleep "$INTERVAL"; }
 fi
 
+# A failed or empty measurement is not a quiet box. Prints the reading, or on failure what
+# came back instead, and returns 1.
+read_foreign() {
+  local r rc=0
+  r="$(foreign_cpu)" || rc=$?
+  case "$rc:$r" in
+    0:|0:*[!0-9]*|[!0]*) echo "'$r' (exit $rc) from $FOREIGN_METHOD"; return 1 ;;
+  esac
+  echo "$r"
+}
+
 foreign_ceiling() {
   local b="$1" peak="$2" c
   c=$(( b * 3 ))
@@ -133,7 +145,15 @@ if [ -n "${MAX_FOREIGN:-}" ]; then
 else
   samples=""
   for i in $(seq 15); do
-    samples="$samples $(foreign_cpu)"
+    if ! s="$(read_foreign)"; then
+      echo >&2
+      echo "contention guard: could not measure foreign CPU at startup, got $s." >&2
+      echo "With no baseline there is no ceiling, and a run that cannot see other load" >&2
+      echo "cannot say its timings are clean. Fix the measurement, or pass --max-foreign to run" >&2
+      echo "with every check it cannot make written into the run record as unchecked." >&2
+      exit 4
+    fi
+    samples="$samples $s"
     [ "$i" -eq 15 ] || sample_gap
   done
   FOREIGN_BASELINE="$(printf '%s\n' $samples | sort -n | sed -n 8p)"
@@ -142,12 +162,20 @@ else
 fi
 echo "    contention guard: $GUARD_DESC"
 
+# Checks a reading could not be taken for, counted as neither a pass nor a breach and written
+# into the run record.
+UNMEASURED=""
+unmeasured() {
+  echo "    WARNING: contention guard could not measure foreign CPU during: $1, got $2" >&2
+  UNMEASURED="${UNMEASURED:+$UNMEASURED; }$1"
+}
+
 check_load() {
   local first fc
-  first="$(foreign_cpu)"
+  first="$(read_foreign)" || { unmeasured "$1" "$first"; return 0; }
   [ "$first" -gt "$MAX_FOREIGN" ] || return 0
   sample_gap
-  fc="$(foreign_cpu)"
+  fc="$(read_foreign)" || { unmeasured "$1" "$fc"; return 0; }
   if [ "$fc" -le "$MAX_FOREIGN" ]; then
     echo "    foreign CPU at ${first}% then ${fc}% (ceiling ${MAX_FOREIGN}%), a passing spike" >&2
     return 0
@@ -167,6 +195,7 @@ check_load() {
 
 if [ "${GUARD_ONLY:-0}" = "1" ]; then
   check_load "--guard-only"
+  [ -z "$UNMEASURED" ] || exit 4
   exit 0
 fi
 
@@ -395,6 +424,10 @@ mkdir -p "$(dirname "$OUT")"
 # person reading the table months from now is not the person who typed --allow-loaded.
 if [ "$LOADED_ANYWAY" = "1" ]; then
   NOTE="SUSPECT: recorded with --allow-loaded while other processes were using more than ${MAX_FOREIGN}% of a core on this ${CORES}-core box. Timings here include whatever else was running and should not be compared against a run taken on an idle machine.${NOTE:+ }${NOTE}"
+fi
+
+if [ -n "$UNMEASURED" ]; then
+  NOTE="UNCHECKED: the contention guard could not measure other processes' CPU before: ${UNMEASURED}. Those timings were not checked against the ${MAX_FOREIGN}% ceiling.${NOTE:+ }${NOTE}"
 fi
 
 # Detected once and recorded, so the file says what it ran on rather than leaving a reader

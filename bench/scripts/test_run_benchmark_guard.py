@@ -19,21 +19,37 @@ echo "$(sed -n "${n}p" "$SAMPLES") 1"
 echo "900.0 4242"
 """
 
+# Stands in for python3 on the /proc path: prints the next line of SAMPLES as is, which may
+# be empty or not a number, and exits with PY_EXIT.
+PY = """#!/bin/bash
+n=$(cat "$COUNT" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$COUNT"
+sed -n "${n}p" "$SAMPLES"
+exit "${PY_EXIT:-0}"
+"""
+
 
 QUIET = [5] * 13
 
 
 class ContentionGuardTests(unittest.TestCase):
-    def guard(self, samples, *args, status=0, proc=None):
+    def guard(self, samples, *args, status=0, proc=None, py_exit=None):
         with tempfile.TemporaryDirectory() as directory:
             d = Path(directory)
             (d / "ps").write_text(PS)
             (d / "ps").chmod(0o755)
+            if py_exit is not None:
+                (d / "python3").write_text(PY)
+                (d / "python3").chmod(0o755)
+                proc = d / "proc"
+                proc.mkdir()
+                (proc / "stat").write_text("cpu  1 2 3 4\n")
             (d / "samples").write_text("".join(f"{s}\n" for s in samples))
             env = dict(os.environ, PATH=f"{d}:{os.environ['PATH']}", COUNT=str(d / "count"),
                        SAMPLES=str(d / "samples"), G16_BASELINE_INTERVAL="0",
                        G16_PROC=str(proc or d / "no-proc"))
             env.pop("MAX_FOREIGN", None)
+            if py_exit is not None:
+                env["PY_EXIT"] = str(py_exit)
             result = subprocess.run(["bash", str(RUN), "--guard-only", *args], env=env,
                                     capture_output=True, text=True, timeout=30)
             self.assertEqual(result.returncode, status, result.stderr)
@@ -107,6 +123,33 @@ class ContentionGuardTests(unittest.TestCase):
         self.assertIn("baseline 0% of a core", out)
         self.assertIn("ceiling 50%", out)
         self.assertIn(f"measured as utime+stime deltas from {proc}", out)
+
+    def test_an_empty_startup_reading_refuses_to_run(self):
+        out, calls, err = self.guard(QUIET[:3] + [""] + QUIET, status=4, py_exit=0)
+        self.assertEqual(calls, 4)
+        self.assertNotIn("contention guard:", out)
+        self.assertIn("could not measure foreign CPU at startup, got '' (exit 0)", err)
+
+    def test_a_garbage_startup_reading_refuses_to_run(self):
+        _, _, err = self.guard(["nan"] + QUIET, status=4, py_exit=0)
+        self.assertIn("got 'nan' (exit 0) from utime+stime deltas", err)
+
+    def test_a_failing_measurement_refuses_to_run_even_if_it_printed_a_number(self):
+        _, calls, err = self.guard(["0"] + QUIET, status=4, py_exit=127)
+        self.assertEqual(calls, 1)
+        self.assertIn("got '0' (exit 127)", err)
+
+    def test_an_empty_check_is_recorded_as_unmeasured_not_passed(self):
+        _, calls, err = self.guard([""], "--max-foreign", "100", status=4, py_exit=0)
+        self.assertEqual(calls, 1)
+        self.assertIn("could not measure foreign CPU during: --guard-only, got ''", err)
+
+    def test_a_garbage_confirming_reading_is_neither_a_breach_nor_a_pass(self):
+        _, calls, err = self.guard(["150", "1.5e2"], "--max-foreign", "100", status=4,
+                                   py_exit=0)
+        self.assertEqual(calls, 2)
+        self.assertNotIn("passing spike", err)
+        self.assertIn("during: --guard-only, got '1.5e2'", err)
 
 
 STAT = ("77 (tmux: server (1)) S 1 {pgrp} 77 0 -1 4194560 3020 0 0 0 {utime} {stime} 0 0 20 "
