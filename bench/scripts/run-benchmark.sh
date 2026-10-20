@@ -5,7 +5,7 @@
 #                                  [--snarkjs-reps N] [--skip-external]
 #                                  [--out FILE] [--note TEXT]
 #                                  [--no-build] [--commit SHA]
-#                                  [--max-foreign PCT] [--allow-loaded]
+#                                  [--max-foreign PCT] [--allow-loaded] [--guard-only]
 #
 # It works out what backends the box can actually run, builds only those, fetches any
 # missing proving keys from S3, benchmarks every circuit it has a complete artifact set
@@ -13,6 +13,10 @@
 # file named after the machine. Anything the box does not have is left blank in the table
 # rather than reported as a zero or an error, because a missing measurement and a
 # measurement of zero are not the same claim.
+#
+# The foreign CPU ceiling defaults to max(3x, +50) over a baseline sampled at startup,
+# capped at 200% of a core. --max-foreign fixes it instead; --guard-only prints the
+# baseline and ceiling and exits.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -44,7 +48,8 @@ while [ $# -gt 0 ]; do
     --allow-loaded) ALLOW_LOADED=1; shift ;;
     --commit)       COMMIT_OVERRIDE="$2"; shift 2 ;;
     --no-build)     NO_BUILD=1; shift ;;
-    -h|--help)      sed -n '2,13p' "$0"; exit 0 ;;
+    --guard-only)   GUARD_ONLY=1; shift ;;
+    -h|--help)      sed -n '2,19p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -70,14 +75,18 @@ log() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 # average cannot make. The threshold is in percent of a single core, so 200 means two other
 # cores' worth of foreign work.
 #
-# 200 rather than something tighter because a desktop is never actually at zero: the window
-# server, the terminal and the editor together idle around 70% of a core here, and a ceiling
-# below that can never pass. This is deliberately a coarse guard. It is not trying to detect
-# a stray 5% background daemon, whose effect is inside the noise anyway. It is trying to
-# catch the case that actually ruined a run, which was a parallel build sitting on ten of
-# the twelve cores at over 1000%.
+# A desktop is never actually at zero: the window server, the terminal and the editor
+# together idle around 70% of a core here, while a quiet Linux box sits near 5%. So the
+# default ceiling is relative to a baseline sampled at startup, the median of five samples
+# a second apart: three times the baseline or the baseline plus half a core, whichever is
+# higher. The factor absorbs an idle desktop wandering between samples; the half core
+# keeps a near-zero baseline from tripping on a daemon waking up while still catching any
+# process that takes a whole core. It is capped at the old fixed 200, so it only ever
+# tightens: a baseline sampled while a parallel build is already running would otherwise
+# lift the ceiling over the very thing it exists to catch, which was a parallel build
+# sitting on ten of the twelve cores at over 1000%. An explicit --max-foreign skips the
+# sampling and wins.
 CORES="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
-MAX_FOREIGN="${MAX_FOREIGN:-200}"
 ALLOW_LOADED="${ALLOW_LOADED:-0}"
 LOADED_ANYWAY=0
 MY_PGID="$(ps -o pgid= -p $$ | tr -d ' ')"
@@ -85,6 +94,30 @@ MY_PGID="$(ps -o pgid= -p $$ | tr -d ' ')"
 foreign_cpu() {
   ps -Ao pcpu=,pgid= | awk -v me="$MY_PGID" '$2 != me { s += $1 } END { printf "%.0f", s+0 }'
 }
+
+foreign_ceiling() {
+  local b="$1" c
+  c=$(( b * 3 ))
+  [ $(( b + 50 )) -le "$c" ] || c=$(( b + 50 ))
+  [ "$c" -le 200 ] || c=200
+  echo "$c"
+}
+
+if [ -n "${MAX_FOREIGN:-}" ]; then
+  FOREIGN_BASELINE=""
+  GUARD_DESC="foreign CPU ceiling ${MAX_FOREIGN}% of a core, set explicitly"
+else
+  samples=""
+  for i in 1 2 3 4 5; do
+    samples="$samples $(foreign_cpu)"
+    [ "$i" -eq 5 ] || sleep "${G16_BASELINE_INTERVAL:-1}"
+  done
+  FOREIGN_BASELINE="$(printf '%s\n' $samples | sort -n | sed -n 3p)"
+  MAX_FOREIGN="$(foreign_ceiling "$FOREIGN_BASELINE")"
+  GUARD_DESC="foreign CPU baseline ${FOREIGN_BASELINE}% of a core (samples:${samples}), ceiling ${MAX_FOREIGN}%"
+fi
+echo "    contention guard: $GUARD_DESC"
+[ "${GUARD_ONLY:-0}" = "1" ] && exit 0
 
 check_load() {
   local fc; fc="$(foreign_cpu)"
@@ -346,7 +379,7 @@ python3 "$BENCH/scripts/render_machine.py" \
   --gpu "$GPU_NAME" --cpu "$CPU_NAME" \
   --snarkjs-reps "$SNARKJS_REPS" \
   --backends "$BACKENDS" --provers "$PROVERS" --commit "$COMMIT" \
-  --note "$NOTE" \
+  --note "$NOTE" --contention "$GUARD_DESC on this ${CORES}-core box" \
   --out "$OUT"
 
 log "wrote $OUT"

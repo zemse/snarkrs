@@ -14,7 +14,7 @@ HEADER = ["variant", "constraints", "prover", "backend", "mode", "rep", "ms", "v
 
 
 class ColdModes(unittest.TestCase):
-    def render(self, rows):
+    def render(self, rows, *extra):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             with (root / "ours.csv").open("w", newline="") as f:
@@ -24,7 +24,8 @@ class ColdModes(unittest.TestCase):
                     w.writerow(["v", "8", "ours", "cpu", mode, i, ms, "yes"])
             out = root / "machine.md"
             args = ["render_machine.py", "--csv-dir", str(root), "--machine", "m",
-                    "--reps", "2", "--backends", "cpu", "--provers", "", "--out", str(out)]
+                    "--reps", "2", "--backends", "cpu", "--provers", "", "--out", str(out),
+                    *extra]
             with mock.patch.object(sys, "argv", args), contextlib.redirect_stdout(io.StringIO()):
                 render_machine.main()
             return out.read_text()
@@ -45,6 +46,10 @@ class ColdModes(unittest.TestCase):
         text = self.render([("cold", 7), ("warm", 1)])
         self.assertEqual(self.cell(text, "cold"), "7.0")
         self.assertNotIn("## cold-inprocess", text)
+
+    def test_contention_guard_ceiling_is_recorded(self):
+        text = self.render([("warm", 1)], "--contention", "foreign CPU baseline 5%, ceiling 55%")
+        self.assertIn("contention guard: foreign CPU baseline 5%, ceiling 55%", text)
 
 
 if __name__ == "__main__":
