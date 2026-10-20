@@ -10,7 +10,7 @@ use std::sync::{Arc, RwLock};
 
 use rayon::prelude::*;
 use snarkrs_field::raw::RawFr;
-use snarkrs_field::{Domain, Field, Fr};
+use snarkrs_field::{powers, Domain, Field, Fr};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Direction {
@@ -52,8 +52,9 @@ const MIN_BUTTERFLIES_PER_TASK: usize = 64;
 /// L1d with room for the twiddle lines and leaves 32 blocks at 2^16 for a 12-thread pool.
 const CACHE_BLOCK: usize = 1 << 11;
 
-/// Twiddle tables are keyed by `(size, root)`: forward and inverse tables share the map,
-/// and [`CpuNtt::stride_twiddles`] names a smaller transform's table by the root it samples.
+/// Twiddle tables are keyed by `(size, root)`, so [`CpuNtt::stride_twiddles`] names a
+/// smaller transform's table by the root it samples. Only forward tables are cached: the
+/// inverse passes read them mirrored, see [`tw`].
 type TwiddleCache = RwLock<HashMap<(usize, Fr), Arc<Vec<Fr>>>>;
 
 /// Multi-threaded CPU NTT, and the only slice-shaped transform in the workspace. The GPU
@@ -63,7 +64,7 @@ type TwiddleCache = RwLock<HashMap<(usize, Fr), Arc<Vec<Fr>>>>;
 pub struct CpuNtt {
     pub threads: usize,
     /// `Domain::twiddles()` rebuilds the whole table on every call, and the prover runs
-    /// six transforms per proof over the same two tables. The cache has to live here:
+    /// six transforms per proof over the same table. The cache has to live here:
     /// [`Self::ntt`] receives a `&Domain`, not a prepared table.
     twiddles: TwiddleCache,
     /// Tables for [`Self::coset_scale_bitrev`], keyed by size and shift.
@@ -86,14 +87,11 @@ impl CpuNtt {
         self.threads.max(1) * TASKS_PER_THREAD
     }
 
-    /// Cached twiddle table for this direction. Returns an `Arc` so the table is neither
-    /// copied nor held under the lock while the transform runs.
-    fn twiddles(&self, domain: &Domain, dir: Direction) -> Arc<Vec<Fr>> {
-        let root = match dir {
-            Direction::Forward => domain.group_gen(),
-            Direction::Inverse => domain.group_gen_inv(),
-        };
-        let key = (domain.size(), root);
+    /// Cached `[w^0, ..., w^(n/2)]`, one longer than `Domain::twiddles()` so that [`tw`]
+    /// can mirror it for the inverse. Returns an `Arc` so the table is neither copied nor
+    /// held under the lock while the transform runs.
+    fn twiddles(&self, domain: &Domain) -> Arc<Vec<Fr>> {
+        let key = (domain.size(), domain.group_gen());
 
         // A poisoned lock here would mean a panic inside a HashMap lookup, which cannot
         // leave the map torn, so recovering beats poisoning every later proof.
@@ -106,10 +104,7 @@ impl CpuNtt {
             return Arc::clone(hit);
         }
 
-        let built = Arc::new(match dir {
-            Direction::Forward => domain.twiddles(),
-            Direction::Inverse => domain.twiddles_inv(),
-        });
+        let built = Arc::new(powers(domain.group_gen(), domain.size() / 2 + 1));
         // Built outside the write lock, so two threads can race on a cold cache. Whoever
         // inserts first wins and the loser drops its copy; both tables hold equal values.
         let mut guard = self.twiddles.write().unwrap_or_else(|e| e.into_inner());
@@ -123,7 +118,7 @@ impl CpuNtt {
     }
 
     /// `twiddles[i * stride]` packed, which is the table of the transform `stride` times
-    /// smaller and is cached under its key. A pass reading the full table at a stride puts
+    /// smaller, its `w^(n/2)` included, and is cached under its key. A pass reading the full table at a stride puts
     /// every twiddle on a cache line of its own, and at a power-of-two stride of kilobytes
     /// on a few of L1's sets: at 2^21 the two outer passes next to the fused block, stride
     /// 8 KB, took 1.5x the others' time.
@@ -153,9 +148,12 @@ impl CpuNtt {
             return;
         }
 
-        let twiddles = self.twiddles(domain, dir);
+        let twiddles = self.twiddles(domain);
         bit_reverse_permute(a, domain.log_size());
-        self.dit_passes(a, &twiddles, parallel);
+        match dir {
+            Direction::Forward => self.dit_passes::<false>(a, &twiddles, parallel),
+            Direction::Inverse => self.dit_passes::<true>(a, &twiddles, parallel),
+        }
 
         if dir == Direction::Inverse {
             // The Domain hands out `1/n` but never applies it; the iNTT owns that.
@@ -171,8 +169,8 @@ impl CpuNtt {
     }
 
     /// Decimation in time: bit-reversed input, natural output, half-size doubling per
-    /// pass.
-    fn dit_passes(&self, a: &mut [Fr], twiddles: &[Fr], parallel: bool) {
+    /// pass. `INV` reads the forward table mirrored and so runs the inverse.
+    fn dit_passes<const INV: bool>(&self, a: &mut [Fr], twiddles: &[Fr], parallel: bool) {
         let n = a.len();
         let mut half = 1usize;
         if parallel && n > CACHE_BLOCK {
@@ -184,9 +182,9 @@ impl CpuNtt {
             // block sits in the array.
             let local = self.block_twiddles(twiddles, n);
             a.par_chunks_mut(CACHE_BLOCK).for_each(|block| {
-                block_dit(block, &local);
+                block_dit::<INV>(block, &local);
             });
-            self.dit_outer_passes(a, twiddles, CACHE_BLOCK);
+            self.dit_outer_passes::<INV>(a, twiddles, CACHE_BLOCK);
             return;
         }
         while half < n {
@@ -194,9 +192,9 @@ impl CpuNtt {
             // `root^i` in natural order, so a pass is a strided read into it.
             let stride = n / (2 * half);
             if parallel {
-                parallel_pass::<false>(a, half, twiddles, stride, self.tasks());
+                parallel_pass::<false, INV>(a, half, twiddles, stride, self.tasks());
             } else {
-                serial_pass::<false>(a, half, twiddles, stride);
+                serial_pass::<false, INV>(a, half, twiddles, stride);
             }
             half <<= 1;
         }
@@ -206,30 +204,30 @@ impl CpuNtt {
     /// `2 * half` run as one trip through the vector, so what the block fusion did for
     /// the small-half passes this does for the large-stride ones, halving their number.
     /// One radix-2 pass mops up when the remaining count is odd.
-    fn dit_outer_passes(&self, a: &mut [Fr], twiddles: &[Fr], mut half: usize) {
+    fn dit_outer_passes<const INV: bool>(&self, a: &mut [Fr], twiddles: &[Fr], mut half: usize) {
         let n = a.len();
         while half * 4 <= n {
             let tw = self.stride_twiddles(twiddles, n, n / (4 * half));
-            parallel_quad_pass_dit(a, half, &tw, self.tasks());
+            parallel_quad_pass_dit::<INV>(a, half, &tw, self.tasks());
             half <<= 2;
         }
         if half < n {
-            parallel_pass::<false>(a, half, twiddles, n / (2 * half), self.tasks());
+            parallel_pass::<false, INV>(a, half, twiddles, n / (2 * half), self.tasks());
         }
     }
 
     /// The mirror for DIF: passes at `half` and `half / 2` pair up, walking down until
     /// only the fused-block passes below `floor` remain.
-    fn dif_outer_passes(&self, a: &mut [Fr], twiddles: &[Fr], floor: usize) {
+    fn dif_outer_passes<const INV: bool>(&self, a: &mut [Fr], twiddles: &[Fr], floor: usize) {
         let n = a.len();
         let mut half = n / 2;
         while half > 2 * floor {
             let tw = self.stride_twiddles(twiddles, n, n / (2 * half));
-            parallel_quad_pass_dif(a, half, &tw, self.tasks());
+            parallel_quad_pass_dif::<INV>(a, half, &tw, self.tasks());
             half >>= 2;
         }
         if half > floor {
-            parallel_pass::<true>(a, half, twiddles, n / (2 * half), self.tasks());
+            parallel_pass::<true, INV>(a, half, twiddles, n / (2 * half), self.tasks());
         }
     }
 
@@ -237,13 +235,13 @@ impl CpuNtt {
     /// per pass. Same twiddle tables, same per-pass indexing, opposite pass order, and
     /// the mirror image of the fusion above: here it is the *final* passes that stay
     /// inside one block.
-    fn dif_passes(&self, a: &mut [Fr], twiddles: &[Fr], parallel: bool) {
+    fn dif_passes<const INV: bool>(&self, a: &mut [Fr], twiddles: &[Fr], parallel: bool) {
         let n = a.len();
         if parallel && n > CACHE_BLOCK {
-            self.dif_outer_passes(a, twiddles, CACHE_BLOCK / 2);
+            self.dif_outer_passes::<INV>(a, twiddles, CACHE_BLOCK / 2);
             let local = self.block_twiddles(twiddles, n);
             a.par_chunks_mut(CACHE_BLOCK).for_each(|block| {
-                block_dif(block, &local);
+                block_dif::<INV>(block, &local);
             });
             return;
         }
@@ -251,9 +249,9 @@ impl CpuNtt {
         while half >= 1 {
             let stride = n / (2 * half);
             if parallel {
-                parallel_pass::<true>(a, half, twiddles, stride, self.tasks());
+                parallel_pass::<true, INV>(a, half, twiddles, stride, self.tasks());
             } else {
-                serial_pass::<true>(a, half, twiddles, stride);
+                serial_pass::<true, INV>(a, half, twiddles, stride);
             }
             half >>= 1;
         }
@@ -279,8 +277,8 @@ impl CpuNtt {
         if a.len() <= 1 {
             return;
         }
-        let twiddles = self.twiddles(domain, Direction::Inverse);
-        self.dif_passes(a, &twiddles, a.len() >= PARALLEL_THRESHOLD);
+        let twiddles = self.twiddles(domain);
+        self.dif_passes::<true>(a, &twiddles, a.len() >= PARALLEL_THRESHOLD);
     }
 
     /// Forward transform, *bit-reversed* input to natural output. The other half of the
@@ -290,8 +288,8 @@ impl CpuNtt {
         if a.len() <= 1 {
             return;
         }
-        let twiddles = self.twiddles(domain, Direction::Forward);
-        self.dit_passes(a, &twiddles, a.len() >= PARALLEL_THRESHOLD);
+        let twiddles = self.twiddles(domain);
+        self.dit_passes::<false>(a, &twiddles, a.len() >= PARALLEL_THRESHOLD);
     }
 
     /// `a[p] *= shift^bitrev(p) / n` for a vector in bit-reversed coefficient order: the
@@ -323,17 +321,9 @@ impl CpuNtt {
     /// lot in memory: the prover runs three pipelines at once, so a cold proof built every
     /// table three times, and on anon-aadhaar (2^21) the two losing copies of each were
     /// 256 MiB that malloc then kept resident. Call it before fanning out; on a warm cache
-    /// it is three lookups.
+    /// it is two lookups.
     pub fn prepare_intt_coset_ntt(&self, domain: &Domain, shift: Fr) {
-        rayon::join(
-            || self.twiddles(domain, Direction::Inverse),
-            || {
-                rayon::join(
-                    || self.twiddles(domain, Direction::Forward),
-                    || self.coset_table(domain, shift),
-                )
-            },
-        );
+        rayon::join(|| self.twiddles(domain), || self.coset_table(domain, shift));
     }
 
     /// Stages 1-3 for one vector: iNTT, coset shift with the deferred `1/n`, forward
@@ -355,23 +345,21 @@ impl CpuNtt {
             return;
         }
 
-        let inv = self.twiddles(domain, Direction::Inverse);
-        let fwd = self.twiddles(domain, Direction::Forward);
+        let twiddles = self.twiddles(domain);
         let table = self.coset_table(domain, shift);
-        let local_inv = self.block_twiddles(&inv, n);
-        let local_fwd = self.block_twiddles(&fwd, n);
+        let local = self.block_twiddles(&twiddles, n);
 
-        self.dif_outer_passes(a, &inv, CACHE_BLOCK / 2);
+        self.dif_outer_passes::<true>(a, &twiddles, CACHE_BLOCK / 2);
         a.par_chunks_mut(CACHE_BLOCK)
             .zip(table.par_chunks(CACHE_BLOCK))
             .for_each(|(block, tab)| {
-                block_dif(block, &local_inv);
+                block_dif::<true>(block, &local);
                 for (x, s) in block.iter_mut().zip(tab.iter()) {
                     *x *= s;
                 }
-                block_dit(block, &local_fwd);
+                block_dit::<false>(block, &local);
             });
-        self.dit_outer_passes(a, &fwd, CACHE_BLOCK);
+        self.dit_outer_passes::<false>(a, &twiddles, CACHE_BLOCK);
     }
 
     /// Cached `[shift^bitrev(p) / n]` table for [`Self::coset_scale_bitrev`], built and
@@ -501,7 +489,7 @@ pub fn bit_reverse_permute(a: &mut [Fr], log_n: u32) {
 /// multiplies by the twiddle on the way in (time), `true` on the way out (frequency).
 /// A const generic so the branch is compiled away rather than sitting in the hot loop.
 #[inline]
-fn butterflies<const DIF: bool>(
+fn butterflies<const DIF: bool, const INV: bool>(
     lo: &mut [Fr],
     hi: &mut [Fr],
     twiddles: &[Fr],
@@ -510,15 +498,45 @@ fn butterflies<const DIF: bool>(
 ) {
     for (k, (x, y)) in lo.iter_mut().zip(hi.iter_mut()).enumerate() {
         let (a, b) = (raw(x), raw(y));
-        let w = raw(&twiddles[(j0 + k) * stride]);
+        let w = tw::<INV>(twiddles, (j0 + k) * stride);
         if DIF {
             *x = a.add(b).to_fr();
-            *y = a.sub(b).mul(w).to_fr();
+            *y = sub::<INV>(a, b).mul(w).to_fr();
         } else {
-            let t = b.mul(w);
-            *x = a.add(t).to_fr();
-            *y = a.sub(t).to_fr();
+            let (s, d) = add_sub::<INV>(a, b.mul(w));
+            *x = s.to_fr();
+            *y = d.to_fr();
         }
+    }
+}
+
+/// Twiddle `i` of a table `[w^0, ..., w^(n/2)]`, or under `INV` the inverse one negated:
+/// for `0 <= i <= n/2`, `w^-i = w^(n-i) = -w^(n/2-i)`, so the inverse transform reads the
+/// forward table mirrored and needs none of its own. Every twiddle multiplies a value
+/// that is then added to and subtracted from another, or a difference, so the kernels
+/// take the sign through [`add_sub`] and [`sub`] by swapping operands, at no cost.
+#[inline(always)]
+fn tw<const INV: bool>(twiddles: &[Fr], i: usize) -> RawFr {
+    raw(&twiddles[if INV { twiddles.len() - 1 - i } else { i }])
+}
+
+/// `(a + t, a - t)` for a `t` multiplied by a [`tw`] twiddle.
+#[inline(always)]
+fn add_sub<const INV: bool>(a: RawFr, t: RawFr) -> (RawFr, RawFr) {
+    if INV {
+        (a.sub(t), a.add(t))
+    } else {
+        (a.add(t), a.sub(t))
+    }
+}
+
+/// `a - b` for a difference about to be multiplied by a [`tw`] twiddle.
+#[inline(always)]
+fn sub<const INV: bool>(a: RawFr, b: RawFr) -> RawFr {
+    if INV {
+        b.sub(a)
+    } else {
+        a.sub(b)
     }
 }
 
@@ -537,24 +555,26 @@ fn raw(x: &Fr) -> RawFr {
 /// stores. `s2` is the second pass's stride `n / (4 * half)`; the first pass's is twice
 /// that.
 #[inline]
-fn quad_dit(strips: [&mut [Fr]; 4], twiddles: &[Fr], s2: usize, half: usize, j0: usize) {
+fn quad_dit<const INV: bool>(
+    strips: [&mut [Fr]; 4],
+    twiddles: &[Fr],
+    s2: usize,
+    half: usize,
+    j0: usize,
+) {
     let [x0, x1, x2, x3] = strips;
     for k in 0..x0.len() {
         let j = j0 + k;
-        let w1 = raw(&twiddles[2 * j * s2]);
+        let w1 = tw::<INV>(twiddles, 2 * j * s2);
         let (y0, y1, y2, y3) = (raw(&x0[k]), raw(&x1[k]), raw(&x2[k]), raw(&x3[k]));
-        let t0 = y1.mul(w1);
-        let a0 = y0.add(t0);
-        let a1 = y0.sub(t0);
-        let t1 = y3.mul(w1);
-        let a2 = y2.add(t1);
-        let a3 = y2.sub(t1);
-        let u0 = a2.mul(raw(&twiddles[j * s2]));
-        x0[k] = a0.add(u0).to_fr();
-        x2[k] = a0.sub(u0).to_fr();
-        let u1 = a3.mul(raw(&twiddles[(j + half) * s2]));
-        x1[k] = a1.add(u1).to_fr();
-        x3[k] = a1.sub(u1).to_fr();
+        let (a0, a1) = add_sub::<INV>(y0, y1.mul(w1));
+        let (a2, a3) = add_sub::<INV>(y2, y3.mul(w1));
+        let (s, d) = add_sub::<INV>(a0, a2.mul(tw::<INV>(twiddles, j * s2)));
+        x0[k] = s.to_fr();
+        x2[k] = d.to_fr();
+        let (s, d) = add_sub::<INV>(a1, a3.mul(tw::<INV>(twiddles, (j + half) * s2)));
+        x1[k] = s.to_fr();
+        x3[k] = d.to_fr();
     }
 }
 
@@ -563,42 +583,48 @@ fn quad_dit(strips: [&mut [Fr]; 4], twiddles: &[Fr], s2: usize, half: usize, j0:
 /// `2 * half` block. `s1` is the first pass's stride `n / (2 * half)`; the second's is
 /// twice that, and `hh` is `half / 2`.
 #[inline]
-fn quad_dif(strips: [&mut [Fr]; 4], twiddles: &[Fr], s1: usize, hh: usize, j0: usize) {
+fn quad_dif<const INV: bool>(
+    strips: [&mut [Fr]; 4],
+    twiddles: &[Fr],
+    s1: usize,
+    hh: usize,
+    j0: usize,
+) {
     let [y0, y1, y2, y3] = strips;
     for k in 0..y0.len() {
         let j = j0 + k;
         let (z0, z1, z2, z3) = (raw(&y0[k]), raw(&y1[k]), raw(&y2[k]), raw(&y3[k]));
         let a0 = z0.add(z2);
-        let a2 = z0.sub(z2).mul(raw(&twiddles[j * s1]));
+        let a2 = sub::<INV>(z0, z2).mul(tw::<INV>(twiddles, j * s1));
         let a1 = z1.add(z3);
-        let a3 = z1.sub(z3).mul(raw(&twiddles[(j + hh) * s1]));
-        let w2 = raw(&twiddles[2 * j * s1]);
+        let a3 = sub::<INV>(z1, z3).mul(tw::<INV>(twiddles, (j + hh) * s1));
+        let w2 = tw::<INV>(twiddles, 2 * j * s1);
         y0[k] = a0.add(a1).to_fr();
-        y1[k] = a0.sub(a1).mul(w2).to_fr();
+        y1[k] = sub::<INV>(a0, a1).mul(w2).to_fr();
         y2[k] = a2.add(a3).to_fr();
-        y3[k] = a2.sub(a3).mul(w2).to_fr();
+        y3[k] = sub::<INV>(a2, a3).mul(w2).to_fr();
     }
 }
 
 /// Every DIT pass inside one CACHE_BLOCK-sized block, `local` its table from
 /// [`CpuNtt::block_twiddles`]: the first three as [`dit_head`], the rest radix 2.
-fn block_dit(block: &mut [Fr], local: &[Fr]) {
-    dit_head(block, local, CACHE_BLOCK / 8);
+fn block_dit<const INV: bool>(block: &mut [Fr], local: &[Fr]) {
+    dit_head::<INV>(block, local, CACHE_BLOCK / 8);
     let mut h = 8usize;
     while h < CACHE_BLOCK {
-        serial_pass::<false>(block, h, local, CACHE_BLOCK / (2 * h));
+        serial_pass::<false, INV>(block, h, local, CACHE_BLOCK / (2 * h));
         h <<= 1;
     }
 }
 
 /// [`block_dit`]'s mirror: the radix-2 DIF passes down to `half = 8`, then [`dif_tail`].
-fn block_dif(block: &mut [Fr], local: &[Fr]) {
+fn block_dif<const INV: bool>(block: &mut [Fr], local: &[Fr]) {
     let mut h = CACHE_BLOCK / 2;
     while h >= 8 {
-        serial_pass::<true>(block, h, local, CACHE_BLOCK / (2 * h));
+        serial_pass::<true, INV>(block, h, local, CACHE_BLOCK / (2 * h));
         h >>= 1;
     }
-    dif_tail(block, local, CACHE_BLOCK / 8);
+    dif_tail::<INV>(block, local, CACHE_BLOCK / 8);
 }
 
 /// The DIT passes at `half` 1, 2 and 4 over every aligned run of eight, as one radix-8
@@ -606,11 +632,11 @@ fn block_dif(block: &mut [Fr], local: &[Fr]) {
 /// the twelve multiplies the three passes spend on a run, seven are by one and are
 /// skipped; the passes' short inner loops, one, two and four butterflies a block, go too.
 #[inline]
-fn dit_head(a: &mut [Fr], twiddles: &[Fr], s8: usize) {
+fn dit_head<const INV: bool>(a: &mut [Fr], twiddles: &[Fr], s8: usize) {
     let (w1, w2, w3) = (
-        raw(&twiddles[s8]),
-        raw(&twiddles[2 * s8]),
-        raw(&twiddles[3 * s8]),
+        tw::<INV>(twiddles, s8),
+        tw::<INV>(twiddles, 2 * s8),
+        tw::<INV>(twiddles, 3 * s8),
     );
     for c in a.as_chunks_mut::<8>().0 {
         let x: [RawFr; 8] = std::array::from_fn(|i| raw(&c[i]));
@@ -618,40 +644,42 @@ fn dit_head(a: &mut [Fr], twiddles: &[Fr], s8: usize) {
         let (a2, a3) = (x[2].add(x[3]), x[2].sub(x[3]));
         let (a4, a5) = (x[4].add(x[5]), x[4].sub(x[5]));
         let (a6, a7) = (x[6].add(x[7]), x[6].sub(x[7]));
-        let t = a3.mul(w2);
-        let (b0, b2, b1, b3) = (a0.add(a2), a0.sub(a2), a1.add(t), a1.sub(t));
-        let t = a7.mul(w2);
-        let (b4, b6, b5, b7) = (a4.add(a6), a4.sub(a6), a5.add(t), a5.sub(t));
+        let (b0, b2) = (a0.add(a2), a0.sub(a2));
+        let (b1, b3) = add_sub::<INV>(a1, a3.mul(w2));
+        let (b4, b6) = (a4.add(a6), a4.sub(a6));
+        let (b5, b7) = add_sub::<INV>(a5, a7.mul(w2));
         c[0] = b0.add(b4).to_fr();
         c[4] = b0.sub(b4).to_fr();
-        let t = b5.mul(w1);
-        c[1] = b1.add(t).to_fr();
-        c[5] = b1.sub(t).to_fr();
-        let t = b6.mul(w2);
-        c[2] = b2.add(t).to_fr();
-        c[6] = b2.sub(t).to_fr();
-        let t = b7.mul(w3);
-        c[3] = b3.add(t).to_fr();
-        c[7] = b3.sub(t).to_fr();
+        let (s, d) = add_sub::<INV>(b1, b5.mul(w1));
+        c[1] = s.to_fr();
+        c[5] = d.to_fr();
+        let (s, d) = add_sub::<INV>(b2, b6.mul(w2));
+        c[2] = s.to_fr();
+        c[6] = d.to_fr();
+        let (s, d) = add_sub::<INV>(b3, b7.mul(w3));
+        c[3] = s.to_fr();
+        c[7] = d.to_fr();
     }
 }
 
 /// The DIF passes at `half` 4, 2 and 1, the mirror of [`dit_head`].
 #[inline]
-fn dif_tail(a: &mut [Fr], twiddles: &[Fr], s8: usize) {
+fn dif_tail<const INV: bool>(a: &mut [Fr], twiddles: &[Fr], s8: usize) {
     let (w1, w2, w3) = (
-        raw(&twiddles[s8]),
-        raw(&twiddles[2 * s8]),
-        raw(&twiddles[3 * s8]),
+        tw::<INV>(twiddles, s8),
+        tw::<INV>(twiddles, 2 * s8),
+        tw::<INV>(twiddles, 3 * s8),
     );
     for c in a.as_chunks_mut::<8>().0 {
         let x: [RawFr; 8] = std::array::from_fn(|i| raw(&c[i]));
         let (u0, u4) = (x[0].add(x[4]), x[0].sub(x[4]));
-        let (u1, u5) = (x[1].add(x[5]), x[1].sub(x[5]).mul(w1));
-        let (u2, u6) = (x[2].add(x[6]), x[2].sub(x[6]).mul(w2));
-        let (u3, u7) = (x[3].add(x[7]), x[3].sub(x[7]).mul(w3));
-        let (v0, v2, v1, v3) = (u0.add(u2), u0.sub(u2), u1.add(u3), u1.sub(u3).mul(w2));
-        let (v4, v6, v5, v7) = (u4.add(u6), u4.sub(u6), u5.add(u7), u5.sub(u7).mul(w2));
+        let (u1, u5) = (x[1].add(x[5]), sub::<INV>(x[1], x[5]).mul(w1));
+        let (u2, u6) = (x[2].add(x[6]), sub::<INV>(x[2], x[6]).mul(w2));
+        let (u3, u7) = (x[3].add(x[7]), sub::<INV>(x[3], x[7]).mul(w3));
+        let (v0, v2) = (u0.add(u2), u0.sub(u2));
+        let (v1, v3) = (u1.add(u3), sub::<INV>(u1, u3).mul(w2));
+        let (v4, v6) = (u4.add(u6), u4.sub(u6));
+        let (v5, v7) = (u5.add(u7), sub::<INV>(u5, u7).mul(w2));
         c[0] = v0.add(v1).to_fr();
         c[1] = v0.sub(v1).to_fr();
         c[2] = v2.add(v3).to_fr();
@@ -663,16 +691,21 @@ fn dif_tail(a: &mut [Fr], twiddles: &[Fr], s8: usize) {
     }
 }
 
-fn serial_pass<const DIF: bool>(a: &mut [Fr], half: usize, twiddles: &[Fr], stride: usize) {
+fn serial_pass<const DIF: bool, const INV: bool>(
+    a: &mut [Fr],
+    half: usize,
+    twiddles: &[Fr],
+    stride: usize,
+) {
     for block in a.chunks_mut(2 * half) {
         let (lo, hi) = block.split_at_mut(half);
-        butterflies::<DIF>(lo, hi, twiddles, stride, 0);
+        butterflies::<DIF, INV>(lo, hi, twiddles, stride, 0);
     }
 }
 
 /// The passes themselves are sequential (pass `k+1` reads what pass `k` wrote), but every
 /// butterfly inside a pass is independent, so the parallelism goes here.
-fn parallel_pass<const DIF: bool>(
+fn parallel_pass<const DIF: bool, const INV: bool>(
     a: &mut [Fr],
     half: usize,
     twiddles: &[Fr],
@@ -689,7 +722,7 @@ fn parallel_pass<const DIF: bool>(
             .div_ceil(tasks)
             .max(MIN_BUTTERFLIES_PER_TASK.div_ceil(half));
         a.par_chunks_mut(per_task * block_len)
-            .for_each(|group| serial_pass::<DIF>(group, half, twiddles, stride));
+            .for_each(|group| serial_pass::<DIF, INV>(group, half, twiddles, stride));
     } else {
         // Late passes: few blocks, and the last one covers the whole array.
         let chunk = strip_chunk(half, blocks, tasks);
@@ -698,7 +731,7 @@ fn parallel_pass<const DIF: bool>(
             lo.par_chunks_mut(chunk)
                 .zip(hi.par_chunks_mut(chunk))
                 .enumerate()
-                .for_each(|(c, (l, h))| butterflies::<DIF>(l, h, twiddles, stride, c * chunk));
+                .for_each(|(c, (l, h))| butterflies::<DIF, INV>(l, h, twiddles, stride, c * chunk));
         });
     }
 }
@@ -715,14 +748,19 @@ fn quad_strips(block: &mut [Fr], half: usize) -> [&mut [Fr]; 4] {
 /// block is at least `4 * CACHE_BLOCK` elements and needs no grouping; the split branch
 /// mirrors the radix-2 one for the late passes where blocks are fewer than tasks.
 /// `twiddles` is packed for the pair ([`CpuNtt::stride_twiddles`]), so its stride is one.
-fn parallel_quad_pass_dit(a: &mut [Fr], half: usize, twiddles: &[Fr], tasks: usize) {
+fn parallel_quad_pass_dit<const INV: bool>(
+    a: &mut [Fr],
+    half: usize,
+    twiddles: &[Fr],
+    tasks: usize,
+) {
     let n = a.len();
     let s2 = 1;
     let block_len = 4 * half;
     let blocks = n / block_len;
     if blocks >= tasks {
         a.par_chunks_mut(block_len).for_each(|block| {
-            quad_dit(quad_strips(block, half), twiddles, s2, half, 0);
+            quad_dit::<INV>(quad_strips(block, half), twiddles, s2, half, 0);
         });
     } else {
         let chunk = strip_chunk(half, blocks, tasks);
@@ -734,14 +772,19 @@ fn parallel_quad_pass_dit(a: &mut [Fr], half: usize, twiddles: &[Fr], tasks: usi
                 .zip(x3.par_chunks_mut(chunk))
                 .enumerate()
                 .for_each(|(c, (((p0, p1), p2), p3))| {
-                    quad_dit([p0, p1, p2, p3], twiddles, s2, half, c * chunk)
+                    quad_dit::<INV>([p0, p1, p2, p3], twiddles, s2, half, c * chunk)
                 });
         });
     }
 }
 
 /// The DIF twin: blocks are `2 * half` and the strips are `half / 2` long.
-fn parallel_quad_pass_dif(a: &mut [Fr], half: usize, twiddles: &[Fr], tasks: usize) {
+fn parallel_quad_pass_dif<const INV: bool>(
+    a: &mut [Fr],
+    half: usize,
+    twiddles: &[Fr],
+    tasks: usize,
+) {
     let n = a.len();
     let s1 = 1;
     let hh = half / 2;
@@ -749,7 +792,7 @@ fn parallel_quad_pass_dif(a: &mut [Fr], half: usize, twiddles: &[Fr], tasks: usi
     let blocks = n / block_len;
     if blocks >= tasks {
         a.par_chunks_mut(block_len).for_each(|block| {
-            quad_dif(quad_strips(block, hh), twiddles, s1, hh, 0);
+            quad_dif::<INV>(quad_strips(block, hh), twiddles, s1, hh, 0);
         });
     } else {
         let chunk = strip_chunk(hh, blocks, tasks);
@@ -761,7 +804,7 @@ fn parallel_quad_pass_dif(a: &mut [Fr], half: usize, twiddles: &[Fr], tasks: usi
                 .zip(y3.par_chunks_mut(chunk))
                 .enumerate()
                 .for_each(|(c, (((p0, p1), p2), p3))| {
-                    quad_dif([p0, p1, p2, p3], twiddles, s1, hh, c * chunk)
+                    quad_dif::<INV>([p0, p1, p2, p3], twiddles, s1, hh, c * chunk)
                 });
         });
     }
@@ -918,7 +961,7 @@ mod tests {
         // The impulse makes the reference O(n), so the sizes the prover actually uses
         // become affordable to predict.
         let ntt = CpuNtt::new();
-        for log in [12u32, 14, 16] {
+        for log in [12u32, 13, 14, 15, 16] {
             let n = 1usize << log;
             let d = domain(n);
             // An odd index around n/3, so `j * k` cycles through the whole table and a
@@ -1118,14 +1161,18 @@ mod tests {
     fn twiddle_cache_returns_the_same_table() {
         let ntt = CpuNtt::new();
         let d = domain(256);
-        let first = ntt.twiddles(&d, Direction::Forward);
-        let second = ntt.twiddles(&d, Direction::Forward);
+        let first = ntt.twiddles(&d);
+        let second = ntt.twiddles(&d);
         assert!(
             Arc::ptr_eq(&first, &second),
             "cache missed on a warm domain"
         );
-        assert_eq!(*first, d.twiddles());
-        assert_eq!(*ntt.twiddles(&d, Direction::Inverse), d.twiddles_inv());
+        assert_eq!(first[..d.size() / 2], d.twiddles());
+        assert_eq!(first[d.size() / 2], -Fr::ONE);
+        // The mirrored read the inverse passes rely on.
+        for (i, want) in d.twiddles_inv().into_iter().enumerate() {
+            assert_eq!(-tw::<true>(&first, i).to_fr(), want, "index {i}");
+        }
     }
 
     #[test]
@@ -1133,28 +1180,26 @@ mod tests {
         let ntt = CpuNtt::new();
         for _ in 0..2 {
             let block_domain = domain(CACHE_BLOCK);
-            for dir in [Direction::Forward, Direction::Inverse] {
-                let want = ntt.twiddles(&block_domain, dir);
-                for n in [CACHE_BLOCK * 2, CACHE_BLOCK * 4, CACHE_BLOCK * 8] {
-                    let d = domain(n);
-                    let full = ntt.twiddles(&d, dir);
-                    let local = ntt.block_twiddles(&full, n);
-                    assert_eq!(local.len(), CACHE_BLOCK / 2);
-                    assert_eq!(*local, *want);
-                    assert!(Arc::ptr_eq(&local, &want));
-                    for (i, value) in local.iter().enumerate() {
-                        assert_eq!(*value, full[i * (n / CACHE_BLOCK)]);
-                    }
+            let want = ntt.twiddles(&block_domain);
+            for n in [CACHE_BLOCK * 2, CACHE_BLOCK * 4, CACHE_BLOCK * 8] {
+                let d = domain(n);
+                let full = ntt.twiddles(&d);
+                let local = ntt.block_twiddles(&full, n);
+                assert_eq!(local.len(), CACHE_BLOCK / 2 + 1);
+                assert_eq!(*local, *want);
+                assert!(Arc::ptr_eq(&local, &want));
+                for (i, value) in local.iter().enumerate() {
+                    assert_eq!(*value, full[i * (n / CACHE_BLOCK)]);
                 }
             }
         }
         let fresh = CpuNtt::new();
         let d = domain(CACHE_BLOCK * 4);
-        let full = fresh.twiddles(&d, Direction::Forward);
+        let full = fresh.twiddles(&d);
         let local = fresh.block_twiddles(&full, d.size());
-        let want = fresh.twiddles(&domain(CACHE_BLOCK), Direction::Forward);
+        let want = fresh.twiddles(&domain(CACHE_BLOCK));
         assert!(Arc::ptr_eq(&local, &want));
-        assert_eq!(*local, domain(CACHE_BLOCK).twiddles());
+        assert_eq!(local[..CACHE_BLOCK / 2], domain(CACHE_BLOCK).twiddles());
     }
 
     /// The outer passes' packed tables are the full table at the pass's stride, the same
@@ -1163,18 +1208,14 @@ mod tests {
     fn stride_twiddles_are_the_smaller_transforms_tables() {
         let ntt = CpuNtt::new();
         let d = domain(1 << 14);
-        for dir in [Direction::Forward, Direction::Inverse] {
-            let full = ntt.twiddles(&d, dir);
-            assert!(Arc::ptr_eq(&ntt.stride_twiddles(&full, d.size(), 1), &full));
-            for s in [2usize, 4, 64, 256] {
-                let packed = ntt.stride_twiddles(&full, d.size(), s);
-                let want: Vec<Fr> = full.iter().step_by(s).copied().collect();
-                assert_eq!(*packed, want, "stride {s}");
-                assert!(Arc::ptr_eq(
-                    &packed,
-                    &ntt.twiddles(&domain(d.size() / s), dir)
-                ));
-            }
+        let full = ntt.twiddles(&d);
+        assert!(Arc::ptr_eq(&ntt.stride_twiddles(&full, d.size(), 1), &full));
+        for s in [2usize, 4, 64, 256] {
+            let packed = ntt.stride_twiddles(&full, d.size(), s);
+            let want: Vec<Fr> = full.iter().step_by(s).copied().collect();
+            assert_eq!(*packed, want, "stride {s}");
+            assert_eq!(packed.len(), d.size() / (2 * s) + 1, "stride {s}");
+            assert!(Arc::ptr_eq(&packed, &ntt.twiddles(&domain(d.size() / s))));
         }
     }
 
