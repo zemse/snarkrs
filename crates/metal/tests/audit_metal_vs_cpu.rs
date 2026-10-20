@@ -5,6 +5,13 @@
 
 #![cfg(target_os = "macos")]
 
+mod resources {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-support/resources.rs"
+    ));
+}
+
 use std::path::{Path, PathBuf};
 
 use snarkrs_field::{CurveGroup, Fr};
@@ -49,6 +56,15 @@ fn artifacts() -> Vec<(String, PathBuf)> {
     walk(&root, "", 1, &mut out);
     out.sort();
     out
+}
+
+/// [`artifacts`], reporting a skip for `test` when there are none.
+fn artifacts_for(test: &str) -> Vec<(String, PathBuf)> {
+    let found = artifacts();
+    if found.is_empty() {
+        resources::skip(format_args!("{test}: no artifacts under bench/artifacts"));
+    }
+    found
 }
 
 /// H element by element, then the five MSM points after normalisation, on the real path.
@@ -148,7 +164,7 @@ fn every_stage_of_the_metal_backend_matches_the_cpu() {
 #[test]
 fn proving_the_same_witness_twice_is_stable() {
     let metal = MetalBackend::new().unwrap();
-    for (name, dir) in artifacts() {
+    for (name, dir) in artifacts_for("proving_the_same_witness_twice_is_stable") {
         let pk = ProvingKey::load(&dir.join("circuit.zkey")).unwrap();
         let witness = Witness::load(&dir.join("circuit.wtns")).unwrap().0;
         let c = metal.prepare(pk).unwrap();
@@ -177,7 +193,7 @@ fn proving_the_same_witness_twice_is_stable() {
 #[test]
 fn wrong_witness_lengths_are_all_rejected() {
     let metal = MetalBackend::new().unwrap();
-    for (name, dir) in artifacts() {
+    for (name, dir) in artifacts_for("wrong_witness_lengths_are_all_rejected") {
         let pk = ProvingKey::load(&dir.join("circuit.zkey")).unwrap();
         let witness = Witness::load(&dir.join("circuit.wtns")).unwrap().0;
         let c = metal.prepare(pk).unwrap();
@@ -220,7 +236,7 @@ fn wrong_witness_lengths_are_all_rejected() {
 #[test]
 fn eight_concurrent_proofs_on_one_circuit() {
     let metal = MetalBackend::new().unwrap();
-    for (name, dir) in artifacts() {
+    for (name, dir) in artifacts_for("eight_concurrent_proofs_on_one_circuit") {
         let pk = ProvingKey::load(&dir.join("circuit.zkey")).unwrap();
         let witness = Witness::load(&dir.join("circuit.wtns")).unwrap().0;
         let vk = VerifyingKey::from_json(&dir.join("vkey.json")).unwrap();
@@ -273,7 +289,7 @@ fn where_the_msm_time_actually_goes() {
     use std::time::Instant;
 
     let msm = MetalMsm::new().unwrap();
-    for (name, dir) in artifacts() {
+    for (name, dir) in artifacts_for("where_the_msm_time_actually_goes") {
         let pk = ProvingKey::load(&dir.join("circuit.zkey")).unwrap();
         let witness = Witness::load(&dir.join("circuit.wtns")).unwrap().0;
         let a = msm.upload_g1_bases(&pk.a_query).expect("upload bases");
@@ -361,7 +377,7 @@ fn where_the_msm_time_actually_goes() {
 #[test]
 fn two_circuits_share_one_backend_under_load() {
     let metal = MetalBackend::new().unwrap();
-    let found = artifacts();
+    let found = artifacts_for("two_circuits_share_one_backend_under_load");
     let mut loaded = Vec::new();
     for (name, dir) in &found {
         let pk = ProvingKey::load(&dir.join("circuit.zkey")).unwrap();

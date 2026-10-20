@@ -12,6 +12,13 @@
 
 #![cfg(target_os = "macos")]
 
+mod resources {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-support/resources.rs"
+    ));
+}
+
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -164,6 +171,7 @@ fn gpu_compute_h_matches_the_cpu_backend() {
 fn a_short_witness_is_rejected() {
     let found = artifacts();
     let Some((_, dir)) = found.first() else {
+        resources::skip("a_short_witness_is_rejected: no artifacts under bench/artifacts");
         return;
     };
     let stages = HStages::new().expect("Metal device");

@@ -767,6 +767,13 @@ fn env_usize(var: &str) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    mod resources {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test-support/resources.rs"
+        ));
+    }
+
     use super::*;
     use crate::layout::PackedGlv;
     use snarkrs_ceremony::prepare::batch_to_affine;
@@ -912,7 +919,10 @@ mod tests {
     fn kernels() -> Option<FftKernels> {
         // No device on a headless builder is a skip, not a failure, the same way the
         // artifact-gated tests in `msm.rs` skip.
-        mtl::system_default()?;
+        if mtl::system_default().is_none() {
+            resources::skip("fft kernels: no Metal device");
+            return None;
+        }
         Some(FftKernels::new().expect("fft kernels"))
     }
 

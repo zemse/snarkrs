@@ -1006,6 +1006,13 @@ const _: () = {
 
 #[cfg(test)]
 mod tests {
+    mod resources {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test-support/resources.rs"
+        ));
+    }
+
     use super::*;
     use snarkrs_field::Field;
 
@@ -1074,7 +1081,7 @@ mod tests {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../bench/artifacts/tiny_mul/circuit.zkey");
         if !path.is_file() {
-            eprintln!("SKIPPED: no tiny_mul artifact");
+            resources::skip(format_args!("no tiny_mul artifact at {}", path.display()));
             return None;
         }
         Some(ProvingKey::load(&path).unwrap())

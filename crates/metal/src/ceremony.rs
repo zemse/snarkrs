@@ -1005,6 +1005,13 @@ fn env_usize(var: &str, default: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    mod resources {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test-support/resources.rs"
+        ));
+    }
+
     use super::*;
     use snarkrs_ceremony::prepare::{batch_to_affine, point_times_fr};
     use snarkrs_ceremony::CpuKeyScale;
@@ -1167,7 +1174,10 @@ mod tests {
     fn kernels() -> Option<CeremonyKernels> {
         // No device on a headless builder is a skip, not a failure, the same way the
         // artifact-gated tests in `msm.rs` skip.
-        mtl::system_default()?;
+        if mtl::system_default().is_none() {
+            resources::skip("ceremony kernels: no Metal device");
+            return None;
+        }
         Some(CeremonyKernels::new().expect("ceremony kernels"))
     }
 

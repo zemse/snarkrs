@@ -13,6 +13,13 @@ pub use snarkrs_lib::json::{
 
 #[cfg(test)]
 mod tests {
+    mod resources {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test-support/resources.rs"
+        ));
+    }
+
     use super::*;
     use crate::artifacts::variants;
     use num_bigint::BigUint;
@@ -33,7 +40,9 @@ mod tests {
     fn reencoding_snarkjs_own_proof_is_a_fixed_point() {
         let found = variants(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/artifacts"));
         if found.is_empty() {
-            eprintln!("SKIPPED: no artifacts under bench/artifacts");
+            resources::skip(
+                "reencoding_snarkjs_own_proof_is_a_fixed_point: no artifacts under bench/artifacts",
+            );
             return;
         }
         for v in &found {

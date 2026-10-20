@@ -1,5 +1,12 @@
 //! The MSM module's unit tests: the host-side helpers, then the GPU against the CPU.
 
+mod resources {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-support/resources.rs"
+    ));
+}
+
 #[test]
 fn slice_override_never_zero_or_past_u32() {
     assert_eq!(parse_slice_override("128"), Some(128));
@@ -819,7 +826,7 @@ fn device_resident_montgomery_scalars_agree_with_host_packing() {
 /// on identical inputs. Points must be exactly equal after normalisation.
 fn five_msms_against_cpu(name: &str) {
     let Some(dir) = artifact(name) else {
-        eprintln!("{name}: artifact missing, skipped");
+        resources::skip(format_args!("five_msms_against_cpu: no {name} artifact"));
         return;
     };
     let pk = ProvingKey::load(&dir.join("circuit.zkey")).expect("zkey");

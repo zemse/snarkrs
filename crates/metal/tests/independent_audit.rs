@@ -13,6 +13,13 @@
 
 #![cfg(target_os = "macos")]
 
+mod resources {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-support/resources.rs"
+    ));
+}
+
 use std::path::{Path, PathBuf};
 
 use objc2_metal::MTLBuffer;
@@ -60,6 +67,15 @@ fn artifacts() -> Vec<(String, PathBuf)> {
     out
 }
 
+/// [`artifacts`], reporting a skip for `test` when there are none.
+fn artifacts_for(test: &str) -> Vec<(String, PathBuf)> {
+    let found = artifacts();
+    if found.is_empty() {
+        resources::skip(format_args!("{test}: no artifacts under bench/artifacts"));
+    }
+    found
+}
+
 /// Eight threads, eight DIFFERENT witnesses, one circuit. Each thread's answer is
 /// compared against that witness's own serially computed answer.
 ///
@@ -69,7 +85,7 @@ fn artifacts() -> Vec<(String, PathBuf)> {
 #[test]
 fn distinct_witnesses_concurrently_do_not_cross_talk() {
     let metal = MetalBackend::new().unwrap();
-    for (name, dir) in artifacts() {
+    for (name, dir) in artifacts_for("distinct_witnesses_concurrently_do_not_cross_talk") {
         let pk = ProvingKey::load(&dir.join("circuit.zkey")).unwrap();
         let base = Witness::load(&dir.join("circuit.wtns")).unwrap().0;
         let c = metal.prepare(pk).unwrap();
@@ -196,7 +212,7 @@ fn dump_h_and_points() {
 #[test]
 fn gpu_output_is_load_bearing() {
     let metal = MetalBackend::new().unwrap();
-    for (name, dir) in artifacts() {
+    for (name, dir) in artifacts_for("gpu_output_is_load_bearing") {
         let pk = ProvingKey::load(&dir.join("circuit.zkey")).unwrap();
         let witness = Witness::load(&dir.join("circuit.wtns")).unwrap().0;
         let vk = VerifyingKey::from_json(&dir.join("vkey.json")).unwrap();

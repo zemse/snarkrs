@@ -721,6 +721,13 @@ const _: () = {
 
 #[cfg(test)]
 mod tests {
+    mod resources {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test-support/resources.rs"
+        ));
+    }
+
     use super::*;
     use snarkrs_formats::{wtns::Witness, Matrix, VerifyingKey};
     use snarkrs_groth16::prove::prove_with_blinders;
@@ -847,7 +854,7 @@ mod tests {
     fn for_each(test: &str, f: impl Fn(&str, &Path)) {
         let found = artifacts();
         if found.is_empty() {
-            eprintln!("SKIPPED {test}: no artifacts under bench/artifacts");
+            resources::skip(format_args!("{test}: no artifacts under bench/artifacts"));
             return;
         }
         for (name, dir) in &found {

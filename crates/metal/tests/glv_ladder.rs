@@ -14,6 +14,13 @@
 
 #![cfg(target_os = "macos")]
 
+mod resources {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-support/resources.rs"
+    ));
+}
+
 use ark_ec::scalar_mul::glv::GLVConfig;
 use ark_ff::{BigInt, Field};
 use objc2_metal::{
@@ -86,7 +93,10 @@ struct Harness {
 
 impl Harness {
     fn new() -> Option<Self> {
-        let device = mtl::system_default()?;
+        let Some(device) = mtl::system_default() else {
+            resources::skip("glv ladder harness: no Metal device");
+            return None;
+        };
         let src = format!("{FR_MSL}\n{MSM_MSL}\n{CEREMONY_MSL}\n{FFT_MSL}\n");
         let lib = mtl::library(&device, &src).expect("MSL compiles");
         let queue = mtl::command_queue(&device).unwrap();

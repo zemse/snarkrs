@@ -12,6 +12,13 @@
 
 #![cfg(target_os = "macos")]
 
+mod resources {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-support/resources.rs"
+    ));
+}
+
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -32,7 +39,7 @@ fn median(mut v: Vec<f64>) -> f64 {
 
 fn bench_one(name: &str, dir: PathBuf) {
     if !dir.join("circuit.zkey").is_file() {
-        println!("MSM-FLOOR {name}: no artifact, skipped");
+        resources::skip(format_args!("MSM-FLOOR {name}: no artifact"));
         return;
     }
     let pk = ProvingKey::load(&dir.join("circuit.zkey")).unwrap();

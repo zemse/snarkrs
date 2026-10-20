@@ -23,6 +23,13 @@
 //! differ — that is the zero knowledge — so a separate assertion demands that they do.
 //! A prover that dropped `r` and `s` on the floor would still verify.
 
+mod resources {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-support/resources.rs"
+    ));
+}
+
 use std::path::{Path, PathBuf};
 
 use ark_serialize::CanonicalSerialize;
@@ -44,7 +51,9 @@ fn artifacts_root() -> PathBuf {
 fn found(test: &str) -> Vec<Variant> {
     let v = variants(artifacts_root());
     if v.is_empty() {
-        eprintln!("SKIPPED {test}: no complete artifacts under bench/artifacts");
+        resources::skip(format_args!(
+            "{test}: no complete artifacts under bench/artifacts"
+        ));
     }
     v
 }
@@ -208,7 +217,7 @@ fn every_variant_survives_a_blinder_sweep() {
 fn tiny_mul_proves_hundreds_of_different_statements() {
     let found = found("tiny_mul_proves_hundreds_of_different_statements");
     let Some(v) = found.iter().find(|v| v.name == "tiny_mul") else {
-        eprintln!("SKIPPED tiny_mul_proves_hundreds_of_different_statements: no tiny_mul");
+        resources::skip("tiny_mul_proves_hundreds_of_different_statements: no tiny_mul");
         return;
     };
     let l = load(v, BackendKind::Cpu);
@@ -260,7 +269,7 @@ fn tiny_mul_proves_hundreds_of_different_statements() {
 fn tiny_mul_rejects_what_it_should() {
     let found = found("tiny_mul_rejects_what_it_should");
     let Some(v) = found.iter().find(|v| v.name == "tiny_mul") else {
-        eprintln!("SKIPPED tiny_mul_rejects_what_it_should: no tiny_mul");
+        resources::skip("tiny_mul_rejects_what_it_should: no tiny_mul");
         return;
     };
     let l = load(v, BackendKind::Cpu);
