@@ -8,14 +8,24 @@
 //! every failed one must leave the existing destination byte identical with no stage
 //! behind, and `zkey verify` through the Metal MSM must accept the CPU-made final key.
 //!
-//! The test causes no fault itself. A round that sees no interruption checks only the
-//! unfaulted path, so the run prints how many operations failed and fails under
-//! `G16_REQUIRE_TESTS=1` if none did. Interruptions come from GPU recovery episodes,
-//! which a second process proving at 2^22 in a loop has produced (BUG-28); retries
-//! inside the backend succeed silently and are what the byte comparison is for.
+//! Two soaks. `interrupted_*` causes no fault itself. A round that sees no interruption
+//! checks only the unfaulted path, so the run prints how many operations failed and
+//! fails under `G16_REQUIRE_TESTS=1` if none did. Interruptions come from GPU recovery
+//! episodes, which a second process proving at 2^22 in a loop has produced (BUG-28);
+//! retries inside the backend succeed silently and are what the byte comparison is for.
 //!
-//! `#[ignore]` because it is a soak that wants the GPU to itself apart from the
-//! deliberate load. `G16_RECOVERY_ROUNDS` sets the round count (default 50) and
+//! `injected_*` puts each of `snarkrs_metal::inject`'s faults behind one submission or
+//! dispatch of every operation in turn, on a quiet machine: a refused status, an ignored
+//! queue, a stale and a missing token, a dispatch cut short with the rest of its buffer or
+//! of its attempt dropped, and a wrong store under a good token. The first six are
+//! retried inside the backend and the output must be the CPU bytes; the last is the open
+//! BUG-28 mechanism and the run reports, per operation, whether it was caught or reached
+//! the file. The injector is per thread and `zkey setup` sends its slot MSMs from the
+//! rayon pool, so the whole run is installed on a one-thread pool.
+//!
+//! Both `#[ignore]`: soaks that want the GPU to themselves apart from the deliberate
+//! load. `G16_RECOVERY_ROUNDS` sets the round count (default 50 interrupted, 4 injected,
+//! where round `r` arms index `r` of each operation's submissions and dispatches) and
 //! `G16_RECOVERY_POWER` the ptau power (default 10, at most 16).
 
 #![cfg(all(feature = "metal", target_os = "macos"))]
@@ -37,6 +47,7 @@ use snarkrs_ceremony::{
     ContributionParams, CpuGroupFft, CpuKeyScale,
 };
 use snarkrs_field::{Fr, PrimeField};
+use snarkrs_metal::inject::{self, Fault, Rest};
 use snarkrs_metal::{MetalGroupFft, MetalKeyScale, MetalMsmBackend};
 use snarkrs_msm::{CpuMsm, GroupFft, KeyScale, MsmBackend};
 
@@ -309,4 +320,201 @@ fn interrupted_metal_ceremony_outputs_match_cpu_or_preserve_destination() {
     if total == 0 {
         resources::skip("no device failure observed, so no interrupted submission was checked");
     }
+}
+
+/// One of the injector's faults: behind a submission's wait, or at a dispatch.
+#[derive(Clone, Copy)]
+enum Arm {
+    Wait(Fault),
+    Cut(Rest),
+}
+
+const ARMS: [Arm; 7] = [
+    Arm::Wait(Fault::Status),
+    Arm::Wait(Fault::Ignored),
+    Arm::Wait(Fault::Stale),
+    Arm::Wait(Fault::MissingToken),
+    Arm::Cut(Rest::Buffer),
+    Arm::Cut(Rest::Attempt),
+    Arm::Wait(Fault::WrongStore),
+];
+
+impl Arm {
+    fn label(self) -> String {
+        match self {
+            Arm::Wait(f) => format!("{f:?}"),
+            Arm::Cut(r) => format!("Cut({r:?})"),
+        }
+    }
+
+    /// Arms this fault at `round` of `submissions` waits or `dispatches` dispatches.
+    fn arm(self, round: usize, submissions: u32, dispatches: u32) -> u32 {
+        match self {
+            Arm::Wait(f) => {
+                let at = round as u32 % submissions;
+                inject::arm_with(Some((at, f)), false);
+                at
+            }
+            Arm::Cut(r) => {
+                let at = round as u32 % dispatches;
+                inject::arm_cut(at, r);
+                at
+            }
+        }
+    }
+}
+
+/// What one faulted run did, counted per operation and arm.
+#[derive(Default)]
+struct Tally {
+    /// `Ok` and the CPU bytes: the backend retried.
+    retried: usize,
+    /// `Ok` and other bytes: the fault reached the file.
+    escaped: usize,
+    /// A device error with the destination and directory untouched.
+    failed: usize,
+}
+
+#[test]
+#[ignore = "GPU fault soak: a wrong store reaches the file on every KeyScale and GroupFft operation, see the module docs"]
+fn injected_metal_faults_match_cpu_or_preserve_destination() {
+    let rounds = env_usize("G16_RECOVERY_ROUNDS", 4);
+    let power = env_usize("G16_RECOVERY_POWER", 10) as u32;
+    assert!((4..=16).contains(&power), "G16_RECOVERY_POWER={power}");
+    let (key, fft, msm) = match (
+        MetalKeyScale::new(),
+        MetalGroupFft::new(),
+        MetalMsmBackend::new(),
+    ) {
+        (Ok(key), Ok(fft), Ok(msm)) => (key, fft, msm),
+        _ => {
+            resources::skip("no Metal device");
+            return;
+        }
+    };
+    let metal = Backends {
+        key: &key.with_min_points(1),
+        fft: &fft.with_min_block(1),
+        msm: &msm,
+    };
+    let cpu_msm = CpuMsm::new();
+    let cpu = Backends {
+        key: &CpuKeyScale,
+        fft: &CpuGroupFft,
+        msm: &cpu_msm,
+    };
+
+    // Everything below runs on the pool's one worker, the arming included, so the
+    // submissions `zkey setup` makes from inside `par_iter` are this thread's.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap();
+    pool.install(|| {
+        let inputs = Inputs::new("inject", power);
+        let expected: Vec<Vec<u8>> = (0..OPERATIONS.len())
+            .map(|op| {
+                let out = inputs.dir.join(format!("cpu-{op}"));
+                run(op, &inputs, &out, &cpu).unwrap();
+                std::fs::read(out).unwrap()
+            })
+            .collect();
+        let final_key = inputs.dir.join("cpu-4");
+
+        let out_dir = inputs.dir.join("metal");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let mut problems = Vec::new();
+        for (op, name) in OPERATIONS.iter().enumerate() {
+            let out = out_dir.join(format!("out-{op}"));
+            inject::arm(None);
+            run(op, &inputs, &out, &metal).unwrap();
+            assert_eq!(std::fs::read(&out).unwrap(), expected[op], "{name}: unfaulted");
+            let (submissions, dispatches) = (inject::calls(), inject::dispatches());
+            assert!(
+                submissions > 0 && dispatches > 0,
+                "{name}: nothing was submitted to Metal"
+            );
+
+            let mut tallies: Vec<Tally> = ARMS.iter().map(|_| Tally::default()).collect();
+            for round in 0..rounds {
+                for (arm, tally) in ARMS.iter().zip(&mut tallies) {
+                    let at = arm.arm(round, submissions, dispatches);
+                    let what = format!("{name}, {} at {at}", arm.label());
+                    std::fs::write(&out, SENTINEL).unwrap();
+                    let before = entries(&out_dir);
+                    let result = run(op, &inputs, &out, &metal);
+                    let fired = inject::fired();
+                    inject::arm(None);
+                    if !fired {
+                        problems.push(format!("{what}: never reached"));
+                    }
+                    match result {
+                        Ok(()) if std::fs::read(&out).unwrap() == expected[op] => {
+                            tally.retried += 1;
+                        }
+                        Ok(()) => {
+                            tally.escaped += 1;
+                            problems.push(format!("{what}: Ok but differs from CPU"));
+                        }
+                        Err(CeremonyError::Accel(e)) => {
+                            tally.failed += 1;
+                            eprintln!("{what}: {e}");
+                            if std::fs::read(&out).unwrap() != SENTINEL {
+                                problems.push(format!("{what}: failed and replaced"));
+                            }
+                        }
+                        Err(e) => problems.push(format!("{what}: non-device error {e}")),
+                    }
+                    if entries(&out_dir) != before {
+                        problems.push(format!("{what}: directory changed"));
+                    }
+                }
+            }
+            eprintln!(
+                "{name}: {submissions} submissions, {dispatches} dispatches; {}",
+                ARMS.iter()
+                    .zip(&tallies)
+                    .map(|(arm, t)| format!(
+                        "{} {} retried, {} escaped, {} failed",
+                        arm.label(),
+                        t.retried,
+                        t.escaped,
+                        t.failed
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            );
+        }
+
+        inject::arm(None);
+        contribute::verify_from_init(&inputs.init, &inputs.prepared, &final_key, metal.msm).unwrap();
+        let (submissions, dispatches) = (inject::calls(), inject::dispatches());
+        let mut tally = Tally::default();
+        for round in 0..rounds {
+            for arm in ARMS {
+                let at = arm.arm(round, submissions, dispatches);
+                let what = format!("zkey verify, {} at {at}", arm.label());
+                let result =
+                    contribute::verify_from_init(&inputs.init, &inputs.prepared, &final_key, metal.msm);
+                let fired = inject::fired();
+                inject::arm(None);
+                if !fired {
+                    problems.push(format!("{what}: never reached"));
+                }
+                match result {
+                    Ok(_) => tally.retried += 1,
+                    Err(CeremonyError::Accel(e)) => {
+                        tally.failed += 1;
+                        eprintln!("{what}: {e}");
+                    }
+                    Err(e) => problems.push(format!("{what}: rejected a good key: {e}")),
+                }
+            }
+        }
+        eprintln!(
+            "zkey verify: {submissions} submissions, {dispatches} dispatches; {} accepted, {} failed",
+            tally.retried, tally.failed
+        );
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    });
 }

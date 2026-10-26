@@ -41,8 +41,10 @@ memmap2.workspace = true
 [dev-dependencies]
 # The Metal ceremony seams, which the `*_metal.rs` tests hold the CPU ones against.
 # snarkrs-metal dev-depends on this crate for the same reason; a dev-dependency in both
-# directions is not a cycle, because neither library depends on the other.
-snarkrs-metal.workspace = true
+# directions is not a cycle, because neither library depends on the other. `fault-inject`
+# for tests/recovery_metal.rs, which puts a fault behind each submission of each ceremony
+# operation; dev-only, so no build of the ceremony library carries the hooks.
+snarkrs-metal = { workspace = true, features = ["fault-inject"] }
 # The CUDA GroupFft, for tests/prepare_cuda.rs. `features = ["cuda"]` because the crate
 # compiles to an empty shell without it; cudarc's dynamic-loading keeps this buildable
 # on machines with no CUDA installed, so unlike the backend crates it need not be
