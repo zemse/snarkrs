@@ -246,8 +246,14 @@ was published: an injected one (`Fault::WrongStore`, `490a0f1`) escaped into the
 Metal ceremony operations. Every ceremony readback is now range-checked, held to the curve, and
 one point per chunk (one thread per FFT piece) is recomputed on the host; a mismatch is a
 `ProveError::Device` and the submission is re-run. The soak `tests/recovery_metal.rs` retries
-every injected fault on all eight operations (+0 to 3.2% at power 16). The CUDA ceremony seams
-have no such check yet.
+every injected fault on all eight operations (+0 to 3.2% at power 16). CUDA has one ceremony
+seam, the group FFT behind `ptau prepare` (key scaling and the ceremony MSMs have no CUDA
+kernels). Since `0a44213` its readbacks are range-checked and held to the curve, and one thread
+per pass is recomputed on the host from a device-side log, so the loop stays free of
+synchronizes; a mismatch re-runs the transform up to eight times and a persistent one fails
+`ptau prepare` with the staged destination untouched. `tests/recovery_cuda.rs` retries 82 of 82
+injected wrong stores at power 10 (+3.3% on prepare phase2 at power 16 on a Tesla T4). CUDA
+driver faults are still not retried.
 
 Since `2a2babe` the wgpu MSM batch is several submissions of about 300 ms, each sealed and
 retried alone up to eight times: under two other proof loops 0 of 60 CLI proofs gave up, against
