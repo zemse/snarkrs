@@ -109,10 +109,14 @@ pub fn unit_fft_with(fft_variants: bool) -> String {
     format!("{}{FR_CUH}\n{CURVE_CUH}\n{FFT_CU}", defines(fft_variants))
 }
 
-/// The `fr_probe` / `fr_constants` translation unit.
+/// The field probe translation unit: `fr_probe` / `fr_constants` over the prelude and
+/// `fq_probe` / `fq2_probe` / `fq_constants` over the curve header. The curve header is
+/// the same text the MSM and FFT units compile, so the probes exercise the Fq and Fq2
+/// definitions those units run, not a copy; it costs this unit nothing extra because
+/// everything in it is `__forceinline__` or a template and only the probes instantiate.
 pub fn unit_field_probe() -> String {
     format!(
-        "{}{FR_CUH}\n{FIELD_PROBE_CU}",
+        "{}{FR_CUH}\n{CURVE_CUH}\n{FIELD_PROBE_CU}",
         defines(fft_variants_enabled())
     )
 }
@@ -130,5 +134,20 @@ mod tests {
         assert!(!defines(false).contains(DEFINE));
         assert!(unit_fft_with(true).starts_with(&defines(true)));
         assert!(!unit_fft_with(false).contains(DEFINE));
+    }
+
+    /// The probe unit carries the curve header ahead of the probes, so `fq_probe` is
+    /// compiled against the MSM's Fq and not against a definition of its own.
+    #[test]
+    fn the_field_probe_unit_probes_the_curve_headers_fq() {
+        let unit = unit_field_probe();
+        let fq = unit
+            .find("struct Fq {")
+            .expect("curve header in the probe unit");
+        let probe = unit
+            .find("void fq_probe(")
+            .expect("fq_probe in the probe unit");
+        assert!(fq < probe);
+        assert!(!FIELD_PROBE_CU.contains("struct Fq"));
     }
 }
