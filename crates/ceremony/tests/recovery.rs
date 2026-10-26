@@ -447,6 +447,98 @@ fn successful_in_place_operations_match_separate_outputs() {
     }
 }
 
+/// The ways an output can name its input without being the same string: through `..`,
+/// a symlink as the output, and a symlink as the input. Returns `(input, output, file)`,
+/// where `file` is the regular file both resolve to, holding a copy of `source`.
+#[cfg(unix)]
+fn indirect_aliases(dir: &Path, tag: &str, source: &Path) -> [(PathBuf, PathBuf, PathBuf); 3] {
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    let make = |name: String| {
+        let file = dir.join(&name);
+        std::fs::copy(source, &file).unwrap();
+        file
+    };
+    let link = |name: String, target: &Path| {
+        let link = dir.join(name);
+        std::os::unix::fs::symlink(target.file_name().unwrap(), &link).unwrap();
+        link
+    };
+    let dotdot = make(format!("dotdot-{tag}"));
+    let via = dir.join("sub").join("..").join(dotdot.file_name().unwrap());
+    let out_target = make(format!("out-target-{tag}"));
+    let out_link = link(format!("out-link-{tag}"), &out_target);
+    let in_target = make(format!("in-target-{tag}"));
+    let in_link = link(format!("in-link-{tag}"), &in_target);
+    [
+        (dotdot.clone(), via, dotdot),
+        (out_target.clone(), out_link, out_target),
+        (in_link, in_target.clone(), in_target),
+    ]
+}
+
+#[cfg(unix)]
+fn assert_links_kept(dir: &Path) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().into_string().unwrap();
+        if name.contains("-link-") {
+            assert!(entry.file_type().unwrap().is_symlink(), "{name} replaced");
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn indirect_in_place_operations_match_separate_outputs_or_preserve_input() {
+    let fixture = Fixture::new("publication-indirect");
+    for (kind, input) in scale_inputs(&fixture).iter().enumerate() {
+        let expected = fixture.dir.join(format!("expected-{kind}"));
+        scale_operation(kind, input, &expected, &CpuKeyScale).unwrap();
+        let expected = std::fs::read(&expected).unwrap();
+        let original = std::fs::read(input).unwrap();
+        for (i, (from, to, file)) in indirect_aliases(&fixture.dir, &format!("{kind}"), input)
+            .into_iter()
+            .enumerate()
+        {
+            let before = entries(&fixture.dir);
+            let error =
+                scale_operation(kind, &from, &to, &LateScale(AtomicUsize::new(0))).unwrap_err();
+            assert!(fake_device(&error), "kind {kind} alias {i}: {error}");
+            assert_eq!(
+                std::fs::read(&file).unwrap(),
+                original,
+                "kind {kind} alias {i}"
+            );
+            assert_eq!(entries(&fixture.dir), before, "kind {kind} alias {i}");
+
+            scale_operation(kind, &from, &to, &CpuKeyScale).unwrap();
+            assert_eq!(
+                std::fs::read(&file).unwrap(),
+                expected,
+                "kind {kind} alias {i}"
+            );
+            assert_eq!(entries(&fixture.dir), before, "kind {kind} alias {i}");
+        }
+        assert_links_kept(&fixture.dir);
+    }
+    let contributed = fixture.dir.join("contributed.ptau");
+    let expected = std::fs::read(&fixture.ptau).unwrap();
+    let original = std::fs::read(&contributed).unwrap();
+    for (i, (from, to, file)) in indirect_aliases(&fixture.dir, "prepare", &contributed)
+        .into_iter()
+        .enumerate()
+    {
+        let before = entries(&fixture.dir);
+        let error = prepare::prepare_phase2(&from, &to, &LateFft(AtomicUsize::new(0))).unwrap_err();
+        assert!(fake_device(&error), "prepare alias {i}: {error}");
+        assert_eq!(std::fs::read(&file).unwrap(), original, "prepare alias {i}");
+        prepare::prepare_phase2(&from, &to, &CpuGroupFft).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), expected, "prepare alias {i}");
+        assert_eq!(entries(&fixture.dir), before, "prepare alias {i}");
+    }
+    assert_links_kept(&fixture.dir);
+}
+
 /// Overwrite `len` bytes at `at` with a big-endian field element above the modulus. The
 /// first byte keeps both flag bits clear, so no decoder reads it as infinity.
 fn corrupt_be(path: &Path, at: usize, len: usize) {

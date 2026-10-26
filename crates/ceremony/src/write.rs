@@ -53,10 +53,17 @@ const POINT_BATCH: usize = 8192;
 /// the destination is already replaced by then, and nothing here checks the arithmetic
 /// of what the operation wrote. It assumes a trusted output directory, not adversarial
 /// path replacement.
+///
+/// The operation writes only to the stage, so an output that is also one of its inputs
+/// (the same path, a path through `..`, or a symlink to it) reads the old input to the
+/// end and is then replaced by the result. A symlinked destination is followed, as
+/// `File::create` and snarkjs follow it: the stage goes beside the final target and
+/// replaces that, and the link stays a link. A hard-linked destination gets a new inode,
+/// so its other names keep the old bytes.
+///
 /// Name separation covers case folding, canonical Unicode normalization and trailing
 /// dot/space trimming, which preserve ASCII decimal digits and their order. DOS 8.3,
 /// device aliases and other alternate-name namespaces are outside this guarantee.
-/// Rename replaces the directory entry, including a symlink, rather than its referent.
 /// Existing regular-file permissions are copied at commit; ownership, ACLs and hard-link
 /// identity are not preserved. New files and in-progress stages use mode 0600 on Unix
 /// and platform defaults elsewhere; inherited ACLs remain filesystem-dependent.
@@ -76,6 +83,7 @@ fn staged_with_counter<T>(
     operation: impl FnOnce(&Path) -> Result<T, CeremonyError>,
 ) -> Result<T, CeremonyError> {
     use std::io::ErrorKind;
+    let destination = &follow_links(destination)?;
     let Some(file_name) = destination.file_name() else {
         return Err(std::io::Error::new(ErrorKind::InvalidInput, "output has no file name").into());
     };
@@ -102,6 +110,32 @@ fn staged_with_counter<T>(
         let _ = dir.sync_all();
     }
     Ok(result)
+}
+
+/// `path` with every symlink in its last component followed, dangling ones included, so
+/// that a link is written through rather than replaced.
+fn follow_links(path: &Path) -> std::io::Result<std::path::PathBuf> {
+    use std::io::ErrorKind;
+    let mut path = path.to_path_buf();
+    // Linux's MAXSYMLINKS.
+    for _ in 0..40 {
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let target = std::fs::read_link(&path)?;
+                path = match path.parent() {
+                    Some(parent) => parent.join(target),
+                    None => target,
+                };
+            }
+            Ok(_) => return Ok(path),
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(path),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        ErrorKind::InvalidInput,
+        "too many levels of symbolic links",
+    ))
 }
 
 struct Stage {
@@ -802,6 +836,39 @@ mod publication_tests {
             );
         }
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_are_written_through_and_loops_refused() {
+        use std::os::unix::fs::symlink;
+        let dir = dir("symlinks");
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        // A chain of two links, the second dangling into another directory.
+        symlink("sub/middle", dir.join("link")).unwrap();
+        symlink("target", sub.join("middle")).unwrap();
+        for content in [&b"first"[..], b"second"] {
+            staged(&dir.join("link"), |stage| {
+                assert_eq!(stage.parent().unwrap(), sub);
+                std::fs::write(stage, content)?;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(std::fs::read(sub.join("target")).unwrap(), content);
+            assert!(std::fs::symlink_metadata(dir.join("link"))
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_eq!(std::fs::read_dir(&sub).unwrap().count(), 2);
+        }
+        symlink("loop-b", dir.join("loop-a")).unwrap();
+        symlink("loop-a", dir.join("loop-b")).unwrap();
+        let result: Result<(), CeremonyError> =
+            staged(&dir.join("loop-a"), |_| panic!("loop destination"));
+        assert!(matches!(result, Err(CeremonyError::Io(_))));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 4);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
