@@ -147,10 +147,17 @@ pub enum Work {
     Variable,
     /// Port of Metal/WebGPU constant work: every scalar emits in every window,
     /// zero digits accumulate into dummy rows, and a fixed complete-addition tree
-    /// folds spills. No separate ones pass or host classification is performed.
+    /// folds spills. No separate ones pass or host classification is performed. The
+    /// accumulation is `msm_segmented_constant_*`, which decides nothing by branching on
+    /// an entry (a run boundary, a padded iteration, a base at infinity and a digit's sign
+    /// are all selects) and adds with the complete formulas; the fold is written the same
+    /// way and the reduce adds with the complete formulas too, so every thread's
+    /// instruction stream, loads, stores and field products are the key's. See
+    /// [`CudaMsm::constant_work`] for what that leaves and what it costs.
     ///
-    /// This is not constant time. Atomic contention, bucket addresses, run boundaries,
-    /// mixed-add exceptions and host group arithmetic still depend on values.
+    /// This is not constant time. Which bucket a digit names still follows its value, so
+    /// the digit pipeline's atomics contend by occupancy and the accumulation's and fold's
+    /// stores land on witness-chosen addresses; the host combine tests for the identity.
     Constant,
 }
 
@@ -888,6 +895,10 @@ struct Kernels {
     accumulate_g2: Kernel,
     segmented_g1: Kernel,
     segmented_g2: Kernel,
+    /// The accumulation for plans with dummy rows: selects instead of branches and the
+    /// complete formulas; see `msm_segmented_constant_impl` in `kernels/msm.cu`.
+    segmented_constant_g1: Kernel,
+    segmented_constant_g2: Kernel,
     merge_g1: Kernel,
     merge_g2: Kernel,
     fold_g1: Kernel,
@@ -964,11 +975,44 @@ struct TestActivity {
     ones_readbacks: AtomicU64,
     legacy_launches: AtomicU64,
     segmented_launches: AtomicU64,
+    constant_launches: AtomicU64,
     fold_launches: AtomicU64,
 }
 
 impl CudaMsm {
     /// Opt in to the fixed schedule before uploading scalars or proving.
+    ///
+    /// What stays witness dependent, on the device: which bucket a digit lands in. That
+    /// is the digit pipeline's atomics, which contend by occupancy, and the addresses the
+    /// accumulation's and the fold's loads and stores touch. Every other decision in the
+    /// accumulation (`msm_segmented_constant_*`), the fold (`msm_fold_*`) and the reduce
+    /// is a select on the entry rather than a branch, and every addition is a complete
+    /// one (`Proj` in msm.cu), so the instruction stream and the field products of every
+    /// thread are the key's. On the host: the identity tests inside the combine's few
+    /// hundred curve additions, as on the CPU backend.
+    ///
+    /// Measured on a Tesla T4 (g4dn.xlarge, clocks locked at 1590 MHz, the 70 W cap
+    /// active), `constant_work_phase_flatness` at 2^18, c=8, 32 windows, 4096 slices a
+    /// window, medians of 12 interleaved reps after 2 warm. G2: the accumulation reads
+    /// 204.0 to 207.1 ms across zeros, ones, bits, dense, one-value and small witnesses
+    /// (ranges within 0.5 ms), the fold 21.1 to 22.9, the reduce 2.33 to 2.34, the digit
+    /// pipeline 1.27 to 1.68 (the atomics). G1: the accumulation reads 36.2 to 38.9 on
+    /// zeros, ones, bits and small and 49.2 to 51.3 on dense and one-value, and the 16 MB
+    /// G1 base vector does not fit the 4 MB L2; at 2^16, where it does, the same six read
+    /// 10.4 to 13.3 and the fold and the reduce are flat to 0.1 ms. Consistent with the
+    /// address residual above, on the loads: a dense or one-value window reads its bases
+    /// in sort order, a zero-heavy one near thread order, and the kernel's work does not
+    /// move while the cache's does. (At 2^18 the G1 fold and reduce read 7.3 to 9.5 and
+    /// 0.75 to 0.94 the other way round, faster after the slower accumulation, which fits
+    /// the power cap raising the clock behind a memory-bound kernel; both are flat at
+    /// 2^16.)
+    ///
+    /// Priced warm on the same box, keccak256, 10 reps x 4 rounds interleaved against
+    /// `f424de2`: 452 to 455 ms (MSM stage 431 to 434) against 236 to 237 (216 to 217)
+    /// with the shortcut accumulation, and 51.7 to 52.1 (37.0 to 37.3) against 51.4 to
+    /// 51.7 (36.6 to 36.8) on the variable path, whose kernels this change does not
+    /// touch. The complete formulas cost 12M plus two products by 3b against the mixed
+    /// addition's 7M + 2S, with a packed store per iteration on top.
     pub fn constant_work(mut self) -> Self {
         self.work = Work::Constant;
         self
@@ -1032,6 +1076,8 @@ impl CudaMsm {
             accumulate_g2: Kernel::load(&module, "msm_accumulate_g2")?,
             segmented_g1: Kernel::load(&module, "msm_segmented_g1")?,
             segmented_g2: Kernel::load(&module, "msm_segmented_g2")?,
+            segmented_constant_g1: Kernel::load(&module, "msm_segmented_constant_g1")?,
+            segmented_constant_g2: Kernel::load(&module, "msm_segmented_constant_g2")?,
             merge_g1: Kernel::load(&module, "msm_merge_g1")?,
             merge_g2: Kernel::load(&module, "msm_merge_g2")?,
             fold_g1: Kernel::load(&module, "msm_fold_g1")?,
@@ -1515,149 +1561,249 @@ impl CudaMsm {
     }
 
     /// The point stages of one job: clear, accumulate, merge, reduce, ones.
+    ///
+    /// Split into one method per phase so the flatness probe in the tests can time each on
+    /// its own; a proof runs them back to back on the stream with no wait between.
     fn launch_points(&self, job: &Job<'_>, out: &Outputs, p: &Plan<'_>) -> Result<(), ProveError> {
+        let params = self.point_params(out, p);
+        // A legacy override never weakens a constant-work plan.
+        if p.dummy_rows == 0 && legacy_accumulate() {
+            self.launch_legacy(job, out, p, &params)?;
+        } else {
+            self.launch_clear(job, out, p, &params)?;
+            self.launch_accumulate(job, out, p, &params)?;
+            self.launch_merge(job, out, p, &params)?;
+        }
+        self.launch_reduce(job, out, p, &params)?;
+        self.launch_ones(job, out, p, &params)
+    }
+
+    fn point_params(&self, out: &Outputs, p: &Plan<'_>) -> MsmParams {
         let mut params = p.params();
         params.base_off = out.base_off as u32;
         params.ones_groups = out.ones_groups as u32;
+        params
+    }
 
-        let (clear, acc, seg, merge, reduce, ones, bases) = match job {
-            Job::G1(j) => (
-                &self.k.clear_g1,
-                &self.k.accumulate_g1,
-                &self.k.segmented_g1,
-                &self.k.merge_g1,
-                &self.k.reduce_g1,
-                &self.k.ones_g1,
-                &j.bases.buf,
-            ),
-            Job::G2(j) => (
-                &self.k.clear_g2,
-                &self.k.accumulate_g2,
-                &self.k.segmented_g2,
-                &self.k.merge_g2,
-                &self.k.reduce_g2,
-                &self.k.ones_g2,
-                &j.bases.buf,
-            ),
+    /// `G16_CUDA_MSM_LEGACY_ACC=1` on a variable-work plan: one thread per bucket, no
+    /// clear and no merge, since every bucket is written in full.
+    fn launch_legacy(
+        &self,
+        job: &Job<'_>,
+        out: &Outputs,
+        p: &Plan<'_>,
+        params: &MsmParams,
+    ) -> Result<(), ProveError> {
+        let (acc, bases) = match job {
+            Job::G1(j) => (&self.k.accumulate_g1, &j.bases.buf),
+            Job::G2(j) => (&self.k.accumulate_g2, &j.bases.buf),
         };
+        let cfg = acc.cfg_1d(p.rows(), POINT_BLOCK);
+        let mut lb = self.stream.launch_builder(&acc.f);
+        lb.arg(&p.entries)
+            .arg(bases)
+            .arg(&p.counts)
+            .arg(&p.cursor)
+            .arg(&out.buckets)
+            .arg(params);
+        // SAFETY: six parameters in order; one thread owns one bucket row exclusively,
+        // and the kernel guards `row < n_windows * n_buckets`.
+        unsafe { lb.launch(cfg) }.map_err(|e| drv("launch msm_accumulate", e))?;
+        #[cfg(test)]
+        self.activity
+            .legacy_launches
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
 
-        let rows = p.rows();
-        // A legacy override never weakens a constant-work plan.
-        if p.dummy_rows == 0 && legacy_accumulate() {
-            let cfg = acc.cfg_1d(rows, POINT_BLOCK);
-            let mut lb = self.stream.launch_builder(&acc.f);
-            lb.arg(&p.entries)
-                .arg(bases)
-                .arg(&p.counts)
-                .arg(&p.cursor)
-                .arg(&out.buckets)
-                .arg(&params);
-            // SAFETY: six parameters in order; one thread owns one bucket row exclusively,
-            // and the kernel guards `row < n_windows * n_buckets`.
-            unsafe { lb.launch(cfg) }.map_err(|e| drv("launch msm_accumulate", e))?;
-            #[cfg(test)]
-            self.activity
-                .legacy_launches
-                .fetch_add(1, Ordering::Relaxed);
-        } else {
-            // A bucket that no slice writes directly still has to read as the identity,
-            // which on this encoding means `zz == 0`. `zeros()` already guarantees that for
-            // a fresh allocation; this is the algorithm's own step and the thing that would
-            // still be correct if the allocation were ever recycled.
-            let cfg = clear.cfg_1d(rows, WIDE_BLOCK);
-            let mut lb = self.stream.launch_builder(&clear.f);
-            lb.arg(&out.buckets).arg(&params);
-            // SAFETY: two parameters in order; `buckets` holds `rows` points and the kernel
-            // guards `gid < rows`.
-            unsafe { lb.launch(cfg) }.map_err(|e| drv("launch msm_clear", e))?;
+    /// A bucket that no slice writes directly still has to read as the identity, which on
+    /// the XYZZ encoding means `zz == 0` and on a constant-work plan's packed projective
+    /// one means (0 : 1 : 0). `zeros()` already guarantees the former for a fresh
+    /// allocation; this is the algorithm's own step and the thing that would still be
+    /// correct if the allocation were ever recycled.
+    fn launch_clear(
+        &self,
+        job: &Job<'_>,
+        out: &Outputs,
+        p: &Plan<'_>,
+        params: &MsmParams,
+    ) -> Result<(), ProveError> {
+        let clear = match job {
+            Job::G1(_) => &self.k.clear_g1,
+            Job::G2(_) => &self.k.clear_g2,
+        };
+        let cfg = clear.cfg_1d(p.rows(), WIDE_BLOCK);
+        let mut lb = self.stream.launch_builder(&clear.f);
+        lb.arg(&out.buckets).arg(params);
+        // SAFETY: two parameters in order; `buckets` holds `rows` points and the kernel
+        // guards `gid < rows`.
+        unsafe { lb.launch(cfg) }.map_err(|e| drv("launch msm_clear", e))?;
+        Ok(())
+    }
 
-            // One thread per slice, `gid = w * slices + k`. The surplus threads of the last
-            // block self-guard on `w >= n_windows`.
-            let threads = p.n_windows * p.slices;
+    /// One thread per slice, `gid = w * slices + k`. The surplus threads of the last block
+    /// self-guard on `w >= n_windows`. A constant-work plan runs the select-only kernel,
+    /// which reads no cursor: the region is full and the slice bounds follow `n`.
+    fn launch_accumulate(
+        &self,
+        job: &Job<'_>,
+        out: &Outputs,
+        p: &Plan<'_>,
+        params: &MsmParams,
+    ) -> Result<(), ProveError> {
+        let threads = p.n_windows * p.slices;
+        if p.dummy_rows != 0 {
+            let (seg, bases) = match job {
+                Job::G1(j) => (&self.k.segmented_constant_g1, &j.bases.buf),
+                Job::G2(j) => (&self.k.segmented_constant_g2, &j.bases.buf),
+            };
             let cfg = seg.cfg_1d(threads, POINT_BLOCK);
             let mut lb = self.stream.launch_builder(&seg.f);
             lb.arg(&p.entries)
                 .arg(bases)
-                .arg(&p.cursor)
                 .arg(&out.buckets)
                 .arg(&out.spill_pts)
                 .arg(&out.spill_rows)
-                .arg(&params);
-            // SAFETY: seven parameters in order; the spill arrays hold two slots per slice,
-            // which is the maximum one thread writes. Every row tag is initialized before
-            // an early return; unwritten point slots stay zero from allocation.
-            unsafe { lb.launch(cfg) }.map_err(|e| drv("launch msm_segmented", e))?;
+                .arg(params);
+            // SAFETY: six parameters in order; the spill arrays hold two slots per slice,
+            // which is the maximum one thread writes, and both of a slice's row tags are
+            // written on every path. `cap == n` on this plan, so every entry a thread reads
+            // is inside its window's region.
+            unsafe { lb.launch(cfg) }.map_err(|e| drv("launch msm_segmented_constant", e))?;
             #[cfg(test)]
             self.activity
-                .segmented_launches
+                .constant_launches
                 .fetch_add(1, Ordering::Relaxed);
-
-            if p.dummy_rows != 0 {
-                let fold = if out.is_g2 {
-                    &self.k.fold_g2
-                } else {
-                    &self.k.fold_g1
-                };
-                let mut in_pts = &out.spill_pts;
-                let mut in_rows = &out.spill_rows;
-                for level in &out.folds {
-                    let cfg = fold.cfg_1d(p.n_windows * level.params.groups as usize, POINT_BLOCK);
-                    let mut lb = self.stream.launch_builder(&fold.f);
-                    lb.arg(in_pts)
-                        .arg(in_rows)
-                        .arg(&level.pts)
-                        .arg(&level.rows)
-                        .arg(&out.buckets)
-                        .arg(&params)
-                        .arg(&level.params);
-                    // SAFETY: seven arguments match msm_fold_*; checked geometry sizes
-                    // the slot arrays and every level is ordered on the same stream.
-                    unsafe { lb.launch(cfg) }.map_err(|e| drv("launch msm_fold", e))?;
-                    #[cfg(test)]
-                    self.activity.fold_launches.fetch_add(1, Ordering::Relaxed);
-                    in_pts = &level.pts;
-                    in_rows = &level.rows;
-                }
-            } else {
-                let cfg = merge.cfg_1d(rows, POINT_BLOCK);
-                let mut lb = self.stream.launch_builder(&merge.f);
-                lb.arg(&out.buckets)
-                    .arg(&out.spill_pts)
-                    .arg(&out.spill_rows)
-                    .arg(&p.counts)
-                    .arg(&p.cursor)
-                    .arg(&params);
-                // SAFETY: six parameters in order; one thread owns one bucket row and only reads
-                // the spill slots of the slices its own run overlaps, which are inside the
-                // `2 * n_windows * slices` allocated.
-                unsafe { lb.launch(cfg) }.map_err(|e| drv("launch msm_merge", e))?;
-            }
+            return Ok(());
         }
+        let (seg, bases) = match job {
+            Job::G1(j) => (&self.k.segmented_g1, &j.bases.buf),
+            Job::G2(j) => (&self.k.segmented_g2, &j.bases.buf),
+        };
+        let cfg = seg.cfg_1d(threads, POINT_BLOCK);
+        let mut lb = self.stream.launch_builder(&seg.f);
+        lb.arg(&p.entries)
+            .arg(bases)
+            .arg(&p.cursor)
+            .arg(&out.buckets)
+            .arg(&out.spill_pts)
+            .arg(&out.spill_rows)
+            .arg(params);
+        // SAFETY: seven parameters in order; the spill arrays hold two slots per slice,
+        // which is the maximum one thread writes. Every row tag is initialized before
+        // an early return; unwritten point slots stay zero from allocation.
+        unsafe { lb.launch(cfg) }.map_err(|e| drv("launch msm_segmented", e))?;
+        #[cfg(test)]
+        self.activity
+            .segmented_launches
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
 
-        // One block per window, at most `REDUCE_TG` threads. See `REDUCE_TG`: a wider block
-        // indexes past the end of the kernel's shared array with no diagnostic at all.
+    /// The spills back into their buckets: the fixed fold tree on a constant-work plan,
+    /// the occupancy-walking merge otherwise.
+    fn launch_merge(
+        &self,
+        job: &Job<'_>,
+        out: &Outputs,
+        p: &Plan<'_>,
+        params: &MsmParams,
+    ) -> Result<(), ProveError> {
+        if p.dummy_rows != 0 {
+            let fold = match job {
+                Job::G1(_) => &self.k.fold_g1,
+                Job::G2(_) => &self.k.fold_g2,
+            };
+            let mut in_pts = &out.spill_pts;
+            let mut in_rows = &out.spill_rows;
+            for level in &out.folds {
+                let cfg = fold.cfg_1d(p.n_windows * level.params.groups as usize, POINT_BLOCK);
+                let mut lb = self.stream.launch_builder(&fold.f);
+                lb.arg(in_pts)
+                    .arg(in_rows)
+                    .arg(&level.pts)
+                    .arg(&level.rows)
+                    .arg(&out.buckets)
+                    .arg(params)
+                    .arg(&level.params);
+                // SAFETY: seven arguments match msm_fold_*; checked geometry sizes the slot
+                // arrays, the last level included (it sinks its stores there), and every
+                // level is ordered on the same stream.
+                unsafe { lb.launch(cfg) }.map_err(|e| drv("launch msm_fold", e))?;
+                #[cfg(test)]
+                self.activity.fold_launches.fetch_add(1, Ordering::Relaxed);
+                in_pts = &level.pts;
+                in_rows = &level.rows;
+            }
+            return Ok(());
+        }
+        let merge = match job {
+            Job::G1(_) => &self.k.merge_g1,
+            Job::G2(_) => &self.k.merge_g2,
+        };
+        let cfg = merge.cfg_1d(p.rows(), POINT_BLOCK);
+        let mut lb = self.stream.launch_builder(&merge.f);
+        lb.arg(&out.buckets)
+            .arg(&out.spill_pts)
+            .arg(&out.spill_rows)
+            .arg(&p.counts)
+            .arg(&p.cursor)
+            .arg(params);
+        // SAFETY: six parameters in order; one thread owns one bucket row and only reads
+        // the spill slots of the slices its own run overlaps, which are inside the
+        // `2 * n_windows * slices` allocated.
+        unsafe { lb.launch(cfg) }.map_err(|e| drv("launch msm_merge", e))?;
+        Ok(())
+    }
+
+    /// One block per window, at most `REDUCE_TG` threads. See `REDUCE_TG`: a wider block
+    /// indexes past the end of the kernel's shared array with no diagnostic at all.
+    fn launch_reduce(
+        &self,
+        job: &Job<'_>,
+        out: &Outputs,
+        p: &Plan<'_>,
+        params: &MsmParams,
+    ) -> Result<(), ProveError> {
+        let reduce = match job {
+            Job::G1(_) => &self.k.reduce_g1,
+            Job::G2(_) => &self.k.reduce_g2,
+        };
         let cfg = reduce.cfg_blocks(p.n_windows, REDUCE_TG);
         let mut lb = self.stream.launch_builder(&reduce.f);
-        lb.arg(&out.buckets).arg(&out.window_sums).arg(&params);
+        lb.arg(&out.buckets).arg(&out.window_sums).arg(params);
         // SAFETY: three parameters in order; the grid is exactly `n_windows` blocks, which
         // is what `blockIdx.x` indexes into `window_sums`.
         unsafe { lb.launch(cfg) }.map_err(|e| drv("launch msm_reduce", e))?;
+        Ok(())
+    }
 
-        // Constant work has no ones allocation, launch or readback.
-        if let Some(ones_out) = &out.ones {
-            // Not optional. `msm_count` and `msm_scatter` deliberately drop every scalar equal
-            // to 1, so without this kernel those terms are simply missing from the proof.
-            let cfg = ones.cfg_blocks(out.ones_groups, REDUCE_TG);
-            let mut lb = self.stream.launch_builder(&ones.f);
-            lb.arg(p.scalars).arg(bases).arg(ones_out).arg(&params);
-            // SAFETY: four parameters in order; the grid is exactly `ones_groups` blocks, which
-            // is what `blockIdx.x` indexes into `ones`, and the grid-stride loop is bounded by
-            // `p.n`, itself bounds checked against both the scalar and the base vector.
-            unsafe { lb.launch(cfg) }.map_err(|e| drv("launch msm_ones", e))?;
-            #[cfg(test)]
-            self.activity.ones_launches.fetch_add(1, Ordering::Relaxed);
-        }
-
+    /// Constant work has no ones allocation, launch or readback. In variable work this is
+    /// not optional: `msm_count` and `msm_scatter` deliberately drop every scalar equal to
+    /// 1, so without this kernel those terms are simply missing from the proof.
+    fn launch_ones(
+        &self,
+        job: &Job<'_>,
+        out: &Outputs,
+        p: &Plan<'_>,
+        params: &MsmParams,
+    ) -> Result<(), ProveError> {
+        let Some(ones_out) = &out.ones else {
+            return Ok(());
+        };
+        let (ones, bases) = match job {
+            Job::G1(j) => (&self.k.ones_g1, &j.bases.buf),
+            Job::G2(j) => (&self.k.ones_g2, &j.bases.buf),
+        };
+        let cfg = ones.cfg_blocks(out.ones_groups, REDUCE_TG);
+        let mut lb = self.stream.launch_builder(&ones.f);
+        lb.arg(p.scalars).arg(bases).arg(ones_out).arg(params);
+        // SAFETY: four parameters in order; the grid is exactly `ones_groups` blocks, which
+        // is what `blockIdx.x` indexes into `ones`, and the grid-stride loop is bounded by
+        // `p.n`, itself bounds checked against both the scalar and the base vector.
+        unsafe { lb.launch(cfg) }.map_err(|e| drv("launch msm_ones", e))?;
+        #[cfg(test)]
+        self.activity.ones_launches.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -2194,6 +2340,20 @@ mod tests {
         assert!(src.contains("msm_reduce_impl<Fq, ProjG1>"));
         assert!(src.contains("msm_reduce_impl<Fq2, ProjG2>"));
         assert!(src.contains("for (u32 i = lo; i < lo + len; i++)"));
+        // The constant-work accumulation reads no cursor and runs every iteration.
+        assert!(src.contains("msm_segmented_constant_impl<Fq>("));
+        assert!(src.contains("msm_segmented_constant_impl<Fq2>("));
+        assert!(src.contains("for (u32 i = lo; i < lo + p.slice_len; i++)"));
+        let constant = src
+            .split("void msm_segmented_constant_impl(")
+            .nth(1)
+            .unwrap()
+            .split("extern \"C\" __global__ void msm_segmented_constant_g1")
+            .next()
+            .unwrap();
+        assert!(!constant.contains("cursor"));
+        assert_eq!(constant.matches("pt_add(").count(), 1);
+        assert!(!constant.contains("pt_madd("));
     }
 
     // Interpret the ported straight-line formula source over arkworks fields. This
@@ -2317,6 +2477,9 @@ mod tests {
                 .join("\n");
             s.replace("__device__ __forceinline__ ", "")
                 .replace("inline ", "")
+                // MSL's address-space qualifier on a pointer; CUDA's global memory is
+                // unqualified.
+                .replace("device ", "")
                 .replace("__constant__", "constant")
                 .replace("u32", "uint")
                 .replace("31u - clz(k)", "msm_hibit(k)")
@@ -2510,6 +2673,8 @@ mod tests {
             "msm_accumulate_g2",
             "msm_segmented_g1",
             "msm_segmented_g2",
+            "msm_segmented_constant_g1",
+            "msm_segmented_constant_g2",
             "msm_merge_g1",
             "msm_merge_g2",
             "msm_fold_g1",
@@ -2680,7 +2845,7 @@ mod tests {
         }
     }
 
-    fn gate_activity(m: &CudaMsm) -> [u64; 6] {
+    fn gate_activity(m: &CudaMsm) -> [u64; 7] {
         let a = &m.activity;
         [
             &a.ones_allocations,
@@ -2688,9 +2853,29 @@ mod tests {
             &a.ones_readbacks,
             &a.legacy_launches,
             &a.segmented_launches,
+            &a.constant_launches,
             &a.fold_launches,
         ]
         .map(|v| v.load(Ordering::Relaxed))
+    }
+
+    /// A constant-work bucket as the device holds it: a projective point packed into the
+    /// XYZZ slot (`proj_pack` in `kernels/msm.cu`), X, Y, Z and an unused fourth
+    /// coordinate. (X : Y : Z) is the Jacobian (X Z, Y Z^2, Z); Z = 0 is the identity.
+    fn packed_proj_g1(p: &PackedXyzzG1) -> G1Projective {
+        let z = p.zz.to_fq();
+        if z.is_zero() {
+            return G1Projective::zero();
+        }
+        G1Projective::new_unchecked(p.x.to_fq() * z, p.y.to_fq() * z * z, z)
+    }
+
+    fn packed_proj_g2(p: &PackedXyzzG2) -> G2Projective {
+        let z = p.zz.to_fq2();
+        if z.is_zero() {
+            return G2Projective::zero();
+        }
+        G2Projective::new_unchecked(p.x.to_fq2() * z, p.y.to_fq2() * z * z, z)
     }
 
     fn gate_plan<'a>(
@@ -2884,7 +3069,8 @@ mod tests {
                 assert_eq!(result.g1().unwrap(), g1 * want);
             }
             if p.dummy_rows != 0 {
-                // Read the actual accumulated dummy buckets, not only the reduced MSM.
+                // Read the actual accumulated dummy buckets, not only the reduced MSM. On a
+                // constant-work plan they are packed projective points.
                 let words = if out.is_g2 { G2_WORDS } else { G1_WORDS };
                 let view = out.buckets.slice(p.n_windows * p.n_buckets * words..);
                 let stored = m.stream.clone_dtoh(&view).unwrap();
@@ -2895,7 +3081,7 @@ mod tests {
                     for (point, sum) in points.iter().zip(&dummy_sums) {
                         let positive = g2 * Fr::from(sum.unsigned_abs());
                         assert_eq!(
-                            point.to_projective(),
+                            packed_proj_g2(point),
                             if *sum < 0 { -positive } else { positive }
                         );
                     }
@@ -2905,7 +3091,7 @@ mod tests {
                     for (point, sum) in points.iter().zip(&dummy_sums) {
                         let positive = g1 * Fr::from(sum.unsigned_abs());
                         assert_eq!(
-                            point.to_projective(),
+                            packed_proj_g1(point),
                             if *sum < 0 { -positive } else { positive }
                         );
                     }
@@ -2914,11 +3100,11 @@ mod tests {
             let after = gate_activity(m);
             let delta: Vec<_> = after.iter().zip(before).map(|(a, b)| a - b).collect();
             let expected = if m.work == Work::Constant {
-                [0, 0, 0, 0, 1, p.fold_levels().count() as u64]
+                [0, 0, 0, 0, 0, 1, p.fold_levels().count() as u64]
             } else if legacy {
-                [1, 1, 1, 1, 0, 0]
+                [1, 1, 1, 1, 0, 0, 0]
             } else {
-                [1, 1, 1, 0, 1, 0]
+                [1, 1, 1, 0, 1, 0, 0]
             };
             assert_eq!(delta, expected, "allocation/launch/readback accounting");
         }
@@ -3195,5 +3381,171 @@ mod tests {
             .expect_err("a foreign device handle must be refused, not read")
             .to_string();
         assert!(msg.contains("metal"), "unhelpful message: {msg}");
+    }
+
+    fn median(mut v: Vec<f64>) -> f64 {
+        v.sort_by(f64::total_cmp);
+        let n = v.len();
+        if n % 2 == 1 {
+            v[n / 2]
+        } else {
+            (v[n / 2 - 1] + v[n / 2]) / 2.0
+        }
+    }
+
+    /// The constant-work MSM's phases across scalar classes at one `n`, interleaved so a
+    /// drift in the machine lands on every class alike: zeros, ones, bits, dense random,
+    /// one dense value everywhere (every entry of a window in one bucket) and small values
+    /// (window zero only). Every rep times each class's digit pipeline, clear,
+    /// accumulation, fold and reduce between an event pair on the stream; medians and
+    /// ranges over the reps after the warm-up. `G16_REVIEW_N` sets the length (2^18 by
+    /// default) and `G16_REVIEW_REPS` the reps (12). The Metal twin is
+    /// `constant_work_phase_flatness` in msm_gpu_probes.rs.
+    #[test]
+    #[ignore = "GPU measurement; run explicitly on the measurement machine"]
+    fn constant_work_phase_flatness() {
+        use snarkrs_field::{CurveGroup, PrimeField, PrimeGroup};
+        let n: usize = std::env::var("G16_REVIEW_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1 << 18);
+        let reps: usize = std::env::var("G16_REVIEW_REPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(12);
+        let warm = 2;
+        let cuda = Cuda::new(0).expect("GPU measurement requires CUDA");
+        let m = CudaMsm::without_key(&cuda)
+            .expect("compile MSM unit")
+            .constant_work();
+        // Every seventh base at infinity, as the tests' `bases_with_infinity`.
+        let mut p1 = G1Projective::generator();
+        let mut p2 = G2Projective::generator();
+        let (mut g1, mut g2) = (Vec::with_capacity(n), Vec::with_capacity(n));
+        for _ in 0..n {
+            p1 += G1Projective::generator();
+            p2 += G2Projective::generator();
+            g1.push(p1);
+            g2.push(p2);
+        }
+        let mut g1 = G1Projective::normalize_batch(&g1);
+        let mut g2 = G2Projective::normalize_batch(&g2);
+        for i in (3..n).step_by(7) {
+            g1[i] = G1Affine::identity();
+            g2[i] = G2Affine::identity();
+        }
+        let b1 = m.upload_g1_bases(&g1).unwrap();
+        let b2 = m.upload_g2_bases(&g2).unwrap();
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let bits: Vec<Fr> = (0..n).map(|_| Fr::from(next() & 1)).collect();
+        let dense: Vec<Fr> = (0..n)
+            .map(|_| {
+                let mut bytes = [0u8; 32];
+                for b in &mut bytes {
+                    *b = next() as u8;
+                }
+                Fr::from_le_bytes_mod_order(&bytes)
+            })
+            .collect();
+        let one_value = -Fr::from(0x7f3a_19c5_d02b_6e41u64);
+        let sets = [
+            ("zeros", vec![Fr::from(0u64); n]),
+            ("ones", vec![Fr::from(1u64); n]),
+            ("bits", bits),
+            ("dense", dense),
+            ("onevalue", vec![one_value; n]),
+            ("small", (0..n).map(|i| Fr::from((i % 5) as u64)).collect()),
+        ];
+        let time = |f: &dyn Fn() -> Result<(), ProveError>| -> f64 {
+            let ev = || {
+                m.ctx
+                    .new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+                    .unwrap()
+            };
+            let (start, end) = (ev(), ev());
+            start.record(&m.stream).unwrap();
+            f().unwrap();
+            end.record(&m.stream).unwrap();
+            m.stream.synchronize().unwrap();
+            elapsed_us(&start, &end).unwrap() as f64 / 1e3
+        };
+        let phases = ["digits", "clear", "accum", "fold", "reduce"];
+        for group in ["g1", "g2"] {
+            let scalars: Vec<ScalarBuf> = sets
+                .iter()
+                .map(|(_, s)| m.upload_scalars(s).unwrap())
+                .collect();
+            let jobs: Vec<Job<'_>> = scalars
+                .iter()
+                .map(|s| {
+                    if group == "g1" {
+                        Job::G1(JobG1 {
+                            bases: &b1,
+                            base_off: 0,
+                            scalars: s.as_scalars(),
+                            scalar_off: 0,
+                            n,
+                        })
+                    } else {
+                        Job::G2(JobG2 {
+                            bases: &b2,
+                            base_off: 0,
+                            scalars: s.as_scalars(),
+                            scalar_off: 0,
+                            n,
+                        })
+                    }
+                })
+                .collect();
+            let plans: Vec<Plan<'_>> = scalars
+                .iter()
+                .map(|s| Plan::new(&m, s.as_scalars(), 0, n).unwrap())
+                .collect();
+            let outs: Vec<Outputs> = jobs
+                .iter()
+                .zip(&plans)
+                .map(|(job, plan)| Outputs::new(&m, job, plan).unwrap())
+                .collect();
+            let mut t: Vec<[Vec<f64>; 5]> = sets.iter().map(|_| Default::default()).collect();
+            for rep in 0..warm + reps {
+                for (i, ((job, plan), out)) in jobs.iter().zip(&plans).zip(&outs).enumerate() {
+                    let params = m.point_params(out, plan);
+                    let d = time(&|| m.launch_digits(plan));
+                    let c = time(&|| m.launch_clear(job, out, plan, &params));
+                    let a = time(&|| m.launch_accumulate(job, out, plan, &params));
+                    let g = time(&|| m.launch_merge(job, out, plan, &params));
+                    let r = time(&|| m.launch_reduce(job, out, plan, &params));
+                    if rep >= warm {
+                        for (v, x) in t[i].iter_mut().zip([d, c, a, g, r]) {
+                            v.push(x);
+                        }
+                    }
+                }
+            }
+            println!(
+                "flatness {group} n={n} c={} w={} slices/window={} reps={reps} (median, min-max, ms)",
+                plans[0].c, plans[0].n_windows, plans[0].slices
+            );
+            for (i, (label, _)) in sets.iter().enumerate() {
+                let mut line = format!("  {label:<9}");
+                for (name, v) in phases.iter().zip(&t[i]) {
+                    let mut s = v.clone();
+                    s.sort_by(f64::total_cmp);
+                    line += &format!(
+                        "  {name} {:.2} ({:.2}-{:.2})",
+                        median(v.clone()),
+                        s[0],
+                        s[s.len() - 1]
+                    );
+                }
+                println!("{line}");
+            }
+        }
     }
 }
