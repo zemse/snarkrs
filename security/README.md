@@ -241,6 +241,13 @@ during a recovery; no token or range check can see that, `prove`'s self-verify i
 `prove_unchecked` on Metal stays exposed. Since `643775f` an H word outside the field or an MSM
 sum off the curve is a `ProveError::Device` and the attempt is re-run (0.3 ms per proof at 2^18,
 1.7 ms at 2^22).
+Ceremony operations have no self-verify, so before `8323d31` a wrong readback under a good token
+was published: an injected one (`Fault::WrongStore`, `490a0f1`) escaped into the output of 7 of 8
+Metal ceremony operations. Every ceremony readback is now range-checked, held to the curve, and
+one point per chunk (one thread per FFT piece) is recomputed on the host; a mismatch is a
+`ProveError::Device` and the submission is re-run. The soak `tests/recovery_metal.rs` retries
+every injected fault on all eight operations (+0 to 3.2% at power 16). The CUDA ceremony seams
+have no such check yet.
 
 Since `2a2babe` the wgpu MSM batch is several submissions of about 300 ms, each sealed and
 retried alone up to eight times: under two other proof loops 0 of 60 CLI proofs gave up, against
