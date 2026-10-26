@@ -256,10 +256,16 @@ impl Curve {
     pub fn entry_reduce_constant(&self) -> String {
         format!("msm_reduce_constant_{}", self.suffix)
     }
+    /// The accumulation for a constant-work plan: selects instead of branches, complete
+    /// formulas, packed projective stores.
+    pub fn entry_segmented_constant(&self) -> String {
+        format!("msm_segmented_constant_{}", self.suffix)
+    }
 
-    /// The seven, in the order a proof dispatches them; a proof runs the merge and the
-    /// reduce, or the fold and the constant reduce, never both.
-    pub fn entries(&self) -> [String; 7] {
+    /// The eight, in the order a proof dispatches them; a proof runs the segmented pass,
+    /// the merge and the reduce, or the constant segmented pass, the fold and the constant
+    /// reduce, never both.
+    pub fn entries(&self) -> [String; 8] {
         [
             self.entry_clear(),
             self.entry_segmented(),
@@ -268,6 +274,7 @@ impl Curve {
             self.entry_ones(),
             self.entry_fold(),
             self.entry_reduce_constant(),
+            self.entry_segmented_constant(),
         ]
     }
 
@@ -354,6 +361,9 @@ pub const STORAGE_MERGE: u32 = 5;
 pub const STORAGE_REDUCE: u32 = 2;
 pub const STORAGE_ONES: u32 = 3;
 pub const STORAGE_FOLD: u32 = 5;
+/// `msm_segmented_constant_*` runs on the segmented pass's layout and reads five of its
+/// six (no cursor: the region is full by construction).
+pub const STORAGE_SEGMENTED_CONSTANT: u32 = STORAGE_SEGMENTED;
 
 /// The spill-slot tag meaning "this slot holds nothing". Not 0, which is bucket row 0.
 pub const NO_ROW: u32 = 0xffff_ffff;
@@ -564,6 +574,7 @@ pub fn points_module_at(v: Variant, c: Curve, wg: Workgroups) -> String {
     s.push_str(&entry_ones(c, wg.tg));
     s.push_str(&entry_fold(c, wg.merge));
     s.push_str(&entry_reduce(c, wg.tg, true));
+    s.push_str(&entry_segmented_constant(c, wg.segmented));
     s
 }
 
@@ -1222,9 +1233,13 @@ fn const_limbs(ty: &str, limbs: &[u32]) -> String {
 /// the bucket holds, and a doubling is `pt_add_complete(p, p)`, which is what keeps the
 /// constant reduce's ladder on one call site.
 ///
-/// Buckets, spill slots and window sums stay XYZZ: the accumulation writes them and the
-/// host reads them. A constant-work kernel converts what it loads (3M, and Y = 1 for the
-/// identity, whose XYZZ form is all zero) and what it stores (4M).
+/// On a constant-work plan the buckets and the spill slots hold projective points in the
+/// XYZZ slots (`proj_pack_*`: X, Y, Z and a zeroed fourth coordinate), because everything
+/// that reads them there (the fold, the constant reduce) works in `Proj` and the host
+/// reads none of them. Converting at every store (4M) and load (3M) instead was a quarter
+/// of the accumulation and a third of the fold on Metal. The window sums stay XYZZ,
+/// converted once per workgroup, since the host reads those; the clear writes the packed
+/// identity on such a plan.
 ///
 /// Microcoded like `pt_add_*`, for `POINT_BODY`'s reason: fourteen inlined `fq2_mul` is
 /// past the Mali compile-time cliff, and this module is built at page load whether or not
@@ -1286,20 +1301,24 @@ fn proj_zero_{sfx}() -> {proj} {{
     return {proj}({f}_zero(), {f}_one(), {f}_zero());
 }}
 
-// (X/ZZ, Y/ZZZ) = (X ZZZ : Y ZZ : ZZ ZZZ). The XYZZ identity is ZZ = 0 and nothing else:
-// msm_clear_{sfx} writes only zz, so a cleared bucket's other three coordinates are what
-// the pool left there, and (X ZZZ : Y ZZ : 0) with them is not a point. So X becomes 0
-// and Y becomes 1 for it; the selects read what the products just consumed, so nothing
-// stays live.
-fn proj_from_xyzz_{sfx}(p: {pt}) -> {proj} {{
-    let x = {f}_mul(p.x, p.zzz);
-    let y = {f}_mul(p.y, p.zz);
-    let z = {f}_mul(p.zz, p.zzz);
-    let inf = {f}_is_zero(p.zz);
-    return {proj}({f}_sel_{sfx}(x, {f}_zero(), inf), {f}_sel_{sfx}(y, {f}_one(), inf), z);
+fn proj_sel_{sfx}(a: {proj}, b: {proj}, take_b: bool) -> {proj} {{
+    return {proj}({f}_sel_{sfx}(a.x, b.x, take_b), {f}_sel_{sfx}(a.y, b.y, take_b),
+                  {f}_sel_{sfx}(a.z, b.z, take_b));
+}}
+
+// A projective point in an XYZZ slot, as the constant-work bucket and spill arrays hold
+// it: no arithmetic, and the fourth coordinate is written as zero so a slot never keeps a
+// previous point's residue.
+fn proj_pack_{sfx}(p: {proj}) -> {pt} {{
+    return {pt}(p.x, p.y, p.z, {f}_zero());
+}}
+
+fn proj_unpack_{sfx}(p: {pt}) -> {proj} {{
+    return {proj}(p.x, p.y, p.zz);
 }}
 
 // (X/Z, Y/Z) = (X Z, Y Z^2, Z^2, Z^3) in XYZZ. Z = 0 gives all zero, the XYZZ identity.
+// For the window sums, which the host reads as XYZZ.
 fn xyzz_from_proj_{sfx}(p: {proj}) -> {pt} {{
     let zz = {f}_sqr(p.z);
     let zzz = {f}_mul(zz, p.z);
@@ -1477,7 +1496,7 @@ const NO_ROW: u32 = {NO_ROW}u;
 }
 
 fn entry_clear(c: Curve, wg: u32) -> String {
-    let f = c.f;
+    let (f, sfx) = (c.f, c.suffix);
     let entry = c.entry_clear();
     let mut s = String::new();
     let _ = write!(
@@ -1489,11 +1508,17 @@ fn entry_clear(c: Curve, wg: u32) -> String {
 // Only zz is written. pt_add, pt_madd and the host conversion all test zz alone, and a bucket
 // the segmented pass direct-writes is overwritten in full anyway, so clearing the other three
 // coordinates would be {bytes} bytes of pure memory traffic per bucket instead of {quarter}.
+// A constant-work plan's buckets hold packed projective points (gen::points::proj_ops),
+// whose identity is (0 : 1 : 0), so there the whole point is written.
 @compute @workgroup_size({wg})
 fn {entry}(@builtin(global_invocation_id) gid: vec3<u32>) {{
     let i = P.lo + gid.x;
     if (i >= P.n_windows * P.n_buckets) {{ return; }}
-    BUCKETS[i].zz = {f}_zero();
+    if (P.dummy_rows != 0u) {{
+        BUCKETS[i] = proj_pack_{sfx}(proj_zero_{sfx}());
+    }} else {{
+        BUCKETS[i].zz = {f}_zero();
+    }}
 }}
 ",
         bytes = c.point_bytes,
@@ -1541,16 +1566,9 @@ fn {entry}(@builtin(global_invocation_id) gid: vec3<u32>) {{
     let k = t - w * P.slices;
     let base = w * P.cap;
     // The scatter left every cursor at its run's end, so the last bucket's cursor is the end
-    // of this window's whole region. Slices past it are empty. Under constant work the last
-    // row is the last dummy row and the region is always full. `dummy_base` and not
-    // `n_windows * n_buckets`: inside a window slab `n_windows` is the slab's end, and a
-    // base taken from it read a real bucket of a later window as the region end and ran
-    // this slice into the next window's entries.
-    var last_row = w * P.n_buckets + P.n_buckets - 1u;
-    if (P.dummy_rows != 0u) {{
-        last_row = P.dummy_base + w * P.dummy_rows + P.dummy_rows - 1u;
-    }}
-    let used = CURSOR[last_row] - base;
+    // of this window's whole region. Slices past it are empty. A constant-work plan
+    // accumulates in msm_segmented_constant_{sfx} below, never here.
+    let used = CURSOR[w * P.n_buckets + P.n_buckets - 1u] - base;
 
     let head_slot = 2u * t;
     let tail_slot = head_slot + 1u;
@@ -1594,6 +1612,114 @@ fn {entry}(@builtin(global_invocation_id) gid: vec3<u32>) {{
         SPILL_ROWS[tail_slot] = cur_row;
         SPILL_PTS[tail_slot] = acc;
     }}
+}}
+"
+    );
+    s
+}
+
+fn entry_segmented_constant(c: Curve, wg: u32) -> String {
+    let (f, sfx) = (c.f, c.suffix);
+    let proj = c.proj();
+    let entry = c.entry_segmented_constant();
+    let mut s = String::new();
+    let _ = write!(
+        s,
+        "
+// The accumulation under constant work (P.dummy_rows != 0): the same slices, spill slots
+// and run bookkeeping as msm_segmented_{sfx}, with every data-dependent decision made by a
+// select rather than a branch, so a thread's instruction stream, its loads, its stores and
+// its field products are the same whatever digits its slice holds. A port of
+// msm_segmented_constant_impl in crates/metal/src/shaders/msm.metal.
+//
+//   * The region is full by construction (every scalar put one entry in every window),
+//     so the slice bounds come from P.n, not from a cursor the digits filled.
+//   * Every iteration runs, slice_len of them, the short last slice of a window included:
+//     a padded iteration re-reads the slice's last entry and adds the identity.
+//   * Every iteration stores the accumulator (packed, see gen::points::proj_ops) with its
+//     row: to the head slot when the first run ends, to its bucket when an interior run
+//     ends, and to the thread's own tail slot otherwise, which the end of the slice
+//     overwrites. slice_len + 2 stores per thread; which addresses they hit still follows
+//     the digits (see below). The choice of destination buffer is the one branch left,
+//     because WGSL has no select over pointers into two buffers; both arms store the same
+//     bytes.
+//   * The point added is the base, negated on a negative digit, replaced by the identity
+//     for a padded iteration and a base at infinity, all by select, and added with the
+//     complete formulas: no identity, equality or cancellation shortcut remains. One
+//     point-operation call site in the loop, as in msm_fold_{sfx}, which is the shape an
+//     iPhone 15 Pro survives (see msm_merge_{sfx}).
+//
+// What this does not hide: which bucket row an entry names, so the address of each store
+// and the cache lines the stores touch (a thread's sink store lands on its own line again
+// and again; a bucket store on a fresh one). That is the counting sort's residual, the
+// same one the digit pipeline's atomics carry, and no accumulation over a bucket layout
+// removes it.
+//
+// Against pt_madd_{sfx} (8M + 2S, with the shortcuts) an iteration here is one complete
+// addition (12M + 2 products by 3b) and one store regardless of what it adds, and the
+// shortcuts' savings are gone on purpose. See WgpuProver::constant_work for what it costs.
+@compute @workgroup_size({wg})
+fn {entry}(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    let t = P.lo + gid.x;
+    if (t >= P.n_windows * P.slices) {{ return; }}
+    let w = t / P.slices;
+    let k = t - w * P.slices;
+    let head_slot = 2u * t;
+    let tail_slot = head_slot + 1u;
+    // cap == n on a constant-work plan and the region holds exactly n entries, so which
+    // slices are empty follows the key alone.
+    let base = w * P.cap;
+    let lo = k * P.slice_len;
+    if (lo >= P.n) {{
+        SPILL_ROWS[head_slot] = NO_ROW;
+        SPILL_ROWS[tail_slot] = NO_ROW;
+        return;
+    }}
+    let hi = min(lo + P.slice_len, P.n);
+
+    var cur_row = ENTRIES[base + lo].x;
+    var acc = proj_zero_{sfx}();
+    let zero = proj_zero_{sfx}();
+    var first_run = true;
+
+    for (var i = lo; i < lo + P.slice_len; i = i + 1u) {{
+        let live = i < hi;
+        let e = ENTRIES[base + min(i, hi - 1u)];
+        // A padded iteration never starts a run.
+        let row = select(cur_row, e.x, live);
+        let boundary = row != cur_row;
+
+        // The run that ends here, or the same bytes into this thread's tail slot. Point
+        // before tag, as in msm_segmented_{sfx}.
+        let acc_out = proj_pack_{sfx}(acc);
+        let to_head = boundary && first_run;
+        let to_bucket = boundary && !first_run;
+        let slot = select(tail_slot, head_slot, to_head);
+        if (to_bucket) {{
+            BUCKETS[cur_row] = acc_out;
+        }} else {{
+            SPILL_PTS[slot] = acc_out;
+        }}
+        SPILL_ROWS[slot] = cur_row;
+        first_run = first_run && !boundary;
+        acc = proj_sel_{sfx}(acc, zero, boundary);
+        cur_row = row;
+
+        // The base, or the identity. The signed digit's sign travels in the entry's low
+        // bit, so a negated base costs one field negation here and no second bucket.
+        let b = BASES[P.base_off + (e.y >> 1u)];
+        let q = {proj}(b.x, {f}_sel_{sfx}(b.y, {f}_neg(b.y), (e.y & 1u) != 0u), {f}_one());
+        acc = pt_add_complete_{sfx}(acc, proj_sel_{sfx}(q, zero, !live || aff_is_inf_{sfx}(b)));
+    }}
+
+    // The last run: the head slot if it is also the first, the tail slot otherwise. The
+    // tail slot's tag is written in either case, so the sink stores above leave nothing
+    // behind: it names the run or it is empty.
+    let acc_out = proj_pack_{sfx}(acc);
+    let slot = select(tail_slot, head_slot, first_run);
+    SPILL_PTS[slot] = acc_out;
+    SPILL_ROWS[slot] = cur_row;
+    SPILL_ROWS[tail_slot] = select(cur_row, NO_ROW, first_run);
 }}
 "
     );
@@ -1793,8 +1919,9 @@ pub fn knobs_reproduce_known_miscompile() -> bool {
 
 /// The reduce, on the XYZZ shortcuts (`constant` false) or on the complete formulas over
 /// projective points for a constant-work plan (`constant` true, `msm_reduce_constant_*`).
-/// Same state machine over one call site either way; the constant one converts what it
-/// loads and what it stores and keeps its own, smaller, workgroup array.
+/// Same state machine over one call site either way; the constant one unpacks the
+/// projective buckets it loads, converts the window sum it stores and keeps its own,
+/// smaller, workgroup array.
 fn entry_reduce(c: Curve, tg: u32, constant: bool) -> String {
     let (pt, sfx) = (c.pt, c.suffix);
     let proj = c.proj();
@@ -1804,7 +1931,7 @@ fn entry_reduce(c: Curve, tg: u32, constant: bool) -> String {
             proj.as_str(),
             format!("proj_zero_{sfx}"),
             format!("pt_add_complete_{sfx}"),
-            format!("proj_from_xyzz_{sfx}("),
+            format!("proj_unpack_{sfx}("),
             format!("xyzz_from_proj_{sfx}("),
             "SHARED_C",
             c.proj_bytes() * u64::from(tg),
@@ -1895,9 +2022,10 @@ fn entry_reduce(c: Curve, tg: u32, constant: bool) -> String {
             "// The same reduce on the complete formulas (gen::points::proj_ops), which the host
 // dispatches for a constant-work plan: a bucket that is empty costs what a full one does,
 // where pt_add_{sfx} returns early and a whole SIMD group of empty buckets returns
-// together. Buckets and window sums stay XYZZ and are converted at the load and the
-// store; the doubling steps of phase B are additions of a point to itself, which the
-// complete formulas allow and which keeps the one call site.
+// together. The buckets hold packed projective points and are unpacked at the load; the
+// window sums the host reads stay XYZZ and are converted at the store. The doubling
+// steps of phase B are additions of a point to itself, which the complete formulas allow
+// and which keeps the one call site.
 //
 // {tg} threads is {shared_bytes} bytes of workgroup storage, three coordinates a point."
         )
@@ -1982,14 +2110,21 @@ fn entry_fold(c: Curve, wg: u32) -> String {
 // spill slots or wholly written by the segmented pass, never both, which is what lets the
 // fold store rather than accumulate.
 //
-// One point-operation call site, in the loop, and nothing else that touches a point but
-// the two conversions: the shape the merge and reduce kernels were cut down to after an
-// iPhone 15 Pro lost its device on two inlined G2 point operations in one loop (see
-// msm_merge_{sfx}). The accumulator is projective and the addition complete (see
-// gen::points::proj_ops), so an empty slot (NO_ROW: a slice or group with one run) adds
-// the identity at the price of any point and never starts a run. Every slot loaded is
-// converted, and the run is converted back at the top of every iteration whether or not
-// the iteration stores it, so the stores' data dependence stays in the store itself.
+// One point-operation call site, in the loop, and nothing else that touches a point: the
+// shape the merge and reduce kernels were cut down to after an iPhone 15 Pro lost its
+// device on two inlined G2 point operations in one loop (see msm_merge_{sfx}). The
+// accumulator is projective and the addition complete (see gen::points::proj_ops), so an
+// empty slot (NO_ROW: a slice or group with one run) adds the identity at the price of
+// any point and never starts a run. The slots hold packed projective points, so a load
+// and a store are moves and not conversions.
+//
+// The run bookkeeping is the accumulation's (msm_segmented_constant_{sfx}): every
+// data-dependent decision is a select, and every iteration stores the run with its tag,
+// to the head slot, to its bucket, or into this thread's own tail slot as a sink; the last
+// level sinks into the next level's buffers, which the host binds and never reads. The
+// one branch left is the choice of destination buffer, because WGSL has no select over
+// pointers into two buffers; both arms store the same bytes. Only the addresses follow
+// the rows.
 @compute @workgroup_size({wg})
 fn {entry}(@builtin(global_invocation_id) gid: vec3<u32>) {{
     let t = P.lo + gid.x;
@@ -2003,56 +2138,55 @@ fn {entry}(@builtin(global_invocation_id) gid: vec3<u32>) {{
     let last = groups == 1u;
     let head_slot = 2u * t;
     let tail_slot = head_slot + 1u;
-    if (!last) {{
-        FOLD_ROWS[head_slot] = NO_ROW;
-        FOLD_ROWS[tail_slot] = NO_ROW;
-    }}
 
     let lo = g * len;
     let hi = min(lo + len, m_in);
     var cur = NO_ROW;
     var first_run = true;
     var acc = proj_zero_{sfx}();
+    let zero = proj_zero_{sfx}();
     // `len` iterations in every group, the window's short last one included, so a thread's
     // additions do not depend on where it sits either. `hi > lo` because groups is
     // ceil(m_in / len), so the clamp below reads a slot the window owns.
     for (var i = lo; i < lo + len; i = i + 1u) {{
+        let live = i < hi;
         let j = w * m_in + min(i, hi - 1u);
-        var r = NO_ROW;
-        if (i < hi) {{ r = SPILL_ROWS[j]; }}
-        let acc_out = xyzz_from_proj_{sfx}(acc);
+        let r = select(NO_ROW, SPILL_ROWS[j], live);
         let empty = r == NO_ROW;
-        if (!empty && r != cur) {{
-            if (cur != NO_ROW) {{
-                if (first_run && !last) {{
-                    FOLD_PTS[head_slot] = acc_out;
-                    FOLD_ROWS[head_slot] = cur;
-                }} else {{
-                    BUCKETS[cur] = acc_out;
-                }}
-                first_run = false;
-            }}
-            acc = proj_zero_{sfx}();
-            cur = r;
+        let boundary = !empty && r != cur;
+        let finished = boundary && cur != NO_ROW;
+
+        let acc_out = proj_pack_{sfx}(acc);
+        let to_head = finished && first_run && !last;
+        let to_bucket = finished && !to_head;
+        let slot = select(tail_slot, head_slot, to_head);
+        if (to_bucket) {{
+            BUCKETS[cur] = acc_out;
+        }} else {{
+            FOLD_PTS[slot] = acc_out;
         }}
-        var q = proj_from_xyzz_{sfx}(SPILL_PTS[j]);
-        if (empty) {{
-            q = proj_zero_{sfx}();
-        }}
+        FOLD_ROWS[slot] = cur;
+        first_run = first_run && !finished;
+        acc = proj_sel_{sfx}(acc, zero, boundary);
+        cur = select(cur, r, boundary);
+
+        let q = proj_sel_{sfx}(proj_unpack_{sfx}(SPILL_PTS[j]), zero, empty);
         acc = pt_add_complete_{sfx}(acc, q);
     }}
 
-    if (cur == NO_ROW) {{ return; }}
-    let acc_out = xyzz_from_proj_{sfx}(acc);
-    if (last) {{
+    // The last run, if any slot held one: its bucket on the last level, else the head slot
+    // if it is also the first, else the tail slot. Both tags are written, so a group of
+    // empty slots hands two empty slots on and the sink stores leave nothing.
+    let acc_out = proj_pack_{sfx}(acc);
+    let has_run = cur != NO_ROW;
+    let slot = select(tail_slot, head_slot, first_run);
+    if (last && has_run) {{
         BUCKETS[cur] = acc_out;
-    }} else if (first_run) {{
-        FOLD_PTS[head_slot] = acc_out;
-        FOLD_ROWS[head_slot] = cur;
     }} else {{
-        FOLD_PTS[tail_slot] = acc_out;
-        FOLD_ROWS[tail_slot] = cur;
+        FOLD_PTS[slot] = acc_out;
     }}
+    FOLD_ROWS[slot] = select(NO_ROW, cur, has_run);
+    FOLD_ROWS[tail_slot] = select(NO_ROW, cur, has_run && !first_run);
 }}
 "
     );

@@ -197,6 +197,9 @@ pub struct PointPlan {
     /// Workgroups per window in the reduce, [`reduce_groups_for`]. On the plan for the
     /// same reason as `fold_len`: it sizes the results buffer.
     reduce_groups: u32,
+    /// The digit plan's work mode, which picks the accumulation kernel: `msm_segmented_*`
+    /// on a variable plan, `msm_segmented_constant_*` on a constant one.
+    work: Work,
 }
 
 impl PointPlan {
@@ -256,6 +259,7 @@ impl PointPlan {
                 Work::Variable => 0,
             },
             reduce_groups: reduce_groups_for(digits.n_windows(), digits.n_buckets(), tg),
+            work: digits.work(),
         })
     }
 
@@ -279,6 +283,9 @@ impl PointPlan {
     }
     pub fn reduce_groups(&self) -> u32 {
         self.reduce_groups
+    }
+    pub fn work(&self) -> Work {
+        self.work
     }
 
     /// Points `msm_reduce_*` writes: one partial per window per group.
@@ -587,10 +594,10 @@ impl PointCurve for G2Curve {
 pub struct MsmPoints<C: PointCurve> {
     kernels: Kernels,
     curve: wgsl::Curve,
-    /// The seven entry point names, `msm_clear_g1` and so on, built once from the suffix.
+    /// The eight entry point names, `msm_clear_g1` and so on, built once from the suffix.
     /// Owned rather than `&'static str` because they are derived from the curve and not
     /// written out, which is what stopped the generator being G2-only.
-    names: [String; 7],
+    names: [String; 8],
     wg: wgsl::Workgroups,
     workgroups_per_dispatch: u32,
     bgl_clear: wgpu::BindGroupLayout,
@@ -617,6 +624,7 @@ const REDUCE: usize = 3;
 const ONES: usize = 4;
 const FOLD: usize = 5;
 const REDUCE_CONSTANT: usize = 6;
+const SEGMENTED_CONSTANT: usize = 7;
 
 /// Overrides the reduction width for every curve, or 0 to use each curve's measured one.
 ///
@@ -791,6 +799,9 @@ impl<C: PointCurve> MsmPoints<C> {
                 (names[ONES].as_str(), &l_ones),
                 (names[FOLD].as_str(), &l_fold),
                 (names[REDUCE_CONSTANT].as_str(), &l_reduce),
+                // The segmented pass's layout: a pipeline layout may declare a binding
+                // the shader ignores, and this one ignores the cursor.
+                (names[SEGMENTED_CONSTANT].as_str(), &l_segmented),
             ],
         )?;
 
@@ -880,12 +891,12 @@ impl<C: PointCurve> MsmPoints<C> {
     }
 
     /// Storage buffers each entry point's pipeline layout declares, counted from the lists
-    /// above rather than from a duplicate. All seven must be at most 8, the browser floor.
+    /// above rather than from a duplicate. All eight must be at most 8, the browser floor.
     ///
     /// Curve-independent by construction: the bindings are the same thirteen resources over
     /// either group, only their element type changes. It is still reported per instantiation
     /// so a test names the entry point it is talking about.
-    pub fn storage_buffer_counts() -> [(String, u32); 7] {
+    pub fn storage_buffer_counts() -> [(String, u32); 8] {
         fn count(entries: &[wgpu::BindGroupLayoutEntry]) -> u32 {
             entries
                 .iter()
@@ -910,6 +921,10 @@ impl<C: PointCurve> MsmPoints<C> {
             (
                 C::WGSL.entry_reduce_constant(),
                 count(&Self::reduce_entries()),
+            ),
+            (
+                C::WGSL.entry_segmented_constant(),
+                count(&Self::segmented_entries()),
             ),
         ]
     }
@@ -1451,6 +1466,8 @@ impl<C: PointCurve> MsmPoints<C> {
         )
     }
 
+    /// The accumulation of one slab: `msm_segmented_*`, or `msm_segmented_constant_*` on a
+    /// constant-work plan, over the same threads and the same bind group.
     fn segmented_slab(
         &self,
         pass: &mut wgpu::ComputePass<'_>,
@@ -1458,9 +1475,13 @@ impl<C: PointCurve> MsmPoints<C> {
         binds: &PointBinds,
         slab: &SlabOffsets,
     ) -> Result<(), ProveError> {
+        let which = match points.work {
+            Work::Constant => SEGMENTED_CONSTANT,
+            Work::Variable => SEGMENTED,
+        };
         self.encode_range(
             pass,
-            &self.names[SEGMENTED],
+            &self.names[which],
             &binds.segmented,
             (slab.windows.end - slab.windows.start) * points.slices,
             self.wg.segmented,

@@ -511,6 +511,10 @@ fn every_g2_pipeline_layout_declares_at_most_eight_storage_buffers() {
         (wgsl::G2.entry_ones(), wgsl::STORAGE_ONES),
         (wgsl::G2.entry_fold(), wgsl::STORAGE_FOLD),
         (wgsl::G2.entry_reduce_constant(), wgsl::STORAGE_REDUCE),
+        (
+            wgsl::G2.entry_segmented_constant(),
+            wgsl::STORAGE_SEGMENTED_CONSTANT,
+        ),
     ];
     let got = MsmPointsG2::storage_buffer_counts();
     assert_eq!(got.len(), want.len());
@@ -609,8 +613,9 @@ fn the_g2_module_compiles_and_reports_what_it_cost() {
         "the G2 point module took {:.1} s to build",
         cost.compile_us as f64 / 1e6
     );
-    // Seven since constant work: the five, the fold and the constant reduce.
-    assert_eq!(cost.pipelines, 7);
+    // Eight since constant work: the five, the fold, the constant reduce and the constant
+    // accumulation.
+    assert_eq!(cost.pipelines, 8);
     assert_eq!(cost.modules, 1);
 }
 

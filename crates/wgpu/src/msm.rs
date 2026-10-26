@@ -79,16 +79,22 @@ pub enum Work {
     ///
     /// That closes the channel of "Remote Side-Channel Attacks on Anonymous Transactions"
     /// (USENIX Security 2020), which recovered Zcash witness sparsity from proving time.
-    /// The fold and the reduce add with the complete formulas (`gen::points::proj_ops`),
-    /// so an empty bucket or slot costs what a full one does. It is not constant time in
-    /// the strict sense: bucket occupancy still follows the digit values, so the atomics'
-    /// contention and the accumulation's run count stay data dependent, as in every
-    /// Pippenger. Stages 0 to 4 were fixed-shape already: the gather multiplies every term
-    /// and the field prelude reduces with `select`.
+    /// The accumulation is `msm_segmented_constant_*`, which decides nothing by branching
+    /// on an entry (a run boundary, a padded iteration, a base at infinity and a digit's
+    /// sign are all selects) and adds with the complete formulas
+    /// (`gen::points::proj_ops`); the merge is the fixed tree of `msm_fold_*`, written the
+    /// same way; and the reduce adds with the complete formulas too. So every thread's
+    /// instruction stream, loads, stores and field products are the key's, and an empty
+    /// bucket or slot costs what a full one does. It is not constant time in the strict
+    /// sense: which bucket a digit names still follows its value, so the digit pipeline's
+    /// atomics contend by occupancy and the accumulation's and fold's stores land on
+    /// witness-chosen addresses, as in every Pippenger over a bucket layout; see
+    /// `crate::backend::WgpuProver::constant_work` for what that leaves and measures.
+    /// Stages 0 to 4 were fixed-shape already: the gather multiplies every term and the
+    /// field prelude reduces with `select`.
     ///
     /// What it costs is what the zeros and ones were saving, so it is priced per circuit
-    /// on `crate::backend::WgpuProver::constant_work`: about half again on a dense
-    /// witness, 3.5x to 10x on a bit-heavy one.
+    /// on `crate::backend::WgpuProver::constant_work`.
     Constant,
     /// Zero scalars are dropped, one scalars go to the ones pass, the window is sized for
     /// the rest. Running time, buffer sizes and the dispatch geometry then follow how many

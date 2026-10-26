@@ -26,7 +26,8 @@ use snarkrs_wgpu::backend::WgpuProver;
 use snarkrs_wgpu::msm::pack_scalars;
 use snarkrs_wgpu::{
     DigitBuffers, DigitPlan, G1Bases, G2Bases, Group, Job, LimitsProfile, MsmResult, ParamRing,
-    PointBuffers, Source, WgpuBackend, Work, DUMMY_ROWS,
+    PointBinds, PointBuffers, PointOffsets, PointPlan, SortBinds, SortOffsets, Source, WgpuBackend,
+    Work, DUMMY_ROWS,
 };
 
 #[path = "msmcommon/mod.rs"]
@@ -352,6 +353,136 @@ fn constant_work_msms_match_the_cpu_on_every_sparsity() {
             "  {label:<24} whole, {s1}+{s2} sub-MSMs and {} submissions all match the CPU",
             batch.last_submits()
         );
+    }
+}
+
+/// Seven points cycled, every fifth negated and every eleventh at infinity, so one bucket
+/// meets the same base twice (a doubling), a base and its negation (a cancellation) and
+/// the identity: the cases `pt_madd` had shortcuts for and the complete formulas must get
+/// right without them. `snarkrs-metal`'s `colliding_bases`.
+fn colliding_bases(n: usize) -> (Vec<G1Affine>, Vec<G2Affine>) {
+    let p1: Vec<G1Affine> = (1..=7u64)
+        .map(|k| (G1Projective::generator() * Fr::from(k)).into_affine())
+        .collect();
+    let p2: Vec<G2Affine> = (1..=7u64)
+        .map(|k| (G2Projective::generator() * Fr::from(k)).into_affine())
+        .collect();
+    let g1 = (0..n)
+        .map(|i| match (i % 11, i % 5) {
+            (4, _) => G1Affine::identity(),
+            (_, 2) => -p1[i % 7],
+            _ => p1[i % 7],
+        })
+        .collect();
+    let g2 = (0..n)
+        .map(|i| match (i % 11, i % 5) {
+            (4, _) => G2Affine::identity(),
+            (_, 2) => -p2[i % 7],
+            _ => p2[i % 7],
+        })
+        .collect();
+    (g1, g2)
+}
+
+/// Scalar vectors chosen for where their digits land rather than how many are zero: one
+/// dense value everywhere puts a window's every entry in one bucket (one run the length of
+/// the region, through every slice's head and tail and the whole fold); a value and its
+/// negation, or two values, alternate between two buckets; single bits give each scalar
+/// one live window; small values live in window zero and send everything else to the
+/// dummy rows.
+fn adversarial_scalars(n: usize) -> Vec<(&'static str, Vec<Fr>)> {
+    let a = -Fr::from(0x7f3a_19c5_d02b_6e41u64);
+    let b = Fr::from(0x1234_5678_9abc_def1u64) * Fr::from(0x0fed_cba9_8765_4321u64);
+    let pow2 = |k: usize| {
+        let mut x = Fr::one();
+        for _ in 0..k {
+            x = x + x;
+        }
+        x
+    };
+    vec![
+        ("one value", vec![a; n]),
+        (
+            "a value and its negation",
+            (0..n).map(|i| if i % 2 == 0 { a } else { -a }).collect(),
+        ),
+        (
+            "two values",
+            (0..n).map(|i| if i % 3 == 0 { a } else { b }).collect(),
+        ),
+        ("single bits", (0..n).map(|i| pow2(i % 254)).collect()),
+        ("small", (0..n).map(|i| Fr::from((i % 9) as u64)).collect()),
+        ("zeros", vec![Fr::zero(); n]),
+        ("ones", vec![Fr::one(); n]),
+    ]
+}
+
+/// `Work::Constant` against the CPU MSM on the bucket collisions above, in both groups, at
+/// sizes from one short slice to many windows of many slices, plus an offset job at each
+/// size the way the L MSM reads the witness. What `msm_segmented_constant_*` and the
+/// select-only fold have to get right with no shortcut to fall back on.
+#[test]
+fn constant_work_matches_the_cpu_on_bucket_collisions() {
+    let _one_at_a_time = exclusive();
+    let b = device();
+    let batch = prover().msm();
+    let cpu = CpuMsm::new();
+    for n in [3usize, 70, 1500, 20_011] {
+        let (g1, g2) = colliding_bases(n);
+        let b1 = G1Bases::upload(b, &g1).expect("g1 bases");
+        let b2 = G2Bases::upload(b, &g2).expect("g2 bases");
+        let off = n.min(5);
+        for (label, scalars) in adversarial_scalars(n) {
+            let whole = [
+                Job::G1 {
+                    bases: &b1,
+                    base_off: 0,
+                },
+                Job::G2 {
+                    bases: &b2,
+                    base_off: 0,
+                },
+            ];
+            let off_job = [Job::G1 {
+                bases: &b1,
+                base_off: off as u32,
+            }];
+            let mut gs = vec![Group {
+                scalars: Source::Host(&scalars),
+                scalar_off: 0,
+                n: n as u32,
+                jobs: &whole,
+                work: Work::Constant,
+            }];
+            if off < n {
+                gs.push(Group {
+                    scalars: Source::Host(&scalars),
+                    scalar_off: off as u32,
+                    n: (n - off) as u32,
+                    jobs: &off_job,
+                    work: Work::Constant,
+                });
+            }
+            let got = pollster::block_on(batch.run(b, None, &gs)).expect("run");
+            assert_eq!(
+                g1_of(&got[0]).into_affine(),
+                cpu.msm_g1(&g1, &scalars).into_affine(),
+                "{label}, n = {n}: G1"
+            );
+            assert_eq!(
+                g2_of(&got[1]).into_affine(),
+                cpu.msm_g2(&g2, &scalars).into_affine(),
+                "{label}, n = {n}: G2"
+            );
+            if off < n {
+                assert_eq!(
+                    g1_of(&got[2]).into_affine(),
+                    cpu.msm_g1(&g1[off..], &scalars[off..]).into_affine(),
+                    "{label}, n = {n}: G1 over an offset range"
+                );
+            }
+        }
+        eprintln!("  n = {n:<6} every collision set matches the CPU in both groups");
     }
 }
 
@@ -699,4 +830,174 @@ fn constant_work_phase_occupancy() {
             }
         }
     }
+}
+
+/// One scalar class's constant-work MSM, planned, allocated and bound once, so a probe can
+/// time its phases rep after rep.
+struct Probe {
+    dplan: DigitPlan,
+    pplan: PointPlan,
+    sbind: SortBinds,
+    pbind: PointBinds,
+    soff: SortOffsets,
+    poff: PointOffsets,
+    _sbuf: wgpu::Buffer,
+    _sort: DigitBuffers,
+    _pts: PointBuffers,
+    _ring: ParamRing,
+}
+
+/// The constant-work MSM's phases across scalar classes at one `n`, interleaved so a drift
+/// in the machine lands on every class alike: zeros, ones, bits, dense random, one dense
+/// value everywhere (every entry of a window in one bucket) and small values (window zero
+/// only). Every rep times each class's digit pipeline, clear, accumulation, fold and
+/// reduce in a sealed submission of its own; medians and ranges over the reps after the
+/// warm-up. `G16_REVIEW_N` sets the length (2^18 by default) and `G16_REVIEW_REPS` the
+/// reps (12). The counterpart of `snarkrs-metal`'s `constant_work_phase_flatness`.
+#[test]
+#[ignore = "GPU measurement; run explicitly on the measurement machine"]
+fn constant_work_phase_flatness() {
+    let _one_at_a_time = exclusive();
+    let _lock = gpulock::exclusive_gpu();
+    let n: usize = std::env::var("G16_REVIEW_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1 << 18);
+    let reps: usize = std::env::var("G16_REVIEW_REPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(12);
+    let warm = 2;
+    let b = device();
+    let batch = prover().msm();
+    let d = batch.digits();
+    let (g1, g2) = bases_with_infinity(n);
+    let b1 = G1Bases::upload(b, &g1).expect("g1 bases");
+    let b2 = G2Bases::upload(b, &g2).expect("g2 bases");
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let bits: Vec<Fr> = (0..n).map(|_| Fr::from(xorshift(&mut seed) & 1)).collect();
+    let dense = random_scalars(n, &mut seed);
+    let one_value = -Fr::from(0x7f3a_19c5_d02b_6e41u64);
+    let sets = [
+        ("zeros", vec![Fr::zero(); n]),
+        ("ones", vec![Fr::one(); n]),
+        ("bits", bits),
+        ("dense", dense),
+        ("onevalue", vec![one_value; n]),
+        ("small", (0..n).map(|i| Fr::from((i % 5) as u64)).collect()),
+    ];
+    let phases = ["digits", "clear", "accum", "fold", "reduce"];
+
+    fn timed(b: &WgpuBackend, encode: impl Fn(&mut wgpu::ComputePass<'_>)) -> f64 {
+        let t = std::time::Instant::now();
+        submit_sealed(b, "flatness probe", encode);
+        t.elapsed().as_secs_f64() * 1e3
+    }
+
+    // The same probe through either curve's module, so the loop below is written once.
+    macro_rules! probe {
+        ($group:expr, $p:expr, $bases:expr) => {{
+            let p = $p;
+            let planned: Vec<Probe> = sets
+                .iter()
+                .map(|(_, scalars)| {
+                    let dplan =
+                        DigitPlan::with_work(n as u32, 0, None, Work::Constant).expect("plan");
+                    let (words, _) = pack_scalars(scalars);
+                    let sbuf = storage_words(b, "probe scalars", &words);
+                    let sort = DigitBuffers::new(b, &dplan, 0).expect("sort buffers");
+                    let pplan = p.plan_points(&dplan, 0).expect("point plan");
+                    let pts = PointBuffers::new(b, &dplan, &pplan, 0, p.curve()).expect("buffers");
+                    let slots = d.sort_slots(&dplan) + p.slots(&dplan, &pplan);
+                    let mut ring = ParamRing::new(b, "probe ring", slots).expect("ring");
+                    let soff = d.plan_sort(&dplan, &mut ring).expect("plan sort");
+                    let poff = p.plan(&dplan, &pplan, &mut ring).expect("plan points");
+                    ring.flush(b);
+                    let sbind = d
+                        .bind_sort(b, &ring, &dplan, &sbuf, &sort)
+                        .expect("bind sort");
+                    let pbind = p
+                        .bind_all(
+                            b,
+                            &ring,
+                            &dplan,
+                            &pplan,
+                            &sbuf,
+                            $bases.chunk(0),
+                            &sort,
+                            &pts,
+                        )
+                        .expect("bind points");
+                    Probe {
+                        dplan,
+                        pplan,
+                        sbind,
+                        pbind,
+                        soff,
+                        poff,
+                        _sbuf: sbuf,
+                        _sort: sort,
+                        _pts: pts,
+                        _ring: ring,
+                    }
+                })
+                .collect();
+            let mut t: Vec<[Vec<f64>; 5]> = sets.iter().map(|_| Default::default()).collect();
+            for rep in 0..warm + reps {
+                for (i, q) in planned.iter().enumerate() {
+                    let x = [
+                        timed(b, |pass| {
+                            d.encode_sort(pass, &q.dplan, &q.sbind, &q.soff).unwrap()
+                        }),
+                        timed(b, |pass| {
+                            p.encode_clear(pass, &q.dplan, &q.pbind, &q.poff).unwrap()
+                        }),
+                        timed(b, |pass| {
+                            p.encode_segmented(pass, &q.pplan, &q.pbind, &q.poff)
+                                .unwrap()
+                        }),
+                        timed(b, |pass| {
+                            p.encode_merge(pass, &q.dplan, &q.pbind, &q.poff).unwrap()
+                        }),
+                        timed(b, |pass| {
+                            p.encode_reduce(pass, &q.dplan, &q.pplan, &q.pbind, &q.poff)
+                                .unwrap()
+                        }),
+                    ];
+                    if rep >= warm {
+                        for (v, x) in t[i].iter_mut().zip(x) {
+                            v.push(x);
+                        }
+                    }
+                }
+            }
+            let q = &planned[0];
+            println!(
+                "flatness {} n={n} c={} w={} slices/window={} fold {} levels of {} reps={reps} \
+                 (median, min-max, ms)",
+                $group,
+                q.dplan.c(),
+                q.dplan.n_windows(),
+                q.pplan.slices(),
+                q.pplan.fold_levels().len(),
+                q.pplan.fold_len(),
+            );
+            for (i, (label, _)) in sets.iter().enumerate() {
+                let mut line = format!("  {label:<9}");
+                for (name, v) in phases.iter().zip(&t[i]) {
+                    let mut s = v.clone();
+                    s.sort_by(f64::total_cmp);
+                    line += &format!(
+                        "  {name} {:.2} ({:.2}-{:.2})",
+                        median(v.clone()),
+                        s[0],
+                        s[s.len() - 1]
+                    );
+                }
+                println!("{line}");
+            }
+        }};
+    }
+    probe!("g1", batch.g1(), b1);
+    probe!("g2", batch.g2(), b2);
 }

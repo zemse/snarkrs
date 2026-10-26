@@ -123,26 +123,36 @@ impl WgpuProver {
     /// time, buffer sizes and dispatch geometry do not reveal how many witness entries are
     /// zero or one; see [`Work::Constant`].
     ///
-    /// What stays witness dependent, on the device: which bucket a digit lands in, so the
-    /// atomics' contention and the run count of the accumulation's slices. The merge is a
-    /// fixed tree (`msm_fold_*`) and it and the reduce (`msm_reduce_constant_*`) add with
-    /// the complete formulas, so an empty bucket or slot costs what a full one does:
-    /// `tests/constant_work.rs::constant_work_phase_occupancy` at 2^18 reads the G1 fold
-    /// at 24.0, 26.9 and 25.7 ms and the G1 reduce at 32.2 on a witness of zeros, of bits
-    /// and a dense one, and in G2 103, 103 and 104 against 186 on all three (at fold
-    /// length 16, the run that saw no abort), where the shortcut kernels read 1.75
-    /// against 2.62 and 1.56 against 11.6 in G1. On the host: the identity tests inside
-    /// the combine's few dozen curve additions, as on the CPU backend. Stages 0 to 4 were
-    /// fixed-shape already: the gather multiplies every term and the field prelude
-    /// reduces with `select`.
+    /// What stays witness dependent, on the device: which bucket a digit lands in. That is
+    /// the digit pipeline's atomics, which contend by occupancy, and the addresses the
+    /// accumulation's and the fold's stores land on. Every other decision in the
+    /// accumulation (`msm_segmented_constant_*`), the fold (`msm_fold_*`) and the reduce
+    /// (`msm_reduce_constant_*`) is a select on the entry rather than a branch, every
+    /// addition is a complete one (`gen::points::proj_ops`), and every thread stores once
+    /// per entry, so the instruction stream, the loads, the stores and the field products
+    /// of every thread are the key's. The one branch left picks the buffer a store goes
+    /// to, because WGSL has no select over pointers into two buffers; both arms store the
+    /// same bytes. `tests/constant_work.rs::constant_work_phase_flatness` at 2^18 (c = 13,
+    /// 20 windows, 2048 slices a window, 12 interleaved reps after 2 warm, load 2.75 at the
+    /// start), medians across zeros, ones, bits, dense, one dense value everywhere and
+    /// small: the accumulation 42.87 to 43.16 ms in G1 and 165.3 to 166.0 in G2, the fold
+    /// 5.92 to 6.15 and 23.3 to 24.3, the reduce 19.02 to 19.04 and 24.9 to 25.8; the
+    /// digit pipeline 0.74 (zeros, small) to 1.96 (one value) in G1, which is the atomics.
+    /// On the host: the identity tests inside the combine's few dozen curve additions, as
+    /// on the CPU backend. Stages 0 to 4 were fixed-shape already: the gather multiplies
+    /// every term and the field prelude reduces with `select`.
     ///
-    /// Priced warm on the M2 Max at the floor profile, 15 reps, alternating rounds under
-    /// the GPU lock, medians against the variable path: js_16x16_d32 1097 ms against 708
-    /// (+55%), keccak256 1301 against 133 (9.8x), rsa2048 1099 against 316 (3.5x),
-    /// anon-aadhaar 5363 against 1087 (4.9x, 3 reps). Steeper than Metal's +26% and 5.7x
-    /// because the constant-work kernels are all curve arithmetic, where WGSL is 2.3x
-    /// behind MSL, and the bit-heavy circuits' G2 job goes from a few hundred scalars to
-    /// the size of H's.
+    /// Priced warm on the M2 Max at the floor profile, interleaved rounds against the
+    /// variable path and against the constant-work kernels before the select-only
+    /// accumulation (load 2.7 to 3.2 at the start of each round): keccak256, 10 reps x 4
+    /// rounds, 493 to 506 ms (MSM stage 473 to 482) against 96 variable (5.2x) and 519 to
+    /// 521 before; anon-aadhaar, 4 reps x 3 rounds, 2253 to 2286 against 781 to 792
+    /// variable (2.9x) and 2262 to 2325 before. The variable path itself is unchanged
+    /// (keccak256 96 to 97 ms either way, anon-aadhaar 781 to 798). js_16x16_d32 and
+    /// rsa2048 were last priced with the shortcut accumulation, at +55% and 3.5x. Steeper
+    /// than Metal's 4.2x because the constant-work kernels are all curve arithmetic, where
+    /// WGSL is behind MSL, and the bit-heavy circuits' G2 job goes from a few hundred
+    /// scalars to the size of H's.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn constant_work() -> Result<Self, ProveError> {
         let mut prover = Self::new()?;
