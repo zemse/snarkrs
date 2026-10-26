@@ -115,9 +115,23 @@ fn slice_len() -> usize {
 /// plan at H's size keeps slice 64 and does not move.
 const SEG_TARGET_THREADS: usize = 4096;
 
-pub(super) fn slice_len_for(n_windows: usize, cap: usize) -> usize {
+/// Digit entries (windows times capacity) at or above which a variable-work plan takes
+/// [`LARGE_SLICE_LEN`] instead of [`SLICE_LEN`]. Each slice owns a spill slot per window,
+/// so doubling the slice halves the spill: on anon-aadhaar's H plan (2^21, c=16, 16
+/// windows, 33.5 M entries) 64 MB to 32 MB, and the warm peak footprint 1,435 to 1,403
+/// MB, with warm proving even at 169.4-172.7 ms against 167.7-172.8 over ten interleaved
+/// rounds. 256 saved 49 MB but cost about 1.5 ms. Under constant work 128 saved 75 MB and
+/// measured 13 ms slower on the same circuit, so constant work stays at 64. js_16x16_d32's
+/// H plan (5.2 M entries) saved 2 to 8 MB and sits under the threshold.
+const LARGE_SLICE_MIN_ENTRIES: usize = 1 << 24;
+const LARGE_SLICE_LEN: usize = 128;
+
+pub(super) fn slice_len_for(n_windows: usize, cap: usize, work: Work) -> usize {
     if let Some(l) = forced_slice_len() {
         return l;
+    }
+    if work == Work::Variable && n_windows * cap >= LARGE_SLICE_MIN_ENTRIES {
+        return LARGE_SLICE_LEN;
     }
     let mut l = SLICE_LEN;
     while l > 8 && n_windows * cap.div_ceil(l) < SEG_TARGET_THREADS {

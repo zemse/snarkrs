@@ -112,7 +112,7 @@ impl<'a> Plan<'a> {
         let n_windows = recode_bits.div_ceil(c as usize);
         let n_buckets = 1usize << (c - 1);
         let cap = general.max(1);
-        let slice_len = slice_len_for(n_windows, cap);
+        let slice_len = slice_len_for(n_windows, cap, scalars.work);
         // Live buckets of the top window, whose short bit range concentrates the
         // digits. When their expected run span clears the wide threshold, their merge
         // moves to `msm_merge_wide_*` and `msm_merge_*` skips them.

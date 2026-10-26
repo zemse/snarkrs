@@ -22,7 +22,20 @@ fn slice_override_never_zero_or_past_u32() {
     );
 }
 
-use super::window::{parse_slice_override, DUMMY_ROWS, MERGE_TG, MSM_NO_ROW, RECODE_BITS, SCAN_TG};
+#[test]
+fn only_large_variable_plans_take_the_long_slice() {
+    if std::env::var_os("G16_METAL_MSM_L").is_some() {
+        return;
+    }
+    // anon-aadhaar's H plan at 2^21, and js_16x16_d32's at 2^18.
+    assert_eq!(slice_len_for(16, 1 << 21, Work::Variable), 128);
+    assert_eq!(slice_len_for(16, 1 << 21, Work::Constant), 64);
+    assert_eq!(slice_len_for(20, 1 << 18, Work::Variable), 64);
+}
+
+use super::window::{
+    parse_slice_override, slice_len_for, DUMMY_ROWS, MERGE_TG, MSM_NO_ROW, RECODE_BITS, SCAN_TG,
+};
 use super::*;
 use crate::layout::as_bytes;
 use objc2_metal::{MTLBuffer, MTLCommandQueue};
