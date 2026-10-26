@@ -22,18 +22,23 @@ pub enum Work {
     ///
     /// That closes the channel of "Remote Side-Channel Attacks on Anonymous
     /// Transactions" (USENIX Security 2020), which recovered Zcash witness sparsity from
-    /// proving time. The merge is the fixed tree of `msm_fold_*` rather than a walk per
-    /// bucket, and the fold and the reduce add with the complete formulas (`Proj` in
-    /// msm.metal), so an empty bucket or slot costs what a full one does. It is not
-    /// constant time in the strict sense: bucket occupancy still follows the digit
-    /// values, so the atomics' contention and the accumulation's run count stay data
-    /// dependent, as in every Pippenger; see
+    /// proving time. The accumulation is `msm_segmented_constant_*`, which decides
+    /// nothing by branching on an entry (a run boundary, a skipped point, a base at
+    /// infinity and a digit's sign are all selects) and adds with the complete
+    /// formulas (`Proj` in msm.metal); the merge is the fixed tree of `msm_fold_*`
+    /// rather than a walk per bucket, written the same way; and the reduce adds with the
+    /// complete formulas too. So every thread's instruction stream, loads, stores and
+    /// field products are the key's, and an empty bucket or slot costs what a full one
+    /// does. It is not constant time in the strict sense: which bucket a digit names
+    /// still follows its value, so the digit pipeline's atomics contend by occupancy
+    /// and the accumulation's and fold's stores land on witness-chosen addresses, as in
+    /// every Pippenger over a bucket layout; see
     /// [`MetalBackend::constant_work`](crate::MetalBackend::constant_work) for what that
-    /// leaves.
+    /// leaves and measures.
     ///
     /// What it costs is what the zeros and ones were saving, so it is priced per
-    /// circuit in `MetalBackend::constant_work`: about a fifth on a dense witness, 4-6x
-    /// on a bit-heavy one.
+    /// circuit in `MetalBackend::constant_work`: about a quarter on a dense witness,
+    /// 2.7-4.2x on a bit-heavy one.
     Constant,
     /// Zero scalars are dropped, one scalars go to the ones gather, the window is sized
     /// for the rest over the bits they actually use. Running time, buffer sizes and the

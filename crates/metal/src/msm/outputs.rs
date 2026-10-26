@@ -248,6 +248,20 @@ impl Outputs {
             mtl::set_buffer(enc, 4, &self.buckets, 0);
             set_params(enc, 5, &p);
             dispatch_1d(enc, acc_pso, rows, 64);
+        } else if plan.dummy_rows > 0 {
+            // Reads no cursor: the region is full and the slice bounds follow `n`.
+            let (seg_pso, bases) = match job {
+                Job::G1(j) => (&msm.pipelines.segmented_constant_g1, &j.bases.buf),
+                Job::G2(j) => (&msm.pipelines.segmented_constant_g2, &j.bases.buf),
+            };
+            enc.setComputePipelineState(seg_pso);
+            mtl::set_buffer(enc, 0, plan.entries.as_ref().unwrap(), 0);
+            mtl::set_buffer(enc, 1, bases, 0);
+            mtl::set_buffer(enc, 2, &self.buckets, 0);
+            mtl::set_buffer(enc, 3, &self.spill_pts, 0);
+            mtl::set_buffer(enc, 4, &self.spill_rows, 0);
+            set_params(enc, 5, &p);
+            dispatch_1d(enc, seg_pso, count, 64);
         } else {
             let (seg_pso, bases) = match job {
                 Job::G1(j) => (&msm.pipelines.segmented_g1, &j.bases.buf),

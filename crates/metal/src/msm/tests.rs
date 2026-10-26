@@ -611,6 +611,115 @@ fn constant_work_matches_the_cpu_on_every_sparsity() {
     }
 }
 
+/// Seven points cycled, every fifth negated and every eleventh at infinity, so one
+/// bucket meets the same base twice (a doubling), a base and its negation (a
+/// cancellation) and the identity: the cases `pt_madd` had shortcuts for and the
+/// complete formulas must get right without them.
+fn colliding_bases(n: usize) -> (Vec<G1Affine>, Vec<G2Affine>) {
+    use snarkrs_field::PrimeGroup;
+    let p1: Vec<G1Affine> = (1..=7u64)
+        .map(|k| (G1Projective::generator() * Fr::from(k)).into_affine())
+        .collect();
+    let p2: Vec<G2Affine> = (1..=7u64)
+        .map(|k| (G2Projective::generator() * Fr::from(k)).into_affine())
+        .collect();
+    let g1 = (0..n)
+        .map(|i| match (i % 11, i % 5) {
+            (4, _) => G1Affine::identity(),
+            (_, 2) => -p1[i % 7],
+            _ => p1[i % 7],
+        })
+        .collect();
+    let g2 = (0..n)
+        .map(|i| match (i % 11, i % 5) {
+            (4, _) => G2Affine::identity(),
+            (_, 2) => -p2[i % 7],
+            _ => p2[i % 7],
+        })
+        .collect();
+    (g1, g2)
+}
+
+/// Scalar vectors chosen for where their digits land rather than how many are zero:
+/// one dense value everywhere puts a window's every entry in one bucket (one run the
+/// length of the region, through every slice's head and tail and the whole fold); a
+/// value and its negation, or two values, alternate between two buckets; single bits
+/// give each scalar one live window; small values live in window zero and send
+/// everything else to the dummy rows.
+fn adversarial_scalars(n: usize) -> Vec<(&'static str, Vec<Fr>)> {
+    use ark_ff::Field;
+    let a = -Fr::from(0x7f3a_19c5_d02b_6e41u64);
+    let b = Fr::from(0x1234_5678_9abc_def1u64) * Fr::from(0x0fed_cba9_8765_4321u64);
+    vec![
+        ("one value", vec![a; n]),
+        (
+            "a value and its negation",
+            (0..n).map(|i| if i % 2 == 0 { a } else { -a }).collect(),
+        ),
+        (
+            "two values",
+            (0..n).map(|i| if i % 3 == 0 { a } else { b }).collect(),
+        ),
+        (
+            "single bits",
+            (0..n)
+                .map(|i| Fr::from(2u64).pow([(i % 254) as u64]))
+                .collect(),
+        ),
+        ("small", (0..n).map(|i| Fr::from((i % 9) as u64)).collect()),
+        ("zeros", vec![Fr::zero(); n]),
+        ("ones", vec![Fr::one(); n]),
+    ]
+}
+
+/// `Work::Constant` against the CPU MSM on the bucket collisions above, in both groups,
+/// at sizes from one short slice to many windows of many slices, plus an offset job
+/// at each size the way the L MSM reads the witness.
+#[test]
+fn constant_work_matches_the_cpu_on_bucket_collisions() {
+    use snarkrs_msm::MsmBackend;
+    let m = MetalMsm::new().expect("Metal device");
+    let cpu = snarkrs_msm::CpuMsm::new();
+    for n in [3usize, 70, 1500, 20_011] {
+        let (g1, g2) = colliding_bases(n);
+        let b1 = m.upload_g1_bases(&g1).expect("upload bases");
+        let b2 = m.upload_g2_bases(&g2).expect("upload bases");
+        let off = n.min(5);
+        for (label, scalars) in adversarial_scalars(n) {
+            let s = m
+                .upload_scalars_with(&scalars, Work::Constant)
+                .expect("upload scalars");
+            assert_eq!(
+                m.msm_g1(&b1, &s).unwrap().into_affine(),
+                cpu.msm_g1(&g1, &scalars).into_affine(),
+                "{label}, n = {n}: G1"
+            );
+            assert_eq!(
+                m.msm_g2(&b2, &s).unwrap().into_affine(),
+                cpu.msm_g2(&g2, &scalars).into_affine(),
+                "{label}, n = {n}: G2"
+            );
+            if off == n {
+                continue;
+            }
+            let got = m
+                .msm_batch(&[Job::G1(JobG1 {
+                    bases: &b1,
+                    base_off: off,
+                    scalars: &s,
+                    scalar_off: off,
+                    n: n - off,
+                })])
+                .unwrap();
+            assert_eq!(
+                got[0].g1().unwrap().into_affine(),
+                cpu.msm_g1(&g1[off..], &scalars[off..]).into_affine(),
+                "{label}, n = {n}: G1 over an offset range"
+            );
+        }
+    }
+}
+
 /// A suffix job riding a wider job's plan, the way L rides A and B's, in both work
 /// modes and both groups, on every sparsity: listed before the job it rides, over
 /// bases of its own and over the wider job's bases at an offset.

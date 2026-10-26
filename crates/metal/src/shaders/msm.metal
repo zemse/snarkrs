@@ -61,7 +61,10 @@
 //    window, so the entry region is always full and the segmented accumulation runs
 //    every slice. The dummy row is picked by thread index, not by value, and there are
 //    several per window only to spread the atomics: on a bit witness nearly every
-//    digit is zero.
+//    digit is zero. That accumulation is `msm_segmented_constant_*`, which decides
+//    nothing by branching on an entry and adds with the complete formulas, so the
+//    instruction stream of every thread is the key's; only which rows the stores name
+//    is the witness's, as it is in the digit pipeline's atomics.
 //
 // 3. POINTS ACCUMULATE IN XYZZ, BASES STAY AFFINE.
 //    Extended Jacobian (X, Y, ZZ, ZZZ) with x = X/ZZ, y = Y/ZZZ and ZZ^3 = ZZZ^2. Mixed
@@ -586,9 +589,13 @@ inline Xyzz<F> pt_mul_small(Xyzz<F> p, uint k) {
 // So an addition costs the same whatever the bucket holds, and nothing stays live
 // that add-2008-s did not keep.
 //
-// Buckets, spill slots and window sums stay XYZZ: the accumulation writes them and
-// the host reads them. A constant-work kernel converts what it loads (3M, and Y = 1
-// for the identity, whose XYZZ form is all zero) and what it stores (4M).
+// On a constant-work plan the buckets and the spill slots hold projective points in
+// the XYZZ slots (`proj_pack`: X, Y, Z and an unused fourth coordinate), because
+// everything that reads them there (the fold, the constant reduce) works in `Proj` and
+// the host reads none of them (no constant plan finishes on the host). Converting at
+// every store (4M) and load (3M) instead was a quarter of the accumulation and a third
+// of the fold. The window sums stay XYZZ, converted once per threadgroup, since the
+// host reads those; the clear writes the packed identity on such a plan.
 // ---------------------------------------------------------------------------
 
 template <typename F>
@@ -676,6 +683,28 @@ inline Xyzz<F> xyzz_from_proj(Proj<F> p) {
     return r;
 }
 
+// A projective point in an XYZZ slot, as the constant-work bucket and spill arrays
+// hold it: no arithmetic, and the fourth coordinate is written as zero so a slot never
+// keeps a previous point's residue.
+template <typename F>
+inline Xyzz<F> proj_pack(Proj<F> p) {
+    Xyzz<F> r;
+    r.x = p.x;
+    r.y = p.y;
+    r.zz = p.z;
+    f_set_zero(r.zzz);
+    return r;
+}
+
+template <typename F>
+inline Proj<F> proj_unpack(Xyzz<F> p) {
+    Proj<F> r;
+    r.x = p.x;
+    r.y = p.y;
+    r.z = p.zz;
+    return r;
+}
+
 // Algorithm 7 of the paper, a = 0: 12M + 2 products by 3b + 19 additions.
 //   X3 = (X1 Y2 + X2 Y1)(Y1 Y2 - 3b Z1 Z2) - 3b (Y1 Z2 + Y2 Z1)(X1 Z2 + X2 Z1)
 //   Y3 = (Y1 Y2 + 3b Z1 Z2)(Y1 Y2 - 3b Z1 Z2) + 9b X1 X2 (X1 Z2 + X2 Z1)
@@ -750,7 +779,8 @@ inline Proj<F> pt_mul_small(Proj<F> p, uint k) {
 }
 
 // The reduce is written once over its point type `P`: `Xyzz<F>` with the shortcuts,
-// or `Proj<F>` under constant work. Loads and stores are XYZZ either way.
+// or `Proj<F>` under constant work, where the buckets hold packed projective points
+// and the window sums the host reads are XYZZ.
 template <typename P>
 struct PtOps;
 
@@ -764,7 +794,7 @@ struct PtOps<Xyzz<F>> {
 template <typename F>
 struct PtOps<Proj<F>> {
     static Proj<F> zero() { return proj_zero<F>(); }
-    static Proj<F> load(Xyzz<F> p) { return proj_from_xyzz(p); }
+    static Proj<F> load(Xyzz<F> p) { return proj_unpack(p); }
     static Xyzz<F> store(Proj<F> p) { return xyzz_from_proj(p); }
 };
 
@@ -1214,7 +1244,10 @@ inline void msm_accumulate_impl(device const uint2* entries,
         }
         acc = pt_madd(acc, b);
     }
-    buckets[gid] = acc;
+    // A constant-work plan's reduce reads packed projective buckets. This kernel is not
+    // the one such a plan runs (see `msm_segmented_constant_impl`), but the override
+    // that selects it must still give a correct sum.
+    buckets[gid] = (p.dummy_rows != 0u) ? proj_pack(proj_from_xyzz(acc)) : acc;
 }
 
 kernel void msm_accumulate_g1(device const uint2* entries [[buffer(0)]],
@@ -1279,8 +1312,9 @@ inline void msm_clear_impl(device Xyzz<F>* buckets, constant MsmParams& p, uint 
         // Every coordinate, not only ZZ. Clearing ZZ alone was correct only because every
         // consumer tests ZZ first, and it left three coordinates of the previous proof's
         // live points in the array; a whole-point store costs about 0.1 ms on the largest
-        // plan and removes both the coupling and the residue.
-        buckets[gid] = pt_zero<F>();
+        // plan and removes both the coupling and the residue. A constant-work plan's
+        // buckets are packed projective points, whose identity is (0 : 1 : 0).
+        buckets[gid] = (p.dummy_rows != 0u) ? proj_pack(proj_zero<F>()) : pt_zero<F>();
     }
 }
 
@@ -1313,23 +1347,12 @@ inline void msm_segmented_impl(device const uint2* entries,
     }
     uint base = w * p.cap;
     // The scatter left every cursor at its run's end, so the last bucket's cursor is the
-    // end of the whole window region. Slices past it are empty. Under constant work the
-    // last row is the last dummy row and the region is always full.
-    uint last = (p.dummy_rows == 0u)
-        ? w * p.n_buckets + p.n_buckets - 1u
-        : p.n_windows * p.n_buckets + w * p.dummy_rows + p.dummy_rows - 1u;
+    // end of the whole window region. Slices past it are empty. A constant-work plan
+    // accumulates in `msm_segmented_constant_impl` below, never here.
+    uint last = w * p.n_buckets + p.n_buckets - 1u;
     uint used = cursor[last] - base;
-
-    // The constant-work fold overwrites the buckets it writes, so there the run that ends
-    // the slice spills too, to a second slot, and no bucket a spill names is ever
-    // direct-written. Everywhere else one slot per slice is enough.
-    bool fold = p.dummy_rows != 0u;
-    uint head_slot = fold ? 2u * gid : gid;
-    uint tail_slot = head_slot + 1u;
+    uint head_slot = gid;
     spill_rows[head_slot] = MSM_NO_ROW;
-    if (fold) {
-        spill_rows[tail_slot] = MSM_NO_ROW;
-    }
 
     uint lo = k * p.slice_len;
     if (lo >= used) {
@@ -1379,9 +1402,6 @@ inline void msm_segmented_impl(device const uint2* entries,
     if (is_first_run) {
         spill_pts[head_slot] = acc;
         spill_rows[head_slot] = cur_row;
-    } else if (fold) {
-        spill_pts[tail_slot] = acc;
-        spill_rows[tail_slot] = cur_row;
     } else {
         buckets[cur_row] = acc;
     }
@@ -1407,6 +1427,145 @@ kernel void msm_segmented_g2(device const uint2* entries [[buffer(0)]],
                              constant MsmParams& p [[buffer(6)]],
                              uint gid [[thread_position_in_grid]]) {
     msm_segmented_impl<Fq2>(entries, bases, cursor, buckets, spill_pts, spill_rows, p, gid);
+}
+
+// Stage 4 under constant work (`p.dummy_rows != 0`): the same slices, spill slots and
+// run bookkeeping as `msm_segmented_impl`, with every data-dependent decision made by a
+// select rather than a branch, so a thread's instruction stream, its loads, its stores
+// and its field products are the same whatever digits its slice holds.
+//
+//   * The region is full by construction (every scalar put one entry in every window),
+//     so the slice bounds come from `p.n`, not from a cursor the digits filled.
+//   * Every iteration runs, `slice_len` of them, the short last slice of a window
+//     included: a padded iteration re-reads the slice's last entry and adds the identity.
+//   * Every iteration stores the accumulator (packed, see `proj_pack`) with its row: to
+//     the head slot when the first run ends, to its bucket when an interior run ends,
+//     and to the thread's own tail slot otherwise, which the end of the slice
+//     overwrites. The number of stores is `slice_len + 2` per thread; which addresses
+//     they hit still follows the digits (see below).
+//   * The point added is the base, negated on a negative digit, replaced by the identity
+//     for a padded iteration, an entry below `skip` and a base at infinity, all by
+//     select, and added with the complete formulas (`Proj`): no identity, equality or
+//     cancellation shortcut remains. One `pt_add` call site in the loop, as in the fold.
+//
+// What this does not hide: which bucket row an entry names, so the address of each
+// store and the cache lines the stores touch (a thread's sink store lands on its own
+// line again and again; a bucket store on a fresh one). That is the counting sort's
+// residual, the same one the digit pipeline's atomics carry, and no accumulation over
+// a bucket layout removes it.
+//
+// Against `pt_madd` (8M + 2S, with the shortcuts) an iteration here is one complete
+// addition (12M + 2 products by 3b) and one store regardless of what it adds, and the
+// shortcuts' savings are gone on purpose. Measured at 2^18 (c=13, 20 windows, 4096
+// slices a window), the accumulation alone, medians of 12 interleaved reps: 20.7 ms in
+// G1 and 89 in G2 on zeros, ones, bits, dense, one-value and small witnesses alike
+// (spread 20.72-20.76 and 88.9-89.3), where `msm_segmented_*` on the same constant-work
+// plans read 13.9-14.4 and 51.0-53.1. See `MetalBackend::constant_work` for the
+// whole-proof cost.
+
+template <typename F>
+inline Proj<F> proj_select(bool take_a, Proj<F> a, Proj<F> b) {
+    Proj<F> r;
+    r.x = f_select(take_a, a.x, b.x);
+    r.y = f_select(take_a, a.y, b.y);
+    r.z = f_select(take_a, a.z, b.z);
+    return r;
+}
+
+template <typename F>
+inline void msm_segmented_constant_impl(device const uint2* entries,
+                                        device const Aff<F>* bases,
+                                        device Xyzz<F>* buckets,
+                                        device Xyzz<F>* spill_pts,
+                                        device uint* spill_rows,
+                                        constant MsmParams& p,
+                                        uint gid) {
+    gid += p.seg_first;
+    uint w = gid / p.slices;
+    uint k = gid - w * p.slices;
+    if (w >= p.n_windows) {
+        return;
+    }
+    uint head_slot = 2u * gid;
+    uint tail_slot = head_slot + 1u;
+    // `cap == n` on a constant-work plan and the region holds exactly `n` entries, so
+    // which slices are empty follows the key alone.
+    uint base = w * p.cap;
+    uint lo = k * p.slice_len;
+    if (lo >= p.n) {
+        spill_rows[head_slot] = MSM_NO_ROW;
+        spill_rows[tail_slot] = MSM_NO_ROW;
+        return;
+    }
+    uint hi = min(lo + p.slice_len, p.n);
+
+    uint cur_row = entries[base + lo].x;
+    Proj<F> acc = proj_zero<F>();
+    Proj<F> zero = proj_zero<F>();
+    bool is_first_run = true;
+
+    for (uint i = lo; i < lo + p.slice_len; i++) {
+        bool live = i < hi;
+        uint2 e = entries[base + min(i, hi - 1u)];
+        // A padded iteration never starts a run.
+        uint row = live ? e.x : cur_row;
+        bool boundary = row != cur_row;
+
+        // The run that ends here, or the same bytes into this thread's tail slot. Point
+        // before tag, as in `msm_segmented_impl`.
+        Xyzz<F> acc_out = proj_pack(acc);
+        bool to_head = boundary && is_first_run;
+        bool to_bucket = boundary && !is_first_run;
+        uint slot = to_head ? head_slot : tail_slot;
+        device Xyzz<F>* pt_dst = to_bucket ? &buckets[cur_row] : &spill_pts[slot];
+        *pt_dst = acc_out;
+        spill_rows[slot] = cur_row;
+        is_first_run = is_first_run && !boundary;
+        acc = proj_select(boundary, zero, acc);
+        cur_row = row;
+
+        // The base, or the identity. A point below `skip` belongs to the wider job
+        // sharing this plan; its base is not this job's to read, so the job's first base
+        // stands in and is discarded by the select, like a padded iteration's.
+        uint point = e.y >> 1;
+        bool kept = live && point >= p.skip;
+        Aff<F> b = bases[p.base_off + (kept ? point - p.skip : 0u)];
+        Proj<F> q;
+        q.x = b.x;
+        q.y = f_select((e.y & 1u) != 0u, f_neg(b.y), b.y);
+        f_set_one(q.z);
+        q = proj_select(!kept || aff_is_inf(b), zero, q);
+        acc = pt_add(acc, q);
+    }
+
+    // The last run: the head slot if it is also the first, the tail slot otherwise. The
+    // tail slot's tag is written in either case, so the sink stores above leave nothing
+    // behind: it names the run or it is empty.
+    Xyzz<F> acc_out = proj_pack(acc);
+    uint slot = is_first_run ? head_slot : tail_slot;
+    spill_pts[slot] = acc_out;
+    spill_rows[slot] = cur_row;
+    spill_rows[tail_slot] = is_first_run ? MSM_NO_ROW : cur_row;
+}
+
+kernel void msm_segmented_constant_g1(device const uint2* entries [[buffer(0)]],
+                                      device const AffG1* bases [[buffer(1)]],
+                                      device PtG1* buckets [[buffer(2)]],
+                                      device PtG1* spill_pts [[buffer(3)]],
+                                      device uint* spill_rows [[buffer(4)]],
+                                      constant MsmParams& p [[buffer(5)]],
+                                      uint gid [[thread_position_in_grid]]) {
+    msm_segmented_constant_impl<Fq>(entries, bases, buckets, spill_pts, spill_rows, p, gid);
+}
+
+kernel void msm_segmented_constant_g2(device const uint2* entries [[buffer(0)]],
+                                      device const AffG2* bases [[buffer(1)]],
+                                      device PtG2* buckets [[buffer(2)]],
+                                      device PtG2* spill_pts [[buffer(3)]],
+                                      device uint* spill_rows [[buffer(4)]],
+                                      constant MsmParams& p [[buffer(5)]],
+                                      uint gid [[thread_position_in_grid]]) {
+    msm_segmented_constant_impl<Fq2>(entries, bases, buckets, spill_pts, spill_rows, p, gid);
 }
 
 // Fold each bucket's spilled partials into it. One thread per bucket, and it looks only
@@ -1571,12 +1730,16 @@ kernel void msm_merge_wide_g2(device PtG2* buckets [[buffer(0)]],
 // empty slot (MSM_NO_ROW, a slice or group with one run) adds the identity and never
 // starts a run. Only constant-work plans fold, so the accumulator is projective and the
 // addition complete (see `Proj`): the identity an empty slot adds costs what any point
-// does. Every slot loaded is converted, and the run is converted back at the top of
-// every iteration whether or not the iteration stores it, so the stores' data
-// dependence stays where it was, in the store itself. Most slots are empty on any
-// witness (a slice inside one bucket spills its head and no tail), so the fold now
-// does the work it used to skip: 3.2 ms in G1 and 13 in G2 at 2^18 on every witness,
-// against 0.8 to 1.0 and 2.6 to 3.9 with the shortcuts.
+// does. Most slots are empty on any witness (a slice inside one bucket spills its head
+// and no tail), so the fold does the work it used to skip: 2.3 ms in G1 and 9.6 in G2
+// at 2^18 on every witness (3.1 and 13.6 while it converted every slot to and from
+// XYZZ), against 0.8 to 1.0 and 2.6 to 3.9 with the shortcuts.
+//
+// The run bookkeeping is the accumulation's (`msm_segmented_constant_impl`): every
+// iteration stores the run (packed, no conversion) with its tag, to the head slot, to
+// its bucket, or into this thread's own tail slot as a sink, and the last level sinks
+// into the next level's buffers, which the host binds and never reads. Only the
+// addresses follow the rows.
 template <typename F>
 inline void msm_fold_impl(device const Xyzz<F>* in_pts,
                           device const uint* in_rows,
@@ -1597,56 +1760,48 @@ inline void msm_fold_impl(device const Xyzz<F>* in_pts,
     }
     uint head_slot = 2u * gid;
     uint tail_slot = head_slot + 1u;
-    if (!last) {
-        out_rows[head_slot] = MSM_NO_ROW;
-        out_rows[tail_slot] = MSM_NO_ROW;
-    }
 
     uint lo = g * len;
     uint hi = min(lo + len, m_in);
     uint cur = MSM_NO_ROW;
     bool is_first_run = true;
     Proj<F> acc = proj_zero<F>();
+    Proj<F> zero = proj_zero<F>();
     // `len` iterations in every group, the window's short last one included, so a
     // thread's additions do not depend on where it sits either.
     for (uint i = lo; i < lo + len; i++) {
         uint j = w * m_in + min(i, hi - 1u);
         uint r = (i < hi) ? in_rows[j] : MSM_NO_ROW;
-        Xyzz<F> acc_out = xyzz_from_proj(acc);
         bool empty = r == MSM_NO_ROW;
-        if (!empty && r != cur) {
-            if (cur != MSM_NO_ROW) {
-                if (is_first_run && !last) {
-                    out_pts[head_slot] = acc_out;
-                    out_rows[head_slot] = cur;
-                } else {
-                    buckets[cur] = acc_out;
-                }
-                is_first_run = false;
-            }
-            acc = proj_zero<F>();
-            cur = r;
-        }
-        Proj<F> q = proj_from_xyzz(in_pts[j]);
-        if (empty) {
-            q = proj_zero<F>();
-        }
+        bool boundary = !empty && r != cur;
+        bool finished = boundary && cur != MSM_NO_ROW;
+
+        Xyzz<F> acc_out = proj_pack(acc);
+        bool to_head = finished && is_first_run && !last;
+        bool to_bucket = finished && !to_head;
+        uint slot = to_head ? head_slot : tail_slot;
+        device Xyzz<F>* pt_dst = to_bucket ? &buckets[cur] : &out_pts[slot];
+        *pt_dst = acc_out;
+        out_rows[slot] = cur;
+        is_first_run = is_first_run && !finished;
+        acc = proj_select(boundary, zero, acc);
+        cur = boundary ? r : cur;
+
+        Proj<F> q = proj_unpack(in_pts[j]);
+        q = proj_select(empty, zero, q);
         acc = pt_add(acc, q);
     }
 
-    if (cur == MSM_NO_ROW) {
-        return;
-    }
-    Xyzz<F> acc_out = xyzz_from_proj(acc);
-    if (last) {
-        buckets[cur] = acc_out;
-    } else if (is_first_run) {
-        out_pts[head_slot] = acc_out;
-        out_rows[head_slot] = cur;
-    } else {
-        out_pts[tail_slot] = acc_out;
-        out_rows[tail_slot] = cur;
-    }
+    // The last run, if any slot held one: its bucket on the last level, else the head
+    // slot if it is also the first, else the tail slot. Both tags are written, so a
+    // group of empty slots hands two empty slots on and the sink stores leave nothing.
+    Xyzz<F> acc_out = proj_pack(acc);
+    bool has_run = cur != MSM_NO_ROW;
+    uint slot = is_first_run ? head_slot : tail_slot;
+    device Xyzz<F>* pt_dst = (last && has_run) ? &buckets[cur] : &out_pts[slot];
+    *pt_dst = acc_out;
+    out_rows[slot] = has_run ? cur : MSM_NO_ROW;
+    out_rows[tail_slot] = (has_run && !is_first_run) ? cur : MSM_NO_ROW;
 }
 
 kernel void msm_fold_g1(device const PtG1* in_pts [[buffer(0)]],

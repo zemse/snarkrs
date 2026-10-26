@@ -126,6 +126,10 @@ struct Pipelines {
     accumulate_g2: ComputePipelineState,
     segmented_g1: ComputePipelineState,
     segmented_g2: ComputePipelineState,
+    /// The accumulation for plans with dummy rows: selects instead of branches and the
+    /// complete formulas; see `msm_segmented_constant_impl` in msm.metal.
+    segmented_constant_g1: ComputePipelineState,
+    segmented_constant_g2: ComputePipelineState,
     merge_g1: ComputePipelineState,
     merge_g2: ComputePipelineState,
     merge_wide_g1: ComputePipelineState,
@@ -196,6 +200,8 @@ impl MetalMsm {
             accumulate_g2: pso("msm_accumulate_g2")?,
             segmented_g1: pso("msm_segmented_g1")?,
             segmented_g2: pso("msm_segmented_g2")?,
+            segmented_constant_g1: pso("msm_segmented_constant_g1")?,
+            segmented_constant_g2: pso("msm_segmented_constant_g2")?,
             merge_g1: pso("msm_merge_g1")?,
             merge_g2: pso("msm_merge_g2")?,
             merge_wide_g1: pso("msm_merge_wide_g1")?,

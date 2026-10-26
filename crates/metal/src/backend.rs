@@ -90,29 +90,34 @@ impl MetalBackend {
     /// time, buffer sizes and dispatch geometry do not reveal how many witness entries
     /// are zero or one; see [`Work::Constant`].
     ///
-    /// What stays witness dependent, on the device: which bucket a digit lands in, so
-    /// the atomics' contention in the digit pipeline, the run count of the accumulation
-    /// and of the fold (which points each thread stores, not how many additions it
-    /// makes), and the identity shortcuts in the accumulation's mixed additions. The
-    /// merge is a fixed tree (`msm_fold_*`) and it and the reduce add with the complete
-    /// formulas, so neither moves with the bucket contents: at 2^18 a witness of zeros,
-    /// one of bits and a dense one read 3.15, 3.16 and 3.17 ms for the fold in G1 and
-    /// 13.0, 13.0 and 13.3 in G2, and 1.81, 1.84 and 1.84 for the reduce in G1, 8.26,
-    /// 8.23 and 8.29 in G2, where the shortcut versions read 0.77, 0.96 and 1.03 (fold,
-    /// G1), 2.60, 3.78 and 3.86 (G2), 0.25, 0.25 and 1.47 (reduce, G1) and 0.83, 0.82
-    /// and 9.78 (G2). On the host: the identity tests inside the combine's few hundred
-    /// curve additions, as on the CPU backend. Stages 0 to 4 were already fixed-shape;
-    /// their one value test, the gather's skip of the multiply for a 0 or 1 witness
-    /// value, is off (keccak256's gather 0.45 ms to 0.71, what a dense witness costs;
-    /// js_16x16_d32 unchanged at 1.56).
+    /// What stays witness dependent, on the device: which bucket a digit lands in. That
+    /// is the digit pipeline's atomics, which contend by occupancy (at 2^18 the count,
+    /// scan and scatter read 0.56 ms on a witness of zeros, 0.68 on bits, 0.84 dense and
+    /// 1.9 when every scalar is one dense value, so every entry of a window hits one
+    /// row), and the addresses the accumulation's and the fold's stores land on. Every
+    /// other decision in the accumulation (`msm_segmented_constant_*`), the fold
+    /// (`msm_fold_*`) and the reduce is a select on the entry rather than a branch, and
+    /// every addition is a complete one (`Proj` in msm.metal), so the instruction
+    /// stream, the loads, the stores and the field products of every thread are the
+    /// key's: see `constant_work_phase_flatness` in msm_gpu_probes.rs for the per-phase
+    /// medians across zeros, ones, bits, dense, one-value and small witnesses. On the
+    /// host: the identity tests inside the combine's few hundred curve additions, as on
+    /// the CPU backend. Stages 0 to 4 were already fixed-shape; their one value test,
+    /// the gather's skip of the multiply for a 0 or 1 witness value, is off (keccak256's
+    /// gather 0.45 ms to 0.71, what a dense witness costs; js_16x16_d32 unchanged at
+    /// 1.56).
     ///
-    /// Priced warm on the M2 Max, 15 reps, alternating rounds under the GPU lock,
-    /// medians against the variable path: js_16x16_d32 115 ms against 91 (+26%),
-    /// keccak256 156 against 27 (5.7x), rsa2048 130 against 35 (3.7x). The complete
-    /// formulas are 19%, 11% and 11% of that over the shortcut fold and reduce. The
-    /// bit-heavy circuits pay more than on the CPU because the variable witness plans
-    /// there were a few hundred scalars over a few windows, and each is now an MSM the
-    /// size of H's, one of them in G2.
+    /// Priced warm on the M2 Max, interleaved rounds against the variable path and
+    /// against the constant-work kernels before the select-only accumulation (load 2.9
+    /// to 3.3 at the start of each batch): keccak256, 10 reps x 4 rounds, 118 ms (round
+    /// medians 115-120) against 28 variable (4.2x) and 108 (105-109) before, the MSM
+    /// stage 99 against 18 and 86; anon-aadhaar, 4 reps x 3 rounds, 474-545 against
+    /// 172-190 variable and 430-482 before, the MSM stage 398-447 against 106-117 and
+    /// 340-385. The variable path itself is unchanged (keccak256 28.1 and 28.0 ms).
+    /// js_16x16_d32 and rsa2048 were last priced with the shortcut accumulation, at
+    /// +26% and 3.7x. The bit-heavy circuits pay more than on the CPU because the
+    /// variable witness plans there were a few hundred scalars over a few windows, and
+    /// each is now an MSM the size of H's, one of them in G2.
     pub fn constant_work() -> Result<Self, ProveError> {
         let mut backend = Self::new()?;
         backend.work = Work::Constant;

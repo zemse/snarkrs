@@ -668,3 +668,155 @@ fn constant_work_phase_occupancy() {
         }
     }
 }
+
+/// The constant-work MSM's phases across scalar classes at one `n`, interleaved so a
+/// drift in the machine lands on every class alike: zeros, ones, bits, dense random,
+/// one dense value everywhere (every entry of a window in one bucket) and small values
+/// (window zero only). Every rep times each class's digit pipeline, clear,
+/// accumulation, fold and reduce in a command buffer of its own; medians and ranges
+/// over the reps after the warm-up. `G16_REVIEW_N` sets the length (2^18 by default)
+/// and `G16_REVIEW_REPS` the reps (12).
+#[test]
+#[ignore = "GPU measurement; run explicitly on the measurement machine"]
+fn constant_work_phase_flatness() {
+    let n: usize = std::env::var("G16_REVIEW_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1 << 18);
+    let reps: usize = std::env::var("G16_REVIEW_REPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(12);
+    let warm = 2;
+    let m = MetalMsm::new().unwrap();
+    // Every seventh base at infinity, as the tests' `bases_with_infinity`.
+    let mut p1 = G1Projective::generator();
+    let mut p2 = G2Projective::generator();
+    let (mut g1, mut g2) = (Vec::with_capacity(n), Vec::with_capacity(n));
+    for _ in 0..n {
+        p1 += G1Projective::generator();
+        p2 += G2Projective::generator();
+        g1.push(p1);
+        g2.push(p2);
+    }
+    let mut g1 = G1Projective::normalize_batch(&g1);
+    let mut g2 = G2Projective::normalize_batch(&g2);
+    for i in (3..n).step_by(7) {
+        g1[i] = G1Affine::identity();
+        g2[i] = G2Affine::identity();
+    }
+    let b1 = m.upload_g1_bases(&g1).unwrap();
+    let b2 = m.upload_g2_bases(&g2).unwrap();
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let bits: Vec<Fr> = (0..n).map(|_| Fr::from(next() & 1)).collect();
+    let dense: Vec<Fr> = (0..n)
+        .map(|_| {
+            let mut bytes = [0u8; 32];
+            for b in &mut bytes {
+                *b = next() as u8;
+            }
+            Fr::from_le_bytes_mod_order(&bytes)
+        })
+        .collect();
+    let one_value = -Fr::from(0x7f3a_19c5_d02b_6e41u64);
+    let sets = [
+        ("zeros", vec![Fr::from(0u64); n]),
+        ("ones", vec![Fr::from(1u64); n]),
+        ("bits", bits),
+        ("dense", dense),
+        ("onevalue", vec![one_value; n]),
+        ("small", (0..n).map(|i| Fr::from((i % 5) as u64)).collect()),
+    ];
+    let time = |f: &mut dyn FnMut(&ComputeCommandEncoderRef)| -> f64 {
+        let t = Instant::now();
+        let queue = m.queue.get();
+        let cb = queue.commandBuffer().unwrap();
+        let enc = mtl::encoder(&cb);
+        f(&enc);
+        enc.endEncoding();
+        cb.commit();
+        crate::cb::wait_ok(&cb, "flatness probe").unwrap();
+        t.elapsed().as_secs_f64() * 1e3
+    };
+    let phases = ["digits", "clear", "accum", "fold", "reduce"];
+    for group in ["g1", "g2"] {
+        let scalars: Vec<ScalarBuf> = sets
+            .iter()
+            .map(|(_, s)| m.upload_scalars_with(s, Work::Constant).unwrap())
+            .collect();
+        let jobs: Vec<Job<'_>> = scalars
+            .iter()
+            .map(|s| {
+                if group == "g1" {
+                    Job::G1(JobG1 {
+                        bases: &b1,
+                        base_off: 0,
+                        scalars: s,
+                        scalar_off: 0,
+                        n,
+                    })
+                } else {
+                    Job::G2(JobG2 {
+                        bases: &b2,
+                        base_off: 0,
+                        scalars: s,
+                        scalar_off: 0,
+                        n,
+                    })
+                }
+            })
+            .collect();
+        let mut keep = Vec::new();
+        let mut plans: Vec<Plan<'_>> = scalars.iter().map(|s| Plan::new(s, 0, n)).collect();
+        for p in &mut plans {
+            p.alloc(&m.pool, &mut keep).unwrap();
+        }
+        let outs: Vec<Outputs> = jobs
+            .iter()
+            .zip(&plans)
+            .map(|(job, plan)| Outputs::alloc(&m, &mut keep, job, plan, 0).unwrap())
+            .collect();
+        let mut t: Vec<[Vec<f64>; 5]> = sets.iter().map(|_| Default::default()).collect();
+        for rep in 0..warm + reps {
+            for (i, ((job, plan), out)) in jobs.iter().zip(&plans).zip(&outs).enumerate() {
+                let d = time(&mut |enc| plan.encode(&m, enc));
+                let c = time(&mut |enc| out.encode_clear(&m, enc, job, plan));
+                let a = time(&mut |enc| out.encode_accumulate(&m, enc, job, plan));
+                let g = time(&mut |enc| out.encode_merge(&m, enc, job, plan));
+                let r = time(&mut |enc| out.encode_reduce(&m, enc, job, plan));
+                if rep >= warm {
+                    for (v, x) in t[i].iter_mut().zip([d, c, a, g, r]) {
+                        v.push(x);
+                    }
+                }
+            }
+        }
+        println!(
+            "flatness {group} n={n} c={} w={} slices/window={} reps={reps} (median, min-max, ms)",
+            plans[0].c, plans[0].n_windows, plans[0].slices
+        );
+        for (i, (label, _)) in sets.iter().enumerate() {
+            let mut line = format!("  {label:<9}");
+            for (name, v) in phases.iter().zip(&t[i]) {
+                let mut s = v.clone();
+                s.sort_by(f64::total_cmp);
+                line += &format!(
+                    "  {name} {:.2} ({:.2}-{:.2})",
+                    median(v.clone()),
+                    s[0],
+                    s[s.len() - 1]
+                );
+            }
+            println!("{line}");
+        }
+        drop(outs);
+        drop(plans);
+        m.pool.give(keep);
+    }
+}
