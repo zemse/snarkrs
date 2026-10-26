@@ -15,18 +15,23 @@
 //! retries inside the backend succeed silently and are what the byte comparison is for.
 //!
 //! `injected_*` puts each of `snarkrs_metal::inject`'s faults behind one submission or
-//! dispatch of every operation in turn, on a quiet machine: a refused status, an ignored
-//! queue, a stale and a missing token, a dispatch cut short with the rest of its buffer or
-//! of its attempt dropped, and a wrong store under a good token. The first six are
-//! retried inside the backend and the output must be the CPU bytes; the last is the open
-//! BUG-28 mechanism and the run reports, per operation, whether it was caught or reached
-//! the file. The injector is per thread and `zkey setup` sends its slot MSMs from the
-//! rayon pool, so the whole run is installed on a one-thread pool.
+//! dispatch of every operation in turn: a refused status, an ignored queue, a stale and
+//! a missing token, a dispatch cut short with the rest of its buffer or of its attempt
+//! dropped, and a wrong store under a good token. All seven are retried inside the
+//! backend and the output must be the CPU bytes, or the operation fails with the
+//! destination untouched; an `Ok` with other bytes fails the test. The wrong store is
+//! the BUG-28 mechanism no token sees, and what refuses it is the value checks on every
+//! ceremony readback (`snarkrs_metal::check`): the MSM's on-curve check for `zkey setup`
+//! and `zkey verify`, the ladder, prefix and finish checks for the KeyScale operations,
+//! the probe and the final scan for the group FFT. The injector is per thread and `zkey
+//! setup` sends its slot MSMs from the rayon pool, so the whole run is installed on a
+//! one-thread pool. It needs no quiet machine, only a Metal device, so it runs with the
+//! rest of the `metal` feature's tests; about two minutes at power 10.
 //!
-//! Both `#[ignore]`: soaks that want the GPU to themselves apart from the deliberate
-//! load. `G16_RECOVERY_ROUNDS` sets the round count (default 50 interrupted, 4 injected,
-//! where round `r` arms index `r` of each operation's submissions and dispatches) and
-//! `G16_RECOVERY_POWER` the ptau power (default 10, at most 16).
+//! `interrupted_*` is `#[ignore]`: a soak that wants the GPU to itself apart from the
+//! deliberate load. `G16_RECOVERY_ROUNDS` sets the round count (default 50 interrupted,
+//! 4 injected, where round `r` arms index `r` of each operation's submissions and
+//! dispatches) and `G16_RECOVERY_POWER` the ptau power (default 10, at most 16).
 
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
@@ -114,6 +119,8 @@ struct Inputs {
     init: PathBuf,
     challenge: PathBuf,
     bellman: PathBuf,
+    /// Left on disk when dropped, for the next process to reuse (`Inputs::reuse`).
+    keep: bool,
 }
 
 impl Inputs {
@@ -123,46 +130,61 @@ impl Inputs {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
+        Self::build(dir, power, false)
+    }
+
+    /// The inputs under `dir`, built there if `dir` does not hold them yet and kept
+    /// afterwards, so two test binaries can time the same files turn and turn about.
+    fn reuse(dir: PathBuf, power: u32) -> Self {
+        if dir.join("bellman").is_file() {
+            Self::paths(dir, true)
+        } else {
+            Self::build(dir, power, true)
+        }
+    }
+
+    fn paths(dir: PathBuf, keep: bool) -> Self {
+        Self {
+            r1cs: dir.join("circuit.r1cs"),
+            raw: dir.join("raw.ptau"),
+            contributed: dir.join("contributed.ptau"),
+            prepared: dir.join("prepared.ptau"),
+            init: dir.join("init.zkey"),
+            challenge: dir.join("challenge"),
+            bellman: dir.join("bellman"),
+            dir,
+            keep,
+        }
+    }
+
+    fn build(dir: PathBuf, power: u32, keep: bool) -> Self {
         std::fs::create_dir_all(&dir).unwrap();
-        let r1cs = dir.join("circuit.r1cs");
+        let i = Self::paths(dir, keep);
         // With its two public signals the circuit's domain is then 2^(power - 1), inside
         // the ptau, and every slot is over setup's MSM crossover from power 10 up.
-        write_r1cs(&r1cs, (1 << (power - 1)) - 2);
-        let raw = dir.join("raw.ptau");
-        let contributed = dir.join("contributed.ptau");
-        let prepared = dir.join("prepared.ptau");
-        let init = dir.join("init.zkey");
-        let challenge = dir.join("challenge");
-        let bellman = dir.join("bellman");
-        phase1::ptau_new(power, &raw).unwrap();
+        write_r1cs(&i.r1cs, (1 << (power - 1)) - 2);
+        phase1::ptau_new(power, &i.raw).unwrap();
         phase1::contribute_with(
-            &raw,
-            &contributed,
+            &i.raw,
+            &i.contributed,
             ContributionParams::default(),
             rng("inputs phase1"),
             &CpuKeyScale,
         )
         .unwrap();
-        prepare::prepare_phase2(&contributed, &prepared, &CpuGroupFft).unwrap();
-        setup::setup(&r1cs, &prepared, &init, &CpuMsm::new()).unwrap();
-        challenge::export_challenge(&contributed, &challenge).unwrap();
-        bellman::export_bellman(&init, &bellman).unwrap();
-        Self {
-            dir,
-            r1cs,
-            raw,
-            contributed,
-            prepared,
-            init,
-            challenge,
-            bellman,
-        }
+        prepare::prepare_phase2(&i.contributed, &i.prepared, &CpuGroupFft).unwrap();
+        setup::setup(&i.r1cs, &i.prepared, &i.init, &CpuMsm::new()).unwrap();
+        challenge::export_challenge(&i.contributed, &i.challenge).unwrap();
+        bellman::export_bellman(&i.init, &i.bellman).unwrap();
+        i
     }
 }
 
 impl Drop for Inputs {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
+        if !self.keep {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 }
 
@@ -322,6 +344,56 @@ fn interrupted_metal_ceremony_outputs_match_cpu_or_preserve_destination() {
     }
 }
 
+/// Warm wall time of the eight operations on Metal, for pricing a change to the backend;
+/// no check of its own. `G16_RECOVERY_ROUNDS` rounds (default 5) over inputs at
+/// `G16_RECOVERY_POWER` (default 16), one line per run, every round printed so the first,
+/// which warms the caches, can be dropped. With `G16_TIMING_DIR` set the inputs are built
+/// there once and reused by the next process, which is how two builds of the backend are
+/// run turn and turn about on the same files: the test binary of each, alternated by a
+/// shell loop, with the load average read beside every run.
+#[test]
+#[ignore = "timing, not a check: see its doc comment"]
+fn time_metal_operations() {
+    let rounds = env_usize("G16_RECOVERY_ROUNDS", 5);
+    let power = env_usize("G16_RECOVERY_POWER", 16) as u32;
+    assert!((4..=20).contains(&power), "G16_RECOVERY_POWER={power}");
+    let (key, fft, msm) = match (
+        MetalKeyScale::new(),
+        MetalGroupFft::new(),
+        MetalMsmBackend::new(),
+    ) {
+        (Ok(key), Ok(fft), Ok(msm)) => (key, fft, msm),
+        _ => {
+            resources::skip("no Metal device");
+            return;
+        }
+    };
+    let metal = Backends {
+        key: &key,
+        fft: &fft,
+        msm: &msm,
+    };
+    let inputs = match std::env::var_os("G16_TIMING_DIR") {
+        Some(dir) => Inputs::reuse(PathBuf::from(dir).join(format!("power-{power}")), power),
+        None => Inputs::new("timing", power),
+    };
+    let out_dir = inputs.dir.join(format!("timing-{}", std::process::id()));
+    std::fs::create_dir_all(&out_dir).unwrap();
+    for round in 0..rounds {
+        for (op, name) in OPERATIONS.iter().enumerate() {
+            let out = out_dir.join(format!("out-{op}"));
+            let _ = std::fs::remove_file(&out);
+            let t = std::time::Instant::now();
+            run(op, &inputs, &out, &metal).unwrap();
+            eprintln!(
+                "timing power {power} round {round}: {name}: {:.3} s",
+                t.elapsed().as_secs_f64()
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
 /// One of the injector's faults: behind a submission's wait, or at a dispatch.
 #[derive(Clone, Copy)]
 enum Arm {
@@ -376,7 +448,6 @@ struct Tally {
 }
 
 #[test]
-#[ignore = "GPU fault soak: a wrong store reaches the file on every KeyScale and GroupFft operation, see the module docs"]
 fn injected_metal_faults_match_cpu_or_preserve_destination() {
     let rounds = env_usize("G16_RECOVERY_ROUNDS", 4);
     let power = env_usize("G16_RECOVERY_POWER", 10) as u32;
