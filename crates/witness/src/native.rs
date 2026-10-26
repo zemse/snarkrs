@@ -104,41 +104,38 @@ pub fn calculate(bin: &Path, input: &Path, n_vars: Option<usize>) -> Result<Vec<
     Ok(w)
 }
 
-/// Run `bin` on `input` and put the witness at `out`. It is written beside `out` under a
-/// fresh name, checked, and renamed into place, so `out` is either the new witness or
-/// untouched.
+/// Run `bin` on `input` and put the witness at `out`. It is written to a fresh, empty
+/// stage beside `out`, checked, and renamed into place, so `out` is either the new witness
+/// or untouched; [`snarkrs_formats::stage`] states what that does and does not promise. A
+/// stage that fails the check is overwritten with zeros before it is removed. A new `out`
+/// gets the umask's mode and an existing one keeps its own.
 pub fn calculate_to_file(bin: &Path, input: &Path, out: &Path) -> Result<(), WitnessError> {
-    let dir = match out.parent() {
-        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
-        _ => PathBuf::from("."),
-    };
-    let name = out
-        .file_name()
-        .ok_or_else(|| WitnessError::Native(format!("{} is not a file name", out.display())))?;
-    let tmp = TempFile {
-        path: dir.join(format!(
-            ".{}.{}.tmp",
-            name.to_string_lossy(),
-            unique_suffix()
-        )),
-    };
-    run(bin, input, &tmp.path)?;
-    let bytes = match std::fs::read(&tmp.path) {
+    if out.file_name().is_none() {
+        return Err(WitnessError::Native(format!(
+            "{} is not a file name",
+            out.display()
+        )));
+    }
+    crate::publish(out, |stage| {
+        let r = run_into(bin, input, stage);
+        if r.is_err() {
+            zero(stage);
+        }
+        r
+    })
+}
+
+/// [`run`] with `out` as the output, then the file it wrote read back and checked.
+fn run_into(bin: &Path, input: &Path, out: &Path) -> Result<(), WitnessError> {
+    run(bin, input, out)?;
+    let bytes = match std::fs::read(out) {
         Ok(b) if !b.is_empty() => b,
         Ok(_) => return Err(no_output(bin)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(no_output(bin)),
-        Err(e) => {
-            return Err(WitnessError::io(
-                format!("reading {}", tmp.path.display()),
-                e,
-            ))
-        }
+        Err(e) => return Err(WitnessError::io(format!("reading {}", out.display()), e)),
     };
     let mut w = Witness::from_bytes(bytes).map_err(|e| malformed(bin, e))?.0;
     crate::scrub(&mut w);
-    std::fs::rename(&tmp.path, out)
-        .map_err(|e| WitnessError::io(format!("writing {}", out.display()), e))?;
-    std::mem::forget(tmp);
     Ok(())
 }
 
@@ -275,23 +272,28 @@ impl TempFile {
 
 impl Drop for TempFile {
     fn drop(&mut self) {
-        if let Ok(meta) = std::fs::metadata(&self.path) {
-            if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&self.path) {
-                use std::io::Write;
-                let mut f = std::io::BufWriter::new(f);
-                let zeros = [0u8; 1 << 16];
-                let mut left = meta.len();
-                while left > 0 {
-                    let n = left.min(zeros.len() as u64) as usize;
-                    if f.write_all(&zeros[..n]).is_err() {
-                        break;
-                    }
-                    left -= n as u64;
-                }
-                let _ = f.flush();
-                let _ = f.get_ref().sync_data();
-            }
-        }
+        zero(&self.path);
         let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Overwrite the file at `path` with zeros, in place and best effort.
+fn zero(path: &Path) {
+    if let Ok(meta) = std::fs::metadata(path) {
+        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) {
+            use std::io::Write;
+            let mut f = std::io::BufWriter::new(f);
+            let zeros = [0u8; 1 << 16];
+            let mut left = meta.len();
+            while left > 0 {
+                let n = left.min(zeros.len() as u64) as usize;
+                if f.write_all(&zeros[..n]).is_err() {
+                    break;
+                }
+                left -= n as u64;
+            }
+            let _ = f.flush();
+            let _ = f.get_ref().sync_data();
+        }
     }
 }

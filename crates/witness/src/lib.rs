@@ -168,12 +168,45 @@ pub fn scrub(w: &mut [Fr]) {
 }
 
 /// [`wtns_bytes`] to a file. The byte image is zeroed once it is written.
+///
+/// The file is written to a stage beside `path` and renamed over it, so an error leaves
+/// `path` as it was; [`snarkrs_formats::stage`] states what that does and does not
+/// promise. A new file gets the umask's mode and an existing one keeps its own.
 pub fn write_wtns(path: &std::path::Path, w: &[Fr]) -> Result<(), WitnessError> {
     let mut bytes = wtns_bytes(w);
-    let r = std::fs::write(path, &bytes)
-        .map_err(|e| WitnessError::io(format!("writing {}", path.display()), e));
+    let r = publish(path, |stage| {
+        std::fs::write(stage, &bytes)
+            .map_err(|e| WitnessError::io(format!("writing {}", path.display()), e))
+    });
     zeroize::Zeroize::zeroize(&mut bytes);
     r
+}
+
+/// Which side of [`publish`] failed: the caller's write, or the staging around it.
+enum Failure {
+    Write(WitnessError),
+    Stage(std::io::Error),
+}
+
+impl From<std::io::Error> for Failure {
+    fn from(e: std::io::Error) -> Self {
+        Failure::Stage(e)
+    }
+}
+
+/// `write` given a stage beside `path`, then the stage renamed over `path`. A failure of
+/// the staging itself is `writing <path>`, as a direct write's would be.
+pub(crate) fn publish(
+    path: &std::path::Path,
+    write: impl FnOnce(&std::path::Path) -> Result<(), WitnessError>,
+) -> Result<(), WitnessError> {
+    snarkrs_formats::stage::staged_all_default_mode(&[path], |stages| {
+        write(&stages[0]).map_err(Failure::Write)
+    })
+    .map_err(|f| match f {
+        Failure::Write(e) => e,
+        Failure::Stage(e) => WitnessError::io(format!("writing {}", path.display()), e),
+    })
 }
 
 #[cfg(test)]

@@ -145,6 +145,74 @@ fn sigabrt_is_a_failure() {
     assert!(!dest.exists());
 }
 
+/// Every entry of the scratch directory but the ones the stand-in binary and its run
+/// leave, so that a stage left behind shows up.
+fn leftovers(s: &Scratch) -> Vec<String> {
+    let mut names: Vec<_> = std::fs::read_dir(&s.0)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| {
+            ![
+                "input.json",
+                "argv.log",
+                "fixture.wtns",
+                "bad.wtns",
+                "circuit",
+                "circuit.dat",
+            ]
+            .contains(&n.as_str())
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn a_failed_run_leaves_an_existing_witness_byte_identical_and_no_stage() {
+    let s = Scratch::new("keep");
+    let dest = s.0.join("witness.wtns");
+    let old = wtns_bytes(&witness(3));
+    let mut bad = witness(4);
+    bad[0] = Fr::from(2u64);
+    let bad = {
+        let fixture = s.0.join("bad.wtns");
+        std::fs::write(&fixture, wtns_bytes(&bad)).unwrap();
+        format!("cp '{}' \"$2\"", fixture.display())
+    };
+    for (body, expect) in [
+        (
+            "echo partial > \"$2\"\nkill -ABRT $$".to_string(),
+            "SIGABRT",
+        ),
+        (bad, "not a BN254 witness"),
+    ] {
+        std::fs::write(&dest, &old).unwrap();
+        let bin = s.bin("circuit", &body, true);
+        let e = err(native::calculate_to_file(&bin, &s.input(), &dest));
+        assert!(e.contains(expect), "{e}");
+        assert_eq!(std::fs::read(&dest).unwrap(), old);
+        assert!(!s.logged_output().unwrap().exists());
+        assert_eq!(leftovers(&s), ["witness.wtns"], "orphan stage");
+    }
+    // A directory where the witness should go is refused before the binary runs.
+    let taken = s.0.join("taken");
+    std::fs::create_dir(&taken).unwrap();
+    std::fs::remove_file(s.0.join("argv.log")).unwrap();
+    let bin = s.bin("circuit", &writes(&s, &witness(5)), true);
+    let e = err(native::calculate_to_file(&bin, &s.input(), &taken));
+    assert!(
+        e.starts_with(&format!("writing {}: ", taken.display())),
+        "{e}"
+    );
+    assert!(s.logged_output().is_none(), "the binary ran");
+    assert!(taken.is_dir());
+    assert_eq!(leftovers(&s), ["taken", "witness.wtns"], "orphan stage");
+    // And a good run replaces the old witness.
+    native::calculate_to_file(&bin, &s.input(), &dest).unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), wtns_bytes(&witness(5)));
+    assert_eq!(leftovers(&s), ["taken", "witness.wtns"], "orphan stage");
+}
+
 #[test]
 fn a_missing_dat_is_reported_before_anything_runs() {
     let s = Scratch::new("dat");
@@ -185,4 +253,36 @@ fn detect_goes_by_content() {
     assert!(e.contains("neither a wasm module"), "{e}");
     let e = err(native::detect(Path::new("no/such/file")));
     assert!(e.contains("ENOENT"), "{e}");
+}
+
+/// `umask(2)`, declared here because this crate has no libc dependency. `mode_t` is 16
+/// bits on Apple platforms and 32 elsewhere.
+unsafe fn umask(mask: u32) -> u32 {
+    #[cfg(target_vendor = "apple")]
+    type ModeT = u16;
+    #[cfg(not(target_vendor = "apple"))]
+    type ModeT = u32;
+    extern "C" {
+        fn umask(mask: ModeT) -> ModeT;
+    }
+    u32::from(umask(mask as ModeT))
+}
+
+/// The only test in this binary that sets the umask, which is process wide.
+#[test]
+fn a_new_witness_follows_the_umask_and_an_existing_one_keeps_its_mode() {
+    let s = Scratch::new("mode");
+    let bin = s.bin("circuit", &writes(&s, &witness(3)), true);
+    let dest = s.0.join("witness.wtns");
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    // SAFETY: umask has no preconditions.
+    let old = unsafe { umask(0o022) };
+    let wrote = native::calculate_to_file(&bin, &s.input(), &dest);
+    unsafe { umask(old) };
+    wrote.unwrap();
+    assert_eq!(mode(&dest), 0o644);
+    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o640)).unwrap();
+    native::calculate_to_file(&bin, &s.input(), &dest).unwrap();
+    assert_eq!(mode(&dest), 0o640);
+    assert_eq!(std::fs::read(&dest).unwrap(), wtns_bytes(&witness(3)));
 }
