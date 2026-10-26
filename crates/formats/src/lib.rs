@@ -21,6 +21,8 @@ pub mod export_json;
 #[cfg(not(target_family = "wasm"))]
 pub mod file_info;
 pub mod json_out;
+#[cfg(not(target_family = "wasm"))]
+pub mod stage;
 pub mod wtns;
 
 use binfile::*;
