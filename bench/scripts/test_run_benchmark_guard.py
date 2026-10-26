@@ -33,10 +33,15 @@ exit "${PY_EXIT:-0}"
 
 QUIET = [5] * 13
 
+# Stands in for getconf, so a test can be a 2-core box.
+GETCONF = """#!/bin/bash
+echo "$CORES"
+"""
+
 
 class ContentionGuardTests(unittest.TestCase):
     def guard(self, samples, *args, status=0, proc=None, py_exit=None, pgid=None,
-              pgid_exit=None):
+              pgid_exit=None, cores=None):
         with tempfile.TemporaryDirectory() as directory:
             d = Path(directory)
             (d / "ps").write_text(PS)
@@ -47,11 +52,17 @@ class ContentionGuardTests(unittest.TestCase):
                 proc = d / "proc"
                 proc.mkdir()
                 (proc / "stat").write_text("cpu  1 2 3 4\n")
+            if cores is not None:
+                (d / "getconf").write_text(GETCONF)
+                (d / "getconf").chmod(0o755)
             (d / "samples").write_text("".join(f"{s}\n" for s in samples))
             env = dict(os.environ, PATH=f"{d}:{os.environ['PATH']}", COUNT=str(d / "count"),
                        SAMPLES=str(d / "samples"), G16_BASELINE_INTERVAL="0",
                        G16_PROC=str(proc or d / "no-proc"))
             env.pop("MAX_FOREIGN", None)
+            env.pop("ALLOW_LOADED", None)
+            if cores is not None:
+                env["CORES"] = str(cores)
             if py_exit is not None:
                 env["PY_EXIT"] = str(py_exit)
             if pgid is not None:
@@ -131,6 +142,50 @@ class ContentionGuardTests(unittest.TestCase):
         self.assertIn("baseline 0% of a core", out)
         self.assertIn("ceiling 50%", out)
         self.assertIn(f"measured as utime+stime deltas from {proc}", out)
+
+    def test_a_loaded_linux_start_refuses_to_run(self):
+        # A t3.small with a hog spinning before start read 99, and the old 200 cap was the
+        # whole box.
+        out, calls, err = self.guard([99] * 15 + [99], status=3, py_exit=0, cores=2)
+        self.assertEqual(calls, 15)
+        self.assertNotIn("contention guard:", out)
+        self.assertIn("used a median of 99% of a core at startup on this 2-core box", err)
+        self.assertIn("over the 50% limit (15 samples 0s apart: 99 99", err)
+        self.assertIn("measured as utime+stime deltas from", err)
+
+    def test_a_quiet_linux_start_passes_under_a_cap_scaled_to_the_box(self):
+        out, _, _ = self.guard([0, 1, 0] + [0] * 12 + [1], py_exit=0, cores=2)
+        self.assertIn("baseline 0% of a core", out)
+        self.assertIn("ceiling 51% = max(3x median, highest + 50) capped at 100", out)
+
+    def test_a_linux_median_at_the_limit_passes_but_never_gets_the_whole_box(self):
+        out, _, _ = self.guard([50] * 15 + [90], py_exit=0, cores=2)
+        self.assertIn("ceiling 100% = max(3x median, highest + 50) capped at 100", out)
+
+    def test_a_big_linux_box_keeps_the_200_cap(self):
+        out, _, _ = self.guard([40] * 15 + [30] + [180], py_exit=0, cores=8)
+        self.assertIn("ceiling 120%", out)
+        self.assertIn("capped at 200", out)
+
+    def test_allow_loaded_warns_on_a_loaded_linux_start_and_carries_on(self):
+        out, calls, err = self.guard([99] * 15 + [99], "--allow-loaded", py_exit=0, cores=2)
+        self.assertEqual(calls, 16)
+        self.assertIn("WARNING: foreign CPU median 99% of a core at startup, over the 50%", err)
+        self.assertNotIn("Wait for the box", err)
+        self.assertIn("ceiling 100%", out)
+
+    def test_an_explicit_ceiling_skips_the_loaded_start_check(self):
+        out, calls, err = self.guard([99], "--max-foreign", "150", py_exit=0, cores=2)
+        self.assertEqual(calls, 1)
+        self.assertNotIn("median", err)
+        self.assertIn("ceiling 150% of a core, set explicitly", out)
+
+    def test_a_loaded_macos_start_is_not_refused_and_keeps_the_200_cap(self):
+        # ps %cpu idles anywhere from 26 to over 200 on a desktop, so no startup limit there.
+        out, calls, err = self.guard([99] * 15 + [99], cores=2)
+        self.assertEqual(calls, 16)
+        self.assertNotIn("limit", err)
+        self.assertIn("ceiling 200% = max(3x median, highest + 50) capped at 200", out)
 
     def test_an_empty_startup_reading_refuses_to_run(self):
         out, calls, err = self.guard(QUIET[:3] + [""] + QUIET, status=4, py_exit=0)

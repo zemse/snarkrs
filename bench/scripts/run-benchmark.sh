@@ -19,7 +19,8 @@
 # are over it. --max-foreign fixes it instead; --guard-only prints the baseline and ceiling,
 # makes one check against them and exits. A reading that is not a number, or a process group
 # ps cannot report, stops the run at startup (exit 4); a bad reading mid-run is written into
-# the run record instead.
+# the run record instead. On Linux a startup median over half a core stops it too (exit 3),
+# and the cap is half a core per core when that is under 200.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -52,7 +53,7 @@ while [ $# -gt 0 ]; do
     --commit)       COMMIT_OVERRIDE="$2"; shift 2 ;;
     --no-build)     NO_BUILD=1; shift ;;
     --guard-only)   GUARD_ONLY=1; shift ;;
-    -h|--help)      sed -n '2,22p' "$0"; exit 0 ;;
+    -h|--help)      sed -n '2,23p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -95,9 +96,19 @@ log() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 # taken again one interval later and the run stops only if that one is over too. Idle
 # spikes here last a second or two; the competitors this exists for, a parallel build or a
 # second benchmark, hold the box for minutes.
+#
+# Only tightening still trusts the baseline, and on a small box that is not enough: a
+# t3.small with one spinning hog at startup read a median of 99, so the ceiling came out at
+# the 200 cap, which on two cores is the whole box, and nothing could ever trip it. Where
+# /proc gives a real delta a quiet Linux box reads 0 to 1%, so a median over half a core,
+# 50x the quiet reading and half of one hog, means something already holds the box and the
+# run refuses to start (--allow-loaded warns and marks it suspect instead). The cap there is
+# also half a core per core when that is lower, so the ceiling is never the whole box. The
+# macOS ps path keeps neither: its idle samples wander from 26 to over 200 here.
 CORES="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
 ALLOW_LOADED="${ALLOW_LOADED:-0}"
 LOADED_ANYWAY=0
+LOADED_LIMIT=""
 # An empty group would count our own work as foreign, so a failed lookup stops here too.
 pgid_rc=0
 MY_PGID="$(ps -o pgid= -p $$ | tr -d ' ')" || pgid_rc=$?
@@ -114,8 +125,12 @@ PROC="${G16_PROC:-/proc}"
 # procps reports lifetime CPU, so where /proc exists the sample is a delta over the
 # interval instead. macOS ps reports the scheduler's decaying recent average, which is
 # already current use.
+FOREIGN_CAP=200
+LOADED_START_MAX=""
 if [ -r "$PROC/stat" ]; then
   FOREIGN_METHOD="utime+stime deltas from $PROC"
+  LOADED_START_MAX=50
+  [ $(( CORES * 50 )) -ge "$FOREIGN_CAP" ] || FOREIGN_CAP=$(( CORES * 50 ))
   foreign_cpu() {
     python3 "$BENCH/scripts/foreign_cpu.py" --pgid "$MY_PGID" --interval "$INTERVAL" --proc "$PROC"
   }
@@ -144,7 +159,7 @@ foreign_ceiling() {
   local b="$1" peak="$2" c
   c=$(( b * 3 ))
   [ $(( peak + 50 )) -le "$c" ] || c=$(( peak + 50 ))
-  [ "$c" -le 200 ] || c=200
+  [ "$c" -le "$FOREIGN_CAP" ] || c="$FOREIGN_CAP"
   echo "$c"
 }
 
@@ -168,7 +183,23 @@ else
   done
   FOREIGN_BASELINE="$(printf '%s\n' $samples | sort -n | sed -n 8p)"
   MAX_FOREIGN="$(foreign_ceiling "$FOREIGN_BASELINE" "$(printf '%s\n' $samples | sort -n | tail -1)")"
-  GUARD_DESC="foreign CPU baseline ${FOREIGN_BASELINE}% of a core (median of samples:${samples}), ceiling ${MAX_FOREIGN}% = max(3x median, highest + 50) capped at 200; $RULE"
+  GUARD_DESC="foreign CPU baseline ${FOREIGN_BASELINE}% of a core (median of samples:${samples}), ceiling ${MAX_FOREIGN}% = max(3x median, highest + 50) capped at ${FOREIGN_CAP}; $RULE"
+  if [ -n "$LOADED_START_MAX" ] && [ "$FOREIGN_BASELINE" -gt "$LOADED_START_MAX" ]; then
+    if [ "$ALLOW_LOADED" = "1" ]; then
+      LOADED_ANYWAY=1
+      LOADED_LIMIT="$LOADED_START_MAX% at startup, or $MAX_FOREIGN"
+      echo "    WARNING: foreign CPU median ${FOREIGN_BASELINE}% of a core at startup, over the ${LOADED_START_MAX}% a quiet box stays under" >&2
+    else
+      echo >&2
+      echo "contention guard: other processes used a median of ${FOREIGN_BASELINE}% of a core at startup on this ${CORES}-core box," >&2
+      echo "over the ${LOADED_START_MAX}% limit (15 samples ${INTERVAL}s apart:${samples}, measured as $FOREIGN_METHOD)." >&2
+      echo "A quiet Linux box reads 0 to 1%, so something is already running, and a ceiling" >&2
+      echo "built on that baseline would let it through. Wait for the box to go idle, pass" >&2
+      echo "--max-foreign to set the ceiling yourself, or pass --allow-loaded to record anyway" >&2
+      echo "and mark the run as suspect." >&2
+      exit 3
+    fi
+  fi
 fi
 echo "    contention guard: $GUARD_DESC"
 
@@ -433,7 +464,8 @@ mkdir -p "$(dirname "$OUT")"
 # A run that was allowed through the load guard has to say so in the file itself. The
 # person reading the table months from now is not the person who typed --allow-loaded.
 if [ "$LOADED_ANYWAY" = "1" ]; then
-  NOTE="SUSPECT: recorded with --allow-loaded while other processes were using more than ${MAX_FOREIGN}% of a core on this ${CORES}-core box. Timings here include whatever else was running and should not be compared against a run taken on an idle machine.${NOTE:+ }${NOTE}"
+  LOADED_LIMIT="${LOADED_LIMIT:-$MAX_FOREIGN}"
+  NOTE="SUSPECT: recorded with --allow-loaded while other processes were using more than ${LOADED_LIMIT}% of a core on this ${CORES}-core box. Timings here include whatever else was running and should not be compared against a run taken on an idle machine.${NOTE:+ }${NOTE}"
 fi
 
 if [ -n "$UNMEASURED" ]; then
