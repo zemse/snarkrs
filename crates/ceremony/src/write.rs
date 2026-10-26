@@ -28,7 +28,7 @@
 
 use std::fs::File;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use ark_ff::BigInt;
@@ -73,41 +73,117 @@ pub fn staged<T>(
     destination: &Path,
     operation: impl FnOnce(&Path) -> Result<T, CeremonyError>,
 ) -> Result<T, CeremonyError> {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    staged_with_counter(destination, &NEXT, operation)
+    staged_with_counter(destination, &NEXT_STAGE, operation)
 }
+
+/// [`staged`] for a set of outputs that belong together, with any error type that an I/O
+/// error converts into.
+///
+/// `operation` gets one stage per destination, in order. Nothing is renamed until it has
+/// returned and every stage is synced, so an error up to that point leaves every
+/// destination as it was and removes every stage. The renames themselves are not one
+/// atomic step: a crash, or a rename that fails, between two of them leaves the earlier
+/// destinations replaced and the later ones not. A destination named twice is renamed
+/// over twice, and the later stage wins.
+pub fn staged_all<T, E: From<std::io::Error>>(
+    destinations: &[&Path],
+    operation: impl FnOnce(&[PathBuf]) -> Result<T, E>,
+) -> Result<T, E> {
+    staged_all_with_counter(destinations, &NEXT_STAGE, operation)
+}
+
+static NEXT_STAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn staged_with_counter<T>(
     destination: &Path,
     next: &std::sync::atomic::AtomicU64,
     operation: impl FnOnce(&Path) -> Result<T, CeremonyError>,
 ) -> Result<T, CeremonyError> {
+    staged_all_with_counter(&[destination], next, |stages| operation(&stages[0]))
+}
+
+/// One destination of [`staged_all`], from reservation to rename.
+struct Pending {
+    destination: PathBuf,
+    parent: PathBuf,
+    permissions: Option<std::fs::Permissions>,
+    stage: Stage,
+}
+
+fn staged_all_with_counter<T, E: From<std::io::Error>>(
+    destinations: &[&Path],
+    next: &std::sync::atomic::AtomicU64,
+    operation: impl FnOnce(&[PathBuf]) -> Result<T, E>,
+) -> Result<T, E> {
     use std::io::ErrorKind;
-    let destination = &follow_links(destination)?;
-    let Some(file_name) = destination.file_name() else {
-        return Err(std::io::Error::new(ErrorKind::InvalidInput, "output has no file name").into());
-    };
-    let permissions = match std::fs::symlink_metadata(destination) {
-        Ok(meta) => meta.is_file().then(|| meta.permissions()),
-        Err(e) if e.kind() == ErrorKind::NotFound => None,
-        Err(e) => return Err(e.into()),
-    };
-    let parent = destination
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let mut stage = Stage::create(parent, file_name, next)?;
-    let path = stage.path.as_ref().expect("uncommitted stage has a path");
-    let result = operation(path)?;
-    if let Some(permissions) = permissions {
-        std::fs::set_permissions(path, permissions)?;
+    let mut pending = Vec::with_capacity(destinations.len());
+    for destination in destinations {
+        let destination = follow_links(destination)?;
+        let Some(file_name) = destination.file_name() else {
+            return Err(
+                std::io::Error::new(ErrorKind::InvalidInput, "output has no file name").into(),
+            );
+        };
+        let permissions = match std::fs::symlink_metadata(&destination) {
+            Ok(meta) => meta.is_file().then(|| meta.permissions()),
+            Err(e) if e.kind() == ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
+        let parent = destination
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+            .to_path_buf();
+        let stage = Stage::create(&parent, file_name, next)?;
+        pending.push(Pending {
+            destination,
+            parent,
+            permissions,
+            stage,
+        });
     }
-    File::open(path)?.sync_all()?;
-    std::fs::rename(path, destination)?;
-    stage.path = None;
+    // Each stage avoids its own destination's name only. One that took another member's
+    // name would be renamed over before its own turn, so the set is refused instead.
+    for p in &pending {
+        let stage = p.stage.path.as_ref().expect("uncommitted stage has a path");
+        let clash = pending.iter().any(|q| {
+            q.parent == p.parent
+                && q.destination
+                    .file_name()
+                    .zip(stage.file_name())
+                    .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
+        });
+        if clash {
+            return Err(std::io::Error::new(
+                ErrorKind::AlreadyExists,
+                "an output is named like a ceremony stage",
+            )
+            .into());
+        }
+    }
+    let paths: Vec<PathBuf> = pending
+        .iter()
+        .map(|p| p.stage.path.clone().expect("uncommitted stage has a path"))
+        .collect();
+    let result = operation(&paths)?;
+    for (p, path) in pending.iter().zip(&paths) {
+        if let Some(permissions) = &p.permissions {
+            std::fs::set_permissions(path, permissions.clone())?;
+        }
+        File::open(path)?.sync_all()?;
+    }
+    for (p, path) in pending.iter_mut().zip(&paths) {
+        std::fs::rename(path, &p.destination)?;
+        p.stage.path = None;
+    }
     #[cfg(unix)]
-    if let Ok(dir) = File::open(parent) {
-        let _ = dir.sync_all();
+    for (i, p) in pending.iter().enumerate() {
+        if pending[..i].iter().any(|q| q.parent == p.parent) {
+            continue;
+        }
+        if let Ok(dir) = File::open(&p.parent) {
+            let _ = dir.sync_all();
+        }
     }
     Ok(result)
 }
@@ -138,11 +214,26 @@ fn follow_links(path: &Path) -> std::io::Result<std::path::PathBuf> {
     ))
 }
 
-struct Stage {
+/// A reserved, uniquely named file that is removed when it drops, unless committed.
+pub(crate) struct Stage {
     path: Option<std::path::PathBuf>,
 }
 
 impl Stage {
+    /// A private scratch file in `beside`'s directory, under a name no user file has.
+    pub(crate) fn beside(beside: &Path) -> std::io::Result<Self> {
+        let parent = beside
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let excluded = beside.file_name().unwrap_or_default();
+        Self::create(parent, excluded, &NEXT_STAGE)
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        self.path.as_deref().expect("uncommitted stage has a path")
+    }
+
     fn create(
         parent: &Path,
         excluded: &std::ffi::OsStr,
@@ -836,6 +927,48 @@ mod publication_tests {
             );
         }
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_set_publishes_all_or_nothing() {
+        let dir = dir("set");
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        std::fs::write(&a, b"old a").unwrap();
+        let result: Result<(), std::io::Error> = staged_all(&[&a, &b], |stages| {
+            std::fs::write(&stages[0], b"new a")?;
+            std::fs::write(&stages[1], b"new b")?;
+            Err(std::io::Error::other("late failure"))
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&a).unwrap(), b"old a");
+        assert!(!b.exists());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "orphan stage");
+        let result: Result<(), std::io::Error> = staged_all(&[&a, &b], |stages| {
+            std::fs::write(&stages[0], b"new a")?;
+            std::fs::write(&stages[1], b"new b")
+        });
+        result.unwrap();
+        assert_eq!(std::fs::read(&a).unwrap(), b"new a");
+        assert_eq!(std::fs::read(&b).unwrap(), b"new b");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_set_member_named_like_a_stage_is_refused() {
+        let dir = dir("set-clash");
+        let a = dir.join("a");
+        let clash = dir.join(format!(".snarkrs-stage-0-{}-0", std::process::id()));
+        let result: Result<(), std::io::Error> =
+            staged_all_with_counter(&[&a, &clash], &AtomicU64::new(0), |_| {
+                panic!("clashing set ran")
+            });
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "orphan stage");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

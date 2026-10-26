@@ -685,3 +685,88 @@ fn unaccelerated_writers_replace_destinations_without_leftovers() {
         );
     }
 }
+
+/// A log that fails on one line, which `ptau truncate` writes before each power.
+struct FailingLog(&'static str);
+
+impl snarkrs_ceremony::snarkjs_log::SnarkjsLog for FailingLog {
+    fn log(&mut self, _: snarkrs_ceremony::snarkjs_log::Level, msg: &str) -> std::io::Result<()> {
+        match msg == self.0 {
+            true => Err(std::io::Error::other("injected log failure")),
+            false => Ok(()),
+        }
+    }
+}
+
+/// A failure at power 3 publishes none of powers 1 and 2, absent or existing.
+#[test]
+fn truncate_late_error_publishes_no_power() {
+    let fixture = Fixture::new("truncate-all-or-nothing");
+    let out = fixture.dir.join("truncate");
+    std::fs::create_dir_all(&out).unwrap();
+    let ptau = snarkrs_ceremony::ptau::Ptau::open(&fixture.ptau).unwrap();
+    let template = out.join("t_").to_str().unwrap().to_owned();
+    let names: Vec<PathBuf> = (1..9).map(|p| out.join(format!("t_{p:02}.ptau"))).collect();
+    for existing in [false, true] {
+        if existing {
+            for name in &names {
+                std::fs::write(name, b"existing destination").unwrap();
+            }
+        }
+        let before = entries(&out);
+        let error = snarkrs_ceremony::ptau_export::ptau_truncate(
+            &ptau,
+            &template,
+            &mut FailingLog("Writing Power: 03"),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, CeremonyError::Io(_)),
+            "unexpected error: {error}"
+        );
+        for name in &names {
+            match existing {
+                true => assert_eq!(std::fs::read(name).unwrap(), b"existing destination"),
+                false => assert!(!name.exists(), "{} was published", name.display()),
+            }
+        }
+        assert_eq!(entries(&out), before, "orphan stage");
+    }
+    let written =
+        snarkrs_ceremony::ptau_export::ptau_truncate(&ptau, &template, &mut Vec::new()).unwrap();
+    assert_eq!(written, names);
+    for name in &names {
+        assert_ne!(std::fs::read(name).unwrap(), b"existing destination");
+    }
+}
+
+/// `zkey verify r1cs` keeps its init key under a reserved name, so a user file named
+/// like the old `<key>.verify-init.zkey` scratch file survives it.
+#[test]
+fn verify_from_r1cs_leaves_neighbouring_files_alone() {
+    let fixture = Fixture::new("verify-r1cs-scratch");
+    let dir = fixture.dir.join("verify");
+    std::fs::create_dir_all(&dir).unwrap();
+    let key = dir.join("final.zkey");
+    let neighbour = dir.join("final.verify-init.zkey");
+    let init = fixture.dir.join("init.zkey");
+    setup::setup(&fixture.r1cs, &fixture.ptau, &init, &CpuMsm::new()).unwrap();
+    contribute::contribute_with(
+        &init,
+        &key,
+        None,
+        transcript::rng_from_entropy_with(&[9; 64], "recovery phase2"),
+        &CpuKeyScale,
+    )
+    .unwrap();
+    std::fs::write(&neighbour, b"user file").unwrap();
+    let before = entries(&dir);
+    contribute::verify_from_r1cs(&fixture.r1cs, &fixture.ptau, &key, &CpuMsm::new()).unwrap();
+    assert_eq!(std::fs::read(&neighbour).unwrap(), b"user file");
+    assert_eq!(entries(&dir), before, "scratch key left behind");
+    let msm = FailMsm::new("msm_g1", 1);
+    let error = contribute::verify_from_r1cs(&fixture.r1cs, &fixture.ptau, &key, &msm).unwrap_err();
+    assert!(fake_device(&error), "unexpected error: {error}");
+    assert_eq!(std::fs::read(&neighbour).unwrap(), b"user file");
+    assert_eq!(entries(&dir), before, "scratch key left behind on failure");
+}

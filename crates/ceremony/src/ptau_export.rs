@@ -273,21 +273,28 @@ pub fn truncate_template(ptau_name: &str) -> String {
 
 /// `snarkjs powersoftau truncate <ptau>`: write `<template><pp>.ptau` for every power
 /// `1 .. power`, `pp` at least two digits, and return the paths in order.
+///
+/// Every file is staged before any is published, so a failure at one power leaves all
+/// of them as they were, where snarkjs keeps the ones it had finished. The renames that
+/// publish them are one after another: a crash between two still leaves a partial set.
 pub fn ptau_truncate<L: SnarkjsLog + ?Sized>(
     ptau: &Ptau,
     template: &str,
     log: &mut L,
 ) -> Result<Vec<PathBuf>, CeremonyError> {
     let h = *ptau.header();
-    let mut written = Vec::new();
-    for p in 1..h.power {
-        let sp = format!("{p:02}");
-        log.debug(&format!("Writing Power: {sp}"))?;
-        let path = PathBuf::from(format!("{template}{sp}.ptau"));
-        crate::write::staged(&path, |stage| truncate_one(ptau, p, stage))?;
-        written.push(path);
-    }
-    Ok(written)
+    let paths: Vec<PathBuf> = (1..h.power)
+        .map(|p| PathBuf::from(format!("{template}{p:02}.ptau")))
+        .collect();
+    let destinations: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
+    crate::write::staged_all(&destinations, |stages| {
+        for (p, stage) in (1..h.power).zip(stages) {
+            log.debug(&format!("Writing Power: {p:02}"))?;
+            truncate_one(ptau, p, stage)?;
+        }
+        Ok::<_, CeremonyError>(())
+    })?;
+    Ok(paths)
 }
 
 /// One `ptau_truncate` output at power `p`.

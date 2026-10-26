@@ -538,13 +538,11 @@ pub fn verify_from_r1cs(
     msm: &dyn MsmBackend,
 ) -> Result<ZkeyVerifyReport, CeremonyError> {
     // snarkjs keeps the init key in memory (`zkey_verify_fromr1cs.js:26`, a `bigMem`
-    // handle). At anon-aadhaar that is 631 MB, so this writes it beside the output
-    // instead and removes it afterwards.
-    let init = final_zkey.with_extension("verify-init.zkey");
-    let out = crate::setup::setup(r1cs, ptau, &init, msm)
-        .and_then(|_| verify_from_init(&init, ptau, final_zkey, msm));
-    let _ = std::fs::remove_file(&init);
-    out
+    // handle). At anon-aadhaar that is 631 MB, so this writes it beside the key instead,
+    // under a reserved name no user file can have, and removes it when it drops.
+    let init = crate::write::Stage::beside(final_zkey)?;
+    crate::setup::setup(r1cs, ptau, init.path(), msm)?;
+    verify_from_init(init.path(), ptau, final_zkey, msm)
 }
 
 fn fail(what: impl Into<String>) -> CeremonyError {
