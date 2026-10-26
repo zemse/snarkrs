@@ -28,7 +28,7 @@ use std::sync::Mutex;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_foundation::NSArray;
+use objc2_foundation::{NSArray, NSString};
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandBufferDescriptor, MTLCommandBufferEncoderInfo,
     MTLCommandBufferEncoderInfoErrorKey, MTLCommandBufferErrorOption, MTLCommandBufferStatus,
@@ -122,7 +122,16 @@ fn error_text(cb: &CommandBufferRef) -> String {
             _ => "?",
         };
         text.push_str(if i == 0 { " (encoders: " } else { ", " });
-        text.push_str(&e.label().to_string());
+        // `label` is bound as never null and comes back nil for an encoder nobody
+        // labelled, which is every ceremony and FFT encoder; the binding would panic on
+        // it, turning a refused buffer into a crash (seen once, in a power-16 prepare
+        // under the timing harness), so the message is sent by hand.
+        // SAFETY: `label` on an encoder info returns an autoreleased NSString or nil.
+        let label: Option<Retained<NSString>> = unsafe { objc2::msg_send![&*e, label] };
+        match label {
+            Some(label) => text.push_str(&label.to_string()),
+            None => text.push_str(&format!("encoder {i}")),
+        }
         text.push_str(": ");
         text.push_str(state);
     }
