@@ -28,13 +28,15 @@ use objc2_metal::{
     MTLResource,
 };
 use rayon::prelude::*;
-use snarkrs_field::raw::{RawFq, RawFq2};
+use snarkrs_field::raw::{RawField, RawFq, RawFq2};
 use snarkrs_field::{FftField, Field, Fr};
 use snarkrs_gpu_layout::glv::twiddle_table;
 use snarkrs_groth16::ProveError;
+use snarkrs_msm::glv;
 use snarkrs_msm::xyzz::Xyzz;
 
 use crate::ceremony::{cer_err, env_window, window_index, CER_WINDOWS};
+use crate::check::{self, CurveField, Reduced};
 use crate::enc::{dispatch_1d, read_back, set_params};
 use crate::kernels::{CEREMONY_MSL, FFT_MSL, FR_MSL, MSM_MSL, SEAL_MSL};
 use crate::layout::{Packed, PackedFq, PackedFq2};
@@ -124,6 +126,12 @@ struct Pass<'a> {
     params: FftParams,
     threads: usize,
     ladders_per_thread: usize,
+    /// The root whose powers `third` tabulates: the primitive `2^exp`-th root for a mix
+    /// pass, the block's own `2^bits`-th for the fused one. For the host's recompute of a
+    /// butterfly ([`probe`]).
+    root: Fr,
+    /// `1/n` for the fused pass, which scales both inputs; `None` for a mix pass.
+    scale: Option<Fr>,
 }
 
 /// One block's live state across the lockstep rounds of [`FftKernels::ifft_many`]: its
@@ -133,6 +141,7 @@ struct Block {
     idx: usize,
     n: usize,
     bits: u32,
+    size_inv: Fr,
     src: Buffer,
     dst: Buffer,
     stw: Buffer,
@@ -151,8 +160,8 @@ struct FftPipelines {
 /// only in the packing, and keeping this module's marker types here is what lets the whole
 /// FFT be added without touching the ladder and apply-key code it shares a crate with.
 trait FftGroup {
-    type Raw: Copy + Send + Sync;
-    type PackedPoint: Packed + Default + Send + Sync;
+    type Raw: CurveField;
+    type PackedPoint: Packed + Default + Reduced + Send + Sync;
     /// The curve whose GLV lattice a twiddle of this group decomposes against. The two
     /// groups share one `beta` and take different eigenvalues, so they take different
     /// lattices too; see item 4 of `shaders/fft.metal`.
@@ -485,27 +494,6 @@ impl FftKernels {
             let bits = n.trailing_zeros();
             let src = self.scratch(&[n, G::SCRATCH])?;
             let dst = self.scratch(&[n, G::SCRATCH])?;
-
-            // The input goes straight into the buffer rather than into a `Vec` that is
-            // then copied in. Metal buffers here are `StorageModeShared` (msm.rs:460), so
-            // the two are the same memory and the copy would be a second 268 MB of
-            // traffic per block at power 20 for nothing.
-            //
-            // `bit_reverse` (prepare.rs:256) is folded into that write, in gather form
-            // so the loop splits over the pool: the permutation is an involution, so
-            // `src[rev(i)] = a[i]` and `src[j] = a[rev(j)]` are the same map. Only this
-            // direction is applied, and the rotation at the bottom is the one that is
-            // NOT an involution.
-            //
-            // SAFETY: the buffer was just allocated with room for `n` of this type and
-            // nothing has been encoded against it, so no dispatch can be reading it.
-            let slots: &mut [G::PackedPoint] =
-                unsafe { core::slice::from_raw_parts_mut(src.contents().cast().as_ptr(), n) };
-            slots
-                .par_iter_mut()
-                .enumerate()
-                .for_each(|(j, s)| *s = G::pack(&a[bit_reverse_index(j, bits)]));
-
             let size_inv = Fr::from(n as u64)
                 .inverse()
                 .expect("a power of two is a unit mod r");
@@ -520,6 +508,7 @@ impl FftKernels {
                 idx: bi,
                 n,
                 bits,
+                size_inv,
                 src,
                 dst,
                 stw,
@@ -536,59 +525,118 @@ impl FftKernels {
         // stride for all of them and no block carries its own. Only the fused final
         // passes read their per-block `stw` instead.
         let tw = self.buffer(&twiddle_table::<G::Cfg>(max_bits, Fr::ONE))?;
+        let curve_b = G::Raw::b();
 
-        for exp in 1..=max_bits {
-            let round: Vec<Pass> = live
-                .iter()
-                .filter(|b| b.bits >= exp)
-                .map(|b| {
-                    if b.bits == exp {
-                        // The block's last pass: the mix with `1/n` fused in (see
-                        // `fft_mix_scale_impl`), dense over all `n/2` butterflies at
-                        // two ladders each, on the block's own scaled table.
-                        Pass {
-                            pso: mix_scale,
-                            src: &b.src,
-                            dst: &b.dst,
-                            third: &b.stw,
-                            params: FftParams {
-                                n: b.n as u32,
-                                ..Default::default()
-                            },
-                            threads: b.n / 2,
-                            ladders_per_thread: 2,
-                        }
-                    } else {
-                        // The mix grid is dense over the `j != 0` butterflies (see
-                        // `fft_mix_impl`): `groups * (span - 1)` ladder threads, except
-                        // at `exp == 1`, where every butterfly is `j == 0` and the pass
-                        // is all of them.
-                        let threads = if exp == 1 {
-                            b.n / 2
+        // The input goes straight into the buffer rather than into a `Vec` that is then
+        // copied in. Metal buffers here are `StorageModeShared` (msm.rs:460), so the two
+        // are the same memory and the copy would be a second 268 MB of traffic per block
+        // at power 20 for nothing.
+        //
+        // `bit_reverse` (prepare.rs:256) is folded into that write, in gather form so
+        // the loop splits over the pool: the permutation is an involution, so
+        // `src[rev(i)] = a[i]` and `src[j] = a[rev(j)]` are the same map. Only this
+        // direction is applied, and the rotation at the bottom is the one that is NOT
+        // an involution.
+        let fill = |b: &Block, a: &[Xyzz<G::Raw>]| {
+            // SAFETY: the buffer has room for `n` of this type and every dispatch
+            // encoded against it has been waited on, so nothing is reading it.
+            let slots: &mut [G::PackedPoint] =
+                unsafe { core::slice::from_raw_parts_mut(b.src.contents().cast().as_ptr(), b.n) };
+            slots
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(j, s)| *s = G::pack(&a[bit_reverse_index(j, b.bits)]));
+        };
+
+        // The rounds, then every block's points held to the curve once, at the end.
+        //
+        // Not once per pass, where the MSM and the ceremony ladders check: a pass over a
+        // 2^20-point G2 block is a million six-multiplication checks against a GPU pass
+        // of about a second, so twenty of them on one host thread would cost half the
+        // transform, and the pool is busy with the sub-crossover blocks meanwhile. Once
+        // is a twentieth of that, and it loses nothing: a wrong word anywhere makes a
+        // point off the curve, the butterflies are rational maps, so the next pass
+        // carries it into two points, the one after into four, and the last into at
+        // least one output. What the scan cannot see, a destination left holding the
+        // previous pass's points, is on the curve; `probe` catches that at the
+        // dispatch, from the pass's own source. A failed scan re-runs the whole call
+        // from `blocks`, which nothing has written yet, after the backoff a refused
+        // submission takes.
+        for attempt in 0..crate::cb::RETRIES {
+            for b in &live {
+                fill(b, &*blocks[b.idx]);
+            }
+            for exp in 1..=max_bits {
+                let round: Vec<Pass> = live
+                    .iter()
+                    .filter(|b| b.bits >= exp)
+                    .map(|b| {
+                        if b.bits == exp {
+                            // The block's last pass: the mix with `1/n` fused in (see
+                            // `fft_mix_scale_impl`), dense over all `n/2` butterflies
+                            // at two ladders each, on the block's own scaled table.
+                            Pass {
+                                pso: mix_scale,
+                                src: &b.src,
+                                dst: &b.dst,
+                                third: &b.stw,
+                                params: FftParams {
+                                    n: b.n as u32,
+                                    ..Default::default()
+                                },
+                                threads: b.n / 2,
+                                ladders_per_thread: 2,
+                                root: primitive_root(b.bits),
+                                scale: Some(b.size_inv),
+                            }
                         } else {
-                            b.n / 2 - (b.n >> exp)
-                        };
-                        Pass {
-                            pso: mix,
-                            src: &b.src,
-                            dst: &b.dst,
-                            third: &tw,
-                            params: FftParams {
-                                n: b.n as u32,
-                                span: 1 << (exp - 1),
-                                log_span: exp - 1,
-                                tw_shift: max_bits - exp,
-                                gid_off: 0,
-                            },
-                            threads,
-                            ladders_per_thread: 1,
+                            // The mix grid is dense over the `j != 0` butterflies (see
+                            // `fft_mix_impl`): `groups * (span - 1)` ladder threads,
+                            // except at `exp == 1`, where every butterfly is `j == 0`
+                            // and the pass is all of them.
+                            let threads = if exp == 1 {
+                                b.n / 2
+                            } else {
+                                b.n / 2 - (b.n >> exp)
+                            };
+                            Pass {
+                                pso: mix,
+                                src: &b.src,
+                                dst: &b.dst,
+                                third: &tw,
+                                params: FftParams {
+                                    n: b.n as u32,
+                                    span: 1 << (exp - 1),
+                                    log_span: exp - 1,
+                                    tw_shift: max_bits - exp,
+                                    gid_off: 0,
+                                },
+                                threads,
+                                ladders_per_thread: 1,
+                                root: primitive_root(exp),
+                                scale: None,
+                            }
                         }
-                    }
-                })
-                .collect();
-            self.run_round::<G>(&round)?;
-            for b in live.iter_mut().filter(|b| b.bits >= exp) {
-                core::mem::swap(&mut b.src, &mut b.dst);
+                    })
+                    .collect();
+                self.run_round::<G>(&round, curve_b)?;
+                for b in live.iter_mut().filter(|b| b.bits >= exp) {
+                    core::mem::swap(&mut b.src, &mut b.dst);
+                }
+            }
+            match blocks_on_curve::<G>(&live, curve_b) {
+                Ok(()) => break,
+                Err(e) if attempt + 1 < crate::cb::RETRIES => {
+                    let thread = std::thread::current();
+                    eprintln!(
+                        "metal: attempt {} of {} failed on thread {}: {e}; re-running the transform",
+                        attempt + 1,
+                        crate::cb::RETRIES,
+                        thread.name().unwrap_or("unnamed"),
+                    );
+                    std::thread::sleep(crate::cb::backoff(attempt + 1));
+                }
+                Err(e) => return Err(e),
             }
         }
 
@@ -646,7 +694,7 @@ impl FftKernels {
     /// Every commit checks both status and a completion seal. A faulted buffer that went
     /// unnoticed would leave the previous pass's points in a `dst`, which is a wrong
     /// point in a file that is otherwise perfectly formed.
-    fn run_round<G: FftGroup>(&self, round: &[Pass]) -> Result<(), ProveError> {
+    fn run_round<G: FftGroup>(&self, round: &[Pass], curve_b: G::Raw) -> Result<(), ProveError> {
         let budget = G::budget(self).unwrap_or(G::BUDGET);
         let mut batch: Vec<(&Pass, FftParams, usize)> = Vec::new();
         let mut used = 0usize;
@@ -658,7 +706,7 @@ impl FftKernels {
                 // stays flat across the mixture.
                 let take = ((budget - used) / pass.ladders_per_thread).min(pass.threads - done);
                 if take == 0 && !batch.is_empty() {
-                    self.dispatch_with_retry(&batch)?;
+                    self.dispatch_with_retry::<G>(&batch, curve_b)?;
                     batch.clear();
                     used = 0;
                     continue;
@@ -673,22 +721,27 @@ impl FftKernels {
                 used += take * pass.ladders_per_thread;
                 done += take;
                 if used >= budget {
-                    self.dispatch_with_retry(&batch)?;
+                    self.dispatch_with_retry::<G>(&batch, curve_b)?;
                     batch.clear();
                     used = 0;
                 }
             }
         }
         if !batch.is_empty() {
-            self.dispatch_with_retry(&batch)?;
+            self.dispatch_with_retry::<G>(&batch, curve_b)?;
         }
         Ok(())
     }
 
-    /// One round's pieces, re-submitted from unchanged source buffers on a refusal.
+    /// One round's pieces, re-submitted from unchanged source buffers on a refusal, or
+    /// on a piece whose probed butterfly is not what the host computes from that source.
     /// Destinations are disjoint from sources and every attempt is waited on before
     /// the next one writes them; `cb::with_retry` also replaces an ignored queue.
-    fn dispatch_with_retry(&self, batch: &[(&Pass, FftParams, usize)]) -> Result<(), ProveError> {
+    fn dispatch_with_retry<G: FftGroup>(
+        &self,
+        batch: &[(&Pass, FftParams, usize)],
+        curve_b: G::Raw,
+    ) -> Result<(), ProveError> {
         let outputs: Vec<NonNull<ProtocolObject<dyn MTLResource>>> = batch
             .iter()
             .map(|(pass, _, _)| NonNull::from(ProtocolObject::from_ref(&**pass.dst)))
@@ -720,8 +773,11 @@ impl FftKernels {
             let token = self.seal.encode(&enc);
             enc.endEncoding();
             cb.commit();
-            self.seal.wait(&cb, token, "ceremony group inverse fft")?;
+            self.seal.wait(&cb, token, GROUP_IFFT)?;
             crate::cb::stored(batch[0].0.dst);
+            for (pass, p, take) in batch {
+                probe::<G>(pass, p, *take, curve_b)?;
+            }
             Ok(())
         })
     }
@@ -733,6 +789,117 @@ impl FftKernels {
     fn buffer<T: Packed>(&self, items: &[T]) -> Result<Buffer, ProveError> {
         crate::enc::buffer(&self.device, items)
     }
+}
+
+const GROUP_IFFT: &str = "ceremony group inverse fft";
+
+/// The primitive `2^bits`-th root of unity, the one `twiddle_table` raises to its powers.
+fn primitive_root(bits: u32) -> Fr {
+    let mut root = Fr::TWO_ADIC_ROOT_OF_UNITY;
+    for _ in bits..Fr::TWO_ADICITY {
+        root.square_in_place();
+    }
+    root
+}
+
+/// One thread of a piece, recomputed on the host and held to what the piece wrote.
+///
+/// The thread is [`check::spot`] of the piece's parameters, so every piece of a run
+/// probes a fixed position and consecutive pieces probe different ones. Its butterflies
+/// are the ones `fft_mix_impl` or `fft_mix_scale_impl` gives that thread, index for
+/// index, computed from the piece's source with the host ladder and compared as points,
+/// since the two ladders reach different representatives. What this catches that a
+/// curve check cannot: a destination the GPU reported written and left holding the
+/// previous pass's points, which are on the curve.
+///
+/// An input off the curve is an earlier pass's wrong store, not this piece's; the probe
+/// stands aside and the scan over the finished blocks refuses it, so the re-run is of
+/// the whole transform rather than eight of a piece that cannot come out right.
+fn probe<G: FftGroup>(
+    pass: &Pass,
+    p: &FftParams,
+    take: usize,
+    curve_b: G::Raw,
+) -> Result<(), ProveError> {
+    let n = p.n as usize;
+    // SAFETY: both buffers hold `n` points of this type; the source is read-only for the
+    // round and the command buffer that wrote the destination has completed. `Packed`,
+    // so every bit pattern is a value.
+    let src: &[G::PackedPoint] = unsafe { read_back(pass.src, n) };
+    let dst: &[G::PackedPoint] = unsafe { read_back(pass.dst, n) };
+    let salt = (u64::from(p.n) << 40) ^ (u64::from(p.span) << 32) ^ u64::from(p.gid_off);
+    let d = p.gid_off as usize + check::spot(take, salt);
+    let half = n / 2;
+
+    // `(lo, hi, twiddle on hi)`, in the kernels' index arithmetic.
+    let mut butterflies: Vec<(usize, usize, Option<Fr>)> = Vec::with_capacity(2);
+    if let Some(s) = pass.scale {
+        butterflies.push((d, d + half, Some(s * pass.root.pow([d as u64]))));
+    } else if p.span == 1 {
+        butterflies.push((2 * d, 2 * d + 1, None));
+    } else {
+        let span = p.span as usize;
+        let groups = half >> p.log_span;
+        let g = d / (span - 1);
+        let j = 1 + (d - g * (span - 1));
+        let lo = (g << (p.log_span + 1)) + j;
+        butterflies.push((lo, lo + span, Some(pass.root.pow([j as u64]))));
+        if d < groups {
+            let lo0 = d << (p.log_span + 1);
+            butterflies.push((lo0, lo0 + span, None));
+        }
+    }
+
+    for (lo, hi, w) in butterflies {
+        if !src[lo].reduced() || !src[hi].reduced() {
+            return Ok(());
+        }
+        let (u, t) = (G::unpack(&src[lo]), G::unpack(&src[hi]));
+        if !check::xyzz_on_curve(&u, curve_b) || !check::xyzz_on_curve(&t, curve_b) {
+            return Ok(());
+        }
+        let t = match w {
+            Some(w) => glv::mul(&t, &w),
+            None => t,
+        };
+        let u = match pass.scale {
+            Some(s) => glv::mul(&u, &s),
+            None => u,
+        };
+        let mut sum = u;
+        sum.add_assign(&t);
+        let mut diff = u;
+        diff.add_assign(&Xyzz { y: t.y.neg(), ..t });
+        for (i, want) in [(lo, sum), (hi, diff)] {
+            if !dst[i].reduced() || !check::same_point(&G::unpack(&dst[i]), &want) {
+                return Err(check::wrong(
+                    GROUP_IFFT,
+                    format!("point {i} of a {n}-point block is not the host butterfly's"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Every point of every finished block, held to the curve. See the note on the attempt
+/// loop in [`FftKernels::ifft_many`] for why once, at the end.
+fn blocks_on_curve<G: FftGroup>(live: &[Block], curve_b: G::Raw) -> Result<(), ProveError> {
+    for b in live {
+        // SAFETY: the last round completed, and `n` points of this type is exactly what
+        // its pass wrote into what is now `src`.
+        let got: &[G::PackedPoint] = unsafe { read_back(&b.src, b.n) };
+        let bad = got
+            .par_iter()
+            .position_any(|p| !p.reduced() || !check::xyzz_on_curve(&G::unpack(p), curve_b));
+        if let Some(i) = bad {
+            return Err(check::wrong(
+                GROUP_IFFT,
+                format!("point {i} of a {}-point block is not on the curve", b.n),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// `i` with its low `bits` bits reversed, the permutation `bit_reverse` (prepare.rs:256)
@@ -918,6 +1085,15 @@ mod tests {
             .collect()
     }
 
+    /// `n` points with none at infinity, for the test that corrupts point 0 of a
+    /// destination: a wrong word beside a zero `ZZ` is still the identity, so on
+    /// `block_g1`'s inputs, where point 0 of a pass is often one, the fault would be
+    /// harmless and nothing would need to notice it.
+    fn dense_g1(seed: u64, n: usize) -> Vec<Xyzz<RawFq>> {
+        let mut rng = Lcg(seed);
+        (0..n).map(|_| scaled_g1(rng.fr(), rng.word())).collect()
+    }
+
     fn kernels() -> Option<FftKernels> {
         // No device on a headless builder is a skip, not a failure, the same way the
         // artifact-gated tests in `msm.rs` skip.
@@ -1038,6 +1214,69 @@ mod tests {
         let mut got = pts;
         k.ifft_g1(&mut got).unwrap();
         assert!(same_g1(&got, &want));
+    }
+
+    /// A wrong store under a good token is refused and re-run: by the piece's probe when
+    /// the probed thread wrote the wrong word, which costs one more wait, otherwise by
+    /// the scan over the finished blocks, which re-runs the transform. Either way the
+    /// answer is the CPU's. Wrong on every attempt, the call fails and the caller's
+    /// points are as they were. No point at infinity in the inputs (see `dense_g1`);
+    /// `an_all_infinity_block_stays_infinity` covers those.
+    #[test]
+    fn a_wrong_store_is_retried_by_the_fft() {
+        use crate::cb::inject::{self, Fault};
+        let Some(k) = kernels() else { return };
+        let k = k.with_min_block(1).with_budget(7);
+        let base: Vec<Vec<_>> = [4usize, 8, 16]
+            .into_iter()
+            .map(|n| dense_g1(0x5eed_2930 + n as u64, n))
+            .collect();
+        let mut want = base.clone();
+        for block in &mut want {
+            CpuGroupFft.ifft_g1(block).unwrap();
+        }
+        let run = |got: &mut Vec<Vec<Xyzz<RawFq>>>| {
+            k.ifft_g1_many(&mut got.iter_mut().map(Vec::as_mut_slice).collect::<Vec<_>>())
+        };
+        inject::arm(None);
+        let mut got = base.clone();
+        run(&mut got).unwrap();
+        let calls = inject::calls();
+        assert!(calls > 0);
+        let (mut by_probe, mut by_scan) = (0, 0);
+        for at in 0..calls {
+            inject::arm_with(Some((at, Fault::WrongStore)), false);
+            let mut got = base.clone();
+            run(&mut got).unwrap();
+            assert!(inject::fired(), "wait {at}");
+            assert!(inject::calls() > calls, "wait {at}: no retry");
+            if inject::calls() == calls + 1 {
+                by_probe += 1;
+            } else {
+                by_scan += 1;
+            }
+            for (g, w) in got.iter().zip(&want) {
+                assert!(same_g1(g, w), "wait {at}");
+            }
+            inject::arm(None);
+        }
+        eprintln!(
+            "{calls} waits: {by_probe} wrong stores caught by the probe, {by_scan} by the scan"
+        );
+
+        inject::arm_with(Some((0, Fault::WrongStore)), true);
+        let mut got = base.clone();
+        assert!(matches!(run(&mut got), Err(ProveError::Device { .. })));
+        assert!(inject::fired());
+        for (g, b) in got.iter().zip(&base) {
+            assert!(same_g1(g, b), "a failed call wrote its points");
+        }
+        inject::arm(None);
+        let mut got = base.clone();
+        run(&mut got).unwrap();
+        for (g, w) in got.iter().zip(&want) {
+            assert!(same_g1(g, w));
+        }
     }
 
     /// Every block size from 2^0 to 2^12, which is every size a ptau file below power 12

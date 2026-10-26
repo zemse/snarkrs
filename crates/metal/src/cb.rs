@@ -192,8 +192,8 @@ pub(crate) fn wait_ok(cb: &CommandBufferRef, context: &str) -> Result<(), ProveE
 pub(crate) const RETRIES: u32 = 8;
 
 /// Backoff before attempt `attempt` (from 1): 400, 800, then 1600 ms, so eight attempts
-/// wait 9.2 s in all.
-fn backoff(attempt: u32) -> std::time::Duration {
+/// wait 9.2 s in all. The group FFT's whole-transform re-run (`fft.rs`) waits the same.
+pub(crate) fn backoff(attempt: u32) -> std::time::Duration {
     std::time::Duration::from_millis(200 << attempt.min(3))
 }
 

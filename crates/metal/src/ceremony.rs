@@ -13,14 +13,17 @@
 
 use objc2::rc::autoreleasepool;
 use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder};
-use snarkrs_field::raw::{RawFq, RawFq2};
+use rayon::prelude::*;
+use snarkrs_field::raw::{RawField, RawFq, RawFq2};
 use snarkrs_field::{
     AffineRepr, CurveGroup, Field, Fq, Fq2, Fr, G1Affine, G1Projective, G2Affine, G2Projective,
 };
 use snarkrs_groth16::ProveError;
+use snarkrs_msm::glv::{self, GlvField};
 use snarkrs_msm::xyzz::Xyzz;
 use snarkrs_msm::{AccelError, GroupFft, KeyScale, MsmBackend};
 
+use crate::check::{self, CurveField, Reduced};
 use crate::enc::{dispatch_1d, read_back, set_params};
 use crate::fft::FftKernels;
 use crate::kernels::{CEREMONY_MSL, FR_MSL, MSM_MSL, SEAL_MSL};
@@ -453,12 +456,12 @@ pub(crate) fn window_index(c: u32) -> usize {
 /// What the two ladder kernels and the two batch-to-affine kernels need to know about a
 /// group, so the submission code is written once.
 trait CerGroup {
-    type Raw: Copy;
+    type Raw: CurveField;
     type Field: Field;
-    type PackedField: Packed + Default;
-    type PackedPoint: Packed + Default;
-    type PackedAffine: Packed + Default;
-    type Affine;
+    type PackedField: Packed + Default + Reduced + Sync;
+    type PackedPoint: Packed + Default + Reduced + Sync;
+    type PackedAffine: Packed + Default + Reduced + PartialEq + Sync;
+    type Affine: AffineRepr<ScalarField = Fr>;
 
     /// Names this group in an error, in the spelling [`AccelError`] uses.
     const OP: &'static str;
@@ -469,6 +472,14 @@ trait CerGroup {
     fn unpack_affine(p: &Self::PackedAffine) -> Self::Affine;
     fn field(p: &Self::PackedField) -> Self::Field;
     fn pack_field(f: &Self::Field) -> Self::PackedField;
+    /// The raw form of a field element read back, for the host's recompute of it. Only
+    /// after [`Reduced::reduced`] said it is one.
+    fn raw_field(f: &Self::PackedField) -> Self::Raw;
+    /// The raw coordinates of an affine point read back, `(0, 0)` for the identity. Same
+    /// condition.
+    fn raw_affine(p: &Self::PackedAffine) -> (Self::Raw, Self::Raw);
+    /// The packed affine point at raw coordinates, `(0, 0)` for the identity.
+    fn affine_from_raw(x: Self::Raw, y: Self::Raw) -> Self::PackedAffine;
     fn pipelines(k: &CeremonyKernels) -> &GroupPipelines;
     fn window(k: &CeremonyKernels) -> u32;
 }
@@ -518,6 +529,21 @@ impl CerGroup for CerG1 {
 
     fn pack_field(f: &Fq) -> PackedFq {
         PackedFq::from_fq(f)
+    }
+
+    fn raw_field(f: &PackedFq) -> RawFq {
+        RawFq::from_fq(&f.to_fq())
+    }
+
+    fn raw_affine(p: &PackedG1Affine) -> (RawFq, RawFq) {
+        (RawFq::from_fq(&p.x.to_fq()), RawFq::from_fq(&p.y.to_fq()))
+    }
+
+    fn affine_from_raw(x: RawFq, y: RawFq) -> PackedG1Affine {
+        PackedG1Affine {
+            x: PackedFq::from_fq(&x.to_fq()),
+            y: PackedFq::from_fq(&y.to_fq()),
+        }
     }
 
     fn pipelines(k: &CeremonyKernels) -> &GroupPipelines {
@@ -573,6 +599,24 @@ impl CerGroup for CerG2 {
         PackedFq2::from_fq2(f)
     }
 
+    fn raw_field(f: &PackedFq2) -> RawFq2 {
+        RawFq2::from_fq2(&f.to_fq2())
+    }
+
+    fn raw_affine(p: &PackedG2Affine) -> (RawFq2, RawFq2) {
+        (
+            RawFq2::from_fq2(&p.x.to_fq2()),
+            RawFq2::from_fq2(&p.y.to_fq2()),
+        )
+    }
+
+    fn affine_from_raw(x: RawFq2, y: RawFq2) -> PackedG2Affine {
+        PackedG2Affine {
+            x: PackedFq2::from_fq2(&x.to_fq2()),
+            y: PackedFq2::from_fq2(&y.to_fq2()),
+        }
+    }
+
     fn pipelines(k: &CeremonyKernels) -> &GroupPipelines {
         &k.g2
     }
@@ -588,6 +632,12 @@ impl CerGroup for CerG2 {
 /// Compiling the library is the expensive call and it belongs once at the top of a
 /// command, exactly as [`crate::msm::MetalMsm::new`] does. Nothing here holds per-command
 /// state, so one instance serves a whole run.
+///
+/// Every readback is checked before its submission counts as done ([`crate::check`]):
+/// the points against the curve, the segment products and the affine points against the
+/// inputs they came from, and one point a chunk against the host's own answer. A store
+/// the GPU reported and did not make is re-run the way a killed buffer is, and the
+/// caller never sees it.
 pub struct CeremonyKernels {
     device: Device,
     queue: crate::cb::Queue,
@@ -755,9 +805,14 @@ impl CeremonyKernels {
         }
         let pipelines = G::pipelines(self);
         let pso = &pipelines.point_mul[window_index(G::window(self))];
+        let b = G::Raw::b();
         let mut out = Vec::with_capacity(points.len());
 
-        for (pts, scs) in points.chunks(self.chunk).zip(scalars.chunks(self.chunk)) {
+        for (ci, (pts, scs)) in points
+            .chunks(self.chunk)
+            .zip(scalars.chunks(self.chunk))
+            .enumerate()
+        {
             // One pool per chunk. Command buffers and encoders are autoreleased and a
             // Rust binary drains nothing on its own; see the longer note in
             // `stages::HResident::compute_h`. A `ptau prepare` submits one of these per
@@ -772,6 +827,9 @@ impl CeremonyKernels {
                     n: n as u32,
                     ..Default::default()
                 };
+                // One multiplication of the chunk on the host, to hold the readback to.
+                let at = check::spot(n, ci as u64);
+                let want = glv::mul(&pts[at], &scs[at]);
 
                 crate::cb::with_retry(&self.queue, |queue| {
                     let cb = crate::cb::command_buffer(queue);
@@ -785,14 +843,22 @@ impl CeremonyKernels {
                     let token = self.seal.encode(&enc);
                     enc.endEncoding();
                     cb.commit();
-                    self.seal
-                        .wait(&cb, token, "ceremony point scalar multiplication")?;
+                    self.seal.wait(&cb, token, POINT_MUL)?;
                     crate::cb::stored(&out_buf);
+                    // SAFETY: the command buffer completed, and `n` points of this type
+                    // is exactly what the kernel wrote.
+                    let got: &[G::PackedPoint] = unsafe { read_back(&out_buf, n) };
+                    points_on_curve::<G>(got, b, POINT_MUL)?;
+                    if !check::same_point(&G::unpack_point(&got[at]), &want) {
+                        return Err(check::wrong(
+                            POINT_MUL,
+                            format!("point {at} is not the host ladder's"),
+                        ));
+                    }
                     Ok(())
                 })?;
 
-                // SAFETY: the command buffer completed, and `n` points of this type is
-                // exactly what the kernel wrote.
+                // SAFETY: as above, and the readback passed its checks.
                 let got: &[G::PackedPoint] = unsafe { read_back(&out_buf, n) };
                 out.extend(got.iter().map(G::unpack_point));
                 Ok(())
@@ -806,7 +872,7 @@ impl CeremonyKernels {
         points: &[Xyzz<G::Raw>],
     ) -> Result<Vec<G::Affine>, ProveError> {
         let mut out = Vec::with_capacity(points.len());
-        for pts in points.chunks(self.chunk) {
+        for (ci, pts) in points.chunks(self.chunk).enumerate() {
             // As in `point_mul`: the pool has to wrap both of `affine_from_device`'s
             // submissions, so it sits outside the call rather than inside it.
             autoreleasepool(|_| -> Result<(), ProveError> {
@@ -814,7 +880,10 @@ impl CeremonyKernels {
                 let packed: Vec<G::PackedPoint> = pts.iter().map(G::pack_point).collect();
                 let in_buf = self.buffer(&packed)?;
                 let aff = self.scratch::<G::PackedAffine>(n)?;
-                self.affine_from_device::<G>(&in_buf, &aff, n, None)?;
+                // One point normalised on the host, to hold the finish pass to.
+                let at = check::spot(n, ci as u64);
+                let want = host_affine::<G>(&pts[at]);
+                self.affine_from_device::<G>(&in_buf, &aff, n, None, (at, want))?;
                 // SAFETY: as above, and `PackedAffine` is `Packed`, so every bit pattern
                 // is a valid value.
                 let got: &[G::PackedAffine] = unsafe { read_back(&aff, n) };
@@ -851,6 +920,15 @@ impl CeremonyKernels {
                     inc: PackedFr::from_fr(&inc),
                     ..Default::default()
                 };
+                // One point scaled on the host, to hold the finish pass to. Affine is
+                // canonical, so the comparison is word for word.
+                let at = check::spot(n, ci as u64);
+                let k = if inc == Fr::ONE {
+                    first
+                } else {
+                    first * inc.pow([(ci * chunk + at) as u64])
+                };
+                let want = G::pack_affine(&(block[at] * k).into_affine());
 
                 // The ladder and the first batch-to-affine pass go into one command
                 // buffer: dispatches inside a serial compute encoder are ordered and
@@ -863,7 +941,7 @@ impl CeremonyKernels {
                     set_params(enc, 2, &p);
                     dispatch_1d(enc, pso, n, 64);
                 };
-                self.affine_from_device::<G>(&xyzz, &aff, n, Some(&ladder))?;
+                self.affine_from_device::<G>(&xyzz, &aff, n, Some(&ladder), (at, want))?;
 
                 // SAFETY: the command buffer completed and `n` affine points is what the
                 // finish pass wrote.
@@ -882,12 +960,21 @@ impl CeremonyKernels {
     ///
     /// `pre` is encoded into the first command buffer ahead of the prefix pass, so a
     /// caller that produced `pts` on the device pays one submission instead of two.
+    ///
+    /// Each pass's readback is checked before its submission is allowed to succeed, so
+    /// a wrong store is re-run where it happened (see [`crate::check`]): the prefix
+    /// pass's segment products are recomputed from the points, and, when `pre` ran a
+    /// ladder into `pts`, its points are held to the curve first, since nothing after
+    /// this readback can tell a wrong ladder output from a right one. The finish pass's
+    /// points are held to the inputs they normalise, and the one at `spot.0` to `spot.1`,
+    /// the caller's own answer for it.
     fn affine_from_device<G: CerGroup>(
         &self,
         pts: &Buffer,
         out: &Buffer,
         n: usize,
         pre: Option<&dyn Fn(&ComputeCommandEncoderRef)>,
+        spot: (usize, G::PackedAffine),
     ) -> Result<(), ProveError> {
         if n == 0 {
             return Ok(());
@@ -902,6 +989,7 @@ impl CeremonyKernels {
             segments: segments as u32,
             ..Default::default()
         };
+        let b = G::Raw::b();
 
         crate::cb::with_retry(&self.queue, |queue| {
             let cb = crate::cb::command_buffer(queue);
@@ -918,14 +1006,20 @@ impl CeremonyKernels {
             let token = self.seal.encode(&enc);
             enc.endEncoding();
             cb.commit();
-            self.seal
-                .wait(&cb, token, "ceremony batch-to-affine, prefix pass")?;
+            self.seal.wait(&cb, token, PREFIX_PASS)?;
             crate::cb::stored(&segprod);
-            Ok(())
+            // SAFETY: the command buffer completed; `pts` holds `n` points, written by
+            // `pre` or uploaded by the caller, and the prefix pass wrote one field
+            // element per segment.
+            let points: &[G::PackedPoint] = unsafe { read_back(pts, n) };
+            let got: &[G::PackedField] = unsafe { read_back(&segprod, segments) };
+            if pre.is_some() {
+                points_on_curve::<G>(points, b, PREFIX_PASS)?;
+            }
+            segment_products::<G>(points, got, PREFIX_PASS)
         })?;
 
-        // SAFETY: the command buffer completed and the prefix pass wrote one field
-        // element per segment.
+        // SAFETY: as above, and the readback passed its checks.
         let got: &[G::PackedField] = unsafe { read_back(&segprod, segments) };
         let seeds = self.buffer(&build_seeds::<G>(got)?)?;
 
@@ -942,13 +1036,118 @@ impl CeremonyKernels {
             let token = self.seal.encode(&enc);
             enc.endEncoding();
             cb.commit();
-            self.seal
-                .wait(&cb, token, "ceremony batch-to-affine, finish pass")?;
+            self.seal.wait(&cb, token, FINISH_PASS)?;
             crate::cb::stored(out);
+            // SAFETY: the command buffer completed, `pts` is as the prefix pass read
+            // it, and the finish pass wrote `n` affine points.
+            let points: &[G::PackedPoint] = unsafe { read_back(pts, n) };
+            let got: &[G::PackedAffine] = unsafe { read_back(out, n) };
+            affine_of::<G>(points, got, FINISH_PASS)?;
+            if got[spot.0] != spot.1 {
+                return Err(check::wrong(
+                    FINISH_PASS,
+                    format!("point {} is not the host's", spot.0),
+                ));
+            }
             Ok(())
         })?;
         Ok(())
     }
+}
+
+const POINT_MUL: &str = "ceremony point scalar multiplication";
+const PREFIX_PASS: &str = "ceremony batch-to-affine, prefix pass";
+const FINISH_PASS: &str = "ceremony batch-to-affine, finish pass";
+
+/// Every point of a readback is a field element per coordinate and a point of the curve.
+///
+/// On the pool: six multiplications a point, against a ladder of hundreds, is still a
+/// few percent of a chunk's wall time if it runs on one thread beside an idle device.
+fn points_on_curve<G: CerGroup>(
+    got: &[G::PackedPoint],
+    b: G::Raw,
+    context: &str,
+) -> Result<(), ProveError> {
+    let bad = got
+        .par_iter()
+        .position_any(|p| !p.reduced() || !check::xyzz_on_curve(&G::unpack_point(p), b));
+    match bad {
+        Some(i) => Err(check::wrong(
+            context,
+            format!("point {i} is not on the curve"),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Every segment product of the prefix pass, recomputed from the points it was taken
+/// over. A field product is canonical, so the words agree exactly or the readback is
+/// wrong. Two multiplications a point.
+fn segment_products<G: CerGroup>(
+    points: &[G::PackedPoint],
+    got: &[G::PackedField],
+    context: &str,
+) -> Result<(), ProveError> {
+    let bad = got.par_iter().enumerate().find_any(|(g, s)| {
+        if !s.reduced() {
+            return true;
+        }
+        let seg = &points[g * SEG_LEN..((g + 1) * SEG_LEN).min(points.len())];
+        let mut acc = G::Raw::ONE;
+        for p in seg {
+            let p = G::unpack_point(p);
+            if !p.is_zero() {
+                acc = acc.mul(p.zz.mul(p.zzz));
+            }
+        }
+        G::raw_field(s) != acc
+    });
+    match bad {
+        Some((g, _)) => Err(check::wrong(
+            context,
+            format!("segment {g}'s product is not the product of its points"),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Every affine point of the finish pass against the XYZZ point it normalises, exactly:
+/// `x ZZ == X` and `y ZZZ == Y`, or `(0, 0)` for the identity. Two multiplications a
+/// point and no inversion, and it holds whatever the seeds were, so a wrong seed is
+/// refused here as well as at the prefix pass.
+fn affine_of<G: CerGroup>(
+    points: &[G::PackedPoint],
+    got: &[G::PackedAffine],
+    context: &str,
+) -> Result<(), ProveError> {
+    let bad = got.par_iter().zip(points).position_any(|(a, p)| {
+        if !a.reduced() {
+            return true;
+        }
+        let p = G::unpack_point(p);
+        let (x, y) = G::raw_affine(a);
+        if p.is_zero() {
+            return !(x.is_zero() && y.is_zero());
+        }
+        x.mul(p.zz) != p.x || y.mul(p.zzz) != p.y
+    });
+    match bad {
+        Some(i) => Err(check::wrong(
+            context,
+            format!("point {i} is not the affine form of its input"),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// `(X/ZZ, Y/ZZZ)` packed, `(0, 0)` for the identity: the finish pass's answer for one
+/// point, from two host inversions. A point with `ZZ != 0` and `ZZZ == 0` has no affine
+/// form; `build_seeds` refuses its chunk before the finish pass runs.
+fn host_affine<G: CerGroup>(p: &Xyzz<G::Raw>) -> G::PackedAffine {
+    if p.is_zero() || p.zzz.is_zero() {
+        return G::affine_from_raw(G::Raw::ZERO, G::Raw::ZERO);
+    }
+    G::affine_from_raw(p.x.mul(p.zz.inv()), p.y.mul(p.zzz.inv()))
 }
 
 /// The inverse of each segment's own accumulator, from ONE inversion.
@@ -1344,13 +1543,14 @@ mod tests {
         assert!(k.point_mul_g1(&pts, &scalars).is_ok());
     }
 
-    /// A wrong store with status and token in place is handed back as the answer, with
-    /// no retry: these kernels check that a buffer ran, not what it holds, and their
-    /// callers write what they get. The wrong value is a point off the curve, in the
-    /// ladder's XYZZ output once normalised and in the affine output directly, which is
-    /// the check a guard would make.
+    /// A wrong store with status and token in place is refused by the readback's checks
+    /// and the submission re-run: the ladder's points are held to the curve and one of
+    /// them to the host ladder, the prefix pass's segment products are recomputed, and
+    /// the finish pass's points are held to their inputs. The answer is the CPU's with
+    /// one more wait than a clean run; a store wrong on every attempt fails the call
+    /// with the caller's slice as it was.
     #[test]
-    fn a_wrong_store_is_the_ceremony_kernels_answer() {
+    fn a_wrong_store_is_retried_by_the_ceremony_kernels() {
         use crate::cb::inject::{self, Fault};
         let Some(k) = kernels() else { return };
         let pts = vec![scaled_g1(Fr::from(7u64), 3), scaled_g1(Fr::from(9u64), 5)];
@@ -1365,26 +1565,46 @@ mod tests {
         inject::arm_with(Some((0, Fault::WrongStore)), false);
         let got = normalize(&k.point_mul_g1(&pts, &scalars).unwrap());
         assert!(inject::fired());
-        assert_eq!(inject::calls(), 1);
-        assert_ne!(got, normalize(&want));
-        assert!(got.iter().any(|p| !p.is_on_curve()));
+        assert_eq!(inject::calls(), 2);
+        assert_eq!(got, normalize(&want));
 
+        let first = Fr::from(13u64);
+        let inc = Fr::from(17u64);
+        let bases = normalize(&pts);
+        let scaled = vec![
+            (bases[0] * first).into_affine(),
+            (bases[1] * (first * inc)).into_affine(),
+        ];
         // The prefix pass's segment product, then the finish pass's points.
         for at in 0..2 {
             inject::arm_with(Some((at, Fault::WrongStore)), false);
             let got = k.batch_to_affine_g1(&pts).unwrap();
             assert!(inject::fired());
-            assert_eq!(inject::calls(), 2);
-            assert!(got.iter().any(|p| !p.is_on_curve()), "wait {at}");
+            assert_eq!(inject::calls(), 3, "wait {at}");
+            assert_eq!(got, bases, "wait {at}");
 
-            let mut got = vec![G1Affine::generator(), G1Affine::generator()];
+            let mut got = bases.clone();
             inject::arm_with(Some((at, Fault::WrongStore)), false);
-            k.apply_key_g1(&mut got, Fr::from(13u64), Fr::from(17u64))
-                .unwrap();
+            k.apply_key_g1(&mut got, first, inc).unwrap();
             assert!(inject::fired());
-            assert_eq!(inject::calls(), 2);
-            assert!(got.iter().any(|p| !p.is_on_curve()), "wait {at}");
+            assert_eq!(inject::calls(), 3, "wait {at}");
+            assert_eq!(got, scaled, "wait {at}");
         }
+
+        inject::arm_with(Some((0, Fault::WrongStore)), true);
+        assert!(matches!(
+            k.point_mul_g1(&pts, &scalars),
+            Err(ProveError::Device { .. })
+        ));
+        assert_eq!(inject::calls(), crate::cb::RETRIES);
+        inject::arm_with(Some((1, Fault::WrongStore)), true);
+        let mut got = bases.clone();
+        assert!(matches!(
+            k.apply_key_g1(&mut got, first, inc),
+            Err(ProveError::Device { .. })
+        ));
+        assert_eq!(inject::calls(), 1 + crate::cb::RETRIES);
+        assert_eq!(got, bases);
         inject::arm(None);
     }
 

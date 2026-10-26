@@ -26,6 +26,9 @@
 pub(crate) mod alloc;
 #[cfg(target_os = "macos")]
 pub(crate) mod cb;
+/// The value checks on every ceremony readback: on the curve, and one point recomputed.
+#[cfg(target_os = "macos")]
+pub(crate) mod check;
 #[cfg(target_os = "macos")]
 pub(crate) mod enc;
 /// The packed structs that cross into MSL. Host-side only, so it builds everywhere;
