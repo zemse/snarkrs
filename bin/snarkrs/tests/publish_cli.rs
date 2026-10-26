@@ -188,3 +188,89 @@ fn prove_replaces_proof_and_public_together_or_not_at_all() {
     expect(&snarkrs(&dir, &verify), 0);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// `args` in `dir` with the umask at 022, as a login shell usually has it.
+#[cfg(unix)]
+fn snarkrs_umask_022(dir: &Path, args: &[&str]) -> Output {
+    use std::os::unix::process::CommandExt;
+    let mut c = Command::new(env!("CARGO_BIN_EXE_snarkrs"));
+    c.args(args)
+        .current_dir(dir)
+        .env("SNARKRS_NO_TIPS", "1")
+        .stdin(Stdio::null());
+    // SAFETY: umask is async-signal-safe and touches nothing but the child's own mask.
+    unsafe {
+        c.pre_exec(|| {
+            libc::umask(0o022);
+            Ok(())
+        });
+    }
+    c.output().unwrap()
+}
+
+/// A new output is as readable as a plain write makes it, 0644 under umask 022, and an
+/// existing one keeps its own mode.
+#[cfg(unix)]
+#[test]
+fn new_outputs_follow_the_umask_and_existing_ones_keep_their_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(tiny) = tiny_mul() else { return };
+    let dir = setup(&tiny, "mode");
+    let mode = |f: &str| std::fs::metadata(dir.join(f)).unwrap().permissions().mode() & 0o777;
+    let runs: [&[&str]; 4] = [
+        &[
+            "zkey",
+            "export",
+            "solidityverifier",
+            "circuit.zkey",
+            "verifier.sol",
+        ],
+        &[
+            "wtns",
+            "calculate",
+            "circuit.wasm",
+            "input.json",
+            "out.wtns",
+        ],
+        &[
+            "trace",
+            "--zkey",
+            "circuit.zkey",
+            "--witness",
+            "circuit.wtns",
+            "--out",
+            "trace.txt",
+        ],
+        &[
+            "groth16",
+            "prove",
+            "circuit.zkey",
+            "circuit.wtns",
+            "proof.json",
+            "public.json",
+            "--backend",
+            "cpu",
+        ],
+    ];
+    let outputs = [
+        "verifier.sol",
+        "out.wtns",
+        "trace.txt",
+        "proof.json",
+        "public.json",
+    ];
+    for args in runs {
+        expect(&snarkrs_umask_022(&dir, args), 0);
+    }
+    for f in outputs {
+        assert_eq!(mode(f), 0o644, "new {f}");
+        std::fs::set_permissions(dir.join(f), std::fs::Permissions::from_mode(0o640)).unwrap();
+    }
+    for args in runs {
+        expect(&snarkrs_umask_022(&dir, args), 0);
+    }
+    for f in outputs {
+        assert_eq!(mode(f), 0o640, "existing {f}");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}

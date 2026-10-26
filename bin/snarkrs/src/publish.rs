@@ -4,7 +4,8 @@
 //! does and does not promise.
 //!
 //! Every error names the destination, never the stage, so the messages are the ones a
-//! direct write gave.
+//! direct write gave. These files are meant to be read by others, so a new one gets the
+//! umask's mode, as a direct write gave it, not the ceremony outputs' 0600.
 
 use std::path::{Path, PathBuf};
 
@@ -34,11 +35,13 @@ pub fn publish_all<E>(
     stage: impl FnOnce(std::io::Error) -> E,
     write: impl FnOnce(&[PathBuf]) -> Result<(), E>,
 ) -> Result<(), E> {
-    snarkrs_ceremony::write::staged_all(paths, |stages| write(stages).map_err(Failure::Write))
-        .map_err(|f| match f {
-            Failure::Write(e) => e,
-            Failure::Stage(e) => stage(e),
-        })
+    snarkrs_ceremony::write::staged_all_default_mode(paths, |stages| {
+        write(stages).map_err(Failure::Write)
+    })
+    .map_err(|f| match f {
+        Failure::Write(e) => e,
+        Failure::Stage(e) => stage(e),
+    })
 }
 
 /// `bytes` at `path`, with `writing <path>` on the error as a direct write had it.

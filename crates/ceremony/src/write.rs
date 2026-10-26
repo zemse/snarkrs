@@ -90,7 +90,19 @@ pub fn staged_all<T, E: From<std::io::Error>>(
     destinations: &[&Path],
     operation: impl FnOnce(&[PathBuf]) -> Result<T, E>,
 ) -> Result<T, E> {
-    staged_all_with_counter(destinations, &NEXT_STAGE, operation)
+    staged_all_with_counter(destinations, &NEXT_STAGE, true, operation)
+}
+
+/// [`staged_all`] for outputs meant to be read by others, such as a proof or a verifier
+/// contract. A new destination gets the mode a plain `File::create` would give it, `0666`
+/// less the umask, because its stage is created with the default open mode rather than
+/// 0600; the stage is that readable while it is being written. An existing destination
+/// keeps its mode, as in [`staged_all`].
+pub fn staged_all_default_mode<T, E: From<std::io::Error>>(
+    destinations: &[&Path],
+    operation: impl FnOnce(&[PathBuf]) -> Result<T, E>,
+) -> Result<T, E> {
+    staged_all_with_counter(destinations, &NEXT_STAGE, false, operation)
 }
 
 static NEXT_STAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -100,7 +112,7 @@ fn staged_with_counter<T>(
     next: &std::sync::atomic::AtomicU64,
     operation: impl FnOnce(&Path) -> Result<T, CeremonyError>,
 ) -> Result<T, CeremonyError> {
-    staged_all_with_counter(&[destination], next, |stages| operation(&stages[0]))
+    staged_all_with_counter(&[destination], next, true, |stages| operation(&stages[0]))
 }
 
 /// One destination of [`staged_all`], from reservation to rename.
@@ -114,6 +126,7 @@ struct Pending {
 fn staged_all_with_counter<T, E: From<std::io::Error>>(
     destinations: &[&Path],
     next: &std::sync::atomic::AtomicU64,
+    private: bool,
     operation: impl FnOnce(&[PathBuf]) -> Result<T, E>,
 ) -> Result<T, E> {
     use std::io::ErrorKind;
@@ -142,7 +155,7 @@ fn staged_all_with_counter<T, E: From<std::io::Error>>(
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."))
             .to_path_buf();
-        let stage = Stage::create(&parent, file_name, next)?;
+        let stage = Stage::create_with(&parent, file_name, next, private)?;
         pending.push(Pending {
             destination,
             parent,
@@ -247,6 +260,16 @@ impl Stage {
         excluded: &std::ffi::OsStr,
         next: &std::sync::atomic::AtomicU64,
     ) -> std::io::Result<Self> {
+        Self::create_with(parent, excluded, next, true)
+    }
+
+    /// `private` makes the stage 0600 on Unix; otherwise it gets the default open mode.
+    fn create_with(
+        parent: &Path,
+        excluded: &std::ffi::OsStr,
+        next: &std::sync::atomic::AtomicU64,
+        private: bool,
+    ) -> std::io::Result<Self> {
         use std::io::ErrorKind;
         use std::sync::atomic::Ordering;
         let first_digit = excluded
@@ -265,7 +288,7 @@ impl Stage {
             let mut options = std::fs::OpenOptions::new();
             options.write(true).create_new(true);
             #[cfg(unix)]
-            {
+            if private {
                 use std::os::unix::fs::OpenOptionsExt;
                 options.mode(0o600);
             }
@@ -984,7 +1007,7 @@ mod publication_tests {
         let a = dir.join("a");
         let clash = dir.join(format!(".snarkrs-stage-0-{}-0", std::process::id()));
         let result: Result<(), std::io::Error> =
-            staged_all_with_counter(&[&a, &clash], &AtomicU64::new(0), |_| {
+            staged_all_with_counter(&[&a, &clash], &AtomicU64::new(0), true, |_| {
                 panic!("clashing set ran")
             });
         assert_eq!(
