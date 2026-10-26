@@ -786,7 +786,9 @@ impl CeremonyKernels {
                     enc.endEncoding();
                     cb.commit();
                     self.seal
-                        .wait(&cb, token, "ceremony point scalar multiplication")
+                        .wait(&cb, token, "ceremony point scalar multiplication")?;
+                    crate::cb::stored(&out_buf);
+                    Ok(())
                 })?;
 
                 // SAFETY: the command buffer completed, and `n` points of this type is
@@ -917,7 +919,9 @@ impl CeremonyKernels {
             enc.endEncoding();
             cb.commit();
             self.seal
-                .wait(&cb, token, "ceremony batch-to-affine, prefix pass")
+                .wait(&cb, token, "ceremony batch-to-affine, prefix pass")?;
+            crate::cb::stored(&segprod);
+            Ok(())
         })?;
 
         // SAFETY: the command buffer completed and the prefix pass wrote one field
@@ -939,7 +943,9 @@ impl CeremonyKernels {
             enc.endEncoding();
             cb.commit();
             self.seal
-                .wait(&cb, token, "ceremony batch-to-affine, finish pass")
+                .wait(&cb, token, "ceremony batch-to-affine, finish pass")?;
+            crate::cb::stored(out);
+            Ok(())
         })?;
         Ok(())
     }
@@ -1336,6 +1342,50 @@ mod tests {
         assert_eq!(inject::calls(), crate::cb::RETRIES);
         inject::arm(None);
         assert!(k.point_mul_g1(&pts, &scalars).is_ok());
+    }
+
+    /// A wrong store with status and token in place is handed back as the answer, with
+    /// no retry: these kernels check that a buffer ran, not what it holds, and their
+    /// callers write what they get. The wrong value is a point off the curve, in the
+    /// ladder's XYZZ output once normalised and in the affine output directly, which is
+    /// the check a guard would make.
+    #[test]
+    fn a_wrong_store_is_the_ceremony_kernels_answer() {
+        use crate::cb::inject::{self, Fault};
+        let Some(k) = kernels() else { return };
+        let pts = vec![scaled_g1(Fr::from(7u64), 3), scaled_g1(Fr::from(9u64), 5)];
+        let scalars = vec![Fr::from(11u64), Fr::from(13u64)];
+        let normalize = batch_to_affine::<snarkrs_field::g1::Config>;
+        let want: Vec<_> = pts
+            .iter()
+            .zip(&scalars)
+            .map(|(p, s)| point_times_fr(p, s))
+            .collect();
+
+        inject::arm_with(Some((0, Fault::WrongStore)), false);
+        let got = normalize(&k.point_mul_g1(&pts, &scalars).unwrap());
+        assert!(inject::fired());
+        assert_eq!(inject::calls(), 1);
+        assert_ne!(got, normalize(&want));
+        assert!(got.iter().any(|p| !p.is_on_curve()));
+
+        // The prefix pass's segment product, then the finish pass's points.
+        for at in 0..2 {
+            inject::arm_with(Some((at, Fault::WrongStore)), false);
+            let got = k.batch_to_affine_g1(&pts).unwrap();
+            assert!(inject::fired());
+            assert_eq!(inject::calls(), 2);
+            assert!(got.iter().any(|p| !p.is_on_curve()), "wait {at}");
+
+            let mut got = vec![G1Affine::generator(), G1Affine::generator()];
+            inject::arm_with(Some((at, Fault::WrongStore)), false);
+            k.apply_key_g1(&mut got, Fr::from(13u64), Fr::from(17u64))
+                .unwrap();
+            assert!(inject::fired());
+            assert_eq!(inject::calls(), 2);
+            assert!(got.iter().any(|p| !p.is_on_curve()), "wait {at}");
+        }
+        inject::arm(None);
     }
 
     #[test]

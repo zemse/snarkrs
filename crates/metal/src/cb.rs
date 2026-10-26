@@ -56,9 +56,10 @@ pub(crate) fn command_buffer(queue: &CommandQueueRef) -> CommandBuffer {
 
 /// Every dispatch on the proving path goes through this pair rather than the encoder's
 /// own, so a test can stop an attempt at any one of them the way a kill does (see
-/// [`inject::arm_cut`]). Outside tests they forward and nothing else.
+/// [`inject::arm_cut`]). Outside tests and the `fault-inject` feature they forward and
+/// nothing else.
 pub(crate) fn dispatch_threads(enc: &ComputeCommandEncoderRef, grid: MTLSize, tg: MTLSize) {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fault-inject"))]
     let grid = match inject::cut_dispatch(grid.width) {
         Some(width) => MTLSize { width, ..grid },
         None => return,
@@ -67,12 +68,27 @@ pub(crate) fn dispatch_threads(enc: &ComputeCommandEncoderRef, grid: MTLSize, tg
 }
 
 pub(crate) fn dispatch_thread_groups(enc: &ComputeCommandEncoderRef, groups: MTLSize, tg: MTLSize) {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fault-inject"))]
     let groups = match inject::cut_dispatch(groups.width) {
         Some(width) => MTLSize { width, ..groups },
         None => return,
     };
     enc.dispatchThreadgroups_threadsPerThreadgroup(groups, tg);
+}
+
+/// Every host readback of a submission's output follows its wait with this, naming the
+/// buffer about to be read, so a test can corrupt one store the completion token did not
+/// see ([`inject::Fault::WrongStore`]). Outside tests and the `fault-inject` feature it
+/// is nothing.
+pub(crate) fn stored(buf: &Buffer) {
+    #[cfg(any(test, feature = "fault-inject"))]
+    if inject::wrong_store_fires() {
+        // SAFETY: a shared buffer of at least 4 bytes, and the command buffer that wrote
+        // it has completed.
+        unsafe { *buf.contents().cast::<u8>().as_ptr() ^= 1 };
+    }
+    #[cfg(not(any(test, feature = "fault-inject")))]
+    let _ = buf;
 }
 
 /// The NSError text hanging off a failed command buffer, empty when there is none, with
@@ -138,7 +154,7 @@ pub(crate) fn wait_ok(cb: &CommandBufferRef, context: &str) -> Result<(), ProveE
         );
     }
     let status = cb.status();
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fault-inject"))]
     if inject::fires() {
         return Err(ProveError::Device {
             backend: "metal",
@@ -148,7 +164,7 @@ pub(crate) fn wait_ok(cb: &CommandBufferRef, context: &str) -> Result<(), ProveE
             ),
         });
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fault-inject"))]
     if inject::ignored_fires() {
         return Err(ProveError::Device {
             backend: "metal",
@@ -302,7 +318,7 @@ pub(crate) fn with_retry<T>(
         match submit(&q) {
             Ok(v) => return Ok(v),
             Err(e) => {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "fault-inject"))]
                 inject::attempt_failed();
                 let refusal = Refusal::of(&e);
                 let thread = std::thread::current();
@@ -388,7 +404,7 @@ impl Seal {
     /// it could be abandoned with the token already in place, and a concurrent one could
     /// still be running.
     pub(crate) fn encode_token(&self, enc: &ComputeCommandEncoderRef, token: Token) {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "fault-inject"))]
         if inject::cut_token() || inject::missing_token_fires() {
             return;
         }
@@ -425,7 +441,7 @@ impl Seal {
                 .as_ptr()
                 .add(token.slot as usize)
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "fault-inject"))]
         let got = if inject::stale_fires() { !got } else { got };
         if got == token.epoch {
             return Ok(());
@@ -460,12 +476,22 @@ impl Seal {
 /// else is dropped is the [`Rest`]: the rest of that command buffer only, as an
 /// interactivity kill of one buffer among several committed back to back, or the rest of
 /// the attempt, as a GPU recovery that voids every buffer in flight.
-#[cfg(test)]
-pub(crate) mod inject {
+///
+/// A [`Fault::WrongStore`] is the one no token can see: status and token are left alone
+/// and the first byte of the output the host reads next is flipped (see
+/// [`super::stored`]), as a buffer the GPU reported complete with a value it did not
+/// store. Nothing here retries it; whether anything downstream notices is the question
+/// it exists to ask.
+///
+/// The state is per thread: a fault armed here is reached by this thread's submissions
+/// only, and a caller whose work goes to a pool must arm on the thread that submits.
+/// Exported as `snarkrs_metal::inject` under the `fault-inject` feature.
+#[cfg(any(test, feature = "fault-inject"))]
+pub mod inject {
     use std::cell::Cell;
 
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-    pub(crate) enum Fault {
+    pub enum Fault {
         /// `wait_ok` reports the buffer as not completed.
         Status,
         /// `wait_ok` reports a queue refusal that requires renewal.
@@ -474,11 +500,13 @@ pub(crate) mod inject {
         Stale,
         /// The data dispatches run, but the completion token is not encoded.
         MissingToken,
+        /// Status and token are good; one byte of the output read back next is not.
+        WrongStore,
     }
 
     /// What a cut drops after the dispatch it lands on.
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-    pub(crate) enum Rest {
+    pub enum Rest {
         /// The rest of that command buffer; later buffers of the attempt run whole.
         Buffer,
         /// Every dispatch and token until `with_retry` sees the failure.
@@ -498,8 +526,10 @@ pub(crate) mod inject {
         static CUTTING: Cell<Option<Rest>> = const { Cell::new(None) };
     }
 
+    #[cfg(test)]
     struct Reset;
 
+    #[cfg(test)]
     impl Drop for Reset {
         fn drop(&mut self) {
             arm(None);
@@ -531,6 +561,7 @@ pub(crate) mod inject {
     }
 
     /// Exercise every submission and dispatch, then exhaustion and reuse, against a CPU result.
+    #[cfg(test)]
     pub(crate) fn check_replay<T: PartialEq + std::fmt::Debug>(
         queue: &super::Queue,
         mut run: impl FnMut() -> Result<T, snarkrs_groth16::ProveError>,
@@ -583,13 +614,13 @@ pub(crate) mod inject {
     }
 
     /// Counts calls from zero again, and fails call `at` with a status fault if given.
-    pub(crate) fn arm(at: Option<u32>) {
+    pub fn arm(at: Option<u32>) {
         arm_with(at.map(|n| (n, Fault::Status)), false);
     }
 
     /// Counts calls from zero again, and fails call `at` with `fault` if given; with
     /// `sticky`, every call from `at` on, so no retry can succeed.
-    pub(crate) fn arm_with(at: Option<(u32, Fault)>, sticky: bool) {
+    pub fn arm_with(at: Option<(u32, Fault)>, sticky: bool) {
         CALLS.set(0);
         FAIL.set(at);
         STICKY.set(sticky);
@@ -600,23 +631,23 @@ pub(crate) mod inject {
     }
 
     /// Counts from zero again and cuts the attempt at dispatch `at`, dropping `rest`.
-    pub(crate) fn arm_cut(at: u32, rest: Rest) {
+    pub fn arm_cut(at: u32, rest: Rest) {
         arm(None);
         CUT.set(Some((at, rest)));
     }
 
     /// `wait_ok` calls on this thread since [`arm`].
-    pub(crate) fn calls() -> u32 {
+    pub fn calls() -> u32 {
         CALLS.get()
     }
 
     /// Dispatches on this thread since [`arm`].
-    pub(crate) fn dispatches() -> u32 {
+    pub fn dispatches() -> u32 {
         DISPATCHES.get()
     }
 
     /// Whether the armed call or cut was reached.
-    pub(crate) fn fired() -> bool {
+    pub fn fired() -> bool {
         FIRED.get()
     }
 
@@ -687,6 +718,21 @@ pub(crate) mod inject {
     /// For the `wait_ok` call just made, which `Seal::wait` follows at once.
     pub(super) fn stale_fires() -> bool {
         hits(CALLS.get().wrapping_sub(1), Fault::Stale)
+    }
+
+    /// For the readback after the armed wait: the first one once that wait has been
+    /// made, so a submission that waits on several buffers before it reads any of them
+    /// (the H stages) is hit as a whole. Once unless sticky, so a retry that follows a
+    /// downstream rejection reads clean output.
+    pub(super) fn wrong_store_fires() -> bool {
+        let hit = match FAIL.get() {
+            Some((at, Fault::WrongStore)) => CALLS.get() > at && (STICKY.get() || !FIRED.get()),
+            _ => false,
+        };
+        if hit {
+            FIRED.set(true);
+        }
+        hit
     }
 }
 

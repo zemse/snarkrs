@@ -56,6 +56,11 @@ pub mod stages;
 
 #[cfg(target_os = "macos")]
 pub use backend::{MetalBackend, MetalCircuit, PrepareCost};
+/// The per-thread fault injector behind every submission, for a test in another crate
+/// that fails, cuts or corrupts a chosen one. Only with the `fault-inject` feature, which
+/// no default build or shipping binary enables.
+#[cfg(all(target_os = "macos", feature = "fault-inject"))]
+pub use cb::inject;
 #[cfg(target_os = "macos")]
 pub use ceremony::{MetalGroupFft, MetalKeyScale, MetalMsmBackend};
 /// The Metal bindings [`mtl`]'s handles come from, for a caller that builds or inspects one.

@@ -720,7 +720,9 @@ impl FftKernels {
             let token = self.seal.encode(&enc);
             enc.endEncoding();
             cb.commit();
-            self.seal.wait(&cb, token, "ceremony group inverse fft")
+            self.seal.wait(&cb, token, "ceremony group inverse fft")?;
+            crate::cb::stored(batch[0].0.dst);
+            Ok(())
         })
     }
 

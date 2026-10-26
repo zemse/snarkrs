@@ -410,7 +410,9 @@ impl MetalMsm {
             let token = self.seal.encode(&enc);
             enc.endEncoding();
             cb.commit();
-            self.seal.wait(&cb, token, context)
+            self.seal.wait(&cb, token, context)?;
+            crate::cb::stored(&out);
+            Ok(())
         })?;
         Ok(ScalarBuf {
             buf: out,
@@ -796,6 +798,12 @@ impl MetalMsm {
             // half-written.
             crate::cb::with_retry(&self.queue, |queue| {
                 encode(&mut Submission::new(self, queue, split))?;
+                // The first buffer the combine reads from the first job.
+                crate::cb::stored(if plans[job_plan[0]].host_tail {
+                    &outs[0].buckets
+                } else {
+                    &outs[0].window_sums
+                });
                 combine()
             })?
         };

@@ -63,6 +63,10 @@ snarkrs-ceremony = { path = "../ceremony" }
 
 [features]
 default = []
+# Compiles the per-thread fault injector into the library and exports it as `inject`, so a
+# test in another crate can fail, cut or corrupt a chosen submission. Its hooks sit on the
+# submission path, so no default build or shipping binary enables it.
+fault-inject = []
 
 # Everything but `layout` is macOS only, so docs.rs's default Linux build shows an empty crate.
 [package.metadata.docs.rs]

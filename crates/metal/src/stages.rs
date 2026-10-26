@@ -636,6 +636,7 @@ impl HResident {
                     }
                 }
                 first?;
+                crate::cb::stored(&sc.h_std);
                 // Every buffer ran to its end. Whether H is there is a separate question
                 // (BUG-28: words outside the field under a GPU recovery, with every
                 // token present), and a wrong answer to it is retried like a kill.

@@ -1225,6 +1225,72 @@ mod tests {
         );
     }
 
+    /// One store of each submission in turn is wrong with status and token in place,
+    /// the fault no completion check sees (BUG-28). The backend returns one of two
+    /// things and never a third: the unfaulted proof, when the wrong word was a window
+    /// sum and the on-curve check sent the batch round again, or a proof that does not
+    /// verify, when it was a word of H, which stays in the field and reaches the proof.
+    /// `prove` wraps this in `verify` and refuses the second at the exit; a caller of
+    /// `prove_unchecked` is handed it.
+    fn a_wrong_store_is_retried_or_reaches_the_proof(
+        test: &str,
+        backend: fn() -> Result<MetalBackend, ProveError>,
+    ) {
+        use crate::cb::inject;
+        for_each(test, |name, dir| {
+            let (circuit, witness, vk) = load_on(dir, backend().unwrap());
+            if circuit.domain_size() > 1 << 14 {
+                return;
+            }
+            let public = witness[1..=circuit.n_public()].to_vec();
+            let (r, s) = (Fr::from(31337u64), Fr::from(4242u64));
+            let mut t = StageTimings::default();
+            inject::arm(None);
+            let want = prove_with_blinders(circuit.as_ref(), &witness, r, s, &mut t).unwrap();
+            let submissions = inject::calls();
+            let (mut retried, mut escaped) = (0, 0);
+            for at in 0..submissions {
+                inject::arm_with(Some((at, inject::Fault::WrongStore)), false);
+                let got = prove_with_blinders(circuit.as_ref(), &witness, r, s, &mut t)
+                    .unwrap_or_else(|e| panic!("{name}: WrongStore after wait {at}: {e}"));
+                assert!(inject::fired(), "{name}: no readback after wait {at}");
+                if (got.a, got.b, got.c) == (want.a, want.b, want.c) {
+                    retried += 1;
+                    assert!(
+                        inject::calls() > submissions,
+                        "{name}: wait {at}: the unfaulted proof with no retry"
+                    );
+                } else {
+                    escaped += 1;
+                    assert!(
+                        verify(&vk, &public, &got).is_err(),
+                        "{name}: wait {at}: a proof from a wrong store verifies"
+                    );
+                }
+            }
+            eprintln!("{test}: {name}: {retried} retried, {escaped} reached the proof");
+            assert!(retried > 0, "{name}: no wrong window sum was caught");
+            assert!(escaped > 0, "{name}: no wrong H word reached the proof");
+            inject::arm(None);
+        });
+    }
+
+    #[test]
+    fn a_wrong_store_is_retried_or_fails_the_proof() {
+        a_wrong_store_is_retried_or_reaches_the_proof(
+            "a_wrong_store_is_retried_or_fails_the_proof",
+            MetalBackend::new,
+        );
+    }
+
+    #[test]
+    fn a_constant_work_wrong_store_is_retried_or_fails_the_proof() {
+        a_wrong_store_is_retried_or_reaches_the_proof(
+            "a_constant_work_wrong_store_is_retried_or_fails_the_proof",
+            MetalBackend::constant_work,
+        );
+    }
+
     #[test]
     fn a_short_witness_is_rejected_before_any_dispatch() {
         for_each("a_short_witness_is_rejected", |name, dir| {
