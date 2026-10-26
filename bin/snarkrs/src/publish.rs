@@ -1,7 +1,7 @@
 //! The CLI's own output files, published the way the ceremony's are: written to a synced
 //! stage beside the destination and renamed over it, so a failed write leaves the old file
-//! as it was and no stage behind. [`snarkrs_ceremony::write::staged_all`] states what that
-//! does and does not promise.
+//! as it was and no stage behind. [`snarkrs_formats::stage`] states what that does and
+//! does not promise.
 //!
 //! Every error names the destination, never the stage, so the messages are the ones a
 //! direct write gave. These files are meant to be read by others, so a new one gets the
@@ -35,7 +35,7 @@ pub fn publish_all<E>(
     stage: impl FnOnce(std::io::Error) -> E,
     write: impl FnOnce(&[PathBuf]) -> Result<(), E>,
 ) -> Result<(), E> {
-    snarkrs_ceremony::write::staged_all_default_mode(paths, |stages| {
+    snarkrs_formats::stage::staged_all_default_mode(paths, |stages| {
         write(stages).map_err(Failure::Write)
     })
     .map_err(|f| match f {
@@ -82,26 +82,14 @@ pub fn publish_proof(
     )
 }
 
-/// A `.wtns` at `path`, from `write` given the stage. An I/O error that names the stage is
-/// reworded to name `path`.
+/// A `.wtns` at `path`, from `write` given `path` itself. `snarkrs_witness::write_wtns`
+/// and `native::calculate_to_file` publish through their own stage, so staging here as
+/// well would only copy the witness twice.
 pub fn publish_wtns(
     path: &Path,
     write: impl FnOnce(&Path) -> Result<(), WitnessError>,
 ) -> Result<(), WitnessError> {
-    let io = |source| WitnessError::Io {
-        context: format!("writing {}", path.display()),
-        source,
-    };
-    publish_all(&[path], io, |stages| {
-        write(&stages[0]).map_err(|e| match e {
-            WitnessError::Io { context, source }
-                if context == format!("writing {}", stages[0].display()) =>
-            {
-                io(source)
-            }
-            e => e,
-        })
-    })
+    write(path)
 }
 
 #[cfg(test)]
@@ -180,31 +168,25 @@ mod tests {
     }
 
     #[test]
-    fn a_witness_error_names_the_destination_and_keeps_it() {
+    fn a_witness_is_replaced_and_a_directory_destination_is_left_alone() {
         let dir = dir("wtns");
         let out = dir.join("witness.wtns");
         std::fs::write(&out, b"old witness").unwrap();
-        let e = publish_wtns(&out, |stage| {
-            std::fs::write(stage, b"partial").unwrap();
-            Err(WitnessError::Io {
-                context: format!("writing {}", stage.display()),
-                source: std::io::Error::other("injected"),
-            })
-        })
-        .unwrap_err();
-        assert_eq!(
-            e.to_string(),
-            format!("writing {}: injected", out.display())
-        );
-        assert_eq!(std::fs::read(&out).unwrap(), b"old witness");
-        assert_eq!(entries(&dir), ["witness.wtns"], "orphan stage");
         let w = [Fr::from(1u64), Fr::from(5u64)];
-        publish_wtns(&out, |stage| snarkrs_witness::write_wtns(stage, &w)).unwrap();
+        publish_wtns(&out, |path| snarkrs_witness::write_wtns(path, &w)).unwrap();
         assert_eq!(
             std::fs::read(&out).unwrap(),
             snarkrs_witness::wtns_bytes(&w)
         );
         assert_eq!(entries(&dir), ["witness.wtns"]);
+        let taken = dir.join("taken");
+        std::fs::create_dir(&taken).unwrap();
+        let e = publish_wtns(&taken, |path| snarkrs_witness::write_wtns(path, &w)).unwrap_err();
+        assert!(e
+            .to_string()
+            .starts_with(&format!("writing {}: ", taken.display())));
+        assert!(taken.is_dir());
+        assert_eq!(entries(&dir), ["taken", "witness.wtns"], "orphan stage");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
