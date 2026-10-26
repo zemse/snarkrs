@@ -1630,7 +1630,13 @@ mod tests {
             let mut got = base.clone();
             run(&mut got).unwrap();
             assert!(inject::fired(), "readback {at}");
-            assert_eq!(inject::calls(), 2 * calls, "readback {at}: one re-run");
+            // The refused attempt read the blocks up to and including the corrupted
+            // one, a result and a log each; the re-run read them all.
+            assert_eq!(
+                inject::calls(),
+                2 * (at / 2 + 1) + calls,
+                "readback {at}: one re-run"
+            );
             for (g, w) in got.iter().zip(&want) {
                 assert!(affine::<G1Cfg>(g) == *w, "readback {at}");
             }
@@ -1641,7 +1647,11 @@ mod tests {
         let mut got = base.clone();
         assert!(matches!(run(&mut got), Err(ProveError::Device { .. })));
         assert!(inject::fired());
-        assert_eq!(inject::calls(), RETRIES, "one refused readback an attempt");
+        assert_eq!(
+            inject::calls(),
+            2 * RETRIES,
+            "the first block's result and log an attempt"
+        );
         for (g, b) in got.iter().zip(&base) {
             assert!(same_g1(g, b), "a failed call wrote its points");
         }
