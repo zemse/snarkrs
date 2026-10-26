@@ -84,7 +84,8 @@ pub fn staged<T>(
 /// destination as it was and removes every stage. The renames themselves are not one
 /// atomic step: a crash, or a rename that fails, between two of them leaves the earlier
 /// destinations replaced and the later ones not. A destination named twice is renamed
-/// over twice, and the later stage wins.
+/// over twice, and the later stage wins. A destination that is a directory is refused
+/// before anything is staged, since its rename would fail only after the others had run.
 pub fn staged_all<T, E: From<std::io::Error>>(
     destinations: &[&Path],
     operation: impl FnOnce(&[PathBuf]) -> Result<T, E>,
@@ -125,6 +126,13 @@ fn staged_all_with_counter<T, E: From<std::io::Error>>(
             );
         };
         let permissions = match std::fs::symlink_metadata(&destination) {
+            Ok(meta) if meta.is_dir() => {
+                return Err(std::io::Error::new(
+                    ErrorKind::IsADirectory,
+                    "the output is a directory",
+                )
+                .into())
+            }
             Ok(meta) => meta.is_file().then(|| meta.permissions()),
             Err(e) if e.kind() == ErrorKind::NotFound => None,
             Err(e) => return Err(e.into()),
@@ -952,6 +960,21 @@ mod publication_tests {
         assert_eq!(std::fs::read(&a).unwrap(), b"new a");
         assert_eq!(std::fs::read(&b).unwrap(), b"new b");
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_set_with_a_directory_member_stages_nothing() {
+        let dir = dir("set-directory");
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        std::fs::write(&a, b"old a").unwrap();
+        std::fs::create_dir(&b).unwrap();
+        let result: Result<(), std::io::Error> =
+            staged_all(&[&a, &b], |_| panic!("set with a directory ran"));
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::IsADirectory);
+        assert_eq!(std::fs::read(&a).unwrap(), b"old a");
+        assert!(b.is_dir());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2, "orphan stage");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
