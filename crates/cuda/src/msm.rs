@@ -993,26 +993,32 @@ impl CudaMsm {
     ///
     /// Measured on a Tesla T4 (g4dn.xlarge, clocks locked at 1590 MHz, the 70 W cap
     /// active), `constant_work_phase_flatness` at 2^18, c=8, 32 windows, 4096 slices a
-    /// window, medians of 12 interleaved reps after 2 warm. G2: the accumulation reads
-    /// 204.0 to 207.1 ms across zeros, ones, bits, dense, one-value and small witnesses
-    /// (ranges within 0.5 ms), the fold 21.1 to 22.9, the reduce 2.33 to 2.34, the digit
-    /// pipeline 1.27 to 1.68 (the atomics). G1: the accumulation reads 36.2 to 38.9 on
-    /// zeros, ones, bits and small and 49.2 to 51.3 on dense and one-value, and the 16 MB
-    /// G1 base vector does not fit the 4 MB L2; at 2^16, where it does, the same six read
-    /// 10.4 to 13.3 and the fold and the reduce are flat to 0.1 ms. Consistent with the
-    /// address residual above, on the loads: a dense or one-value window reads its bases
-    /// in sort order, a zero-heavy one near thread order, and the kernel's work does not
-    /// move while the cache's does. (At 2^18 the G1 fold and reduce read 7.3 to 9.5 and
-    /// 0.75 to 0.94 the other way round, faster after the slower accumulation, which fits
-    /// the power cap raising the clock behind a memory-bound kernel; both are flat at
-    /// 2^16.)
+    /// window, medians of 12 interleaved reps after 2 warm, with the accumulation on the
+    /// complete mixed addition (`pt_add_mixed`, 11M plus two products by 3b an entry).
+    /// G2: the accumulation reads 195.0 to 198.5 ms across zeros, ones, bits, dense,
+    /// one-value and small witnesses (ranges within 1 ms), the fold 21.1 to 22.8, the
+    /// reduce 2.32 to 2.34, the digit pipeline 1.26 to 1.67 (the atomics). G1: the
+    /// accumulation reads 34.7 to 36.0 across all six, the fold 9.0 to 9.4, the reduce
+    /// 0.90 to 0.93. With the projective addition (`c7f5dcc`, 12M plus two products by
+    /// 3b) the G2 accumulation read 204.0 to 207.1 and the G1 one 36.2 to 38.9 on zeros,
+    /// ones, bits and small but 49.2 to 51.3 on dense and one-value, a split that the
+    /// 16 MB G1 base vector not fitting the 4 MB L2 explains (at 2^16, where it does,
+    /// the six read 10.4 to 13.3): a dense or one-value window reads its bases in sort
+    /// order, a zero-heavy one near thread order. That address residual is still the
+    /// loads' to carry; it was not visible at 2^18 on this kernel in the same probe on
+    /// the same box, and why is not established: occupancy did not move (ptxas, sm_75:
+    /// `msm_segmented_constant_g1` 154 registers against 160, the same 160-register
+    /// allocation; the G2 kernel 255 either way, with 144 bytes of stack against 176).
     ///
     /// Priced warm on the same box, keccak256, 10 reps x 4 rounds interleaved against
-    /// `f424de2`: 452 to 455 ms (MSM stage 431 to 434) against 236 to 237 (216 to 217)
-    /// with the shortcut accumulation, and 51.7 to 52.1 (37.0 to 37.3) against 51.4 to
-    /// 51.7 (36.6 to 36.8) on the variable path, whose kernels this change does not
-    /// touch. The complete formulas cost 12M plus two products by 3b against the mixed
-    /// addition's 7M + 2S, with a packed store per iteration on top.
+    /// `c7f5dcc`: 416 to 419 ms (MSM stage 393 to 395) against 450 to 451 (429 to 430),
+    /// and 52.2 to 52.5 (36.9 to 37.1) against 52.1 to 52.5 (36.8 to 37.1) on the
+    /// variable path, whose kernels neither change touches; anon-aadhaar, 3 reps x 2
+    /// rounds, 1978 to 1990 (1846 to 1850) against 2184 to 2187 (2041), variable 412 to
+    /// 413 (292 to 293). The shortcut accumulation (`pt_madd`, 7M + 2S with its identity
+    /// and equality branches) priced keccak256 at 236 to 237 ms before `c7f5dcc`; what
+    /// remains of the gap is the one addition an entry regardless of its digit, the
+    /// packed store an iteration, and no shortcut on the zero digits the dummy rows hold.
     pub fn constant_work(mut self) -> Self {
         self.work = Work::Constant;
         self
@@ -2352,8 +2358,12 @@ mod tests {
             .next()
             .unwrap();
         assert!(!constant.contains("cursor"));
-        assert_eq!(constant.matches("pt_add(").count(), 1);
+        // One point-op call site in the loop, the mixed complete addition; the padded
+        // iteration and the base at infinity are selects on its result.
+        assert_eq!(constant.matches("pt_add_mixed(").count(), 1);
+        assert_eq!(constant.matches("pt_add(").count(), 0);
         assert!(!constant.contains("pt_madd("));
+        assert!(constant.contains("acc = proj_select(keep, acc, sum);"));
     }
 
     // Interpret the ported straight-line formula source over arkworks fields. This
@@ -2461,6 +2471,21 @@ mod tests {
                         formula("pt_add(Proj<F> a, Proj<F> b)", &[("a", aa), ("b", bb)], b3),
                         (a + b).into_affine(),
                     );
+                    // The mixed addition takes `b` affine, so never the identity: that
+                    // case is the kernel's select. `a` runs over every point including
+                    // the identity, so `a == b` (doubling) and `a == -b` (cancelling)
+                    // are both here.
+                    if !b.is_zero() {
+                        let affine = [b.x, b.y, C::BaseField::ZERO];
+                        check(
+                            formula(
+                                "pt_add_mixed(Proj<F> a, Aff<F> b)",
+                                &[("a", aa), ("b", affine)],
+                                b3,
+                            ),
+                            (a + b).into_affine(),
+                        );
+                    }
                 }
             }
         }
@@ -2545,6 +2570,11 @@ mod tests {
                 formula_body(metal, signature)
             );
         }
+        // The mixed addition is CUDA's alone, outside the block the port test compares,
+        // and `check_complete` above is what pins it. When the Metal twin grows one, add
+        // its signature to the loop.
+        assert!(!metal.contains("pt_add_mixed("));
+        assert!(kernels::MSM_CU.contains("Proj<F> pt_add_mixed(Proj<F> a, Aff<F> b)"));
     }
 
     #[test]

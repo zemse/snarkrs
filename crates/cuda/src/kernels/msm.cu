@@ -777,10 +777,11 @@ extern "C" __global__ void msm_segmented_g2(const MsmEntry* entries,
 //     and to the thread's own tail slot otherwise, which the end of the slice
 //     overwrites. The number of stores is `slice_len + 2` per thread; which addresses
 //     they hit still follows the digits (see below).
-//   * The point added is the base, negated on a negative digit, replaced by the identity
-//     for a padded iteration and a base at infinity, both by select, and added with the
-//     complete formulas (`Proj`): no identity, equality or cancellation shortcut remains.
-//     One `pt_add` call site in the loop, as in the fold.
+//   * The point added is the base, negated on a negative digit, and added with the
+//     complete mixed formula (`pt_add_mixed`): no identity, equality or cancellation
+//     shortcut remains. A padded iteration and a base at infinity, which the affine
+//     encoding cannot hand the formula, keep the accumulator by select, after the
+//     addition has been computed. One point-op call site in the loop, as in the fold.
 //
 // What this does not hide: which bucket row an entry names, so the address of each
 // store and the cache lines the stores touch (a thread's sink store lands on its own
@@ -789,9 +790,9 @@ extern "C" __global__ void msm_segmented_g2(const MsmEntry* entries,
 // a bucket layout removes it.
 //
 // Against `pt_madd` (8M + 2S, with the shortcuts) an iteration here is one complete
-// addition (12M + 2 products by 3b) and one store regardless of what it adds, and the
-// shortcuts' savings are gone on purpose. See `CudaMsm::constant_work` for what it was
-// measured to cost on a T4.
+// mixed addition (11M + 2 products by 3b) and one store regardless of what it adds, and
+// the shortcuts' savings are gone on purpose. See `CudaMsm::constant_work` for what it
+// was measured to cost on a T4.
 
 template <typename F>
 __device__ __forceinline__ Proj<F> proj_select(bool take_a, Proj<F> a, Proj<F> b) {
@@ -799,6 +800,45 @@ __device__ __forceinline__ Proj<F> proj_select(bool take_a, Proj<F> a, Proj<F> b
     r.x = f_select(take_a, a.x, b.x);
     r.y = f_select(take_a, a.y, b.y);
     r.z = f_select(take_a, a.z, b.z);
+    return r;
+}
+
+// Algorithm 8 of the paper, a = 0: 11M + 2 products by 3b + 13 additions, Algorithm 7
+// with Z2 = 1 folded in. Complete for every projective `a`, the identity included, and
+// every affine `b`; the affine encoding has no identity, so a base at infinity is the
+// caller's select. CUDA only, which is why it sits here and not with `pt_add` in the
+// block the Metal-port test compares; `check_complete` on the host pins it against
+// arkworks, the doubling and cancelling cases included.
+//   X3 = (X1 Y2 + X2 Y1)(Y1 Y2 - 3b Z1) - 3b (Y1 + Y2 Z1)(X1 + X2 Z1)
+//   Y3 = (Y1 Y2 + 3b Z1)(Y1 Y2 - 3b Z1) + 9b X1 X2 (X1 + X2 Z1)
+//   Z3 = (Y1 + Y2 Z1)(Y1 Y2 + 3b Z1) + 3 X1 X2 (X1 Y2 + X2 Y1)
+template <typename F>
+__device__ __forceinline__ Proj<F> pt_add_mixed(Proj<F> a, Aff<F> b) {
+    F t0 = f_mul(a.x, b.x);
+    F t1 = f_mul(a.y, b.y);
+    F t3 = f_mul(f_add(b.x, b.y), f_add(a.x, a.y));
+    t3 = f_sub(t3, f_add(t0, t1));                  // X1 Y2 + X2 Y1
+    F t4 = f_add(f_mul(b.y, a.z), a.y);             // Y1 + Y2 Z1
+    F y3 = f_add(f_mul(b.x, a.z), a.x);             // X1 + X2 Z1
+    F x3 = f_add(t0, t0);
+    t0 = f_add(x3, t0);                             // 3 X1 X2
+    F t2 = f_mul_b3(a.z);                           // 3b Z1
+    F z3 = f_add(t1, t2);                           // Y1 Y2 + 3b Z1
+    t1 = f_sub(t1, t2);                             // Y1 Y2 - 3b Z1
+    y3 = f_mul_b3(y3);                              // 3b (X1 + X2 Z1)
+    x3 = f_mul(t4, y3);
+    t2 = f_mul(t3, t1);
+    x3 = f_sub(t2, x3);
+    y3 = f_mul(y3, t0);
+    t1 = f_mul(t1, z3);
+    y3 = f_add(t1, y3);
+    t0 = f_mul(t0, t3);
+    z3 = f_mul(z3, t4);
+    z3 = f_add(z3, t0);
+    Proj<F> r;
+    r.x = x3;
+    r.y = y3;
+    r.z = z3;
     return r;
 }
 
@@ -853,15 +893,15 @@ __device__ __forceinline__ void msm_segmented_constant_impl(const MsmEntry* entr
         acc = proj_select(boundary, zero, acc);
         cur_row = row;
 
-        // The base, or the identity. A padded iteration re-reads a base this job owns and
-        // the select discards it.
+        // The base, negated on a negative digit, added to the accumulator. A padded
+        // iteration re-reads a base this job owns, and a base at infinity has no affine
+        // form the formula could take; both keep the accumulator by select, after the sum
+        // has been computed.
         Aff<F> b = bases[p.base_off + (e.y >> 1)];
-        Proj<F> q;
-        q.x = b.x;
-        q.y = f_select((e.y & 1u) != 0u, f_neg(b.y), b.y);
-        f_set_one(q.z);
-        q = proj_select(!live || aff_is_inf(b), zero, q);
-        acc = pt_add(acc, q);
+        bool keep = !live || aff_is_inf(b);
+        b.y = f_select((e.y & 1u) != 0u, f_neg(b.y), b.y);
+        Proj<F> sum = pt_add_mixed(acc, b);
+        acc = proj_select(keep, acc, sum);
     }
 
     // The last run: the head slot if it is also the first, the tail slot otherwise. The
