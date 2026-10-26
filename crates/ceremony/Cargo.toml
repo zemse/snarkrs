@@ -48,8 +48,8 @@ snarkrs-metal = { workspace = true, features = ["fault-inject"] }
 # The CUDA GroupFft, for tests/prepare_cuda.rs. `features = ["cuda"]` because the crate
 # compiles to an empty shell without it; cudarc's dynamic-loading keeps this buildable
 # on machines with no CUDA installed, so unlike the backend crates it need not be
-# optional here.
-snarkrs-cuda = { workspace = true, features = ["cuda"] }
+# optional here. `fault-inject` for tests/recovery_cuda.rs, as for the Metal twin above.
+snarkrs-cuda = { workspace = true, features = ["cuda", "fault-inject"] }
 
 [features]
 default = []

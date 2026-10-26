@@ -24,6 +24,10 @@ snarkrs-groth16 = { workspace = true, features = ["deterministic-blinders"] }
 # run time rather than linking them), and only RUNNING needs an NVIDIA GPU. That is what
 # lets the backend be developed and typechecked on the M2 Max.
 cuda = ["dep:cudarc"]
+# Compiles the per-thread fault injector into the library and exports it as `inject`, so a
+# test in another crate can corrupt a chosen readback of the group FFT. Its hook sits on
+# the FFT's download path and is nothing without this feature or `cfg(test)`.
+fault-inject = []
 
 [dependencies]
 snarkrs-field.workspace = true

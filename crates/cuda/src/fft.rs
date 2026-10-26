@@ -5,17 +5,29 @@
 //! same; what this file owns is the CUDA shape of the submission, and it is simpler than
 //! the Metal one for reasons that are that backend's, not this one's:
 //!
-//! * **No retry loop and no ladder budget.** Both exist to survive macOS killing a busy
-//!   command buffer with `kIOGPUCommandBufferCallbackErrorImpactingInteractivity`, a
-//!   display-contention behaviour with no analogue on a headless compute card. A pass
-//!   here is one launch however large it is, `gid_off` stays zero, and a driver failure
-//!   is an error rather than something to sleep and retry.
+//! * **No ladder budget, and no retry of a driver failure.** Both exist on Metal to
+//!   survive macOS killing a busy command buffer with
+//!   `kIOGPUCommandBufferCallbackErrorImpactingInteractivity`, a display-contention
+//!   behaviour with no analogue on a headless compute card. A pass here is one launch
+//!   however large it is, `gid_off` stays zero, and a driver failure is an error rather
+//!   than something to sleep and retry: the codes that are device faults leave the
+//!   context unusable (`context::is_device_fault`). What is re-run is a readback that
+//!   fails the value checks below, the one fault the driver does not report.
 //! * **One synchronize, at the read back.** The Metal host batches passes into command
 //!   buffers and waits on each; launches on one CUDA stream queue asynchronously and
 //!   execute in issue order, which is exactly the pass-after-pass dependency the
 //!   transform needs, so the rounds are ordered for free and the host never blocks until
 //!   the download. Same argument as the header of `msm.rs`: the thing to avoid is a
 //!   synchronize, and there is none in the loop.
+//! * **Every readback is checked, as on Metal (`check.rs`), with no wait per pass.**
+//!   Metal probes one thread of every piece after the piece's wait; here nothing waits
+//!   before the download, so as each pass is launched the probed thread's source and
+//!   destination points are copied on the same stream into a small per-block log,
+//!   behind the launch and ahead of the pass that overwrites the source. The host then
+//!   probes every pass from the one download at the end and scans every finished block
+//!   on the curve. A refused readback re-runs the whole transform from the caller's
+//!   slice, which nothing has written yet, up to [`RETRIES`] times; a persistent one
+//!   fails the call with the caller's points as they were.
 //! * **The pack lands in a host `Vec` and crosses PCIe.** Metal writes the bit-reversed
 //!   points straight into shared memory. Here the copy is real but small next to the
 //!   arithmetic: a pass moves `n` points each way once per transform, against ~3,000 Fq
@@ -47,13 +59,15 @@ use cudarc::driver::{
     sys, CudaContext, CudaEvent, CudaModule, CudaSlice, CudaStream, DeviceRepr, PushKernelArg,
 };
 use rayon::prelude::*;
-use snarkrs_field::raw::{RawFq, RawFq2};
+use snarkrs_field::raw::{RawField, RawFq, RawFq2};
 use snarkrs_field::{FftField, Field, Fr};
 use snarkrs_gpu_layout::glv::twiddle_table;
 use snarkrs_gpu_layout::{Packed, PackedFq, PackedFq2};
 use snarkrs_groth16::ProveError;
+use snarkrs_msm::glv;
 use snarkrs_msm::xyzz::Xyzz;
 
+use crate::check::{self, CurveField, Reduced};
 use crate::msm::{bad, download, drv, upload_words, Kernel, PackedXyzzG1, PackedXyzzG2};
 use crate::{as_words, from_words, kernels, Cuda};
 
@@ -160,16 +174,65 @@ const _: () = {
 unsafe impl DeviceRepr for FftParams {}
 
 /// One block's live state across the lockstep rounds of [`FftKernels::ifft_many`]: its
-/// ping-pong pair, its own `1/n`-scaled twiddle table, the stream its passes run on,
-/// and where in the caller's slice of blocks it came from.
+/// ping-pong pair, its own `1/n`-scaled twiddle table, the log of its probed threads,
+/// the stream its passes run on, and where in the caller's slice of blocks it came from.
 struct Block {
     idx: usize,
     n: usize,
     bits: u32,
+    size_inv: Fr,
     src: CudaSlice<u32>,
     dst: CudaSlice<u32>,
     stw: CudaSlice<u32>,
+    /// [`LOG_POINTS`] slots per pass, filled by [`log_probe`] and read by [`probe`].
+    log: CudaSlice<u32>,
+    probes: Vec<Probe>,
     stream: Arc<CudaStream>,
+}
+
+/// One butterfly of a pass's probed thread, held on the host to the pass's own source;
+/// see [`probe`].
+struct Probe {
+    /// The point it reads and writes at the low index, and at the high one.
+    lo: usize,
+    hi: usize,
+    /// The twiddle on the high input, `None` for the `j == 0` butterflies.
+    w: Option<Fr>,
+    /// `1/n`, which the block's fused pass puts on both inputs.
+    scale: Option<Fr>,
+    /// Where its four points sit in the block's log, in points: `dst[lo]`, `dst[hi]`,
+    /// `src[lo]`, `src[hi]`.
+    slot: usize,
+}
+
+/// Points the log holds per pass: two butterflies of four, the most a thread has.
+const LOG_POINTS: usize = 8;
+
+/// Attempts at the transform before giving up, counting the first, and the backoff
+/// before each re-run: Metal's (`crates/metal/src/cb.rs`, `RETRIES` and `backoff`),
+/// carried over rather than re-derived. Nothing on a headless card is known to need the
+/// wait; a wrong store from a fault the driver did not report is given the same time to
+/// clear, 9.2 s over the eight attempts.
+const RETRIES: u32 = 8;
+
+fn backoff(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(200 << attempt.min(3))
+}
+
+const GROUP_IFFT: &str = "ceremony group inverse fft";
+
+/// How an attempt at the transform ended short of its points.
+enum Attempt {
+    /// A readback failed a check: the transform is re-run from the unchanged inputs.
+    Refused(ProveError),
+    /// The driver failed, or a readback had the wrong shape: no re-run.
+    Failed(ProveError),
+}
+
+impl From<ProveError> for Attempt {
+    fn from(e: ProveError) -> Self {
+        Attempt::Failed(e)
+    }
 }
 
 /// Blocks the host until every stream of a multi-stream round has drained, however the
@@ -222,8 +285,8 @@ struct PassTime {
 /// What the two kernels need to know about a group, so the submission code is written
 /// once. The smaller CUDA twin of `crates/metal/src/fft.rs`'s trait of the same name.
 trait FftGroup {
-    type Raw: Copy + Send + Sync;
-    type PackedPoint: Packed + Default + Send + Sync;
+    type Raw: CurveField;
+    type PackedPoint: Packed + Default + Reduced + Send + Sync;
     /// The curve whose GLV lattice a twiddle of this group decomposes against. The two
     /// groups share one `beta` and take different eigenvalues, so they take different
     /// lattices too; see `snarkrs_gpu_layout::glv`.
@@ -489,6 +552,10 @@ impl FftKernels {
     /// `exp` is pass `exp` of every block still deep enough to have one, and a block's
     /// own depth `exp == bits` is its fused mix+scale pass, so each block retires in its
     /// own last round and no scaling round follows.
+    ///
+    /// The rounds, the downloads and the checks are one attempt; see [`RETRIES`] for
+    /// what a refused readback does, and [`probe`] and [`scan`] for the checks. The
+    /// caller's points are written only after every block has passed both.
     fn ifft_many<G: FftGroup>(&self, blocks: &mut [&mut [Xyzz<G::Raw>]]) -> Result<(), ProveError> {
         for a in blocks.iter() {
             check_block_len(G::OP, a.len())?;
@@ -501,10 +568,10 @@ impl FftKernels {
         // `G16_CUDA_FFT_STREAMS=N` round-robins the independent blocks over N streams so
         // a round of small blocks can fill the device instead of queuing behind each
         // other. No cross-stream ordering is needed: blocks are independent transforms
-        // and each one's uploads, passes and download stay on its own stream, while the
-        // shared `tw` upload below completes (host-blocking) before any launch is
-        // issued anywhere. When `tw` is *freed* is a separate question, and the one this
-        // reasoning used to skip; [`DrainOnExit`] answers it.
+        // and each one's uploads, passes, log copies and download stay on its own
+        // stream, while the shared `tw` upload below completes (host-blocking) before
+        // any launch is issued anywhere. When `tw` is *freed* is a separate question,
+        // and the one this reasoning used to skip; [`DrainOnExit`] answers it.
         let pool: Vec<Arc<CudaStream>> = if self.streams > 1 {
             (0..self.streams.min(blocks.len().max(1)))
                 .map(|_| {
@@ -517,10 +584,11 @@ impl FftKernels {
             vec![self.stream.clone()]
         };
 
-        // Per-block ping-pong. `src` holds the input of the pass about to run and is
-        // never written by it; `dst` starts zeroed (msm.rs's allocation policy: an
-        // uninitialised limb array is a plausible field element) and every pass
-        // overwrites all `n` of its slots.
+        // Per-block ping-pong. `src` is filled from the caller's slice by [`fill`] at
+        // the start of every attempt and is never written by the pass that reads it;
+        // `dst` starts zeroed (msm.rs's allocation policy: an uninitialised limb array
+        // is a plausible field element) and every pass overwrites all `n` of its slots.
+        // The log holds the probed thread of every pass.
         let mut live: Vec<Block> = Vec::with_capacity(blocks.len());
         for (bi, a) in blocks.iter().enumerate() {
             let n = a.len();
@@ -529,22 +597,15 @@ impl FftKernels {
             }
             let bits = n.trailing_zeros();
             let stream = pool[live.len() % pool.len()].clone();
-
-            // `bit_reverse` (prepare.rs:256) folded into the pack, in gather form so the
-            // loop splits over the pool: the permutation is an involution, so
-            // `src[rev(i)] = a[i]` and `src[j] = a[rev(j)]` are the same map. Only this
-            // direction is applied; the rotation at the bottom is the one that is NOT an
-            // involution. Unlike Metal the pack cannot land in the device buffer
-            // directly, so it lands in a `Vec` and one `memcpy_htod` follows.
-            let mut packed = vec![G::PackedPoint::default(); n];
-            packed
-                .par_iter_mut()
-                .enumerate()
-                .for_each(|(j, s)| *s = G::pack(&a[bit_reverse_index(j, bits)]));
-            let src = upload_words(&stream, as_words(&packed))?;
-            let dst = stream
-                .alloc_zeros::<u32>(n * point_words)
-                .map_err(|e| drv("allocate fft scratch", e))?;
+            let alloc = |words: usize, what: &str| {
+                stream.alloc_zeros::<u32>(words).map_err(|e| drv(what, e))
+            };
+            let src = alloc(n * point_words, "allocate fft input")?;
+            let dst = alloc(n * point_words, "allocate fft scratch")?;
+            let log = alloc(
+                LOG_POINTS * bits as usize * point_words,
+                "allocate fft probe log",
+            )?;
 
             let size_inv = Fr::from(n as u64)
                 .inverse()
@@ -558,9 +619,12 @@ impl FftKernels {
                 idx: bi,
                 n,
                 bits,
+                size_inv,
                 src,
                 dst,
                 stw,
+                log,
+                probes: Vec::new(),
                 stream,
             });
         }
@@ -579,76 +643,38 @@ impl FftKernels {
         // every launch below is finished before the buffers those launches read go away.
         // See [`DrainOnExit`].
         let _drain = DrainOnExit(&pool);
+        let curve_b = G::Raw::b();
 
+        // The attempts. A refused readback re-runs the rounds from the caller's slice,
+        // which nothing has written yet, after the backoff; the driver's own failures
+        // come straight out, as the module docs say.
         let mut times: Vec<PassTime> = Vec::new();
-        for exp in 1..=max_bits {
-            for b in live.iter().filter(|b| b.bits >= exp) {
-                let (kernel, third, params, threads) = if b.bits == exp {
-                    // The block's last pass: the mix with `1/n` fused in, dense over all
-                    // `n/2` butterflies at two ladders each, on the block's own scaled
-                    // table.
-                    let params = FftParams {
-                        n: b.n as u32,
-                        ..Default::default()
-                    };
-                    (&pair.mix_scale, &b.stw, params, b.n / 2)
-                } else {
-                    // The mix grid is dense over the `j != 0` butterflies (see
-                    // `fft_mix_impl`): `groups * (span - 1)` ladder threads, except at
-                    // `exp == 1`, where every butterfly is `j == 0` and the pass is all
-                    // of them.
-                    let threads = if exp == 1 {
-                        b.n / 2
-                    } else {
-                        b.n / 2 - (b.n >> exp)
-                    };
-                    let params = FftParams {
-                        n: b.n as u32,
-                        span: 1 << (exp - 1),
-                        log_span: exp - 1,
-                        tw_shift: max_bits - exp,
-                        gid_off: 0,
-                    };
-                    (&pair.mix, &tw, params, threads)
-                };
-                let cfg = kernel.cfg_1d(threads, self.block);
-                let start = self.timed_event(&b.stream)?;
-                let mut lb = b.stream.launch_builder(&kernel.f);
-                lb.arg(&b.src).arg(&b.dst).arg(third).arg(&params);
-                // SAFETY: four parameters bound in order and with matching types; `src`
-                // and `dst` each hold `n` points of this group, every in-bounds index
-                // the kernel touches is under `n`, the twiddle table holds at least
-                // `(n/2) * GLV_WORDS` words by construction, and the surplus threads of
-                // the last CUDA block exit on the kernel's own bounds guard.
-                unsafe { lb.launch(cfg) }.map_err(|e| drv("launch fft mix", e))?;
-                if let Some(start) = start {
-                    let end = self.timed_event(&b.stream)?.expect("timing is on");
-                    times.push(PassTime {
-                        idx: b.idx,
-                        bits: b.bits,
-                        exp,
-                        fused: b.bits == exp,
-                        threads,
-                        start,
-                        end,
-                    });
-                }
+        let mut got: Vec<Vec<G::PackedPoint>> = Vec::new();
+        for attempt in 0..RETRIES {
+            times.clear();
+            for b in &mut live {
+                fill::<G>(b, &*blocks[b.idx])?;
             }
-            // Launches on one stream execute in issue order, so pass `exp + 1` of a
-            // block reads what its pass `exp` wrote with no event and no host wait; the
-            // swap is pure host bookkeeping.
-            for b in live.iter_mut().filter(|b| b.bits >= exp) {
-                core::mem::swap(&mut b.src, &mut b.dst);
+            self.run_rounds::<G>(pair, &mut live, &tw, max_bits, &mut times)?;
+            match read_back_checked::<G>(&live, curve_b) {
+                Ok(points) => {
+                    got = points;
+                    break;
+                }
+                Err(Attempt::Refused(e)) if attempt + 1 < RETRIES => {
+                    let thread = std::thread::current();
+                    eprintln!(
+                        "cuda: attempt {} of {RETRIES} failed on thread {}: {e}; re-running the transform",
+                        attempt + 1,
+                        thread.name().unwrap_or("unnamed"),
+                    );
+                    std::thread::sleep(backoff(attempt + 1));
+                }
+                Err(Attempt::Refused(e) | Attempt::Failed(e)) => return Err(e),
             }
         }
 
-        for b in &live {
-            // The one wait per block: `download` synchronizes the block's stream before
-            // the `Vec` is read, which also orders it after every launch above.
-            let words = download(&b.stream, &b.src)?;
-            let got = from_words::<G::PackedPoint>(&words)
-                .ok_or_else(|| bad("fft read back is not a whole number of points"))?;
-
+        for (b, got) in live.iter().zip(&got) {
             // The `a[1..].reverse()` that finishes the inverse (prepare.rs:340), folded
             // into the read back: `ifft(a)[0] = X[0]/n` and `ifft(a)[i] = X[n-i]/n`.
             // Splitting this off from the scaling gives an answer that is a rotation
@@ -700,6 +726,84 @@ impl FftKernels {
         Ok(())
     }
 
+    /// The rounds of one attempt: every pass of every block, launched in lockstep and
+    /// each followed on its stream by the copies that log its probed thread.
+    fn run_rounds<G: FftGroup>(
+        &self,
+        pair: &FftPair,
+        live: &mut [Block],
+        tw: &CudaSlice<u32>,
+        max_bits: u32,
+        times: &mut Vec<PassTime>,
+    ) -> Result<(), ProveError> {
+        let point_words = core::mem::size_of::<G::PackedPoint>() / 4;
+        for exp in 1..=max_bits {
+            for b in live.iter_mut().filter(|b| b.bits >= exp) {
+                let (kernel, third, params, threads) = if b.bits == exp {
+                    // The block's last pass: the mix with `1/n` fused in, dense over all
+                    // `n/2` butterflies at two ladders each, on the block's own scaled
+                    // table.
+                    let params = FftParams {
+                        n: b.n as u32,
+                        ..Default::default()
+                    };
+                    (&pair.mix_scale, &b.stw, params, b.n / 2)
+                } else {
+                    // The mix grid is dense over the `j != 0` butterflies (see
+                    // `fft_mix_impl`): `groups * (span - 1)` ladder threads, except at
+                    // `exp == 1`, where every butterfly is `j == 0` and the pass is all
+                    // of them.
+                    let threads = if exp == 1 {
+                        b.n / 2
+                    } else {
+                        b.n / 2 - (b.n >> exp)
+                    };
+                    let params = FftParams {
+                        n: b.n as u32,
+                        span: 1 << (exp - 1),
+                        log_span: exp - 1,
+                        tw_shift: max_bits - exp,
+                        gid_off: 0,
+                    };
+                    (&pair.mix, tw, params, threads)
+                };
+                let cfg = kernel.cfg_1d(threads, self.block);
+                let start = self.timed_event(&b.stream)?;
+                {
+                    let mut lb = b.stream.launch_builder(&kernel.f);
+                    lb.arg(&b.src).arg(&b.dst).arg(third).arg(&params);
+                    // SAFETY: four parameters bound in order and with matching types;
+                    // `src` and `dst` each hold `n` points of this group, every
+                    // in-bounds index the kernel touches is under `n`, the twiddle
+                    // table holds at least `(n/2) * GLV_WORDS` words by construction,
+                    // and the surplus threads of the last CUDA block exit on the
+                    // kernel's own bounds guard.
+                    unsafe { lb.launch(cfg) }.map_err(|e| drv("launch fft mix", e))?;
+                }
+                if let Some(start) = start {
+                    let end = self.timed_event(&b.stream)?.expect("timing is on");
+                    times.push(PassTime {
+                        idx: b.idx,
+                        bits: b.bits,
+                        exp,
+                        fused: b.bits == exp,
+                        threads,
+                        start,
+                        end,
+                    });
+                }
+                log_probe::<G>(b, exp, threads, &params, point_words)?;
+            }
+            // Launches on one stream execute in issue order, so pass `exp + 1` of a
+            // block reads what its pass `exp` wrote with no event and no host wait; the
+            // swap is pure host bookkeeping.
+            for b in live.iter_mut().filter(|b| b.bits >= exp) {
+                core::mem::swap(&mut b.src, &mut b.dst);
+            }
+        }
+        Ok(())
+    }
+
     /// An event recorded on `stream` now, or `None` with timing off. `CU_EVENT_DEFAULT`
     /// and not the cudarc default, which is `CU_EVENT_DISABLE_TIMING`: that one records
     /// fine and then fails at `elapsed_ms`, the same trap `msm.rs` documents.
@@ -715,6 +819,216 @@ impl FftKernels {
             .map_err(|e| drv("record fft timing event", e))?;
         Ok(Some(e))
     }
+}
+
+/// The primitive `2^bits`-th root of unity, the one `twiddle_table` raises to its powers.
+fn primitive_root(bits: u32) -> Fr {
+    let mut root = Fr::TWO_ADIC_ROOT_OF_UNITY;
+    for _ in bits..Fr::TWO_ADICITY {
+        root.square_in_place();
+    }
+    root
+}
+
+/// The caller's block into `src`, for one attempt.
+///
+/// `bit_reverse` (prepare.rs:256) folded into the pack, in gather form so the loop
+/// splits over the pool: the permutation is an involution, so `src[rev(i)] = a[i]` and
+/// `src[j] = a[rev(j)]` are the same map. Only this direction is applied; the rotation at
+/// the read back is the one that is NOT an involution. Unlike Metal the pack cannot land
+/// in the device buffer directly, so it lands in a `Vec` and one `memcpy_htod` follows,
+/// waited on because the source is pageable and goes away at the end of this function.
+fn fill<G: FftGroup>(b: &mut Block, a: &[Xyzz<G::Raw>]) -> Result<(), ProveError> {
+    let mut packed = vec![G::PackedPoint::default(); b.n];
+    packed
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(j, s)| *s = G::pack(&a[bit_reverse_index(j, b.bits)]));
+    b.stream
+        .memcpy_htod(as_words(&packed), &mut b.src)
+        .map_err(|e| drv("upload fft input", e))?;
+    b.stream
+        .synchronize()
+        .map_err(|e| drv("synchronize upload", e))?;
+    b.probes.clear();
+    Ok(())
+}
+
+/// The probed thread of the pass just launched: its two or four points, copied on the
+/// block's stream from `dst` and `src` into the log, behind the launch and ahead of the
+/// pass that overwrites `src`, with what the host will hold them to.
+///
+/// The thread is [`check::spot`] of the pass's parameters, so every pass of a run probes
+/// a fixed position and consecutive passes probe different ones. Its butterflies are the
+/// ones `fft_mix_impl` or `fft_mix_scale_impl` gives that thread, index for index.
+fn log_probe<G: FftGroup>(
+    b: &mut Block,
+    exp: u32,
+    threads: usize,
+    p: &FftParams,
+    point_words: usize,
+) -> Result<(), ProveError> {
+    let half = b.n / 2;
+    let salt = (u64::from(p.n) << 40) ^ (u64::from(p.span) << 32);
+    let d = check::spot(threads, salt);
+
+    // `(lo, hi, twiddle on hi, scale on both)`, in the kernels' index arithmetic.
+    let mut butterflies: Vec<(usize, usize, Option<Fr>, Option<Fr>)> = Vec::with_capacity(2);
+    if b.bits == exp {
+        let s = b.size_inv;
+        let w = s * primitive_root(b.bits).pow([d as u64]);
+        butterflies.push((d, d + half, Some(w), Some(s)));
+    } else if exp == 1 {
+        butterflies.push((2 * d, 2 * d + 1, None, None));
+    } else {
+        let span = 1usize << (exp - 1);
+        let groups = half >> (exp - 1);
+        let g = d / (span - 1);
+        let j = 1 + (d - g * (span - 1));
+        let lo = (g << exp) + j;
+        let w = primitive_root(exp).pow([j as u64]);
+        butterflies.push((lo, lo + span, Some(w), None));
+        if d < groups {
+            let lo0 = d << exp;
+            butterflies.push((lo0, lo0 + span, None, None));
+        }
+    }
+
+    let Block {
+        src,
+        dst,
+        log,
+        probes,
+        stream,
+        ..
+    } = &mut *b;
+    for (lo, hi, w, scale) in butterflies {
+        let slot = probes.len() * 4;
+        for (k, (from, i)) in [(&*dst, lo), (&*dst, hi), (&*src, lo), (&*src, hi)]
+            .into_iter()
+            .enumerate()
+        {
+            let at = (slot + k) * point_words;
+            stream
+                .memcpy_dtod(
+                    &from.slice(i * point_words..(i + 1) * point_words),
+                    &mut log.slice_mut(at..at + point_words),
+                )
+                .map_err(|e| drv("log fft probe", e))?;
+        }
+        probes.push(Probe {
+            lo,
+            hi,
+            w,
+            scale,
+            slot,
+        });
+    }
+    Ok(())
+}
+
+/// A block's buffer off the device as points: `download`, the injector's hook on the
+/// words, then the shape check.
+fn read_back<P: Packed + Default>(
+    stream: &Arc<CudaStream>,
+    buf: &CudaSlice<u32>,
+) -> Result<Vec<P>, ProveError> {
+    let mut words = download(stream, buf)?;
+    crate::fault::stored(&mut words);
+    from_words::<P>(&words).ok_or_else(|| bad("fft read back is not a whole number of points"))
+}
+
+/// Every block's result and log, downloaded and held to the checks in block order,
+/// stopping at the first refusal. Nothing of the caller's is written here.
+fn read_back_checked<G: FftGroup>(
+    live: &[Block],
+    curve_b: G::Raw,
+) -> Result<Vec<Vec<G::PackedPoint>>, Attempt> {
+    let mut out = Vec::with_capacity(live.len());
+    for b in live {
+        // The one wait per block: `download` synchronizes the block's stream before the
+        // `Vec` is read, which also orders it after every launch and copy of the rounds.
+        // The log follows on the drained stream.
+        let got = read_back::<G::PackedPoint>(&b.stream, &b.src)?;
+        let log = read_back::<G::PackedPoint>(&b.stream, &b.log)?;
+        probe::<G>(b, &log, curve_b)?;
+        scan::<G>(b, &got, curve_b)?;
+        out.push(got);
+    }
+    Ok(out)
+}
+
+/// One thread of every pass, recomputed on the host and held to what the pass wrote.
+///
+/// Each probed butterfly is computed from the pass's own source with the host ladder and
+/// compared as a point, since the two ladders reach different representatives. What this
+/// catches that a curve check cannot: a destination the device left holding the previous
+/// pass's points, which are on the curve.
+///
+/// An input off the curve is an earlier pass's wrong store, not this one's; the probe
+/// stands aside and the scan over the finished block refuses it.
+fn probe<G: FftGroup>(b: &Block, log: &[G::PackedPoint], curve_b: G::Raw) -> Result<(), Attempt> {
+    for p in &b.probes {
+        let (dlo, dhi, slo, shi) = (
+            &log[p.slot],
+            &log[p.slot + 1],
+            &log[p.slot + 2],
+            &log[p.slot + 3],
+        );
+        if !slo.reduced() || !shi.reduced() {
+            continue;
+        }
+        let (u, t) = (G::unpack(slo), G::unpack(shi));
+        if !check::xyzz_on_curve(&u, curve_b) || !check::xyzz_on_curve(&t, curve_b) {
+            continue;
+        }
+        let t = match p.w {
+            Some(w) => glv::mul(&t, &w),
+            None => t,
+        };
+        let u = match p.scale {
+            Some(s) => glv::mul(&u, &s),
+            None => u,
+        };
+        let mut sum = u;
+        sum.add_assign(&t);
+        let mut diff = u;
+        diff.add_assign(&Xyzz { y: t.y.neg(), ..t });
+        for (i, got, want) in [(p.lo, dlo, sum), (p.hi, dhi, diff)] {
+            if !got.reduced() || !check::same_point(&G::unpack(got), &want) {
+                return Err(Attempt::Refused(check::wrong(
+                    GROUP_IFFT,
+                    format!(
+                        "point {i} of a {}-point block is not the host butterfly's",
+                        b.n
+                    ),
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Every point of a finished block, held to the curve.
+///
+/// Once, at the end, not per pass: a pass over a 2^20-point G2 block is a million
+/// six-multiplication checks against about a second of GPU, so twenty of them would cost
+/// a good part of the transform while the pool is busy with the sub-crossover blocks, and
+/// once loses nothing, because a wrong word makes a point off the curve and the
+/// butterflies are rational maps, so it reaches at least one output. What the scan cannot
+/// see, a destination left holding the previous pass's points, [`probe`] catches from the
+/// log.
+fn scan<G: FftGroup>(b: &Block, got: &[G::PackedPoint], curve_b: G::Raw) -> Result<(), Attempt> {
+    let bad = got
+        .par_iter()
+        .position_any(|p| !p.reduced() || !check::xyzz_on_curve(&G::unpack(p), curve_b));
+    if let Some(i) = bad {
+        return Err(Attempt::Refused(check::wrong(
+            GROUP_IFFT,
+            format!("point {i} of a {}-point block is not on the curve", b.n),
+        )));
+    }
+    Ok(())
 }
 
 /// Refuses a block length the transform has no subgroup for, before anything touches the
@@ -1048,6 +1362,20 @@ mod tests {
             .collect()
     }
 
+    /// `n` points with none at infinity, for the test that corrupts the first point of a
+    /// readback: a wrong word beside a zero `ZZ` is still the identity, so on `block_g1`'s
+    /// inputs, where point 0 of a pass is often one, the fault would be harmless and
+    /// nothing would need to notice it.
+    fn dense_g1(seed: u64, n: usize) -> Vec<Xyzz<RawFq>> {
+        let mut rng = Lcg(seed);
+        (0..n).map(|_| scaled_g1(rng.fr(), rng.word())).collect()
+    }
+
+    /// Element for element the same points, whatever the representatives.
+    fn same_g1(a: &[Xyzz<RawFq>], b: &[Xyzz<RawFq>]) -> bool {
+        a.len() == b.len() && a.iter().zip(b).all(|(p, q)| check::same_point(p, q))
+    }
+
     /// `n` points drawn from a pool of three, laid out so the first pass meets equal and
     /// opposite pairs: pass 1 pairs `a[i]` with `a[i + n/2]`, which here is `a[i]` again
     /// for even `i` and `-a[i]` for odd `i`. Half of that pass takes `pt_add`'s doubling
@@ -1270,6 +1598,59 @@ mod tests {
         let g2 = affine::<G2Cfg>(&g2);
         assert_eq!(g2[0], affine::<G2Cfg>(&pool_g2[1..2])[0]);
         assert!(g2[1..].iter().all(|p| p.is_zero()), "G2 constant block");
+    }
+
+    /// A wrong store under a drained stream is refused and the transform re-run: by the
+    /// scan when the result readback carries it, by the probe when the log does, each a
+    /// readback of its own, so every readback index of a clean run is tried. Either way
+    /// the answer is the reference's and the run cost one re-run. Wrong on every attempt,
+    /// the call fails and the caller's points are as they were. No point at infinity in
+    /// the inputs (see `dense_g1`); `an_all_infinity_block_stays_infinity` covers those.
+    #[test]
+    #[ignore = "needs an NVIDIA device"]
+    fn a_wrong_store_is_retried_by_the_fft() {
+        use crate::fault::inject::{self, Fault};
+        let Some(k) = kernels() else { return };
+        let base: Vec<Vec<_>> = [4usize, 8, 16]
+            .into_iter()
+            .map(|n| dense_g1(0x5eed_2930 + n as u64, n))
+            .collect();
+        let want: Vec<_> = base.iter().map(|b| dft_ref::<G1Cfg>(b, true)).collect();
+        let run = |got: &mut Vec<Vec<Xyzz<RawFq>>>| {
+            k.ifft_g1_many(&mut got.iter_mut().map(Vec::as_mut_slice).collect::<Vec<_>>())
+        };
+        inject::arm(None);
+        let mut got = base.clone();
+        run(&mut got).unwrap();
+        let calls = inject::calls();
+        assert_eq!(calls, 2 * base.len() as u32, "a result and a log per block");
+
+        for at in 0..calls {
+            inject::arm_with(Some((at, Fault::WrongStore)), false);
+            let mut got = base.clone();
+            run(&mut got).unwrap();
+            assert!(inject::fired(), "readback {at}");
+            assert_eq!(inject::calls(), 2 * calls, "readback {at}: one re-run");
+            for (g, w) in got.iter().zip(&want) {
+                assert!(affine::<G1Cfg>(g) == *w, "readback {at}");
+            }
+        }
+        eprintln!("{calls} readbacks, each corrupted once and refused");
+
+        inject::arm_with(Some((0, Fault::WrongStore)), true);
+        let mut got = base.clone();
+        assert!(matches!(run(&mut got), Err(ProveError::Device { .. })));
+        assert!(inject::fired());
+        assert_eq!(inject::calls(), RETRIES, "one refused readback an attempt");
+        for (g, b) in got.iter().zip(&base) {
+            assert!(same_g1(g, b), "a failed call wrote its points");
+        }
+        inject::arm(None);
+        let mut got = base.clone();
+        run(&mut got).unwrap();
+        for (g, w) in got.iter().zip(&want) {
+            assert!(affine::<G1Cfg>(g) == *w);
+        }
     }
 
     /// Blocks of every depth from 0 to 2^10 in one `ifft_many` call, which is the shape

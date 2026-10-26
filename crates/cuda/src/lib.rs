@@ -30,8 +30,13 @@ mod backend;
 /// The ceremony seam that has CUDA kernels: `ptau prepare`'s group FFT.
 #[cfg(feature = "cuda")]
 mod ceremony;
+/// The host-side checks every readback of that seam is held to.
+#[cfg(feature = "cuda")]
+mod check;
 #[cfg(feature = "cuda")]
 mod context;
+#[cfg(feature = "cuda")]
+mod fault;
 /// The group inverse FFT behind `ptau prepare`: `ceremony::CudaGroupFft` is its seam.
 #[cfg(feature = "cuda")]
 pub mod fft;
@@ -48,6 +53,11 @@ pub use backend::{CudaBackend, CudaCircuit, PrepareCost};
 pub use ceremony::CudaGroupFft;
 #[cfg(feature = "cuda")]
 pub use context::{Cuda, CudaError};
+/// The per-thread fault injector behind the group FFT's readbacks, for a test in another
+/// crate that corrupts a chosen one. Only with the `fault-inject` feature, which no
+/// shipping build carries.
+#[cfg(all(feature = "cuda", feature = "fault-inject"))]
+pub use fault::inject;
 
 #[cfg(feature = "cuda")]
 mod words {
