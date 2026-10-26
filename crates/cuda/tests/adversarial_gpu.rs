@@ -791,6 +791,151 @@ fn offsets_select_the_right_sub_msm() {
     });
 }
 
+/// Every window width the kernels can address, in both groups and under both schedules,
+/// against a naive sum.
+///
+/// `window_size` picks 3..=8 and nothing else in this workspace ever ran another width, so
+/// 2 and 9..=16 existed only as `G16_CUDA_MSM_C` values no test had validated. The widths
+/// are not interchangeable in the kernels. `top_bits(12)` and `top_bits(14)` are 3, so at
+/// those widths the top window has four live buckets, each holding a quarter of the
+/// scalars, and such a bucket's run spans thousands of slices: that is the one-thread
+/// `msm_merge_*` walk and, under constant work, the deepest fold. The signed digit's
+/// `(1 << c) - b - carry` and its `mag <= 2^(c-1)` bound move with `c`, and at 16 a window
+/// is 32768 buckets, the reduce kernel's longest serial walk. A wrong digit at any of them
+/// is a proof that fails verification with nothing else to go on, so this is the gate for
+/// sweeping `G16_CUDA_MSM_C` at all.
+///
+/// Forced through [`CudaMsm::with_window`] rather than the environment, which is
+/// process-global and would race the rest of this binary. Four scalar vectors a length:
+/// all zero and all one, so the bucket stages see nothing and the whole answer comes out
+/// of `msm_ones_*` at every width; all `r - 1`, a digit in the top window of every width
+/// and the edge of the "no carry out of the top" argument; and a mix of random, 0, 1,
+/// `r - 1` and `2^253`. The references are computed once per vector and reused across
+/// every width and schedule, which is most of what keeps this to minutes.
+#[test]
+#[ignore = "sweeps every window width in both groups and both schedules; minutes on a T4"]
+fn every_window_width_agrees_with_a_naive_sum() {
+    on_device("every_window_width_agrees_with_a_naive_sum", |cuda| {
+        let module = CudaMsm::compile(cuda).expect("compile the MSM unit");
+        let mut seed = 0x5EED_C0DE_0000_0C16u64;
+        // Around the slice length, and a few thousand that are not powers of two so the
+        // last slice of a window is partial and the fat top buckets at c = 12 and 14 span
+        // many slices.
+        for n in [1usize, 63, 64, 65, 2500, 4095, 6007] {
+            let mut b1 = Vec::with_capacity(n);
+            let mut b2 = Vec::with_capacity(n);
+            let mut cur1 = G1Projective::generator();
+            let mut cur2 = G2Projective::generator();
+            for _ in 0..n {
+                cur1 += G1Projective::generator();
+                cur2 += G2Projective::generator();
+                b1.push(cur1.into_affine());
+                b2.push(cur2.into_affine());
+            }
+            let top = Fr::from(2u64).pow([253u64]);
+            let vectors = [
+                ("all zero", vec![Fr::zero(); n]),
+                ("all one", vec![Fr::one(); n]),
+                ("all r-1", vec![-Fr::one(); n]),
+                (
+                    "mixed",
+                    (0..n)
+                        .map(|i| match i % 5 {
+                            0 => rand_fr(&mut seed),
+                            1 => Fr::one(),
+                            2 => Fr::zero(),
+                            3 => -Fr::one(),
+                            _ => top,
+                        })
+                        .collect(),
+                ),
+            ];
+            let want: Vec<(G1Affine, G2Affine)> = vectors
+                .iter()
+                .map(|(_, s)| {
+                    (
+                        naive_g1(&b1, s).into_affine(),
+                        naive_g2(&b2, s).into_affine(),
+                    )
+                })
+                .collect();
+
+            // 2..=16 is the range the plan accepts: `MAX_WINDOW` in msm.rs, checked below.
+            for c in 2u32..=16 {
+                for constant in [false, true] {
+                    let schedule = if constant { "constant" } else { "variable" };
+                    eprintln!("  n = {n}, c = {c}, {schedule} work");
+                    let m = CudaMsm::from_module(cuda, module.clone())
+                        .expect("bind the MSM kernels")
+                        .with_window(c);
+                    let m = if constant { m.constant_work() } else { m };
+                    let db1 = m.upload_g1_bases(&b1).expect("upload G1 bases");
+                    let db2 = m.upload_g2_bases(&b2).expect("upload G2 bases");
+                    for ((what, scalars), (want1, want2)) in vectors.iter().zip(&want) {
+                        let ds = m.upload_scalars(scalars).expect("upload scalars");
+                        // One batch, so the two groups share the digit plan the way the
+                        // A and B MSMs do in a proof.
+                        let got = m
+                            .msm_batch(&[
+                                Job::G1(JobG1 {
+                                    bases: &db1,
+                                    base_off: 0,
+                                    scalars: ds.as_scalars(),
+                                    scalar_off: 0,
+                                    n,
+                                }),
+                                Job::G2(JobG2 {
+                                    bases: &db2,
+                                    base_off: 0,
+                                    scalars: ds.as_scalars(),
+                                    scalar_off: 0,
+                                    n,
+                                }),
+                            ])
+                            .unwrap_or_else(|e| {
+                                panic!("c = {c}, n = {n}, {what}, {schedule} work: {e}")
+                            });
+                        assert_eq!(
+                            got[0].g1().expect("G1 result").into_affine(),
+                            *want1,
+                            "G1 c = {c}, n = {n}, {what}, {schedule} work"
+                        );
+                        assert_eq!(
+                            got[1].g2().expect("G2 result").into_affine(),
+                            *want2,
+                            "G2 c = {c}, n = {n}, {what}, {schedule} work"
+                        );
+                    }
+                }
+            }
+        }
+
+        // The hook reaches the plan: a width the kernels cannot address is refused there,
+        // rather than quietly replaced by the heuristic's pick, which is what would make
+        // every assertion above vacuous.
+        let g = G1Projective::generator().into_affine();
+        for c in [1u32, 17] {
+            let m = CudaMsm::from_module(cuda, module.clone())
+                .expect("bind the MSM kernels")
+                .with_window(c);
+            let db = m.upload_g1_bases(&[g]).expect("upload G1 base");
+            let ds = m.upload_scalars(&[Fr::from(5u64)]).expect("upload scalar");
+            let err = m
+                .msm(Job::G1(JobG1 {
+                    bases: &db,
+                    base_off: 0,
+                    scalars: ds.as_scalars(),
+                    scalar_off: 0,
+                    n: 1,
+                }))
+                .err()
+                .unwrap_or_else(|| panic!("c = {c} was accepted"))
+                .to_string();
+            assert!(err.contains("window"), "c = {c}: unhelpful message: {err}");
+        }
+    });
+}
+
 // ---------------------------------------------------------------------------
 // 5. Concurrency, with inputs that can actually tell two proofs apart
 // ---------------------------------------------------------------------------

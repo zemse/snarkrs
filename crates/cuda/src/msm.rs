@@ -420,6 +420,12 @@ pub fn window_size(m: usize) -> u32 {
     base
 }
 
+/// The width a plan actually runs at: [`CudaMsm::with_window`] when set, else the
+/// heuristic (and its `G16_CUDA_MSM_C` override) for `general` scalars.
+fn pick_window(forced: Option<u32>, general: usize) -> u32 {
+    forced.unwrap_or_else(|| window_size(general))
+}
+
 /// Blocks in the ones kernel. Enough that a 2^18-long witness gives each thread about sixty
 /// scalars to scan, few enough that the host adds a few dozen points. It trades device
 /// parallelism against a serial host tail.
@@ -926,6 +932,8 @@ pub struct CudaMsm {
     #[cfg(test)]
     activity: TestActivity,
     work: Work,
+    /// A forced window width, see [`Self::with_window`]. `None` leaves it to [`window_size`].
+    window: Option<u32>,
     ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
     /// Kept alive explicitly. `CudaFunction` holds an `Arc<CudaModule>` internally, so this
@@ -963,6 +971,18 @@ impl CudaMsm {
     /// Opt in to the fixed schedule before uploading scalars or proving.
     pub fn constant_work(mut self) -> Self {
         self.work = Work::Constant;
+        self
+    }
+
+    /// Run every plan at window width `c` instead of [`window_size`]'s pick.
+    ///
+    /// The per-object form of `G16_CUDA_MSM_C`, for a sweep or a test that wants two
+    /// widths in one process: the environment is process-global, so a test that set it
+    /// would race every other test in the binary. Not clamped. A width outside
+    /// `2..=MAX_WINDOW` is refused by the plan, as an error from the MSM rather than a
+    /// silently substituted width.
+    pub fn with_window(mut self, c: u32) -> Self {
+        self.window = Some(c);
         self
     }
 
@@ -1029,6 +1049,7 @@ impl CudaMsm {
             #[cfg(test)]
             activity: TestActivity::default(),
             work: Work::Variable,
+            window: None,
             a: upload_g1(&stream, &[])?,
             b_g2: upload_g2(&stream, &[])?,
             b_g1: upload_g1(&stream, &[])?,
@@ -1677,7 +1698,7 @@ impl<'a> Plan<'a> {
             n,
             scalar_off,
             general,
-            window_size(general),
+            pick_window(msm.window, general),
             slice_len(),
             msm.work,
         )?;
@@ -2554,6 +2575,20 @@ mod tests {
             let c = window_size(m);
             assert!((3..=MAX_WINDOW).contains(&c), "m = {m} gave c = {c}");
         }
+    }
+
+    /// A forced width wins over the heuristic and is passed through untouched, so the
+    /// plan's own range check is what rejects a bad one.
+    #[test]
+    fn a_forced_window_overrides_the_heuristic() {
+        assert_eq!(pick_window(None, 1500), window_size(1500));
+        for c in [1u32, 2, 3, 12, 14, MAX_WINDOW, MAX_WINDOW + 1] {
+            assert_eq!(pick_window(Some(c), 1500), c);
+            assert_eq!(pick_window(Some(c), 1 << 18), c);
+        }
+        assert!(Geometry::new(65, 0, 65, 1, 64, Work::Variable).is_err());
+        assert!(Geometry::new(65, 0, 65, MAX_WINDOW + 1, 64, Work::Variable).is_err());
+        assert!(Geometry::new(65, 0, 65, MAX_WINDOW, 64, Work::Variable).is_ok());
     }
 
     /// `slices` and `cap` must bound what the kernels index, for every window width. The
