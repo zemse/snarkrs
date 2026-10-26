@@ -116,11 +116,14 @@ keys. Historical end-to-end results do not establish current readiness.
   up front if `snarkjs` is not on PATH, runs `snarkrs-csp artifacts` for the selected
   variants, then passes `--snarkjs` to `bench`. Each variant's warm-up proof is written
   as snarkjs JSON and checked with `snarkjs groth16 verify` against that variant's
-  `vkey.json` and `public.json`, after our own verifier and before any timed iteration.
-  A reject, a nonzero exit or a missing `OK!` fails the run, names the variant and leaves
-  the proof on disk. The `vkey.json` is exported from the zkey by our ceremony code, not
-  by snarkjs, so the check is independent of our verifier and proof encoder but not of
-  our key decoding. It is off by default; a row without it has only the internal checks.
+  `public.json` and a vkey that `snarkjs zkey export verificationkey` reads from the zkey
+  itself, after our own verifier and before any timed iteration. A missing snarkjs, a
+  nonzero exit from either command, an export that leaves no groth16 vkey, or a verify
+  without `OK!` fails the run, names the variant and leaves the proof and exported vkey
+  on disk. The check is independent of our verifier, proof encoder and key decoding; the
+  `vkey.json` that `artifacts` writes with our ceremony code is not used. `public.json`
+  still comes from our witness decoding. It is off by default; a row without it has only
+  the internal checks.
 * **Hardware and protocol need disclosure.** Keep the machine, revision, build features,
   key release/checksums, witness arithmetic mode, sampling counts, validation policy and
   effective allocator settings beside any submitted rows. Laptop results are not

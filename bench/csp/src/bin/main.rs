@@ -52,8 +52,9 @@ struct BenchArgs {
     /// Restrict to one input size. Default: every size the target defines.
     #[arg(long)]
     input_size: Option<usize>,
-    /// Also check each warm-up proof with `snarkjs groth16 verify` at this path, against
-    /// the `vkey.json` and `public.json` that `artifacts` writes. A reject fails the run.
+    /// Also check each warm-up proof with `snarkjs groth16 verify` at this path, against a
+    /// vkey this snarkjs exports from the zkey and the `public.json` that `artifacts`
+    /// writes. A failed export or a reject fails the run.
     #[arg(long, value_name = "BIN")]
     snarkjs: Option<PathBuf>,
 }

@@ -172,26 +172,44 @@ fn tempdir(variant: Variant) -> Result<std::path::PathBuf> {
     Ok(dir)
 }
 
-/// `snarkjs groth16 verify` on `proof`, against the `vkey.json` and `public.json` that
-/// `snarkrs-csp artifacts` wrote. Our verifier shares our encoders, so it cannot see an
-/// encoding error made the same way on both sides; snarkjs can. A rejected proof is left
-/// on disk and its path is in the error.
+/// `snarkjs groth16 verify` on `proof`, against a vkey snarkjs exports from `zkey` itself
+/// and the `public.json` that `snarkrs-csp artifacts` wrote. Our verifier shares our
+/// encoders and our zkey decoding, so it cannot see an error made the same way on both
+/// sides; snarkjs reads the key and checks the proof with none of our code. A rejected
+/// proof is left on disk beside the exported vkey and its path is in the error.
 fn snarkjs_verify(
     bin: &Path,
     variant: Variant,
+    zkey: &Path,
     artifacts: &Path,
     proof: &snarkrs_groth16::Proof,
 ) -> Result<()> {
-    let dir = artifacts.join(variant.name());
-    let (vkey, public) = (dir.join("vkey.json"), dir.join("public.json"));
-    for f in [&vkey, &public] {
-        anyhow::ensure!(
-            f.is_file(),
-            "{} missing; run snarkrs-csp artifacts",
-            f.display()
-        );
-    }
+    let public = artifacts.join(variant.name()).join("public.json");
+    anyhow::ensure!(
+        public.is_file(),
+        "{}: {} missing; run snarkrs-csp artifacts",
+        variant.name(),
+        public.display()
+    );
     let tmp = tempdir(variant)?;
+    let vkey = tmp.join("vkey.json");
+    std::fs::remove_file(&vkey).ok();
+    let out = std::process::Command::new(bin)
+        .args(["zkey", "export", "verificationkey"])
+        .arg(zkey)
+        .arg(&vkey)
+        .output()
+        .with_context(|| format!("{}: running {}", variant.name(), bin.display()))?;
+    check_snarkjs_output(&out, None)
+        .and_then(|()| check_vkey(&vkey))
+        .with_context(|| {
+            format!(
+                "{}: snarkjs did not export a verification key from {}",
+                variant.name(),
+                zkey.display()
+            )
+        })?;
+
     let proof_path = tmp.join("proof.json");
     std::fs::write(&proof_path, snarkrs_groth16::json::proof_to_string(proof))?;
     let out = std::process::Command::new(bin)
@@ -202,17 +220,42 @@ fn snarkjs_verify(
         .output()
         .with_context(|| format!("{}: running {}", variant.name(), bin.display()))?;
     // snarkjs 0.7 exits 1 on a reject, but only the `OK!` line says it actually checked.
+    check_snarkjs_output(&out, Some("OK!")).with_context(|| {
+        format!(
+            "{}: snarkjs did not accept {}",
+            variant.name(),
+            proof_path.display()
+        )
+    })?;
+    std::fs::remove_dir_all(&tmp).ok();
+    Ok(())
+}
+
+/// Success is exit 0, plus `marker` on stdout when the command prints one.
+fn check_snarkjs_output(out: &std::process::Output, marker: Option<&str>) -> Result<()> {
     let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
     anyhow::ensure!(
-        out.status.success() && stdout.contains("OK!"),
-        "{}: snarkjs did not accept {} ({}): {}{}",
-        variant.name(),
-        proof_path.display(),
+        out.status.success() && marker.is_none_or(|m| stdout.contains(m)),
+        "snarkjs status: {}; stdout: {}; stderr: {}",
         out.status,
         stdout.trim(),
-        String::from_utf8_lossy(&out.stderr).trim()
+        stderr.trim()
     );
-    std::fs::remove_dir_all(&tmp).ok();
+    Ok(())
+}
+
+/// `zkey export verificationkey` prints nothing on success, so the file is the evidence.
+fn check_vkey(vkey: &Path) -> Result<()> {
+    let text =
+        std::fs::read_to_string(vkey).with_context(|| format!("reading {}", vkey.display()))?;
+    let json: serde_json::Value =
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", vkey.display()))?;
+    anyhow::ensure!(
+        json["protocol"] == "groth16",
+        "{} is not a groth16 verification key",
+        vkey.display()
+    );
     Ok(())
 }
 
@@ -242,7 +285,7 @@ pub fn variant(variant: Variant, cfg: &Config) -> Result<(Metrics, Breakdown)> {
     verify(&pk.vk, &public, &proof)
         .with_context(|| format!("{}: our own verifier rejected the proof", variant.name()))?;
     if let Some(snarkjs) = cfg.snarkjs {
-        snarkjs_verify(snarkjs, variant, cfg.artifacts, &proof)?;
+        snarkjs_verify(snarkjs, variant, &zkey, cfg.artifacts, &proof)?;
     }
     let n_constraints = num_constraints(&pk);
     let proof_size = snarkrs_groth16::json::proof_to_string(&proof).len()
@@ -339,4 +382,135 @@ pub fn variant(variant: Variant, cfg: &Config) -> Result<(Metrics, Breakdown)> {
     std::fs::write(&breakdown_path, serde_json::to_string_pretty(&breakdown)?)?;
 
     Ok((row, breakdown))
+}
+
+/// The oracle against a shell script standing in for snarkjs. Each test uses its own
+/// variant, because `tempdir` is keyed by variant and process and the tests run in parallel.
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::Target;
+    use snarkrs_field::{AffineRepr, G1Affine, G2Affine};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+
+    const EXPORT_OK: &str = r#"printf '{"protocol":"groth16"}' > "$5""#;
+    /// Accepts only a vkey that the export step wrote, never the artifact directory's.
+    const VERIFY_OK: &str = r#"case "$3" in */artifacts/*) exit 9 ;; esac; grep -q groth16 "$3" && echo '[INFO]  snarkJS: OK!'"#;
+
+    fn variant(input_size: usize) -> Variant {
+        Variant {
+            target: Target::Sha256,
+            input_size,
+        }
+    }
+
+    fn proof() -> snarkrs_groth16::Proof {
+        snarkrs_groth16::Proof {
+            a: G1Affine::generator(),
+            b: G2Affine::generator(),
+            c: G1Affine::generator(),
+        }
+    }
+
+    /// A directory holding an executable `snarkjs` that runs `export` for `zkey ...` and
+    /// `verify` for `groth16 verify ...`, and an artifact directory with only public.json.
+    fn setup(name: &str, v: Variant, export: &str, verify: &str) -> (PathBuf, PathBuf) {
+        let root =
+            std::env::temp_dir().join(format!("snarkrs-csp-test-{name}-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let artifacts = root.join("artifacts");
+        std::fs::create_dir_all(artifacts.join(v.name())).unwrap();
+        std::fs::write(
+            artifacts.join(v.name()).join("public.json"),
+            "[\n \"1\"\n]\n",
+        )
+        .unwrap();
+        let bin = root.join("snarkjs");
+        std::fs::write(
+            &bin,
+            format!("#!/bin/sh\ncase \"$1\" in\nzkey) {export} ;;\ngroth16) {verify} ;;\nesac\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (bin, artifacts)
+    }
+
+    fn run(name: &str, v: Variant, export: &str, verify: &str) -> Result<()> {
+        let (bin, artifacts) = setup(name, v, export, verify);
+        let result = snarkjs_verify(&bin, v, &v.zkey(&artifacts), &artifacts, &proof());
+        std::fs::remove_dir_all(bin.parent().unwrap()).ok();
+        std::fs::remove_dir_all(tempdir(v).unwrap()).ok();
+        result
+    }
+
+    fn error(name: &str, v: Variant, export: &str, verify: &str) -> String {
+        format!("{:#}", run(name, v, export, verify).unwrap_err())
+    }
+
+    #[test]
+    fn accepts_with_the_vkey_snarkjs_exported() {
+        run("accept", variant(128), EXPORT_OK, VERIFY_OK).unwrap();
+    }
+
+    #[test]
+    fn export_nonzero_exit_names_the_variant() {
+        let e = error(
+            "export-exit",
+            variant(256),
+            "echo 'bad zkey' >&2; exit 3",
+            VERIFY_OK,
+        );
+        assert!(e.starts_with("sha256_256: snarkjs did not export"), "{e}");
+        assert!(e.contains("exit status: 3"), "{e}");
+        assert!(e.contains("stderr: bad zkey"), "{e}");
+    }
+
+    #[test]
+    fn export_without_a_file_fails() {
+        let e = error("export-nofile", variant(512), "true", VERIFY_OK);
+        assert!(e.starts_with("sha256_512: snarkjs did not export"), "{e}");
+        assert!(e.contains("reading"), "{e}");
+    }
+
+    #[test]
+    fn verify_without_ok_fails() {
+        let e = error(
+            "verify-nook",
+            variant(1024),
+            EXPORT_OK,
+            "echo 'Invalid proof'",
+        );
+        assert!(e.starts_with("sha256_1024: snarkjs did not accept"), "{e}");
+        assert!(e.contains("stdout: Invalid proof"), "{e}");
+    }
+
+    #[test]
+    fn verify_nonzero_exit_fails_even_with_ok() {
+        let e = error(
+            "verify-exit",
+            variant(2048),
+            EXPORT_OK,
+            "echo 'snarkJS: OK!'; exit 1",
+        );
+        assert!(e.starts_with("sha256_2048: snarkjs did not accept"), "{e}");
+        assert!(e.contains("exit status: 1"), "{e}");
+    }
+
+    #[test]
+    fn missing_snarkjs_names_the_variant() {
+        let v = Variant {
+            target: Target::Keccak,
+            input_size: 128,
+        };
+        let (bin, artifacts) = setup("missing", v, EXPORT_OK, VERIFY_OK);
+        std::fs::remove_file(&bin).unwrap();
+        let e = format!(
+            "{:#}",
+            snarkjs_verify(&bin, v, &v.zkey(&artifacts), &artifacts, &proof()).unwrap_err()
+        );
+        std::fs::remove_dir_all(bin.parent().unwrap()).ok();
+        std::fs::remove_dir_all(tempdir(v).unwrap()).ok();
+        assert!(e.starts_with("keccak_128: running"), "{e}");
+    }
 }
