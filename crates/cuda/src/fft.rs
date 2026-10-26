@@ -782,8 +782,22 @@ fn env_timing() -> bool {
 
 #[cfg(test)]
 mod tests {
+    mod resources {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test-support/resources.rs"
+        ));
+    }
+
     use super::*;
+    use ark_ec::short_weierstrass::{Affine, Projective};
+    use snarkrs_field::raw::RawField;
+    use snarkrs_field::{AffineRepr, CurveGroup, Fq, Fq2, G1Affine, G2Affine, Zero};
     use snarkrs_gpu_layout::PackedGlv;
+    use snarkrs_msm::xyzz::{to_projective, RawCurve};
+
+    type G1Cfg = snarkrs_field::g1::Config;
+    type G2Cfg = snarkrs_field::g2::Config;
 
     /// Every row of [`VARIANTS`] has an instantiation line in the source, and the gated
     /// rows sit behind the `G16_FFT_VARIANTS` guard their loading is keyed on.
@@ -921,5 +935,435 @@ mod tests {
         };
         assert!(reason.contains("G2"), "{reason}");
         assert!(reason.contains("two-adic subgroup"), "{reason}");
+    }
+
+    /// `f_beta_mul(Fq2)` multiplies both halves by the one G1 `beta`, which is the G2
+    /// endomorphism only because ark's G2 coefficient is that same `beta` with `c1 == 0`.
+    /// The kernel comment asserts it; this pins it, so a change to either lattice shows up
+    /// here and not as a G2 block that disagrees.
+    #[test]
+    fn the_g2_endomorphism_is_the_g1_beta_in_c0() {
+        let g1 = <G1Cfg as GLVConfig>::ENDO_COEFFS;
+        let g2 = <G2Cfg as GLVConfig>::ENDO_COEFFS;
+        assert_eq!(g1.len(), 1);
+        assert_eq!(g2.len(), 1);
+        assert_eq!(g2[0], Fq2::new(g1[0], Fq::zero()));
+        for line in ["r.c0 = fq_mul(x.c0, b);", "r.c1 = fq_mul(x.c1, b);"] {
+            assert!(
+                kernels::FFT_CU.contains(line),
+                "kernels/fft.cu's f_beta_mul(Fq2) no longer contains:\n{line}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // On-device checks. Ported from `crates/metal/src/fft.rs`; the oracle differs
+    // because snarkrs-ceremony depends on this crate, so `CpuGroupFft` cannot be a
+    // dev-dependency here without a cycle. `dft_ref` below is independent of every
+    // table and formula the kernels share with the CPU transform instead.
+    // -----------------------------------------------------------------------
+
+    /// Deterministic draws, so a failure is reproducible without a seed to record. Same
+    /// generator and same reason as the Metal twin's.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn word(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 11
+        }
+
+        fn fr(&mut self) -> Fr {
+            let a = Fr::from(self.word());
+            let b = Fr::from(self.word());
+            let c = Fr::from(self.word());
+            a * b + c
+        }
+    }
+
+    /// `[k] G` in XYZZ with a deliberately non-trivial `ZZ`, so the butterflies see the
+    /// spread of representatives a real transform hands them rather than a vector that is
+    /// entirely `ZZ == 1`. `ZZ = u^2`, `ZZZ = u^3` keeps the `ZZ^3 == ZZZ^2` invariant.
+    fn scaled_g1(k: Fr, u: u64) -> Xyzz<RawFq> {
+        let p = (G1Affine::generator() * k).into_affine();
+        let u = RawFq::from_fq(&Fq::from(u | 1));
+        let zz = u.sqr();
+        let zzz = zz.mul(u);
+        Xyzz {
+            x: RawFq::from_fq(&p.x).mul(zz),
+            y: RawFq::from_fq(&p.y).mul(zzz),
+            zz,
+            zzz,
+        }
+    }
+
+    fn scaled_g2(k: Fr, u: u64) -> Xyzz<RawFq2> {
+        let p = (G2Affine::generator() * k).into_affine();
+        let u = RawFq2 {
+            c0: RawFq::from_fq(&Fq::from(u | 1)),
+            c1: RawFq::ONE,
+        };
+        let zz = u.sqr();
+        let zzz = zz.mul(u);
+        Xyzz {
+            x: RawFq2::from_fq2(&p.x).mul(zz),
+            y: RawFq2::from_fq2(&p.y).mul(zzz),
+            zz,
+            zzz,
+        }
+    }
+
+    /// `n` points with every fourth one the point at infinity.
+    ///
+    /// Infinity is a live input, not a defensive one: ptau section 12's `power+1` block is
+    /// padded with it (prepare.rs:562), and after one butterfly it is also what a
+    /// cancellation leaves behind, so it has to survive the ladder, the addition and the
+    /// scaling pass.
+    fn block_g1(seed: u64, n: usize) -> Vec<Xyzz<RawFq>> {
+        let mut rng = Lcg(seed);
+        (0..n)
+            .map(|i| {
+                if i % 4 == 0 {
+                    Xyzz::ZERO
+                } else {
+                    scaled_g1(rng.fr(), rng.word())
+                }
+            })
+            .collect()
+    }
+
+    fn block_g2(seed: u64, n: usize) -> Vec<Xyzz<RawFq2>> {
+        let mut rng = Lcg(seed);
+        (0..n)
+            .map(|i| {
+                if i % 4 == 0 {
+                    Xyzz::ZERO
+                } else {
+                    scaled_g2(rng.fr(), rng.word())
+                }
+            })
+            .collect()
+    }
+
+    /// `n` points drawn from a pool of three, laid out so the first pass meets equal and
+    /// opposite pairs: pass 1 pairs `a[i]` with `a[i + n/2]`, which here is `a[i]` again
+    /// for even `i` and `-a[i]` for odd `i`. Half of that pass takes `pt_add`'s doubling
+    /// branch and the other half cancels to infinity, which every later pass then ladders
+    /// and adds. The same-x branches and a zero `ZZ` are where a point formula goes wrong
+    /// silently, and a block of distinct random points never reaches them.
+    fn repeated<F: RawField>(pool: &[Xyzz<F>], n: usize) -> Vec<Xyzz<F>> {
+        let half = (n / 2).max(1);
+        (0..n)
+            .map(|i| {
+                let p = pool[(i % half) % pool.len()];
+                if i >= half && i % 2 == 1 {
+                    Xyzz { y: p.y.neg(), ..p }
+                } else {
+                    p
+                }
+            })
+            .collect()
+    }
+
+    fn pool_g1(seed: u64) -> Vec<Xyzz<RawFq>> {
+        let mut rng = Lcg(seed);
+        (0..3).map(|_| scaled_g1(rng.fr(), rng.word())).collect()
+    }
+
+    fn pool_g2(seed: u64) -> Vec<Xyzz<RawFq2>> {
+        let mut rng = Lcg(seed);
+        (0..3).map(|_| scaled_g2(rng.fr(), rng.word())).collect()
+    }
+
+    /// The comparison the byte-identity claim rests on: affine, which is canonical, and
+    /// which is what `lagrange_evaluations` (prepare.rs:414) writes to the file.
+    fn affine<P: RawCurve>(a: &[Xyzz<P::RF>]) -> Vec<Affine<P>> {
+        Projective::normalize_batch(&a.iter().map(to_projective::<P>).collect::<Vec<_>>())
+    }
+
+    /// The transform the device is measured against, sharing nothing with the kernels:
+    /// ark's projective arithmetic, a plain scalar multiplication per twiddle, and the
+    /// primitive root `prepare::root_table` builds, which is ark's `get_root_of_unity`
+    /// (`TWO_ADIC_ROOT_OF_UNITY` squared down to the block). `inverse` runs the same
+    /// butterflies over `w^-1` and scales by `1/n`, the textbook definition, so the
+    /// `a[1..].reverse()` fold, the GLV lattice, `f_beta_mul` and both twiddle tables are
+    /// all on the other side of the comparison. `prepare::ifft` agrees with this by
+    /// construction: `fft` over `w` then `a[1..].reverse()` is `sum a[j] w^(-ij)`.
+    fn dft_ref<P: RawCurve<ScalarField = Fr>>(a: &[Xyzz<P::RF>], inverse: bool) -> Vec<Affine<P>> {
+        let n = a.len();
+        let mut v: Vec<Projective<P>> = a.iter().map(to_projective::<P>).collect();
+        if n > 1 {
+            let bits = n.trailing_zeros();
+            for i in 0..n {
+                let r = ((i as u32).reverse_bits() >> (u32::BITS - bits)) as usize;
+                if i < r {
+                    v.swap(i, r);
+                }
+            }
+            let mut w = Fr::get_root_of_unity(n as u64).expect("2^bits divides r - 1");
+            if inverse {
+                w = w.inverse().expect("a root of unity is a unit");
+            }
+            let mut len = 2;
+            while len <= n {
+                let step = w.pow([(n / len) as u64]);
+                let mut tw = Vec::with_capacity(len / 2);
+                let mut t = Fr::ONE;
+                for _ in 0..len / 2 {
+                    tw.push(t);
+                    t *= step;
+                }
+                v.par_chunks_mut(len).for_each(|chunk| {
+                    let (lo, hi) = chunk.split_at_mut(len / 2);
+                    for (j, (lo, hi)) in lo.iter_mut().zip(hi.iter_mut()).enumerate() {
+                        let t = *hi * tw[j];
+                        *hi = *lo - t;
+                        *lo += t;
+                    }
+                });
+                len <<= 1;
+            }
+            if inverse {
+                let size_inv = Fr::from(n as u64)
+                    .inverse()
+                    .expect("a power of two is a unit mod r");
+                v.par_iter_mut().for_each(|p| *p *= size_inv);
+            }
+        }
+        Projective::normalize_batch(&v)
+    }
+
+    /// One block through the device and back: the result is the reference inverse, and
+    /// the reference forward transform of it is the input again. The round trip is what
+    /// pins the convention rather than the arithmetic: an answer off by the rotation the
+    /// module doc warns about is a valid transform of something, just not of `input`.
+    fn check_ifft<G: FftGroup>(k: &FftKernels, input: &[Xyzz<G::Raw>], what: &str)
+    where
+        G::Cfg: RawCurve<RF = G::Raw>,
+    {
+        let mut got = input.to_vec();
+        k.ifft_many::<G>(&mut [&mut got])
+            .unwrap_or_else(|e| panic!("{} {what}: device ifft failed: {e}", G::OP));
+        assert!(
+            affine::<G::Cfg>(&got) == dft_ref::<G::Cfg>(input, true),
+            "{} {what}: the device ifft disagrees with the reference",
+            G::OP
+        );
+        assert!(
+            dft_ref::<G::Cfg>(&got, false) == affine::<G::Cfg>(input),
+            "{} {what}: the forward transform of the device ifft is not the input",
+            G::OP
+        );
+    }
+
+    fn device() -> Option<Cuda> {
+        match Cuda::new(0) {
+            Ok(c) => {
+                let (major, minor) = c.compute_capability();
+                eprintln!(
+                    "cuda device: {} (sm_{major}{minor}, {} SMs)",
+                    c.device_name(),
+                    c.sm_count()
+                );
+                Some(c)
+            }
+            Err(e) => {
+                resources::skip(format_args!("cuda FFT test, no usable device: {e}"));
+                None
+            }
+        }
+    }
+
+    /// The shipped variant, compiled from the FFT unit. A second process on the same
+    /// box hits the PTX cache (`context.rs`), so only the first test of a cold box pays
+    /// NVRTC.
+    fn kernels() -> Option<FftKernels> {
+        let cuda = device()?;
+        Some(FftKernels::new(&cuda).expect("fft kernels"))
+    }
+
+    /// Every block size from 2^0 to 2^12, every size a ptau file below power 12 contains
+    /// and the shape of every pass count from zero to thirteen, then 2^15 for a grid
+    /// wider than any one CUDA block. 2^0 is the host pass-through: nothing is launched
+    /// and the point comes back untouched.
+    #[test]
+    #[ignore = "needs an NVIDIA device"]
+    fn ifft_g1_matches_the_reference_at_every_block_size() {
+        let Some(k) = kernels() else { return };
+        for bits in (0..=12u32).chain([15]) {
+            let n = 1usize << bits;
+            let input = block_g1(0x5eed_1000 + u64::from(bits), n);
+            check_ifft::<FftG1>(&k, &input, &format!("block of 2^{bits}"));
+        }
+    }
+
+    #[test]
+    #[ignore = "needs an NVIDIA device"]
+    fn ifft_g2_matches_the_reference_at_every_block_size() {
+        let Some(k) = kernels() else { return };
+        for bits in (0..=10u32).chain([12]) {
+            let n = 1usize << bits;
+            let input = block_g2(0x5eed_2000 + u64::from(bits), n);
+            check_ifft::<FftG2>(&k, &input, &format!("block of 2^{bits}"));
+        }
+    }
+
+    /// A block that is entirely the point at infinity, which is what `ptau new` produces
+    /// before any contribution: `tau == 1` makes every input the generator and most
+    /// outputs the identity. A ladder that starts its accumulator anywhere but infinity,
+    /// or a butterfly that reads a zero `ZZ` as a real coordinate, fails here and nowhere
+    /// else.
+    #[test]
+    #[ignore = "needs an NVIDIA device"]
+    fn an_all_infinity_block_stays_infinity() {
+        let Some(k) = kernels() else { return };
+        let n = 256;
+        let mut g1 = vec![Xyzz::<RawFq>::ZERO; n];
+        k.ifft_g1(&mut g1).expect("ifft_g1");
+        assert!(
+            g1.iter().all(|p| p.is_zero()),
+            "G1 infinity did not survive"
+        );
+        let mut g2 = vec![Xyzz::<RawFq2>::ZERO; n];
+        k.ifft_g2(&mut g2).expect("ifft_g2");
+        assert!(
+            g2.iter().all(|p| p.is_zero()),
+            "G2 infinity did not survive"
+        );
+    }
+
+    /// Blocks whose butterflies meet the same point twice and a point against its
+    /// negation (see [`repeated`]), at the one-pass size and three deeper ones, plus a
+    /// constant block, whose transform is its single point at index 0 and infinity
+    /// everywhere else: `(1/n) sum_j P w^(-ij)` is `P` at `i == 0` and a geometric sum
+    /// of the roots, which is zero, at every other `i`.
+    #[test]
+    #[ignore = "needs an NVIDIA device"]
+    fn repeated_and_cancelling_points_agree() {
+        let Some(k) = kernels() else { return };
+        let pool_g1 = pool_g1(0x5eed_7001);
+        let pool_g2 = pool_g2(0x5eed_7002);
+        for n in [2usize, 8, 64, 512] {
+            check_ifft::<FftG1>(
+                &k,
+                &repeated(&pool_g1, n),
+                &format!("repeated block of {n}"),
+            );
+            check_ifft::<FftG2>(
+                &k,
+                &repeated(&pool_g2, n),
+                &format!("repeated block of {n}"),
+            );
+        }
+
+        let n = 128;
+        let mut g1 = vec![pool_g1[0]; n];
+        k.ifft_g1(&mut g1).expect("ifft_g1");
+        let g1 = affine::<G1Cfg>(&g1);
+        assert_eq!(g1[0], affine::<G1Cfg>(&pool_g1[..1])[0]);
+        assert!(g1[1..].iter().all(|p| p.is_zero()), "G1 constant block");
+        let mut g2 = vec![pool_g2[1]; n];
+        k.ifft_g2(&mut g2).expect("ifft_g2");
+        let g2 = affine::<G2Cfg>(&g2);
+        assert_eq!(g2[0], affine::<G2Cfg>(&pool_g2[1..2])[0]);
+        assert!(g2[1..].iter().all(|p| p.is_zero()), "G2 constant block");
+    }
+
+    /// Blocks of every depth from 0 to 2^10 in one `ifft_many` call, which is the shape
+    /// `process_section` sends: one `tw` table at the deepest block's `max_bits` serves
+    /// every shallower block through `tw_shift`, each block's own `exp == bits` round is
+    /// its fused pass, and the 0- and 1-point blocks are skipped rather than launched.
+    /// Once on the one stream and once round-robined over three, with the timing events
+    /// on for the second so that path is exercised too.
+    #[test]
+    #[ignore = "needs an NVIDIA device"]
+    fn blocks_of_every_depth_agree_in_one_call() {
+        let Some(k) = kernels() else { return };
+        let sizes: Vec<usize> = std::iter::once(0).chain((0..=10).map(|b| 1 << b)).collect();
+        let g1: Vec<Vec<Xyzz<RawFq>>> = sizes
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| block_g1(0x5eed_6100 + i as u64, n))
+            .collect();
+        let g2: Vec<Vec<Xyzz<RawFq2>>> = sizes
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| block_g2(0x5eed_6200 + i as u64, n))
+            .collect();
+        let want_g1: Vec<_> = g1.iter().map(|a| dft_ref::<G1Cfg>(a, true)).collect();
+        let want_g2: Vec<_> = g2.iter().map(|a| dft_ref::<G2Cfg>(a, true)).collect();
+
+        let mut k = k;
+        for streams in [1usize, 3] {
+            k = k.with_streams(streams).with_timing(streams > 1);
+            let mut got_g1 = g1.clone();
+            k.ifft_g1_many(&mut got_g1.iter_mut().map(Vec::as_mut_slice).collect::<Vec<_>>())
+                .expect("ifft_g1_many");
+            let mut got_g2 = g2.clone();
+            k.ifft_g2_many(&mut got_g2.iter_mut().map(Vec::as_mut_slice).collect::<Vec<_>>())
+                .expect("ifft_g2_many");
+            for (i, &n) in sizes.iter().enumerate() {
+                assert!(
+                    affine::<G1Cfg>(&got_g1[i]) == want_g1[i],
+                    "G1 block of {n} points disagrees under {streams} streams"
+                );
+                assert!(
+                    affine::<G2Cfg>(&got_g2[i]) == want_g2[i],
+                    "G2 block of {n} points disagrees under {streams} streams"
+                );
+            }
+        }
+    }
+
+    /// The launch geometry is not the answer: every thread count from one per block to
+    /// past the kernel's own maximum, which `cfg_1d` clamps, reaches the same points.
+    /// 7 divides neither a pass's thread count nor a warp, so the last block is partial
+    /// in every pass and the kernel's bounds guard is what keeps the surplus threads out.
+    #[test]
+    #[ignore = "needs an NVIDIA device"]
+    fn the_thread_count_does_not_change_the_points() {
+        let Some(k) = kernels() else { return };
+        let g1 = block_g1(0x5eed_8001, 1 << 9);
+        let g2 = block_g2(0x5eed_8002, 1 << 7);
+        let mut k = k;
+        for threads in [1u32, 7, 32, 128, 1024] {
+            k = k.with_block(threads);
+            check_ifft::<FftG1>(&k, &g1, &format!("{threads} threads per block"));
+            check_ifft::<FftG2>(&k, &g2, &format!("{threads} threads per block"));
+        }
+    }
+
+    /// Every variant the unit can carry reaches the same points, which is what makes a
+    /// `G16_CUDA_FFT_VARIANT` sweep a measurement rather than a correctness gamble. The
+    /// gated rows are compiled here on purpose: this is the one test that pays for them,
+    /// and the PTX cache keeps a rerun free. Run it last and alone: the shipped two pairs
+    /// are already a 60 MB PTX and about nine minutes of NVRTC on a 4 vCPU g4dn.xlarge
+    /// (every ladder inlines the CIOS multiply, see the `fft.cu` banner), and this set is
+    /// four times that, so with `--ignored` it would hold every other gate behind it.
+    #[test]
+    #[ignore = "needs an NVIDIA device and compiles the gated variant set, tens of minutes cold"]
+    fn every_variant_gives_the_same_points() {
+        let Some(cuda) = device() else { return };
+        let module = FftKernels::compile_with(&cuda, true).expect("compile the gated fft unit");
+        let mut k = FftKernels::from_module_with(&cuda, module, true).expect("fft kernels");
+        assert_eq!(
+            k.variant_names(),
+            VARIANTS.iter().map(|d| d.name).collect::<Vec<_>>()
+        );
+        let g1 = block_g1(0x5eed_3001, 512);
+        let g2 = block_g2(0x5eed_3002, 512);
+        for def in &VARIANTS {
+            k = k.with_variant(def.name).expect("a loaded variant");
+            assert_eq!(k.variant(), def.name);
+            check_ifft::<FftG1>(&k, &g1, &format!("variant {}", def.name));
+            check_ifft::<FftG2>(&k, &g2, &format!("variant {}", def.name));
+        }
+        assert!(
+            k.with_variant("c9").is_err(),
+            "an unknown variant was accepted"
+        );
     }
 }
