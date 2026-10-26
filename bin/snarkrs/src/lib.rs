@@ -11,6 +11,7 @@ pub mod fallback;
 pub mod fftbench;
 pub mod json;
 pub mod log;
+pub mod publish;
 
 use anyhow::Result;
 use snarkrs_ceremony::{CpuGroupFft, CpuKeyScale};

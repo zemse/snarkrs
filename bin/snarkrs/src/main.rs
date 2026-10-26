@@ -75,7 +75,7 @@ use snarkrs_ceremony::{
 use snarkrs_cli::{
     bench,
     cli::{self, Parsed, Support},
-    fft_backend, json, key_backend, log, make_backend, msm_backend, BackendKind,
+    fft_backend, json, key_backend, log, make_backend, msm_backend, publish, BackendKind,
 };
 use snarkrs_field::Fr;
 use snarkrs_formats::{wtns::Witness, ProvingKey, VerifyingKey};
@@ -1053,7 +1053,7 @@ fn run_zkey(cmd: ZkeyCmd) -> Result<u8> {
                 .with_context(|| format!("exporting from {}", zkey.display()))?;
             log::info("> Detected protocol: groth16");
             log::info("EXPORT VERIFICATION KEY FINISHED");
-            std::fs::write(&out, source).with_context(|| format!("writing {}", out.display()))?;
+            publish::publish(&out, source.as_bytes())?;
             log::debug(format!("wrote {}", out.display()));
         }
         ZkeyCmd::Export {
@@ -1226,11 +1226,15 @@ fn run_wtns(cmd: WtnsCmd) -> Result<u8> {
                 snarkrs_witness::read_file(&input).and_then(|text| match native::detect(&wasm)? {
                     native::Kind::Wasm => {
                         let mut w = wasm_witness(&wasm, &text, false)?;
-                        let r = snarkrs_witness::write_wtns(&witness, &w);
+                        let r = publish::publish_wtns(&witness, |stage| {
+                            snarkrs_witness::write_wtns(stage, &w)
+                        });
                         snarkrs_groth16::scrub(&mut w);
                         r
                     }
-                    native::Kind::Native => native::calculate_to_file(&wasm, &input, &witness),
+                    native::Kind::Native => publish::publish_wtns(&witness, |stage| {
+                        native::calculate_to_file(&wasm, &input, stage)
+                    }),
                 });
             if let Err(e) = done {
                 return Ok(witness_failed(&e));
@@ -1260,7 +1264,8 @@ fn run_wtns(cmd: WtnsCmd) -> Result<u8> {
                 // too. A circom 2 module calls none of the hooks that would print them.
                 snarkrs_witness::read_file(&sym)?;
                 let mut w = wasm_witness(&wasm, &text, true)?;
-                let r = snarkrs_witness::write_wtns(&witness, &w);
+                let r =
+                    publish::publish_wtns(&witness, |stage| snarkrs_witness::write_wtns(stage, &w));
                 snarkrs_groth16::scrub(&mut w);
                 r
             });
@@ -1492,8 +1497,9 @@ fn run_prove(
         })?;
     }
 
-    json::write_proof(proof_out, &proof)?;
-    json::write_public(public_out, public)?;
+    // As one set, so a failure on public.json does not leave a new proof beside the old
+    // signals, as snarkjs can.
+    publish::publish_proof(proof_out, &proof, public_out, public)?;
     // Written out, so the in-memory copy has nothing left to do. `Scrubbed` zeroes it as
     // it drops, and the backend's own scratch (H, stage 0's B and C) is zeroed by
     // `snarkrs-groth16` as it drops.
@@ -1580,8 +1586,7 @@ fn run_trace(
 
     match out {
         Some(path) => {
-            std::fs::write(path, trace.to_text())
-                .with_context(|| format!("writing {}", path.display()))?;
+            publish::publish(path, trace.to_text().as_bytes())?;
             eprintln!("wrote {}", path.display());
         }
         None => print!("{}", trace.to_text()),

@@ -196,7 +196,7 @@ pub fn run(args: Args) -> Result<()> {
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::create_dir_all(dir).ok();
         }
-        std::fs::write(path, out).with_context(|| format!("writing {}", path.display()))?;
+        crate::publish::publish(path, out.as_bytes())?;
         println!("\nwrote {} rows to {}", rows.len(), path.display());
     }
     Ok(())
