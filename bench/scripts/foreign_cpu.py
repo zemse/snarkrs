@@ -4,18 +4,23 @@
 procps `ps -o pcpu` is CPU time over the whole lifetime of the process, so a long-lived
 daemon that has just become busy barely moves it. This reads utime+stime from every
 /proc/<pid>/stat twice, an interval apart, and divides the difference by the interval.
+
+A process that starts and exits inside the interval is in neither reading. Its time lands in
+its parent's cutime+cstime when the parent reaps it, so those count too, less what a child
+that was already running had used before the interval.
 """
 import argparse
+from collections import defaultdict
 import os
 from pathlib import Path
 import time
 
 
 def parse_stat(line):
-    """(pgrp, utime + stime in clock ticks) from one /proc/<pid>/stat line."""
+    """(ppid, pgrp, utime+stime+cutime+cstime in clock ticks) from one /proc/<pid>/stat line."""
     # comm is in parentheses and may itself hold spaces or parentheses, so split after the last one.
     fields = line[line.rindex(")") + 2:].split()
-    return int(fields[2]), int(fields[11]) + int(fields[12])
+    return fields[1], int(fields[2]), sum(int(f) for f in fields[11:15])
 
 
 def snapshot(proc):
@@ -30,12 +35,18 @@ def snapshot(proc):
 
 
 def foreign_percent(before, after, me, hz, seconds):
+    # A child that exits inside the interval hands its whole lifetime to its parent's
+    # cutime+cstime, including the part already counted in the first reading.
+    gone = defaultdict(int)
+    for pid, (ppid, _, used) in before.items():
+        if pid not in after:
+            gone[ppid] += used
     ticks = 0
-    for pid, (pgrp, used) in after.items():
+    for pid, (_, pgrp, used) in after.items():
         if pgrp == me:
             continue
         # A process that started inside the interval spent all of its time inside it.
-        ticks += max(used - before.get(pid, (pgrp, 0))[1], 0)
+        ticks += max(used - before.get(pid, (None, pgrp, 0))[2] - gone[pid], 0)
     return 100.0 * ticks / hz / max(seconds, 1e-3)
 
 

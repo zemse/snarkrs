@@ -1,6 +1,8 @@
 import os
 from pathlib import Path
+import signal
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -123,7 +125,7 @@ class ContentionGuardTests(unittest.TestCase):
             proc = Path(directory)
             (proc / "stat").write_text("cpu  1 2 3 4\n")
             (proc / "77").mkdir()
-            (proc / "77" / "stat").write_text(STAT.format(pgrp=1, utime=500, stime=20))
+            (proc / "77" / "stat").write_text(stat(pgrp=1, utime=500, stime=20))
             out, calls, _ = self.guard([900] * 17, proc=proc)
         self.assertEqual(calls, 0)
         self.assertIn("baseline 0% of a core", out)
@@ -170,37 +172,86 @@ class ContentionGuardTests(unittest.TestCase):
         self.assertIn("could not read this script's process group, got '' (exit 0)", err)
 
 
-STAT = ("77 (tmux: server (1)) S 1 {pgrp} 77 0 -1 4194560 3020 0 0 0 {utime} {stime} 0 0 20 "
-        "0 1 0 1234 9400320 1100 18446744073709551615 1 1 0 0 0 0 0 4096 81923 0 0 0 17 3 "
-        "0 0 0 0 0\n")
+STAT = ("77 (tmux: server (1)) S 1 {pgrp} 77 0 -1 4194560 3020 0 0 0 {utime} {stime} {cutime} "
+        "{cstime} 20 0 1 0 1234 9400320 1100 18446744073709551615 1 1 0 0 0 0 0 4096 81923 0 0 "
+        "0 17 3 0 0 0 0 0\n")
+
+
+def stat(pgrp, utime, stime, cutime=0, cstime=0):
+    return STAT.format(pgrp=pgrp, utime=utime, stime=stime, cutime=cutime, cstime=cstime)
 
 
 class ProcStatTests(unittest.TestCase):
     def test_parse_skips_a_command_name_with_spaces_and_parentheses(self):
-        self.assertEqual(foreign_cpu.parse_stat(STAT.format(pgrp=4242, utime=500, stime=20)),
-                         (4242, 520))
+        self.assertEqual(foreign_cpu.parse_stat(stat(4242, 500, 20, 7, 3)), ("1", 4242, 530))
 
     def test_foreign_percent_is_the_tick_delta_over_the_interval(self):
-        before = {"10": (1, 1000), "11": (4242, 0), "12": (7, 50)}
-        after = {"10": (1, 1150), "11": (4242, 5000), "12": (7, 50), "13": (9, 30)}
+        before = {"10": ("1", 1, 1000), "11": ("1", 4242, 0), "12": ("1", 7, 50)}
+        after = {"10": ("1", 1, 1150), "11": ("1", 4242, 5000), "12": ("1", 7, 50),
+                 "13": ("1", 9, 30)}
         # 150 ticks from the long-lived daemon, 30 from a process born inside the interval,
         # none from our own group, at 100 ticks a second over two seconds.
         self.assertEqual(foreign_cpu.foreign_percent(before, after, 4242, 100, 2.0), 90.0)
 
+    def test_children_born_and_reaped_inside_the_interval_count(self):
+        # A loop of short processes is in neither reading, only in the parent's cutime. On a
+        # t3.small a core's worth of 0.3s python runs used to read as about 30%.
+        before = {"10": ("1", 7, 100)}
+        after = {"10": ("1", 7, 195)}
+        self.assertEqual(foreign_cpu.foreign_percent(before, after, 4242, 100, 1.0), 95.0)
+
+    def test_a_long_child_that_exits_counts_only_its_time_inside_the_interval(self):
+        # Reaping hands the parent all 5030 ticks, 5000 of them spent before the interval.
+        before = {"10": ("1", 7, 100), "11": ("10", 7, 5000)}
+        after = {"10": ("1", 7, 5130)}
+        self.assertEqual(foreign_cpu.foreign_percent(before, after, 4242, 100, 1.0), 30.0)
+
+    def test_an_unreaped_exit_only_clamps_its_own_parent(self):
+        # Nobody waited for 11, so its parent's cutime never grew; 12's half core still shows.
+        before = {"10": ("1", 7, 100), "11": ("10", 7, 5000), "12": ("1", 8, 0)}
+        after = {"10": ("1", 7, 110), "12": ("1", 8, 50)}
+        self.assertEqual(foreign_cpu.foreign_percent(before, after, 4242, 100, 1.0), 50.0)
+
     def test_reused_pid_never_counts_negative(self):
-        self.assertEqual(foreign_cpu.foreign_percent({"10": (1, 900)}, {"10": (1, 5)}, 4242,
-                                                     100, 1.0), 0.0)
+        self.assertEqual(foreign_cpu.foreign_percent({"10": ("1", 1, 900)},
+                                                     {"10": ("1", 1, 5)}, 4242, 100, 1.0), 0.0)
 
     def test_snapshot_reads_every_pid_and_ignores_the_rest(self):
         with tempfile.TemporaryDirectory() as directory:
             proc = Path(directory)
             for pid, pgrp in (("77", 1), ("78", 4242)):
                 (proc / pid).mkdir()
-                (proc / pid / "stat").write_text(STAT.format(pgrp=pgrp, utime=3, stime=4))
+                (proc / pid / "stat").write_text(stat(pgrp, 3, 4, 1, 1))
             (proc / "self").mkdir()
             (proc / "stat").write_text("cpu  1 2 3 4\n")
             (proc / "79").mkdir()
-            self.assertEqual(foreign_cpu.snapshot(proc), {"77": (1, 7), "78": (4242, 7)})
+            self.assertEqual(foreign_cpu.snapshot(proc),
+                             {"77": ("1", 1, 9), "78": ("1", 4242, 9)})
+
+
+# Real processes against the real /proc, so only on Linux.
+@unittest.skipUnless(Path("/proc/self/stat").exists(), "needs a Linux /proc")
+class LiveProcTests(unittest.TestCase):
+    def hog(self, script):
+        p = subprocess.Popen(["sh", "-c", script], start_new_session=True)
+        self.addCleanup(p.wait)
+        self.addCleanup(os.killpg, p.pid, signal.SIGKILL)
+
+    def foreign(self):
+        out = subprocess.run([sys.executable, str(SCRIPTS / "foreign_cpu.py"), "--pgid",
+                              str(os.getpgrp()), "--interval", "2"], capture_output=True,
+                             text=True, check=True, timeout=30).stdout
+        return int(out)
+
+    def test_a_long_lived_process_that_starts_spinning_is_seen(self):
+        # procps' lifetime pcpu showed a hog like this at 18% twenty seconds into its spin.
+        self.hog("sleep 1; while :; do :; done")
+        subprocess.run(["sleep", "1.5"], check=True)
+        self.assertGreaterEqual(self.foreign(), 60)
+
+    def test_a_loop_of_short_lived_processes_is_seen(self):
+        self.hog("while :; do sh -c 'i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done'; done")
+        self.assertGreaterEqual(self.foreign(), 60)
 
 
 if __name__ == "__main__":
