@@ -300,6 +300,10 @@ pub(crate) fn check_power(power: u32) -> Result<(), CeremonyError> {
 /// hash.
 pub fn ptau_new(power: u32, out: &Path) -> Result<Digest, CeremonyError> {
     check_power(power)?;
+    crate::write::staged(out, |stage| ptau_new_inner(power, stage))
+}
+
+fn ptau_new_inner(power: u32, out: &Path) -> Result<Digest, CeremonyError> {
     let n = 1usize << power;
     let g1 = G1Affine::generator();
     let g2 = G2Affine::generator();

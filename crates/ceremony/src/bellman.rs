@@ -166,6 +166,10 @@ fn export_h(section: &[u8], power: u32) -> Result<Vec<G1Affine>, CeremonyError> 
 /// Write the zkey at `zkey` as a bellman `MPCParameters` file. Backs `snarkjs zkey export
 /// bellman`.
 pub fn export_bellman(zkey: &Path, out: &Path) -> Result<(), CeremonyError> {
+    crate::write::staged(out, |stage| export_bellman_inner(zkey, stage))
+}
+
+fn export_bellman_inner(zkey: &Path, out: &Path) -> Result<(), CeremonyError> {
     let file = BinFile::open(zkey, ZKEY_MAGIC, ZKEY_MAX_VERSION)?;
     check_protocol(&file)?;
     let header = Groth16Header::read(file.unique_section(S_HEADER)?)?;
@@ -377,6 +381,17 @@ fn import_failed(what: &str) -> CeremonyError {
 /// Import the `.mpcparams` at `mpcparams` onto `zkey_old`, writing `zkey_new`. `name`
 /// labels every contribution the file adds. Backs `snarkjs zkey import bellman`.
 pub fn import_bellman(
+    zkey_old: &Path,
+    mpcparams: &Path,
+    zkey_new: &Path,
+    name: Option<&str>,
+) -> Result<BellmanImport, CeremonyError> {
+    crate::write::staged(zkey_new, |stage| {
+        import_bellman_inner(zkey_old, mpcparams, stage, name)
+    })
+}
+
+fn import_bellman_inner(
     zkey_old: &Path,
     mpcparams: &Path,
     zkey_new: &Path,

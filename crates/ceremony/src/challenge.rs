@@ -118,10 +118,14 @@ pub struct ExportedChallenge {
 /// Write the challenge for the next contribution to `ptau`. Backs `snarkjs powersoftau
 /// export challenge`.
 ///
-/// Fails, after writing the file as snarkjs does, when the digest of what was written is
-/// not the `nextChallenge` the ptau declares: the points were changed after the record
-/// that hashed them.
+/// Fails when the digest of what was written is not the `nextChallenge` the ptau
+/// declares: the points were changed after the record that hashed them. snarkjs leaves
+/// that file at `out`; here it is discarded and an existing `out` is left as it was.
 pub fn export_challenge(ptau: &Path, out: &Path) -> Result<ExportedChallenge, CeremonyError> {
+    crate::write::staged(out, |stage| export_challenge_inner(ptau, stage))
+}
+
+fn export_challenge_inner(ptau: &Path, out: &Path) -> Result<ExportedChallenge, CeremonyError> {
     let file = Ptau::open(ptau)?;
     let n = file.domain();
     let contributions = file.contributions()?;
@@ -370,6 +374,18 @@ const fn import_chunk(sg: usize, scg: usize, import_points: bool) -> usize {
 /// contribution record. Backs `snarkjs powersoftau import response`; `import_points =
 /// false` is its `-nopoints`.
 pub fn import_response(
+    ptau_in: &Path,
+    response: &Path,
+    ptau_out: &Path,
+    name: Option<&str>,
+    import_points: bool,
+) -> Result<Phase1Report, CeremonyError> {
+    crate::write::staged(ptau_out, |stage| {
+        import_response_inner(ptau_in, response, stage, name, import_points)
+    })
+}
+
+fn import_response_inner(
     ptau_in: &Path,
     response: &Path,
     ptau_out: &Path,

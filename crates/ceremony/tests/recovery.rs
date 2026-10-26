@@ -234,20 +234,34 @@ fn entries(dir: &Path) -> Vec<std::ffi::OsString> {
     entries
 }
 
-fn assert_preserved(out: &Path, mut operation: impl FnMut(&Path) -> Result<(), CeremonyError>) {
+fn fake_device(error: &CeremonyError) -> bool {
+    matches!(
+        error,
+        CeremonyError::Accel(AccelError::Device {
+            backend: "fake",
+            ..
+        })
+    )
+}
+
+fn assert_preserved(out: &Path, operation: impl FnMut(&Path) -> Result<(), CeremonyError>) {
+    assert_preserved_on(out, fake_device, operation)
+}
+
+/// `operation` fails after writing part of its output, with an error `expected` accepts,
+/// and neither an absent nor an existing `out` changes, nor does any stage remain.
+fn assert_preserved_on(
+    out: &Path,
+    expected: fn(&CeremonyError) -> bool,
+    mut operation: impl FnMut(&Path) -> Result<(), CeremonyError>,
+) {
     for existing in [false, true] {
         if existing {
             std::fs::write(out, b"existing destination").unwrap();
         }
         let before = entries(out.parent().unwrap());
         let error = operation(out).unwrap_err();
-        assert!(matches!(
-            error,
-            CeremonyError::Accel(AccelError::Device {
-                backend: "fake",
-                ..
-            })
-        ));
+        assert!(expected(&error), "unexpected error: {error}");
         if existing {
             assert_eq!(std::fs::read(out).unwrap(), b"existing destination");
         } else {
@@ -429,6 +443,153 @@ fn successful_in_place_operations_match_separate_outputs() {
         assert_eq!(
             std::fs::read(&alias).unwrap(),
             std::fs::read(&expected).unwrap()
+        );
+    }
+}
+
+/// Overwrite `len` bytes at `at` with a big-endian field element above the modulus. The
+/// first byte keeps both flag bits clear, so no decoder reads it as infinity.
+fn corrupt_be(path: &Path, at: usize, len: usize) {
+    let mut bytes = std::fs::read(path).unwrap();
+    bytes[at] = 0x3f;
+    bytes[at + 1..at + len].fill(0xff);
+    std::fs::write(path, bytes).unwrap();
+}
+
+fn malformed_point(error: &CeremonyError) -> bool {
+    !matches!(error, CeremonyError::Io(_) | CeremonyError::Accel(_))
+}
+
+struct FailFft;
+
+impl snarkrs_msm::GroupFft for FailFft {
+    fn name(&self) -> &'static str {
+        "fake"
+    }
+    fn ifft_g1(
+        &self,
+        _: &mut [snarkrs_msm::xyzz::Xyzz<snarkrs_field::raw::RawFq>],
+    ) -> Result<(), AccelError> {
+        Err(AccelError::device(
+            "fake",
+            "ifft_g1",
+            "lagrange block failed",
+        ))
+    }
+    fn ifft_g2(
+        &self,
+        _: &mut [snarkrs_msm::xyzz::Xyzz<snarkrs_field::raw::RawFq2>],
+    ) -> Result<(), AccelError> {
+        unreachable!("convert transforms only G1")
+    }
+}
+
+#[test]
+fn convert_late_error_preserves_absent_and_existing_destinations() {
+    let fixture = Fixture::new("publication-convert");
+    let ptau = snarkrs_ceremony::ptau::Ptau::open(&fixture.ptau).unwrap();
+    assert_preserved(&fixture.dir.join("converted.ptau"), |out| {
+        snarkrs_ceremony::ptau_export::ptau_convert(&ptau, out, &FailFft, &mut Vec::new())
+    });
+}
+
+/// The challenge, response and bellman paths fail on a point decoded after earlier
+/// sections are already in the stage.
+#[test]
+fn import_and_export_point_errors_preserve_destinations() {
+    let fixture = Fixture::new("publication-points");
+    let contributed = fixture.dir.join("contributed.ptau");
+    // 2^9 powers: tauG1 holds 1023 points, so tauG2 starts after 64 + 1023 * 32 bytes of
+    // response and after 80 + 1023 * 64 + 12 bytes of ptau.
+    let n_tau_g1 = 1023;
+
+    let challenge = fixture.dir.join("challenge");
+    let response = fixture.dir.join("response");
+    snarkrs_ceremony::challenge::export_challenge(&contributed, &challenge).unwrap();
+    snarkrs_ceremony::challenge::challenge_contribute_with(
+        &challenge,
+        &response,
+        transcript::rng_from_entropy_with(&[13; 64], "publication response"),
+        &CpuKeyScale,
+    )
+    .unwrap();
+    corrupt_be(&response, 64 + n_tau_g1 * 32, 64);
+    assert_preserved_on(&fixture.dir.join("imported.ptau"), malformed_point, |out| {
+        snarkrs_ceremony::challenge::import_response(&contributed, &response, out, None, true)
+            .map(|_| ())
+    });
+
+    let tampered = fixture.dir.join("tampered.ptau");
+    std::fs::copy(&contributed, &tampered).unwrap();
+    let tau_g2 = 80 + n_tau_g1 * 64 + 12;
+    let mut bytes = std::fs::read(&tampered).unwrap();
+    assert_eq!(bytes[tau_g2 - 12..tau_g2 - 8], 3u32.to_le_bytes());
+    bytes[tau_g2..tau_g2 + 128].fill(0xff);
+    std::fs::write(&tampered, bytes).unwrap();
+    assert_preserved_on(&fixture.dir.join("exported"), malformed_point, |out| {
+        snarkrs_ceremony::challenge::export_challenge(&tampered, out).map(|_| ())
+    });
+
+    let init = fixture.dir.join("init.zkey");
+    let mpcparams = fixture.dir.join("mpcparams");
+    setup::setup(&fixture.r1cs, &fixture.ptau, &init, &CpuMsm::new()).unwrap();
+    snarkrs_ceremony::bellman::export_bellman(&init, &mpcparams).unwrap();
+    // Six header points, the two-point IC array, then the H count and its first point.
+    let h_count = 2 * 64 + 2 * 128 + 64 + 128 + 4 + 2 * 64;
+    let bytes = std::fs::read(&mpcparams).unwrap();
+    assert_eq!(bytes[h_count..h_count + 4], 511u32.to_be_bytes());
+    corrupt_be(&mpcparams, h_count + 4, 64);
+    assert_preserved_on(&fixture.dir.join("imported.zkey"), malformed_point, |out| {
+        snarkrs_ceremony::bellman::import_bellman(&init, &mpcparams, out, None).map(|_| ())
+    });
+}
+
+/// Every writer that has no late failure to inject still publishes through a stage: it
+/// replaces what was there and leaves nothing else behind.
+#[test]
+fn unaccelerated_writers_replace_destinations_without_leftovers() {
+    let fixture = Fixture::new("publication-plain");
+    let out = fixture.dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let init = fixture.dir.join("init.zkey");
+    setup::setup(&fixture.r1cs, &fixture.ptau, &init, &CpuMsm::new()).unwrap();
+    let ptau = snarkrs_ceremony::ptau::Ptau::open(&fixture.ptau).unwrap();
+    let template = out.join("truncated_").to_str().unwrap().to_owned();
+    let mut names: Vec<String> = [
+        "new.ptau",
+        "challenge",
+        "bellman",
+        "verifier.sol",
+        "vkey.json",
+    ]
+    .map(String::from)
+    .into();
+    names.extend((1..9).map(|p| format!("truncated_{p:02}.ptau")));
+    names.push("converted.ptau".into());
+    for name in &names {
+        std::fs::write(out.join(name), b"existing destination").unwrap();
+    }
+    phase1::ptau_new(9, &out.join("new.ptau")).unwrap();
+    snarkrs_ceremony::challenge::export_challenge(&fixture.ptau, &out.join("challenge")).unwrap();
+    snarkrs_ceremony::bellman::export_bellman(&init, &out.join("bellman")).unwrap();
+    snarkrs_ceremony::solidity::export_solidity_verifier(&init, &out.join("verifier.sol")).unwrap();
+    snarkrs_ceremony::vkey::export_verification_key(&init, &out.join("vkey.json")).unwrap();
+    snarkrs_ceremony::ptau_export::ptau_truncate(&ptau, &template, &mut Vec::new()).unwrap();
+    snarkrs_ceremony::ptau_export::ptau_convert(
+        &ptau,
+        &out.join("converted.ptau"),
+        &CpuGroupFft,
+        &mut Vec::new(),
+    )
+    .unwrap();
+    names.sort();
+    let names: Vec<std::ffi::OsString> = names.into_iter().map(Into::into).collect();
+    assert_eq!(entries(&out), names, "orphan stage");
+    for name in &names {
+        assert_ne!(
+            std::fs::read(out.join(name)).unwrap(),
+            b"existing destination",
+            "{name:?} was not replaced"
         );
     }
 }

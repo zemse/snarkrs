@@ -284,39 +284,42 @@ pub fn ptau_truncate<L: SnarkjsLog + ?Sized>(
         let sp = format!("{p:02}");
         log.debug(&format!("Writing Power: {sp}"))?;
         let path = PathBuf::from(format!("{template}{sp}.ptau"));
-        let mut out = BinFileWriter::create(&path, PTAU_MAGIC, PTAU_VERSION, PTAU_SECTIONS)?;
-        write_header(&mut out, p, h.ceremony_power)?;
-        for id in [
-            S_TAU_G1,
-            S_TAU_G2,
-            S_ALPHA_TAU_G1,
-            S_BETA_TAU_G1,
-            S_BETA_G2,
-            S_CONTRIBUTIONS,
-            S_LAGRANGE_TAU_G1,
-            S_LAGRANGE_TAU_G2,
-            S_LAGRANGE_ALPHA_TAU_G1,
-            S_LAGRANGE_BETA_TAU_G1,
-        ] {
-            let body = ptau.section(id)?;
-            // Section 7 goes whole; every other section's prefix is exactly the full size
-            // of that section at power `p` (`powersoftau_truncate.js:48-57`).
-            let len = match expected_section_bytes(id, p) {
-                Some(len) => len as usize,
-                None => body.len(),
-            };
-            let prefix = body.get(..len).ok_or_else(|| {
-                CeremonyError::malformed(
-                    id,
-                    format!("{} bytes, too short for power {p}", body.len()),
-                )
-            })?;
-            out.write_section_verbatim(id, prefix)?;
-        }
-        out.finish()?;
+        crate::write::staged(&path, |stage| truncate_one(ptau, p, stage))?;
         written.push(path);
     }
     Ok(written)
+}
+
+/// One `ptau_truncate` output at power `p`.
+fn truncate_one(ptau: &Ptau, p: u32, path: &Path) -> Result<(), CeremonyError> {
+    let h = *ptau.header();
+    let mut out = BinFileWriter::create(path, PTAU_MAGIC, PTAU_VERSION, PTAU_SECTIONS)?;
+    write_header(&mut out, p, h.ceremony_power)?;
+    for id in [
+        S_TAU_G1,
+        S_TAU_G2,
+        S_ALPHA_TAU_G1,
+        S_BETA_TAU_G1,
+        S_BETA_G2,
+        S_CONTRIBUTIONS,
+        S_LAGRANGE_TAU_G1,
+        S_LAGRANGE_TAU_G2,
+        S_LAGRANGE_ALPHA_TAU_G1,
+        S_LAGRANGE_BETA_TAU_G1,
+    ] {
+        let body = ptau.section(id)?;
+        // Section 7 goes whole; every other section's prefix is exactly the full size
+        // of that section at power `p` (`powersoftau_truncate.js:48-57`).
+        let len = match expected_section_bytes(id, p) {
+            Some(len) => len as usize,
+            None => body.len(),
+        };
+        let prefix = body.get(..len).ok_or_else(|| {
+            CeremonyError::malformed(id, format!("{} bytes, too short for power {p}", body.len()))
+        })?;
+        out.write_section_verbatim(id, prefix)?;
+    }
+    out.finish()
 }
 
 /// `snarkjs powersoftau convert <old.ptau> <new.ptau>`: copy the file and append the
@@ -333,6 +336,16 @@ pub fn ptau_convert<L: SnarkjsLog + ?Sized>(
     if power > Fr::TWO_ADICITY {
         return Err(CeremonyError::CircuitTooBig(power));
     }
+    crate::write::staged(new_ptau, |stage| convert_into(ptau, stage, fft, log))
+}
+
+fn convert_into<L: SnarkjsLog + ?Sized>(
+    ptau: &Ptau,
+    new_ptau: &Path,
+    fft: &dyn GroupFft,
+    log: &mut L,
+) -> Result<(), CeremonyError> {
+    let power = ptau.power();
     let mut out = BinFileWriter::create(new_ptau, PTAU_MAGIC, PTAU_VERSION, PTAU_SECTIONS)?;
     write_header(&mut out, power, power)?;
     for id in [

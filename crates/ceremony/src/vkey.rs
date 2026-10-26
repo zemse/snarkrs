@@ -161,8 +161,7 @@ pub fn export_verification_key(zkey: &Path, out: &Path) -> Result<(), CeremonyEr
         text.push_str(if i + 1 == fields.len() { "\n" } else { ",\n" });
     }
     text.push('}');
-    std::fs::write(out, text)?;
-    Ok(())
+    crate::write::staged(out, |stage| Ok(std::fs::write(stage, text)?))
 }
 
 /// `JSON.stringify` at one space of indent, for the string / number / array tree

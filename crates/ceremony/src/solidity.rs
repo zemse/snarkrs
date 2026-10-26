@@ -62,8 +62,8 @@ pub fn solidity_verifier(zkey: &Path) -> Result<String, CeremonyError> {
 
 /// [`solidity_verifier`] written to `out`. Backs `snarkjs zkey export solidityverifier`.
 pub fn export_solidity_verifier(zkey: &Path, out: &Path) -> Result<(), CeremonyError> {
-    std::fs::write(out, solidity_verifier(zkey)?)?;
-    Ok(())
+    let source = solidity_verifier(zkey)?;
+    crate::write::staged(out, |stage| Ok(std::fs::write(stage, source)?))
 }
 
 /// The identity is `(0, 0)` to the precompiles, which is also arkworks' affine zero.

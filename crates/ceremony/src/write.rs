@@ -47,8 +47,12 @@ const POINT_BATCH: usize = 8192;
 /// rereads of the output must use the supplied path. An error leaves the destination
 /// unchanged; cleanup is best effort and never replaces the primary error.
 ///
-/// This provides atomic visibility, not crash durability (no fsync) or arithmetic
-/// verification. It assumes a trusted output directory, not adversarial path replacement.
+/// The stage is fsynced before the rename and, on Unix, the directory after it. That
+/// gives atomic visibility to other readers, not crash durability: macOS `fsync` does not
+/// flush the drive cache (`F_FULLFSYNC` would), a failed directory sync is ignored because
+/// the destination is already replaced by then, and nothing here checks the arithmetic
+/// of what the operation wrote. It assumes a trusted output directory, not adversarial
+/// path replacement.
 /// Name separation covers case folding, canonical Unicode normalization and trailing
 /// dot/space trimming, which preserve ASCII decimal digits and their order. DOS 8.3,
 /// device aliases and other alternate-name namespaces are outside this guarantee.
@@ -58,7 +62,7 @@ const POINT_BATCH: usize = 8192;
 /// and platform defaults elsewhere; inherited ACLs remain filesystem-dependent.
 ///
 /// [`BinFileWriter::create`] itself still creates or truncates its path directly.
-pub(crate) fn staged<T>(
+pub fn staged<T>(
     destination: &Path,
     operation: impl FnOnce(&Path) -> Result<T, CeremonyError>,
 ) -> Result<T, CeremonyError> {
@@ -90,8 +94,13 @@ fn staged_with_counter<T>(
     if let Some(permissions) = permissions {
         std::fs::set_permissions(path, permissions)?;
     }
+    File::open(path)?.sync_all()?;
     std::fs::rename(path, destination)?;
     stage.path = None;
+    #[cfg(unix)]
+    if let Ok(dir) = File::open(parent) {
+        let _ = dir.sync_all();
+    }
     Ok(result)
 }
 
