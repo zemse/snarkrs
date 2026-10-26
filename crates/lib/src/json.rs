@@ -39,12 +39,23 @@ fn parse(path: &Path) -> impl FnOnce(JsonError) -> FileError {
     move |error| FileError::Parse { path, error }
 }
 
-pub fn write_proof(path: &Path, p: &Proof) -> Result<(), FileError> {
-    std::fs::write(path, proof_to_string(p)).map_err(io("writing proof to", path))
+/// `text` at `path`, through a stage beside it that is renamed over `path` once written, so
+/// an error leaves `path` as it was. [`snarkrs_formats::stage`] states what that does and
+/// does not promise. A new file gets the umask's mode and an existing one keeps its own.
+fn publish(path: &Path, text: String) -> std::io::Result<()> {
+    snarkrs_formats::stage::staged_all_default_mode(&[path], |stages| {
+        std::fs::write(&stages[0], text)
+    })
 }
 
+/// `proof.json` at `path`. A failed write leaves the old file as it was.
+pub fn write_proof(path: &Path, p: &Proof) -> Result<(), FileError> {
+    publish(path, proof_to_string(p)).map_err(io("writing proof to", path))
+}
+
+/// `public.json` at `path`. A failed write leaves the old file as it was.
 pub fn write_public(path: &Path, public: &[Fr]) -> Result<(), FileError> {
-    std::fs::write(path, public_to_string(public)).map_err(io("writing public signals to", path))
+    publish(path, public_to_string(public)).map_err(io("writing public signals to", path))
 }
 
 pub fn read_proof(path: &Path) -> Result<Proof, FileError> {
