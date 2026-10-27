@@ -210,13 +210,6 @@ impl CudaBackend {
     }
 }
 
-/// Opens a device, or says why it could not.
-///
-/// A thin wrapper over [`Cuda::new`], which is where the interesting part lives: `cudarc`'s
-/// dynamic loader panics rather than erroring when `libcuda` is absent, and `Cuda::new`
-/// catches that so the signature means what it says. Without it there would be no way for
-/// this backend to report "no device" and no way for `tests/pipeline_gpu.rs` to skip, since
-/// the process would already be gone.
 /// Device 0, or the ordinal in `G16_CUDA_DEVICE`.
 fn env_ordinal() -> Result<usize, ProveError> {
     match std::env::var("G16_CUDA_DEVICE") {
@@ -229,6 +222,13 @@ fn env_ordinal() -> Result<usize, ProveError> {
     }
 }
 
+/// Opens a device, or says why it could not.
+///
+/// A thin wrapper over [`Cuda::new`], which is where the interesting part lives: `cudarc`'s
+/// dynamic loader panics rather than erroring when `libcuda` is absent, and `Cuda::new`
+/// catches that so the signature means what it says. Without it there would be no way for
+/// this backend to report "no device" and no way for `tests/pipeline_gpu.rs` to skip, since
+/// the process would already be gone.
 fn open_device(ordinal: usize) -> Result<Cuda, ProveError> {
     Cuda::new(ordinal).map_err(|e| bad(format!("no usable CUDA device {ordinal}: {e}")))
 }
