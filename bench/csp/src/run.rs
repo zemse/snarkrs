@@ -11,11 +11,11 @@
 //! way to see that happen.
 
 use crate::metrics::{Breakdown, Metrics, Properties};
-use crate::{circuits, inputs, metrics, Prover, Variant};
+use crate::{circuits, inputs, metrics, KeyPolicy, Prover, Variant};
 use anyhow::{Context, Result};
 use snarkrs_field::Fr;
 use snarkrs_formats::{wtns::Witness, ProvingKey};
-use snarkrs_groth16::{prove::prove, verify::verify, StageTimings};
+use snarkrs_groth16::StageTimings;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -32,6 +32,9 @@ pub struct Config<'a> {
     pub mem_bin: &'a Path,
     /// A `snarkjs` to check each warm-up proof with, outside the timed region. None skips it.
     pub snarkjs: Option<&'a Path>,
+    /// Load a key with `gamma_g2 == delta_g2` under [`KeyPolicy::Unblinded`] rather than
+    /// refuse it. Off by default.
+    pub allow_unblinded: bool,
 }
 
 /// One timed iteration, split by phase.
@@ -84,6 +87,7 @@ fn proof_iteration(
     input_json: String,
     zkey: &Path,
     prover: &Prover,
+    key: KeyPolicy,
 ) -> Result<(Split, snarkrs_groth16::Proof, Vec<Fr>)> {
     let mut split = Split::default();
 
@@ -94,8 +98,7 @@ fn proof_iteration(
     match prover {
         Prover::G16(backend) => {
             let t = Instant::now();
-            let pk =
-                ProvingKey::load(zkey).with_context(|| format!("loading {}", zkey.display()))?;
+            let (pk, _) = crate::load_key(zkey, key == KeyPolicy::Unblinded)?;
             let n_public = pk.n_public;
             split.zkey_load = t.elapsed();
 
@@ -111,12 +114,7 @@ fn proof_iteration(
             split.prepare = t.elapsed();
 
             let t = Instant::now();
-            let proof = prove(
-                circuit.as_ref(),
-                &witness,
-                &mut ark_std::rand::thread_rng(),
-                &mut split.stages,
-            )?;
+            let proof = key.prove(circuit.as_ref(), &witness, &mut split.stages)?;
             split.prove = t.elapsed();
             Ok((split, proof, public))
         }
@@ -276,25 +274,33 @@ pub fn variant(variant: Variant, cfg: &Config) -> Result<(Metrics, Breakdown)> {
         zkey.display()
     );
     let input_json = inputs::json(variant.target, variant.input_size);
+    let (pk, key) = crate::load_key(&zkey, cfg.allow_unblinded)?;
+    if key == KeyPolicy::Unblinded {
+        eprintln!(
+            "{}: gamma_g2 equals delta_g2, so anyone can forge a proof against this key; \
+             measured under --allow-unblinded-zkey and labelled unblinded",
+            variant.name()
+        );
+    }
+    let n_constraints = num_constraints(&pk);
+    let reload = || crate::load_key(&zkey, key == KeyPolicy::Unblinded).map(|(pk, _)| pk);
 
     // Warm-up. Its proof is the one that gets verified and measured for size, so a
     // variant whose proof does not verify fails before any timing is reported rather
     // than after.
-    let (_, proof, public) = proof_iteration(variant, input_json.clone(), &zkey, &cfg.prover)?;
-    let pk = ProvingKey::load(&zkey)?;
-    verify(&pk.vk, &public, &proof)
+    let (_, proof, public) = proof_iteration(variant, input_json.clone(), &zkey, &cfg.prover, key)?;
+    key.verify(&pk.vk, &public, &proof)
         .with_context(|| format!("{}: our own verifier rejected the proof", variant.name()))?;
     if let Some(snarkjs) = cfg.snarkjs {
         snarkjs_verify(snarkjs, variant, &zkey, cfg.artifacts, &proof)?;
     }
-    let n_constraints = num_constraints(&pk);
     let proof_size = snarkrs_groth16::json::proof_to_string(&proof).len()
         + snarkrs_groth16::json::public_to_string(&public).len();
     drop(pk);
 
     let mut splits = Vec::with_capacity(cfg.reps);
     for _ in 0..cfg.reps {
-        let (split, _, _) = proof_iteration(variant, input_json.clone(), &zkey, &cfg.prover)?;
+        let (split, _, _) = proof_iteration(variant, input_json.clone(), &zkey, &cfg.prover, key)?;
         splits.push(split);
     }
 
@@ -304,12 +310,12 @@ pub fn variant(variant: Variant, cfg: &Config) -> Result<(Metrics, Breakdown)> {
     let mut verify_vkey = Vec::with_capacity(cfg.reps);
     for _ in 0..cfg.reps {
         let t = Instant::now();
-        let pk = ProvingKey::load(&zkey)?;
-        verify(&pk.vk, &public, &proof)?;
+        let pk = reload()?;
+        key.verify(&pk.vk, &public, &proof)?;
         verify_full.push(t.elapsed());
 
         let t = Instant::now();
-        verify(&pk.vk, &public, &proof)?;
+        key.verify(&pk.vk, &public, &proof)?;
         verify_vkey.push(t.elapsed());
     }
 
@@ -324,7 +330,7 @@ pub fn variant(variant: Variant, cfg: &Config) -> Result<(Metrics, Breakdown)> {
 
     let row = Metrics {
         name: cfg.prover.system().to_string(),
-        feat: cfg.prover.feat(),
+        feat: cfg.prover.feat(key),
         target: variant.target.as_str().to_string(),
         input_size: variant.input_size,
         proof_duration: mean(&totals),
@@ -339,7 +345,7 @@ pub fn variant(variant: Variant, cfg: &Config) -> Result<(Metrics, Breakdown)> {
         peak_memory: match (&cfg.prover, cfg.mem_reps) {
             (_, 0) | (Prover::Rapidsnark(_), _) => 0,
             (Prover::G16(backend), reps) => {
-                crate::mem::sample(cfg.mem_bin, variant, *backend, cfg.artifacts, reps)?
+                crate::mem::sample(cfg.mem_bin, variant, *backend, key, cfg.artifacts, reps)?
             }
         },
         acceleration: None,
@@ -348,7 +354,8 @@ pub fn variant(variant: Variant, cfg: &Config) -> Result<(Metrics, Breakdown)> {
 
     let breakdown = Breakdown {
         variant: variant.name(),
-        backend: cfg.prover.label(),
+        backend: cfg.prover.label(key),
+        unblinded_zkey: key == KeyPolicy::Unblinded,
         reps: cfg.reps,
         witness_ms: ms(avg(|s| s.witness)),
         zkey_load_ms: ms(avg(|s| s.zkey_load)),

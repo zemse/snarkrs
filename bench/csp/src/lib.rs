@@ -21,6 +21,10 @@
 //!
 //! What is deliberately *not* reproduced is criterion's sampling ramp; see [`run`].
 
+use anyhow::Context;
+use snarkrs_field::Fr;
+use snarkrs_formats::{ProvingKey, VerifyingKey};
+use snarkrs_groth16::{PreparedCircuit, Proof, StageTimings};
 use std::path::{Path, PathBuf};
 
 pub mod circuits;
@@ -159,17 +163,89 @@ impl Prover {
     }
 
     /// The `feat` column: which backend, for us; nothing for rapidsnark, which has one.
-    pub fn feat(&self) -> Option<String> {
+    /// A key loaded under [`KeyPolicy::Unblinded`] adds `unblinded`, so the row, its file
+    /// name and its breakdown all carry it.
+    pub fn feat(&self, key: KeyPolicy) -> Option<String> {
+        let mut parts = Vec::new();
+        if let Prover::G16(b) = self {
+            parts.push(b.as_str());
+        }
+        if key == KeyPolicy::Unblinded {
+            parts.push("unblinded");
+        }
+        (!parts.is_empty()).then(|| parts.join("-"))
+    }
+
+    pub fn label(&self, key: KeyPolicy) -> String {
+        match self.feat(key) {
+            Some(f) => format!("{}/{f}", self.system()),
+            None => self.system().to_string(),
+        }
+    }
+}
+
+/// How a variant's key was loaded.
+///
+/// `Unblinded` is the benchmark exception for the published poseidon keys, whose
+/// `gamma_g2` equals their `delta_g2`: no phase-2 contribution, so anyone can forge a
+/// proof against them, and `ProvingKey::load` and the checked `prove` both refuse them.
+/// Only `--allow-unblinded-zkey` reaches it, only for a key that has that shape, and it
+/// drops that one refusal: every other load, prove and verify check still runs. A row
+/// measured this way says so in `feat`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyPolicy {
+    Checked,
+    Unblinded,
+}
+
+/// `ProvingKey::load`, or with `allow_unblinded` its benchmark twin. On a key with
+/// `gamma_g2 != delta_g2` the two run the same checks, so such a key comes back
+/// `Checked` either way.
+pub fn load_key(zkey: &Path, allow_unblinded: bool) -> anyhow::Result<(ProvingKey, KeyPolicy)> {
+    let loaded = if allow_unblinded {
+        ProvingKey::load_allowing_unblinded(zkey)
+    } else {
+        ProvingKey::load(zkey)
+    };
+    let pk = loaded.with_context(|| format!("loading {}", zkey.display()))?;
+    let key = if allow_unblinded && pk.vk.gamma_g2 == pk.vk.delta_g2 {
+        KeyPolicy::Unblinded
+    } else {
+        KeyPolicy::Checked
+    };
+    Ok((pk, key))
+}
+
+impl KeyPolicy {
+    /// The checked `prove`, or the twin that skips only the `gamma_g2 != delta_g2` refusal
+    /// in its self-verify.
+    pub fn prove(
+        self,
+        circuit: &dyn PreparedCircuit,
+        witness: &[Fr],
+        timings: &mut StageTimings,
+    ) -> Result<Proof, snarkrs_groth16::ProveError> {
+        let rng = &mut ark_std::rand::thread_rng();
         match self {
-            Prover::G16(b) => Some(b.as_str().to_string()),
-            Prover::Rapidsnark(_) => None,
+            KeyPolicy::Checked => snarkrs_groth16::prove::prove(circuit, witness, rng, timings),
+            KeyPolicy::Unblinded => {
+                snarkrs_groth16::prove::prove_allowing_unblinded(circuit, witness, rng, timings)
+            }
         }
     }
 
-    pub fn label(&self) -> String {
-        match self.feat() {
-            Some(f) => format!("{}/{f}", self.system()),
-            None => self.system().to_string(),
+    /// The checked `verify`, or its twin as [`KeyPolicy::prove`] picks.
+    pub fn verify(
+        self,
+        vk: &VerifyingKey,
+        public: &[Fr],
+        proof: &Proof,
+    ) -> Result<(), snarkrs_groth16::verify::VerifyError> {
+        match self {
+            KeyPolicy::Checked => snarkrs_groth16::verify::verify(vk, public, proof),
+            KeyPolicy::Unblinded => {
+                snarkrs_groth16::verify::verify_allowing_unblinded(vk, public, proof)
+            }
         }
     }
 }

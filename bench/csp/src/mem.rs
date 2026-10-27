@@ -8,7 +8,7 @@
 //! Upstream averages ten samples rather than taking the maximum. That is theirs to
 //! justify; we copy it so the two columns mean the same thing.
 
-use crate::{Backend, Variant};
+use crate::{Backend, KeyPolicy, Variant};
 use anyhow::{anyhow, Context, Result};
 use std::path::Path;
 use std::process::Command;
@@ -18,13 +18,14 @@ pub fn sample(
     bin: &Path,
     variant: Variant,
     backend: Backend,
+    key: KeyPolicy,
     artifacts: &Path,
     reps: usize,
 ) -> Result<usize> {
     anyhow::ensure!(reps > 0, "--mem-reps must be at least 1");
     let mut total = 0usize;
     for _ in 0..reps {
-        total += one(bin, variant, backend, artifacts)?;
+        total += one(bin, variant, backend, key, artifacts)?;
     }
     Ok(total / reps)
 }
@@ -40,15 +41,25 @@ const RSS_SCALE: usize = 1;
 #[cfg(not(target_os = "macos"))]
 const RSS_SCALE: usize = 1024;
 
-fn one(bin: &Path, variant: Variant, backend: Backend, artifacts: &Path) -> Result<usize> {
-    let out = Command::new("/usr/bin/time")
-        .args(TIME_ARGS)
+fn one(
+    bin: &Path,
+    variant: Variant,
+    backend: Backend,
+    key: KeyPolicy,
+    artifacts: &Path,
+) -> Result<usize> {
+    let mut cmd = Command::new("/usr/bin/time");
+    cmd.args(TIME_ARGS)
         .arg(bin)
         .args(["--target", variant.target.as_str()])
         .args(["--input-size", &variant.input_size.to_string()])
         .args(["--backend", backend.as_str()])
         .arg("--artifacts")
-        .arg(artifacts)
+        .arg(artifacts);
+    if key == KeyPolicy::Unblinded {
+        cmd.arg("--allow-unblinded-zkey");
+    }
+    let out = cmd
         .output()
         .with_context(|| format!("running /usr/bin/time on {}", bin.display()))?;
 

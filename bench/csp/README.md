@@ -16,10 +16,13 @@ bench/scripts/csp-fetch.sh      # once: 3.6 GB of published zkeys, checksum veri
 bench/scripts/csp-bench.sh      # every backend this build has, then the comparison
 bench/scripts/csp-bench.sh --backend cpu --reps 5 --mem-reps 3     # a quicker pass
 SNARKJS_VERIFY=1 bench/scripts/csp-bench.sh --target sha256 --input-size 128
+G16_CSP_ALLOW_UNBLINDED=1 bench/scripts/csp-bench.sh --target poseidon
 ```
 
 `--target` and `--input-size` restrict the run to matching variants. `SNARKJS_VERIFY=1`
 adds the independent check described under submission readiness.
+`G16_CSP_ALLOW_UNBLINDED=1` is the poseidon key exception described there; without it
+the poseidon keys are refused.
 
 `csp-fetch.sh` also clones the upstream circuit sources into `bench/vendor`, which is where
 `build.rs` reads the witness generators from. Nothing under `bench/vendor` or
@@ -74,7 +77,8 @@ Record the actual arithmetic mode of the binary that produced the row.
 
 **Validation is included.** The native prover uses checked key loading and checked
 `prove`, so point/key validation is inside `zkey_load_ms` and proof self-verification is
-inside `prove_ms`. The memory binary also uses checked `prove`. The driver separately
+inside `prove_ms`. Under the poseidon key exception the same work runs less one O(1)
+comparison. The memory binary also uses checked `prove`. The driver separately
 verifies the warm-up proof before reporting timings; that is not an independent oracle.
 `SNARKJS_VERIFY=1` adds one, outside the timed region.
 
@@ -90,17 +94,23 @@ marker of zero, not a measured zero-byte peak.
 ## Submission readiness
 
 The harness is for local comparisons, not a submission-ready row. In particular, the
-all-target commands above are expected to fail checked loading on the published unblinded
-poseidon keys recorded in the backlog. This is a source audit, not a fresh run of those
-keys. Historical end-to-end results do not establish current readiness.
+all-target commands above stop at `poseidon_2` unless `G16_CSP_ALLOW_UNBLINDED=1` is set,
+because the published poseidon keys are unblinded. Historical end-to-end results do not
+establish current readiness.
 
-* **Poseidon key policy is unresolved.** The backlog records published poseidon keys with
-  `gamma_g2 == delta_g2`, which checked loading refuses because anyone can forge proofs
-  against them. There is no CSP benchmark opt-in today: timing, verification, artifacts,
-  list and memory paths all call `ProvingKey::load`. Do not replace those calls wholesale
-  with `load_unchecked`. A future exception must be explicit, confined to identified
-  benchmark artifacts, recorded with the results, and leave normal validated loading
-  unchanged. These keys are not suitable for production.
+* **The poseidon keys need an explicit exception.** All five published poseidon keys have
+  `gamma_g2 == delta_g2`: no phase-2 contribution, so anyone can forge a proof against
+  them, and `ProvingKey::load` and the checked `prove` refuse them. Default runs keep that
+  refusal. `--allow-unblinded-zkey` on `bench`, `artifacts`, `list` and
+  `snarkrs-csp-mem` (`G16_CSP_ALLOW_UNBLINDED=1` in `csp-bench.sh`) loads with
+  `ProvingKey::load_allowing_unblinded` and proves and verifies with the matching
+  `_allowing_unblinded` functions, which drop that one comparison and run every other
+  check: the container, header, infinity, curve and IC checks at load, and the proof
+  element checks and pairing in the self-verify. It applies only to a key that has that
+  shape; any other key in the same run loads the default way. A row measured under it
+  has `unblinded` in `feat` (`cpu-unblinded`, so in its file name too),
+  `unblinded_zkey: true` in the breakdown, and the run prints a warning per variant. The
+  exception exists to time these benchmark keys; such a key is not fit for anything else.
 * **Backend selection is explicit.** CPU and Metal are separate runs, with `feat: cpu`
   or `feat: metal` and `backend: g16/cpu` or `backend: g16/metal` in the breakdown.
   `make_backend` refuses unavailable backends rather than falling back. Small-circuit

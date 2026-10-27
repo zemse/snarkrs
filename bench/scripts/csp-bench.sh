@@ -6,12 +6,14 @@
 #   bench/scripts/csp-bench.sh --backend cpu --reps 5
 #   bench/scripts/csp-bench.sh --target sha256 --input-size 128
 #   SNARKJS_VERIFY=1 bench/scripts/csp-bench.sh     # also check proofs with snarkjs
+#   G16_CSP_ALLOW_UNBLINDED=1 bench/scripts/csp-bench.sh --target poseidon
 #
 # Writes one `{target}_{size}_g16_{backend}_metrics.json` per variant, in the schema the
 # upstream collector reads, plus a `_breakdown.json` beside it carrying the phase split
 # the upstream schema has nowhere to put. With SNARKJS_VERIFY=1 each variant's warm-up
 # proof also goes through `snarkjs groth16 verify` before it is timed, and a reject
-# stops the run.
+# stops the run. G16_CSP_ALLOW_UNBLINDED=1 times the published poseidon keys, which have
+# no phase-2 contribution and are refused otherwise; their rows say `unblinded` in `feat`.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -25,6 +27,12 @@ BACKENDS=""
 FEATURES="${FEATURES:-metal}"
 SNARKJS_VERIFY="${SNARKJS_VERIFY:-}"
 SELECT=()
+ALLOW=()
+if [ -n "${G16_CSP_ALLOW_UNBLINDED:-}" ]; then
+  ALLOW=(--allow-unblinded-zkey)
+  echo "G16_CSP_ALLOW_UNBLINDED is set: keys with gamma_g2 == delta_g2 are timed, not refused," \
+    "and anyone can forge a proof against them" >&2
+fi
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -35,7 +43,7 @@ while [ $# -gt 0 ]; do
     --features)  FEATURES="$2"; shift 2 ;;
     --target)     SELECT+=(--target "$2"); shift 2 ;;
     --input-size) SELECT+=(--input-size "$2"); shift 2 ;;
-    -h|--help)   sed -n '2,14p' "$0"; exit 0 ;;
+    -h|--help)   sed -n '2,17p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -64,7 +72,7 @@ echo "=== building snarkrs-csp (features: $FEATURES) ==="
 if [ -n "$SNARKJS_VERIFY" ]; then
   echo
   echo "=== vkey.json and public.json for the snarkjs check ==="
-  "$CSP_BIN" artifacts ${SELECT[@]+"${SELECT[@]}"} \
+  "$CSP_BIN" artifacts ${SELECT[@]+"${SELECT[@]}"} ${ALLOW[@]+"${ALLOW[@]}"} \
     | grep --line-buffered -v -e '^Generating witness' -e 'allocating and retrying'
 fi
 
@@ -74,7 +82,7 @@ for backend in $BACKENDS; do
   # The witness generator narrates every call on stdout and there is no flag to stop it.
   "$CSP_BIN" bench \
       --backend "$backend" --reps "$REPS" --mem-reps "$MEM_REPS" --out-dir "$OUT" \
-      ${SELECT[@]+"${SELECT[@]}"} ${ORACLE[@]+"${ORACLE[@]}"} \
+      ${SELECT[@]+"${SELECT[@]}"} ${ORACLE[@]+"${ORACLE[@]}"} ${ALLOW[@]+"${ALLOW[@]}"} \
     | grep --line-buffered -v -e '^Generating witness' -e 'allocating and retrying'
 done
 

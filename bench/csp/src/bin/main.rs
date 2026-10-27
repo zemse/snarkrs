@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use snarkrs_csp::{run, Backend, Prover, Target, Variant};
+use snarkrs_csp::{run, Backend, KeyPolicy, Prover, Target, Variant};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -17,7 +17,8 @@ enum Cmd {
     /// Time proving and verification, and write one metrics row per variant.
     Bench(BenchArgs),
     /// Write `input.json`, `circuit.wtns`, `vkey.json` and `public.json` next to each
-    /// zkey, so `snarkrs bench` and the audit tests can use the same circuits.
+    /// zkey, so `snarkrs bench` and the audit tests can use the same circuits. An
+    /// unblinded key gets no `circuit.wtns`.
     Artifacts(ArtifactArgs),
     /// Print the variants and their constraint counts, proving nothing.
     List(ArtifactArgs),
@@ -57,6 +58,12 @@ struct BenchArgs {
     /// writes. A failed export or a reject fails the run.
     #[arg(long, value_name = "BIN")]
     snarkjs: Option<PathBuf>,
+    /// Benchmark only: time a key whose `gamma_g2` equals its `delta_g2` instead of
+    /// refusing it. Anyone can forge a proof against such a key. Every other check still
+    /// runs, a key without that shape is loaded as usual, and a row measured this way has
+    /// `unblinded` in its `feat`.
+    #[arg(long)]
+    allow_unblinded_zkey: bool,
 }
 
 #[derive(clap::Args)]
@@ -67,6 +74,9 @@ struct ArtifactArgs {
     target: Option<Target>,
     #[arg(long)]
     input_size: Option<usize>,
+    /// Accept a key with `gamma_g2 == delta_g2`, as `bench --allow-unblinded-zkey` does.
+    #[arg(long)]
+    allow_unblinded_zkey: bool,
 }
 
 fn selected(target: Option<Target>, input_size: Option<usize>) -> Vec<Variant> {
@@ -116,6 +126,7 @@ fn bench(a: BenchArgs) -> Result<()> {
         mem_reps: a.mem_reps,
         mem_bin: &mem_bin,
         snarkjs: a.snarkjs.as_deref(),
+        allow_unblinded: a.allow_unblinded_zkey,
     };
 
     println!(
@@ -159,22 +170,27 @@ fn artifacts(a: ArtifactArgs) -> Result<()> {
         }
         let input_json = snarkrs_csp::inputs::json(v.target, v.input_size);
         let wtns = snarkrs_csp::circuits::witness(v, input_json.clone())?;
-        let pk = snarkrs_formats::ProvingKey::load(&zkey)?;
+        let (pk, key) = snarkrs_csp::load_key(&zkey, a.allow_unblinded_zkey)?;
         let witness = snarkrs_formats::wtns::Witness::from_bytes(wtns.clone())?.0;
         let public = &witness[1..=pk.n_public];
 
         std::fs::write(dir.join("input.json"), &input_json)?;
-        std::fs::write(dir.join("circuit.wtns"), &wtns)?;
+        // Not for an unblinded key. The audit tests take a directory holding a key and a
+        // witness as theirs and load it with the checked loader, which refuses this one.
+        if key == KeyPolicy::Checked {
+            std::fs::write(dir.join("circuit.wtns"), &wtns)?;
+        }
         snarkrs_ceremony::vkey::export_verification_key(&zkey, &dir.join("vkey.json"))?;
         std::fs::write(
             dir.join("public.json"),
             snarkrs_groth16::json::public_to_string(public),
         )?;
         println!(
-            "ok    {:<16} {} constraints, witness {} bytes",
+            "ok    {:<16} {} constraints, witness {} bytes{}",
             v.name(),
             run::num_constraints(&pk),
-            wtns.len()
+            wtns.len(),
+            unblinded_note(key)
         );
     }
     Ok(())
@@ -191,13 +207,21 @@ fn list(a: ArtifactArgs) -> Result<()> {
             println!("{:<16} {:>12} {:>14}", v.name(), "-", "missing");
             continue;
         };
-        let pk = snarkrs_formats::ProvingKey::load(&zkey)?;
+        let (pk, key) = snarkrs_csp::load_key(&zkey, a.allow_unblinded_zkey)?;
         println!(
-            "{:<16} {:>12} {:>14}",
+            "{:<16} {:>12} {:>14}{}",
             v.name(),
             run::num_constraints(&pk),
-            meta.len()
+            meta.len(),
+            unblinded_note(key)
         );
     }
     Ok(())
+}
+
+fn unblinded_note(key: KeyPolicy) -> &'static str {
+    match key {
+        KeyPolicy::Checked => "",
+        KeyPolicy::Unblinded => "  UNBLINDED: gamma_g2 == delta_g2, anyone can forge",
+    }
 }

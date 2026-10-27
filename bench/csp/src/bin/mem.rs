@@ -8,7 +8,7 @@
 use anyhow::Result;
 use clap::Parser;
 use snarkrs_csp::{circuits, inputs, Backend, Target, Variant};
-use snarkrs_formats::{wtns::Witness, ProvingKey};
+use snarkrs_formats::wtns::Witness;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -21,6 +21,9 @@ struct Args {
     backend: Backend,
     #[arg(long, default_value = "bench/artifacts/csp")]
     artifacts: PathBuf,
+    /// Accept a key with `gamma_g2 == delta_g2`, as `snarkrs-csp bench` does.
+    #[arg(long)]
+    allow_unblinded_zkey: bool,
 }
 
 fn main() -> Result<()> {
@@ -34,13 +37,12 @@ fn main() -> Result<()> {
     };
 
     let wtns = circuits::witness(v, inputs::json(v.target, v.input_size))?;
-    let pk = ProvingKey::load(&v.zkey(&args.artifacts))?;
+    let (pk, key) = snarkrs_csp::load_key(&v.zkey(&args.artifacts), args.allow_unblinded_zkey)?;
     let witness = Witness::from_bytes(wtns)?.0;
     let circuit = snarkrs_csp::make_backend(args.backend)?.prepare(pk)?;
-    let proof = snarkrs_groth16::prove::prove(
+    let proof = key.prove(
         circuit.as_ref(),
         &witness,
-        &mut ark_std::rand::thread_rng(),
         &mut snarkrs_groth16::StageTimings::default(),
     )?;
     std::hint::black_box(&proof);

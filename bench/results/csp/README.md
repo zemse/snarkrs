@@ -259,7 +259,8 @@ provers. The September numbers, at the stock witness generator, are the last one
 At 517 to 2,092 constraints Metal lost to both, because its prepare and prove summed to
 about 19.5 ms from `poseidon_2` to `poseidon_12`: dispatch and upload, not arithmetic. Their constraint counts and
 key bytes matched the published row exactly, which is why poseidon needed no per-constraint
-correction. A loader exception for benchmark keys is the open item in `bench/csp/README.md`.
+correction. `G16_CSP_ALLOW_UNBLINDED=1` now times these keys under a labelled exception,
+described in `bench/csp/README.md`; they have not been re-measured with it.
 
 ## Witness generation: 1.37x, and where the rest of it is
 
