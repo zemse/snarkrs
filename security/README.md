@@ -67,7 +67,10 @@ one function.
 looks like before phase 2, and anyone can forge against it with `A = alpha`, `B = beta`,
 `C = -L`; the Foom and Veil verifiers were drained that way (zkSecurity, February 2026).
 `ProvingKey::load` and `VerifyingKey::from_json` refuse it; the `_unchecked` loaders accept it
-for development keys.
+for development keys. `ProvingKey::load_allowing_unblinded`, with `prove_allowing_unblinded`
+and `verify_allowing_unblinded`, skips only this comparison and runs every other check. It
+exists for the published ethproofs poseidon benchmark keys; `bench/csp` reaches it only under
+`--allow-unblinded-zkey` and labels every row it measures `unblinded`.
 
 **32. The wgpu floor profile has a capacity limit.** Under the browser's 128 MiB binding floor,
 anon-aadhaar's G2 bases (140.9 MB) do not fit and the backend refuses with a clean error. The
