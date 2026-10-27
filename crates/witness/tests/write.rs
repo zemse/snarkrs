@@ -71,6 +71,7 @@ fn write_wtns_into_a_missing_directory_fails_naming_the_destination() {
 /// `umask(2)`, declared here because this crate has no libc dependency. `mode_t` is 16
 /// bits on Apple platforms and 32 elsewhere.
 #[cfg(unix)]
+#[allow(clippy::useless_conversion)] // widens u16 on Apple, the same type elsewhere
 unsafe fn umask(mask: u32) -> u32 {
     #[cfg(target_vendor = "apple")]
     type ModeT = u16;
