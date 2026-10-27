@@ -236,7 +236,8 @@ def main():
             print(f"  rapidsnark   warm  skipped ({why})")
         else:
             clear(tmp_proof, tmp_public)
-            r = sh([a.rapidsnark_warm, zkey, wtns, tmp_proof, tmp_public, str(a.reps)])
+            # The wrapper refuses to run without the vkey it checks each proof against.
+            r = sh([a.rapidsnark_warm, zkey, wtns, tmp_proof, tmp_public, str(a.reps), vkey])
             if r.returncode != 0:
                 print(f"  rapidsnark   warm  FAILED: exit {r.returncode}: "
                       f"{(r.stderr or r.stdout)[:160].strip()}")
