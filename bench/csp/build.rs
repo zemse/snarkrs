@@ -40,7 +40,13 @@ fn main() {
     // witnesscalc-adapter compiles every `.cpp` in one flat directory, and upstream keeps
     // each circuit in a subdirectory of its own. Hard link rather than copy: poseidon_16
     // alone is 20 MB of generated C++.
+    //
+    // The adapter makes this directory a rerun-if-changed input, and cargo reads the
+    // newest mtime under it, the directory's own included. So nothing here may leave an
+    // mtime later than the sources': a link already in place is kept, and the directory's
+    // mtime is put back to its newest source's at the end.
     std::fs::create_dir_all(&staged).unwrap();
+    let mut newest = std::time::SystemTime::UNIX_EPOCH;
     for name in CIRCUITS {
         let family = name.rsplit_once('_').expect("name is family_size").0;
         let dir = src.join(family).join(name);
@@ -65,9 +71,13 @@ fn main() {
                     from.display()
                 );
             }
+            newest = newest.max(mtime(&from));
             link(&from, &staged.join(to));
         }
     }
+    std::fs::File::open(&staged)
+        .and_then(|d| d.set_modified(newest))
+        .expect("resetting the staged directory's mtime");
     println!("cargo:rerun-if-changed={}", src.display());
 
     // Clone before `build_and_link` would, so there is a checkout to patch. It only
@@ -105,13 +115,44 @@ fn main() {
     }
 }
 
+fn mtime(p: &Path) -> std::time::SystemTime {
+    std::fs::metadata(p)
+        .and_then(|m| m.modified())
+        .unwrap_or_else(|e| panic!("{}: {e}", p.display()))
+}
+
+/// Stage `from` at `to`, leaving a link that is already there alone. A copy, where a hard
+/// link is refused, takes `from`'s mtime, so it reads as no newer than its source.
 fn link(from: &Path, to: &Path) {
+    if same_file(from, to) {
+        return;
+    }
     if to.exists() {
         std::fs::remove_file(to).ok();
     }
     if std::fs::hard_link(from, to).is_err() {
         std::fs::copy(from, to).expect("staging witness generator source");
+        std::fs::File::options()
+            .write(true)
+            .open(to)
+            .and_then(|f| f.set_modified(mtime(from)))
+            .expect("setting the staged copy's mtime");
     }
+}
+
+#[cfg(unix)]
+fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+/// A copy is compared by content, which is only reached where hard links are refused.
+#[cfg(not(unix))]
+fn same_file(a: &Path, b: &Path) -> bool {
+    matches!((std::fs::read(a), std::fs::read(b)), (Ok(a), Ok(b)) if a == b)
 }
 
 fn clone_witnesscalc(dir: &Path) {
