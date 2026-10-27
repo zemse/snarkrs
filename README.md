@@ -82,7 +82,7 @@ phase 2, the proving key, run once per circuit:
 > blank = not measurable on this box: snarkjs has no warm mode, its CLI starts a fresh
 > process per proof. Its cold numbers are in `bench/results/machines/`.
 
-> note: g16 cpu here is built with `RUSTFLAGS="-C target-feature=+adx,+bmi2"`, which turns on the x86_64 field assembly. A build without it measured 1.5x to 1.6x slower on this box and lost to rapidsnark on the two smallest circuits.
+> note: g16 cpu here is built with `RUSTFLAGS="-C target-feature=+adx,+bmi2"`, as the x86_64 release binaries are. A build without the flags now runs the same field assembly, choosing the mulx multiply at run time when CPUID reports ADX and BMI2, and measured 1.4% to 4.3% slower on this box. Before that dispatch it was 1.5x to 1.6x slower and lost to rapidsnark on the two smallest circuits.
 
 > note: constraint count is a poor predictor of proving time. e.g. `railgun-13x01` has fewer constraints than `keccak256` but takes more to prove.
 
@@ -105,6 +105,10 @@ cargo install --path bin/snarkrs                     # CPU and WebGPU
 cargo install --path bin/snarkrs --features metal    # + Apple Metal
 cargo install --path bin/snarkrs --features cuda     # + NVIDIA CUDA
 ```
+
+On x86_64 a plain install runs the field assembly, with the mulx multiply whenever the CPU
+reports ADX and BMI2, so no `RUSTFLAGS` are needed. `RUSTFLAGS="-C target-feature=+adx,+bmi2"` buys the last few
+percent, and the binary then refuses to start on a CPU without them.
 
 The package and the binary are both `snarkrs`, a drop-in for the snarkjs 0.7.6 command line on Groth16 and
 BN254: the same commands, aliases, positional file names and defaults, `-e=`/`-n=`/`-v`
