@@ -433,27 +433,30 @@ fn pick_window(forced: Option<u32>, general: usize) -> u32 {
     forced.unwrap_or_else(|| window_size(general))
 }
 
-/// Blocks in the ones kernel. Enough that a 2^18-long witness gives each thread about sixty
-/// scalars to scan, few enough that the host adds a few dozen points. It trades device
-/// parallelism against a serial host tail.
+/// Blocks in the ones kernel: `ONES_SPT` scalars a thread, at most 256 blocks.
 ///
-/// **This is no longer the Metal formula, and this is the half that is stale.** The twin
-/// (`crates/metal/src/msm.rs`) now hands each thread 8 scalars rather than 64 and clamps to
-/// 256 groups rather than 64, because measuring it showed the scan is a *dependent* chain:
-/// a thread waits on its own previous mixed addition, so 64 scalars per thread regardless
-/// of `n` was 832 threads at 2^16 and the four witness MSMs' ones scans came out flat in
-/// `n`, latency-bound at about a sixth of occupancy. `msm_ones_impl` in `msm.cu` has the
-/// same shape, and at 2^18 this launches 64 blocks of 64 threads where Metal launches
-/// 16,384 threads — on a T4's 40 SMs that is one or two blocks per SM, two warps each.
-///
-/// The formula is left alone anyway, because the Metal number is an M2 Max number and
-/// nothing here has run on a card. Whoever next has a T4 should sweep the scalars-per-
-/// thread the way `G16_METAL_MSM_ONES_SPT` sweeps it there (4 and 8 tie, 16 and up climb
-/// back) and take the measured answer. Metal has also since grown an `ones_idx` gather
-/// path that this backend has no kernel for.
+/// The scan is a *dependent* chain, a thread waiting on its own previous mixed addition,
+/// so the old 64 scalars a thread, capped at 64 blocks, launched 64 blocks of 64 threads
+/// at 2^18, one or two a SM on a T4, and the ones scans were latency-bound. The Metal
+/// twin found the same and moved to 8 and 256. Swept on a Tesla T4 with
+/// `G16_CUDA_MSM_ONES_SPT` at 4, 8, 16, 32 and 64, then 16 and 32 against the old shape,
+/// warm, 4 interleaved rounds x 10 reps, round medians in ms (old / 16 / 32): sha256
+/// 17.7-18.0 / 14.3-14.6 / 15.6-15.8, rsa2048 65.6-65.9 / 62.5-63.1 / 62.1-62.4,
+/// keccak256 52.6-52.8 / 52.4-52.7 / 51.4-51.5, anon-aadhaar 412.6-417.2 / 407.8-410.1 /
+/// 407.5-409.4, railgun-01x01 23.3-23.4 / 22.8-22.9 / 22.9; tornado and railgun-13x01
+/// flat at both. 32 is the one no circuit reads slower at. The host adds the at most 256
+/// partials, a few hundred additions.
 fn ones_groups_for(n: usize) -> usize {
-    n.div_ceil(REDUCE_TG as usize * 64).clamp(1, 64)
+    let spt = std::env::var("G16_CUDA_MSM_ONES_SPT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(ONES_SPT);
+    n.div_ceil(REDUCE_TG as usize * spt).clamp(1, 256)
 }
+
+/// Scalars a thread of the ones kernel scans; see [`ones_groups_for`].
+const ONES_SPT: usize = 32;
 
 // ---------------------------------------------------------------------------
 // Device-side structs
@@ -2847,7 +2850,7 @@ mod tests {
     fn ones_groups_stay_in_range() {
         for n in [0usize, 1, 1000, 1 << 18, 1 << 24] {
             let g = ones_groups_for(n);
-            assert!((1..=64).contains(&g), "n = {n} gave {g} groups");
+            assert!((1..=256).contains(&g), "n = {n} gave {g} groups");
         }
     }
 
