@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use snarkrs_field::Fr;
 use snarkrs_groth16::Proof;
-use snarkrs_witness::WitnessError;
 
 use crate::json::{self, FileError};
 
@@ -80,16 +79,6 @@ pub fn publish_proof(
             Ok(())
         },
     )
-}
-
-/// A `.wtns` at `path`, from `write` given `path` itself. `snarkrs_witness::write_wtns`
-/// and `native::calculate_to_file` publish through their own stage, so staging here as
-/// well would only copy the witness twice.
-pub fn publish_wtns(
-    path: &Path,
-    write: impl FnOnce(&Path) -> Result<(), WitnessError>,
-) -> Result<(), WitnessError> {
-    write(path)
 }
 
 #[cfg(test)]
@@ -164,29 +153,6 @@ mod tests {
             json::public_to_string(&public)
         );
         assert_eq!(entries(&dir), ["proof.json", "public.json"]);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn a_witness_is_replaced_and_a_directory_destination_is_left_alone() {
-        let dir = dir("wtns");
-        let out = dir.join("witness.wtns");
-        std::fs::write(&out, b"old witness").unwrap();
-        let w = [Fr::from(1u64), Fr::from(5u64)];
-        publish_wtns(&out, |path| snarkrs_witness::write_wtns(path, &w)).unwrap();
-        assert_eq!(
-            std::fs::read(&out).unwrap(),
-            snarkrs_witness::wtns_bytes(&w)
-        );
-        assert_eq!(entries(&dir), ["witness.wtns"]);
-        let taken = dir.join("taken");
-        std::fs::create_dir(&taken).unwrap();
-        let e = publish_wtns(&taken, |path| snarkrs_witness::write_wtns(path, &w)).unwrap_err();
-        assert!(e
-            .to_string()
-            .starts_with(&format!("writing {}: ", taken.display())));
-        assert!(taken.is_dir());
-        assert_eq!(entries(&dir), ["taken", "witness.wtns"], "orphan stage");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

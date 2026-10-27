@@ -1226,15 +1226,11 @@ fn run_wtns(cmd: WtnsCmd) -> Result<u8> {
                 snarkrs_witness::read_file(&input).and_then(|text| match native::detect(&wasm)? {
                     native::Kind::Wasm => {
                         let mut w = wasm_witness(&wasm, &text, false)?;
-                        let r = publish::publish_wtns(&witness, |stage| {
-                            snarkrs_witness::write_wtns(stage, &w)
-                        });
+                        let r = snarkrs_witness::write_wtns(&witness, &w);
                         snarkrs_groth16::scrub(&mut w);
                         r
                     }
-                    native::Kind::Native => publish::publish_wtns(&witness, |stage| {
-                        native::calculate_to_file(&wasm, &input, stage)
-                    }),
+                    native::Kind::Native => native::calculate_to_file(&wasm, &input, &witness),
                 });
             if let Err(e) = done {
                 return Ok(witness_failed(&e));
@@ -1264,8 +1260,7 @@ fn run_wtns(cmd: WtnsCmd) -> Result<u8> {
                 // too. A circom 2 module calls none of the hooks that would print them.
                 snarkrs_witness::read_file(&sym)?;
                 let mut w = wasm_witness(&wasm, &text, true)?;
-                let r =
-                    publish::publish_wtns(&witness, |stage| snarkrs_witness::write_wtns(stage, &w));
+                let r = snarkrs_witness::write_wtns(&witness, &w);
                 snarkrs_groth16::scrub(&mut w);
                 r
             });
