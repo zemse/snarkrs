@@ -25,6 +25,7 @@ pub mod json_out;
 pub mod stage;
 pub mod wtns;
 
+use binfile::FirstError;
 use binfile::*;
 use rayon::prelude::*;
 use snarkrs_field::*;
@@ -110,52 +111,150 @@ impl Coefficients {
     /// Check both matrices' CSR bounds against the domain and witness length. Paid once
     /// per key, before a backend uploads or gathers a hand-built key's coefficients.
     pub fn check_structure(&self, domain_size: usize, n_vars: usize) -> Result<(), ZkeyError> {
+        for matrix in Matrix::BOTH {
+            let m = matrix.index();
+            Self::check_matrix(
+                matrix,
+                &self.row_ptr[m],
+                &self.signal[m],
+                self.value[m].len(),
+                domain_size,
+                n_vars,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// [`Coefficients::check_structure`] for one matrix held somewhere other than a
+    /// `Coefficients`, such as the device memory a [`KeySink`] handed out: its row
+    /// pointers, its signals and how many values it has.
+    pub fn check_matrix(
+        matrix: Matrix,
+        rp: &[u32],
+        signal: &[u32],
+        values: usize,
+        domain_size: usize,
+        n_vars: usize,
+    ) -> Result<(), ZkeyError> {
         let bad = |reason| ZkeyError::Malformed { section: 4, reason };
         let rows_plus_one = domain_size
             .checked_add(1)
             .ok_or_else(|| bad(format!("domain size {domain_size} overflows CSR row count")))?;
-        for matrix in Matrix::BOTH {
-            let (m, name) = (matrix.index(), matrix.name());
-            let rp = &self.row_ptr[m];
-            if rp.len() != rows_plus_one {
+        let name = matrix.name();
+        if rp.len() != rows_plus_one {
+            return Err(bad(format!(
+                "matrix {name} has {} row_ptr entries, domain size {domain_size} needs {rows_plus_one}",
+                rp.len()
+            )));
+        }
+        for c in 1..rp.len() {
+            if rp[c] < rp[c - 1] {
                 return Err(bad(format!(
-                    "matrix {name} has {} row_ptr entries, domain size {domain_size} needs {rows_plus_one}",
-                    rp.len()
+                    "matrix {name} row_ptr is not monotone at row {}: {} then {}",
+                    c - 1,
+                    rp[c - 1],
+                    rp[c]
                 )));
             }
-            for c in 1..rp.len() {
-                if rp[c] < rp[c - 1] {
-                    return Err(bad(format!(
-                        "matrix {name} row_ptr is not monotone at row {}: {} then {}",
-                        c - 1,
-                        rp[c - 1],
-                        rp[c]
-                    )));
-                }
-            }
-            if rp[0] != 0 {
+        }
+        if rp[0] != 0 {
+            return Err(bad(format!(
+                "matrix {name} row_ptr starts at {}, expected 0",
+                rp[0]
+            )));
+        }
+        let total = rp[domain_size] as usize;
+        if total != signal.len() || total != values {
+            return Err(bad(format!(
+                "matrix {name} row_ptr ends at {total} but has {} signals and {values} values",
+                signal.len(),
+            )));
+        }
+        for (k, &s) in signal.iter().enumerate() {
+            if s as usize >= n_vars {
                 return Err(bad(format!(
-                    "matrix {name} row_ptr starts at {}, expected 0",
-                    rp[0]
+                    "matrix {name} nonzero {k} references signal {s} beyond n_vars {n_vars}"
                 )));
-            }
-            let total = rp[domain_size] as usize;
-            if total != self.signal[m].len() || total != self.value[m].len() {
-                return Err(bad(format!(
-                    "matrix {name} row_ptr ends at {total} but has {} signals and {} values",
-                    self.signal[m].len(),
-                    self.value[m].len()
-                )));
-            }
-            for (k, &s) in self.signal[m].iter().enumerate() {
-                if s as usize >= n_vars {
-                    return Err(bad(format!(
-                        "matrix {name} nonzero {k} references signal {s} beyond n_vars {n_vars}"
-                    )));
-                }
             }
         }
         Ok(())
+    }
+}
+
+/// Memory of a backend's own that [`ProvingKey::load_into`] decodes the bulk of a key
+/// straight into, in place of the key's vectors: the four G1 query sections 5, 6, 8 and
+/// 9, and both CSR matrices of section 4. Every check the loader makes runs exactly as it
+/// does for [`ProvingKey::load`]; only where a validated value is written changes. It
+/// exists for unified memory, where the device reads host memory directly and a parsed
+/// vector would only be copied into a device buffer and dropped.
+///
+/// Each method is asked once, after the section's length has been checked against the
+/// header and before its first value is decoded, and may answer `None` to keep that
+/// section in the key as usual. What it hands out must be exactly as long as asked for.
+pub trait KeySink {
+    /// A G1 point as the sink stores it.
+    type G1: Send;
+    /// A section 4 value as the sink stores it.
+    type Fr: Send;
+
+    fn g1(p: &G1Affine) -> Self::G1;
+    fn fr(v: &Fr) -> Self::Fr;
+
+    /// Room for the `n` points of query section `section`, and one infinity flag each.
+    fn g1_section(
+        &mut self,
+        section: u32,
+        n: usize,
+    ) -> Result<Option<PointsInto<'_, Self::G1>>, ZkeyError>;
+
+    /// Room for both matrices, indexed by [`Matrix::index`]: `rows + 1` row pointers each,
+    /// and `nnz[m]` signals and values for matrix `m`.
+    fn coefficients(
+        &mut self,
+        rows: usize,
+        nnz: [usize; 2],
+    ) -> Result<Option<[CsrInto<'_, Self::Fr>; 2]>, ZkeyError>;
+}
+
+/// Where one query section goes. `infinity[i]` is whether point `i` is the identity.
+pub struct PointsInto<'a, T> {
+    pub points: &'a mut [T],
+    pub infinity: &'a mut [bool],
+}
+
+/// Where one CSR matrix goes, with the invariants [`Coefficients`] documents.
+pub struct CsrInto<'a, T> {
+    pub row_ptr: &'a mut [u32],
+    pub signal: &'a mut [u32],
+    pub value: &'a mut [T],
+}
+
+/// The sink every plain load uses: it takes nothing, so every section stays in the key.
+struct Keep;
+
+impl KeySink for Keep {
+    type G1 = G1Affine;
+    type Fr = Fr;
+
+    fn g1(p: &G1Affine) -> G1Affine {
+        *p
+    }
+    fn fr(v: &Fr) -> Fr {
+        *v
+    }
+    fn g1_section(
+        &mut self,
+        _: u32,
+        _: usize,
+    ) -> Result<Option<PointsInto<'_, G1Affine>>, ZkeyError> {
+        Ok(None)
+    }
+    fn coefficients(
+        &mut self,
+        _: usize,
+        _: [usize; 2],
+    ) -> Result<Option<[CsrInto<'_, Fr>; 2]>, ZkeyError> {
+        Ok(None)
     }
 }
 
@@ -237,7 +336,7 @@ impl ProvingKey {
     /// uses [`ProvingKey::from_bytes`] instead.
     #[cfg(not(target_family = "wasm"))]
     pub fn load(path: &std::path::Path) -> Result<Self, ZkeyError> {
-        Self::parse(BinFile::open(path, b"zkey", 2)?, Check::Full)
+        Self::parse(BinFile::open(path, b"zkey", 2)?, Check::Full, &mut Keep)
     }
 
     /// [`ProvingKey::load`] without the per-point curve checks on sections 5 to 9 and
@@ -249,7 +348,11 @@ impl ProvingKey {
     /// proof element, which the checked `prove` in `snarkrs-groth16` still refuses to return.
     #[cfg(not(target_family = "wasm"))]
     pub fn load_unchecked(path: &std::path::Path) -> Result<Self, ZkeyError> {
-        Self::parse(BinFile::open(path, b"zkey", 2)?, Check::Unchecked)
+        Self::parse(
+            BinFile::open(path, b"zkey", 2)?,
+            Check::Unchecked,
+            &mut Keep,
+        )
     }
 
     /// [`ProvingKey::load`] that accepts a key whose `gamma_g2` equals its `delta_g2`, and
@@ -260,7 +363,34 @@ impl ProvingKey {
     /// `prove_allowing_unblinded`, since the checked `prove` refuses the key too.
     #[cfg(not(target_family = "wasm"))]
     pub fn load_allowing_unblinded(path: &std::path::Path) -> Result<Self, ZkeyError> {
-        Self::parse(BinFile::open(path, b"zkey", 2)?, Check::AllowUnblinded)
+        Self::parse(
+            BinFile::open(path, b"zkey", 2)?,
+            Check::AllowUnblinded,
+            &mut Keep,
+        )
+    }
+
+    /// [`ProvingKey::load`] that decodes the G1 query sections 5, 6, 8 and 9 and both
+    /// section 4 matrices into `sink` instead of the key, with every check `load` runs.
+    /// Each section the sink takes is left empty in the returned key, so that key is the
+    /// header, the verifying key, the G2 query and whatever the sink declined.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn load_into<S: KeySink>(path: &std::path::Path, sink: &mut S) -> Result<Self, ZkeyError> {
+        Self::parse(BinFile::open(path, b"zkey", 2)?, Check::Full, sink)
+    }
+
+    /// [`ProvingKey::load_allowing_unblinded`] into a [`KeySink`], as
+    /// [`ProvingKey::load_into`] is to `load`. Benchmark only, for the same reason.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn load_allowing_unblinded_into<S: KeySink>(
+        path: &std::path::Path,
+        sink: &mut S,
+    ) -> Result<Self, ZkeyError> {
+        Self::parse(
+            BinFile::open(path, b"zkey", 2)?,
+            Check::AllowUnblinded,
+            sink,
+        )
     }
 
     /// Parse and validate a `.zkey` that is already in memory, for the browser, where the
@@ -272,17 +402,25 @@ impl ProvingKey {
     /// exists. In a 4 GiB wasm32 address space that doubling is worth avoiding on its own,
     /// and the caller has no use for the bytes afterwards anyway.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, ZkeyError> {
-        Self::parse(BinFile::from_bytes(bytes, b"zkey", 2)?, Check::Full)
+        Self::parse(
+            BinFile::from_bytes(bytes, b"zkey", 2)?,
+            Check::Full,
+            &mut Keep,
+        )
     }
 
     /// [`ProvingKey::from_bytes`] with the checks [`ProvingKey::load_unchecked`] skips.
     pub fn from_bytes_unchecked(bytes: Vec<u8>) -> Result<Self, ZkeyError> {
-        Self::parse(BinFile::from_bytes(bytes, b"zkey", 2)?, Check::Unchecked)
+        Self::parse(
+            BinFile::from_bytes(bytes, b"zkey", 2)?,
+            Check::Unchecked,
+            &mut Keep,
+        )
     }
 
-    /// Everything after the container is opened, shared by all five constructors so the
+    /// Everything after the container is opened, shared by all seven constructors so the
     /// paths cannot diverge on a single validation.
-    fn parse(file: BinFile, check: Check) -> Result<Self, ZkeyError> {
+    fn parse<S: KeySink>(file: BinFile, check: Check, sink: &mut S) -> Result<Self, ZkeyError> {
         let mut s1 = Cursor::new(file.unique_section(1)?, 1);
         let protocol = s1.u32()?;
         if protocol != PROTOCOL_GROTH16 {
@@ -348,13 +486,13 @@ impl ProvingKey {
 
         // Unchecked here because every IC point gets the full check further down, in both
         // modes: there are `n_public + 1` of them and the verifier depends on them.
-        let ic = read_g1_section(&file, 3, n_ic, Check::Unchecked)?;
-        let coeffs = read_coefficients(&file.map_section(4)?, n_vars, domain_size)?;
-        let a_query = read_g1_section(&file, 5, n_vars, check)?;
-        let b_g1_query = read_g1_section(&file, 6, n_vars, check)?;
+        let ic = read_g1_section(&file, 3, n_ic, Check::Unchecked, &mut Keep)?.points;
+        let coeffs = read_coefficients(&file.map_section(4)?, n_vars, domain_size, sink)?;
+        let a_query = read_g1_section(&file, 5, n_vars, check, sink)?;
+        let b_g1_query = read_g1_section(&file, 6, n_vars, check, sink)?;
         let b_g2_query = read_g2_section(&file, 7, n_vars, check)?;
-        let l_query = read_g1_section(&file, 8, n_vars - n_ic, check)?;
-        let h_query = read_g1_section(&file, 9, domain_size, check)?;
+        let l_query = read_g1_section(&file, 8, n_vars - n_ic, check, sink)?;
+        let h_query = read_g1_section(&file, 9, domain_size, check, sink)?;
 
         // Only the O(1) points are validated on load. The query sections are millions of
         // points on a real circuit and a subgroup check each would dominate key load, so
@@ -422,10 +560,10 @@ impl ProvingKey {
         // contain points at infinity in these sections, 33.9% of the B query in
         // js_16x16_d32, so rejecting them individually would reject every real key.
         for (section, all_inf, n) in [
-            (5u32, a_query.iter().all(|p| p.infinity), a_query.len()),
-            (6, b_g1_query.iter().all(|p| p.infinity), b_g1_query.len()),
+            (5u32, a_query.all_infinity, a_query.n),
+            (6, b_g1_query.all_infinity, b_g1_query.n),
             (7, b_g2_query.iter().all(|p| p.infinity), b_g2_query.len()),
-            (9, h_query.iter().all(|p| p.infinity), h_query.len()),
+            (9, h_query.all_infinity, h_query.n),
         ] {
             if n > 0 && all_inf {
                 return Err(ZkeyError::Malformed {
@@ -460,11 +598,11 @@ impl ProvingKey {
             beta_g2,
             delta_g1,
             delta_g2,
-            a_query,
-            b_g1_query,
+            a_query: a_query.points,
+            b_g1_query: b_g1_query.points,
             b_g2_query,
-            l_query,
-            h_query,
+            l_query: l_query.points,
+            h_query: h_query.points,
             coeffs,
             vk: VerifyingKey {
                 alpha_g1,
@@ -521,25 +659,68 @@ fn check_modulus(c: &mut Cursor<'_>, want: &[u8]) -> Result<(), ZkeyError> {
     Ok(())
 }
 
-fn read_g1_section(
+/// One G1 section: its points, unless a [`KeySink`] took them, and what the infinity gate
+/// in [`ProvingKey::parse`] needs to know about them either way.
+struct G1Section {
+    points: Vec<G1Affine>,
+    n: usize,
+    all_infinity: bool,
+}
+
+fn read_g1_section<S: KeySink>(
     file: &BinFile,
     id: u32,
     n: usize,
     check: Check,
-) -> Result<Vec<G1Affine>, ZkeyError> {
+    sink: &mut S,
+) -> Result<G1Section, ZkeyError> {
     let section = file.map_section(id)?;
     let data = &*section;
     expect_records(data, n, G1_BYTES, id)?;
-    // One pass over the mapped bytes straight into the output vector: the section is
-    // never materialised as an intermediate buffer. The curve check rides in the same
-    // pass, while the point is still in cache, which is what makes it close to free.
-    // BN254 G1 has cofactor 1, so on the curve is in the subgroup.
-    decode_records(data, G1_BYTES, G1Affine::identity(), |i, b| {
+    // One pass over the mapped bytes straight into the output: the section is never
+    // materialised as an intermediate buffer. The curve check rides in the same pass,
+    // while the point is still in cache, which is what makes it close to free. BN254 G1
+    // has cofactor 1, so on the curve is in the subgroup.
+    let decode = |i: usize, b: &[u8]| {
         let p = g1(b)?;
         if check != Check::Unchecked && !valid_g1(&p) {
             return Err(off_curve(id, i));
         }
         Ok(p)
+    };
+    if let Some(PointsInto { points, infinity }) = sink.g1_section(id, n)? {
+        assert_eq!(points.len(), n, "sink room for section {id} points");
+        assert_eq!(infinity.len(), n, "sink room for section {id} flags");
+        // What is stored is the decoded point, not the bytes again: on the mmap path a
+        // second read could see a file someone changed after the check.
+        let first_err = FirstError::default();
+        let finite = data
+            .par_chunks_exact(G1_BYTES)
+            .zip(points.par_iter_mut())
+            .zip(infinity.par_iter_mut())
+            .enumerate()
+            .map(|(i, ((b, out), inf))| {
+                let p = decode(i, b).unwrap_or_else(|e| {
+                    first_err.record(i, e);
+                    G1Affine::identity()
+                });
+                *out = S::g1(&p);
+                *inf = p.infinity;
+                !p.infinity
+            })
+            .reduce(|| false, |a, b| a || b);
+        first_err.into_result()?;
+        return Ok(G1Section {
+            points: Vec::new(),
+            n,
+            all_infinity: !finite,
+        });
+    }
+    let points = decode_records(data, G1_BYTES, G1Affine::identity(), decode)?;
+    Ok(G1Section {
+        all_infinity: points.iter().all(|p| p.infinity),
+        n,
+        points,
     })
 }
 
@@ -604,10 +785,11 @@ fn check_g2(p: &G2Affine, section: u32, what: &str) -> Result<(), ZkeyError> {
 /// one counting pass plus one placement pass produces both the ordering and the index in
 /// O(n + domain_size), with no comparison sort and no hash map. It is also stable, which
 /// keeps the placement deterministic across runs and across backends.
-fn read_coefficients(
+fn read_coefficients<S: KeySink>(
     data: &[u8],
     n_vars: usize,
     domain_size: usize,
+    sink: &mut S,
 ) -> Result<Coefficients, ZkeyError> {
     let mut c = Cursor::new(data, 4);
     let n_coefs = c.u32()? as usize;
@@ -649,7 +831,29 @@ fn read_coefficients(
         row_ptr[0][domain_size] as usize,
         row_ptr[1][domain_size] as usize,
     ];
-    let mut signal = [vec![0u32; totals[0]], vec![0u32; totals[1]]];
+    let mut into = sink.coefficients(domain_size, totals)?;
+    if let Some(into) = &into {
+        for (m, d) in into.iter().enumerate() {
+            assert_eq!(
+                d.row_ptr.len(),
+                domain_size + 1,
+                "sink room for row_ptr {m}"
+            );
+            assert_eq!(d.signal.len(), totals[m], "sink room for signal {m}");
+            assert_eq!(d.value.len(), totals[m], "sink room for value {m}");
+        }
+    }
+    let mut kept = match into {
+        Some(_) => [Vec::new(), Vec::new()],
+        None => [vec![0u32; totals[0]], vec![0u32; totals[1]]],
+    };
+    let signal: [&mut [u32]; 2] = match &mut into {
+        Some([a, b]) => [&mut *a.signal, &mut *b.signal],
+        None => {
+            let [a, b] = &mut kept;
+            [a, b]
+        }
+    };
     // The record each slot came from. The placement pass stays serial and only moves
     // indices; the Montgomery decode of each value then runs in parallel per slot.
     let mut source = [vec![0u32; totals[0]], vec![0u32; totals[1]]];
@@ -696,14 +900,33 @@ fn read_coefficients(
         source[m][slot] = i as u32;
     }
 
-    let [a, b] = source
-        .map(|src| collect_records(src.par_iter().map(|&i| value_of(i as usize)), Fr::zero()));
-    let value = [a?, b?];
-
+    let Some(into) = into else {
+        let [a, b] = source
+            .map(|src| collect_records(src.par_iter().map(|&i| value_of(i as usize)), Fr::zero()));
+        let value = [a?, b?];
+        return Ok(Coefficients {
+            row_ptr,
+            signal: kept,
+            value,
+        });
+    };
+    for (m, d) in into.into_iter().enumerate() {
+        let first_err = FirstError::default();
+        d.value
+            .par_iter_mut()
+            .zip(source[m].par_iter())
+            .enumerate()
+            .for_each(|(slot, (out, &i))| match value_of(i as usize) {
+                Ok(v) => *out = S::fr(&v),
+                Err(e) => first_err.record(slot, e),
+            });
+        first_err.into_result()?;
+        d.row_ptr.copy_from_slice(&row_ptr[m]);
+    }
     Ok(Coefficients {
-        row_ptr,
-        signal,
-        value,
+        row_ptr: Default::default(),
+        signal: Default::default(),
+        value: Default::default(),
     })
 }
 

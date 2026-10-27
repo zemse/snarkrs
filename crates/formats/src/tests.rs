@@ -188,7 +188,7 @@ fn csr_is_stable_and_reproduces_the_records() {
         (1, 0, 0, 19),
         (0, 7, 6, 23),
     ];
-    let coeffs = read_coefficients(&synthetic_section4(&records), 8, 8).unwrap();
+    let coeffs = read_coefficients(&synthetic_section4(&records), 8, 8, &mut Keep).unwrap();
 
     assert_row_ptr(&coeffs, 8, &[4, 2]);
 
@@ -206,13 +206,24 @@ fn csr_is_stable_and_reproduces_the_records() {
     let mut got = flatten(&coeffs);
     got.sort_by_key(|&(m, c, s, _)| (m, c, s));
     assert_eq!(got, want);
+
+    // Through a sink the same CSR lands in the sink, slot for slot.
+    let mut sink = VecSink::default();
+    let kept = read_coefficients(&synthetic_section4(&records), 8, 8, &mut sink).unwrap();
+    for (m, (row_ptr, signal, value)) in sink.csr.unwrap().into_iter().enumerate() {
+        assert!(kept.row_ptr[m].is_empty() && kept.signal[m].is_empty());
+        assert!(kept.value[m].is_empty());
+        assert_eq!(row_ptr, coeffs.row_ptr[m]);
+        assert_eq!(signal, coeffs.signal[m]);
+        assert_eq!(value, coeffs.value[m]);
+    }
 }
 
 #[test]
 fn csr_rejects_records_outside_the_domain_or_witness() {
-    assert!(read_coefficients(&synthetic_section4(&[(0, 9, 1, 3)]), 8, 8).is_err());
-    assert!(read_coefficients(&synthetic_section4(&[(0, 1, 9, 3)]), 8, 8).is_err());
-    assert!(read_coefficients(&synthetic_section4(&[(2, 1, 1, 3)]), 8, 8).is_err());
+    assert!(read_coefficients(&synthetic_section4(&[(0, 9, 1, 3)]), 8, 8, &mut Keep).is_err());
+    assert!(read_coefficients(&synthetic_section4(&[(0, 1, 9, 3)]), 8, 8, &mut Keep).is_err());
+    assert!(read_coefficients(&synthetic_section4(&[(2, 1, 1, 3)]), 8, 8, &mut Keep).is_err());
 }
 
 /// Rebuilds the flat `(matrix, constraint, signal, value)` list from CSR.
@@ -1019,4 +1030,233 @@ fn the_byte_path_rejects_what_the_mmap_path_rejects() {
         ProvingKey::from_bytes(lying),
         Err(ZkeyError::Malformed { section: 1, .. })
     ));
+}
+
+/// A [`KeySink`] into plain vectors, so the sink path can be compared with the vector
+/// path value for value. Every slot starts at a value the loader would have to write over,
+/// so a slot it skipped shows up as a mismatch.
+#[derive(Default)]
+struct VecSink {
+    g1: Vec<(u32, Vec<G1Affine>, Vec<bool>)>,
+    csr: Option<[CsrVecs; 2]>,
+}
+
+/// One matrix's row pointers, signals and values.
+type CsrVecs = (Vec<u32>, Vec<u32>, Vec<Fr>);
+
+impl KeySink for VecSink {
+    type G1 = G1Affine;
+    type Fr = Fr;
+
+    fn g1(p: &G1Affine) -> G1Affine {
+        *p
+    }
+    fn fr(v: &Fr) -> Fr {
+        *v
+    }
+    fn g1_section(
+        &mut self,
+        section: u32,
+        n: usize,
+    ) -> Result<Option<PointsInto<'_, G1Affine>>, ZkeyError> {
+        self.g1
+            .push((section, vec![G1Affine::generator(); n], vec![false; n]));
+        let (_, points, infinity) = self.g1.last_mut().unwrap();
+        Ok(Some(PointsInto { points, infinity }))
+    }
+    fn coefficients(
+        &mut self,
+        rows: usize,
+        nnz: [usize; 2],
+    ) -> Result<Option<[CsrInto<'_, Fr>; 2]>, ZkeyError> {
+        let room = |k: usize| {
+            (
+                vec![u32::MAX; rows + 1],
+                vec![u32::MAX; k],
+                vec![Fr::from(7u64); k],
+            )
+        };
+        let [a, b] = self.csr.insert([room(nnz[0]), room(nnz[1])]);
+        Ok(Some([csr_into(a), csr_into(b)]))
+    }
+}
+
+fn csr_into((row_ptr, signal, value): &mut CsrVecs) -> CsrInto<'_, Fr> {
+    CsrInto {
+        row_ptr,
+        signal,
+        value,
+    }
+}
+
+/// What `load_into` leaves in the sink and the key together is exactly what `load`
+/// returns, and the key keeps nothing the sink took.
+#[test]
+fn the_sink_path_parses_what_the_vector_path_parses() {
+    for_each_artifact("the_sink_path_parses_what_the_vector_path_parses", |a| {
+        let path = a.dir.join("circuit.zkey");
+        let plain = ProvingKey::load(&path).unwrap();
+        let mut sink = VecSink::default();
+        let sunk = ProvingKey::load_into(&path, &mut sink).unwrap();
+
+        let n = &a.name;
+        assert_eq!(sunk.n_vars, plain.n_vars, "{n}: n_vars");
+        assert_eq!(sunk.n_public, plain.n_public, "{n}: n_public");
+        assert_eq!(sunk.domain_size, plain.domain_size, "{n}: domain_size");
+        assert_eq!(sunk.alpha_g1, plain.alpha_g1, "{n}: alpha_g1");
+        assert_eq!(sunk.beta_g1, plain.beta_g1, "{n}: beta_g1");
+        assert_eq!(sunk.beta_g2, plain.beta_g2, "{n}: beta_g2");
+        assert_eq!(sunk.delta_g1, plain.delta_g1, "{n}: delta_g1");
+        assert_eq!(sunk.delta_g2, plain.delta_g2, "{n}: delta_g2");
+        assert!(sunk.b_g2_query == plain.b_g2_query, "{n}: b_g2_query");
+        assert_eq!(sunk.vk.gamma_g2, plain.vk.gamma_g2, "{n}: vk.gamma_g2");
+        assert_eq!(sunk.vk.ic, plain.vk.ic, "{n}: vk.ic");
+
+        for v in [
+            &sunk.a_query,
+            &sunk.b_g1_query,
+            &sunk.l_query,
+            &sunk.h_query,
+        ] {
+            assert!(v.is_empty(), "{n}: the key kept a section the sink took");
+        }
+        let sections: Vec<u32> = sink.g1.iter().map(|(s, _, _)| *s).collect();
+        assert_eq!(sections, [5, 6, 8, 9], "{n}: sections offered to the sink");
+        for ((section, points, infinity), want) in sink.g1.iter().zip([
+            &plain.a_query,
+            &plain.b_g1_query,
+            &plain.l_query,
+            &plain.h_query,
+        ]) {
+            assert!(points == want, "{n}: section {section} points");
+            let want_inf: Vec<bool> = want.iter().map(|p| p.infinity).collect();
+            assert!(
+                *infinity == want_inf,
+                "{n}: section {section} infinity flags"
+            );
+        }
+
+        let csr = sink.csr.as_ref().expect("section 4 offered to the sink");
+        for (m, (row_ptr, signal, value)) in csr.iter().enumerate() {
+            assert!(
+                sunk.coeffs.row_ptr[m].is_empty(),
+                "{n}: key kept row_ptr {m}"
+            );
+            assert!(sunk.coeffs.signal[m].is_empty(), "{n}: key kept signal {m}");
+            assert!(sunk.coeffs.value[m].is_empty(), "{n}: key kept value {m}");
+            assert!(*row_ptr == plain.coeffs.row_ptr[m], "{n}: row_ptr {m}");
+            assert!(*signal == plain.coeffs.signal[m], "{n}: signal {m}");
+            assert!(*value == plain.coeffs.value[m], "{n}: value {m}");
+        }
+    });
+}
+
+/// Offset and length of the first section `id` in a zkey's bytes.
+fn section_at(bytes: &[u8], id: u32) -> (usize, usize) {
+    let nsec = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+    let mut off = 12usize;
+    for _ in 0..nsec {
+        let sid = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+        let slen = u64::from_le_bytes(bytes[off + 4..off + 12].try_into().unwrap()) as usize;
+        off += 12;
+        if sid == id {
+            return (off, slen);
+        }
+        off += slen;
+    }
+    panic!("no section {id}");
+}
+
+fn load_sunk(path: &Path) -> Result<ProvingKey, ZkeyError> {
+    ProvingKey::load_into(path, &mut VecSink::default())
+}
+
+fn load_unblinded_sunk(path: &Path) -> Result<ProvingKey, ZkeyError> {
+    ProvingKey::load_allowing_unblinded_into(path, &mut VecSink::default())
+}
+
+/// Every refusal of the vector path is a refusal of the sink path, with the same message:
+/// the sink changes where a value is written and nothing about which values are accepted.
+/// Each edit hits a check that runs over a section the sink takes, or one beside it.
+#[test]
+fn the_sink_path_refuses_what_the_vector_path_refuses() {
+    type Edit = fn(&mut Vec<u8>);
+    let edits: [(&str, Edit); 11] = [
+        ("a-off-curve", |b| {
+            let at = locate(b).a_query_at + FQ_BYTES;
+            b[at] ^= 1;
+        }),
+        ("l-off-curve", |b| {
+            let (at, len) = section_at(b, 8);
+            b[at + len - 1] ^= 1;
+        }),
+        ("h-off-curve", |b| {
+            let (at, _) = section_at(b, 9);
+            b[at + G1_BYTES + FQ_BYTES] ^= 1;
+        }),
+        ("h-at-modulus", |b| {
+            let (at, _) = section_at(b, 9);
+            b[at..at + FQ_BYTES].copy_from_slice(&Fq::MODULUS.to_bytes_le());
+        }),
+        ("b1-zeroed", |b| {
+            let (at, len) = section_at(b, 6);
+            b[at..at + len].fill(0);
+        }),
+        ("h-zeroed", |b| {
+            let (at, len) = section_at(b, 9);
+            b[at..at + len].fill(0);
+        }),
+        ("beta-g1-zeroed", |b| {
+            let at = locate(b).beta_g1_at;
+            b[at..at + G1_BYTES].fill(0);
+        }),
+        ("unblinded", |b| unblind(b)),
+        ("coef-at-modulus", |b| {
+            let (at, _) = section_at(b, 4);
+            let v = at + 4 + 12;
+            b[v..v + FR_BYTES].copy_from_slice(&Fr::MODULUS.to_bytes_le());
+        }),
+        ("coef-signal", |b| {
+            let (at, _) = section_at(b, 4);
+            b[at + 4 + 8..at + 4 + 12].copy_from_slice(&u32::MAX.to_le_bytes());
+        }),
+        ("coef-matrix", |b| {
+            let (at, len) = section_at(b, 4);
+            let last = at + len - COEF_RECORD;
+            b[last..last + 4].copy_from_slice(&2u32.to_le_bytes());
+        }),
+    ];
+    // Each edit writes a whole mutated key, so the gigabyte csp keys are left to the
+    // per-check tests above.
+    for_each_artifact("the_sink_path_refuses_what_the_vector_path_refuses", |a| {
+        if std::fs::metadata(a.dir.join("circuit.zkey")).unwrap().len() > 100 << 20 {
+            return;
+        }
+        for (what, edit) in edits {
+            // Named apart from the other mutation tests, which run beside this one.
+            let file = format!("sink-{what}");
+            let plain = load_mutated_with(&file, &a.dir, ProvingKey::load, edit)
+                .err()
+                .unwrap_or_else(|| panic!("{}: {what} accepted by load", a.name));
+            let sunk = load_mutated_with(&file, &a.dir, load_sunk, edit)
+                .err()
+                .unwrap_or_else(|| panic!("{}: {what} accepted by load_into", a.name));
+            assert_eq!(sunk.to_string(), plain.to_string(), "{}: {what}", a.name);
+
+            let plain = load_mutated_with(&file, &a.dir, ProvingKey::load_allowing_unblinded, edit);
+            let sunk = load_mutated_with(&file, &a.dir, load_unblinded_sunk, edit);
+            match (plain, sunk) {
+                (Err(p), Err(s)) => {
+                    assert_eq!(s.to_string(), p.to_string(), "{}: {what}", a.name)
+                }
+                (Ok(_), Ok(_)) => assert_eq!(what, "unblinded", "{}", a.name),
+                (p, s) => panic!(
+                    "{}: {what}: the unblinded opt-in gave {:?} and its sink twin {:?}",
+                    a.name,
+                    p.err().map(|e| e.to_string()),
+                    s.err().map(|e| e.to_string())
+                ),
+            }
+        }
+    });
 }

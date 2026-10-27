@@ -594,21 +594,42 @@ where
     T: Copy + Send + Sync,
     E: Send,
 {
-    let first_err = std::sync::Mutex::new(None::<(usize, E)>);
+    let first_err = FirstError::default();
     let out = items
         .enumerate()
         .map(|(i, r)| {
             r.unwrap_or_else(|e| {
-                let mut slot = first_err.lock().unwrap_or_else(|p| p.into_inner());
-                if slot.as_ref().is_none_or(|(j, _)| i < *j) {
-                    *slot = Some((i, e));
-                }
+                first_err.record(i, e);
                 fallback
             })
         })
         .collect();
-    match first_err.into_inner().unwrap_or_else(|p| p.into_inner()) {
-        None => Ok(out),
-        Some((_, e)) => Err(e),
+    first_err.into_result().map(|()| out)
+}
+
+/// The error of the lowest-indexed item that failed, out of a parallel pass that keeps
+/// going past failures so it stays indexed. Shared by [`collect_records`] and the loader's
+/// passes that write into caller memory instead of a vector.
+pub(crate) struct FirstError<E>(std::sync::Mutex<Option<(usize, E)>>);
+
+impl<E> Default for FirstError<E> {
+    fn default() -> Self {
+        Self(std::sync::Mutex::new(None))
+    }
+}
+
+impl<E> FirstError<E> {
+    pub(crate) fn record(&self, i: usize, e: E) {
+        let mut slot = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.as_ref().is_none_or(|(j, _)| i < *j) {
+            *slot = Some((i, e));
+        }
+    }
+
+    pub(crate) fn into_result(self) -> Result<(), E> {
+        match self.0.into_inner().unwrap_or_else(|p| p.into_inner()) {
+            None => Ok(()),
+            Some((_, e)) => Err(e),
+        }
     }
 }
