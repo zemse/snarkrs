@@ -69,18 +69,20 @@ phase 2, the proving key, run once per circuit:
 <tr><th align="right">g16 cuda (ms)</th><th align="right">g16 cpu (ms)</th><th align="right">rapidsnark (ms)</th><th align="right">snarkjs (ms)</th></tr>
 </thead>
 <tbody>
-<tr><td><code>railgun-01x01</code></td><td align="right">20,135</td><td align="right">23.7</td><td align="right">231.0</td><td align="right">170.0</td><td align="right"></td></tr>
-<tr><td><code>tornado</code></td><td align="right">28,275</td><td align="right">32.0</td><td align="right">396.1</td><td align="right">300.0</td><td align="right"></td></tr>
-<tr><td><code>sha256</code></td><td align="right">59,281</td><td align="right">18.0</td><td align="right">193.6</td><td align="right">175.0</td><td align="right"></td></tr>
-<tr><td><code>railgun-13x01</code></td><td align="right">141,276</td><td align="right">135.3</td><td align="right">1447.7</td><td align="right">1191.5</td><td align="right"></td></tr>
-<tr><td><code>rsa2048</code></td><td align="right">190,945</td><td align="right">64.7</td><td align="right">776.9</td><td align="right">790.5</td><td align="right"></td></tr>
-<tr><td><code>keccak256</code></td><td align="right">239,176</td><td align="right">51.4</td><td align="right">758.1</td><td align="right">682.0</td><td align="right"></td></tr>
-<tr><td><code>anon-aadhaar</code></td><td align="right">1,115,080</td><td align="right">406.5</td><td align="right">5925.0</td><td align="right">5774.0</td><td align="right"></td></tr>
+<tr><td><code>railgun-01x01</code></td><td align="right">20,135</td><td align="right">23.4</td><td align="right">117.7</td><td align="right">170.3</td><td align="right"></td></tr>
+<tr><td><code>tornado</code></td><td align="right">28,275</td><td align="right">31.6</td><td align="right">197.4</td><td align="right">296.1</td><td align="right"></td></tr>
+<tr><td><code>sha256</code></td><td align="right">59,281</td><td align="right">18.0</td><td align="right">97.1</td><td align="right">178.5</td><td align="right"></td></tr>
+<tr><td><code>railgun-13x01</code></td><td align="right">141,276</td><td align="right">135.1</td><td align="right">686.4</td><td align="right">1169.4</td><td align="right"></td></tr>
+<tr><td><code>rsa2048</code></td><td align="right">190,945</td><td align="right">65.2</td><td align="right">374.3</td><td align="right">760.5</td><td align="right"></td></tr>
+<tr><td><code>keccak256</code></td><td align="right">239,176</td><td align="right">52.1</td><td align="right">349.3</td><td align="right">657.2</td><td align="right"></td></tr>
+<tr><td><code>anon-aadhaar</code></td><td align="right">1,115,080</td><td align="right">415.2</td><td align="right">2538.9</td><td align="right">5206.9</td><td align="right"></td></tr>
 </tbody>
 </table>
 
 > blank = not measurable on this box: snarkjs has no warm mode, its CLI starts a fresh
 > process per proof. Its cold numbers are in `bench/results/machines/`.
+
+> note: g16 cpu here is built with `RUSTFLAGS="-C target-feature=+adx,+bmi2"`, which turns on the x86_64 field assembly. A build without it measured 1.5x to 1.6x slower on this box and lost to rapidsnark on the two smallest circuits.
 
 > note: constraint count is a poor predictor of proving time. e.g. `railgun-13x01` has fewer constraints than `keccak256` but takes more to prove.
 
