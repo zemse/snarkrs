@@ -49,6 +49,8 @@ UBUNTU_OWNER = "099720109477"
 UBUNTU_NAME = {"x86_64": "ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*",
                "arm64": "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-arm64-server-*"}
 SNARKJS = Path.home() / "Library/pnpm/snarkjs"
+# Appended to the user-data: apt's timers stopped and masked before anything is timed.
+QUIET_APT = REPO / "bench/aws/quiet-apt.sh"
 
 CIRCUITS = [
     "js_2x2_d32",
@@ -189,7 +191,7 @@ def launch(box, args):
     # `ami` and `name` are set by drivers that reuse this launcher (bench/aws/arkab-ec2.py).
     ami = getattr(args, "ami", None) or ubuntu_ami(box.arch)
     # The guest hard cap: shutdown with terminate behaviour ends the instance.
-    user_data = f"#!/bin/bash\nshutdown -h +{args.max_minutes}\n"
+    user_data = f"#!/bin/bash\nshutdown -h +{args.max_minutes}\n" + QUIET_APT.read_text()
     tags = (f"ResourceType=instance,Tags=[{{Key=Owner,Value={OWNER}}},"
             f"{{Key=Name,Value={getattr(args, 'name', 'g16-matrix')}-{box.itype}-EPHEMERAL}}]")
     last = None
@@ -259,9 +261,18 @@ def wait_ready(box):
     for _ in range(40):
         if box.ssh("true", check=False).returncode == 0:
             say(f"ssh ok, host key {want}")
-            return
+            break
         time.sleep(5)
-    raise RuntimeError("ssh never came up")
+    else:
+        raise RuntimeError("ssh never came up")
+    # sshd answers before cloud-init has run the user-data, so wait for quiet-apt.sh's
+    # marker: its lock wait gives up after 900 s.
+    for _ in range(100):
+        if box.ssh("test -f /var/lib/g16-apt-quiet", check=False).returncode == 0:
+            say("apt timers masked")
+            return
+        time.sleep(10)
+    raise RuntimeError("apt timers not masked: no /var/lib/g16-apt-quiet")
 
 
 def upload(box, bundle):

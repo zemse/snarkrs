@@ -105,6 +105,7 @@ SG=$(aws_ ec2 describe-security-groups --filters Name=group-name,Values=agent-ss
 [[ "$SG" == sg-* ]] || { echo 'missing agent-ssh security group' >&2; exit 1; }
 aws_ ec2 describe-key-pairs --key-names "$KEY_NAME" >/dev/null
 
+QUIET_APT="$(quiet_apt_userdata)"
 UD=$(mktemp)
 cat > "$UD" <<EOF
 #!/bin/bash
@@ -112,6 +113,7 @@ set -euo pipefail
 exec > /var/log/g16-bootstrap.log 2>&1
 # Arm the hard deadline before any other setup. Re-armed at every boot by systemd below.
 shutdown -h +$MAX_MIN
+$QUIET_APT
 mkdir -p /var/lib/g16-watchdog
 printf '%s %s %s\n' '$((IDLE_MIN * 60))' '$((MAX_MIN * 60))' 300 > /var/lib/g16-watchdog/config
 touch /var/lib/g16-watchdog/lease

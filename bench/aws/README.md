@@ -132,13 +132,20 @@ re-sample before quoting them. They are carried because nobody runs a batch prov
 on-demand and because the discount is not uniform: 60-66% on these CPU families, 41% on
 g4dn, and 22% on the Ada GPUs, which is large enough to reorder the ranking.
 
-## Two things this harness learned the hard way
+## Three things this harness learned the hard way
 
 **Do not use the EC2 regional apt mirror.** Measured from a c7a.xlarge in us-east-1:
 `us-east-1.ec2.archive.ubuntu.com` served `jammy/universe/Packages.gz` at 486 kB/s with
 repeated timeouts, while `archive.ubuntu.com` served the same object from the same instance
 in 69 ms. That was ten minutes of billed boot before anything was built. user-data rewrites
 the mirror before the first `apt-get` call.
+
+**Ubuntu upgrades itself mid-run.** `apt-daily-upgrade.timer` starts unattended-upgrade at a
+random time of day, and on 2026-10-27 it tripped `run-benchmark.sh`'s contention guard in
+the middle of a sweep. Every launcher's user-data embeds `quiet-apt.sh`, which stops and
+masks both apt timers, stops a running upgrade and waits for the dpkg lock before anything
+else runs. user-data runs on the first boot only, so a box that was set up some other way
+gets it once by hand: `ssh HOST 'sudo bash -s' < bench/aws/quiet-apt.sh`.
 
 **The first CUDA run on a fresh box is not a proof, it is a compile.** `~/.nv/ComputeCache`
 is empty on a new instance, so the first `--backend cuda` invocation pays NVRTC

@@ -41,7 +41,8 @@ class RunnerTests(unittest.TestCase):
             root = Path(directory)
             scripts = root / "bench/aws"
             scripts.mkdir(parents=True)
-            for name in ("lib.sh", "machines.csv", "idle-watchdog.sh", "run-gpu-bench-safe.sh", "rapidsnark-oracle.sh"):
+            for name in ("lib.sh", "machines.csv", "idle-watchdog.sh", "run-gpu-bench-safe.sh", "rapidsnark-oracle.sh",
+                         "quiet-apt.sh"):
                 shutil.copy(AWS / name, scripts / name)
             helpers = root / "bench/scripts"
             helpers.mkdir()
@@ -98,6 +99,7 @@ case "$name" in
               grep -q 'shutdown -h +180' "$userdata"
               grep -q 'systemctl enable --now g16-watchdog.timer' "$userdata"
               grep -q "'3600' '10800' 300" "$userdata"
+              grep -q 'systemctl mask apt-daily.timer apt-daily-upgrade.timer' "$userdata"
               ;;
           esac
         done

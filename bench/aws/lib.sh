@@ -119,6 +119,11 @@ revoke_ssh_ingress() {
   return 0
 }
 
+# quiet-apt.sh's text, for a user-data heredoc. Taken into a variable before the heredoc,
+# so a missing file fails the driver under `set -e` instead of dropping out of the user-data
+# as a substitution inside the heredoc would.
+quiet_apt_userdata() { cat "$REPO_ROOT/bench/aws/quiet-apt.sh"; }
+
 presign() { aws_ s3 presign "s3://$BUCKET/$1" --expires-in "${2:-28800}"; }
 
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR

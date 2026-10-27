@@ -76,12 +76,14 @@ say "ami=$AMI sg=$SG"
 
 # Bootstrap runs while we wait for ssh, so its apt work overlaps the boot. The dead-man
 # switch is the first line: if everything below this point dies, the box still stops billing.
+QUIET_APT="$(quiet_apt_userdata)"
 UD="$(mktemp)"
 cat > "$UD" <<EOF
 #!/bin/bash
 shutdown -h +$((HOURS * 60))
 exec > /var/log/g16-bootstrap.log 2>&1
 set -x
+$QUIET_APT
 # Do not use the EC2 regional apt mirror. Measured from a c7a.xlarge in us-east-1 during
 # this sweep: us-east-1.ec2.archive.ubuntu.com served jammy/universe Packages.gz at
 # 486 kB/s and timed out repeatedly, while archive.ubuntu.com served the same object from

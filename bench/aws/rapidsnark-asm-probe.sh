@@ -52,12 +52,14 @@ trap cleanup EXIT INT TERM
 AMI="$(resolve_ami "$TYPE")"; SG="$(ensure_key_and_sg)"; open_ssh_ingress "$SG"; USER_NAME="$(iam_user)"
 say "arch=$ARCH ami=$AMI price=\$$PRICE/hr"
 
+QUIET_APT="$(quiet_apt_userdata)"
 UD="$(mktemp)"
 cat > "$UD" <<EOF
 #!/bin/bash
 shutdown -h +$((HOURS * 60))
 exec > /var/log/g16-bootstrap.log 2>&1
 set -x
+$QUIET_APT
 # Delimiter is # not |: the alternation contains a | and sed would read it as the end
 # of the pattern, failing with unbalanced parentheses behind the trailing || true.
 sed -i -E 's#http://[a-z0-9-]+\\.ec2\\.(archive|ports)\\.ubuntu\\.com#http://\\1.ubuntu.com#g' \

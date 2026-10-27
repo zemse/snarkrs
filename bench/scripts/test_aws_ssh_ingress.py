@@ -20,7 +20,9 @@ case "$*" in
     echo sgr-0123456789abcdef0 ;;
   *revoke-security-group-ingress*) [[ "$REVOKE" != fail ]] || exit 254 ;;
   *describe-images*) echo ami-test ;;
-  *run-instances*) [[ "$RUNFAIL" != 1 ]] || { echo 'UnauthorizedOperation' >&2; exit 254; }; echo i-0123456789abcdef0 ;;
+  *run-instances*)
+    for arg in "$@"; do [[ "$arg" != file://* ]] || cp "${arg#file://}" "$MOCK_LOG.userdata"; done
+    [[ "$RUNFAIL" != 1 ]] || { echo 'UnauthorizedOperation' >&2; exit 254; }; echo i-0123456789abcdef0 ;;
 esac
 exit 0
 '''
@@ -50,7 +52,7 @@ class SshIngressTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "bench/aws").mkdir(parents=True)
-            for name in ("lib.sh", "machines.csv", "bench-machine.sh"):
+            for name in ("lib.sh", "machines.csv", "bench-machine.sh", "quiet-apt.sh"):
                 shutil.copy(AWS / name, root / "bench/aws" / name)
             tools = root / "tools"
             tools.mkdir()
@@ -72,6 +74,8 @@ class SshIngressTests(unittest.TestCase):
             result = subprocess.run(["bash", str(target), *args], env=env,
                                     capture_output=True, text=True, timeout=30)
             calls = log.read_text().splitlines()
+            userdata = Path(f"{log}.userdata")
+            self.userdata = userdata.read_text() if userdata.exists() else None
             return result, calls
 
     @staticmethod
@@ -137,6 +141,15 @@ class SshIngressTests(unittest.TestCase):
                                         runfail="1", authorize="dup")
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertEqual(self.count(calls, "revoke-security-group-ingress"), 0)
+
+    def test_bench_machine_user_data_masks_apt_before_its_own_apt(self):
+        self.run_script(("bench-machine.sh", "c7i.xlarge", "1"), runfail="1")
+        ud = self.userdata
+        self.assertIsNotNone(ud)
+        self.assertIn("systemctl mask apt-daily.timer apt-daily-upgrade.timer", ud)
+        self.assertLess(ud.index("shutdown -h +"), ud.index("systemctl mask"))
+        self.assertLess(ud.index("systemctl mask"), ud.index("apt-get"))
+        subprocess.run(["bash", "-n"], input=ud, text=True, check=True)
 
 
 if __name__ == "__main__":

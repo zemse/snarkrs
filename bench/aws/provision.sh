@@ -75,12 +75,14 @@ case "$RULE" in sgr-*)
 esac
 echo "sg: $SG (ssh open to $MYIP only)"
 
+QUIET_APT="$(cat "$(dirname "$0")/quiet-apt.sh")"
 UD="$(mktemp)"
 cat > "$UD" <<EOF
 #!/bin/bash
 exec > /var/log/g16-bootstrap.log 2>&1
 set -x
 shutdown -h +$((HOURS * 60))
+$QUIET_APT
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y build-essential cmake m4 nasm libsodium-dev git curl pkg-config python3 unzip

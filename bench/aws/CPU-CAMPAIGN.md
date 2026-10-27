@@ -53,7 +53,8 @@ space before deploying, especially on the target's 8 GiB root volume.
 
 The coordinator alone arms the independent AWS deadline, starts the stopped target,
 validates use through the native capability and installs the existing tested
-`idle-watchdog.sh` timer. This driver requires an active watchdog state directory
+`idle-watchdog.sh` timer. It also runs `quiet-apt.sh` on the target once, as root, so
+apt's timers cannot start an upgrade inside the campaign. This driver requires an active watchdog state directory
 with writable `lease` and directory, a `config` file and no stale `done` marker.
 It renews that existing lease every 30 seconds and marks `done` after success or
 failure. State-file presence does not attest timer installation or firing; the
