@@ -26,13 +26,13 @@ failure policies and the hardware actually tested.
 <tr><th align="right">g16 metal (ms)</th><th align="right">g16 cpu (ms)</th><th align="right">rapidsnark (ms)</th><th align="right">snarkjs (ms)</th></tr>
 </thead>
 <tbody>
-<tr><td><code>railgun-01x01</code></td><td align="right">20,135</td><td align="right">29.1</td><td align="right">65.4</td><td align="right">72.0</td><td align="right"></td></tr>
-<tr><td><code>tornado</code></td><td align="right">28,275</td><td align="right">40.2</td><td align="right">102.9</td><td align="right">117.5</td><td align="right"></td></tr>
-<tr><td><code>sha256</code></td><td align="right">59,281</td><td align="right">21.0</td><td align="right">57.3</td><td align="right">72.0</td><td align="right"></td></tr>
-<tr><td><code>railgun-13x01</code></td><td align="right">141,276</td><td align="right">125.2</td><td align="right">390.3</td><td align="right">421.0</td><td align="right"></td></tr>
-<tr><td><code>rsa2048</code></td><td align="right">190,945</td><td align="right">56.8</td><td align="right">225.4</td><td align="right">344.5</td><td align="right"></td></tr>
-<tr><td><code>keccak256</code></td><td align="right">239,176</td><td align="right">38.8</td><td align="right">216.1</td><td align="right">289.0</td><td align="right"></td></tr>
-<tr><td><code>anon-aadhaar</code></td><td align="right">1,115,080</td><td align="right">263.2</td><td align="right">1764.5</td><td align="right">2120.0</td><td align="right"></td></tr>
+<tr><td><code>railgun-01x01</code></td><td align="right">20,135</td><td align="right">12.2</td><td align="right">35.9</td><td align="right">71.5</td><td align="right"></td></tr>
+<tr><td><code>tornado</code></td><td align="right">28,275</td><td align="right">20.4</td><td align="right">55.7</td><td align="right">116.0</td><td align="right"></td></tr>
+<tr><td><code>sha256</code></td><td align="right">59,281</td><td align="right">11.4</td><td align="right">29.8</td><td align="right">72.0</td><td align="right"></td></tr>
+<tr><td><code>railgun-13x01</code></td><td align="right">141,276</td><td align="right">52.4</td><td align="right">196.7</td><td align="right">426.0</td><td align="right"></td></tr>
+<tr><td><code>rsa2048</code></td><td align="right">190,945</td><td align="right">31.1</td><td align="right">112.8</td><td align="right">348.5</td><td align="right"></td></tr>
+<tr><td><code>keccak256</code></td><td align="right">239,176</td><td align="right">27.8</td><td align="right">106.0</td><td align="right">291.0</td><td align="right"></td></tr>
+<tr><td><code>anon-aadhaar</code></td><td align="right">1,115,080</td><td align="right">169.8</td><td align="right">764.7</td><td align="right">2147.0</td><td align="right"></td></tr>
 </tbody>
 </table>
 
