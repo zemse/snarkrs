@@ -46,9 +46,10 @@ impl From<CudaError> for ProveError {
 /// sticky code's reason also says the context is gone, because nothing here rebuilds it.
 pub(crate) fn fault(reason: String, e: DriverError) -> ProveError {
     if is_device_fault(e.0) {
-        let reason = match is_sticky(e.0) {
-            true => format!("{reason}; {STICKY}"),
-            false => reason,
+        let reason = if is_sticky(e.0) {
+            format!("{reason}; {STICKY}")
+        } else {
+            reason
         };
         ProveError::Device {
             backend: "cuda",
