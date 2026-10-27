@@ -209,7 +209,8 @@ const COEF_RECORD: usize = 12 + FR_BYTES;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Check {
     Full,
-    /// `Full` without the `gamma_g2 != delta_g2` refusal.
+    /// `Full` without the `gamma_g2 != delta_g2` refusal. Only the native loader takes it.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
     AllowUnblinded,
     Unchecked,
 }
