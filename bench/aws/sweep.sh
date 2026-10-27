@@ -31,8 +31,14 @@ teardown() {
   echo
   echo "================ TEARDOWN ================"
   "$HERE/terminate.sh" || true
+  revoke_ssh_ingress
 }
 trap teardown EXIT INT TERM
+
+# The sweep opens ssh once for all its lanes and revokes it after terminate.sh; a lane that
+# opened and revoked its own would cut ssh for the lanes still running.
+open_ssh_ingress "$(ensure_key_and_sg)" || exit 1
+export G16_SSH_INGRESS_HELD=1
 
 # Under `set -u`, bash 3.2 (which macOS ships) treats "${EMPTY[@]}" as an unbound
 # variable rather than as zero words, so a wave with no boxes -- which is exactly what

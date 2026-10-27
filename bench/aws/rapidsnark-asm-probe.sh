@@ -44,11 +44,12 @@ cleanup() {
       && say "confirmed terminated" || say "WARNING: run bench/aws/terminate.sh"
     say "billed about $(( ($(date +%s) - T0 + 59) / 60 )) min at \$$PRICE/hr"
   fi
+  revoke_ssh_ingress
   exit $code
 }
 trap cleanup EXIT INT TERM
 
-AMI="$(resolve_ami "$TYPE")"; SG="$(ensure_key_and_sg)"; USER_NAME="$(iam_user)"
+AMI="$(resolve_ami "$TYPE")"; SG="$(ensure_key_and_sg)"; open_ssh_ingress "$SG"; USER_NAME="$(iam_user)"
 say "arch=$ARCH ami=$AMI price=\$$PRICE/hr"
 
 UD="$(mktemp)"

@@ -79,16 +79,44 @@ ensure_key_and_sg() {
     aws_ ec2 create-key-pair --key-name "$KEY_NAME" --query KeyMaterial --output text > "$KEY_PATH"
     chmod 400 "$KEY_PATH"
   fi
-  local vpc sg myip
+  local vpc sg
   vpc="$(aws_ ec2 describe-vpcs --filters Name=isDefault,Values=true --query 'Vpcs[0].VpcId' --output text)"
   sg="$(aws_ ec2 create-security-group --group-name "$SG_NAME" --vpc-id "$vpc" \
          --description 'ssh for groth16 benchmarking' --query GroupId --output text 2>/dev/null \
        || aws_ ec2 describe-security-groups --group-names "$SG_NAME" \
          --query 'SecurityGroups[0].GroupId' --output text)"
-  myip="$(curl -s https://checkip.amazonaws.com)/32"
-  aws_ ec2 authorize-security-group-ingress --group-id "$sg" --protocol tcp --port 22 \
-    --cidr "$myip" >/dev/null 2>&1 || true
   echo "$sg"
+}
+
+# Opens tcp 22 for this machine's IPv4 /32 only, never a wider range, and remembers the rule id
+# so revoke_ssh_ingress can take it back. Call it in the parent shell, not inside $(...).
+# Two runs from one IP overlapping cannot share a rule: the second sees a duplicate and does not own it.
+# G16_SSH_INGRESS_HELD=1 means a parent (sweep.sh) owns the rule for all its lanes.
+SSH_RULE_ID=""; SSH_RULE_SG=""
+open_ssh_ingress() {  # open_ssh_ingress <sg-id>
+  [ "${G16_SSH_INGRESS_HELD:-}" = 1 ] && return 0
+  local sg="$1" ip id o
+  ip="$(curl -s --max-time 10 https://checkip.amazonaws.com || true)"
+  ip="${ip//[$' \t\r\n']/}"
+  [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || { echo "refusing to open ssh: checkip returned '$ip', not an IPv4 address" >&2; return 1; }
+  for o in ${ip//./ }; do
+    [ "$((10#$o))" -le 255 ] || { echo "refusing to open ssh: '$ip' is not an IPv4 address" >&2; return 1; }
+  done
+  id="$(aws_ ec2 authorize-security-group-ingress --group-id "$sg" --protocol tcp --port 22 \
+        --cidr "$ip/32" --query 'SecurityGroupRules[0].SecurityGroupRuleId' --output text 2>/dev/null || true)"
+  # A failed authorize is a duplicate, so the rule is not ours and stays.
+  case "$id" in sgr-*) SSH_RULE_ID="$id"; SSH_RULE_SG="$sg" ;; esac
+  return 0
+}
+
+# Always returns 0: a failed revoke must not change the caller's exit status or skip teardown.
+revoke_ssh_ingress() {
+  [ -n "$SSH_RULE_ID" ] || return 0
+  aws_ ec2 revoke-security-group-ingress --group-id "$SSH_RULE_SG" \
+      --security-group-rule-ids "$SSH_RULE_ID" >/dev/null 2>&1 \
+    || echo "WARNING: could not revoke ssh rule $SSH_RULE_ID on $SSH_RULE_SG" >&2
+  SSH_RULE_ID=""
+  return 0
 }
 
 presign() { aws_ s3 presign "s3://$BUCKET/$1" --expires-in "${2:-28800}"; }

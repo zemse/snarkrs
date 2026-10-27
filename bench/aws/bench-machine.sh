@@ -60,6 +60,7 @@ cleanup() {
     local mins=$(( ( $(date +%s) - T_LAUNCH + 59 ) / 60 ))
     say "billed about ${mins} min at \$${PRICE}/hr = \$$(python3 -c "print(f'{$mins/60*$PRICE:.2f}')")"
   fi
+  revoke_ssh_ingress
   say "exit $code"
   exit $code
 }
@@ -69,6 +70,7 @@ say "arch=$ARCH vcpu=$VCPU gpu=${GPU:-none} price=\$$PRICE/hr reps=$REPS"
 
 AMI="$(resolve_ami "$TYPE")"
 SG="$(ensure_key_and_sg)"
+open_ssh_ingress "$SG"
 USER_NAME="$(iam_user)"
 say "ami=$AMI sg=$SG"
 

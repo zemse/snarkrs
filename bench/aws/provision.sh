@@ -30,9 +30,13 @@ HOURS="${G16_AWS_HOURS:-6}"
 KEY_NAME="${G16_AWS_KEY:-g16-cuda-bench}"
 KEY_PATH="$HOME/.ssh/${KEY_NAME}.pem"
 SG_NAME="${G16_AWS_SG:-g16-cuda-bench-sg}"
+SSH_RULES="${G16_SSH_RULES:-$HOME/.cache/g16-bench/ssh-rules}"
 
 USER_NAME="$(aws sts get-caller-identity --query 'Arn' --output text | sed 's#.*/##')"
-MYIP="$(curl -s https://checkip.amazonaws.com)/32"
+MYIP="$(curl -s --max-time 10 https://checkip.amazonaws.com | tr -d '[:space:]')"
+[[ "$MYIP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || { echo "refusing to open ssh: checkip returned '$MYIP', not an IPv4 address" >&2; exit 1; }
+for o in ${MYIP//./ }; do [ "$((10#$o))" -le 255 ] || { echo "refusing to open ssh: '$MYIP' is not an IPv4 address" >&2; exit 1; }; done
+MYIP="$MYIP/32"
 echo "iam user: $USER_NAME   your ip: $MYIP   region: $REGION"
 
 # The Deep Learning Base OSS Nvidia Driver AMI ships the driver and several CUDA toolkits
@@ -60,8 +64,15 @@ SG="$(aws ec2 create-security-group --region "$REGION" --group-name "$SG_NAME" \
         --query GroupId --output text 2>/dev/null \
       || aws ec2 describe-security-groups --region "$REGION" --group-names "$SG_NAME" \
         --query 'SecurityGroups[0].GroupId' --output text)"
-aws ec2 authorize-security-group-ingress --region "$REGION" --group-id "$SG" \
-  --protocol tcp --port 22 --cidr "$MYIP" >/dev/null 2>&1 || true
+# The box outlives this script, so terminate.sh revokes the rule (recorded here) once nothing is left running.
+# A failed authorize is a duplicate, so the rule is not ours and is not recorded.
+RULE="$(aws ec2 authorize-security-group-ingress --region "$REGION" --group-id "$SG" \
+  --protocol tcp --port 22 --cidr "$MYIP" \
+  --query 'SecurityGroupRules[0].SecurityGroupRuleId' --output text 2>/dev/null || true)"
+case "$RULE" in sgr-*)
+  mkdir -p "$(dirname "$SSH_RULES")"
+  echo "$REGION $SG $RULE" >> "$SSH_RULES" ;;
+esac
 echo "sg: $SG (ssh open to $MYIP only)"
 
 UD="$(mktemp)"
