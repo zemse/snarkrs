@@ -48,14 +48,16 @@ use objc2_metal::{
     MTLComputePipelineState, MTLDevice,
 };
 use snarkrs_field::{Domain, Fr};
-use snarkrs_formats::ProvingKey;
+use snarkrs_formats::{Coefficients, Matrix, ProvingKey};
 use snarkrs_groth16::{HPoly, ProveError, StageTimings};
 
 use crate::enc::set_params;
 use crate::kernels::{FR_MSL, GATHER_MSL, NTT_MSL, POINTWISE_MSL, SEAL_MSL};
 use crate::layout::{PackedFr, PackedScalar, FR_MODULUS};
 use crate::msm::Work;
-use crate::mtl::{self, Buffer, ComputeCommandEncoderRef, ComputePipelineState, Device, Library};
+use crate::mtl::{
+    self, Buffer, ComputeCommandEncoderRef, ComputePipelineState, Device, DeviceRef, Library,
+};
 
 /// The tag on [`snarkrs_groth16::HPoly::Device`] values produced here. A handle carrying any
 /// other tag came from a different backend and must not be dereferenced as an [`HHandle`].
@@ -218,6 +220,17 @@ impl HStages {
     /// coset power table, packed once and left resident.
     pub fn prepare(&self, pk: &ProvingKey) -> Result<HResident, ProveError> {
         HResident::new(self, pk)
+    }
+
+    /// [`Self::prepare`] for CSR matrices a loader already wrote into device memory, see
+    /// [`Csr`]. The matrices are checked as `prepare` checks a key's.
+    pub(crate) fn prepare_csr(
+        &self,
+        domain_size: usize,
+        n_vars: usize,
+        csr: [Csr; 2],
+    ) -> Result<HResident, ProveError> {
+        HResident::from_csr(self, domain_size, n_vars, csr)
     }
 
     /// `data` packed into Montgomery form straight into a shared buffer, with no host
@@ -419,24 +432,143 @@ pub struct HResident {
     pool: Pool,
 }
 
+/// One CSR matrix resident in shared memory, with its shape. `row_ptr` holds
+/// `rows + 1` `u32`s, `signal` holds `nnz` of them and `value` holds `nnz` [`PackedFr`].
+/// An empty vector still has a buffer of one element.
+pub(crate) struct Csr {
+    pub(crate) row_ptr: Buffer,
+    pub(crate) signal: Buffer,
+    pub(crate) value: Buffer,
+    pub(crate) rows: usize,
+    pub(crate) nnz: usize,
+}
+
+impl Csr {
+    /// Room for a matrix of this shape, zeroed by the driver.
+    pub(crate) fn zeroed(device: &DeviceRef, rows: usize, nnz: usize) -> Result<Self, ProveError> {
+        let u32s = |n: usize| {
+            crate::alloc::bytes(&[n.max(1), 4]).and_then(|b| crate::alloc::shared(device, b))
+        };
+        let rows_plus_one = rows
+            .checked_add(1)
+            .ok_or_else(|| bad(format!("domain size {rows} overflows the CSR row count")))?;
+        Ok(Self {
+            row_ptr: u32s(rows_plus_one)?,
+            signal: u32s(nnz)?,
+            value: crate::alloc::shared(
+                device,
+                crate::alloc::bytes(&[nnz.max(1), core::mem::size_of::<PackedFr>()])?,
+            )?,
+            rows,
+            nnz,
+        })
+    }
+
+    /// The three vectors, writable from the host.
+    ///
+    /// # Safety
+    ///
+    /// No command buffer may hold any of the three buffers while the slices live, which a
+    /// fresh [`Self::zeroed`] satisfies.
+    pub(crate) unsafe fn host_mut(&mut self) -> (&mut [u32], &mut [u32], &mut [PackedFr]) {
+        (
+            core::slice::from_raw_parts_mut(
+                self.row_ptr.contents().cast::<u32>().as_ptr(),
+                self.rows + 1,
+            ),
+            core::slice::from_raw_parts_mut(
+                self.signal.contents().cast::<u32>().as_ptr(),
+                self.nnz,
+            ),
+            core::slice::from_raw_parts_mut(
+                self.value.contents().cast::<PackedFr>().as_ptr(),
+                self.nnz,
+            ),
+        )
+    }
+}
+
+fn domain_of(domain_size: usize) -> Result<Domain, ProveError> {
+    let domain = Domain::new(domain_size).map_err(|e| bad(e.to_string()))?;
+    if domain.size() != domain_size {
+        return Err(bad(format!(
+            "domain size {domain_size} is not a power of two"
+        )));
+    }
+    Ok(domain)
+}
+
 impl HResident {
     fn new(st: &HStages, pk: &ProvingKey) -> Result<Self, ProveError> {
-        let domain = Domain::new(pk.domain_size).map_err(|e| bad(e.to_string()))?;
-        if domain.size() != pk.domain_size {
-            return Err(bad(format!(
-                "domain size {} is not a power of two",
-                pk.domain_size
-            )));
-        }
+        let domain = domain_of(pk.domain_size)?;
+        pk.coeffs
+            .check_structure(domain.size(), pk.n_vars)
+            .map_err(|e| bad(e.to_string()))?;
+        let row_ptr = [
+            st.buf_u32(&pk.coeffs.row_ptr[0])?,
+            st.buf_u32(&pk.coeffs.row_ptr[1])?,
+        ];
+        let signal = [
+            st.buf_u32(&pk.coeffs.signal[0])?,
+            st.buf_u32(&pk.coeffs.signal[1])?,
+        ];
+        let value = [st.buf(&pk.coeffs.value[0])?, st.buf(&pk.coeffs.value[1])?];
+        Self::with_csr(st, domain, pk.n_vars, row_ptr, signal, value)
+    }
 
+    fn from_csr(
+        st: &HStages,
+        domain_size: usize,
+        n_vars: usize,
+        csr: [Csr; 2],
+    ) -> Result<Self, ProveError> {
+        let domain = domain_of(domain_size)?;
+        for (matrix, c) in Matrix::BOTH.into_iter().zip(&csr) {
+            if c.rows != domain.size() {
+                return Err(bad(format!(
+                    "matrix {} has {} rows, domain size is {}",
+                    matrix.name(),
+                    c.rows,
+                    domain.size()
+                )));
+            }
+            // SAFETY: each buffer holds what `Csr` says it does, and no command buffer has
+            // been encoded against any of them yet.
+            let (rp, sig) = unsafe {
+                (
+                    core::slice::from_raw_parts(
+                        c.row_ptr.contents().cast::<u32>().as_ptr(),
+                        c.rows + 1,
+                    ),
+                    core::slice::from_raw_parts(c.signal.contents().cast::<u32>().as_ptr(), c.nnz),
+                )
+            };
+            Coefficients::check_matrix(matrix, rp, sig, c.nnz, domain.size(), n_vars)
+                .map_err(|e| bad(e.to_string()))?;
+        }
+        let [a, b] = csr;
+        Self::with_csr(
+            st,
+            domain,
+            n_vars,
+            [a.row_ptr, b.row_ptr],
+            [a.signal, b.signal],
+            [a.value, b.value],
+        )
+    }
+
+    fn with_csr(
+        st: &HStages,
+        domain: Domain,
+        n_vars: usize,
+        row_ptr: [Buffer; 2],
+        signal: [Buffer; 2],
+        value: [Buffer; 2],
+    ) -> Result<Self, ProveError> {
         // See `Domain::proving_coset_shift` for why this shift and not another.
         let coset_shift = domain
             .proving_coset_shift()
             .map_err(|e| bad(format!("no 2n-th root of unity: {e}")))?;
-
-        pk.coeffs
-            .check_structure(domain.size(), pk.n_vars)
-            .map_err(|e| bad(e.to_string()))?;
 
         // shift^j for j in [0, n). Not the twiddles: the twiddles are powers of the
         // domain's own root of unity and this is a primitive 2n-th root, so it is a table
@@ -453,17 +585,11 @@ impl HResident {
         let coset_pows = table(pows)?;
 
         Ok(Self {
-            n_vars: pk.n_vars,
+            n_vars,
             batches: split_passes(domain.log_size(), st.max_fused),
-            row_ptr: [
-                st.buf_u32(&pk.coeffs.row_ptr[0])?,
-                st.buf_u32(&pk.coeffs.row_ptr[1])?,
-            ],
-            signal: [
-                st.buf_u32(&pk.coeffs.signal[0])?,
-                st.buf_u32(&pk.coeffs.signal[1])?,
-            ],
-            value: [st.buf(&pk.coeffs.value[0])?, st.buf(&pk.coeffs.value[1])?],
+            row_ptr,
+            signal,
+            value,
             tw_fwd,
             tw_inv,
             coset_pows,

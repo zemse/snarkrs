@@ -7,7 +7,9 @@ use std::sync::Arc;
 
 use snarkrs_groth16::ProveError;
 
-use crate::mtl::Buffer;
+use crate::layout::PackedG1Affine;
+use crate::mtl::{Buffer, DeviceRef};
+use objc2_metal::MTLBuffer;
 
 use super::window::{window_size_for, Work, RECODE_BITS};
 
@@ -38,6 +40,32 @@ impl G1Bases {
     }
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// Room for `n` bases, all at infinity, for a caller that fills it in place through
+    /// [`Self::host_mut`]. Empty still gets one base's worth, since a zero-length
+    /// `MTLBuffer` is not a valid allocation.
+    pub(crate) fn zeroed(device: &DeviceRef, n: usize) -> Result<Self, ProveError> {
+        let bytes = crate::alloc::bytes(&[n.max(1), core::mem::size_of::<PackedG1Affine>()])?;
+        Ok(Self {
+            buf: crate::alloc::shared(device, bytes)?,
+            len: n,
+            inf: vec![true; n],
+        })
+    }
+
+    /// The bases and their infinity flags, writable from the host.
+    ///
+    /// # Safety
+    ///
+    /// No command buffer may hold the buffer while the slice lives. A fresh one from
+    /// [`Self::zeroed`] that has not been handed to an MSM satisfies that.
+    pub(crate) unsafe fn host_mut(&mut self) -> (&mut [PackedG1Affine], &mut [bool]) {
+        let points = core::slice::from_raw_parts_mut(
+            self.buf.contents().cast::<PackedG1Affine>().as_ptr(),
+            self.len,
+        );
+        (points, &mut self.inf)
     }
 }
 

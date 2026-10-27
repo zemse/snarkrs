@@ -31,14 +31,16 @@
 //! GPU still runs every other stage, so the proof's time is still the GPU's. See
 //! [`g2_on_cpu`].
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
 use snarkrs_field::{Fr, G1Projective, G2Affine, G2Projective};
-use snarkrs_formats::{Coefficients, ProvingKey};
+use snarkrs_formats::{Coefficients, ProvingKey, ZkeyError};
 use snarkrs_groth16::{Backend, HPoly, MsmOutputs, PreparedCircuit, ProveError, StageTimings};
 use snarkrs_msm::{CpuMsm, MsmBackend};
 
+use crate::load::DeviceSink;
 use crate::msm::{G1Bases, G2Bases, Job, JobG1, JobG2, MetalMsm, ScalarBuf, Work};
 use crate::mtl::{self, Device};
 use crate::stages::{HHandle, HResident, HStages};
@@ -147,6 +149,60 @@ impl MetalBackend {
     pub fn device(&self) -> &Device {
         self.stages.device()
     }
+
+    /// [`ProvingKey::load`] and [`Backend::prepare`] as one pass: the G1 query sections and
+    /// both CSR matrices are decoded and validated straight into their shared buffers, so
+    /// none of them is ever an arkworks vector. Every check `load` makes still runs, the
+    /// per-point curve checks and the `gamma_g2 != delta_g2` refusal included, and the
+    /// circuit is the one `prepare` would build from the same file.
+    ///
+    /// On keccak_2048 (1.5M constraints, a 1.1 GB key) the two calls took 219 and 113 ms;
+    /// what this skips is the vectors' writes to fresh pages and the serial repack of
+    /// each into its buffer.
+    pub fn load(&self, path: &Path) -> Result<MetalCircuit, LoadError> {
+        self.load_with(path, false)
+    }
+
+    /// [`Self::load`] through [`ProvingKey::load_allowing_unblinded`]. Benchmark only, for
+    /// the reason given there.
+    pub fn load_allowing_unblinded(&self, path: &Path) -> Result<MetalCircuit, LoadError> {
+        self.load_with(path, true)
+    }
+
+    fn load_with(&self, path: &Path, allow_unblinded: bool) -> Result<MetalCircuit, LoadError> {
+        let mut sink = DeviceSink::new(self.device());
+        let loaded = if allow_unblinded {
+            ProvingKey::load_allowing_unblinded_into(path, &mut sink)
+        } else {
+            ProvingKey::load_into(path, &mut sink)
+        };
+        let pk = match loaded {
+            Ok(pk) => pk,
+            Err(e) => {
+                return Err(sink
+                    .failed
+                    .take()
+                    .map_or(LoadError::Key(e), LoadError::Prove))
+            }
+        };
+        Ok(MetalCircuit::from_sink(
+            self.stages.clone(),
+            self.msm.clone(),
+            pk,
+            sink,
+            self.work,
+        )?)
+    }
+}
+
+/// Why [`MetalBackend::load`] failed: the file is not a key it accepts, or the device
+/// could not take it.
+#[derive(Debug, thiserror::Error)]
+pub enum LoadError {
+    #[error(transparent)]
+    Key(#[from] ZkeyError),
+    #[error(transparent)]
+    Prove(#[from] ProveError),
 }
 
 impl Backend for MetalBackend {
@@ -277,25 +333,96 @@ impl MetalCircuit {
         };
         let a_bases = g1(std::mem::take(&mut pk.a_query))?;
         let b_g1_bases = g1(std::mem::take(&mut pk.b_g1_query))?;
-        let b_g2 = {
-            let v = std::mem::take(&mut pk.b_g2_query);
-            if g2_on_cpu(&v, pk.domain_size, work) {
-                let pool = rayon::ThreadPoolBuilder::new()
-                    .num_threads(rayon::current_num_threads())
-                    .thread_name(|i| format!("metal-g2-{i}"))
-                    .build()
-                    .map_err(|e| bad(format!("stage 6 thread pool: {e}")))?;
-                BG2::Cpu { bases: v, pool }
-            } else {
-                let bases = msm.upload_g2_bases(&v);
-                snarkrs_groth16::malloc::release(v);
-                BG2::Gpu(bases?)
-            }
-        };
+        let b_g2 = BG2::new(
+            &msm,
+            std::mem::take(&mut pk.b_g2_query),
+            pk.domain_size,
+            work,
+        )?;
         let l_bases = g1(std::mem::take(&mut pk.l_query))?;
         let h_bases = g1(std::mem::take(&mut pk.h_query))?;
         let bases_us = t1.elapsed().as_micros() as u64;
 
+        Ok(Self::finish(
+            pk,
+            stages,
+            msm,
+            resident,
+            [a_bases, b_g1_bases, l_bases, h_bases],
+            b_g2,
+            (stages_us, bases_us, t_all),
+            work,
+        ))
+    }
+
+    /// [`Self::new`] for a key [`MetalBackend::load`] decoded into `sink`: the G1 bases and
+    /// both CSR matrices are already in their buffers, so what is left is the twiddle and
+    /// coset tables, the G2 bases, and the same shape checks.
+    fn from_sink(
+        stages: Arc<HStages>,
+        msm: Arc<MetalMsm>,
+        mut pk: ProvingKey,
+        sink: DeviceSink<'_>,
+        work: Work,
+    ) -> Result<Self, ProveError> {
+        let n_vars = pk.n_vars;
+        let [Some(a), Some(b1), Some(l), Some(h)] = sink.g1 else {
+            return Err(bad(
+                "the loader did not hand every G1 query section to the sink",
+            ));
+        };
+        let csr = sink
+            .csr
+            .ok_or_else(|| bad("the loader did not hand section 4 to the sink"))?;
+        let want_l = n_vars
+            .checked_sub(pk.n_public + 1)
+            .ok_or_else(|| bad(format!("n_public {} exceeds n_vars {n_vars}", pk.n_public)))?;
+        for (name, got, want) in [
+            ("a_query", a.len(), n_vars),
+            ("b_g1_query", b1.len(), n_vars),
+            ("b_g2_query", pk.b_g2_query.len(), n_vars),
+            ("l_query", l.len(), want_l),
+            ("h_query", h.len(), pk.domain_size),
+        ] {
+            if got != want {
+                return Err(bad(format!("{name} has {got} bases, want {want}")));
+            }
+        }
+
+        let t_all = Instant::now();
+        let resident = stages.prepare_csr(pk.domain_size, n_vars, csr)?;
+        let stages_us = t_all.elapsed().as_micros() as u64;
+        let t1 = Instant::now();
+        let b_g2 = BG2::new(
+            &msm,
+            std::mem::take(&mut pk.b_g2_query),
+            pk.domain_size,
+            work,
+        )?;
+        let bases_us = t1.elapsed().as_micros() as u64;
+        Ok(Self::finish(
+            pk,
+            stages,
+            msm,
+            resident,
+            [a, b1, l, h],
+            b_g2,
+            (stages_us, bases_us, t_all),
+            work,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish(
+        pk: ProvingKey,
+        stages: Arc<HStages>,
+        msm: Arc<MetalMsm>,
+        resident: HResident,
+        [a_bases, b_g1_bases, l_bases, h_bases]: [G1Bases; 4],
+        b_g2: BG2,
+        (stages_us, bases_us, t_all): (u64, u64, Instant),
+        work: Work,
+    ) -> Self {
         let cost = PrepareCost {
             stages_us,
             bases_us,
@@ -303,12 +430,12 @@ impl MetalCircuit {
         };
         if std::env::var_os("G16_METAL_PREPARE").is_some() {
             eprintln!(
-                "metal prepare: stages {} us, bases {} us, total {} us (domain {}, n_vars {n_vars})",
-                cost.stages_us, cost.bases_us, cost.total_us, pk.domain_size,
+                "metal prepare: stages {} us, bases {} us, total {} us (domain {}, n_vars {})",
+                cost.stages_us, cost.bases_us, cost.total_us, pk.domain_size, pk.n_vars,
             );
         }
 
-        Ok(Self {
+        Self {
             pk,
             stages,
             msm,
@@ -320,7 +447,7 @@ impl MetalCircuit {
             h_bases,
             cost,
             work,
-        })
+        }
     }
 
     /// What [`MetalBackend::prepare`] cost for this key.
@@ -520,6 +647,29 @@ enum BG2 {
         bases: Vec<G2Affine>,
         pool: rayon::ThreadPool,
     },
+}
+
+impl BG2 {
+    /// Where stage 6 runs for this key, see [`g2_on_cpu`], with the bases put there.
+    fn new(
+        msm: &MetalMsm,
+        v: Vec<G2Affine>,
+        domain_size: usize,
+        work: Work,
+    ) -> Result<Self, ProveError> {
+        if g2_on_cpu(&v, domain_size, work) {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(rayon::current_num_threads())
+                .thread_name(|i| format!("metal-g2-{i}"))
+                .build()
+                .map_err(|e| bad(format!("stage 6 thread pool: {e}")))?;
+            Ok(BG2::Cpu { bases: v, pool })
+        } else {
+            let bases = msm.upload_g2_bases(&v);
+            snarkrs_groth16::malloc::release(v);
+            Ok(BG2::Gpu(bases?))
+        }
+    }
 }
 
 /// Whether stage 6 runs on the CPU, on a pool of its own, while the GPU runs stages 5, 7,
