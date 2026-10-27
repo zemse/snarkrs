@@ -131,9 +131,10 @@ establish current readiness.
   `feat` for the backend. Do not put `metal` into `acceleration` or reuse a zkVM value to
   imply GPU support. Agree GPU reporting with upstream before submitting; no schema
   acceptance is established here.
-* **Independent verification is opt-in.** With `SNARKJS_VERIFY=1`, `csp-bench.sh` fails
-  up front if `snarkjs` is not on PATH, runs `snarkrs-csp artifacts` for the selected
-  variants, then passes `--snarkjs` to `bench`. Each variant's warm-up proof is written
+* **Independent verification is opt-in.** With `SNARKJS_VERIFY=1`, `csp-bench.sh` uses
+  `$SNARKJS` if set, else a snarkjs 0.7.6 already in the npx cache, else the one on PATH,
+  prints which, and fails up front if there is none. It then runs `snarkrs-csp
+  artifacts` for the selected variants and passes `--snarkjs` to `bench`. Each variant's warm-up proof is written
   as snarkjs JSON and checked with `snarkjs groth16 verify` against that variant's
   `public.json` and a vkey that `snarkjs zkey export verificationkey` reads from the zkey
   itself, after our own verifier and before any timed iteration. A missing snarkjs, a

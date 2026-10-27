@@ -59,20 +59,32 @@ fi
 
 ORACLE=()
 if [ -n "$SNARKJS_VERIFY" ]; then
-  if ! SNARKJS="$(command -v snarkjs)"; then
-    echo "SNARKJS_VERIFY is set but snarkjs is not on PATH" >&2
+  # $SNARKJS, then the snarkjs 0.7.6 the repo's other checks use if the npx cache already
+  # holds it (this never downloads one), then whatever is on PATH, which may be older.
+  if [ -z "${SNARKJS:-}" ]; then
+    for pkg in "${npm_config_cache:-$HOME/.npm}"/_npx/*/node_modules/snarkjs/package.json; do
+      if [ -f "$pkg" ] && grep -q '"version": "0.7.6"' "$pkg"; then
+        SNARKJS="$(dirname "$(dirname "$pkg")")/.bin/snarkjs"
+        break
+      fi
+    done
+  fi
+  if ! SNARKJS="$(command -v "${SNARKJS:-snarkjs}")"; then
+    echo "SNARKJS_VERIFY is set but there is no snarkjs: set SNARKJS or put one on PATH" >&2
     exit 1
   fi
+  echo "snarkjs: $SNARKJS ($("$SNARKJS" --version 2>/dev/null | head -n 1 || true))"
   ORACLE=(--snarkjs "$SNARKJS")
 fi
 
 echo "=== building snarkrs-csp (features: $FEATURES) ==="
 ( cd bench/csp && cargo build --release ${FEATURES:+--features "$FEATURES"} )
 
-# The vkey and public signals snarkjs checks against, regenerated so they match this build.
+# The public signals snarkjs checks against, regenerated so they match this build. The
+# vkey it checks with is not this one: `bench` has snarkjs export it from the zkey.
 if [ -n "$SNARKJS_VERIFY" ]; then
   echo
-  echo "=== vkey.json and public.json for the snarkjs check ==="
+  echo "=== public.json for the snarkjs check ==="
   "$CSP_BIN" artifacts ${SELECT[@]+"${SELECT[@]}"} ${ALLOW[@]+"${ALLOW[@]}"} \
     | grep --line-buffered -v -e '^Generating witness' -e 'allocating and retrying'
 fi
