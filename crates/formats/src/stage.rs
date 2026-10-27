@@ -11,10 +11,11 @@
 //! unchanged; cleanup is best effort and never replaces the primary error.
 //!
 //! The stage is fsynced before the rename and, on Unix, the directory after it. That
-//! gives atomic visibility to other readers, not crash durability: macOS `fsync` does not
-//! flush the drive cache (`F_FULLFSYNC` would), a failed directory sync is ignored because
-//! the destination is already replaced by then, and nothing here checks what the
-//! operation wrote. It assumes a trusted output directory, not adversarial path
+//! gives atomic visibility to other readers, not crash durability: on macOS these are
+//! plain `fsync(2)`, which does not flush the drive cache (`F_FULLFSYNC` would, at about
+//! 4 ms a call, and is what `File::sync_all` does there), so power loss can still lose
+//! the output. A failed directory sync is ignored because the destination is already
+//! replaced by then, and nothing here checks what the operation wrote. It assumes a trusted output directory, not adversarial path
 //! replacement.
 //!
 //! The operation writes only to the stage, so an output that is also one of its inputs
@@ -34,6 +35,23 @@ use std::fs::File;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Plain `fsync(2)`. Rust's `File::sync_all` is `F_FULLFSYNC` on Apple targets.
+#[cfg(target_vendor = "apple")]
+fn sync(file: &File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: `fsync` takes only a file descriptor, and `file` keeps it open for the call.
+    if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn sync(file: &File) -> std::io::Result<()> {
+    file.sync_all()
+}
 
 /// Run `operation` on one stage per destination, in order, then rename every stage over
 /// its destination. New files and in-progress stages are 0600 on Unix and platform
@@ -142,7 +160,7 @@ fn staged_all_with_counter<T, E: From<std::io::Error>>(
         if let Some(permissions) = &p.permissions {
             std::fs::set_permissions(path, permissions.clone())?;
         }
-        File::open(path)?.sync_all()?;
+        sync(&File::open(path)?)?;
     }
     for (p, path) in pending.iter_mut().zip(&paths) {
         std::fs::rename(path, &p.destination)?;
@@ -154,7 +172,7 @@ fn staged_all_with_counter<T, E: From<std::io::Error>>(
             continue;
         }
         if let Ok(dir) = File::open(&p.parent) {
-            let _ = dir.sync_all();
+            let _ = sync(&dir);
         }
     }
     Ok(result)
