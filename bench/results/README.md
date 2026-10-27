@@ -274,7 +274,8 @@ Cold, same circuit:
 > re-measurement at `72b3946` (2026-10-27), same harness and reps: warm at 140,261
 > constraints is rapidsnark 553.8 ms, ours CPU 258.6 ms, Metal **69.4 ms**, 7.99x; cold is
 > 572.8, 316.3 and **164.5 ms**, 3.48x. rapidsnark moved by under 3%, so the change is ours.
-> The T4 has not been re-run, so the comparisons on this page stay on the August numbers.
+> The T4's joinsplit ladder has not been re-run, so the comparisons on this page stay on the
+> August numbers.
 
 ## The ratio trap, which is the most important thing on this page
 
