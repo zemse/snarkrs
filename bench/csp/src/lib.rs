@@ -125,12 +125,28 @@ impl Variant {
 
 /// Which prover to measure. `wgpu` is absent on purpose: it is the browser backend and
 /// this benchmark is a native one.
+///
+/// `Auto` is a row policy, not a backend: per variant it runs the CPU below
+/// [`AUTO_METAL_FROM`] constraints and Metal at or above, and each cell names the one it
+/// ran. `Cpu` and `Metal` stay exactly what they say.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum Backend {
     Cpu,
     Metal,
     Cuda,
+    Auto,
 }
+
+/// `auto` runs Metal from this many constraints up and the CPU below.
+///
+/// From the M2 Max runs in `bench/results/csp/README.md`: the CPU was faster at 53,048
+/// constraints (`sha256_128`, 47.36 ms against 49.73) and at all five poseidon sizes,
+/// 517 to 2,092, and Metal was faster from 89,224 (`sha256_256`, 65.63 ms against 87.02)
+/// on every larger variant. Nothing between those two was measured. A straight line
+/// through them crosses near 56,700; 2^16 sits above that, so a circuit in the gap goes
+/// to the CPU, which has no fixed per-proof cost to lose. Another machine has another
+/// crossover.
+pub const AUTO_METAL_FROM: usize = 1 << 16;
 
 impl Backend {
     pub fn as_str(self) -> &'static str {
@@ -138,6 +154,17 @@ impl Backend {
             Backend::Cpu => "cpu",
             Backend::Metal => "metal",
             Backend::Cuda => "cuda",
+            Backend::Auto => "auto",
+        }
+    }
+
+    /// The backend that proves a circuit of `n_constraints`: `Auto` picks by
+    /// [`AUTO_METAL_FROM`], any other backend is itself.
+    pub fn resolve(self, n_constraints: usize) -> Backend {
+        match self {
+            Backend::Auto if n_constraints >= AUTO_METAL_FROM => Backend::Metal,
+            Backend::Auto => Backend::Cpu,
+            b => b,
         }
     }
 }
@@ -162,13 +189,17 @@ impl Prover {
         }
     }
 
-    /// The `feat` column: which backend, for us; nothing for rapidsnark, which has one.
-    /// A key loaded under [`KeyPolicy::Unblinded`] adds `unblinded`, so the row, its file
-    /// name and its breakdown all carry it.
-    pub fn feat(&self, key: KeyPolicy) -> Option<String> {
+    /// The `feat` column for a circuit of `n_constraints`: which backend, for us; nothing
+    /// for rapidsnark, which has one. Under `auto` it is `auto-` and the backend that ran,
+    /// so each cell names its own. A key loaded under [`KeyPolicy::Unblinded`] adds
+    /// `unblinded`, so the row, its file name and its breakdown all carry it.
+    pub fn feat(&self, n_constraints: usize, key: KeyPolicy) -> Option<String> {
         let mut parts = Vec::new();
         if let Prover::G16(b) = self {
-            parts.push(b.as_str());
+            if *b == Backend::Auto {
+                parts.push(b.as_str());
+            }
+            parts.push(b.resolve(n_constraints).as_str());
         }
         if key == KeyPolicy::Unblinded {
             parts.push("unblinded");
@@ -176,8 +207,8 @@ impl Prover {
         (!parts.is_empty()).then(|| parts.join("-"))
     }
 
-    pub fn label(&self, key: KeyPolicy) -> String {
-        match self.feat(key) {
+    pub fn label(&self, n_constraints: usize, key: KeyPolicy) -> String {
+        match self.feat(n_constraints, key) {
             Some(f) => format!("{}/{f}", self.system()),
             None => self.system().to_string(),
         }
@@ -251,9 +282,11 @@ impl KeyPolicy {
 }
 
 /// Refuses rather than falling back. A row that silently measured the CPU while labelled
-/// `metal` is worse than no row.
+/// `metal` is worse than no row. So `auto` that resolves to Metal in a build without it
+/// is an error too, not a CPU cell.
 pub fn make_backend(kind: Backend) -> anyhow::Result<Box<dyn snarkrs_groth16::Backend>> {
     match kind {
+        Backend::Auto => anyhow::bail!("`auto` is resolved per circuit before a backend is made"),
         Backend::Cpu => Ok(Box::new(snarkrs_groth16::cpu::CpuBackend::new())),
         #[cfg(feature = "metal")]
         Backend::Metal => Ok(Box::new(snarkrs_metal::MetalBackend::new()?)),

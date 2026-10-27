@@ -103,6 +103,9 @@ pub fn filename(target: &str, input_size: usize, system: &str, feat: Option<&str
 pub struct Breakdown {
     pub variant: String,
     pub backend: String,
+    /// The constraint count from which `--backend auto` runs Metal, on an `auto` cell.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_metal_from: Option<usize>,
     /// The key had `gamma_g2 == delta_g2` and was loaded under `--allow-unblinded-zkey`.
     /// Anyone can forge a proof against such a key.
     pub unblinded_zkey: bool,

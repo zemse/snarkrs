@@ -4,6 +4,7 @@
 #   bench/scripts/csp-fetch.sh              # once: zkeys + circuit sources
 #   bench/scripts/csp-bench.sh              # every backend this build has
 #   bench/scripts/csp-bench.sh --backend cpu --reps 5
+#   bench/scripts/csp-bench.sh --backend auto       # cpu below 2^16 constraints, metal above
 #   bench/scripts/csp-bench.sh --target sha256 --input-size 128
 #   SNARKJS_VERIFY=1 bench/scripts/csp-bench.sh     # also check proofs with snarkjs
 #   G16_CSP_ALLOW_UNBLINDED=1 bench/scripts/csp-bench.sh --target poseidon
@@ -43,7 +44,7 @@ while [ $# -gt 0 ]; do
     --features)  FEATURES="$2"; shift 2 ;;
     --target)     SELECT+=(--target "$2"); shift 2 ;;
     --input-size) SELECT+=(--input-size "$2"); shift 2 ;;
-    -h|--help)   sed -n '2,17p' "$0"; exit 0 ;;
+    -h|--help)   sed -n '2,18p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done

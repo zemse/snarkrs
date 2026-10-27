@@ -283,12 +283,16 @@ pub fn variant(variant: Variant, cfg: &Config) -> Result<(Metrics, Breakdown)> {
         );
     }
     let n_constraints = num_constraints(&pk);
+    let prover = match &cfg.prover {
+        Prover::G16(b) => Prover::G16(b.resolve(n_constraints)),
+        p => p.clone(),
+    };
     let reload = || crate::load_key(&zkey, key == KeyPolicy::Unblinded).map(|(pk, _)| pk);
 
     // Warm-up. Its proof is the one that gets verified and measured for size, so a
     // variant whose proof does not verify fails before any timing is reported rather
     // than after.
-    let (_, proof, public) = proof_iteration(variant, input_json.clone(), &zkey, &cfg.prover, key)?;
+    let (_, proof, public) = proof_iteration(variant, input_json.clone(), &zkey, &prover, key)?;
     key.verify(&pk.vk, &public, &proof)
         .with_context(|| format!("{}: our own verifier rejected the proof", variant.name()))?;
     if let Some(snarkjs) = cfg.snarkjs {
@@ -300,7 +304,7 @@ pub fn variant(variant: Variant, cfg: &Config) -> Result<(Metrics, Breakdown)> {
 
     let mut splits = Vec::with_capacity(cfg.reps);
     for _ in 0..cfg.reps {
-        let (split, _, _) = proof_iteration(variant, input_json.clone(), &zkey, &cfg.prover, key)?;
+        let (split, _, _) = proof_iteration(variant, input_json.clone(), &zkey, &prover, key)?;
         splits.push(split);
     }
 
@@ -330,7 +334,7 @@ pub fn variant(variant: Variant, cfg: &Config) -> Result<(Metrics, Breakdown)> {
 
     let row = Metrics {
         name: cfg.prover.system().to_string(),
-        feat: cfg.prover.feat(key),
+        feat: cfg.prover.feat(n_constraints, key),
         target: variant.target.as_str().to_string(),
         input_size: variant.input_size,
         proof_duration: mean(&totals),
@@ -342,7 +346,7 @@ pub fn variant(variant: Variant, cfg: &Config) -> Result<(Metrics, Breakdown)> {
         // rapidsnark's peak is not ours to measure through `snarkrs-csp-mem`, which links
         // our prover. Left at the collector's 0 marker rather than reported as a number
         // that came from the wrong process.
-        peak_memory: match (&cfg.prover, cfg.mem_reps) {
+        peak_memory: match (&prover, cfg.mem_reps) {
             (_, 0) | (Prover::Rapidsnark(_), _) => 0,
             (Prover::G16(backend), reps) => {
                 crate::mem::sample(cfg.mem_bin, variant, *backend, key, cfg.artifacts, reps)?
@@ -354,7 +358,9 @@ pub fn variant(variant: Variant, cfg: &Config) -> Result<(Metrics, Breakdown)> {
 
     let breakdown = Breakdown {
         variant: variant.name(),
-        backend: cfg.prover.label(key),
+        backend: cfg.prover.label(n_constraints, key),
+        auto_metal_from: matches!(cfg.prover, Prover::G16(crate::Backend::Auto))
+            .then_some(crate::AUTO_METAL_FROM),
         unblinded_zkey: key == KeyPolicy::Unblinded,
         reps: cfg.reps,
         witness_ms: ms(avg(|s| s.witness)),

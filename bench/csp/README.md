@@ -111,12 +111,21 @@ establish current readiness.
   has `unblinded` in `feat` (`cpu-unblinded`, so in its file name too),
   `unblinded_zkey: true` in the breakdown, and the run prints a warning per variant. The
   exception exists to time these benchmark keys; such a key is not fit for anything else.
-* **Backend selection is explicit.** CPU and Metal are separate runs, with `feat: cpu`
-  or `feat: metal` and `backend: g16/cpu` or `backend: g16/metal` in the breakdown.
-  `make_backend` refuses unavailable backends rather than falling back. Small-circuit
-  CPU wins do not justify labelling a mixed CPU/Metal row as Metal. There is no automatic
-  fastest-backend selector; any combined submission needs an agreed per-cell policy and
-  actual backend labels.
+* **Backend selection is explicit.** `--backend cpu` and `--backend metal` are separate
+  runs, with `feat: cpu` or `feat: metal` and `backend: g16/cpu` or `backend: g16/metal`
+  in the breakdown, and neither ever falls back to the other: `make_backend` refuses an
+  unavailable backend. `--backend auto` is the mixed row policy. Metal loses to the CPU
+  on every poseidon size, because its fixed prepare and prove cost is larger than the
+  whole CPU proof there, so `auto` runs the CPU below `AUTO_METAL_FROM` constraints
+  (65,536) and Metal at or above. The threshold comes from the M2 Max runs in
+  `bench/results/csp`: the CPU won at 53,048 constraints and below, Metal at 89,224 and
+  above, and nothing in between was measured, so 2^16 is a conservative pick inside
+  that gap rather than a measured crossover; `lib.rs` has the numbers. Each cell names
+  the backend it ran: `feat: auto-cpu` or `feat: auto-metal`, the same in the
+  breakdown's `backend`, plus `auto_metal_from`. An `auto` cell that needs Metal in a
+  build without it fails rather than running the CPU. `csp_report.py` prints an `auto`
+  run as one table with a backend column. Any submission of a mixed row still needs the
+  upstream schema question below settled.
 * **GPU metadata needs agreement.** The checked-out upstream schema's `acceleration`
   enum has `precompile` and `inline`, not GPU backends. Our rows omit that field and use
   `feat` for the backend. Do not put `metal` into `acceleration` or reuse a zkVM value to

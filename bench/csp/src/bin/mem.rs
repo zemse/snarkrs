@@ -39,7 +39,8 @@ fn main() -> Result<()> {
     let wtns = circuits::witness(v, inputs::json(v.target, v.input_size))?;
     let (pk, key) = snarkrs_csp::load_key(&v.zkey(&args.artifacts), args.allow_unblinded_zkey)?;
     let witness = Witness::from_bytes(wtns)?.0;
-    let circuit = snarkrs_csp::make_backend(args.backend)?.prepare(pk)?;
+    let backend = args.backend.resolve(snarkrs_csp::run::num_constraints(&pk));
+    let circuit = snarkrs_csp::make_backend(backend)?.prepare(pk)?;
     let proof = key.prove(
         circuit.as_ref(),
         &witness,

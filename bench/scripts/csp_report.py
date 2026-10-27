@@ -20,10 +20,18 @@ ORDER = {"poseidon": 0, "sha256": 1, "keccak": 2, "ecdsa": 3}
 
 
 def load_ours(metrics_dir):
+    """Rows by `name/feat`, each cell with the backend that ran it under `auto`.
+
+    An `auto` cell's feat is `auto-<backend>`, so the group drops the backend and the
+    cell keeps it. rapidsnark rows have no feat and are their own group.
+    """
     rows = {}
     for path in sorted(pathlib.Path(metrics_dir).glob("*_metrics.json")):
         r = json.loads(path.read_text())
-        rows.setdefault(r.get("feat") or "cpu", {})[(r["target"], r["input_size"])] = r
+        parts = r["feat"].split("-") if r.get("feat") else []
+        used = parts.pop(1) if parts[:1] == ["auto"] and len(parts) > 1 else None
+        group = "/".join([r["name"]] + (["-".join(parts)] if parts else []))
+        rows.setdefault(group, {})[(r["target"], r["input_size"])] = (r, used)
     return rows
 
 
@@ -49,44 +57,54 @@ def main():
     print(f"published circom: {published['_host']}")
     print(f"  {published['_caveat']}\n")
 
-    for backend, rows in sorted(ours.items()):
-        print(f"=== g16 / {backend} ===")
+    for group, rows in sorted(ours.items()):
+        print(f"=== {group} ===")
+        if "unblinded" in group:
+            print(
+                "  keys with gamma_g2 == delta_g2, timed under G16_CSP_ALLOW_UNBLINDED:"
+                " anyone can forge a proof against them"
+            )
+        auto = any(used for _, used in rows.values())
         head = (
             f"{'variant':<15}{'constraints':>12}{'ours ms':>10}{'circom ms':>11}"
             f"{'speedup':>9}{'their nc':>11}{'ours ms/Mc':>12}{'circom ms/Mc':>14}"
             f"{'ours MB':>9}{'circom MB':>11}"
         )
-        print(head)
+        print(head + (f"{'backend':>9}" if auto else ""))
         for key in sorted(rows, key=lambda k: (ORDER.get(k[0], 9), k[1])):
-            o = rows[key]
+            o, used = rows[key]
+            tail = f"{used or '-':>9}" if auto else ""
             t = theirs.get(key)
             name = f"{key[0]}_{key[1]}"
             o_ms, o_nc = ms(o["proof_duration"]), o["num_constraints"]
             o_rate = o_ms / (o_nc / 1e6)
             o_mb = o["peak_memory"] / 1e6
             if not t:
-                print(f"{name:<15}{o_nc:>12}{o_ms:>10.1f}{'-':>11}{'-':>9}{'-':>11}{o_rate:>12.1f}{'-':>14}{o_mb:>9.0f}{'-':>11}")
+                print(f"{name:<15}{o_nc:>12}{o_ms:>10.1f}{'-':>11}{'-':>9}{'-':>11}{o_rate:>12.1f}{'-':>14}{o_mb:>9.0f}{'-':>11}{tail}")
                 continue
             t_ms, t_nc = ms(t["proof_duration"]), t["num_constraints"]
             t_rate = t_ms / (t_nc / 1e6)
             print(
                 f"{name:<15}{o_nc:>12}{o_ms:>10.1f}{t_ms:>11.1f}{t_ms / o_ms:>8.2f}x"
                 f"{t_nc:>11}{o_rate:>12.1f}{t_rate:>14.1f}"
-                f"{o_mb:>9.0f}{t['peak_memory'] / 1e6:>11.0f}"
+                f"{o_mb:>9.0f}{t['peak_memory'] / 1e6:>11.0f}{tail}"
             )
         print()
 
     if len(ours) > 1:
-        print("=== our backends against each other (proving time, ms) ===")
+        print("=== our rows against each other (proving time, ms) ===")
         names = sorted(ours)
+        width = {n: max(10, len(n) + 2) for n in names}
         keys = sorted(
             set().union(*(set(v) for v in ours.values())),
             key=lambda k: (ORDER.get(k[0], 9), k[1]),
         )
-        print(f"{'variant':<15}" + "".join(f"{n:>10}" for n in names))
+        print(f"{'variant':<15}" + "".join(f"{n:>{width[n]}}" for n in names))
         for key in keys:
             cells = "".join(
-                f"{ms(ours[n][key]['proof_duration']):>10.1f}" if key in ours[n] else f"{'-':>10}"
+                f"{ms(ours[n][key][0]['proof_duration']):>{width[n]}.1f}"
+                if key in ours[n]
+                else f"{'-':>{width[n]}}"
                 for n in names
             )
             print(f"{key[0] + '_' + str(key[1]):<15}{cells}")

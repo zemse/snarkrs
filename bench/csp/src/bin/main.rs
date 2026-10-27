@@ -30,6 +30,8 @@ struct BenchArgs {
     artifacts: PathBuf,
     #[arg(long, default_value = "bench/vendor/csp-benchmarks/circom/circuits")]
     witness_src: PathBuf,
+    /// `auto` runs the CPU below `snarkrs_csp::AUTO_METAL_FROM` constraints and Metal at
+    /// or above, and names the one it ran in each row's `feat`.
     #[arg(long, value_enum, default_value_t = Backend::Cpu)]
     backend: Backend,
     /// Measure the `rapidsnark` CLI at this path instead of our prover, over the same
@@ -130,7 +132,7 @@ fn bench(a: BenchArgs) -> Result<()> {
     };
 
     println!(
-        "{:<16} {:>11} {:>9} {:>9} {:>9} {:>9} {:>10} {:>9} {:>10}",
+        "{:<16} {:>11} {:>9} {:>9} {:>9} {:>9} {:>10} {:>9} {:>10}  backend",
         "variant",
         "constraints",
         "witness",
@@ -144,7 +146,7 @@ fn bench(a: BenchArgs) -> Result<()> {
     for v in variants {
         let (row, b) = run::variant(v, &cfg)?;
         println!(
-            "{:<16} {:>11} {:>8.1}ms {:>7.1}ms {:>7.1}ms {:>7.1}ms {:>8.1}ms {:>7.2}ms {:>8.0}MB",
+            "{:<16} {:>11} {:>8.1}ms {:>7.1}ms {:>7.1}ms {:>7.1}ms {:>8.1}ms {:>7.2}ms {:>8.0}MB  {}",
             b.variant,
             row.num_constraints,
             b.witness_ms,
@@ -153,7 +155,8 @@ fn bench(a: BenchArgs) -> Result<()> {
             b.prove_ms,
             b.total_ms,
             b.verify_vkey_ms,
-            row.peak_memory as f64 / 1e6
+            row.peak_memory as f64 / 1e6,
+            b.backend
         );
     }
     println!("\nrows written to {}", a.out_dir.display());
