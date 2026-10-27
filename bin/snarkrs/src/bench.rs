@@ -165,6 +165,9 @@ pub fn run(args: Args) -> Result<()> {
 
     // Which x86 build this is, so a baseline build is never read as an adx+bmi2 one.
     println!("adx+bmi2 build: {}", if ADX_BMI2 { "yes" } else { "no" });
+    // And which multiply runs, which a build without the flags decides from CPUID.
+    let mulx = snarkrs_field::raw::mulx_multiply();
+    println!("mulx multiply: {}", if mulx { "yes" } else { "no" });
     let mut rows = Vec::new();
     for v in &variants {
         let constraints = v.constraints();
