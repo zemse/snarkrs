@@ -37,11 +37,44 @@ pub fn prove<R: ark_std::rand::RngCore + ark_std::rand::CryptoRng>(
     rng: &mut R,
     timings: &mut StageTimings,
 ) -> Result<Proof, ProveError> {
+    prove_then(circuit, witness, rng, timings, crate::verify::verify)
+}
+
+/// [`prove`] with the check of the result done by
+/// [`crate::verify::verify_allowing_unblinded`], for a key loaded with
+/// `ProvingKey::load_allowing_unblinded`. Benchmark only: it times the same work as
+/// [`prove`] on a published key with no phase-2 contribution, which [`prove`] refuses
+/// because anyone can forge a proof against it.
+pub fn prove_allowing_unblinded<R: ark_std::rand::RngCore + ark_std::rand::CryptoRng>(
+    circuit: &dyn PreparedCircuit,
+    witness: &[Fr],
+    rng: &mut R,
+    timings: &mut StageTimings,
+) -> Result<Proof, ProveError> {
+    prove_then(
+        circuit,
+        witness,
+        rng,
+        timings,
+        crate::verify::verify_allowing_unblinded,
+    )
+}
+
+type Check =
+    fn(&snarkrs_formats::VerifyingKey, &[Fr], &Proof) -> Result<(), crate::verify::VerifyError>;
+
+fn prove_then<R: ark_std::rand::RngCore + ark_std::rand::CryptoRng>(
+    circuit: &dyn PreparedCircuit,
+    witness: &[Fr],
+    rng: &mut R,
+    timings: &mut StageTimings,
+    check: Check,
+) -> Result<Proof, ProveError> {
     let proof = prove_unchecked(circuit, witness, rng, timings)?;
     // `prove_unchecked` has refused a witness of the wrong length, so the slice is in range.
     let public = &witness[1..=circuit.n_public()];
     let start = Instant::now();
-    let checked = crate::verify::verify(&circuit.key().vk, public, &proof);
+    let checked = check(&circuit.key().vk, public, &proof);
     timings.verify_us += start.elapsed().as_micros() as u64;
     checked.map_err(ProveError::SelfVerify)?;
     Ok(proof)

@@ -511,7 +511,11 @@ struct Header2 {
     n_public_at: usize,
     domain_size_at: usize,
     beta_g1_at: usize,
+    gamma_g2_at: usize,
     delta_g1_at: usize,
+    delta_g2_at: usize,
+    /// Start of section 5, the A query.
+    a_query_at: usize,
 }
 
 fn locate(bytes: &[u8]) -> Header2 {
@@ -519,12 +523,16 @@ fn locate(bytes: &[u8]) -> Header2 {
     let nsec = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
     let mut off = 12usize;
     let mut s2 = None;
+    let mut s5 = None;
     for _ in 0..nsec {
         let sid = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
         let slen = u64::from_le_bytes(bytes[off + 4..off + 12].try_into().unwrap()) as usize;
         off += 12;
         if sid == 2 && s2.is_none() {
             s2 = Some(off);
+        }
+        if sid == 5 && s5.is_none() {
+            s5 = Some(off);
         }
         off += slen;
     }
@@ -538,7 +546,10 @@ fn locate(bytes: &[u8]) -> Header2 {
         n_public_at: p - 4,
         domain_size_at: p,
         beta_g1_at: alpha1 + 64,
+        gamma_g2_at: alpha1 + 64 + 64 + 128,
         delta_g1_at: alpha1 + 64 + 64 + 128 + 128,
+        delta_g2_at: alpha1 + 64 + 64 + 128 + 128 + 64,
+        a_query_at: s5.expect("section 5"),
     }
 }
 
@@ -547,6 +558,15 @@ fn load_mutated(
     base: &std::path::Path,
     edit: impl Fn(&mut Vec<u8>),
 ) -> Result<(), ZkeyError> {
+    load_mutated_with(name, base, ProvingKey::load, edit).map(|_| ())
+}
+
+fn load_mutated_with(
+    name: &str,
+    base: &std::path::Path,
+    load: fn(&Path) -> Result<ProvingKey, ZkeyError>,
+    edit: impl Fn(&mut Vec<u8>),
+) -> Result<ProvingKey, ZkeyError> {
     let mut bytes = std::fs::read(base.join("circuit.zkey")).unwrap();
     edit(&mut bytes);
     let path = std::env::temp_dir().join(format!(
@@ -554,9 +574,99 @@ fn load_mutated(
         std::process::id()
     ));
     std::fs::write(&path, &bytes).unwrap();
-    let r = ProvingKey::load(&path).map(|_| ());
+    let r = load(&path);
     let _ = std::fs::remove_file(&path);
     r
+}
+
+/// `delta_g2` overwritten with `gamma_g2`: the shape of a key with no phase-2
+/// contribution, which the published poseidon benchmark keys have.
+fn unblind(b: &mut [u8]) {
+    let h = locate(b);
+    b.copy_within(h.gamma_g2_at..h.gamma_g2_at + 128, h.delta_g2_at);
+}
+
+/// The default loader refuses a key with no phase-2 contribution, and the benchmark
+/// opt-in takes it with nothing else relaxed: its verifying key still fails the default
+/// structure check.
+#[test]
+fn an_unblinded_key_loads_only_through_the_benchmark_opt_in() {
+    for_each_artifact(
+        "an_unblinded_key_loads_only_through_the_benchmark_opt_in",
+        |a| {
+            let err = load_mutated("unblinded", &a.dir, |b| unblind(b))
+                .expect_err(&format!("{}: an unblinded key must be refused", a.name));
+            let msg = err.to_string();
+            assert!(
+                msg.contains("gamma_g2 equals delta_g2"),
+                "{}: unhelpful error: {msg}",
+                a.name
+            );
+
+            let pk = load_mutated_with(
+                "unblinded-opt-in",
+                &a.dir,
+                ProvingKey::load_allowing_unblinded,
+                |b| unblind(b),
+            )
+            .unwrap_or_else(|e| panic!("{}: opt-in refused an unblinded key: {e}", a.name));
+            assert!(pk.vk.gamma_g2 == pk.vk.delta_g2, "{}", a.name);
+            assert!(pk.vk.check_structure().is_err(), "{}", a.name);
+            pk.vk
+                .check_structure_allowing_unblinded()
+                .unwrap_or_else(|e| panic!("{}: {e}", a.name));
+        },
+    );
+}
+
+/// The opt-in drops one refusal and no other: an unblinded key that is also broken some
+/// other way is still refused, by the infinity gate and by the per-point curve check.
+#[test]
+fn the_unblinded_opt_in_still_refuses_an_otherwise_invalid_key() {
+    for_each_artifact(
+        "the_unblinded_opt_in_still_refuses_an_otherwise_invalid_key",
+        |a| {
+            let err = load_mutated_with(
+                "unblinded-zeroed",
+                &a.dir,
+                ProvingKey::load_allowing_unblinded,
+                |b| {
+                    unblind(b);
+                    let at = locate(b).beta_g1_at;
+                    b[at..at + 64].fill(0);
+                },
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{}: zeroed beta_g1 accepted", a.name));
+            let msg = err.to_string();
+            assert!(
+                msg.contains("beta_g1") && msg.contains("infinity"),
+                "{}: unhelpful error: {msg}",
+                a.name
+            );
+
+            // One bit of the first A query point's y. That leaves a canonical coordinate
+            // off the curve, which only the per-point check sees.
+            let err = load_mutated_with(
+                "unblinded-off-curve",
+                &a.dir,
+                ProvingKey::load_allowing_unblinded,
+                |b| {
+                    unblind(b);
+                    let at = locate(b).a_query_at + FQ_BYTES;
+                    b[at] ^= 1;
+                },
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{}: off-curve A query point accepted", a.name));
+            let msg = err.to_string();
+            assert!(
+                msg.contains("not on the curve"),
+                "{}: unhelpful error: {msg}",
+                a.name
+            );
+        },
+    );
 }
 
 /// The critical finding: zeroing `beta_g1` or `delta_g1` switches zero knowledge off while

@@ -204,10 +204,13 @@ const PROTOCOL_GROTH16: u32 = 1;
 const COEF_RECORD: usize = 12 + FR_BYTES;
 
 /// How much of a key the parser validates. See [`ProvingKey::load`] for what the checked
-/// mode adds and [`ProvingKey::load_unchecked`] for what skipping it gives up.
+/// mode adds, [`ProvingKey::load_unchecked`] for what skipping it gives up and
+/// [`ProvingKey::load_allowing_unblinded`] for the one refusal the third mode drops.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Check {
     Full,
+    /// `Full` without the `gamma_g2 != delta_g2` refusal.
+    AllowUnblinded,
     Unchecked,
 }
 
@@ -248,6 +251,17 @@ impl ProvingKey {
         Self::parse(BinFile::open(path, b"zkey", 2)?, Check::Unchecked)
     }
 
+    /// [`ProvingKey::load`] that accepts a key whose `gamma_g2` equals its `delta_g2`, and
+    /// runs every other check `load` does, the per-point curve checks included. Benchmark
+    /// only: it exists so published benchmark keys with no phase-2 contribution can be
+    /// timed. Anyone can forge a proof against such a key, so a key loaded this way must
+    /// never back a proof anyone relies on. Pair it with `snarkrs-groth16`'s
+    /// `prove_allowing_unblinded`, since the checked `prove` refuses the key too.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn load_allowing_unblinded(path: &std::path::Path) -> Result<Self, ZkeyError> {
+        Self::parse(BinFile::open(path, b"zkey", 2)?, Check::AllowUnblinded)
+    }
+
     /// Parse and validate a `.zkey` that is already in memory, for the browser, where the
     /// key arrives over `fetch` rather than from a path. Validates exactly what
     /// [`ProvingKey::load`] does.
@@ -265,7 +279,7 @@ impl ProvingKey {
         Self::parse(BinFile::from_bytes(bytes, b"zkey", 2)?, Check::Unchecked)
     }
 
-    /// Everything after the container is opened, shared by all four constructors so the
+    /// Everything after the container is opened, shared by all five constructors so the
     /// paths cannot diverge on a single validation.
     fn parse(file: BinFile, check: Check) -> Result<Self, ZkeyError> {
         let mut s1 = Cursor::new(file.unique_section(1)?, 1);
@@ -521,7 +535,7 @@ fn read_g1_section(
     // BN254 G1 has cofactor 1, so on the curve is in the subgroup.
     decode_records(data, G1_BYTES, G1Affine::identity(), |i, b| {
         let p = g1(b)?;
-        if check == Check::Full && !valid_g1(&p) {
+        if check != Check::Unchecked && !valid_g1(&p) {
             return Err(off_curve(id, i));
         }
         Ok(p)
@@ -541,7 +555,7 @@ fn read_g2_section(
     // proof rather than on each of these points.
     decode_records(data, G2_BYTES, G2Affine::identity(), |i, b| {
         let p = g2(b)?;
-        if check == Check::Full && !p.is_on_curve() {
+        if check != Check::Unchecked && !p.is_on_curve() {
             return Err(off_curve(id, i));
         }
         Ok(p)
@@ -721,6 +735,17 @@ impl VerifyingKey {
     ///   `C = -L` then verifies for any public input. See [`ProvingKey::load`].
     /// * An empty `ic`, which has no constant-wire point.
     pub fn check_structure(&self) -> Result<(), ZkeyError> {
+        self.structure(false)
+    }
+
+    /// [`VerifyingKey::check_structure`] without the `gamma_g2 != delta_g2` refusal, for a
+    /// key [`ProvingKey::load_allowing_unblinded`] loaded. Benchmark only, for the same
+    /// reason: anyone can forge a proof that passes against such a key.
+    pub fn check_structure_allowing_unblinded(&self) -> Result<(), ZkeyError> {
+        self.structure(true)
+    }
+
+    fn structure(&self, allow_unblinded: bool) -> Result<(), ZkeyError> {
         let bad = |what| Err(ZkeyError::UnsafeVerifyingKey(what));
         if self.alpha_g1.infinity {
             return bad("alpha_g1 is the point at infinity");
@@ -734,7 +759,7 @@ impl VerifyingKey {
         if self.delta_g2.infinity {
             return bad("delta_g2 is the point at infinity");
         }
-        if self.gamma_g2 == self.delta_g2 {
+        if !allow_unblinded && self.gamma_g2 == self.delta_g2 {
             return bad(
                 "gamma_g2 equals delta_g2, so the key had no phase-2 contribution and anyone \
                  can forge a proof against it",

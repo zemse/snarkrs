@@ -50,6 +50,20 @@ pub fn verify(vk: &VerifyingKey, public: &[Fr], proof: &Proof) -> Result<(), Ver
     verify_unchecked(vk, public, proof)
 }
 
+/// [`verify`] for a key with no phase-2 contribution: every check but the `gamma_g2 !=
+/// delta_g2` refusal, see [`VerifyingKey::check_structure_allowing_unblinded`]. Benchmark
+/// only. Passing it proves nothing, since anyone can forge a proof against such a key; it
+/// still catches a proof the prover got wrong.
+pub fn verify_allowing_unblinded(
+    vk: &VerifyingKey,
+    public: &[Fr],
+    proof: &Proof,
+) -> Result<(), VerifyError> {
+    vk.check_structure_allowing_unblinded()?;
+    check_proof(proof)?;
+    verify_unchecked(vk, public, proof)
+}
+
 /// The three proof elements, checked as [`verify`] documents.
 pub fn check_proof(proof: &Proof) -> Result<(), VerifyError> {
     let bad = |what| Err(VerifyError::InvalidProof(what));
@@ -164,6 +178,52 @@ mod tests {
         assert!(matches!(
             aggregate_public(&vk, &[Fr::from(1u64)]),
             Err(VerifyError::EmptyVerifyingKey)
+        ));
+    }
+
+    /// Why `verify_allowing_unblinded` is benchmark only. With `gamma_g2 == delta_g2`, the
+    /// proof `A = alpha`, `B = beta`, `C = -L_bar` passes the pairing for any public input.
+    /// `verify` refuses the key; the opt-in accepts the forgery, and still refuses a key or
+    /// a proof that fails any other check.
+    #[test]
+    fn the_unblinded_opt_in_accepts_a_forgery_and_nothing_else_it_should_not() {
+        use snarkrs_field::{AffineRepr, CurveGroup};
+        let g1 = |k: u64| (G1Affine::generator() * Fr::from(k)).into_affine();
+        let g2 = |k: u64| (G2Affine::generator() * Fr::from(k)).into_affine();
+        let key = |alpha_g1| VerifyingKey {
+            alpha_g1,
+            beta_g2: g2(5),
+            gamma_g2: g2(7),
+            delta_g2: g2(7),
+            ic: vec![g1(11), g1(13)],
+        };
+        let vk = key(g1(3));
+        let public = [Fr::from(42u64)];
+        let forged = Proof {
+            a: vk.alpha_g1,
+            b: vk.beta_g2,
+            c: (-aggregate_public(&vk, &public).unwrap()).into_affine(),
+        };
+
+        assert!(matches!(
+            verify(&vk, &public, &forged),
+            Err(VerifyError::UnsafeKey(_))
+        ));
+        verify_allowing_unblinded(&vk, &public, &forged).unwrap();
+
+        assert!(matches!(
+            verify_allowing_unblinded(&key(G1Affine::identity()), &public, &forged),
+            Err(VerifyError::UnsafeKey(_))
+        ));
+        let mut bad_proof = forged.clone();
+        bad_proof.a = G1Affine::identity();
+        assert!(matches!(
+            verify_allowing_unblinded(&vk, &public, &bad_proof),
+            Err(VerifyError::InvalidProof(_))
+        ));
+        assert!(matches!(
+            verify_allowing_unblinded(&vk, &[Fr::from(43u64)], &forged),
+            Err(VerifyError::PairingFailed)
         ));
     }
 }
