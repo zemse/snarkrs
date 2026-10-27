@@ -28,6 +28,8 @@ use std::borrow::Cow;
 use snarkrs_field::{Fr, G1Affine, G1Projective, G2Affine, G2Projective};
 
 pub mod accel;
+/// The curve and spot checks the GPU backends hold a ceremony readback to.
+pub mod check;
 pub mod glv;
 pub mod xyzz;
 use snarkrs_field::raw::RawField;

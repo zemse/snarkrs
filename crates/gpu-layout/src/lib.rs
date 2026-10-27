@@ -447,6 +447,43 @@ impl PackedG2Affine {
     }
 }
 
+/// A wire struct whose every field element is in `[0, p)`.
+///
+/// `PackedFq::to_fq` is `new_unchecked` over the device's words, and the raw layer's
+/// multiply assumes reduced inputs, so a backend asks this before any arithmetic on a
+/// readback: a wrong word that is not a field element is refused rather than multiplied.
+pub trait Reduced {
+    fn reduced(&self) -> bool;
+}
+
+impl Reduced for PackedFq {
+    #[inline]
+    fn reduced(&self) -> bool {
+        self.to_fq().0 < Fq::MODULUS
+    }
+}
+
+impl Reduced for PackedFq2 {
+    #[inline]
+    fn reduced(&self) -> bool {
+        self.c0.reduced() && self.c1.reduced()
+    }
+}
+
+impl Reduced for PackedG1Affine {
+    #[inline]
+    fn reduced(&self) -> bool {
+        self.x.reduced() && self.y.reduced()
+    }
+}
+
+impl Reduced for PackedG2Affine {
+    #[inline]
+    fn reduced(&self) -> bool {
+        self.x.reduced() && self.y.reduced()
+    }
+}
+
 /// Marker for a type whose in-memory bytes are exactly what the GPU should see.
 ///
 /// # Safety
@@ -638,6 +675,23 @@ pub(crate) mod tests {
         PackedFr::pack_into(&xs, &mut out);
         assert_eq!(out, PackedFr::pack_slice(&xs));
         assert_eq!(PackedFr::unpack_slice(&out), xs);
+    }
+
+    #[test]
+    fn a_word_at_or_past_the_modulus_is_not_reduced() {
+        let one = PackedFq::from_fq(&Fq::from(1u64));
+        assert!(one.reduced());
+        let mut v = one;
+        v.v = [0xffff_ffff; 8];
+        assert!(!v.reduced());
+        let mut p = PackedFq::default();
+        let m = Fq::MODULUS;
+        for (i, limb) in m.0.iter().enumerate() {
+            p.v[2 * i] = *limb as u32;
+            p.v[2 * i + 1] = (*limb >> 32) as u32;
+        }
+        assert!(!p.reduced(), "the modulus itself");
+        assert!(PackedFq::default().reduced());
     }
 }
 
