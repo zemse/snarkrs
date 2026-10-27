@@ -97,10 +97,10 @@ fn proof_iteration(
 
     match prover {
         Prover::G16(backend) => {
-            let t = Instant::now();
-            let (pk, _) = crate::load_key(zkey, key == KeyPolicy::Unblinded)?;
-            let n_public = pk.n_public;
-            split.zkey_load = t.elapsed();
+            // On Metal the upload is part of the load, see `load_prepared`.
+            let prepared = crate::load_prepared(*backend, zkey, key == KeyPolicy::Unblinded)?;
+            let circuit = prepared.circuit;
+            split.zkey_load = prepared.load;
 
             // The witness parse is charged to the prepare phase rather than to witness
             // generation: it is our deserialiser, not the generator's, and upstream pays
@@ -109,9 +109,8 @@ fn proof_iteration(
             let witness = Witness::from_bytes(wtns)
                 .with_context(|| format!("{}: parsing generated witness", variant.name()))?
                 .0;
-            let public = public_of(&witness, n_public)?;
-            let circuit = crate::make_backend(*backend)?.prepare(pk)?;
-            split.prepare = t.elapsed();
+            let public = public_of(&witness, circuit.n_public())?;
+            split.prepare = prepared.prepare + t.elapsed();
 
             let t = Instant::now();
             let proof = key.prove(circuit.as_ref(), &witness, &mut split.stages)?;

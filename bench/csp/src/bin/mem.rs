@@ -37,10 +37,19 @@ fn main() -> Result<()> {
     };
 
     let wtns = circuits::witness(v, inputs::json(v.target, v.input_size))?;
-    let (pk, key) = snarkrs_csp::load_key(&v.zkey(&args.artifacts), args.allow_unblinded_zkey)?;
+    let zkey = v.zkey(&args.artifacts);
+    // `snarkrs-csp bench` passes the backend its row resolved to. Only a hand-run `auto`
+    // has to parse the key once to find out, which is then a second parse in the process.
+    let backend = match args.backend {
+        Backend::Auto => {
+            let (pk, _) = snarkrs_csp::load_key(&zkey, args.allow_unblinded_zkey)?;
+            Backend::Auto.resolve(snarkrs_csp::run::num_constraints(&pk))
+        }
+        b => b,
+    };
+    let prepared = snarkrs_csp::load_prepared(backend, &zkey, args.allow_unblinded_zkey)?;
+    let (circuit, key) = (prepared.circuit, prepared.key);
     let witness = Witness::from_bytes(wtns)?.0;
-    let backend = args.backend.resolve(snarkrs_csp::run::num_constraints(&pk));
-    let circuit = snarkrs_csp::make_backend(backend)?.prepare(pk)?;
     let proof = key.prove(
         circuit.as_ref(),
         &witness,

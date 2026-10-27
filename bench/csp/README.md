@@ -77,8 +77,10 @@ Record the actual arithmetic mode of the binary that produced the row.
 
 **Validation is included.** The native prover uses checked key loading and checked
 `prove`, so point/key validation is inside `zkey_load_ms` and proof self-verification is
-inside `prove_ms`. Under the poseidon key exception the same work runs less one O(1)
-comparison. The memory binary also uses checked `prove`. The driver separately
+inside `prove_ms`. On Metal the key is decoded straight into the device's buffers, so
+`zkey_load_ms` also holds the upload and `prepare_ms` is the witness parse and making the
+backend; on the CPU `prepare_ms` is the witness parse and `prepare`. Under the poseidon
+key exception the same work runs less one O(1) comparison. The memory binary also uses checked `prove`. The driver separately
 verifies the warm-up proof before reporting timings; that is not an independent oracle.
 `SNARKJS_VERIFY=1` adds one, outside the timed region.
 

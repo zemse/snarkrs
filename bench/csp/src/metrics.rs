@@ -110,7 +110,8 @@ pub struct Breakdown {
     /// Anyone can forge a proof against such a key.
     pub unblinded_zkey: bool,
     pub reps: usize,
-    /// Per-phase means, milliseconds.
+    /// Per-phase means, milliseconds. On Metal `zkey_load_ms` includes the upload to the
+    /// device, which the key is decoded straight into.
     pub witness_ms: f64,
     pub zkey_load_ms: f64,
     pub prepare_ms: f64,

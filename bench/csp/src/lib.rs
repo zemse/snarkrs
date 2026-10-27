@@ -26,6 +26,7 @@ use snarkrs_field::Fr;
 use snarkrs_formats::{ProvingKey, VerifyingKey};
 use snarkrs_groth16::{PreparedCircuit, Proof, StageTimings};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 pub mod circuits;
 pub mod inputs;
@@ -279,6 +280,62 @@ impl KeyPolicy {
             }
         }
     }
+}
+
+/// A key loaded and prepared, and what each half cost.
+pub struct Prepared {
+    pub circuit: Box<dyn PreparedCircuit>,
+    pub key: KeyPolicy,
+    pub load: Duration,
+    pub prepare: Duration,
+}
+
+/// The key at `zkey` loaded and prepared on `backend`, with every check [`load_key`] runs.
+///
+/// Metal decodes the key straight into its device buffers with `MetalBackend::load`, so
+/// its upload is timed as part of the load, and its prepare is making the backend. Every
+/// other backend is [`load_key`] then [`make_backend`] and `prepare`, timed as such.
+pub fn load_prepared(
+    backend: Backend,
+    zkey: &Path,
+    allow_unblinded: bool,
+) -> anyhow::Result<Prepared> {
+    #[cfg(feature = "metal")]
+    if backend == Backend::Metal {
+        let t = Instant::now();
+        let metal = snarkrs_metal::MetalBackend::new()?;
+        let prepare = t.elapsed();
+        let t = Instant::now();
+        let loaded = if allow_unblinded {
+            metal.load_allowing_unblinded(zkey)
+        } else {
+            metal.load(zkey)
+        };
+        let circuit = loaded.with_context(|| format!("loading {}", zkey.display()))?;
+        let load = t.elapsed();
+        let vk = &circuit.key().vk;
+        return Ok(Prepared {
+            key: if allow_unblinded && vk.gamma_g2 == vk.delta_g2 {
+                KeyPolicy::Unblinded
+            } else {
+                KeyPolicy::Checked
+            },
+            circuit: Box::new(circuit),
+            load,
+            prepare,
+        });
+    }
+    let t = Instant::now();
+    let (pk, key) = load_key(zkey, allow_unblinded)?;
+    let load = t.elapsed();
+    let t = Instant::now();
+    let circuit = make_backend(backend)?.prepare(pk)?;
+    Ok(Prepared {
+        circuit,
+        key,
+        load,
+        prepare: t.elapsed(),
+    })
 }
 
 /// Refuses rather than falling back. A row that silently measured the CPU while labelled
