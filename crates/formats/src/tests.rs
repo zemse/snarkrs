@@ -252,30 +252,38 @@ struct Artifact {
     dir: PathBuf,
 }
 
+/// A directory holding `circuit.zkey` and `circuit.wtns`, at the top of `bench/artifacts`
+/// or one level down, which is where the csp set sits, the rule
+/// `crates/metal/tests/audit_metal_vs_cpu.rs` uses. Any other directory there is a
+/// container, not an artifact. `large/` is skipped: `gen-artifacts.sh` puts it below where
+/// these tests scan so that only the tests that ask for it load it. An artifact missing
+/// `vkey.json` or `public.json` still fails under `G16_REQUIRE_TESTS=1`.
 fn artifacts() -> Vec<Artifact> {
+    fn walk(dir: &Path, prefix: &str, depth: usize, out: &mut Vec<Artifact>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for d in entries.flatten().map(|e| e.path()).filter(|d| d.is_dir()) {
+            let name = format!("{prefix}{}", d.file_name().unwrap().to_string_lossy());
+            if name == "large" {
+                continue;
+            }
+            if d.join("circuit.zkey").is_file() && d.join("circuit.wtns").is_file() {
+                if resources::complete_files(&d, &["vkey.json", "public.json"], "formats artifacts")
+                {
+                    out.push(Artifact { name, dir: d });
+                }
+            } else if depth > 0 {
+                walk(&d, &format!("{name}/"), depth - 1, out);
+            }
+        }
+    }
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../bench/artifacts")
         .canonicalize();
     let Ok(root) = root else { return Vec::new() };
-    let Ok(entries) = std::fs::read_dir(&root) else {
-        return Vec::new();
-    };
-    let mut out: Vec<Artifact> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|d| d.is_dir())
-        .filter(|d| {
-            resources::complete_files(
-                d,
-                &["circuit.zkey", "circuit.wtns", "vkey.json", "public.json"],
-                "formats artifacts",
-            )
-        })
-        .map(|dir| Artifact {
-            name: dir.file_name().unwrap().to_string_lossy().into_owned(),
-            dir,
-        })
-        .collect();
+    let mut out = Vec::new();
+    walk(&root, "", 1, &mut out);
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
 }
@@ -469,17 +477,20 @@ fn coefficients_csr_reproduces_the_raw_section() {
 /// End-to-end proof that the verifying key was parsed correctly: snarkjs' own reference
 /// proof must satisfy the pairing equation under our parsed key and our parsed witness.
 /// A single wrong coordinate anywhere in `vk` breaks this.
+///
+/// `proof.json` is not one of an artifact's required files: only some generators write
+/// one. So an artifact without it is passed over, and only a run where none has one is a
+/// skip.
 #[test]
 fn snarkjs_reference_proof_verifies_under_the_parsed_key() {
+    let checked = std::cell::Cell::new(0);
     for_each_artifact("reference_proof", |a| {
         let proof_path = a.dir.join("proof.json");
         if !proof_path.is_file() {
-            resources::skip(format_args!(
-                "formats pairing test: missing {}",
-                a.dir.join("proof.json").display()
-            ));
+            eprintln!("reference_proof: {} has no proof.json", a.name);
             return;
         }
+        checked.set(checked.get() + 1);
         let vk = VerifyingKey::from_json(&a.dir.join("vkey.json")).unwrap();
         let p = json(&proof_path);
         let pi_a = json_g1(&p["pi_a"], "pi_a").unwrap();
@@ -498,6 +509,9 @@ fn snarkjs_reference_proof_verifies_under_the_parsed_key() {
         );
         assert_eq!(out, PairingOutput::zero(), "{}: pairing check", a.name);
     });
+    if checked.get() == 0 && !artifacts().is_empty() {
+        resources::skip("formats pairing test: no artifact under bench/artifacts has a proof.json");
+    }
 }
 
 // Regression tests for the two key-handling findings from the audit. Both were

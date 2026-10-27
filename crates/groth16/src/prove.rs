@@ -402,30 +402,40 @@ mod tests {
         dir: PathBuf,
     }
 
+    /// A directory holding `circuit.zkey` and `circuit.wtns`, at the top of
+    /// `bench/artifacts` or one level down where the csp set sits, as
+    /// `crates/metal/tests/audit_metal_vs_cpu.rs` scans. `large/` is skipped, being for the
+    /// tests that ask for it. An artifact missing `vkey.json` or `public.json` still fails
+    /// under `G16_REQUIRE_TESTS=1`.
     fn artifacts() -> Vec<Artifact> {
+        fn walk(dir: &Path, prefix: &str, depth: usize, out: &mut Vec<Artifact>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for d in entries.flatten().map(|e| e.path()).filter(|d| d.is_dir()) {
+                let name = format!("{prefix}{}", d.file_name().unwrap().to_string_lossy());
+                if name == "large" {
+                    continue;
+                }
+                if d.join("circuit.zkey").is_file() && d.join("circuit.wtns").is_file() {
+                    if resources::complete_files(
+                        &d,
+                        &["vkey.json", "public.json"],
+                        "CPU prover artifacts",
+                    ) {
+                        out.push(Artifact { name, dir: d });
+                    }
+                } else if depth > 0 {
+                    walk(&d, &format!("{name}/"), depth - 1, out);
+                }
+            }
+        }
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../bench/artifacts")
             .canonicalize();
         let Ok(root) = root else { return Vec::new() };
-        let Ok(entries) = std::fs::read_dir(&root) else {
-            return Vec::new();
-        };
-        let mut out: Vec<Artifact> = entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|d| d.is_dir())
-            .filter(|d| {
-                resources::complete_files(
-                    d,
-                    &["circuit.zkey", "circuit.wtns", "vkey.json", "public.json"],
-                    "CPU prover artifacts",
-                )
-            })
-            .map(|dir| Artifact {
-                name: dir.file_name().unwrap().to_string_lossy().into_owned(),
-                dir,
-            })
-            .collect();
+        let mut out = Vec::new();
+        walk(&root, "", 1, &mut out);
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
     }
@@ -505,20 +515,28 @@ mod tests {
 
     /// Separates "our prover is broken" from "our verifier is broken". If this fails and
     /// the end-to-end test also fails, the verifier is the suspect.
+    ///
+    /// `proof.json` is not one of an artifact's required files, so an artifact without it
+    /// is passed over, and only a run where none has one is a skip.
     #[test]
     fn verifier_accepts_snarkjs_own_proof() {
+        let checked = std::cell::Cell::new(0);
         for_each_artifact("verifier_accepts_snarkjs_own_proof", |a| {
             if !a.dir.join("proof.json").is_file() {
-                resources::skip(format_args!(
-                    "verifier_accepts_snarkjs_own_proof: missing {}",
-                    a.dir.join("proof.json").display()
-                ));
+                eprintln!(
+                    "verifier_accepts_snarkjs_own_proof: {} has no proof.json",
+                    a.name
+                );
                 return;
             }
+            checked.set(checked.get() + 1);
             let vk = VerifyingKey::from_json(&a.dir.join("vkey.json")).unwrap();
             let public = public_inputs(&a.dir);
             verify(&vk, &public, &reference_proof(&a.dir)).unwrap();
         });
+        if checked.get() == 0 && !artifacts().is_empty() {
+            resources::skip("verifier_accepts_snarkjs_own_proof: no artifact has a proof.json");
+        }
     }
 
     /// The test the whole project exists for: our prover, our verifier, snarkjs' key.
