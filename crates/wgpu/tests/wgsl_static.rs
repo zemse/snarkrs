@@ -327,6 +327,20 @@ fn all_modules() -> Vec<Module> {
                 &pointsgen::points_module_at(v, c, c.with_tg(tg)),
             ));
         }
+        // The module the wide accumulation compiles from, at its own segmented size.
+        if let Some(w) = c.wide {
+            out.push(parse(
+                &format!("points {} wide segmented={}", c.suffix, w.segmented),
+                &pointsgen::points_module_at(
+                    v,
+                    c,
+                    pointsgen::Workgroups {
+                        segmented: w.segmented,
+                        ..c.wg
+                    },
+                ),
+            ));
+        }
     }
     out
 }

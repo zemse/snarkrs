@@ -493,6 +493,36 @@ fn the_g2_msm_matches_cpu_pippenger_at_2_16() {
     println!("2^16 bases at c = {} matched the CPU Pippenger", run.c);
 }
 
+/// The wide accumulation is a second module, so it gets its own oracle. 100,001 general
+/// scalars at c = 8 is 32 windows of 782 slices, 25,024 threads: inside the wide band, and
+/// not a multiple of 256, so the last workgroup runs the guard.
+#[test]
+fn the_wide_g2_accumulation_matches_cpu_pippenger() {
+    let _gpu = exclusive();
+    let mut rng = test_rng();
+    let n = 100_001usize;
+    let bases = walk_bases(n, &mut rng);
+    let scalars = general_scalars(n, &mut rng);
+    let dplan = DigitPlan::new(n as u32, 0, Some(general_count(&scalars))).expect("plan");
+    let threads = points()
+        .plan_points(&dplan, 0)
+        .expect("point plan")
+        .seg_threads(&dplan);
+    let wide = points().wide().expect("G2 ships a wide accumulation");
+    assert!(
+        wide.covers(threads) && !threads.is_multiple_of(wide.segmented),
+        "{threads} threads no longer reach the wide module's guard; move n"
+    );
+    let run = run_msm(&bases, &scalars, 0, 0, n as u32, None, 1);
+    assert!(!run.result.is_zero());
+    assert_matches_cpu(&run, &bases, &scalars, "the wide band");
+    run.assert_no_overrun(1, "the wide band");
+    println!(
+        "{n} bases at c = {}, {threads} threads at {}, matched the CPU Pippenger",
+        run.c, wide.segmented
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 6. The browser floor, from the host layouts and from the generator
 // ---------------------------------------------------------------------------
@@ -614,9 +644,9 @@ fn the_g2_module_compiles_and_reports_what_it_cost() {
         cost.compile_us as f64 / 1e6
     );
     // Eight since constant work: the five, the fold, the constant reduce and the constant
-    // accumulation.
-    assert_eq!(cost.pipelines, 8);
-    assert_eq!(cost.modules, 1);
+    // accumulation. Plus the wide accumulation, in a module of its own.
+    assert_eq!(cost.pipelines, 9);
+    assert_eq!(cost.modules, 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -811,32 +841,39 @@ enum Stage {
 fn the_g2_workgroup_sizes_are_measured() {
     let _gpu_timing = gpulock::exclusive_gpu();
     let _gpu = exclusive();
-    // 2^19 general scalars at c = 13, the floor's sub-MSM at a 2^22 key, so the segmented
-    // pass is 81,920 threads and the sweep measures its throughput. At the 32,768 the other
-    // sweeps run it is 5,632 threads, 44 workgroups of 128 on 38 cores, and every size reads
-    // the latency of an underfilled GPU: 53 ns per entry there against 27 here, and a ranking
+    // 2^19 general scalars at c = 13, the floor's sub-MSM at a 2^22 key, so the clear and the
+    // merge are measured at throughput. At the 32,768 the other sweeps run the segmented
+    // pass is 5,632 threads, 44 workgroups of 128 on 38 cores, and every size reads the
+    // latency of an underfilled GPU: 53 ns per entry there against 27 here, and a ranking
     // that put 16 first by 4%. See `gen::points::Workgroups`.
     let bench = Bench::new(1 << 19, 13);
+    // The segmented pass ships at two sizes (`gen::points::Wide`), so it is swept once on
+    // each side: 4,096 threads, a small key's pass, at the narrow size, and 34,816, a
+    // js_16x16_d32 sized one, at the wide size. Not at 81,920, above the wide band, where
+    // 32, 64 and 256 sit within a few percent of each other and swap places between runs.
+    let narrow = Bench::new(1 << 14, 8);
+    let wide = Bench::new(136 << 10, 8);
     let sizes = [16u32, 32, 64, 128, 256];
-    let shipped = wgsl::G2.wg;
 
     // Each kernel timed ALONE. The first version of this sweep timed all five together and
     // reported every row as noise, because `msm_segmented_g2` is 97% of the accumulation and
     // `msm_clear_g2` is 0.2% of it: a 20% swing on the clear moves the total by 0.04%.
     // Repetition counts differ per kernel for the same reason, so every cell is a few
     // milliseconds of GPU time rather than a few microseconds.
-    let cases: [(String, Stage, u32); 3] = [
-        (wgsl::G2.entry_clear(), Stage::Clear, 400),
-        (wgsl::G2.entry_segmented(), Stage::Segmented, 4),
-        (wgsl::G2.entry_merge(), Stage::Merge, 20),
+    let cases: [(String, &Bench, Stage, u32); 4] = [
+        (wgsl::G2.entry_clear(), &bench, Stage::Clear, 400),
+        (wgsl::G2.entry_segmented(), &narrow, Stage::Segmented, 4),
+        (wgsl::G2.entry_segmented(), &wide, Stage::Segmented, 4),
+        (wgsl::G2.entry_merge(), &bench, Stage::Merge, 20),
     ];
 
-    let mut rows: Vec<(String, Vec<f64>)> = Vec::new();
-    for (name, stage, reps) in cases {
+    // (kernel, threads in its segmented pass, shipped size there, medians per size)
+    let mut rows: Vec<(String, u32, u32, Vec<f64>)> = Vec::new();
+    for (name, at, stage, reps) in cases {
         let pipelines: Vec<MsmPointsG2> = sizes
             .iter()
             .map(|&sz| {
-                let mut wg = shipped;
+                let mut wg = wgsl::G2.wg;
                 match stage {
                     Stage::Clear => wg.clear = sz,
                     Stage::Segmented => wg.segmented = sz,
@@ -846,23 +883,35 @@ fn the_g2_workgroup_sizes_are_measured() {
             })
             .collect();
         let cases: Vec<_> = pipelines.iter().map(|p| (p, wgsl::G2.slice_len)).collect();
-        rows.push((name, bench.time_each(&cases, reps, stage, 7)));
+        // The size `MsmPoints::new` dispatches this pass at; the sweep forces each size
+        // through `with_shape`, which leaves the wide module out.
+        let threads = PointPlan::new(&at.dplan, 0, wgsl::G2.wg.tg, wgsl::G2)
+            .expect("plan")
+            .seg_threads(&at.dplan);
+        let ships = match stage {
+            Stage::Clear => wgsl::G2.wg.clear,
+            Stage::Segmented => match wgsl::G2.wide.filter(|w| w.covers(threads)) {
+                Some(w) => w.segmented,
+                None => wgsl::G2.wg.segmented,
+            },
+            _ => wgsl::G2.wg.merge,
+        };
+        rows.push((name, threads, ships, at.time_each(&cases, reps, stage, 7)));
     }
 
     println!(
-        "2^19 general scalars, c = 13, slice_len {}, each kernel alone, medians of seven \
-         interleaved rounds, us",
+        "slice_len {}, each kernel alone, medians of seven interleaved rounds, us; clear and \
+         merge at 2^19 general scalars and c = 13",
         wgsl::G2.slice_len
     );
-    print!("{:20}", "kernel");
+    print!("{:20}{:>8}", "kernel", "threads");
     for s in sizes {
         print!("{s:>9}");
     }
     println!("{:>7}{:>7}", "ships", "best");
-    for (name, row) in &rows {
-        let ships = shipped_size(&shipped, name);
+    for (name, threads, ships, row) in &rows {
         let best = argmin(row);
-        print!("{name:20}");
+        print!("{name:20}{threads:>8}");
         for v in row {
             print!("{v:9.1}");
         }
@@ -873,37 +922,26 @@ fn the_g2_workgroup_sizes_are_measured() {
     // numbers are pinned, so if Tint reverses the ranking at U14 this fails loudly rather
     // than silently keeping a size that stopped being right. 3% of slack, because the
     // clear's whole row is under half a millisecond and is mostly measurement noise.
-    for (name, row) in &rows {
-        let ships = shipped_size(&shipped, name);
+    for (name, threads, ships, row) in &rows {
         let best = argmin(row);
-        let at_shipped = row[sizes.iter().position(|&s| s == ships).unwrap()];
+        let at_shipped = row[sizes.iter().position(|s| s == ships).unwrap()];
         let regret = at_shipped / row[best] - 1.0;
         println!(
-            "{name}: ships {ships}, best {} ({:+.1}%)",
+            "{name} at {threads} threads: ships {ships}, best {} ({:+.1}%)",
             sizes[best],
             regret * 100.0
         );
-        // Relative for the two kernels that cost milliseconds, absolute for `msm_clear_g2`,
+        // Relative for the kernels that cost milliseconds, absolute for `msm_clear_g2`,
         // whose whole row is under 20 microseconds and moves by 2x between runs. A 3%
         // bound on a 10-microsecond row would be a coin flip in CI.
         assert!(
             regret < 0.03 || at_shipped - row[best] < 25.0,
-            "{name} ships {ships} at {at_shipped:.1} us and {} is {:.1} us ({:.1}%) faster; \
-             gen::points::Workgroups is stale",
+            "{name} at {threads} threads ships {ships} at {at_shipped:.1} us and {} is \
+             {:.1} us ({:.1}%) faster; gen::points::Workgroups or Wide is stale",
             sizes[best],
             at_shipped - row[best],
             regret * 100.0
         );
-    }
-}
-
-fn shipped_size(wg: &wgsl::Workgroups, entry: &str) -> u32 {
-    if entry == wgsl::G2.entry_clear() {
-        wg.clear
-    } else if entry == wgsl::G2.entry_segmented() {
-        wg.segmented
-    } else {
-        wg.merge
     }
 }
 

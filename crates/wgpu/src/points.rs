@@ -599,6 +599,9 @@ pub struct MsmPoints<C: PointCurve> {
     /// written out, which is what stopped the generator being G2-only.
     names: [String; 8],
     wg: wgsl::Workgroups,
+    /// `msm_segmented_*` alone at [`wgsl::Wide::segmented`], for a variable-work pass whose
+    /// thread count [`wgsl::Wide::covers`], built from the same generator.
+    wide: Option<(wgsl::Wide, Kernels)>,
     workgroups_per_dispatch: u32,
     bgl_clear: wgpu::BindGroupLayout,
     bgl_segmented: wgpu::BindGroupLayout,
@@ -700,7 +703,7 @@ impl<C: PointCurve> MsmPoints<C> {
         if forced > 0 {
             wg.tg = forced.min(C::WGSL.max_tg());
         }
-        Self::with_shape(backend, wg, max_wg)
+        Self::with_wide(backend, wg, max_wg, C::WGSL.wide)
     }
 
     /// Same, with the workgroup sizes and the per-dispatch workgroup cap forced.
@@ -714,6 +717,17 @@ impl<C: PointCurve> MsmPoints<C> {
         wg: wgsl::Workgroups,
         workgroups_per_dispatch: u32,
     ) -> Result<Self, ProveError> {
+        Self::with_wide(backend, wg, workgroups_per_dispatch, None)
+    }
+
+    /// Same, with the wide accumulation as well. [`Self::with_shape`] leaves it out, so a
+    /// sweep that forces `segmented` measures that size at every thread count.
+    pub fn with_wide(
+        backend: &WgpuBackend,
+        wg: wgsl::Workgroups,
+        workgroups_per_dispatch: u32,
+        wide: Option<wgsl::Wide>,
+    ) -> Result<Self, ProveError> {
         let curve = C::WGSL;
         let limits = backend.granted_limits();
         // The browser floor, not the granted limit; see `WgpuBackend::ceiling_invocations`.
@@ -723,6 +737,7 @@ impl<C: PointCurve> MsmPoints<C> {
             ("segmented", wg.segmented),
             ("merge", wg.merge),
             ("tg", wg.tg),
+            ("wide segmented", wide.map_or(1, |w| w.segmented)),
         ] {
             if n == 0 || n > max_inv {
                 return Err(bad(format!(
@@ -804,12 +819,33 @@ impl<C: PointCurve> MsmPoints<C> {
                 (names[SEGMENTED_CONSTANT].as_str(), &l_segmented),
             ],
         )?;
+        let wide = match wide {
+            Some(w) => {
+                let src = wgsl::points_module_at(
+                    Variant::default(),
+                    curve,
+                    wgsl::Workgroups {
+                        segmented: w.segmented,
+                        ..wg
+                    },
+                );
+                let k = Kernels::build_with_layouts(
+                    backend,
+                    &format!("msm_points_{}_wide", curve.suffix),
+                    &src,
+                    &[(names[SEGMENTED].as_str(), &l_segmented)],
+                )?;
+                Some((w, k))
+            }
+            None => None,
+        };
 
         Ok(Self {
             kernels,
             curve,
             names,
             wg,
+            wide,
             workgroups_per_dispatch,
             bgl_clear,
             bgl_segmented,
@@ -1237,7 +1273,8 @@ impl<C: PointCurve> MsmPoints<C> {
                     s.start * points.slices,
                     s.end * points.slices,
                     s.end,
-                    self.wg.segmented,
+                    self.segmented_at(points, (s.end - s.start) * points.slices)
+                        .1,
                 )?,
                 merge: if levels.is_empty() {
                     self.push_range(
@@ -1315,7 +1352,8 @@ impl<C: PointCurve> MsmPoints<C> {
         for s in slabs {
             let rows = (s.end - s.start) * digits.n_buckets();
             let threads = (s.end - s.start) * points.slices;
-            n += self.dispatches(rows, self.wg.clear) + self.dispatches(threads, self.wg.segmented);
+            n += self.dispatches(rows, self.wg.clear)
+                + self.dispatches(threads, self.segmented_at(points, threads).1);
             if levels.is_empty() {
                 n += self.dispatches(rows, self.wg.merge);
             }
@@ -1479,14 +1517,27 @@ impl<C: PointCurve> MsmPoints<C> {
             Work::Constant => SEGMENTED_CONSTANT,
             Work::Variable => SEGMENTED,
         };
-        self.encode_range(
+        let threads = (slab.windows.end - slab.windows.start) * points.slices;
+        let (kernels, wg) = self.segmented_at(points, threads);
+        self.encode_range_in(
             pass,
+            kernels,
             &self.names[which],
             &binds.segmented,
-            (slab.windows.end - slab.windows.start) * points.slices,
-            self.wg.segmented,
+            threads,
+            wg,
             &slab.segmented,
         )
+    }
+
+    /// The module and workgroup size one segmented dispatch of `threads` threads runs at:
+    /// the wide one on a variable-work pass inside [`wgsl::Wide`]'s band. The plan, the slot
+    /// count and the encode all ask this, so they cannot disagree about the dispatch count.
+    fn segmented_at(&self, points: &PointPlan, threads: u32) -> (&Kernels, u32) {
+        match &self.wide {
+            Some((w, k)) if points.work == Work::Variable && w.covers(threads) => (k, w.segmented),
+            _ => (&self.kernels, self.wg.segmented),
+        }
     }
 
     /// The merge of one slab: `msm_merge_*` over its rows, or under constant work every
@@ -1579,6 +1630,21 @@ impl<C: PointCurve> MsmPoints<C> {
         wg: u32,
         offsets: &[u32],
     ) -> Result<(), ProveError> {
+        self.encode_range_in(pass, &self.kernels, what, bind, n, wg, offsets)
+    }
+
+    /// Same, with the pipeline taken from `kernels`.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_range_in(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        kernels: &Kernels,
+        what: &str,
+        bind: &wgpu::BindGroup,
+        n: u32,
+        wg: u32,
+        offsets: &[u32],
+    ) -> Result<(), ProveError> {
         let want = self.dispatches(n, wg) as usize;
         if offsets.len() != want {
             return Err(bad(format!(
@@ -1586,7 +1652,7 @@ impl<C: PointCurve> MsmPoints<C> {
                 offsets.len()
             )));
         }
-        pass.set_pipeline(self.kernels.get(what)?);
+        pass.set_pipeline(kernels.get(what)?);
         let span = self.span(wg);
         let mut lo = 0u32;
         for &off in offsets {
@@ -1712,11 +1778,23 @@ impl<C: PointCurve> MsmPoints<C> {
     }
 
     pub fn cost(&self) -> crate::pipelines::PrepareCost {
-        self.kernels.cost()
+        let mut c = self.kernels.cost();
+        if let Some((_, k)) = &self.wide {
+            c.add(k.cost());
+        }
+        c
+    }
+
+    /// The wide accumulation this module runs mid-sized passes at, if any.
+    pub fn wide(&self) -> Option<wgsl::Wide> {
+        self.wide.as_ref().map(|(w, _)| *w)
     }
 
     pub fn summary(&self) -> String {
-        self.kernels.summary()
+        match &self.wide {
+            Some((_, k)) => format!("{}; {}", self.kernels.summary(), k.summary()),
+            None => self.kernels.summary(),
+        }
     }
 }
 

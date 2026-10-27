@@ -152,6 +152,9 @@ pub struct Curve {
     pub slice_len: u32,
     /// The measured workgroup sizes for this curve's five entry points.
     pub wg: Workgroups,
+    /// A wider `msm_segmented_*` for the pass sizes that want one, or `None` to run every
+    /// pass at [`Workgroups::segmented`]. See [`Wide`].
+    pub wide: Option<Wide>,
     /// What a caller whose bucket array is over the storage binding limit should be told
     /// beyond the byte counts. G2 has a real alternative and G1 does not.
     pub headroom: &'static str,
@@ -176,6 +179,7 @@ pub const G1: Curve = Curve {
         merge: 256,
         tg: 64,
     },
+    wide: None,
     headroom: "no BN254 group has a narrower accumulator than this one, so the only way \
                down is a narrower window",
 };
@@ -199,6 +203,11 @@ pub const G2: Curve = Curve {
         merge: 256,
         tg: 64,
     },
+    wide: Some(Wide {
+        segmented: 256,
+        from: 19_456,
+        to: 40_960,
+    }),
     headroom: "G1 has twice the headroom at the same c",
 };
 
@@ -425,8 +434,12 @@ pub const NO_ROW: u32 = 0xffff_ffff;
 /// msm_segmented_g2    283.8   281.1   314.8   306.7
 /// ```
 ///
-/// G2 ships 64: 11% under 128, and the `tests/msm_g2.rs` sweep now runs at that size so
-/// it measures throughput rather than the latency of 44 workgroups. G1 ships 64 as well:
+/// That 2^19 row does not hold still either: on 2026-10-27 the `tests/msm_g2.rs` sweep at
+/// that size read 32 first, 64 second and 256 third, where an earlier session had 256 ahead
+/// of 64 by 4.6 to 7.6%. There 32, 64 and 256 sit within 9% and swap places between
+/// sessions. The G2 accumulation is not one size at all: it ships 64 on small and very
+/// large passes and 256 between, see [`Wide`], which has the per-thread-count table. G1
+/// ships 64 as well:
 /// four runs of the `tests/msm_g1.rs` sweep at 32,768 put it ahead of 128 by 1.1% to
 /// 4.1%, failing that test's 3% bound twice while 128 shipped, and the whole 2^22 stage
 /// reads the same at either size.
@@ -481,6 +494,52 @@ pub struct Workgroups {
     /// modules at this width on every run, and U14 has to re-measure in Chrome, where the
     /// array is charged by Tint and not by naga.
     pub tg: u32,
+}
+
+/// The accumulation's workgroup size on a mid-sized pass: [`Self::segmented`] threads on a
+/// variable-work dispatch of `from..to` threads, [`Workgroups::segmented`] outside it.
+///
+/// One size cannot serve both ends, because `msm_segmented_*` is one serial chain of up to
+/// `slice_len` mixed additions per thread and a pass costs a whole number of chains. G2,
+/// random general scalars at c = 8 (c = 13 for the last row), the kernel alone, medians of
+/// eleven interleaved rounds, milliseconds (`tests/msm_trace.rs`, M2 Max, 2026-10-27):
+///
+/// ```text
+/// threads      32      64     128     256   whose G2 pass
+///     832    33.1    31.5    32.2    33.0   js_1x1_d8
+///   2,496    33.3    31.9    33.0    34.2   js_2x2_d16
+///  13,120    68.5    65.3    67.2    69.6   anon-aadhaar, second piece
+///  17,344    98.1    69.2    68.4    84.7   js_8x8_d32
+///  21,856   101.4   100.4   101.4    89.7   anon-aadhaar, first piece
+///  34,592   137.1   138.2   159.6   126.7   js_16x16_d32, railgun-13x01
+///  81,920   280.8   285.6   308.0   297.3   a 2^22 key
+/// ```
+///
+/// A fifteen-round sweep of 64 against 256 puts the crossover between 18,432 threads (71.1
+/// against 87.7) and 19,456 (99.3 against 94.0), which is `from`. At 40,960 the two tie
+/// (169.5 against 172.3) and at 81,920 64 led in all four runs of 2026-10-27, which is `to`.
+///
+/// **256 is also why a small pass at 256 is bimodal.** A G2 workgroup of 256 is one per
+/// core: the kernel alone reads 34.9 ms at 32 groups of 256 and 67.3 at 34, a second whole
+/// chain, where 64 holds one chain up to 168 groups (10,752 threads) and doubles by 192. With
+/// one group per core, two groups the hardware places on one core run one after the other,
+/// so js_2x2_d16's pass of 10 groups read 34.3 or 66 ms from one submission to the next over
+/// the same buffers, alternating, and some runs held one mode throughout. That was the
+/// 30 ms `tests/proof.rs::where_the_msm_time_goes` charged its batch: the median of five
+/// landed on the slow mode. At 64 the same pass is 39 groups, several fit a core, and no
+/// run here has doubled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Wide {
+    pub segmented: u32,
+    pub from: u32,
+    pub to: u32,
+}
+
+impl Wide {
+    /// Whether a segmented dispatch of `threads` threads runs at [`Self::segmented`].
+    pub const fn covers(&self, threads: u32) -> bool {
+        threads >= self.from && threads < self.to
+    }
 }
 
 // ---------------------------------------------------------------------------
