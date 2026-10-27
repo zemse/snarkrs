@@ -44,12 +44,14 @@
 //! add from 6.43/3.30/3.40 to 2.72/1.84/1.81, sub from 5.39/2.49/2.64 to 2.71/1.84/1.83 and
 //! mul from 25.7/19.4/19.6 to 20.4/13.9/13.9.
 //!
-//! On x86_64 with bmi2 and adx (the release builds' `+adx,+bmi2`) the same three are inline
-//! assembly too: a `mulx`/`adcx`/`adox` multiply and cmov-reduced add and sub
-//! (`raw/x86_64.rs`). On a c7i (Sapphire Rapids), same three regimes, `RawFr` add went from
-//! 4.59/2.76/3.44 to 2.49/1.64/3.18, sub from 4.07/2.73/3.24 to 2.42/1.64/3.18 and mul from
-//! 23.0/16.8/19.1 to 16.9/14.1/14.5, against ark-ff's 18.3/16.5/18.0 mul. Every other target
-//! keeps the portable code.
+//! On x86_64 the same three are inline assembly too: a `mulx`/`adcx`/`adox` multiply and
+//! cmov-reduced add and sub (`raw/x86_64.rs`). On a c7i (Sapphire Rapids) with `+adx,+bmi2`,
+//! same three regimes, `RawFr` add went from 4.59/2.76/3.44 to 2.49/1.64/3.18, sub from
+//! 4.07/2.73/3.24 to 2.42/1.64/3.18 and mul from 23.0/16.8/19.1 to 16.9/14.1/14.5, against
+//! ark-ff's 18.3/16.5/18.0 mul. The add and sub use only baseline x86_64 instructions and run
+//! in every x86_64 build. The multiply is fixed at compile time in a `+adx,+bmi2` build (the
+//! release builds'); any other x86_64 build checks the CPU once and keeps the portable
+//! multiply where ADX or BMI2 is missing. Every other target keeps the portable code.
 
 use crate::{Fq, Fq2, Fr};
 
@@ -96,14 +98,7 @@ fn sbb(a: u64, b: u64, borrow: u64) -> (u64, u64) {
     (t as u64, (t >> 127) as u64)
 }
 
-#[cfg(not(any(
-    target_arch = "aarch64",
-    all(
-        target_arch = "x86_64",
-        target_feature = "bmi2",
-        target_feature = "adx"
-    )
-)))]
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 #[inline(always)]
 fn adc(a: u64, b: u64, carry: u64) -> (u64, u64) {
     let t = a as u128 + b as u128 + carry as u128;
@@ -150,14 +145,7 @@ fn cond_sub(t: [u64; 4], m: &[u64; 4]) -> [u64; 4] {
 /// `(a + b) mod m` for fully reduced inputs. The carry out of limb 3 is provably zero
 /// for both BN254 fields (moduli are 254-bit), so the sum fits four limbs and one
 /// conditional subtraction finishes it.
-#[cfg(not(any(
-    target_arch = "aarch64",
-    all(
-        target_arch = "x86_64",
-        target_feature = "bmi2",
-        target_feature = "adx"
-    )
-)))]
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 #[inline(always)]
 fn add_mod(a: [u64; 4], b: [u64; 4], m: &[u64; 4]) -> [u64; 4] {
     let (s0, c) = adc(a[0], b[0], 0);
@@ -168,14 +156,7 @@ fn add_mod(a: [u64; 4], b: [u64; 4], m: &[u64; 4]) -> [u64; 4] {
 }
 
 /// `(a - b) mod m`, branch-free: the modulus is masked in when the subtraction borrows.
-#[cfg(not(any(
-    target_arch = "aarch64",
-    all(
-        target_arch = "x86_64",
-        target_feature = "bmi2",
-        target_feature = "adx"
-    )
-)))]
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 #[inline(always)]
 fn sub_mod(a: [u64; 4], b: [u64; 4], m: &[u64; 4]) -> [u64; 4] {
     let (d0, bw) = sbb(a[0], b[0], 0);
@@ -202,7 +183,7 @@ fn sub_mod(a: [u64; 4], b: [u64; 4], m: &[u64; 4]) -> [u64; 4] {
     )
 )))]
 #[inline(always)]
-fn mont_mul(a: [u64; 4], b: [u64; 4], m: &[u64; 4], n0: u64) -> [u64; 4] {
+fn mont_mul_portable(a: [u64; 4], b: [u64; 4], m: &[u64; 4], n0: u64) -> [u64; 4] {
     let mut t = [0u64; 4];
     for bi in b {
         let bi = bi as u128;
@@ -333,18 +314,32 @@ fn fq_reduce(t: [u64; 8]) -> [u64; 4] {
     add_mod(lo, [t[4], t[5], t[6], t[7]], &FQ_MOD)
 }
 
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "bmi2",
-    target_feature = "adx"
-))]
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+use mont_mul_portable as mont_mul;
+
+#[cfg(target_arch = "x86_64")]
 mod x86_64;
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "bmi2",
-    target_feature = "adx"
-))]
+#[cfg(target_arch = "x86_64")]
 use x86_64::{add_mod, mont_mul, sub_mod};
+
+/// Whether the multiply runs the `mulx`/`adcx`/`adox` assembly: always in an x86_64 build
+/// with `+adx,+bmi2`, and in any other x86_64 build when CPUID reports both. Never on other
+/// targets.
+pub fn mulx_multiply() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    return x86_64::mulx();
+    #[cfg(not(target_arch = "x86_64"))]
+    false
+}
+
+/// Makes an x86_64 build without `+adx,+bmi2` take the portable multiply from now on, so
+/// tests on a CPU with ADX and BMI2 still reach it. Both multiplies return the same limbs,
+/// so flipping this while other threads compute changes no result. No effect elsewhere.
+#[doc(hidden)]
+pub fn disable_mulx() {
+    #[cfg(target_arch = "x86_64")]
+    x86_64::disable_mulx();
+}
 
 // ---------------------------------------------------------------------------
 // The operation surface, as a trait, so curve arithmetic can be written once over a

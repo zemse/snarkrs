@@ -1,6 +1,47 @@
-//! x86_64 assembly for `raw.rs`'s add, sub and multiply, built when bmi2 and adx are on.
+//! x86_64 assembly for `raw.rs`'s add, sub and multiply. The add and sub are baseline x86_64.
+//! The multiply needs bmi2 and adx: a build with both enabled calls it directly, and any
+//! other build goes through [`mulx`], so a CPU without them never reaches it.
 
 use super::{FQ_MOD, FQ_N0, FR_MOD, FR_N0};
+
+/// The CPU probe behind [`mulx`]: 0 not yet run, 1 portable multiply, 2 `mulx` multiply.
+#[cfg(not(all(target_feature = "bmi2", target_feature = "adx")))]
+static MULX: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Whether [`mont_mul`] runs the assembly. A constant in a `+adx,+bmi2` build. Otherwise one
+/// byte compare per multiply, after a probe on first use; `is_x86_feature_detected!` caches
+/// too, but costs an atomic load and a bit test per feature.
+#[inline(always)]
+pub(super) fn mulx() -> bool {
+    #[cfg(all(target_feature = "bmi2", target_feature = "adx"))]
+    return true;
+    #[cfg(not(all(target_feature = "bmi2", target_feature = "adx")))]
+    {
+        // `2` first, so the assembly is one compare away.
+        let v = MULX.load(core::sync::atomic::Ordering::Relaxed);
+        v == 2 || (v == 0 && probe())
+    }
+}
+
+#[cfg(not(all(target_feature = "bmi2", target_feature = "adx")))]
+#[cold]
+#[inline(never)]
+fn probe() -> bool {
+    let yes = std::is_x86_feature_detected!("bmi2") && std::is_x86_feature_detected!("adx");
+    // A racing `disable_mulx` must win, so only an unprobed flag is written.
+    let _ = MULX.compare_exchange(
+        0,
+        if yes { 2 } else { 1 },
+        core::sync::atomic::Ordering::Relaxed,
+        core::sync::atomic::Ordering::Relaxed,
+    );
+    MULX.load(core::sync::atomic::Ordering::Relaxed) == 2
+}
+
+pub(super) fn disable_mulx() {
+    #[cfg(not(all(target_feature = "bmi2", target_feature = "adx")))]
+    MULX.store(1, core::sync::atomic::Ordering::Relaxed);
+}
 
 /// A modulus and its `n0`, for the multiply to read RIP-relative rather than through a
 /// register.
@@ -94,7 +135,7 @@ macro_rules! mont_mul_asm {
         let (r0, r1, r2, r3): (u64, u64, u64, u64);
         // SAFETY: reads the 32 bytes behind `b` and the 40 of the static; writes registers
         // only; no stack; flags clobbered. `mulx` needs bmi2 and `adcx`/`adox` adx, which
-        // the cfg on the `mod` line requires at compile time.
+        // the build enables or `mulx()` has found on this CPU.
         unsafe {
             core::arch::asm!(
                 // Row 0: t = a * b0.
@@ -276,8 +317,15 @@ macro_rules! mont_mul_asm {
 /// are read RIP-relative from a static, which leaves the thirteen allocatable registers
 /// exactly enough. Passing `a` through memory too was measured slower: the caller copies the
 /// limbs with 16-byte moves, and a 16-byte load of two 8-byte stores cannot be forwarded.
+///
+/// Without `+adx,+bmi2` at compile time this checks [`mulx`] first and falls back to the
+/// portable multiply, inlined beside the assembly.
 #[inline(always)]
 pub(super) fn mont_mul(a: [u64; 4], b: [u64; 4], m: &[u64; 4], n0: u64) -> [u64; 4] {
+    #[cfg(not(all(target_feature = "bmi2", target_feature = "adx")))]
+    if !mulx() {
+        return super::mont_mul_portable(a, b, m, n0);
+    }
     // Both arms are constant after inlining, so this compiles to one of the two.
     if *m == FQ_MOD && n0 == FQ_N0 {
         mont_mul_asm!(a, b, FQ_PARAMS)
