@@ -568,6 +568,7 @@ mod tests {
     /// `umask(2)`, declared here because this crate has no libc dependency. `mode_t` is
     /// 16 bits on Apple platforms and 32 elsewhere.
     #[cfg(unix)]
+    #[allow(clippy::useless_conversion)] // widens u16 on Apple, the same type elsewhere
     unsafe fn libc_umask(mask: u32) -> u32 {
         #[cfg(target_vendor = "apple")]
         type ModeT = u16;
