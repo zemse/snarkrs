@@ -42,9 +42,14 @@ impl From<CudaError> for ProveError {
 }
 
 /// A driver failure as a [`ProveError`]: [`ProveError::Device`] when [`is_device_fault`]
-/// says the device failed, [`ProveError::Backend`] when this crate misused the driver.
+/// says the device failed, [`ProveError::Backend`] when this crate misused the driver. A
+/// sticky code's reason also says the context is gone, because nothing here rebuilds it.
 pub(crate) fn fault(reason: String, e: DriverError) -> ProveError {
     if is_device_fault(e.0) {
+        let reason = match is_sticky(e.0) {
+            true => format!("{reason}; {STICKY}"),
+            false => reason,
+        };
         ProveError::Device {
             backend: "cuda",
             reason,
@@ -80,7 +85,7 @@ pub(crate) fn is_device_fault(code: CUresult) -> bool {
             // "unavailable at the current time": an exclusive-process card in use.
             | CUDA_ERROR_DEVICE_UNAVAILABLE
             // Hardware: "uncorrectable ECC error", "uncorrectable NVLink error", and an
-            // error the GPU's error containment caught. Sticky.
+            // error the GPU's error containment caught. Only the last is sticky.
             | CUDA_ERROR_ECC_UNCORRECTABLE
             | CUDA_ERROR_NVLINK_UNCORRECTABLE
             | CUDA_ERROR_CONTAINED
@@ -111,6 +116,32 @@ pub(crate) fn is_device_fault(code: CUresult) -> bool {
             | CUDA_ERROR_EXTERNAL_DEVICE
             // "an unknown internal error": the driver's own state, not this call's.
             | CUDA_ERROR_UNKNOWN
+    )
+}
+
+/// What a sticky fault's error adds to its reason.
+const STICKY: &str = "the CUDA context is unusable for the rest of this process, and a new \
+                      CUDA backend in it fails the same way: prove on another backend or in \
+                      a new process";
+
+/// Whether `code` is one the driver docs say poisons the context: "leaves the process in an
+/// inconsistent state and any further CUDA work will return the same error", or, for a
+/// device assert, "the context cannot be used anymore". This crate neither rebuilds the
+/// context nor retries the call, and its error says so.
+fn is_sticky(code: CUresult) -> bool {
+    use CUresult::*;
+    matches!(
+        code,
+        CUDA_ERROR_CONTAINED
+            | CUDA_ERROR_LAUNCH_TIMEOUT
+            | CUDA_ERROR_ILLEGAL_ADDRESS
+            | CUDA_ERROR_ASSERT
+            | CUDA_ERROR_HARDWARE_STACK_ERROR
+            | CUDA_ERROR_ILLEGAL_INSTRUCTION
+            | CUDA_ERROR_MISALIGNED_ADDRESS
+            | CUDA_ERROR_INVALID_ADDRESS_SPACE
+            | CUDA_ERROR_INVALID_PC
+            | CUDA_ERROR_LAUNCH_FAILED
     )
 }
 
@@ -521,6 +552,11 @@ mod tests {
         ] {
             let e = fault("op".into(), DriverError(code));
             assert!(e.is_device_fault(), "{code:?} gave {e}");
+            assert_eq!(
+                e.to_string().contains(STICKY),
+                is_sticky(code),
+                "{code:?} gave {e}"
+            );
         }
         // Launch geometry, bad arguments and handles, a missing kernel, a context this
         // crate destroyed: each fails the same way on a second attempt.

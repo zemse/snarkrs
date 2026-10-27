@@ -59,8 +59,10 @@ runtime. See the [selection gates](bin/snarkrs/src/main.rs) and
 
 Checked `prove` verifies its proof before returning it. Backend-internal submission
 retries are distinct from CLI proof retries: Metal and native WGPU retry eligible
-interrupted submissions, without switching to CPU. Library proving and browser WebGPU
-proving do not automatically fall back to CPU.
+interrupted submissions, without switching to CPU. CUDA retries no driver call and does not
+rebuild its context: a kernel exception poisons the context for the rest of the process, and
+its device fault says so. Library proving and browser WebGPU proving do not automatically
+fall back to CPU.
 
 The CLI defaults to self-verification and fallback. After a GPU self-verification failure
 or device fault it retries the proof once on that backend, then reloads the key for a
