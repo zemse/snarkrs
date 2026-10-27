@@ -53,7 +53,7 @@
 //! run on the CPU backend can still be finished on the GPU. That path exists for
 //! cross-checks and is reached only when a caller deliberately mixes backends.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use cudarc::driver::CudaModule;
@@ -96,36 +96,33 @@ pub struct CudaBackend {
     work: Work,
     cuda: Cuda,
     stages_module: Arc<CudaModule>,
-    msm_module: Arc<CudaModule>,
+    /// The MSM unit for each [`Work`], variable then constant. The constructor compiles
+    /// the one its work needs and [`Self::prepare`] the other on first use: only the
+    /// constant-work unit carries the constant-work kernels (`kernels::unit_msm_with`).
+    msm_modules: Mutex<[Option<Arc<CudaModule>>; 2]>,
     compile_us: u64,
 }
 
 impl CudaBackend {
     /// Opt-in fixed-work proving, not constant time. See [`Work::Constant`].
     pub fn constant_work() -> Result<Self, ProveError> {
-        Ok(Self::new()?.with_constant_work())
+        Self::open(env_ordinal()?, Work::Constant)
     }
 
-    /// Select constant work for circuits prepared after this call.
+    /// Select constant work for circuits prepared after this call. The first such
+    /// [`Self::prepare`] compiles the constant-work MSM unit, which [`Self::new`] does not.
     pub fn with_constant_work(mut self) -> Self {
         self.work = Work::Constant;
         self
     }
 
-    /// Opens device 0, or the ordinal in `G16_CUDA_DEVICE`, and compiles every kernel.
+    /// Opens device 0, or the ordinal in `G16_CUDA_DEVICE`, and compiles every kernel
+    /// variable work launches.
     ///
     /// Fails on a machine with no usable NVIDIA device rather than falling back to the
     /// CPU, for the reason in the module docs.
     pub fn new() -> Result<Self, ProveError> {
-        let ordinal = match std::env::var("G16_CUDA_DEVICE") {
-            Ok(v) => v.trim().parse::<usize>().map_err(|e| {
-                bad(format!(
-                    "G16_CUDA_DEVICE={v:?} is not a device ordinal: {e}"
-                ))
-            })?,
-            Err(_) => 0,
-        };
-        Self::with_ordinal(ordinal)
+        Self::with_ordinal(env_ordinal()?)
     }
 
     /// Same, on a caller-chosen device ordinal.
@@ -136,6 +133,10 @@ impl CudaBackend {
     /// of `H` before stage 9's read of it. Two contexts, or two streams, and the handoff
     /// would need an event and would be a silent race without one.
     pub fn with_ordinal(ordinal: usize) -> Result<Self, ProveError> {
+        Self::open(ordinal, Work::Variable)
+    }
+
+    fn open(ordinal: usize, work: Work) -> Result<Self, ProveError> {
         let cuda = open_device(ordinal)?;
 
         let t = Instant::now();
@@ -144,7 +145,7 @@ impl CudaBackend {
         // re-trigger the minutes-long ptxas pass over the G2 curve arithmetic, at the cost
         // of one extra NVRTC invocation.
         let stages_module = CudaStages::compile(&cuda)?;
-        let msm_module = CudaMsm::compile(&cuda)?;
+        let msm_module = CudaMsm::compile_with(&cuda, work)?;
         let compile_us = t.elapsed().as_micros() as u64;
 
         if std::env::var_os("G16_CUDA_PREPARE").is_some() {
@@ -157,13 +158,28 @@ impl CudaBackend {
             );
         }
 
+        let mut msm_modules = [None, None];
+        msm_modules[work as usize] = Some(msm_module);
         Ok(Self {
-            work: Work::Variable,
+            work,
             cuda,
             stages_module,
-            msm_module,
+            msm_modules: Mutex::new(msm_modules),
             compile_us,
         })
+    }
+
+    /// The MSM module for this backend's work, compiled here if the constructor compiled
+    /// the other one, and shared by every circuit prepared after.
+    fn msm_module(&self) -> Result<Arc<CudaModule>, ProveError> {
+        let mut modules = self.msm_modules.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = &mut modules[self.work as usize];
+        if let Some(m) = slot.as_ref() {
+            return Ok(m.clone());
+        }
+        let m = CudaMsm::compile_with(&self.cuda, self.work)?;
+        *slot = Some(m.clone());
+        Ok(m)
     }
 
     /// The open context, for a caller that wants to allocate against the same device.
@@ -201,6 +217,18 @@ impl CudaBackend {
 /// catches that so the signature means what it says. Without it there would be no way for
 /// this backend to report "no device" and no way for `tests/pipeline_gpu.rs` to skip, since
 /// the process would already be gone.
+/// Device 0, or the ordinal in `G16_CUDA_DEVICE`.
+fn env_ordinal() -> Result<usize, ProveError> {
+    match std::env::var("G16_CUDA_DEVICE") {
+        Ok(v) => v.trim().parse::<usize>().map_err(|e| {
+            bad(format!(
+                "G16_CUDA_DEVICE={v:?} is not a device ordinal: {e}"
+            ))
+        }),
+        Err(_) => Ok(0),
+    }
+}
+
 fn open_device(ordinal: usize) -> Result<Cuda, ProveError> {
     Cuda::new(ordinal).map_err(|e| bad(format!("no usable CUDA device {ordinal}: {e}")))
 }
@@ -298,7 +326,7 @@ impl CudaCircuit {
         // arkworks and `G2Affine` is 136, neither is `repr(C)`, and both carry an infinity
         // flag that the packed layout encodes as all-zero coordinates instead.
         let t1 = Instant::now();
-        let msm = CudaMsm::from_module(&backend.cuda, backend.msm_module.clone())?.with_key(&pk)?;
+        let msm = CudaMsm::from_module(&backend.cuda, backend.msm_module()?)?.with_key(&pk)?;
         let msm = if backend.work == Work::Constant {
             msm.constant_work()
         } else {

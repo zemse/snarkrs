@@ -761,6 +761,12 @@ extern "C" __global__ void msm_segmented_g2(const MsmEntry* entries,
     msm_segmented_impl<Fq2>(entries, bases, cursor, buckets, spill_pts, spill_rows, p, gid);
 }
 
+// The constant-work accumulation below, the fold and the reduce's constant branch are
+// compiled only into the unit `kernels::unit_msm_with` assembles for constant work, which
+// defines G16_MSM_CONSTANT_WORK. In the default unit they were 15.5 MB of a 46.7 MB PTX,
+// and every process paid for them in `cuModuleLoad` without launching one.
+#ifdef G16_MSM_CONSTANT_WORK
+
 // Stage 4 under constant work (`p.dummy_rows != 0`): the same slices, spill slots and
 // run bookkeeping as `msm_segmented_impl`, with every data-dependent decision made by a
 // select rather than a branch, so a thread's instruction stream, its loads, its stores
@@ -934,6 +940,8 @@ extern "C" __global__ void msm_segmented_constant_g2(const MsmEntry* entries,
     msm_segmented_constant_impl<Fq2>(entries, bases, buckets, spill_pts, spill_rows, p, gid);
 }
 
+#endif // G16_MSM_CONSTANT_WORK
+
 // Fold each bucket's spilled partials into it. One thread per bucket row, and it looks
 // only at the slices its own run overlaps, so there is no search and no atomic.
 template <typename F>
@@ -990,6 +998,8 @@ extern "C" __global__ void msm_merge_g2(PtG2* buckets,
     u32 row = blockIdx.x * blockDim.x + threadIdx.x;
     msm_merge_impl<Fq2>(buckets, spill_pts, spill_rows, counts, cursor, p, row);
 }
+
+#ifdef G16_MSM_CONSTANT_WORK
 
 // Fixed spill tree, ported from Metal msm_fold_impl. No occupancy-sized merge. Only
 // constant-work plans fold, so the accumulator is projective and the addition complete
@@ -1087,6 +1097,8 @@ extern "C" __global__ void msm_fold_g2(const PtG2* in_pts,
     msm_fold_impl<Fq2>(in_pts, in_rows, out_pts, out_rows, buckets, p, f, gid);
 }
 
+#endif // G16_MSM_CONSTANT_WORK
+
 // Stage 5: collapse one window's 2^(c-1) buckets to one point. ONE BLOCK PER WINDOW.
 //
 // The window sum is sum_j (j+1) B_j. Split the buckets into one segment per thread, at
@@ -1148,11 +1160,13 @@ extern "C" __global__ void msm_reduce_g1(const PtG1* buckets, PtG1* window_sums,
         PtG1 variable[REDUCE_TG];
         ProjG1 constant[REDUCE_TG];
     } shared;
+#ifdef G16_MSM_CONSTANT_WORK
     if (p.dummy_rows != 0u) {
         msm_reduce_impl<Fq, ProjG1>(buckets, window_sums, p, shared.constant, blockIdx.x, threadIdx.x, blockDim.x);
-    } else {
-        msm_reduce_impl<Fq, PtG1>(buckets, window_sums, p, shared.variable, blockIdx.x, threadIdx.x, blockDim.x);
+        return;
     }
+#endif
+    msm_reduce_impl<Fq, PtG1>(buckets, window_sums, p, shared.variable, blockIdx.x, threadIdx.x, blockDim.x);
 }
 
 extern "C" __global__ void msm_reduce_g2(const PtG2* buckets, PtG2* window_sums, MsmParams p) {
@@ -1160,11 +1174,13 @@ extern "C" __global__ void msm_reduce_g2(const PtG2* buckets, PtG2* window_sums,
         PtG2 variable[REDUCE_TG];
         ProjG2 constant[REDUCE_TG];
     } shared;
+#ifdef G16_MSM_CONSTANT_WORK
     if (p.dummy_rows != 0u) {
         msm_reduce_impl<Fq2, ProjG2>(buckets, window_sums, p, shared.constant, blockIdx.x, threadIdx.x, blockDim.x);
-    } else {
-        msm_reduce_impl<Fq2, PtG2>(buckets, window_sums, p, shared.variable, blockIdx.x, threadIdx.x, blockDim.x);
+        return;
     }
+#endif
+    msm_reduce_impl<Fq2, PtG2>(buckets, window_sums, p, shared.variable, blockIdx.x, threadIdx.x, blockDim.x);
 }
 
 // The scalar-of-1 path: sum the bases whose scalar is exactly 1, one mixed addition each.

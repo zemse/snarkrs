@@ -43,7 +43,7 @@ mod resources {
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use snarkrs_cuda::msm::{CudaMsm, Job, JobG1, JobG2};
+use snarkrs_cuda::msm::{CudaMsm, Job, JobG1, JobG2, Work};
 use snarkrs_cuda::{Cuda, CudaBackend};
 use snarkrs_field::{
     CurveGroup, Field, Fr, G1Affine, G1Projective, G2Affine, G2Projective, One, PrimeField,
@@ -64,8 +64,9 @@ fn constant_work_matches_cpu_and_variable_for_both_groups() {
     use snarkrs_gpu_layout::{PackedFr, PackedScalar};
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let cuda = Cuda::new(0).expect("NVIDIA gate requires a usable device");
-    let module = CudaMsm::compile(&cuda).expect("NVRTC/PTX compilation");
-    let variable = CudaMsm::from_module(&cuda, module.clone()).unwrap();
+    let variable =
+        CudaMsm::from_module(&cuda, CudaMsm::compile(&cuda).expect("NVRTC/PTX")).unwrap();
+    let module = CudaMsm::compile_with(&cuda, Work::Constant).expect("NVRTC/PTX compilation");
     let constant = CudaMsm::from_module(&cuda, module).unwrap().constant_work();
     assert!(dirty_the_pool(&cuda) > 0);
     let mut seed = 0x921bu64;
@@ -285,8 +286,9 @@ fn constant_work_matches_the_cpu_on_bucket_collisions() {
     on_device(
         "constant_work_matches_the_cpu_on_bucket_collisions",
         |cuda| {
-            let m = CudaMsm::without_key(cuda)
-                .expect("compile the MSM unit")
+            let module = CudaMsm::compile_with(cuda, Work::Constant).expect("compile the MSM unit");
+            let m = CudaMsm::from_module(cuda, module)
+                .expect("bind the MSM kernels")
                 .constant_work();
             let cpu = snarkrs_msm::CpuMsm::new();
             for n in [3usize, 70, 1500, 20_011] {
@@ -947,7 +949,9 @@ fn offsets_select_the_right_sub_msm() {
 #[ignore = "sweeps every window width in both groups and both schedules; minutes on a T4"]
 fn every_window_width_agrees_with_a_naive_sum() {
     on_device("every_window_width_agrees_with_a_naive_sum", |cuda| {
-        let module = CudaMsm::compile(cuda).expect("compile the MSM unit");
+        let variable_module = CudaMsm::compile(cuda).expect("compile the MSM unit");
+        let constant_module =
+            CudaMsm::compile_with(cuda, Work::Constant).expect("compile the MSM unit");
         let mut seed = 0x5EED_C0DE_0000_0C16u64;
         // Around the slice length, and a few thousand that are not powers of two so the
         // last slice of a window is partial and the fat top buckets at c = 12 and 14 span
@@ -996,6 +1000,11 @@ fn every_window_width_agrees_with_a_naive_sum() {
                 for constant in [false, true] {
                     let schedule = if constant { "constant" } else { "variable" };
                     eprintln!("  n = {n}, c = {c}, {schedule} work");
+                    let module = if constant {
+                        &constant_module
+                    } else {
+                        &variable_module
+                    };
                     let m = CudaMsm::from_module(cuda, module.clone())
                         .expect("bind the MSM kernels")
                         .with_window(c);
@@ -1046,7 +1055,7 @@ fn every_window_width_agrees_with_a_naive_sum() {
         // every assertion above vacuous.
         let g = G1Projective::generator().into_affine();
         for c in [1u32, 17] {
-            let m = CudaMsm::from_module(cuda, module.clone())
+            let m = CudaMsm::from_module(cuda, variable_module.clone())
                 .expect("bind the MSM kernels")
                 .with_window(c);
             let db = m.upload_g1_bases(&[g]).expect("upload G1 base");

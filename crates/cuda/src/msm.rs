@@ -895,18 +895,24 @@ struct Kernels {
     accumulate_g2: Kernel,
     segmented_g1: Kernel,
     segmented_g2: Kernel,
-    /// The accumulation for plans with dummy rows: selects instead of branches and the
-    /// complete formulas; see `msm_segmented_constant_impl` in `kernels/msm.cu`.
-    segmented_constant_g1: Kernel,
-    segmented_constant_g2: Kernel,
     merge_g1: Kernel,
     merge_g2: Kernel,
-    fold_g1: Kernel,
-    fold_g2: Kernel,
     reduce_g1: Kernel,
     reduce_g2: Kernel,
     ones_g1: Kernel,
     ones_g2: Kernel,
+    /// Present only in a module from [`CudaMsm::compile_with`] with [`Work::Constant`].
+    constant: Option<ConstantKernels>,
+}
+
+/// The kernels only a constant-work plan launches, compiled only into its unit.
+struct ConstantKernels {
+    /// The accumulation for plans with dummy rows: selects instead of branches and the
+    /// complete formulas; see `msm_segmented_constant_impl` in `kernels/msm.cu`.
+    segmented_g1: Kernel,
+    segmented_g2: Kernel,
+    fold_g1: Kernel,
+    fold_g2: Kernel,
 }
 
 /// Threads a block for the trivial kernels. `zero_u32` and the two bucket clears take six
@@ -980,7 +986,9 @@ struct TestActivity {
 }
 
 impl CudaMsm {
-    /// Opt in to the fixed schedule before uploading scalars or proving.
+    /// Opt in to the fixed schedule before uploading scalars or proving. The object must
+    /// be bound to a module from [`Self::compile_with`] with [`Work::Constant`]; on any
+    /// other the first MSM is refused.
     ///
     /// What stays witness dependent, on the device: which bucket a digit lands in. That
     /// is the digit pipeline's atomics, which contend by occupancy, and the addresses the
@@ -1059,7 +1067,17 @@ impl CudaMsm {
     /// and [`crate::backend::CudaBackend`] compiles here exactly once and hands the same
     /// module to every circuit it prepares.
     pub fn compile(cuda: &Cuda) -> Result<Arc<CudaModule>, ProveError> {
-        cuda.compile("msm", &kernels::unit_msm())
+        Self::compile_with(cuda, Work::Variable)
+    }
+
+    /// [`Self::compile`] for `work`. Only a [`Work::Constant`] module carries the
+    /// constant-work kernels (see [`kernels::unit_msm_with`]), and [`Self::constant_work`]
+    /// on an object bound to any other is refused at the first MSM. That module still runs
+    /// variable work, so one object of each can share it.
+    pub fn compile_with(cuda: &Cuda, work: Work) -> Result<Arc<CudaModule>, ProveError> {
+        let constant = work == Work::Constant;
+        let unit = if constant { "msm-constant" } else { "msm" };
+        cuda.compile(unit, &kernels::unit_msm_with(constant))
             .map_err(ProveError::from)
     }
 
@@ -1082,16 +1100,23 @@ impl CudaMsm {
             accumulate_g2: Kernel::load(&module, "msm_accumulate_g2")?,
             segmented_g1: Kernel::load(&module, "msm_segmented_g1")?,
             segmented_g2: Kernel::load(&module, "msm_segmented_g2")?,
-            segmented_constant_g1: Kernel::load(&module, "msm_segmented_constant_g1")?,
-            segmented_constant_g2: Kernel::load(&module, "msm_segmented_constant_g2")?,
             merge_g1: Kernel::load(&module, "msm_merge_g1")?,
             merge_g2: Kernel::load(&module, "msm_merge_g2")?,
-            fold_g1: Kernel::load(&module, "msm_fold_g1")?,
-            fold_g2: Kernel::load(&module, "msm_fold_g2")?,
             reduce_g1: Kernel::load(&module, "msm_reduce_g1")?,
             reduce_g2: Kernel::load(&module, "msm_reduce_g2")?,
             ones_g1: Kernel::load(&module, "msm_ones_g1")?,
             ones_g2: Kernel::load(&module, "msm_ones_g2")?,
+            // A variable-work unit has no such entry, and that absence is the whole test:
+            // the reduce's constant branch is compiled under the same define.
+            constant: match module.load_function("msm_fold_g1") {
+                Ok(_) => Some(ConstantKernels {
+                    segmented_g1: Kernel::load(&module, "msm_segmented_constant_g1")?,
+                    segmented_g2: Kernel::load(&module, "msm_segmented_constant_g2")?,
+                    fold_g1: Kernel::load(&module, "msm_fold_g1")?,
+                    fold_g2: Kernel::load(&module, "msm_fold_g2")?,
+                }),
+                Err(_) => None,
+            },
         };
 
         let ctx = cuda.context().clone();
@@ -1266,6 +1291,15 @@ impl CudaMsm {
             .ok_or_else(|| bad("msm_batch returned no result for one job"))
     }
 
+    /// The constant-work kernels, or why this object cannot run a constant-work plan.
+    /// Checked before anything is queued: the reduce of a module without them has no
+    /// projective branch, so a plan that reached it would be combined as XYZZ.
+    fn constant_kernels(&self) -> Result<&ConstantKernels, ProveError> {
+        self.k.constant.as_ref().ok_or_else(|| {
+            bad("constant work needs a module from CudaMsm::compile_with(.., Work::Constant)")
+        })
+    }
+
     /// Every MSM in one stream, one synchronize, one readback.
     ///
     /// Jobs that share a scalar buffer, offset and length share their digit pipeline: the A,
@@ -1277,6 +1311,9 @@ impl CudaMsm {
     pub fn msm_batch(&self, jobs: &[Job<'_>]) -> Result<Vec<MsmResult>, ProveError> {
         if jobs.is_empty() {
             return Ok(Vec::new());
+        }
+        if self.work == Work::Constant {
+            self.constant_kernels()?;
         }
 
         for job in jobs {
@@ -1659,9 +1696,10 @@ impl CudaMsm {
     ) -> Result<(), ProveError> {
         let threads = p.n_windows * p.slices;
         if p.dummy_rows != 0 {
+            let k = self.constant_kernels()?;
             let (seg, bases) = match job {
-                Job::G1(j) => (&self.k.segmented_constant_g1, &j.bases.buf),
-                Job::G2(j) => (&self.k.segmented_constant_g2, &j.bases.buf),
+                Job::G1(j) => (&k.segmented_g1, &j.bases.buf),
+                Job::G2(j) => (&k.segmented_g2, &j.bases.buf),
             };
             let cfg = seg.cfg_1d(threads, POINT_BLOCK);
             let mut lb = self.stream.launch_builder(&seg.f);
@@ -1716,9 +1754,10 @@ impl CudaMsm {
         params: &MsmParams,
     ) -> Result<(), ProveError> {
         if p.dummy_rows != 0 {
+            let k = self.constant_kernels()?;
             let fold = match job {
-                Job::G1(_) => &self.k.fold_g1,
-                Job::G2(_) => &self.k.fold_g2,
+                Job::G1(_) => &k.fold_g1,
+                Job::G2(_) => &k.fold_g2,
             };
             let mut in_pts = &out.spill_pts;
             let mut in_rows = &out.spill_rows;
@@ -3149,8 +3188,8 @@ mod tests {
             "run this gate with G16_CUDA_MSM_LEGACY_ACC=0"
         );
         let cuda = Cuda::new(0).expect("NVIDIA work gate requires CUDA");
-        let module = CudaMsm::compile(&cuda).unwrap();
-        let variable = CudaMsm::from_module(&cuda, module.clone()).unwrap();
+        let variable = CudaMsm::from_module(&cuda, CudaMsm::compile(&cuda).unwrap()).unwrap();
+        let module = CudaMsm::compile_with(&cuda, Work::Constant).unwrap();
         let constant = CudaMsm::from_module(&cuda, module).unwrap().constant_work();
         let mut seed = 19u64;
         let n = 129;
@@ -3185,8 +3224,8 @@ mod tests {
             "run this gate with G16_CUDA_MSM_LEGACY_ACC=0"
         );
         let cuda = Cuda::new(0).expect("NVIDIA boundary gate requires CUDA");
-        let module = CudaMsm::compile(&cuda).unwrap();
-        let variable = CudaMsm::from_module(&cuda, module.clone()).unwrap();
+        let variable = CudaMsm::from_module(&cuda, CudaMsm::compile(&cuda).unwrap()).unwrap();
+        let module = CudaMsm::compile_with(&cuda, Work::Constant).unwrap();
         let constant = CudaMsm::from_module(&cuda, module).unwrap().constant_work();
         for (n, c, len) in [
             (0, 2, 3),
@@ -3213,8 +3252,8 @@ mod tests {
             "run this gate with G16_CUDA_MSM_LEGACY_ACC=1"
         );
         let cuda = Cuda::new(0).expect("NVIDIA legacy override gate requires CUDA");
-        let module = CudaMsm::compile(&cuda).unwrap();
-        let variable = CudaMsm::from_module(&cuda, module.clone()).unwrap();
+        let variable = CudaMsm::from_module(&cuda, CudaMsm::compile(&cuda).unwrap()).unwrap();
+        let module = CudaMsm::compile_with(&cuda, Work::Constant).unwrap();
         let constant = CudaMsm::from_module(&cuda, module).unwrap().constant_work();
         let values: Vec<_> = gate_carry_scalars(3)
             .into_iter()
@@ -3445,8 +3484,9 @@ mod tests {
             .unwrap_or(12);
         let warm = 2;
         let cuda = Cuda::new(0).expect("GPU measurement requires CUDA");
-        let m = CudaMsm::without_key(&cuda)
-            .expect("compile MSM unit")
+        let module = CudaMsm::compile_with(&cuda, Work::Constant).expect("compile MSM unit");
+        let m = CudaMsm::from_module(&cuda, module)
+            .expect("bind the MSM kernels")
             .constant_work();
         // Every seventh base at infinity, as the tests' `bases_with_infinity`.
         let mut p1 = G1Projective::generator();

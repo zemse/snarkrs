@@ -85,12 +85,24 @@ pub fn unit_stages() -> String {
 }
 
 /// Stages 5 to 9. Separate from the stages unit because it is by far the largest and
-/// compiling it is most of the prepare cost.
+/// compiling it is most of the prepare cost. Variable work only; see [`unit_msm_with`].
 pub fn unit_msm() -> String {
-    format!(
-        "{}{FR_CUH}\n{CURVE_CUH}\n{MSM_CU}",
-        defines(fft_variants_enabled())
-    )
+    unit_msm_with(false)
+}
+
+/// [`unit_msm`], plus the constant-work kernels when `constant_work` is set: the
+/// `msm_segmented_constant_*` accumulation, the `msm_fold_*` tree and the reduce's
+/// projective branch, behind `G16_MSM_CONSTANT_WORK`. The same define-in-the-source shape
+/// as `G16_FFT_VARIANTS`. Left out of the default unit because the driver's
+/// `cuModuleLoad` pays for every entry a unit carries, in every process: on a T4 with
+/// `~/.nv` warm the unit loads in 185 ms with them (46.7 MB of PTX) and 124 ms without
+/// (31.2 MB), and a cold first compile drops from 476 s to 297 s.
+pub fn unit_msm_with(constant_work: bool) -> String {
+    let mut d = defines(fft_variants_enabled());
+    if constant_work {
+        d.push_str("#define G16_MSM_CONSTANT_WORK 1\n");
+    }
+    format!("{d}{FR_CUH}\n{CURVE_CUH}\n{MSM_CU}")
 }
 
 /// The ceremony group FFT. Its own unit rather than a rider on the MSM one: a unit
