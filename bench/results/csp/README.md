@@ -15,7 +15,7 @@ will get quoted and it is the one that is wrong.
 
 This file was first written from a run on 2026-09-24 at the stock witness generator. Every
 table except the poseidon one and the witness generation section below is from the
-2026-10-27 re-run.
+2026-10-27 re-run; the poseidon one is from 2026-10-28.
 
 ## Method
 
@@ -28,7 +28,7 @@ table except the poseidon one and the witness generation section below is from t
 | witness | witnesscalc, in process, inside the timed region, identical for all three provers |
 | witness generator | `bench/csp/build.rs` as of this commit: the `Fr_mod`/`Fr_idiv` paths of `b414260`, the short products of `e83ee96` and the small `Fr_pow` of `3465d0b`, over generators compiled with `--sanity_check 0` (`f73229f`) |
 | provers | `g16` cpu, `g16` metal, rapidsnark; one loop, only the prover swapped |
-| variants | sha256 and keccak at 128 to 2048 bytes, ecdsa at 32; poseidon is refused, see below |
+| variants | sha256 and keccak at 128 to 2048 bytes, ecdsa at 32; poseidon only under the unblinded exception, see below |
 | memory | 10 samples per variant, `MallocLargeCache=0` in the sampling process |
 | raw output | `bench/results/csp/metrics/*.json`, untracked, which is why the numbers are in this file |
 
@@ -241,26 +241,44 @@ larger per constraint than any hash circuit, because the width-12 comb table is 
 and `preprocessing_size` is 412,467,641 bytes once the 59.5 MB `.cpp` and 18.6 MB `.dat`
 the page counts are added.
 
-## poseidon, not re-run
+## poseidon, unblinded
 
 The five poseidon keys on the page are unblinded: `gamma_g2` equals `delta_g2`, so anyone
-can forge a proof against them. `ProvingKey::load` now refuses such a key, and every path
-in the harness loads through it, so the 2026-10-27 run stopped at `poseidon_2` on all three
-provers. The September numbers, at the stock witness generator, are the last ones there are:
+can forge a proof against them. `ProvingKey::load` refuses such a key, so these rows were
+measured on 2026-10-28 at `a02df99` under `--allow-unblinded-zkey`, which skips that one
+comparison and runs every other check. Every row here is labelled `unblinded` in its
+`feat` (`cpu-unblinded`, `metal-unblinded`, `auto-cpu-unblinded`, rapidsnark's
+`unblinded`); none of them is fit for submission. Same protocol as the hash rows, one
+warm-up then the mean of 10, 10 memory samples, each pass started under the contention
+guard. The cell is the median of three passes; the old cell is the September run at the
+stock witness generator.
 
-| variant | constraints | rapidsnark | g16 cpu | g16 metal |
-| ------- | ----------: | ---------: | ------: | --------: |
-| `poseidon_2` | 517 | 11.03 | **5.15** | 20.69 |
-| `poseidon_4` | 736 | 11.61 | **5.56** | 19.80 |
-| `poseidon_8` | 1,171 | 14.45 | **7.63** | 20.93 |
-| `poseidon_12` | 1,613 | 15.69 | **8.37** | 21.40 |
-| `poseidon_16` | 2,092 | 18.74 | **15.77** | 34.94 |
+| variant | constraints | rapidsnark | g16 cpu | g16 auto | g16 metal | cpu, September |
+| ------- | ----------: | ---------: | ------: | -------: | --------: | -------------: |
+| `poseidon_2` | 517 | 10.82 | **5.82** | 6.17 | 17.92 | 5.15 |
+| `poseidon_4` | 736 | 11.75 | **6.41** | 6.08 | 17.69 | 5.56 |
+| `poseidon_8` | 1,171 | 14.69 | **7.95** | 7.51 | 18.54 | 7.63 |
+| `poseidon_12` | 1,613 | 15.65 | **8.34** | 8.11 | 18.44 | 8.37 |
+| `poseidon_16` | 2,092 | 19.74 | **9.88** | 9.91 | 20.96 | 15.77 |
 
-At 517 to 2,092 constraints Metal lost to both, because its prepare and prove summed to
-about 19.5 ms from `poseidon_2` to `poseidon_12`: dispatch and upload, not arithmetic. Their constraint counts and
-key bytes matched the published row exactly, which is why poseidon needed no per-constraint
-correction. `G16_CSP_ALLOW_UNBLINDED=1` now times these keys under a labelled exception,
-described in `bench/csp/README.md`; they have not been re-measured with it.
+`auto` runs the CPU on every poseidon size, all of them under 65,536 constraints, so it and
+the cpu column are the same prover measured twice: the gap between them, up to 6%, is the
+noise at these sizes. Peak RSS is 14 to 21 MiB on the CPU and 37 to 45 MiB on Metal.
+
+The CPU went from 15.77 to 9.88 ms at `poseidon_16` and is 1.8x to 2.0x rapidsnark at
+every size. At `poseidon_2` and `poseidon_4` it is 13% and 15% slower than the September
+cell, beyond the noise here and not explained: rapidsnark, which shares the witness, moved
+by under 6%. Of the 5.82 ms at `poseidon_2`, 4.27 is `prove_ms` (2.12 of it MSM), 1.07 the
+zkey read, 0.25 the witness and 0.23 the prepare.
+
+Metal loses to both at every size, because its prepare and prove come to 16 to 19 ms
+whatever the circuit: dispatch and pipeline setup, not arithmetic. Its column is the median
+of six back-to-back passes. The first two Metal passes of the session came in at 30 to 55
+ms per proof, and the third at 19 to 22, before settling; they are left out. Why the first
+runs of a session are slower was not isolated.
+
+Constraint counts and key bytes match the published row exactly, which is why poseidon
+needs no per-constraint correction.
 
 ## Witness generation: 1.37x, and where the rest of it is
 
