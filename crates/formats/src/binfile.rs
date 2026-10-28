@@ -35,6 +35,10 @@ pub const FQ_BYTES: usize = 32;
 pub const G1_BYTES: usize = FQ_BYTES * 2;
 pub const G2_BYTES: usize = FQ_BYTES * 4;
 pub const FR_BYTES: usize = 32;
+/// The fewest bytes a parallel decode hands one task. Below it the pass runs on the
+/// calling thread: waking the pool for a few records cost poseidon_2's 254 KB key half
+/// of its 1 ms load.
+pub const MIN_TASK_BYTES: usize = 1 << 14;
 
 /// Where a binfile's bytes live. Both variants deref to `&[u8]`, so nothing below this
 /// type, and no decoder in `lib.rs` or `wtns.rs`, knows which one it got.
@@ -574,6 +578,7 @@ where
 {
     collect_records(
         data.par_chunks_exact(stride)
+            .with_min_len(MIN_TASK_BYTES.div_ceil(stride))
             .enumerate()
             .map(|(i, b)| decode(i, b)),
         fallback,

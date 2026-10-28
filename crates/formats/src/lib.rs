@@ -551,7 +551,23 @@ impl ProvingKey {
         let coeffs = read_coefficients(&file.map_section(4)?, n_vars, domain_size, sink)?;
         let a_query = read_g1_section(&file, 5, n_vars, check, sink)?;
         let b_g1_query = read_g1_section(&file, 6, n_vars, check, sink)?;
-        let b_g2_query = read_g2_section(&file, 7, n_vars, check)?;
+        // The header's three G2 subgroup checks are 50 us each, so they run beside the
+        // section 7 decode and are reported in the order below, after any section error.
+        let (b_g2_query, (beta2, (gamma2, delta2))) = rayon::join(
+            || read_g2_section(&file, 7, n_vars, check),
+            || {
+                rayon::join(
+                    || check_g2(&beta_g2, 2, "beta_g2"),
+                    || {
+                        rayon::join(
+                            || check_g2(&gamma_g2, 2, "gamma_g2"),
+                            || check_g2(&delta_g2, 2, "delta_g2"),
+                        )
+                    },
+                )
+            },
+        );
+        let b_g2_query = b_g2_query?;
         let l_query = read_g1_section(&file, 8, n_vars - n_ic, check, sink)?;
         let h_query = read_g1_section(&file, 9, domain_size, check, sink)?;
 
@@ -562,10 +578,10 @@ impl ProvingKey {
         // proof twenty seconds later.
         check_g1(&alpha_g1, 2, "alpha_g1")?;
         check_g1(&beta_g1, 2, "beta_g1")?;
-        check_g2(&beta_g2, 2, "beta_g2")?;
-        check_g2(&gamma_g2, 2, "gamma_g2")?;
+        beta2?;
+        gamma2?;
         check_g1(&delta_g1, 2, "delta_g1")?;
-        check_g2(&delta_g2, 2, "delta_g2")?;
+        delta2?;
         // And none of the six may be the point at infinity. This is the gate that stops a
         // malicious key from silently switching zero knowledge off.
         //
@@ -759,6 +775,7 @@ fn read_g1_section<S: KeySink>(
             .par_chunks_exact(G1_BYTES)
             .zip(points.par_iter_mut())
             .zip(infinity.par_iter_mut())
+            .with_min_len(MIN_TASK_BYTES / G1_BYTES)
             .enumerate()
             .map(|(i, ((b, out), inf))| {
                 let p = decode(i, b).unwrap_or_else(|e| {
@@ -880,6 +897,7 @@ fn read_coefficients<S: KeySink>(
     let first_err = FirstError::default();
     (0..n_coefs)
         .into_par_iter()
+        .with_min_len(MIN_TASK_RECORDS)
         .for_each(|i| match check_record(i) {
             Ok((m, constraint)) => {
                 counts[m][constraint + 1].fetch_add(1, Ordering::Relaxed);
@@ -947,7 +965,8 @@ fn read_coefficients<S: KeySink>(
     // `Some` for an index error, which the serial pass reported after any bad value in an
     // earlier record; `None` for a matrix id, which it reported as it was.
     let first_err = FirstError::default();
-    (0..n_coefs).into_par_iter().for_each(|i| {
+    let records = (0..n_coefs).into_par_iter().with_min_len(MIN_TASK_RECORDS);
+    records.for_each(|i| {
         let (m, constraint, sig, _) = match coef_indices(data, i) {
             Ok(r) => r,
             Err(e) => return first_err.record(i, (e, false)),
@@ -1011,6 +1030,7 @@ fn read_coefficients<S: KeySink>(
                 let values = collect_records(
                     distinct
                         .par_iter()
+                        .with_min_len(MIN_TASK_BYTES / FR_BYTES)
                         .map(|b| fr_double_montgomery(&b[..], &r_inv)),
                     Fr::zero(),
                 );
@@ -1028,13 +1048,22 @@ fn read_coefficients<S: KeySink>(
             }
             None => {
                 let values = collect_records(
-                    a.par_iter().chain(b).map(|&i| value_of(i as usize)),
+                    a.par_iter()
+                        .chain(b)
+                        .with_min_len(MIN_TASK_BYTES / FR_BYTES)
+                        .map(|&i| value_of(i as usize)),
                     Fr::zero(),
                 )?;
                 let n_a = a.len() as u32;
                 let value_id = [
-                    (0..n_a).into_par_iter().collect(),
-                    (n_a..n_a + b.len() as u32).into_par_iter().collect(),
+                    (0..n_a)
+                        .into_par_iter()
+                        .with_min_len(MIN_TASK_RECORDS)
+                        .collect(),
+                    (n_a..n_a + b.len() as u32)
+                        .into_par_iter()
+                        .with_min_len(MIN_TASK_RECORDS)
+                        .collect(),
                 ];
                 (value_id, values)
             }
@@ -1051,6 +1080,7 @@ fn read_coefficients<S: KeySink>(
         d.value
             .par_iter_mut()
             .zip(source[m].par_iter())
+            .with_min_len(MIN_TASK_BYTES / FR_BYTES)
             .enumerate()
             .for_each(|(slot, (out, &i))| match value_of(i as usize) {
                 Ok(v) => *out = S::fr(&v),
@@ -1067,6 +1097,9 @@ fn read_coefficients<S: KeySink>(
     })
 }
 
+/// The fewest section 4 records a parallel pass over indices alone hands one task, for
+/// the same reason as [`MIN_TASK_BYTES`]: such a record costs a few nanoseconds.
+const MIN_TASK_RECORDS: usize = 1 << 14;
 /// Slots per chunk of [`intern`]'s parallel pass.
 const INTERN_CHUNK: usize = 1 << 16;
 /// Lines in each chunk's cache of recently seen values.
