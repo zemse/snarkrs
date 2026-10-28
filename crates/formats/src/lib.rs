@@ -1004,6 +1004,16 @@ unsafe fn sort_row(source: &Rows<'_>, signal: &Rows<'_>, lo: usize, hi: usize) {
     assert!(lo <= hi && hi <= source.len && hi <= signal.len);
     let src = std::slice::from_raw_parts_mut(source.ptr.add(lo), hi - lo);
     let sig = std::slice::from_raw_parts_mut(signal.ptr.add(lo), hi - lo);
+    // Insertion sort is quadratic, and a key may put any number of records in one row.
+    if src.len() > 32 {
+        let mut pairs: Vec<(u32, u32)> = src.iter().copied().zip(sig.iter().copied()).collect();
+        pairs.sort_unstable_by_key(|&(i, _)| i);
+        for (k, (i, s)) in pairs.into_iter().enumerate() {
+            src[k] = i;
+            sig[k] = s;
+        }
+        return;
+    }
     for k in 1..src.len() {
         let mut j = k;
         while j > 0 && src[j - 1] > src[j] {
