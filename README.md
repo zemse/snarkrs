@@ -69,13 +69,13 @@ phase 2, the proving key, run once per circuit:
 <tr><th align="right">g16 cuda (ms)</th><th align="right">g16 cpu (ms)</th><th align="right">rapidsnark (ms)</th><th align="right">snarkjs (ms)</th></tr>
 </thead>
 <tbody>
-<tr><td><code>railgun-01x01</code></td><td align="right">20,135</td><td align="right">23.4</td><td align="right">117.7</td><td align="right">170.3</td><td align="right"></td></tr>
-<tr><td><code>tornado</code></td><td align="right">28,275</td><td align="right">31.6</td><td align="right">197.4</td><td align="right">296.1</td><td align="right"></td></tr>
-<tr><td><code>sha256</code></td><td align="right">59,281</td><td align="right">18.0</td><td align="right">97.1</td><td align="right">178.5</td><td align="right"></td></tr>
-<tr><td><code>railgun-13x01</code></td><td align="right">141,276</td><td align="right">135.1</td><td align="right">686.4</td><td align="right">1169.4</td><td align="right"></td></tr>
-<tr><td><code>rsa2048</code></td><td align="right">190,945</td><td align="right">65.2</td><td align="right">374.3</td><td align="right">760.5</td><td align="right"></td></tr>
-<tr><td><code>keccak256</code></td><td align="right">239,176</td><td align="right">52.1</td><td align="right">349.3</td><td align="right">657.2</td><td align="right"></td></tr>
-<tr><td><code>anon-aadhaar</code></td><td align="right">1,115,080</td><td align="right">415.2</td><td align="right">2538.9</td><td align="right">5206.9</td><td align="right"></td></tr>
+<tr><td><code>railgun-01x01</code></td><td align="right">20,135</td><td align="right">22.8</td><td align="right">117.7</td><td align="right">172.2</td><td align="right"></td></tr>
+<tr><td><code>tornado</code></td><td align="right">28,275</td><td align="right">31.3</td><td align="right">197.1</td><td align="right">299.7</td><td align="right"></td></tr>
+<tr><td><code>sha256</code></td><td align="right">59,281</td><td align="right">15.6</td><td align="right">97.5</td><td align="right">178.8</td><td align="right"></td></tr>
+<tr><td><code>railgun-13x01</code></td><td align="right">141,276</td><td align="right">132.0</td><td align="right">693.1</td><td align="right">1166.0</td><td align="right"></td></tr>
+<tr><td><code>rsa2048</code></td><td align="right">190,945</td><td align="right">61.0</td><td align="right">370.8</td><td align="right">754.8</td><td align="right"></td></tr>
+<tr><td><code>keccak256</code></td><td align="right">239,176</td><td align="right">50.1</td><td align="right">355.6</td><td align="right">661.1</td><td align="right"></td></tr>
+<tr><td><code>anon-aadhaar</code></td><td align="right">1,115,080</td><td align="right">394.4</td><td align="right">2521.6</td><td align="right">5219.0</td><td align="right"></td></tr>
 </tbody>
 </table>
 
