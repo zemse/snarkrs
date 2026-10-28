@@ -82,7 +82,7 @@ phase 2, the proving key, run once per circuit:
 > blank = not measurable on this box: snarkjs has no warm mode, its CLI starts a fresh
 > process per proof. Its cold numbers are in `bench/results/machines/`.
 
-> note: g16 cpu here is built with `RUSTFLAGS="-C target-feature=+adx,+bmi2"`, as the x86_64 release binaries are. A build without the flags now runs the same field assembly, choosing the mulx multiply at run time when CPUID reports ADX and BMI2, and measured 1.4% to 4.3% slower on this box. Before that dispatch it was 1.5x to 1.6x slower and lost to rapidsnark on the two smallest circuits.
+> note: g16 cpu here is built with `RUSTFLAGS="-C target-feature=+adx,+bmi2"`, as the x86_64 release binaries are. A build without the flags now runs the same field assembly, choosing the mulx multiply at run time when CPUID reports ADX and BMI2, and measured 1.5% to 3.0% slower on this box. Before that dispatch it was 1.5x to 1.6x slower and lost to rapidsnark on the two smallest circuits.
 
 > note: constraint count is a poor predictor of proving time. e.g. `railgun-13x01` has fewer constraints than `keccak256` but takes more to prove.
 
