@@ -147,7 +147,9 @@ impl CsrHost {
         for matrix in Matrix::BOTH {
             let m = matrix.index();
             signal.extend_from_slice(&coeffs.signal[m]);
-            push_fr_words(&coeffs.value[m], &mut value);
+            for &id in &coeffs.value_id[m] {
+                value.extend_from_slice(&PackedFr::from_fr(&coeffs.values[id as usize]).v);
+            }
         }
 
         Ok(Self {
@@ -894,7 +896,8 @@ mod tests {
         Coefficients {
             row_ptr: [vec![0, 1, 1, 2, 2], vec![0, 1, 1, 2, 2]],
             signal: [vec![0, 1], vec![0, 1]],
-            value: [vec![Fr::from(1u64); 2], vec![Fr::from(1u64); 2]],
+            value_id: [vec![0; 2], vec![0; 2]],
+            values: vec![Fr::from(1u64)],
         }
     }
 
@@ -939,7 +942,7 @@ mod tests {
             let mut c = coefficients();
             c.row_ptr[m].fill(0);
             c.signal[m].clear();
-            c.value[m].clear();
+            c.value_id[m].clear();
             let host = CsrHost::build(&c, 4, 2).unwrap();
             assert_eq!(host.nnz[m], 0);
             assert_eq!(host.signal.len(), 2);

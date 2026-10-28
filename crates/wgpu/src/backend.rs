@@ -466,17 +466,23 @@ impl WgpuCircuit {
         let Coefficients {
             row_ptr,
             signal,
-            value,
+            value_id,
+            values,
         } = std::mem::replace(
             &mut pk.coeffs,
             Coefficients {
                 row_ptr: Default::default(),
                 signal: Default::default(),
-                value: Default::default(),
+                value_id: Default::default(),
+                values: Vec::new(),
             },
         );
-        row_ptr.into_iter().chain(signal).for_each(release);
-        value.into_iter().for_each(release);
+        row_ptr
+            .into_iter()
+            .chain(signal)
+            .chain(value_id)
+            .for_each(release);
+        release(values);
         release(std::mem::take(&mut pk.a_query));
         release(std::mem::take(&mut pk.b_g1_query));
         release(std::mem::take(&mut pk.b_g2_query));
@@ -1109,7 +1115,7 @@ mod tests {
                 [
                     key.coeffs.row_ptr[m].len(),
                     key.coeffs.signal[m].len(),
-                    key.coeffs.value[m].len()
+                    key.coeffs.value_id[m].len()
                 ],
                 [0; 3]
             );
@@ -1117,11 +1123,12 @@ mod tests {
                 [
                     key.coeffs.row_ptr[m].capacity(),
                     key.coeffs.signal[m].capacity(),
-                    key.coeffs.value[m].capacity()
+                    key.coeffs.value_id[m].capacity()
                 ],
                 [0; 3]
             );
         }
+        assert_eq!(key.coeffs.values.capacity(), 0);
     }
 
     #[test]

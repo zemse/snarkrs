@@ -1349,11 +1349,7 @@ fn synthetic_key(domain_size: usize, n_vars: usize, seed: &mut u64) -> ProvingKe
         b_g2_query: g2,
         l_query: g1(n_vars - n_public - 1),
         h_query: g1(domain_size),
-        coeffs: Coefficients {
-            row_ptr: [rp0, rp1],
-            signal: [sg0, sg1],
-            value: [v0, v1],
-        },
+        coeffs: Coefficients::from_values([rp0, rp1], [sg0, sg1], [v0, v1]),
         vk: VerifyingKey {
             alpha_g1: one,
             beta_g2: one2,

@@ -341,11 +341,7 @@ fn synthetic_coeffs(rng: &mut SplitMix64, n_rows: usize, n_vars: usize) -> Coeff
             row_ptr[m].push(signal[m].len() as u32);
         }
     }
-    Coefficients {
-        row_ptr,
-        signal,
-        value,
-    }
+    Coefficients::from_values(row_ptr, signal, value)
 }
 
 /// A proving key carrying only what stages 0 to 4 read.
@@ -489,13 +485,13 @@ fn a_key_with_no_coefficients_still_binds() {
         let mut pk = synthetic_key(&mut rng, n, n_vars);
         pk.coeffs.row_ptr[1] = vec![0u32; n + 1];
         pk.coeffs.signal[1].clear();
-        pk.coeffs.value[1].clear();
+        pk.coeffs.value_id[1].clear();
         if empty_a {
             pk.coeffs.row_ptr[0] = vec![0u32; n + 1];
             pk.coeffs.signal[0].clear();
-            pk.coeffs.value[0].clear();
+            pk.coeffs.value_id[0].clear();
         }
-        let nnz_a = pk.coeffs.value[0].len();
+        let nnz_a = pk.coeffs.value_id[0].len();
         assert_eq!(
             nnz_a == 0,
             empty_a,

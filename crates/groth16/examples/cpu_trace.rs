@@ -71,7 +71,7 @@ fn trace(pk: &ProvingKey, witness: &[Fr]) -> Result<Value, Box<dyn Error>> {
             "matrix": m, "coefficient_visits": signals.len(),
             "zero_skips": zeros, "one_shortcuts": ones,
             "Fr_mul": signals.len() - zeros - ones, "Fr_add": signals.len() - zeros,
-            "coefficient_storage_bytes": std::mem::size_of_val(pk.coeffs.value[m].as_slice()),
+            "coefficient_storage_bytes": std::mem::size_of_val(pk.coeffs.value_id[m].as_slice()),
             "signal_storage_bytes": std::mem::size_of_val(signals.as_slice()),
             "row_pointer_storage_bytes": std::mem::size_of_val(pk.coeffs.row_ptr[m].as_slice())
         }));

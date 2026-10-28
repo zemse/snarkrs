@@ -134,7 +134,8 @@ impl CpuCircuit {
         let m = matrix.index();
         let row_ptr = &self.pk.coeffs.row_ptr[m];
         let signal = &self.pk.coeffs.signal[m];
-        let value = &self.pk.coeffs.value[m];
+        let value_id = &self.pk.coeffs.value_id[m];
+        let values = &self.pk.coeffs.values;
 
         (0..self.domain.size())
             .into_par_iter()
@@ -153,10 +154,11 @@ impl CpuCircuit {
                     if w.is_zero() {
                         continue;
                     }
+                    let v = values[value_id[k] as usize];
                     if w.is_one() {
-                        acc += value[k];
+                        acc += v;
                     } else {
-                        acc += value[k] * w;
+                        acc += v * w;
                     }
                 }
                 acc
@@ -496,7 +498,8 @@ mod tests {
             coeffs: Coefficients {
                 row_ptr: [vec![0, 1, 1, 2, 2], vec![0, 1, 1, 2, 2]],
                 signal: [vec![0, 1], vec![0, 1]],
-                value: [vec![Fr::one(); 2], vec![Fr::one(); 2]],
+                value_id: [vec![0; 2], vec![0; 2]],
+                values: vec![Fr::one()],
             },
             vk: VerifyingKey {
                 alpha_g1: G1Affine::identity(),
@@ -549,7 +552,8 @@ mod tests {
         let coefficients = (
             pk.coeffs.row_ptr.clone(),
             pk.coeffs.signal.clone(),
-            pk.coeffs.value.clone(),
+            pk.coeffs.value_id.clone(),
+            pk.coeffs.values.clone(),
         );
         let queries = (
             pk.a_query.clone(),
@@ -594,8 +598,18 @@ mod tests {
             (vk.0, vk.1, vk.2, vk.3, &vk.4)
         );
         assert_eq!(
-            (&key.coeffs.row_ptr, &key.coeffs.signal, &key.coeffs.value),
-            (&coefficients.0, &coefficients.1, &coefficients.2)
+            (
+                &key.coeffs.row_ptr,
+                &key.coeffs.signal,
+                &key.coeffs.value_id,
+                &key.coeffs.values
+            ),
+            (
+                &coefficients.0,
+                &coefficients.1,
+                &coefficients.2,
+                &coefficients.3
+            )
         );
         assert_eq!(
             (
@@ -712,7 +726,7 @@ mod tests {
                     .windows(2)
                     .map(|row| {
                         (row[0] as usize..row[1] as usize)
-                            .map(|k| coeffs.value[m][k] * witness[coeffs.signal[m][k] as usize])
+                            .map(|k| coeffs.value(m, k) * witness[coeffs.signal[m][k] as usize])
                             .sum()
                     })
                     .collect();

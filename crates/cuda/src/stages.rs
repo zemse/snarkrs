@@ -416,7 +416,7 @@ impl CudaStages {
             up_u32(&pk.coeffs.row_ptr[b])?,
         ];
         let signal = [up_u32(&pk.coeffs.signal[a])?, up_u32(&pk.coeffs.signal[b])?];
-        let value = [up_fr(&pk.coeffs.value[a])?, up_fr(&pk.coeffs.value[b])?];
+        let value = [up_fr(&pk.coeffs.dense(a))?, up_fr(&pk.coeffs.dense(b))?];
         let tw_fwd = up_fr(&domain.twiddles())?;
         let tw_inv = up_fr(&domain.twiddles_inv())?;
         let coset_pows = up_fr(&pows)?;

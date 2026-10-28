@@ -92,23 +92,69 @@ impl Matrix {
 /// race-free gather that both backends share. This is a one-time cost paid in `prepare`,
 /// never per proof.
 ///
+/// The values are interned. A key holds few distinct coefficients (31 in keccak_2048's
+/// 11.9 million records, 878 in anon-aadhaar's 3.3 million), so each nonzero stores a
+/// `u32` index into `values` rather than a 32-byte `Fr` of its own: on keccak_2048, 48 MB
+/// of indices in place of 381 MB of values, which the CPU backend holds for the life of
+/// the circuit.
+///
 /// The fields are `pub`, so a hand-built `Coefficients` can hold anything. What
 /// `read_coefficients` upholds, and what a consumer of a parsed key may assume, is:
 /// `row_ptr[m].len() == domain_size + 1`; `row_ptr[m][0] == 0`;
 /// `row_ptr[m]` is non-decreasing;
-/// `row_ptr[m][domain_size] == signal[m].len() == value[m].len()`; and every
-/// `signal[m][k] < n_vars`. The backends re-check these at prepare time with
-/// [`Coefficients::check_structure`] because a key built by hand is still reachable.
+/// `row_ptr[m][domain_size] == signal[m].len() == value_id[m].len()`; every
+/// `signal[m][k] < n_vars`; and every `value_id[m][k] < values.len()`. The backends
+/// re-check these at prepare time with [`Coefficients::check_structure`] because a key
+/// built by hand is still reachable.
 pub struct Coefficients {
-    /// `row_ptr[m][c]..row_ptr[m][c+1]` indexes into `signal`/`value`, for matrix `m`,
+    /// `row_ptr[m][c]..row_ptr[m][c+1]` indexes into `signal`/`value_id`, for matrix `m`,
     /// indexed by [`Matrix::index`]. Transposing them is silent and produces a proof
     /// that does not verify.
     pub row_ptr: [Vec<u32>; 2],
     pub signal: [Vec<u32>; 2],
-    pub value: [Vec<Fr>; 2],
+    /// Nonzero `k` of matrix `m` is `values[value_id[m][k]]`.
+    pub value_id: [Vec<u32>; 2],
+    /// The distinct values of both matrices.
+    pub values: Vec<Fr>,
 }
 
 impl Coefficients {
+    /// A key built by hand, one value per nonzero, interned.
+    pub fn from_values(row_ptr: [Vec<u32>; 2], signal: [Vec<u32>; 2], value: [Vec<Fr>; 2]) -> Self {
+        let mut ids = std::collections::HashMap::new();
+        let mut values = Vec::new();
+        let value_id = value.map(|v| {
+            v.iter()
+                .map(|x| {
+                    *ids.entry(*x).or_insert_with(|| {
+                        values.push(*x);
+                        (values.len() - 1) as u32
+                    })
+                })
+                .collect()
+        });
+        Self {
+            row_ptr,
+            signal,
+            value_id,
+            values,
+        }
+    }
+
+    /// Nonzero `k` of matrix `m`.
+    pub fn value(&self, m: usize, k: usize) -> Fr {
+        self.values[self.value_id[m][k] as usize]
+    }
+
+    /// Matrix `m`'s values in nonzero order, for a backend that uploads them one per
+    /// nonzero.
+    pub fn dense(&self, m: usize) -> Vec<Fr> {
+        self.value_id[m]
+            .par_iter()
+            .map(|&id| self.values[id as usize])
+            .collect()
+    }
+
     /// Check both matrices' CSR bounds against the domain and witness length. Paid once
     /// per key, before a backend uploads or gathers a hand-built key's coefficients.
     pub fn check_structure(&self, domain_size: usize, n_vars: usize) -> Result<(), ZkeyError> {
@@ -118,10 +164,24 @@ impl Coefficients {
                 matrix,
                 &self.row_ptr[m],
                 &self.signal[m],
-                self.value[m].len(),
+                self.value_id[m].len(),
                 domain_size,
                 n_vars,
             )?;
+            let n = self.values.len();
+            let past = self.value_id[m]
+                .par_iter()
+                .position_first(|&id| id as usize >= n);
+            if let Some(k) = past {
+                return Err(ZkeyError::Malformed {
+                    section: 4,
+                    reason: format!(
+                        "matrix {} nonzero {k} references value {} beyond the {n} values",
+                        matrix.name(),
+                        self.value_id[m][k]
+                    ),
+                });
+            }
         }
         Ok(())
     }
@@ -936,13 +996,54 @@ fn read_coefficients<S: KeySink>(
     }
 
     let Some(into) = into else {
-        let [a, b] = source
-            .map(|src| collect_records(src.par_iter().map(|&i| value_of(i as usize)), Fr::zero()));
-        let value = [a?, b?];
+        let raw = |i: u32| -> &[u8; FR_BYTES] {
+            let off = 4 + i as usize * COEF_RECORD + 12;
+            data[off..off + FR_BYTES]
+                .try_into()
+                .expect("slice is FR_BYTES long")
+        };
+        let [a, b] = &source;
+        let (value_id, values) = match intern(&source, raw) {
+            // Every record's value is one of `distinct`, so decoding those checks them
+            // all. On a failure, the error is the first slot's in A then B, as it is when
+            // every slot is decoded.
+            Some((value_id, distinct)) => {
+                let values = collect_records(
+                    distinct
+                        .par_iter()
+                        .map(|b| fr_double_montgomery(&b[..], &r_inv)),
+                    Fr::zero(),
+                );
+                let values = match values {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return Err(a
+                            .iter()
+                            .chain(b)
+                            .find_map(|&i| value_of(i as usize).err())
+                            .expect("a distinct value failed, so some record's did"))
+                    }
+                };
+                (value_id, values)
+            }
+            None => {
+                let values = collect_records(
+                    a.par_iter().chain(b).map(|&i| value_of(i as usize)),
+                    Fr::zero(),
+                )?;
+                let n_a = a.len() as u32;
+                let value_id = [
+                    (0..n_a).into_par_iter().collect(),
+                    (n_a..n_a + b.len() as u32).into_par_iter().collect(),
+                ];
+                (value_id, values)
+            }
+        };
         return Ok(Coefficients {
             row_ptr,
             signal: kept,
-            value,
+            value_id,
+            values,
         });
     };
     for (m, d) in into.into_iter().enumerate() {
@@ -961,8 +1062,102 @@ fn read_coefficients<S: KeySink>(
     Ok(Coefficients {
         row_ptr: Default::default(),
         signal: Default::default(),
-        value: Default::default(),
+        value_id: Default::default(),
+        values: Vec::new(),
     })
+}
+
+/// Slots per chunk of [`intern`]'s parallel pass.
+const INTERN_CHUNK: usize = 1 << 16;
+/// Lines in each chunk's cache of recently seen values.
+const INTERN_LINES: usize = 1 << 12;
+/// Fewer nonzeros than this keep a value each. Interning saves such a key at most 7 MB,
+/// and with a chunk or two to spread over it loaded tornado's 88 thousand 0.3 ms slower
+/// than decoding every value.
+const INTERN_MIN: usize = 1 << 18;
+
+/// Both matrices' slot indices, and the distinct raw values they index.
+type Interned<'d> = ([Vec<u32>; 2], Vec<&'d [u8; FR_BYTES]>);
+
+/// Each slot's index into the distinct raw values of both matrices, and those values in
+/// first-seen order, A before B. `raw(i)` is record `i`'s value bytes, and `source[m]`
+/// names the record behind each slot of matrix `m`.
+///
+/// Each chunk interns its slots into a map of its own, then a serial merge numbers the
+/// chunks' values and a second parallel pass renumbers each chunk's slots. `None` for a
+/// key below [`INTERN_MIN`] nonzeros, or whose chunks hold more than one distinct value
+/// per eight slots: it is not worth a map, and its slots keep a value each, which is 4
+/// bytes per nonzero more than storing the values alone and costs no merge.
+fn intern<'d>(
+    source: &[Vec<u32>; 2],
+    raw: impl Fn(u32) -> &'d [u8; FR_BYTES] + Sync,
+) -> Option<Interned<'d>> {
+    use std::collections::HashMap;
+
+    let total = source[0].len() + source[1].len();
+    if total < INTERN_MIN {
+        return None;
+    }
+    let mut value_id = source.each_ref().map(|s| vec![0u32; s.len()]);
+    let [id_a, id_b] = &mut value_id;
+    let local: Vec<Vec<&[u8; FR_BYTES]>> = id_a
+        .par_chunks_mut(INTERN_CHUNK)
+        .zip(source[0].par_chunks(INTERN_CHUNK))
+        .chain(
+            id_b.par_chunks_mut(INTERN_CHUNK)
+                .zip(source[1].par_chunks(INTERN_CHUNK)),
+        )
+        .map(|(ids, src)| {
+            let mut seen = HashMap::new();
+            let mut distinct = Vec::new();
+            // A direct-mapped cache in front of the map, on the value's low 12 bits, which
+            // are as good as random for a Montgomery form: most slots hit it and skip the
+            // hash.
+            let mut recent: Vec<Option<(&[u8; FR_BYTES], u32)>> = vec![None; INTERN_LINES];
+            for (id, &i) in ids.iter_mut().zip(src) {
+                let b = raw(i);
+                let line = u16::from_le_bytes([b[0], b[1]]) as usize % INTERN_LINES;
+                if let Some((k, v)) = recent[line] {
+                    if k == b {
+                        *id = v;
+                        continue;
+                    }
+                }
+                *id = *seen.entry(b).or_insert_with(|| {
+                    distinct.push(b);
+                    (distinct.len() - 1) as u32
+                });
+                recent[line] = Some((b, *id));
+            }
+            distinct
+        })
+        .collect();
+    if local.iter().map(Vec::len).sum::<usize>() > total / 8 {
+        return None;
+    }
+
+    let mut seen = HashMap::new();
+    let mut distinct = Vec::new();
+    let renumber: Vec<Vec<u32>> = local
+        .iter()
+        .map(|chunk| {
+            chunk
+                .iter()
+                .map(|&b| {
+                    *seen.entry(b).or_insert_with(|| {
+                        distinct.push(b);
+                        (distinct.len() - 1) as u32
+                    })
+                })
+                .collect()
+        })
+        .collect();
+    let [id_a, id_b] = &mut value_id;
+    id_a.par_chunks_mut(INTERN_CHUNK)
+        .chain(id_b.par_chunks_mut(INTERN_CHUNK))
+        .zip(renumber.par_iter())
+        .for_each(|(ids, to)| ids.iter_mut().for_each(|id| *id = to[*id as usize]));
+    Some((value_id, distinct))
 }
 
 /// A vector the placement pass writes from many threads, one slot each.
@@ -1267,7 +1462,8 @@ mod csr_tests {
         Coefficients {
             row_ptr: [vec![0, 1, 1, 2, 2], vec![0, 1, 1, 2, 2]],
             signal: [vec![0, 1], vec![0, 1]],
-            value: [vec![Fr::one(); 2], vec![Fr::one(); 2]],
+            value_id: [vec![0; 2], vec![0; 2]],
+            values: vec![Fr::one()],
         }
     }
 
@@ -1315,7 +1511,7 @@ mod csr_tests {
                         c.signal[m].pop();
                     }
                     _ => {
-                        c.value[m].pop();
+                        c.value_id[m].pop();
                     }
                 }
                 rejects(&c, m, "row_ptr ends at");
@@ -1346,19 +1542,31 @@ mod csr_tests {
     }
 
     #[test]
+    fn rejects_out_of_range_value_ids() {
+        for m in 0..2 {
+            for id in [1, u32::MAX] {
+                let mut c = coefficients();
+                c.value_id[m][1] = id;
+                rejects(&c, m, "beyond the 1 values");
+            }
+        }
+    }
+
+    #[test]
     fn accepts_empty_rows_and_matrices() {
         assert!(coefficients().check_structure(4, 2).is_ok());
         for m in 0..2 {
             let mut c = coefficients();
             c.row_ptr[m].fill(0);
             c.signal[m].clear();
-            c.value[m].clear();
+            c.value_id[m].clear();
             assert!(c.check_structure(4, 2).is_ok());
         }
         let c = Coefficients {
             row_ptr: [vec![0; 5], vec![0; 5]],
             signal: [vec![], vec![]],
-            value: [vec![], vec![]],
+            value_id: [vec![], vec![]],
+            values: vec![],
         };
         assert!(c.check_structure(4, 0).is_ok());
     }

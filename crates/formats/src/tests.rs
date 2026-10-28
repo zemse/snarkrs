@@ -196,7 +196,7 @@ fn csr_is_stable_and_reproduces_the_records() {
     let a = &coeffs.row_ptr[0];
     let row3 = a[3] as usize..a[4] as usize;
     assert_eq!(&coeffs.signal[0][row3.clone()], &[5, 4]);
-    assert_eq!(&coeffs.value[0][row3], &[Fr::from(11u64), Fr::from(17u64)]);
+    assert_eq!(&coeffs.dense(0)[row3], &[Fr::from(11u64), Fr::from(17u64)]);
 
     let mut want: Vec<_> = records
         .iter()
@@ -212,10 +212,10 @@ fn csr_is_stable_and_reproduces_the_records() {
     let kept = read_coefficients(&synthetic_section4(&records), 8, 8, &mut sink).unwrap();
     for (m, (row_ptr, signal, value)) in sink.csr.unwrap().into_iter().enumerate() {
         assert!(kept.row_ptr[m].is_empty() && kept.signal[m].is_empty());
-        assert!(kept.value[m].is_empty());
+        assert!(kept.value_id[m].is_empty() && kept.values.is_empty());
         assert_eq!(row_ptr, coeffs.row_ptr[m]);
         assert_eq!(signal, coeffs.signal[m]);
-        assert_eq!(value, coeffs.value[m]);
+        assert_eq!(value, coeffs.dense(m));
     }
 }
 
@@ -267,10 +267,52 @@ fn csr_rows_keep_file_order_under_the_parallel_placement() {
         assert!(got_sig == want_sig, "matrix {m}: rows not in file order");
         let want_val: Vec<Fr> = want.iter().map(|&(_, _, v)| Fr::from(v)).collect();
         assert!(
-            coeffs.value[m] == want_val,
+            coeffs.dense(m) == want_val,
             "matrix {m}: values not in file order"
         );
     }
+}
+
+/// A key with few distinct values over many interning chunks stores each value once, and
+/// every slot still reads its own record's value.
+#[test]
+fn csr_values_are_interned_across_chunks() {
+    let (domain, n_vars) = (1usize << 12, 1u32 << 12);
+    let mut x = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let records: Vec<(u32, u32, u32, u64)> = (0..400_000)
+        .map(|_| {
+            let r = next();
+            (
+                (r >> 20) as u32 & 1,
+                (r % domain as u64) as u32,
+                (r >> 32) as u32 % n_vars,
+                [1, 2, 7, 1 << 40, 3][(r >> 50) as usize % 5],
+            )
+        })
+        .collect();
+    let coeffs = read_coefficients(
+        &synthetic_section4(&records),
+        n_vars as usize,
+        domain,
+        &mut Keep,
+    )
+    .unwrap();
+    assert_eq!(coeffs.values.len(), 5);
+    assert!(coeffs.check_structure(domain, n_vars as usize).is_ok());
+    let mut want: Vec<_> = records
+        .iter()
+        .map(|&(m, c, s, v)| (m, c, s, Fr::from(v)))
+        .collect();
+    want.sort_by_key(|&(m, c, s, _)| (m, c, s));
+    let mut got = flatten(&coeffs);
+    got.sort_by_key(|&(m, c, s, _)| (m, c, s));
+    assert!(got == want, "interned values differ from the records'");
 }
 
 #[test]
@@ -286,7 +328,7 @@ fn flatten(c: &Coefficients) -> Vec<(u32, u32, u32, Fr)> {
     for m in 0..2usize {
         for row in 0..c.row_ptr[m].len() - 1 {
             for k in c.row_ptr[m][row] as usize..c.row_ptr[m][row + 1] as usize {
-                out.push((m as u32, row as u32, c.signal[m][k], c.value[m][k]));
+                out.push((m as u32, row as u32, c.signal[m][k], c.value(m, k)));
             }
         }
     }
@@ -305,7 +347,7 @@ fn assert_row_ptr(c: &Coefficients, domain_size: usize, totals: &[usize; 2]) {
             "matrix {m} row_ptr tail"
         );
         assert_eq!(c.signal[m].len(), total, "matrix {m}");
-        assert_eq!(c.value[m].len(), total, "matrix {m}");
+        assert_eq!(c.value_id[m].len(), total, "matrix {m}");
     }
 }
 
@@ -1032,8 +1074,9 @@ fn the_byte_path_and_the_mmap_path_parse_identically() {
                 "{n}: coeffs.signal[{m}]"
             );
             assert_eq!(
-                mapped.coeffs.value[m], owned.coeffs.value[m],
-                "{n}: coeffs.value[{m}]"
+                mapped.coeffs.dense(m),
+                owned.coeffs.dense(m),
+                "{n}: coeffs.dense({m})"
             );
         }
         assert_eq!(mapped.vk.alpha_g1, owned.vk.alpha_g1, "{n}: vk.alpha_g1");
@@ -1197,10 +1240,13 @@ fn the_sink_path_parses_what_the_vector_path_parses() {
                 "{n}: key kept row_ptr {m}"
             );
             assert!(sunk.coeffs.signal[m].is_empty(), "{n}: key kept signal {m}");
-            assert!(sunk.coeffs.value[m].is_empty(), "{n}: key kept value {m}");
+            assert!(
+                sunk.coeffs.value_id[m].is_empty(),
+                "{n}: key kept value {m}"
+            );
             assert!(*row_ptr == plain.coeffs.row_ptr[m], "{n}: row_ptr {m}");
             assert!(*signal == plain.coeffs.signal[m], "{n}: signal {m}");
-            assert!(*value == plain.coeffs.value[m], "{n}: value {m}");
+            assert!(*value == plain.coeffs.dense(m), "{n}: value {m}");
         }
     });
 }

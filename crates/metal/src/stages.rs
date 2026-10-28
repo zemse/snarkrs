@@ -250,6 +250,21 @@ impl HStages {
         Ok(buf)
     }
 
+    /// [`Self::buf`] for one matrix of interned values: `values[ids[k]]` at slot `k`. `ids`
+    /// must be in range, which [`Coefficients::check_structure`] checks.
+    fn buf_interned(&self, values: &[Fr], ids: &[u32]) -> Result<Buffer, ProveError> {
+        let buf = self.empty(ids.len())?;
+        // SAFETY: as in `buf`, the buffer was just allocated with room for `ids.len()`
+        // packed values and no dispatch can be reading it.
+        let dst = unsafe {
+            core::slice::from_raw_parts_mut(buf.contents().as_ptr() as *mut PackedFr, ids.len())
+        };
+        for (d, &id) in dst.iter_mut().zip(ids) {
+            *d = PackedFr::from_fr(&values[id as usize]);
+        }
+        Ok(buf)
+    }
+
     fn buf_u32(&self, data: &[u32]) -> Result<Buffer, ProveError> {
         crate::enc::buffer(&self.device, data)
     }
@@ -512,7 +527,11 @@ impl HResident {
             st.buf_u32(&pk.coeffs.signal[0])?,
             st.buf_u32(&pk.coeffs.signal[1])?,
         ];
-        let value = [st.buf(&pk.coeffs.value[0])?, st.buf(&pk.coeffs.value[1])?];
+        let c = &pk.coeffs;
+        let value = [
+            st.buf_interned(&c.values, &c.value_id[0])?,
+            st.buf_interned(&c.values, &c.value_id[1])?,
+        ];
         Self::with_csr(st, domain, pk.n_vars, row_ptr, signal, value)
     }
 

@@ -513,11 +513,17 @@ mod tests {
             )
         );
         assert_eq!(
-            (&key.coeffs.row_ptr, &key.coeffs.signal, &key.coeffs.value),
+            (
+                &key.coeffs.row_ptr,
+                &key.coeffs.signal,
+                &key.coeffs.value_id,
+                &key.coeffs.values
+            ),
             (
                 &expected.coeffs.row_ptr,
                 &expected.coeffs.signal,
-                &expected.coeffs.value
+                &expected.coeffs.value_id,
+                &expected.coeffs.values
             )
         );
         assert_eq!(

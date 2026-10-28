@@ -88,7 +88,7 @@ fn tiny_guards(b: &dyn Backend, c: &dyn PreparedCircuit, dir: &Path, w: &[Fr]) {
             );
         }
     }
-    let mutations: [(&str, Mutation); 4] = [
+    let mutations: [(&str, Mutation); 5] = [
         ("n_public", |k| {
             k.n_public = k.n_vars + 1;
         }),
@@ -99,7 +99,10 @@ fn tiny_guards(b: &dyn Backend, c: &dyn PreparedCircuit, dir: &Path, w: &[Fr]) {
             k.coeffs.signal[0][0] = k.n_vars as u32;
         }),
         ("CSR values", |k| {
-            k.coeffs.value[0].pop();
+            k.coeffs.value_id[0].pop();
+        }),
+        ("CSR value id", |k| {
+            k.coeffs.value_id[0][0] = k.coeffs.values.len() as u32;
         }),
     ];
     for (name, mutate) in mutations {

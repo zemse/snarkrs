@@ -131,7 +131,7 @@ mod audit {
                 .chunks(32)
                 .map(|g| 32 * g.iter().max().unwrap())
                 .sum();
-            let values = &pk.coeffs.value[m];
+            let values = pk.coeffs.dense(m);
             let trivial_coef = values
                 .iter()
                 .filter(|v| v.is_zero() || **v == Fr::one() || **v == -Fr::one())

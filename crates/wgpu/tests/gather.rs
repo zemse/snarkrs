@@ -467,11 +467,7 @@ fn synthetic(rng: &mut SplitMix64, n_rows: usize, n_vars: usize) -> Coefficients
             row_ptr[m].push(signal[m].len() as u32);
         }
     }
-    Coefficients {
-        row_ptr,
-        signal,
-        value,
-    }
+    Coefficients::from_values(row_ptr, signal, value)
 }
 
 /// The gather, written the obvious way with arkworks, as an oracle independent of
@@ -483,7 +479,7 @@ fn reference(coeffs: &Coefficients, w: &[Fr], m: usize, n_rows: usize) -> Vec<Fr
             let hi = coeffs.row_ptr[m][c + 1] as usize;
             let mut acc = Fr::zero();
             for k in lo..hi {
-                acc += coeffs.value[m][k] * w[coeffs.signal[m][k] as usize];
+                acc += coeffs.value(m, k) * w[coeffs.signal[m][k] as usize];
             }
             acc
         })
@@ -670,11 +666,11 @@ fn the_concatenated_csr_is_the_two_matrices_end_to_end() {
     assert_eq!(host.value.len(), (nnz_a + nnz_b) * LIMBS);
     assert_eq!(
         &host.value[..nnz_a * LIMBS],
-        &fr_words(&coeffs.value[0])[..]
+        &fr_words(&coeffs.dense(0))[..]
     );
     assert_eq!(
         &host.value[nnz_a * LIMBS..],
-        &fr_words(&coeffs.value[1])[..]
+        &fr_words(&coeffs.dense(1))[..]
     );
 
     // The base offsets the kernel is handed, spelled out. `nz_base_b == nnz_a` is the one

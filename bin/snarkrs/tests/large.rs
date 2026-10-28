@@ -88,7 +88,8 @@ fn proof_uses_the_supplied_backend_instance() {
         coeffs: Coefficients {
             row_ptr: [vec![0, 0], vec![0, 0]],
             signal: [vec![], vec![]],
-            value: [vec![], vec![]],
+            value_id: [vec![], vec![]],
+            values: vec![],
         },
         vk: VerifyingKey {
             alpha_g1: g1,
