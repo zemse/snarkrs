@@ -121,7 +121,6 @@ pub fn verify_unchecked(
     // unwraps the exponentiation: it is `None` when the loop's output is zero, which only
     // degenerate input reaches, and here that input is the caller's. The output group is
     // written additively, so "the product is 1" is "the sum is 0".
-    //
     let mlo = miller_loop([
         (-proof.a, proof.b),
         (vk.alpha_g1, vk.beta_g2),
