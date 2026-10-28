@@ -87,6 +87,7 @@ fn main() {
     if !witnesscalc.exists() {
         clone_witnesscalc(&witnesscalc);
     }
+    stage_gmp(&witnesscalc);
     println!("cargo:rerun-if-env-changed=G16_CSP_STOCK_FR");
     if std::env::var_os("G16_CSP_STOCK_FR").is_none() {
         patch_fr(&witnesscalc);
@@ -174,6 +175,64 @@ fn clone_witnesscalc(dir: &Path) {
         None,
     );
     run(&["submodule", "update", "--init", "--recursive"], Some(dir));
+}
+
+const GMP: &str = "gmp-6.3.0";
+const GMP_SHA256: &str = "a3c2b80201b89e68616f4ad30bc66aee4927c3ce50e33929ca819d5c43538898";
+
+/// Put GMP 6.3.0 at `depends/gmp`, where `build_gmp.sh` builds whatever it finds.
+///
+/// GMP 6.2.1's arm64 assembly keeps loop counters in x18, which Darwin reserves: the
+/// kernel zeroes it on every page fault and on interrupts. A counter zeroed inside
+/// `mpn_add_n` or `mpn_mul_1` wraps, and the loop walks up the stack until it faults
+/// at the top. Witnesscalc's own static initializers multiply through these at load,
+/// while the dylibs' pages are still faulting in, so about one launch in 500 died there
+/// before `main`. A long witness run could die the same way on its own thread, which
+/// Rust then reports as a stack overflow. 6.3.0 uses x17. Witnesscalc's script fetched
+/// 6.2.1 until September 2026, the `v2.2.0` tag the adapter checks out still does, and
+/// an extracted `depends/gmp` is never fetched again, so the version is checked here
+/// rather than left to the script.
+fn stage_gmp(witnesscalc: &Path) {
+    let depends = witnesscalc.join("depends");
+    let gmp = depends.join("gmp");
+    let version = std::fs::read_to_string(gmp.join("configure")).unwrap_or_default();
+    if version.contains(&format!("PACKAGE_VERSION='{}'", &GMP[4..])) {
+        return;
+    }
+    // Any other extraction goes, with the `package` built from it.
+    if gmp.exists() {
+        std::fs::remove_dir_all(&gmp).expect("removing a stale depends/gmp");
+    }
+    let archive = depends.join(format!("{GMP}.tar.xz"));
+    if !archive.is_file() {
+        let ok = Command::new("curl")
+            .args(["--fail", "--location", "--retry", "3", "-o"])
+            .arg(&archive)
+            .arg(format!("https://ftp.gnu.org/gnu/gmp/{GMP}.tar.xz"))
+            .status()
+            .expect("curl is not on PATH")
+            .success();
+        assert!(ok, "could not fetch {GMP}.tar.xz");
+    }
+    let out = Command::new("shasum")
+        .args(["-a", "256"])
+        .arg(&archive)
+        .output()
+        .expect("shasum is not on PATH");
+    let got = String::from_utf8_lossy(&out.stdout);
+    if !got.starts_with(GMP_SHA256) {
+        std::fs::remove_file(&archive).ok();
+        panic!("{GMP}.tar.xz has sha256 {got}, expected {GMP_SHA256}");
+    }
+    let ok = Command::new("tar")
+        .arg("-xf")
+        .arg(&archive)
+        .current_dir(&depends)
+        .status()
+        .expect("tar is not on PATH")
+        .success();
+    assert!(ok, "could not extract {GMP}.tar.xz");
+    std::fs::rename(depends.join(GMP), &gmp).expect("moving the GMP source into place");
 }
 
 /// Give `Fr_mod`, `Fr_idiv` and `Fr_pow` a path that does not go through GMP.
