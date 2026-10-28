@@ -29,6 +29,7 @@ use binfile::FirstError;
 use binfile::*;
 use rayon::prelude::*;
 use snarkrs_field::*;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Everything needed to prove, as parsed from a `.zkey`.
 pub struct ProvingKey {
@@ -785,6 +786,13 @@ fn check_g2(p: &G2Affine, section: u32, what: &str) -> Result<(), ZkeyError> {
 /// one counting pass plus one placement pass produces both the ordering and the index in
 /// O(n + domain_size), with no comparison sort and no hash map. It is also stable, which
 /// keeps the placement deterministic across runs and across backends.
+///
+/// Both passes run over the pool. The count is atomic increments; the placement claims
+/// each record's slot with an atomic bump of its row's cursor, which leaves a row's
+/// records in whatever order the threads got there, and then sorts each row by record
+/// index, which is the order the serial placement left them in. Rows hold a handful of
+/// records, so that sort is an insertion sort. On keccak_2048's 11.9 million records the
+/// two serial passes were 38 and 45 ms.
 fn read_coefficients<S: KeySink>(
     data: &[u8],
     n_vars: usize,
@@ -805,22 +813,23 @@ fn read_coefficients<S: KeySink>(
         }
         Ok((m, constraint))
     };
-    // The same checks the counting pass makes, first in parallel: the first touch of the
-    // mapped section is page faults, and this spreads them over every core.
-    if let Some(err) = (0..n_coefs)
+    // Every record is checked before any is counted, and the error is the first record's
+    // in file order, as the serial pass reported it.
+    let atomic = |n: usize| (0..n).map(|_| AtomicU32::new(0)).collect::<Vec<_>>();
+    let counts = [atomic(domain_size + 1), atomic(domain_size + 1)];
+    let first_err = FirstError::default();
+    (0..n_coefs)
         .into_par_iter()
-        .find_map_first(|i| check_record(i).err())
-    {
-        return Err(err);
-    }
-    let mut counts = [vec![0u32; domain_size + 1], vec![0u32; domain_size + 1]];
-    for i in 0..n_coefs {
-        let (m, constraint) = check_record(i)?;
-        counts[m][constraint + 1] += 1;
-    }
+        .for_each(|i| match check_record(i) {
+            Ok((m, constraint)) => {
+                counts[m][constraint + 1].fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => first_err.record(i, e),
+        });
+    first_err.into_result()?;
 
     // Prefix sum in place turns the histogram into the row offsets.
-    let mut row_ptr = counts;
+    let mut row_ptr = counts.map(|c| c.into_iter().map(AtomicU32::into_inner).collect::<Vec<_>>());
     for ptr in &mut row_ptr {
         for i in 0..domain_size {
             ptr[i + 1] += ptr[i];
@@ -854,8 +863,8 @@ fn read_coefficients<S: KeySink>(
             [a, b]
         }
     };
-    // The record each slot came from. The placement pass stays serial and only moves
-    // indices; the Montgomery decode of each value then runs in parallel per slot.
+    // The record each slot came from. The placement only moves indices; the Montgomery
+    // decode of each value then runs in parallel per slot.
     let mut source = [vec![0u32; totals[0]], vec![0u32; totals[1]]];
 
     let r_inv = r_inv();
@@ -869,35 +878,61 @@ fn read_coefficients<S: KeySink>(
         Some(value_err) => value_err,
         None => err,
     };
-    let mut cursor = [row_ptr[0].clone(), row_ptr[1].clone()];
-    for i in 0..n_coefs {
-        let (m, constraint, sig, _) = coef_indices(data, i)?;
+    let cursor = row_ptr
+        .each_ref()
+        .map(|rp| rp.iter().map(|&p| AtomicU32::new(p)).collect::<Vec<_>>());
+    let [sig_a, sig_b] = signal;
+    let signal_at = [Rows::new(sig_a), Rows::new(sig_b)];
+    let source_at = source.each_mut().map(|s| Rows::new(s));
+    // `Some` for an index error, which the serial pass reported after any bad value in an
+    // earlier record; `None` for a matrix id, which it reported as it was.
+    let first_err = FirstError::default();
+    (0..n_coefs).into_par_iter().for_each(|i| {
+        let (m, constraint, sig, _) = match coef_indices(data, i) {
+            Ok(r) => r,
+            Err(e) => return first_err.record(i, (e, false)),
+        };
         if sig >= n_vars {
-            return Err(index_error(
-                i,
-                ZkeyError::Malformed {
-                    section: 4,
-                    reason: format!("signal {sig} is outside n_vars {n_vars}"),
-                },
-            ));
+            let e = ZkeyError::Malformed {
+                section: 4,
+                reason: format!("signal {sig} is outside n_vars {n_vars}"),
+            };
+            return first_err.record(i, (e, true));
         }
         // Pass 1 checked `constraint`, but on the mmap path this is a second read of a file
         // someone else may be writing, and a record that changed in between indexed past
         // the end: SIGABRT on `js_16x16_d32` in 4 of 6 live races. Re-check both indices
         // so a changed record is an error rather than an abort or a silently wrong CSR.
-        if constraint >= domain_size || cursor[m][constraint] >= row_ptr[m][constraint + 1] {
-            return Err(index_error(
-                i,
-                ZkeyError::Malformed {
-                    section: 4,
-                    reason: format!("record {i} changed between the two passes over section 4"),
-                },
-            ));
+        let slot = (constraint < domain_size)
+            .then(|| cursor[m][constraint].fetch_add(1, Ordering::Relaxed))
+            .filter(|&slot| slot < row_ptr[m][constraint + 1]);
+        let Some(slot) = slot else {
+            let e = ZkeyError::Malformed {
+                section: 4,
+                reason: format!("record {i} changed between the two passes over section 4"),
+            };
+            return first_err.record(i, (e, true));
+        };
+        // SAFETY: the bump hands every slot below the row's end to exactly one record.
+        unsafe {
+            signal_at[m].write(slot as usize, sig as u32);
+            source_at[m].write(slot as usize, i as u32);
         }
-        let slot = cursor[m][constraint] as usize;
-        cursor[m][constraint] += 1;
-        signal[m][slot] = sig as u32;
-        source[m][slot] = i as u32;
+    });
+    if let Some((i, (e, after_values))) = first_err.into_first() {
+        return Err(if after_values { index_error(i, e) } else { e });
+    }
+    for m in 0..2 {
+        let rp = &row_ptr[m];
+        (0..domain_size)
+            .into_par_iter()
+            .with_min_len(1 << 12)
+            .for_each(|c| {
+                let (lo, hi) = (rp[c] as usize, rp[c + 1] as usize);
+                // SAFETY: rows are disjoint ranges of both vectors, and the placement that
+                // wrote them has finished.
+                unsafe { sort_row(&source_at[m], &signal_at[m], lo, hi) };
+            });
     }
 
     let Some(into) = into else {
@@ -928,6 +963,55 @@ fn read_coefficients<S: KeySink>(
         signal: Default::default(),
         value: Default::default(),
     })
+}
+
+/// A vector the placement pass writes from many threads, one slot each.
+struct Rows<'a> {
+    ptr: *mut u32,
+    len: usize,
+    _borrow: std::marker::PhantomData<&'a mut [u32]>,
+}
+
+// SAFETY: only written through `write` and `sort_row`, whose callers keep threads on
+// disjoint slots.
+unsafe impl Send for Rows<'_> {}
+unsafe impl Sync for Rows<'_> {}
+
+impl<'a> Rows<'a> {
+    fn new(v: &'a mut [u32]) -> Self {
+        Self {
+            ptr: v.as_mut_ptr(),
+            len: v.len(),
+            _borrow: std::marker::PhantomData,
+        }
+    }
+
+    /// # Safety
+    ///
+    /// No other thread touches slot `i` meanwhile.
+    unsafe fn write(&self, i: usize, v: u32) {
+        assert!(i < self.len);
+        *self.ptr.add(i) = v;
+    }
+}
+
+/// Sorts `source[lo..hi]` ascending, moving `signal[lo..hi]` along with it.
+///
+/// # Safety
+///
+/// No other thread touches `lo..hi` of either vector meanwhile.
+unsafe fn sort_row(source: &Rows<'_>, signal: &Rows<'_>, lo: usize, hi: usize) {
+    assert!(lo <= hi && hi <= source.len && hi <= signal.len);
+    let src = std::slice::from_raw_parts_mut(source.ptr.add(lo), hi - lo);
+    let sig = std::slice::from_raw_parts_mut(signal.ptr.add(lo), hi - lo);
+    for k in 1..src.len() {
+        let mut j = k;
+        while j > 0 && src[j - 1] > src[j] {
+            src.swap(j - 1, j);
+            sig.swap(j - 1, j);
+            j -= 1;
+        }
+    }
 }
 
 /// `(matrix, constraint, signal, offset of the value)` for record `i`.

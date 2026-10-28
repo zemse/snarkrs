@@ -219,6 +219,60 @@ fn csr_is_stable_and_reproduces_the_records() {
     }
 }
 
+/// Enough records that the parallel placement really races: every row still lists its
+/// records in file order, as a serial stable counting sort leaves them.
+#[test]
+fn csr_rows_keep_file_order_under_the_parallel_placement() {
+    let (domain, n_vars) = (1usize << 10, 1u32 << 12);
+    let mut x = 0x2545_f491_4f6c_dd1du64;
+    let mut next = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let records: Vec<(u32, u32, u32, u64)> = (0..300_000)
+        .map(|_| {
+            let r = next();
+            // A few hot rows, so some rows hold hundreds of records.
+            let row = if r % 4 == 0 { r % 8 } else { r % domain as u64 };
+            (
+                (r >> 20) as u32 & 1,
+                row as u32,
+                (r >> 32) as u32 % n_vars,
+                r >> 40,
+            )
+        })
+        .collect();
+    let coeffs = read_coefficients(
+        &synthetic_section4(&records),
+        n_vars as usize,
+        domain,
+        &mut Keep,
+    )
+    .unwrap();
+    for m in 0..2 {
+        let mut want: Vec<(u32, u32, u64)> = records
+            .iter()
+            .filter(|r| r.0 == m as u32)
+            .map(|&(_, c, s, v)| (c, s, v))
+            .collect();
+        want.sort_by_key(|&(c, _, _)| c);
+        let rp = &coeffs.row_ptr[m];
+        let got_sig: Vec<(u32, u32)> = (0..domain)
+            .flat_map(|c| (rp[c] as usize..rp[c + 1] as usize).map(move |k| (c as u32, k)))
+            .map(|(c, k)| (c, coeffs.signal[m][k]))
+            .collect();
+        let want_sig: Vec<(u32, u32)> = want.iter().map(|&(c, s, _)| (c, s)).collect();
+        assert!(got_sig == want_sig, "matrix {m}: rows not in file order");
+        let want_val: Vec<Fr> = want.iter().map(|&(_, _, v)| Fr::from(v)).collect();
+        assert!(
+            coeffs.value[m] == want_val,
+            "matrix {m}: values not in file order"
+        );
+    }
+}
+
 #[test]
 fn csr_rejects_records_outside_the_domain_or_witness() {
     assert!(read_coefficients(&synthetic_section4(&[(0, 9, 1, 3)]), 8, 8, &mut Keep).is_err());

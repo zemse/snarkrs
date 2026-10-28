@@ -627,9 +627,14 @@ impl<E> FirstError<E> {
     }
 
     pub(crate) fn into_result(self) -> Result<(), E> {
-        match self.0.into_inner().unwrap_or_else(|p| p.into_inner()) {
+        match self.into_first() {
             None => Ok(()),
             Some((_, e)) => Err(e),
         }
+    }
+
+    /// The lowest failing index and its error.
+    pub(crate) fn into_first(self) -> Option<(usize, E)> {
+        self.0.into_inner().unwrap_or_else(|p| p.into_inner())
     }
 }
