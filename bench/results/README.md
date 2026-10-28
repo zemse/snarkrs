@@ -271,9 +271,9 @@ Cold, same circuit:
 | EC2 g4dn.2xlarge | 1557.3 ms | 2301.2 ms | **695.6 ms** (CUDA) | 2.24x |
 
 > **The M2 Max rows above are the August run.** [`TABLES.md`](TABLES.md) now carries a
-> re-measurement at `72b3946` (2026-10-27), same harness and reps: warm at 140,261
-> constraints is rapidsnark 553.8 ms, ours CPU 258.6 ms, Metal **69.4 ms**, 7.99x; cold is
-> 572.8, 316.3 and **164.5 ms**, 3.48x. rapidsnark moved by under 3%, so the change is ours.
+> re-measurement at `a02df99` (2026-10-28), same harness and reps: warm at 140,261
+> constraints is rapidsnark 547.1 ms, ours CPU 252.4 ms, Metal **68.0 ms**, 8.04x; cold is
+> 558.3, 291.0 and **142.4 ms**, 3.92x. rapidsnark moved by under 3%, so the change is ours.
 > The T4's joinsplit ladder has not been re-run, so the comparisons on this page stay on the
 > August numbers.
 
