@@ -91,6 +91,11 @@ use snarkrs_witness::{native, WitnessError};
 /// snarkjs' exit code for a line it could not use.
 const BAD_USAGE: u8 = 99;
 
+/// The zkey size below which `groth16 prove` keeps malloc's large cache rather than
+/// re-exec without it. js_1x1_d8's 2.4 MB key peaks at the same max RSS either way, and
+/// at 1 MB more footprint on the CPU and 4 MB more on Metal.
+const SMALL_KEY_BYTES: u64 = 4 << 20;
+
 #[derive(Parser)]
 #[command(
     name = "snarkrs",
@@ -629,12 +634,18 @@ fn main() -> ExitCode {
     // One proof and exit, so there is nothing for the cache to be reused by. Not `bench`,
     // whose warm loop is a long-lived prover and would fault its buffers in on every rep.
     // fullprove's native witness binary inherits the setting, as `snarkrs-csp-mem`'s does.
-    if matches!(
-        cli.cmd,
+    // A prove from a key under `SMALL_KEY_BYTES` skips it: the exec is a second process
+    // start, 3.5 ms on the M2 Max, and on such a key the cache costs no max RSS at all.
+    let reexec = match &cli.cmd {
         Cmd::Groth16 {
-            cmd: Groth16Cmd::Prove { .. } | Groth16Cmd::Fullprove { .. }
-        }
-    ) {
+            cmd: Groth16Cmd::Prove { zkey, .. },
+        } => std::fs::metadata(zkey).map_or(true, |m| m.len() >= SMALL_KEY_BYTES),
+        Cmd::Groth16 {
+            cmd: Groth16Cmd::Fullprove { .. },
+        } => true,
+        _ => false,
+    };
+    if reexec {
         snarkrs_groth16::malloc::reexec_without_large_cache();
     }
     match run(cli.cmd) {
