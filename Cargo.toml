@@ -14,6 +14,7 @@ members = [
     "crates/web",
     "crates/witness",
     "crates/gnark",
+    "crates/gnark-solver",
     "crates/lib",
     "bin/snarkrs",
 ]
@@ -91,6 +92,7 @@ snarkrs-web  = { path = "crates/web", version = "0.1.0" }
 snarkrs-witness = { path = "crates/witness", version = "0.1.0", default-features = false }
 snarkrs-lib = { path = "crates/lib", version = "0.1.0" }
 snarkrs-gnark = { path = "crates/gnark", version = "0.1.0" }
+snarkrs-gnark-solver = { path = "crates/gnark-solver", version = "0.1.0" }
 
 [profile.release]
 opt-level = 3

@@ -1,0 +1,27 @@
+[package]
+name = "snarkrs-gnark-solver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A pure-Rust solver for gnark v0.14 BN254 R1CS files, bit-identical to gnark's own"
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+include = ["src/**/*", "LICENSE-MIT", "LICENSE-APACHE"]
+
+[dependencies]
+snarkrs-field.workspace = true
+ark-ff.workspace = true
+rayon.workspace = true
+thiserror.workspace = true
+num-bigint.workspace = true
+# The SP1 witness JSON.
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+memmap2.workspace = true

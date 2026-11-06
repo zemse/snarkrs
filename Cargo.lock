@@ -2045,6 +2045,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "snarkrs-gnark-solver"
+version = "0.1.0"
+dependencies = [
+ "ark-ff",
+ "memmap2",
+ "num-bigint",
+ "rayon",
+ "serde",
+ "serde_json",
+ "snarkrs-field",
+ "thiserror",
+]
+
+[[package]]
 name = "snarkrs-gpu-layout"
 version = "0.1.0"
 dependencies = [
