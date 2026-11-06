@@ -57,8 +57,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use cudarc::driver::CudaModule;
-use snarkrs_field::Fr;
-use snarkrs_formats::ProvingKey;
+use snarkrs_field::{Field, Fr};
+use snarkrs_formats::{HBasis, ProvingKey};
 use snarkrs_groth16::{Backend, HPoly, MsmOutputs, PreparedCircuit, ProveError, StageTimings};
 
 use crate::context::Cuda;
@@ -271,7 +271,14 @@ pub struct CudaCircuit {
     stages: CudaStages,
     msm: CudaMsm,
     cost: PrepareCost,
+    /// Points an MSM run of [`PreparedCircuit::h_and_msms_from_rows`] covers at most, see
+    /// [`CudaMsm`]'s `msms_resident`.
+    msm_chunk: usize,
 }
+
+/// [`CudaCircuit`]'s MSM run on the rows path: 2^22 points, so the largest batch's scratch
+/// is 3 GB whatever the key, and a key below it runs each MSM whole.
+pub const MSM_CHUNK: usize = 1 << 22;
 
 impl CudaCircuit {
     fn new(backend: &CudaBackend, pk: ProvingKey) -> Result<Self, ProveError> {
@@ -288,20 +295,17 @@ impl CudaCircuit {
                 return Err(bad(format!("{name} has {got} bases, n_vars is {n_vars}")));
             }
         }
-        // A gnark key's H query is not snarkjs' odd-coset basis, and this backend's stage 9
-        // only computes that one.
-        if pk.h_basis != snarkrs_formats::HBasis::SnarkjsOddCoset {
-            return Err(bad(format!(
-                "the key's H basis is {:?}, which only the CPU backend proves",
-                pk.h_basis
-            )));
-        }
-        if pk.h_query.len() != pk.domain_size {
-            return Err(bad(format!(
-                "h_query has {} bases, domain size is {}",
-                pk.h_query.len(),
-                pk.domain_size
-            )));
+        // A gnark key's H query is `domain_size - 1` bases for H's bit-reversed coefficients,
+        // which only `h_and_msms_from_rows` computes.
+        let want_h = pk.h_basis.bases(pk.domain_size);
+        if pk.h_query.len() != want_h {
+            let (got, n) = (pk.h_query.len(), pk.domain_size);
+            return Err(bad(match pk.h_basis {
+                HBasis::SnarkjsOddCoset => format!("h_query has {got} bases, domain size is {n}"),
+                HBasis::GnarkBitReversed => format!(
+                    "h_query has {got} bases, a gnark key on a domain of {n} needs {want_h}"
+                ),
+            }));
         }
         let want_l = n_vars
             .checked_sub(pk.n_public + 1)
@@ -359,6 +363,7 @@ impl CudaCircuit {
             stages,
             msm,
             cost,
+            msm_chunk: MSM_CHUNK,
         })
     }
 
@@ -426,6 +431,12 @@ impl PreparedCircuit for CudaCircuit {
         t: &mut StageTimings,
     ) -> Result<MsmOutputs, ProveError> {
         self.check_witness(witness)?;
+        if self.pk.h_basis != HBasis::SnarkjsOddCoset {
+            return Err(bad(
+                "a gnark key's H basis is its bit-reversed coefficients, not the odd coset; \
+                 prove it from A.w and B.w with `h_and_msms_from_rows`",
+            ));
+        }
         // Checked here rather than left to `msm_batch`'s bounds check, which only rejects
         // an `H` that is too *long*. A short one is in bounds against `h_query` and would
         // simply run: the missing tail would contribute nothing and the proof would fail
@@ -439,6 +450,37 @@ impl PreparedCircuit for CudaCircuit {
             )));
         }
         self.msm.msms(witness, h, t)
+    }
+
+    /// Stages 1 to 9 from the caller's rows, every stage on the device: the rows, the
+    /// witness and nothing else cross PCIe, and `H` never leaves. The only way a gnark key
+    /// proves; a zkey proves this way too, with `H` left on the odd coset.
+    ///
+    /// For a gnark key the H MSM runs over the first `n - 1` coefficients against `Z` and
+    /// its result is multiplied by `-1/2`, which is `1 / t` on the odd coset; see
+    /// `kernels/rows.cu`. The MSMs run in runs of at most [`MSM_CHUNK`] points.
+    fn h_and_msms_from_rows(
+        &self,
+        witness: &[Fr],
+        a_rows: &[Fr],
+        b_rows: &[Fr],
+        t: &mut StageTimings,
+    ) -> Result<MsmOutputs, ProveError> {
+        self.check_witness(witness)?;
+        let gnark = self.pk.h_basis == HBasis::GnarkBitReversed;
+        let handle = self
+            .stages
+            .compute_h_from_rows(witness, a_rows, b_rows, gnark, t)?;
+        let h_len = self.pk.h_basis.bases(self.pk.domain_size);
+        let start = Instant::now();
+        let mut out =
+            self.msm
+                .msms_resident(handle.witness_std(), handle.h_std(), h_len, self.msm_chunk)?;
+        t.msm_us += start.elapsed().as_micros() as u64;
+        if gnark {
+            out.h_g1 *= -Fr::from(2u64).inverse().expect("2 is invertible mod r");
+        }
+        Ok(out)
     }
 
     /// The debugging seam only: a device `H` costs a full PCIe readback of the whole

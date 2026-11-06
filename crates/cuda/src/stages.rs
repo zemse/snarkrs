@@ -50,7 +50,7 @@ use cudarc::driver::{
     DriverError, LaunchConfig, PinnedHostSlice, PushKernelArg,
 };
 use snarkrs_field::{Domain, Field, Fr};
-use snarkrs_formats::{Matrix, ProvingKey};
+use snarkrs_formats::{HBasis, Matrix, ProvingKey};
 use snarkrs_gpu_layout::{PackedFr, PackedScalar};
 use snarkrs_groth16::{HPoly, ProveError, StageTimings};
 
@@ -187,6 +187,8 @@ struct Events {
     gather: CudaEvent,
     ntt: CudaEvent,
     join: CudaEvent,
+    /// After the gnark tail, [`CudaStages::compute_h_from_rows`] only.
+    tail: CudaEvent,
 }
 
 impl Events {
@@ -201,8 +203,163 @@ impl Events {
             gather: ev()?,
             ntt: ev()?,
             join: ev()?,
+            tail: ev()?,
         })
     }
+}
+
+/// Words in each half of a [`Staging`] pair, 32 MiB. A whole number of `Fr` and of both
+/// packed point sizes, so a chunk never splits an element.
+const STAGING_WORDS: usize = 8 << 20;
+
+/// Two page-locked buffers the host fills in turn while the other is on the wire, for a
+/// vector too large to stage whole: 64 MiB of pinned memory however long the vector is.
+/// The rows path stages the witness and both row vectors through one, and a key whose
+/// bases are streamed from disk goes through one too.
+pub(crate) struct Staging {
+    bufs: [PinnedHostSlice<u32>; 2],
+    /// Recorded after each buffer's copy is queued, and waited on before the host writes
+    /// that buffer again. Waiting on one never recorded returns at once.
+    done: [CudaEvent; 2],
+}
+
+impl Staging {
+    pub(crate) fn new(ctx: &Arc<CudaContext>) -> Result<Self, ProveError> {
+        let buf = || {
+            // SAFETY: unset on return, and only ever read by a copy of the words `fill`
+            // has just written.
+            unsafe { ctx.alloc_pinned::<u32>(STAGING_WORDS) }
+                .map_err(|e| drv("allocate pinned staging", e))
+        };
+        let ev = || {
+            ctx.new_event(Some(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING))
+                .map_err(|e| drv("cuEventCreate", e))
+        };
+        Ok(Self {
+            bufs: [buf()?, buf()?],
+            done: [ev()?, ev()?],
+        })
+    }
+
+    /// `dst[off..off + len]` from `fill`, a chunk at a time: `fill(start, out)` writes words
+    /// `start..start + out.len()` of the source into `out`. Each copy is queued on `stream`
+    /// as soon as its chunk is written, so the host packs one chunk while the previous one
+    /// crosses the bus; the last may still be in flight on return, ordered before anything
+    /// queued after it.
+    pub(crate) fn upload(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        dst: &mut CudaSlice<u32>,
+        off: usize,
+        len: usize,
+        mut fill: impl FnMut(usize, &mut [u32]) -> Result<(), ProveError>,
+    ) -> Result<(), ProveError> {
+        if off.checked_add(len).is_none_or(|end| end > dst.len()) {
+            return Err(bad(format!(
+                "staged upload of {len} words at {off} into a buffer of {}",
+                dst.len()
+            )));
+        }
+        for (i, start) in (0..len).step_by(STAGING_WORDS).enumerate() {
+            let m = STAGING_WORDS.min(len - start);
+            let k = i % 2;
+            self.done[k]
+                .synchronize()
+                .map_err(|e| drv("wait for a staging buffer", e))?;
+            let chunk = &mut self.bufs[k]
+                .as_mut_slice()
+                .map_err(|e| drv("map pinned staging", e))?[..m];
+            fill(start, chunk)?;
+            // A plain slice, not the `PinnedHostSlice`, so the copy is exactly `m` words;
+            // the memory under it is page locked either way, so the copy is asynchronous.
+            stream
+                .memcpy_htod(&*chunk, &mut dst.slice_mut(off + start..off + start + m))
+                .map_err(|e| drv("staged upload", e))?;
+            self.done[k]
+                .record(stream)
+                .map_err(|e| drv("record staging event", e))?;
+        }
+        Ok(())
+    }
+
+    /// `src` from its first word, as [`PackedFr`] words (Montgomery limbs, as on the host),
+    /// packed on the pool.
+    pub(crate) fn upload_fr(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        dst: &mut CudaSlice<u32>,
+        src: &[Fr],
+    ) -> Result<(), ProveError> {
+        self.upload(stream, dst, 0, src.len() * 8, |start, out| {
+            pack_fr(&src[start / 8..(start + out.len()) / 8], out);
+            Ok(())
+        })
+    }
+}
+
+impl Drop for Staging {
+    /// A copy may still be reading either buffer, and freeing pinned memory under a DMA is
+    /// undefined, so both are waited on first.
+    fn drop(&mut self) {
+        for e in &self.done {
+            let _ = e.synchronize();
+        }
+    }
+}
+
+/// `src` into `out` as [`PackedFr`] words, on the pool for a chunk large enough to be
+/// worth it.
+fn pack_fr(src: &[Fr], out: &mut [u32]) {
+    use rayon::prelude::*;
+    const PIECE: usize = 1 << 14;
+    // SAFETY: `PackedFr` is eight `u32` with no padding and no invalid bit patterns, and
+    // `out` holds exactly `src.len() * 8` of them, 4-byte aligned like any `u32` slice.
+    let dst = unsafe {
+        core::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<PackedFr>(), out.len() / 8)
+    };
+    dst.par_chunks_mut(PIECE)
+        .zip(src.par_chunks(PIECE))
+        .for_each(|(d, s)| PackedFr::pack_into(s, d));
+}
+
+/// `count` powers of `base` from `base^0`, packed and uploaded through `staging` a chunk at
+/// a time, so a 2^24 domain's twiddle and coset tables never exist whole on the host. The
+/// values are `snarkrs_field::powers`', which `Domain::twiddles` builds, element for element:
+/// each piece starts from `base^start` and runs the product, and a field element has one
+/// representation however it was reached.
+fn upload_powers(
+    stream: &Arc<CudaStream>,
+    staging: &mut Staging,
+    base: Fr,
+    count: usize,
+) -> Result<CudaSlice<u32>, ProveError> {
+    let mut dst = stream
+        .alloc_zeros::<u32>(count.max(1) * 8)
+        .map_err(|e| drv("allocate power table", e))?;
+    staging.upload(stream, &mut dst, 0, count * 8, |start, out| {
+        // SAFETY: as in `pack_fr`.
+        let packed = unsafe {
+            core::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<PackedFr>(), out.len() / 8)
+        };
+        fill_powers(base, start / 8, packed);
+        Ok(())
+    })?;
+    Ok(dst)
+}
+
+/// `out[i] = base^(first + i)`, on the pool.
+fn fill_powers(base: Fr, first: usize, out: &mut [PackedFr]) {
+    use rayon::prelude::*;
+    const PIECE: usize = 1 << 14;
+    out.par_chunks_mut(PIECE)
+        .enumerate()
+        .for_each(|(i, piece)| {
+            let mut acc = base.pow([(first + i * PIECE) as u64]);
+            for p in piece {
+                *p = PackedFr::from_fr(&acc);
+                acc *= base;
+            }
+        });
 }
 
 /// Per-proof scratch: the pinned staging buffer for the witness, its device copy, the three
@@ -238,6 +395,9 @@ struct Scratch {
     /// [`CudaStages::launch_head`].
     unused: CudaSlice<u32>,
     ev: Events,
+    /// The witness and row staging of [`CudaStages::compute_h_from_rows`], made there on
+    /// its first use of this scratch.
+    staging: Option<Staging>,
 }
 
 type Pool = Arc<Mutex<Vec<Scratch>>>;
@@ -265,6 +425,11 @@ pub struct CudaStages {
     tail: CudaFunction,
     h_join: CudaFunction,
     mont_to_std: CudaFunction,
+    rows_abc: CudaFunction,
+    gnark_coeffs: CudaFunction,
+    /// A key with no constraint matrices, a gnark one: stage 0 is the caller's rows, through
+    /// [`Self::compute_h_from_rows`], and [`Self::compute_h`] refuses.
+    rows_only: bool,
 
     /// Largest number of NTT passes one launch can fuse, from the device's own shared
     /// memory attribute rather than hardcoded.
@@ -338,6 +503,8 @@ impl CudaStages {
         let tail = func("g16_ntt_tail")?;
         let h_join = func("g16_h_join")?;
         let mont_to_std = func("g16_mont_to_std")?;
+        let rows_abc = func("g16_rows_abc")?;
+        let gnark_coeffs = func("g16_gnark_coeffs")?;
 
         let ctx = cuda.context().clone();
         let stream = cuda.stream().clone();
@@ -392,6 +559,50 @@ impl CudaStages {
             .proving_coset_shift()
             .map_err(|e| bad(format!("no 2n-th root of unity: {e}")))?;
 
+        // A gnark key's matrices stay in gnark's R1CS. Its stage 0 is the caller's rows, so
+        // there is nothing to gather from, and the three tables go up a chunk at a time:
+        // at 2^24 they are 1 GB, and the host this key is proved on may not have it spare.
+        let rows_only = pk.h_basis != HBasis::SnarkjsOddCoset;
+        if rows_only {
+            let mut staging = Staging::new(&ctx)?;
+            let empty = || upload_u32(&stream, &[]);
+            let n = domain.size();
+            let tw_fwd = upload_powers(&stream, &mut staging, domain.group_gen(), n / 2)?;
+            let tw_inv = upload_powers(&stream, &mut staging, domain.group_gen_inv(), n / 2)?;
+            let coset_pows = upload_powers(&stream, &mut staging, coset_shift, n)?;
+            drop(staging);
+            return Ok(Self {
+                work: crate::msm::Work::Variable,
+                row_ptr: [empty()?, empty()?],
+                signal: [empty()?, empty()?],
+                value: [empty()?, empty()?],
+                tw_fwd,
+                tw_inv,
+                coset_pows,
+
+                n_vars: pk.n_vars,
+                batches: split_passes(domain.log_size(), max_fused),
+                coset_shift,
+                domain,
+
+                ctx,
+                stream,
+                module,
+                gather,
+                head,
+                tail,
+                h_join,
+                mont_to_std,
+                rows_abc,
+                gnark_coeffs,
+                rows_only,
+                max_fused,
+                block,
+                pool: Arc::new(Mutex::new(Vec::new())),
+                last_upload_us: AtomicU64::new(0),
+            });
+        }
+
         pk.coeffs
             .check_structure(domain.size(), pk.n_vars)
             .map_err(|e| bad(e.to_string()))?;
@@ -443,6 +654,9 @@ impl CudaStages {
             tail,
             h_join,
             mont_to_std,
+            rows_abc,
+            gnark_coeffs,
+            rows_only,
             max_fused,
             block,
             pool: Arc::new(Mutex::new(Vec::new())),
@@ -531,6 +745,12 @@ impl CudaStages {
     /// results stay correct (the two proofs own disjoint scratch), but the timings are only
     /// meaningful when proofs are run serially, which is how the benchmark runs them.
     pub fn compute_h(&self, witness: &[Fr], t: &mut StageTimings) -> Result<HPoly, ProveError> {
+        if self.rows_only {
+            return Err(bad(
+                "a gnark key carries no constraint matrices; prove it from A.w and B.w with \
+                 `h_and_msms_from_rows`",
+            ));
+        }
         if witness.len() != self.n_vars {
             return Err(ProveError::WitnessLength {
                 got: witness.len(),
@@ -633,13 +853,219 @@ impl CudaStages {
                 witness_prefix,
                 witness_fold,
                 n_vars: self.n_vars,
+                reuse: true,
             }),
         })
+    }
+
+    /// Stages 0 to 4 with stage 0 from the caller: `a_rows[i]` and `b_rows[i]` are
+    /// constraint `i`'s A.w and B.w, at most `domain_size` of each, and every row past them
+    /// is zero. With `gnark`, `H` then goes on to the basis a gnark key's `Z` is laid out
+    /// for (see `g16_gnark_coeffs` in `kernels/rows.cu`): coefficients times `-2`, bit
+    /// reversed, coefficient `n - 1` checked zero here. Otherwise it stays on the odd coset,
+    /// as [`Self::compute_h`] leaves it.
+    ///
+    /// The witness and both row vectors cross through the scratch's [`Staging`] pair, so
+    /// beyond the caller's own buffers this holds 64 MiB of pinned host memory, not a copy
+    /// of either. The handle carries the standard-form witness for the MSMs, which read it
+    /// through [`HHandle::witness_std`]; [`HHandle::witness_std_for`] refuses it, since no
+    /// fingerprint was taken.
+    ///
+    /// Timings as [`Self::compute_h`]: `gather_us` is the staged uploads, overlapped with the
+    /// host's packing, plus the witness conversion and the row kernel; `ntt_us` is the six
+    /// transforms and, with `gnark`, the inverse one and the reordering after them.
+    pub fn compute_h_from_rows(
+        &self,
+        witness: &[Fr],
+        a_rows: &[Fr],
+        b_rows: &[Fr],
+        gnark: bool,
+        t: &mut StageTimings,
+    ) -> Result<HHandle, ProveError> {
+        if witness.len() != self.n_vars {
+            return Err(ProveError::WitnessLength {
+                got: witness.len(),
+                want: self.n_vars,
+            });
+        }
+        let n = self.domain.size();
+        let rows = a_rows.len();
+        if b_rows.len() != rows || rows > n {
+            return Err(bad(format!(
+                "A.w has {rows} rows and B.w has {}; both must be one per constraint, at most \
+                 the domain size {n}",
+                b_rows.len()
+            )));
+        }
+        // Owned by the handle from here, so the scratch goes back to the pool on every
+        // return below, not only on success.
+        let mut handle = HHandle {
+            scratch: Some(self.take_scratch()?),
+            pool: Arc::clone(&self.pool),
+            stream: Arc::clone(&self.stream),
+            len: n,
+            witness_prefix: Vec::new(),
+            witness_fold: 0,
+            n_vars: self.n_vars,
+            reuse: false,
+        };
+        let sc = handle.scratch.as_mut().expect("just taken");
+        if sc.staging.is_none() {
+            sc.staging = Some(Staging::new(&self.ctx)?);
+        }
+        let fused = std::env::var_os("G16_CUDA_UNFUSED").is_none();
+
+        sc.ev
+            .start
+            .record(&self.stream)
+            .map_err(|e| drv("record start event", e))?;
+        {
+            let Scratch {
+                staging,
+                witness: w,
+                a,
+                b,
+                ..
+            } = &mut *sc;
+            let staging = staging.as_mut().expect("made above");
+            staging.upload_fr(&self.stream, w, witness)?;
+            staging.upload_fr(&self.stream, a, a_rows)?;
+            staging.upload_fr(&self.stream, b, b_rows)?;
+        }
+        sc.ev
+            .upload
+            .record(&self.stream)
+            .map_err(|e| drv("record upload event", e))?;
+
+        self.launch_mont_to_std(sc, self.n_vars)?;
+        self.launch_rows_abc(sc, rows, n)?;
+        sc.ev
+            .gather
+            .record(&self.stream)
+            .map_err(|e| drv("record gather event", e))?;
+
+        self.launch_transforms(sc, n, fused)?;
+        sc.ev
+            .ntt
+            .record(&self.stream)
+            .map_err(|e| drv("record ntt event", e))?;
+        if !fused {
+            self.launch_h_join(sc, n)?;
+            sc.ev
+                .join
+                .record(&self.stream)
+                .map_err(|e| drv("record join event", e))?;
+        }
+        if gnark {
+            self.launch_gnark_tail(sc, n)?;
+            sc.ev
+                .tail
+                .record(&self.stream)
+                .map_err(|e| drv("record tail event", e))?;
+        }
+
+        self.stream
+            .synchronize()
+            .map_err(|e| drv("synchronize stages 0-4 from rows", e))?;
+
+        let upload_us = elapsed_us(&sc.ev.start, &sc.ev.upload)?;
+        self.last_upload_us.store(upload_us, Ordering::Relaxed);
+        t.gather_us += upload_us + elapsed_us(&sc.ev.upload, &sc.ev.gather)?;
+        t.ntt_us += elapsed_us(&sc.ev.gather, &sc.ev.ntt)?;
+        let before_tail = if fused {
+            &sc.ev.ntt
+        } else {
+            t.pointwise_us += elapsed_us(&sc.ev.ntt, &sc.ev.join)?;
+            &sc.ev.join
+        };
+        if gnark {
+            t.ntt_us += elapsed_us(before_tail, &sc.ev.tail)?;
+            // `bitrev(n - 1) = n - 1`, so the last slot is coefficient `n - 1`. `A*B - C`
+            // has degree at most `2n - 2` and vanishes on the domain, so its quotient by `t`
+            // has degree at most `n - 2`, for any rows at all, since C is A*B on them by
+            // construction. A nonzero here is the arithmetic above gone wrong.
+            let last = self
+                .stream
+                .clone_dtoh(&sc.h_mont.slice((n - 1) * 8..n * 8))
+                .map_err(|e| drv("download H coefficient n - 1", e))?;
+            self.stream
+                .synchronize()
+                .map_err(|e| drv("synchronize H coefficient n - 1", e))?;
+            if last.iter().any(|&w| w != 0) {
+                return Err(bad(format!(
+                    "H has a nonzero coefficient {}, so the quotient by the vanishing \
+                     polynomial is not exact",
+                    n - 1
+                )));
+            }
+        }
+        Ok(handle)
     }
 
     // -----------------------------------------------------------------------
     // Launches
     // -----------------------------------------------------------------------
+
+    /// Stage 0 from rows: C = A*B on the first `rows`, all three zero past them. One thread
+    /// per element; see `g16_rows_abc` in rows.cu.
+    fn launch_rows_abc(&self, sc: &Scratch, rows: usize, n: usize) -> Result<(), ProveError> {
+        let (rr, nn) = (rows as u32, n as u32);
+        let block = self.block.min(nn.max(1));
+        let cfg = LaunchConfig {
+            grid_dim: (nn.div_ceil(block).max(1), 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut lb = self.stream.launch_builder(&self.rows_abc);
+        lb.arg(&sc.a).arg(&sc.b).arg(&sc.c).arg(&rr).arg(&nn);
+        // SAFETY: five parameters bound in order with matching types; all three buffers are
+        // domain sized, `rows <= n` was checked by the caller, and the kernel guards its
+        // tail block.
+        unsafe { lb.launch(cfg) }.map_err(|e| drv("launch g16_rows_abc", e))?;
+        Ok(())
+    }
+
+    /// `H` on the odd coset to a gnark key's basis: the inverse transform of `h_mont` into
+    /// `t`, the 1/n riding in on the load as in stage 1, then `g16_gnark_coeffs` back into
+    /// both H buffers.
+    fn launch_gnark_tail(&self, sc: &Scratch, n: usize) -> Result<(), ProveError> {
+        let log_n = self.domain.log_size();
+        let size_inv = PackedFr::from_fr(&self.domain.size_inv());
+        for (bi, b) in self.batches.iter().enumerate() {
+            let p = NttParams {
+                log_n,
+                s0: b.s0,
+                k: b.k,
+                scale_mode: if bi == 0 { SCALE_CONST } else { SCALE_NONE },
+                store_mode: STORE_PLAIN,
+                kscale: size_inv,
+            };
+            if bi == 0 {
+                self.launch_head(&p, &sc.h_mont, &sc.t, &self.tw_inv, sc, n)?;
+            } else {
+                self.launch_tail(&p, &sc.t, &self.tw_inv, sc, n)?;
+            }
+        }
+        let nn = n as u32;
+        let block = self.block.min(nn.max(1));
+        let cfg = LaunchConfig {
+            grid_dim: (nn.div_ceil(block).max(1), 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut lb = self.stream.launch_builder(&self.gnark_coeffs);
+        lb.arg(&sc.t)
+            .arg(&self.coset_pows)
+            .arg(&sc.h_mont)
+            .arg(&sc.h_std)
+            .arg(&log_n);
+        // SAFETY: five parameters bound in order with matching types; `t`, `coset_pows` and
+        // both H buffers are domain sized, every index the kernel forms (`bitrev(p)` and
+        // `n - j` for `j > 0`) is below `n`, and it guards its tail block. `t` and the H
+        // buffers are distinct allocations, so no thread reads what another writes.
+        unsafe { lb.launch(cfg) }.map_err(|e| drv("launch g16_gnark_coeffs", e))?;
+        Ok(())
+    }
 
     /// Stage 0.5: the on-device Montgomery-to-standard conversion of the witness. One
     /// thread per element, no sharing; see `g16_mont_to_std` in pointwise.cu.
@@ -897,8 +1323,14 @@ impl CudaStages {
         };
         // SAFETY: the pinned buffer is unset on return, which is fine because the packer
         // writes all `n_vars` elements before anything reads it, and the only reader is the
-        // DMA that the same thread issues after that write.
-        let host_witness = unsafe { self.ctx.alloc_pinned::<u32>(self.n_vars.max(1) * 8) }
+        // DMA that the same thread issues after that write. A rows-only key stages its
+        // witness through `Staging` instead and never packs into this, so it gets one word.
+        let host_words = if self.rows_only {
+            1
+        } else {
+            self.n_vars.max(1) * 8
+        };
+        let host_witness = unsafe { self.ctx.alloc_pinned::<u32>(host_words) }
             .map_err(|e| drv("allocate pinned witness staging", e))?;
         Ok(Scratch {
             host_witness,
@@ -912,6 +1344,7 @@ impl CudaStages {
             h_std: words(n)?,
             unused: words(1)?,
             ev: Events::new(&self.ctx)?,
+            staging: None,
         })
     }
 }
@@ -998,6 +1431,9 @@ pub struct HHandle {
     /// [`Self::witness_std_for`].
     witness_fold: u64,
     n_vars: usize,
+    /// Whether [`Self::witness_std_for`] may vouch for the witness at all. False from
+    /// [`CudaStages::compute_h_from_rows`], which takes no fingerprint.
+    reuse: bool,
 }
 
 impl HHandle {
@@ -1042,7 +1478,7 @@ impl HHandle {
         if std::env::var("G16_CUDA_WITNESS_REUSE").as_deref() == Ok("0") {
             return None;
         }
-        if witness.len() != self.n_vars {
+        if !self.reuse || witness.len() != self.n_vars {
             return None;
         }
         let fold = witness_fingerprint(witness);
@@ -1050,6 +1486,13 @@ impl HHandle {
             return None;
         }
         Some((&self.sc().witness_std, &self.witness_prefix))
+    }
+
+    /// The standard-form witness this handle's stages left on the device, `n_vars * 8`
+    /// words, with nothing checked: for the caller that ran those stages itself, as the
+    /// rows path does stages 0 to 9 in one call.
+    pub(crate) fn witness_std(&self) -> &CudaSlice<u32> {
+        &self.sc().witness_std
     }
 
     /// Copies H down to the host. Tests and cross-checks want this; the proving path must
@@ -1182,6 +1625,83 @@ mod tests {
             split_passes(22, 10).iter().map(|b| b.k).collect::<Vec<_>>(),
             vec![8, 7, 7]
         );
+    }
+
+    /// `g16_gnark_coeffs` on the host, over the natural-order output of the inverse
+    /// transform `launch_gnark_tail` runs first.
+    fn gnark_coeffs_model(g: &[Fr], pows: &[Fr], log_n: u32) -> Vec<Fr> {
+        let n = 1usize << log_n;
+        (0..n)
+            .map(|p| {
+                let j = if log_n == 0 {
+                    0
+                } else {
+                    ((p as u32).reverse_bits() >> (32 - log_n)) as usize
+                };
+                if j == 0 {
+                    g[j]
+                } else {
+                    -(g[j] * pows[n - j])
+                }
+            })
+            .collect()
+    }
+
+    /// The gnark tail the kernels run is the CPU backend's `to_gnark_coefficients`, element
+    /// for element: the natural inverse transform plus `g16_gnark_coeffs`' reorder and
+    /// `-shift^(n - j)` unscale against the DIF inverse plus the inverse coset table. Any
+    /// vector does, as both are linear; at `n = 1` there is no reversal and no unscale.
+    #[test]
+    fn the_gnark_tail_is_the_cpu_backends() {
+        use snarkrs_ntt::{CpuNtt, Direction};
+        let ntt = CpuNtt::new();
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        for log_n in [0u32, 1, 2, 5, 10, 13] {
+            let domain = Domain::new(1 << log_n).unwrap();
+            let shift = domain.proving_coset_shift().unwrap();
+            let n = domain.size();
+            let v: Vec<Fr> = (0..n)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    Fr::from(seed) * Fr::from(seed.rotate_left(17))
+                })
+                .collect();
+
+            let mut want = v.clone();
+            ntt.intt_to_bitrev(&domain, &mut want);
+            ntt.coset_scale_bitrev(&domain, &mut want, shift.inverse().unwrap());
+
+            let mut g = v.clone();
+            ntt.ntt(&domain, &mut g, Direction::Inverse);
+            let mut pows = vec![PackedFr::default(); n];
+            fill_powers(shift, 0, &mut pows);
+            let pows = PackedFr::unpack_slice(&pows);
+            assert_eq!(gnark_coeffs_model(&g, &pows, log_n), want, "n = {n}");
+        }
+    }
+
+    /// The chunked tables are `Domain`'s, whichever piece and chunk boundary a power falls on.
+    #[test]
+    fn staged_power_tables_are_the_domains() {
+        let domain = Domain::new(1 << 16).unwrap();
+        let shift = domain.proving_coset_shift().unwrap();
+        for (base, want) in [
+            (domain.group_gen(), domain.twiddles()),
+            (domain.group_gen_inv(), domain.twiddles_inv()),
+            (shift, snarkrs_field::powers(shift, domain.size())),
+        ] {
+            // Two chunks that split a piece, as a staged upload's would.
+            let cut = want.len() / 2 + 77;
+            let mut got = vec![PackedFr::default(); want.len()];
+            let (lo, hi) = got.split_at_mut(cut);
+            fill_powers(base, 0, lo);
+            fill_powers(base, cut, hi);
+            assert_eq!(PackedFr::unpack_slice(&got), want);
+        }
+        let src: Vec<Fr> = (0..40_000u64).map(Fr::from).collect();
+        let mut words = vec![0u32; src.len() * 8];
+        pack_fr(&src, &mut words);
+        assert_eq!(words, as_words(&PackedFr::pack_slice(&src)));
     }
 
     /// The argument block is a wire format shared with `kernels/ntt.cu`, which carries the

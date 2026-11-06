@@ -1997,6 +1997,7 @@ dependencies = [
  "snarkrs-gpu-layout",
  "snarkrs-groth16",
  "snarkrs-msm",
+ "snarkrs-ntt",
  "thiserror",
 ]
 

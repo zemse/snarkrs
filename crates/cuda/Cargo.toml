@@ -17,6 +17,8 @@ include = ["src/**/*", "LICENSE-MIT", "LICENSE-APACHE"]
 # `prove_with_blinders`, for the tests that compare proofs bit for bit at pinned blinders.
 # Dev-only, so the feature never reaches a shipping build of this crate.
 snarkrs-groth16 = { workspace = true, features = ["deterministic-blinders"] }
+# The CPU transforms the gnark tail's host model is checked against.
+snarkrs-ntt.workspace = true
 
 [features]
 # Off by default so a macOS workspace build never needs CUDA. With the feature on, this

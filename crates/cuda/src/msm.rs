@@ -458,6 +458,43 @@ fn ones_groups_for(n: usize) -> usize {
 /// Scalars a thread of the ones kernel scans; see [`ones_groups_for`].
 const ONES_SPT: usize = 32;
 
+/// Which MSMs a batch of [`CudaMsm::msms_resident`] runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Resident {
+    /// A, B in G2 and B in G1 over one run of the witness, sharing a plan.
+    Witness,
+    /// L over one run of the private witness.
+    L,
+    /// H over one run of `H`.
+    H,
+}
+
+/// The batches [`CudaMsm::msms_resident`] runs, in order, as the MSMs and the run of points
+/// (offset into the bases, length) each covers.
+pub(crate) fn resident_schedule(
+    n_vars: usize,
+    l_len: usize,
+    h_len: usize,
+    chunk: usize,
+) -> Result<Vec<(Resident, usize, usize)>, ProveError> {
+    if chunk == 0 {
+        return Err(bad("an MSM run of zero points"));
+    }
+    let mut out = Vec::new();
+    for (stage, len) in [
+        (Resident::Witness, n_vars),
+        (Resident::L, l_len),
+        (Resident::H, h_len),
+    ] {
+        out.extend(
+            (0..len)
+                .step_by(chunk)
+                .map(|off| (stage, off, chunk.min(len - off))),
+        );
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // Device-side structs
 // ---------------------------------------------------------------------------
@@ -1542,6 +1579,78 @@ impl CudaMsm {
             l_g1: out[3].g1()?,
             h_g1: out[4].g1()?,
         })
+    }
+
+    /// Stages 5 to 9 when the standard-form witness and `H` are already on the device, every
+    /// MSM cut into runs of at most `chunk` points: the batches [`resident_schedule`] lists,
+    /// run one after another. A run of the witness is one batch of A and both B, sharing
+    /// their digit plan as [`Self::msms`] does; L and H are a batch a run.
+    ///
+    /// A batch's scratch is then bounded by the run rather than by the key. Unchunked, a
+    /// 2^24 key's five MSMs ask for about 25 GB of entries and spill slots at once; in runs
+    /// of 2^22 the largest batch asks for 3 GB.
+    ///
+    /// Nothing is classified on the host, so every scalar counts as general and the plans
+    /// are the same for every witness of this shape. That costs no work, as the digit
+    /// pipeline drops zeros and the ones pass takes ones whatever the plan's size, and it
+    /// saves a host pass over the witness and its `n_vars + 1` prefix.
+    pub(crate) fn msms_resident(
+        &self,
+        witness_std: &CudaSlice<u32>,
+        h_std: &CudaSlice<u32>,
+        h_len: usize,
+        chunk: usize,
+    ) -> Result<MsmOutputs, ProveError> {
+        let w = Scalars::device_std(witness_std, self.n_vars)?;
+        let h = Scalars::device_std(h_std, h_len)?;
+        let l_off = self.n_public + 1;
+        let mut out = MsmOutputs {
+            a_g1: G1Projective::zero(),
+            b_g2: G2Projective::zero(),
+            b_g1: G1Projective::zero(),
+            l_g1: G1Projective::zero(),
+            h_g1: G1Projective::zero(),
+        };
+        let (mut device_us, mut combine_us) = (0, 0);
+        for (stage, off, n) in resident_schedule(self.n_vars, self.l.len(), h_len, chunk)? {
+            let g1 = |bases, scalars, scalar_off| {
+                Job::G1(JobG1 {
+                    bases,
+                    base_off: off,
+                    scalars,
+                    scalar_off,
+                    n,
+                })
+            };
+            match stage {
+                Resident::Witness => {
+                    let jobs = [
+                        g1(&self.a, w, off),
+                        Job::G2(JobG2 {
+                            bases: &self.b_g2,
+                            base_off: off,
+                            scalars: w,
+                            scalar_off: off,
+                            n,
+                        }),
+                        g1(&self.b_g1, w, off),
+                    ];
+                    let r = self.msm_batch(&jobs)?;
+                    out.a_g1 += r[0].g1()?;
+                    out.b_g2 += r[1].g2()?;
+                    out.b_g1 += r[2].g1()?;
+                }
+                Resident::L => {
+                    out.l_g1 += self.msm_batch(&[g1(&self.l, w, l_off + off)])?[0].g1()?
+                }
+                Resident::H => out.h_g1 += self.msm_batch(&[g1(&self.h, h, off)])?[0].g1()?,
+            }
+            device_us += self.last_device_us();
+            combine_us += self.last_combine_us();
+        }
+        self.last_device_us.store(device_us, Ordering::Relaxed);
+        self.last_combine_us.store(combine_us, Ordering::Relaxed);
+        Ok(out)
     }
 
     // -----------------------------------------------------------------------

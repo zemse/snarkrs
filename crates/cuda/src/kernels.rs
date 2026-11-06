@@ -19,6 +19,9 @@ pub const NTT_CU: &str = include_str!("kernels/ntt.cu");
 /// Stage 4: `H = A*B - C`, fused into the tail of the last transform where possible.
 pub const POINTWISE_CU: &str = include_str!("kernels/pointwise.cu");
 
+/// Stage 0 from A.w and B.w rows, and the tail that takes H to a gnark key's basis.
+pub const ROWS_CU: &str = include_str!("kernels/rows.cu");
+
 /// BN254 Fq, Fq2 and the G1/G2 point arithmetic, shared by the MSM and FFT units. Split
 /// out of `msm.cu` so the FFT unit does not recompile the seventeen MSM entry points;
 /// everything in it is a template or a `__forceinline__` helper, so a unit pays only for
@@ -76,10 +79,10 @@ pub(crate) fn fft_variants_enabled() -> bool {
 ///
 /// The order gather / ntt / pointwise is a correctness contract, not a preference:
 /// `ntt.cu` forward-declares `g16_store_h` and `pointwise.cu` defines it, so pointwise
-/// must come last. Both files say so in prose.
+/// comes after ntt. Both files say so in prose. `rows.cu` calls into both and comes last.
 pub fn unit_stages() -> String {
     format!(
-        "{}{FR_CUH}\n{GATHER_CU}\n{NTT_CU}\n{POINTWISE_CU}",
+        "{}{FR_CUH}\n{GATHER_CU}\n{NTT_CU}\n{POINTWISE_CU}\n{ROWS_CU}",
         defines(fft_variants_enabled())
     )
 }

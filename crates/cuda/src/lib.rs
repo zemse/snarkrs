@@ -48,7 +48,7 @@ pub mod msm;
 pub mod stages;
 
 #[cfg(feature = "cuda")]
-pub use backend::{CudaBackend, CudaCircuit, PrepareCost};
+pub use backend::{CudaBackend, CudaCircuit, PrepareCost, MSM_CHUNK};
 #[cfg(feature = "cuda")]
 pub use ceremony::CudaGroupFft;
 #[cfg(feature = "cuda")]
