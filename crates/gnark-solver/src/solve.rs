@@ -9,17 +9,21 @@
 use crate::hints::Hint;
 use crate::r1cs::{gnark_text, Op, CONSTANT};
 use crate::{GnarkR1cs, Solution, SolveError};
-use ark_ff::AdditiveGroup;
 use rayon::prelude::*;
+use snarkrs_field::raw::RawFr;
 use snarkrs_field::{Field, Fr, Zero};
 use std::collections::BTreeMap;
 
-/// A level shorter than this runs on the calling thread, as gnark runs a level of fewer
-/// than 50 instructions per CPU on one.
-const PAR_LEVEL: usize = 512;
+/// A level shorter than this runs on the calling thread. Measured on SP1's circuit, where
+/// 123,576 of the 135,582 levels are under 16 instructions: from 128 up, a level is worth
+/// waking the pool for.
+const PAR_LEVEL: usize = 128;
 
-/// The fewest instructions one task takes from a parallel level.
-const MIN_TASK: usize = 128;
+/// The fewest instructions one task takes from a parallel level. Tasks are small, 32 per
+/// thread, so that work stealing evens out cores of different speeds (the M2 Max's four
+/// efficiency cores) before the level's barrier rather than leaving it waiting on them.
+const MIN_TASK: usize = 8;
+const TASKS_PER_THREAD: usize = 32;
 
 /// Solves gnark R1CS files, with a registry of hints by gnark's hint ID.
 pub struct Solver {
@@ -152,7 +156,8 @@ impl Solver {
             if ops.len() < PAR_LEVEL {
                 run.ops(ops)?;
             } else {
-                let task = MIN_TASK.max(ops.len() / (4 * rayon::current_num_threads()));
+                let task =
+                    MIN_TASK.max(ops.len() / (TASKS_PER_THREAD * rayon::current_num_threads()));
                 // Each task stops at its first error and the earliest one wins, so the
                 // error is the same whichever thread finds it.
                 let errors: Vec<SolveError> = ops
@@ -256,15 +261,19 @@ impl Run<'_> {
     /// `c` and `wire` are in range and `wire` is solved, as the reader proved of every term
     /// it handed the solver.
     #[inline(always)]
-    unsafe fn accumulate(&self, acc: &mut Fr, c: u32, wire: u32) {
+    unsafe fn accumulate(&self, acc: &mut RawFr, c: u32, wire: u32) {
+        let x = || RawFr::from_fr(&self.w.get(wire as usize));
         match c {
             0 => {}
-            1 => *acc += self.w.get(wire as usize),
-            2 => *acc += self.w.get(wire as usize).double(),
-            3 => *acc -= self.w.get(wire as usize),
+            1 => *acc = acc.add(x()),
+            2 => {
+                let x = x();
+                *acc = acc.add(x.add(x))
+            }
+            3 => *acc = acc.sub(x()),
             _ => {
-                *acc +=
-                    *self.r1cs.coefficients.get_unchecked(c as usize) * self.w.get(wire as usize)
+                let k = RawFr::from_fr(self.r1cs.coefficients.get_unchecked(c as usize));
+                *acc = acc.add(k.mul(x()))
             }
         }
     }
@@ -275,7 +284,7 @@ impl Run<'_> {
         let (end_l, end_r) = (4 + 2 * nl, 4 + 2 * (nl + nr));
         let end = end_r + 2 * no;
         let skip = op.solve as usize;
-        let mut v = [Fr::zero(); 3];
+        let mut v = [RawFr::ZERO; 3];
         let mut k = 4;
         for (side, until) in [(0, end_l), (1, end_r), (2, end)] {
             while k < until {
@@ -292,7 +301,7 @@ impl Run<'_> {
                 k += 2;
             }
         }
-        let [mut a, mut b, mut c] = v;
+        let [mut a, mut b, mut c] = v.map(RawFr::to_fr);
         let unsatisfied = |a: &Fr, b: &Fr, c: &Fr| SolveError::Unsatisfied {
             constraint: op.constraint as usize,
             message: format!("{} ⋅ {} != {}", gnark_text(a), gnark_text(b), gnark_text(c)),
@@ -356,16 +365,16 @@ impl Run<'_> {
         let mut j = 3;
         for _ in 0..n_inputs {
             let n = cd[j] as usize;
-            let mut v = Fr::zero();
+            let mut v = RawFr::ZERO;
             for &[c, wire] in cd[j + 1..j + 1 + 2 * n].as_chunks::<2>().0 {
                 if wire == CONSTANT {
-                    v += self.r1cs.coefficients[c as usize];
+                    v = v.add(RawFr::from_fr(&self.r1cs.coefficients[c as usize]));
                 } else {
                     // SAFETY: as for an R1C term; a zero coefficient's wire is not read.
                     unsafe { self.accumulate(&mut v, c, wire) };
                 }
             }
-            inputs.push(v);
+            inputs.push(v.to_fr());
             j += 1 + 2 * n;
         }
         let (from, to) = (cd[j] as usize, cd[j + 1] as usize);
