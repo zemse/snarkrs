@@ -25,7 +25,7 @@ pub mod proof;
 pub mod vk;
 pub mod witness;
 
-pub use pk::GnarkProvingKey;
+pub use pk::{GnarkDump, GnarkProvingKey, Query};
 pub use vk::GnarkVerifyingKey;
 pub use witness::GnarkWitness;
 

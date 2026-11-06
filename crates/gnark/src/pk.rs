@@ -24,6 +24,7 @@ use rayon::prelude::*;
 use snarkrs_field::*;
 use snarkrs_formats::binfile::{self, G1_BYTES, G2_BYTES};
 use snarkrs_formats::{Coefficients, HBasis, ProvingKey};
+use std::ops::Range;
 
 /// The largest `log2(domain)` this crate accepts. The CPU prover evaluates on the odd half
 /// of the `2n`-th roots of unity, so it needs a `2n`-th root, and Fr has 2-adicity 28.
@@ -207,59 +208,338 @@ impl GnarkProvingKey {
     /// `G1.Z` goes in the H query under [`HBasis::GnarkBitReversed`]. The key carries no
     /// constraint matrices, so it proves only from A.w and B.w rows.
     pub fn into_proving_key(self, vk: &GnarkVerifyingKey) -> Result<ProvingKey, GnarkError> {
-        let mismatch = |what: &str| GnarkError::Mismatch {
+        let points = (
+            [self.alpha_g1, self.beta_g1, self.delta_g1],
+            [self.beta_g2, self.delta_g2],
+        );
+        let mut pk = proving_key(&self.header, points, vk)?;
+        pk.a_query = self.a;
+        pk.b_g1_query = self.b_g1;
+        pk.b_g2_query = self.b_g2;
+        pk.l_query = self.k;
+        pk.h_query = self.z;
+        Ok(pk)
+    }
+}
+
+/// snarkrs' key for a dump's header and five header points, checked against `vk` as
+/// [`GnarkProvingKey::into_proving_key`] documents, with all five queries left empty.
+fn proving_key(
+    header: &DumpHeader,
+    points: ([G1Affine; 3], [G2Affine; 2]),
+    vk: &GnarkVerifyingKey,
+) -> Result<ProvingKey, GnarkError> {
+    let ([alpha_g1, beta_g1, delta_g1], [beta_g2, delta_g2]) = points;
+    let mismatch = |what: &str| GnarkError::Mismatch {
+        part: "verifying key",
+        reason: format!("{what} differs from the proving key's"),
+    };
+    if vk.alpha_g1 != alpha_g1 {
+        return Err(mismatch("G1.Alpha"));
+    }
+    if vk.beta_g1 != beta_g1 {
+        return Err(mismatch("G1.Beta"));
+    }
+    if vk.delta_g1 != delta_g1 {
+        return Err(mismatch("G1.Delta"));
+    }
+    if vk.beta_g2 != beta_g2 {
+        return Err(mismatch("G2.Beta"));
+    }
+    if vk.delta_g2 != delta_g2 {
+        return Err(mismatch("G2.Delta"));
+    }
+    let public_wires = header.n_public_wires();
+    if vk.k.len() != public_wires {
+        return Err(GnarkError::Mismatch {
             part: "verifying key",
-            reason: format!("{what} differs from the proving key's"),
+            reason: format!(
+                "{} K points, the proving key leaves {public_wires} public wires",
+                vk.k.len()
+            ),
+        });
+    }
+    Ok(ProvingKey {
+        n_vars: header.n_wires,
+        n_public: public_wires - 1,
+        domain_size: header.domain_size,
+        alpha_g1,
+        beta_g1,
+        beta_g2,
+        delta_g1,
+        delta_g2,
+        a_query: Vec::new(),
+        b_g1_query: Vec::new(),
+        b_g2_query: Vec::new(),
+        l_query: Vec::new(),
+        h_query: Vec::new(),
+        h_basis: HBasis::GnarkBitReversed,
+        coeffs: Coefficients {
+            row_ptr: Default::default(),
+            signal: Default::default(),
+            value_id: Default::default(),
+            values: Vec::new(),
+        },
+        vk: vk.to_verifying_key(),
+    })
+}
+
+/// One of the five dumped queries, as [`GnarkDump::read_points`] names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Query {
+    /// `G1.A`, one base per wire once re-expanded.
+    G1A,
+    /// `G1.B`, one base per wire once re-expanded.
+    G1B,
+    /// `G1.Z`, `domain_size - 1` bases.
+    G1Z,
+    /// `G1.K`, one base per private wire.
+    G1K,
+    /// `G2.B`, one base per wire once re-expanded.
+    G2B,
+}
+
+impl Query {
+    pub const ALL: [Query; 5] = [Query::G1A, Query::G1B, Query::G1Z, Query::G1K, Query::G2B];
+
+    /// Bytes of one point: [`G1_BYTES`] or [`G2_BYTES`].
+    pub fn stride(self) -> usize {
+        match self {
+            Query::G2B => G2_BYTES,
+            _ => G1_BYTES,
+        }
+    }
+
+    fn part(self) -> &'static str {
+        match self {
+            Query::G1A => "G1.A",
+            Query::G1B => "G1.B",
+            Query::G1Z => "G1.Z",
+            Query::G1K => "G1.K",
+            Query::G2B => "G2.B",
+        }
+    }
+}
+
+/// A mapped dump with its header checked and not one query point decoded, for a prover
+/// that streams the queries somewhere else a chunk at a time and so never holds a decoded
+/// copy. [`GnarkProvingKey::read_dump`] is the same parse with everything decoded at once.
+///
+/// [`Self::read_points`] writes the dumped bytes themselves, re-expanded: Montgomery
+/// little-endian `x` then `y` per point (for G2 `A0` before `A1` in each), the identity as
+/// all zero bytes. Every point it writes passes the checks `read_dump` makes of it.
+pub struct GnarkDump {
+    map: memmap2::Mmap,
+    header: DumpHeader,
+    points: ([G1Affine; 3], [G2Affine; 2]),
+    /// Byte ranges into `map`.
+    infinity_a: Range<usize>,
+    infinity_b: Range<usize>,
+    slices: [Range<usize>; 5],
+    /// Unflagged wires before each `block` of `InfinityA` and `InfinityB`, which
+    /// is where that block's points start in the compact slice.
+    starts_a: Vec<usize>,
+    starts_b: Vec<usize>,
+    /// [`EXPAND_BLOCK`], or a smaller block for a test that has to cross one on a toy key.
+    block: usize,
+}
+
+impl GnarkDump {
+    /// Map a dump and check everything [`DumpHeader::read`] checks.
+    pub fn open(path: &std::path::Path) -> Result<Self, GnarkError> {
+        Self::open_blocked(path, EXPAND_BLOCK)
+    }
+
+    pub(crate) fn open_blocked(path: &std::path::Path, block: usize) -> Result<Self, GnarkError> {
+        let map = crate::map(path)?;
+        let at = |s: &[u8]| {
+            let start = s.as_ptr() as usize - map.as_ptr() as usize;
+            start..start + s.len()
         };
-        if vk.alpha_g1 != self.alpha_g1 {
-            return Err(mismatch("G1.Alpha"));
-        }
-        if vk.beta_g1 != self.beta_g1 {
-            return Err(mismatch("G1.Beta"));
-        }
-        if vk.delta_g1 != self.delta_g1 {
-            return Err(mismatch("G1.Delta"));
-        }
-        if vk.beta_g2 != self.beta_g2 {
-            return Err(mismatch("G2.Beta"));
-        }
-        if vk.delta_g2 != self.delta_g2 {
-            return Err(mismatch("G2.Delta"));
-        }
-        let public_wires = self.header.n_public_wires();
-        if vk.k.len() != public_wires {
-            return Err(GnarkError::Mismatch {
-                part: "verifying key",
-                reason: format!(
-                    "{} K points, the proving key leaves {public_wires} public wires",
-                    vk.k.len()
-                ),
-            });
-        }
-        Ok(ProvingKey {
-            n_vars: self.header.n_wires,
-            n_public: public_wires - 1,
-            domain_size: self.header.domain_size,
-            alpha_g1: self.alpha_g1,
-            beta_g1: self.beta_g1,
-            beta_g2: self.beta_g2,
-            delta_g1: self.delta_g1,
-            delta_g2: self.delta_g2,
-            a_query: self.a,
-            b_g1_query: self.b_g1,
-            b_g2_query: self.b_g2,
-            l_query: self.k,
-            h_query: self.z,
-            h_basis: HBasis::GnarkBitReversed,
-            coeffs: Coefficients {
-                row_ptr: Default::default(),
-                signal: Default::default(),
-                value_id: Default::default(),
-                values: Vec::new(),
-            },
-            vk: vk.to_verifying_key(),
+        let l = layout(&map)?;
+        let (infinity_a, infinity_b) = (at(l.infinity_a), at(l.infinity_b));
+        let slices = [at(l.g1_a), at(l.g1_b), at(l.g1_z), at(l.g1_k), at(l.g2_b)];
+        let starts_a = block_starts(l.infinity_a, block);
+        let starts_b = block_starts(l.infinity_b, block);
+        let (header, points) = (l.header, (l.points, l.g2_points));
+        Ok(Self {
+            map,
+            header,
+            points,
+            infinity_a,
+            infinity_b,
+            slices,
+            starts_a,
+            starts_b,
+            block,
         })
     }
+
+    pub fn header(&self) -> &DumpHeader {
+        &self.header
+    }
+
+    /// The key [`GnarkProvingKey::into_proving_key`] gives, checked against `vk` the same
+    /// way, but with every query empty: the five header points, the dimensions and `vk`
+    /// are what proving needs on the host once the queries live elsewhere.
+    pub fn proving_key(&self, vk: &GnarkVerifyingKey) -> Result<ProvingKey, GnarkError> {
+        proving_key(&self.header, self.points, vk)
+    }
+
+    /// Points in `q` once re-expanded: `nbWires` for the three wire queries, the private
+    /// wires for `G1.K`, `domain_size - 1` for `G1.Z`.
+    pub fn len(&self, q: Query) -> usize {
+        match q {
+            Query::G1A | Query::G1B | Query::G2B => self.header.n_wires,
+            Query::G1Z => self.header.g1_z,
+            Query::G1K => self.header.g1_k,
+        }
+    }
+
+    /// Points `start..start + out.len() / q.stride()` of `q`, re-expanded, written into
+    /// `out` as the dump holds them, with every one checked as [`GnarkProvingKey::read_dump`]
+    /// checks it. Returns how many of them are not the identity, so a caller that reads a
+    /// whole query can refuse one that is all identity with [`Self::check_not_all_infinity`].
+    ///
+    /// The pages of the dump this read are dropped from the process before it returns
+    /// (`MADV_DONTNEED`, a no-op where it is unsupported): a stream through a 6 GB dump keeps
+    /// at most a chunk of it resident, and a page read twice is read from the file again.
+    pub fn read_points(&self, q: Query, start: usize, out: &mut [u8]) -> Result<usize, GnarkError> {
+        let stride = q.stride();
+        let count = out.len() / stride;
+        let end = start
+            .checked_add(count)
+            .filter(|&e| out.len().is_multiple_of(stride) && e <= self.len(q))
+            .ok_or_else(|| {
+                bad(
+                    q.part(),
+                    format!(
+                        "{} bytes at point {start} is not a whole run of the {} points",
+                        out.len(),
+                        self.len(q)
+                    ),
+                )
+            })?;
+        let data = &self.map[self.slices[q as usize].clone()];
+        let flags = match q {
+            Query::G1A => Some((&self.map[self.infinity_a.clone()], &self.starts_a)),
+            Query::G1B | Query::G2B => Some((&self.map[self.infinity_b.clone()], &self.starts_b)),
+            Query::G1Z | Query::G1K => None,
+        };
+
+        // Pieces that never cross a `block`, so each finds its place in the compact
+        // slice from its block's start and at most one block of flags.
+        let mut pieces = Vec::new();
+        let mut rest = out;
+        let mut at = start;
+        while at < end {
+            let next = ((at / self.block + 1) * self.block).min(end);
+            let (piece, tail) = rest.split_at_mut((next - at) * stride);
+            pieces.push((at, piece));
+            rest = tail;
+            at = next;
+        }
+        let check = |i: usize, b: &[u8]| -> Result<bool, GnarkError> {
+            let part = q.part();
+            if q == Query::G2B {
+                let p = binfile::g2(b).map_err(|e| bad(part, format!("point {i}: {e}")))?;
+                if !p.is_on_curve() {
+                    return Err(bad(part, format!("point {i} is not on the curve")));
+                }
+                Ok(!p.infinity)
+            } else {
+                let p = binfile::g1(b).map_err(|e| bad(part, format!("point {i}: {e}")))?;
+                if !(p.is_on_curve() && p.is_in_correct_subgroup_assuming_on_curve()) {
+                    return Err(bad(part, format!("point {i} is not on the curve")));
+                }
+                Ok(!p.infinity)
+            }
+        };
+        let counts: Vec<Result<(usize, Range<usize>), GnarkError>> = pieces
+            .into_par_iter()
+            .map(|(from, piece)| {
+                let mut src = match flags {
+                    Some((flags, starts)) => {
+                        let block = from / self.block;
+                        let skipped = &flags[block * self.block..from];
+                        starts[block] + skipped.iter().filter(|&&f| f == 0).count()
+                    }
+                    None => from,
+                };
+                let first = src;
+                let mut live = 0;
+                for (w, slot) in (from..).zip(piece.chunks_exact_mut(stride)) {
+                    if flags.is_some_and(|(flags, _)| flags[w] == 1) {
+                        slot.fill(0);
+                        continue;
+                    }
+                    let b = &data[src * stride..(src + 1) * stride];
+                    live += usize::from(check(src, b)?);
+                    slot.copy_from_slice(b);
+                    src += 1;
+                }
+                Ok((live, first * stride..src * stride))
+            })
+            .collect();
+        let mut live = 0;
+        for c in counts {
+            let (n, read) = c?;
+            live += n;
+            self.release(self.slices[q as usize].start + read.start, read.len());
+        }
+        Ok(live)
+    }
+
+    /// The check [`GnarkProvingKey::read_dump`] makes of a whole query once it is read:
+    /// `live` points of `q` not the identity, from [`Self::read_points`] over all of it. A
+    /// query that is entirely the identity has been zeroed, and only `G1.K` may be (on a key
+    /// with no private wires).
+    pub fn check_not_all_infinity(&self, q: Query, live: usize) -> Result<(), GnarkError> {
+        let n = self.len(q);
+        if q != Query::G1K && n > 0 && live == 0 {
+            return Err(bad(
+                q.part(),
+                format!(
+                    "every one of the {n} points is the point at infinity; the query has \
+                     been zeroed"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn release(&self, offset: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        // SAFETY: the map is a read-only file mapping that nothing here writes, so a page
+        // dropped from it reads back the file's bytes on its next touch. No borrow of the
+        // range is alive: `read_points` has finished copying out of it. A failure leaves the
+        // pages resident, which only costs memory.
+        let _ = unsafe {
+            self.map
+                .unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, offset, len)
+        };
+    }
+
+    #[cfg(not(unix))]
+    fn release(&self, _offset: usize, _len: usize) {}
+}
+
+/// Unflagged entries before each `block` of `flags`.
+fn block_starts(flags: &[u8], block: usize) -> Vec<usize> {
+    let mut starts: Vec<usize> = flags
+        .par_chunks(block)
+        .map(|block| block.iter().filter(|&&f| f == 0).count())
+        .collect();
+    let mut acc = 0;
+    for s in &mut starts {
+        let n = *s;
+        *s = acc;
+        acc += n;
+    }
+    starts
 }
 
 impl DumpHeader {

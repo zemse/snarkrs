@@ -335,3 +335,135 @@ fn dumped_bytes_reinterpret_as_fr() {
     // And the values are the field elements, not just the same bits: the public X is 5.
     assert_eq!(wv[1] * wv[1], Fr::from(25u64));
 }
+
+/// Every query streamed through `GnarkDump::read_points` in runs that start and end
+/// anywhere, across an `EXPAND_BLOCK` boundary too, decodes to exactly what `read_dump`
+/// expands, with the identity as zero bytes in the flagged slots.
+#[test]
+fn a_streamed_dump_reads_what_read_dump_decodes() {
+    let pk = GnarkProvingKey::read_dump(&toy("pk.dump")).unwrap();
+    // The toy key is smaller than one `EXPAND_BLOCK`, so a small block is what makes the
+    // runs cross block boundaries, partway into a block and exactly at one.
+    for block in [1 << 14, 1000, 1] {
+        streamed_matches(
+            &pk,
+            &GnarkDump::open_blocked(&toy("pk.dump"), block).unwrap(),
+        );
+    }
+}
+
+fn streamed_matches(pk: &GnarkProvingKey, dump: &GnarkDump) {
+    use snarkrs_formats::binfile;
+    assert_eq!(dump.header(), &pk.header);
+    for q in Query::ALL {
+        let stride = q.stride();
+        let n = dump.len(q);
+        let len = match q {
+            Query::G1A => pk.a.len(),
+            Query::G1B => pk.b_g1.len(),
+            Query::G1Z => pk.z.len(),
+            Query::G1K => pk.k.len(),
+            Query::G2B => pk.b_g2.len(),
+        };
+        assert_eq!(len, n, "{q:?}");
+        for run in [1, 7, 1000, n] {
+            let mut bytes = Vec::new();
+            let mut live = 0;
+            let mut at = 0;
+            while at < n {
+                let m = run.min(n - at);
+                let mut out = vec![0xa5u8; m * stride];
+                live += dump.read_points(q, at, &mut out).unwrap();
+                bytes.extend_from_slice(&out);
+                at += m;
+            }
+            let mut want_live = 0;
+            for (i, b) in bytes.chunks_exact(stride).enumerate() {
+                let infinity = if q == Query::G2B {
+                    let p = binfile::g2(b).unwrap();
+                    assert_eq!(p, pk.b_g2[i], "{q:?} point {i}");
+                    p.infinity
+                } else {
+                    let want = match q {
+                        Query::G1A => pk.a[i],
+                        Query::G1B => pk.b_g1[i],
+                        Query::G1Z => pk.z[i],
+                        _ => pk.k[i],
+                    };
+                    assert_eq!(binfile::g1(b).unwrap(), want, "{q:?} point {i}");
+                    want.infinity
+                };
+                if infinity {
+                    assert!(b.iter().all(|&v| v == 0), "{q:?} point {i}");
+                } else {
+                    want_live += 1;
+                }
+            }
+            assert_eq!(live, want_live, "{q:?} run {run}");
+            dump.check_not_all_infinity(q, live).unwrap();
+        }
+    }
+    assert!(dump.check_not_all_infinity(Query::G1A, 0).is_err());
+    dump.check_not_all_infinity(Query::G1K, 0).unwrap();
+}
+
+/// A run past the end, or one that is not whole points, is refused rather than read short.
+#[test]
+fn a_streamed_run_out_of_range_is_refused() {
+    let dump = GnarkDump::open(&toy("pk.dump")).unwrap();
+    let n = dump.len(Query::G1Z);
+    assert!(dump.read_points(Query::G1Z, n, &mut [0u8; 64]).is_err());
+    assert!(dump.read_points(Query::G1Z, 0, &mut [0u8; 65]).is_err());
+    assert_eq!(dump.read_points(Query::G1Z, n, &mut []).unwrap(), 0);
+}
+
+/// The header-only key is `into_proving_key`'s with the queries left out.
+#[test]
+fn a_streamed_dump_gives_the_key_without_its_queries() {
+    let vk = GnarkVerifyingKey::read(&toy("vk.bin")).unwrap();
+    let full = GnarkProvingKey::read_dump(&toy("pk.dump"))
+        .unwrap()
+        .into_proving_key(&vk)
+        .unwrap();
+    let key = GnarkDump::open(&toy("pk.dump"))
+        .unwrap()
+        .proving_key(&vk)
+        .unwrap();
+    assert_eq!(
+        (key.n_vars, key.n_public, key.domain_size, key.h_basis),
+        (full.n_vars, full.n_public, full.domain_size, full.h_basis)
+    );
+    assert_eq!(
+        (key.alpha_g1, key.beta_g1, key.delta_g1),
+        (full.alpha_g1, full.beta_g1, full.delta_g1)
+    );
+    assert_eq!((key.beta_g2, key.delta_g2), (full.beta_g2, full.delta_g2));
+    assert_eq!(key.vk.ic, full.vk.ic);
+    assert!(key.a_query.is_empty() && key.h_query.is_empty() && key.l_query.is_empty());
+}
+
+/// A query point off the curve is refused by the streamed read too, by the read that
+/// covers it and no other.
+#[test]
+fn a_streamed_off_curve_point_is_refused() {
+    let mut b = bytes("pk.dump");
+    let at = after_flags(&b) + 4 + 8;
+    b[at] ^= 1;
+    let dir = std::env::temp_dir().join(format!("snarkrs-gnark-dump-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("pk.dump");
+    std::fs::write(&path, &b).unwrap();
+    let dump = GnarkDump::open(&path).unwrap();
+    let mut out = vec![0u8; dump.len(Query::G1A) * 64];
+    let err = dump
+        .read_points(Query::G1A, 0, &mut out)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("G1.A") && err.contains("not on the curve"),
+        "{err}"
+    );
+    let mut out = vec![0u8; dump.len(Query::G1B) * 64];
+    dump.read_points(Query::G1B, 0, &mut out).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
