@@ -19,10 +19,11 @@
 //! the `n` powers and drops the last, which is `bitrev(n - 1) = n - 1`, the one coefficient
 //! of H that is always zero. `G1.K` is the private wires, `nbPublic..nbWires`.
 
-use crate::{check_header_g1, check_header_g2, GnarkError, Reader, DUMP_MARKER};
+use crate::{check_header_g1, check_header_g2, GnarkError, GnarkVerifyingKey, Reader, DUMP_MARKER};
 use rayon::prelude::*;
 use snarkrs_field::*;
 use snarkrs_formats::binfile::{self, G1_BYTES, G2_BYTES};
+use snarkrs_formats::{Coefficients, HBasis, ProvingKey};
 
 /// The largest `log2(domain)` this crate accepts. The CPU prover evaluates on the odd half
 /// of the `2n`-th roots of unity, so it needs a `2n`-th root, and Fr has 2-adicity 28.
@@ -191,6 +192,72 @@ impl GnarkProvingKey {
             b_g2,
             z,
             k,
+        })
+    }
+}
+
+impl GnarkProvingKey {
+    /// snarkrs' proving key, with `vk` supplying what the dump does not hold: `gamma` and
+    /// the public wires' `K`, which is snarkjs' IC. The five points both files hold must
+    /// agree, and `vk` must have one `K` point per public wire.
+    ///
+    /// The mapping onto zkey terms: `G1.A`, `G1.B` and `G2.B` are the A, B1 and B2 queries;
+    /// `G1.K` is the C query over the private wires, `witness[n_public + 1..]`, because
+    /// gnark's `nbPublic` counts the constant wire and snarkjs' `n_public` does not; and
+    /// `G1.Z` goes in the H query under [`HBasis::GnarkBitReversed`]. The key carries no
+    /// constraint matrices, so it proves only from A.w and B.w rows.
+    pub fn into_proving_key(self, vk: &GnarkVerifyingKey) -> Result<ProvingKey, GnarkError> {
+        let mismatch = |what: &str| GnarkError::Mismatch {
+            part: "verifying key",
+            reason: format!("{what} differs from the proving key's"),
+        };
+        if vk.alpha_g1 != self.alpha_g1 {
+            return Err(mismatch("G1.Alpha"));
+        }
+        if vk.beta_g1 != self.beta_g1 {
+            return Err(mismatch("G1.Beta"));
+        }
+        if vk.delta_g1 != self.delta_g1 {
+            return Err(mismatch("G1.Delta"));
+        }
+        if vk.beta_g2 != self.beta_g2 {
+            return Err(mismatch("G2.Beta"));
+        }
+        if vk.delta_g2 != self.delta_g2 {
+            return Err(mismatch("G2.Delta"));
+        }
+        let public_wires = self.header.n_public_wires();
+        if vk.k.len() != public_wires {
+            return Err(GnarkError::Mismatch {
+                part: "verifying key",
+                reason: format!(
+                    "{} K points, the proving key leaves {public_wires} public wires",
+                    vk.k.len()
+                ),
+            });
+        }
+        Ok(ProvingKey {
+            n_vars: self.header.n_wires,
+            n_public: public_wires - 1,
+            domain_size: self.header.domain_size,
+            alpha_g1: self.alpha_g1,
+            beta_g1: self.beta_g1,
+            beta_g2: self.beta_g2,
+            delta_g1: self.delta_g1,
+            delta_g2: self.delta_g2,
+            a_query: self.a,
+            b_g1_query: self.b_g1,
+            b_g2_query: self.b_g2,
+            l_query: self.k,
+            h_query: self.z,
+            h_basis: HBasis::GnarkBitReversed,
+            coeffs: Coefficients {
+                row_ptr: Default::default(),
+                signal: Default::default(),
+                value_id: Default::default(),
+                values: Vec::new(),
+            },
+            vk: vk.to_verifying_key(),
         })
     }
 }

@@ -22,6 +22,8 @@ ark-ec.workspace = true
 rayon.workspace = true
 thiserror.workspace = true
 memmap2.workspace = true
+ark-std.workspace = true
 
 [dev-dependencies]
-ark-std.workspace = true
+# The prove example needs an OS-seeded RNG; `getrandom` is ark-std's name for rand/std.
+ark-std = { workspace = true, features = ["std", "getrandom"] }

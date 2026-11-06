@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use snarkrs_field::{AffineRepr as _, Fr, G1Affine, G2Affine, Zero as _};
-use snarkrs_formats::{wtns::Witness, Coefficients, ProvingKey, VerifyingKey};
+use snarkrs_formats::{wtns::Witness, Coefficients, HBasis, ProvingKey, VerifyingKey};
 use snarkrs_gpu_layout::testrng::SplitMix64;
 use snarkrs_gpu_layout::{PackedScalar, LIMBS};
 use snarkrs_groth16::cpu::CpuCircuit;
@@ -365,6 +365,7 @@ fn synthetic_key(rng: &mut SplitMix64, domain_size: usize, n_vars: usize) -> Pro
         b_g2_query: Vec::new(),
         l_query: Vec::new(),
         h_query: Vec::new(),
+        h_basis: HBasis::SnarkjsOddCoset,
         coeffs: synthetic_coeffs(rng, domain_size, n_vars),
         vk: VerifyingKey {
             alpha_g1: G1Affine::zero(),

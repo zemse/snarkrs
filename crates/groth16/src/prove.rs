@@ -71,13 +71,47 @@ fn prove_then<R: ark_std::rand::RngCore + ark_std::rand::CryptoRng>(
     check: Check,
 ) -> Result<Proof, ProveError> {
     let proof = prove_unchecked(circuit, witness, rng, timings)?;
-    // `prove_unchecked` has refused a witness of the wrong length, so the slice is in range.
+    self_verify(circuit, witness, proof, timings, check)
+}
+
+/// The check [`prove`] makes of its result, once stages 0 to 11 have refused a witness of
+/// the wrong length.
+fn self_verify(
+    circuit: &dyn PreparedCircuit,
+    witness: &[Fr],
+    proof: Proof,
+    timings: &mut StageTimings,
+    check: Check,
+) -> Result<Proof, ProveError> {
     let public = &witness[1..=circuit.n_public()];
     let start = Instant::now();
     let checked = check(&circuit.key().vk, public, &proof);
     timings.verify_us += start.elapsed().as_micros() as u64;
     checked.map_err(ProveError::SelfVerify)?;
     Ok(proof)
+}
+
+/// [`prove`] with stage 0 done by the caller, through
+/// [`PreparedCircuit::h_and_msms_from_rows`]: `a_rows` and `b_rows` are each constraint's
+/// `A.w` and `B.w`, as gnark's solver leaves them. The only way to prove a gnark key, and
+/// checked the same way [`prove`] is.
+///
+/// The rows are not checked against `witness` here, and do not need to be: a proof whose
+/// H came from rows that are not this witness's does not verify, so the check of the result
+/// refuses it like any other wrong proof.
+pub fn prove_from_rows<R: ark_std::rand::RngCore + ark_std::rand::CryptoRng>(
+    circuit: &dyn PreparedCircuit,
+    witness: &[Fr],
+    a_rows: &[Fr],
+    b_rows: &[Fr],
+    rng: &mut R,
+    timings: &mut StageTimings,
+) -> Result<Proof, ProveError> {
+    let (r, s) = sample_blinders(rng)?;
+    let proof = blinded_with(circuit, witness, r, s, timings, |t| {
+        circuit.h_and_msms_from_rows(witness, a_rows, b_rows, t)
+    })?;
+    self_verify(circuit, witness, proof, timings, crate::verify::verify)
 }
 
 /// [`prove`] without the check of the result. For a benchmark that verifies outside its
@@ -157,6 +191,21 @@ fn prove_blinded(
     s: Fr,
     timings: &mut StageTimings,
 ) -> Result<Proof, ProveError> {
+    blinded_with(circuit, witness, r, s, timings, |t| {
+        circuit.h_and_msms(witness, t)
+    })
+}
+
+/// [`prove_blinded`] with stages 0 to 9 passed in, so the rows path shares every step
+/// around them.
+fn blinded_with(
+    circuit: &dyn PreparedCircuit,
+    witness: &[Fr],
+    r: Fr,
+    s: Fr,
+    timings: &mut StageTimings,
+    stages: impl FnOnce(&mut StageTimings) -> Result<MsmOutputs, ProveError>,
+) -> Result<Proof, ProveError> {
     refuse_if_unoptimized()?;
     check_witness_shape(circuit, witness)?;
     // One call for stages 0-9 rather than `compute_h` then `msms`: only stage 9 needs
@@ -174,7 +223,7 @@ fn prove_blinded(
     // that are all blocked on a device, and the five MSMs inside each one have nowhere
     // left to schedule: `audit_metal_vs_cpu` deadlocked for two days at 0% CPU. The
     // caller's own thread is the only safe place for a blocking wait.
-    let (m, terms) = spawn_terms(circuit.key(), r, s, || circuit.h_and_msms(witness, timings));
+    let (m, terms) = spawn_terms(circuit.key(), r, s, || stages(timings));
     let m = m?;
     Ok(assemble_from_terms(circuit.key(), &m, &terms, timings))
 }

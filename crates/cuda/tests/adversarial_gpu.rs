@@ -49,7 +49,7 @@ use snarkrs_field::{
     CurveGroup, Field, Fr, G1Affine, G1Projective, G2Affine, G2Projective, One, PrimeField,
     PrimeGroup, Zero,
 };
-use snarkrs_formats::{wtns::Witness, ProvingKey, VerifyingKey};
+use snarkrs_formats::{wtns::Witness, HBasis, ProvingKey, VerifyingKey};
 use snarkrs_groth16::cpu::CpuBackend;
 use snarkrs_groth16::prove::prove_with_blinders;
 use snarkrs_groth16::verify::verify;
@@ -1349,6 +1349,7 @@ fn synthetic_key(domain_size: usize, n_vars: usize, seed: &mut u64) -> ProvingKe
         b_g2_query: g2,
         l_query: g1(n_vars - n_public - 1),
         h_query: g1(domain_size),
+        h_basis: HBasis::SnarkjsOddCoset,
         coeffs: Coefficients::from_values([rp0, rp1], [sg0, sg1], [v0, v1]),
         vk: VerifyingKey {
             alpha_g1: one,

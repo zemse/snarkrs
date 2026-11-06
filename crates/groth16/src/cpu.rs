@@ -10,7 +10,7 @@ use web_time::Instant;
 use crate::{Backend, HPoly, MsmOutputs, MsmSplit, PreparedCircuit, ProveError, StageTimings};
 use rayon::prelude::*;
 use snarkrs_field::*;
-use snarkrs_formats::{Matrix, ProvingKey};
+use snarkrs_formats::{HBasis, Matrix, ProvingKey};
 use snarkrs_msm::{CpuMsm, MsmBackend};
 use snarkrs_ntt::CpuNtt;
 
@@ -57,6 +57,8 @@ pub struct CpuCircuit {
     domain: Domain,
     /// snarkjs' `inc`, from [`Domain::proving_coset_shift`].
     coset_shift: Fr,
+    /// Its inverse, for a gnark key, whose H goes back from the coset to coefficients.
+    coset_shift_inv: Fr,
     /// One instance for the life of the circuit: the twiddle cache is per instance, and
     /// a fresh one would rebuild the size/2 table on every one of the six transforms.
     ntt: CpuNtt,
@@ -89,9 +91,13 @@ impl CpuCircuit {
             .proving_coset_shift()
             .map_err(|e| bad(format!("no 2n-th root of unity: {e}")))?;
 
-        pk.coeffs
-            .check_structure(domain.size(), pk.n_vars)
-            .map_err(|e| bad(e.to_string()))?;
+        // A gnark key's matrices stay in gnark's R1CS: its stage 0 is the caller's A.w and
+        // B.w, through `h_and_msms_from_rows`, and `compute_h` refuses it before a gather.
+        if pk.h_basis == HBasis::SnarkjsOddCoset {
+            pk.coeffs
+                .check_structure(domain.size(), pk.n_vars)
+                .map_err(|e| bad(e.to_string()))?;
+        }
 
         // `msms` slices the private witness as `witness[n_public + 1..]`, which past
         // `n_vars` is a panic and not an error, and the workspace release profile's
@@ -109,6 +115,7 @@ impl CpuCircuit {
             pk,
             domain,
             coset_shift,
+            coset_shift_inv: coset_shift.inverse().expect("a root of unity is nonzero"),
             ntt: CpuNtt::new(),
             msm: CpuMsm::new(),
         })
@@ -166,57 +173,28 @@ impl CpuCircuit {
             .collect()
     }
 
-    fn check_witness(&self, witness: &[Fr]) -> Result<(), ProveError> {
-        if witness.len() != self.pk.n_vars {
-            return Err(ProveError::WitnessLength {
-                got: witness.len(),
-                want: self.pk.n_vars,
+    /// `compute_h` and `msms` are the zkey path: stage 0 gathers from the key's matrices,
+    /// and stage 9 takes `H` on the odd coset. A gnark key has neither.
+    fn refuse_gnark_key(&self) -> Result<(), ProveError> {
+        if self.pk.h_basis == HBasis::GnarkBitReversed {
+            return Err(ProveError::Backend {
+                backend: "cpu",
+                reason: "a gnark key carries no constraint matrices; prove it from A.w and B.w \
+                         with `h_and_msms_from_rows`"
+                    .to_string(),
             });
         }
         Ok(())
     }
-}
 
-impl PreparedCircuit for CpuCircuit {
-    fn backend_name(&self) -> &'static str {
-        "cpu"
-    }
-    fn n_vars(&self) -> usize {
-        self.pk.n_vars
-    }
-    fn n_public(&self) -> usize {
-        self.pk.n_public
-    }
-    fn domain_size(&self) -> usize {
-        self.domain.size()
-    }
-    fn key(&self) -> &ProvingKey {
-        &self.pk
-    }
-
-    fn compute_h(&self, witness: &[Fr], t: &mut StageTimings) -> Result<HPoly, ProveError> {
-        self.check_witness(witness)?;
-
-        // Stage 0. There is no C matrix in the zkey: snarkjs' buildABC1 fills C by
-        // multiplying the A and B evaluations pointwise, which is exact because the R1CS
-        // constraint *is* a*b = c, so on the domain the C evaluations are that product.
-        let start = Instant::now();
-        let (mut a, mut b) = stage!(
-            "s0 gather A and B (concurrent)",
-            rayon::join(
-                || self.gather(Matrix::A, witness),
-                || self.gather(Matrix::B, witness)
-            )
-        );
-        let mut c: Vec<Fr> = stage!(
-            "s0 build C = A*B pointwise",
-            a.par_iter()
-                .zip(b.par_iter())
-                .map(|(x, y)| *x * y)
-                .collect()
-        );
-        t.gather_us += start.elapsed().as_micros() as u64;
-
+    /// Stages 1-4 on stage 0's three vectors, `H` on the odd coset into `a`'s buffer.
+    fn coset_h(
+        &self,
+        mut a: Vec<Fr>,
+        mut b: Vec<Fr>,
+        mut c: Vec<Fr>,
+        t: &mut StageTimings,
+    ) -> Vec<Fr> {
         // Stages 1-3, three vectors through iNTT -> coset shift -> NTT, concurrently.
         // The previous shape ran them one after another on the grounds that each
         // transform is already internally parallel and the three would fight for the
@@ -270,7 +248,96 @@ impl PreparedCircuit for CpuCircuit {
         // `b` and `c` are witness images too. `a` is now `H` and is zeroed when that drops.
         crate::scrub(&mut b);
         crate::scrub(&mut c);
-        Ok(HPoly::Host(a))
+        a
+    }
+
+    /// `A*B - C` on the odd coset, in place, to what gnark's `pk.G1.Z` is a basis for:
+    /// the coefficients of `(A*B - C) / t` times `-2`, in bit-reversed order, the last of
+    /// them checked zero. Stage 9 multiplies its result by `-1/2`.
+    ///
+    /// On the odd coset `t(x) = x^n - 1 = -1 - 1 = -2`, so dividing by `t` there is a
+    /// constant, and one scalar multiplication of the MSM output pays it instead of `n`
+    /// field multiplications here. A polynomial's coefficients do not depend on which coset
+    /// it was evaluated on, so this coset and gnark's (its multiplicative generator) agree
+    /// on them. The decimation-in-frequency inverse leaves them in bit-reversed order, the
+    /// order gnark's `computeH` leaves them in and `pk.G1.Z` is laid out for, and the coset
+    /// table then divides position `p` by `shift^bitrev(p)` along with the deferred `1/n`.
+    fn to_gnark_coefficients(&self, h: &mut [Fr]) -> Result<(), ProveError> {
+        self.ntt.intt_to_bitrev(&self.domain, h);
+        self.ntt
+            .coset_scale_bitrev(&self.domain, h, self.coset_shift_inv);
+        // `bitrev(n - 1) = n - 1`, so the last slot is coefficient `n - 1`. `A*B - C` has
+        // degree at most `2n - 2` and vanishes on the domain, so its quotient by `t` has
+        // degree at most `n - 2`. C is `A*B` on the rows by construction, so this holds for
+        // any witness at all: a nonzero here is the arithmetic above gone wrong, which is
+        // what it is cheap enough to check for.
+        let n = self.domain.size();
+        if !h[n - 1].is_zero() {
+            return Err(ProveError::Backend {
+                backend: "cpu",
+                reason: format!(
+                    "H has a nonzero coefficient {}, so the quotient by the vanishing \
+                     polynomial is not exact",
+                    n - 1
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn check_witness(&self, witness: &[Fr]) -> Result<(), ProveError> {
+        if witness.len() != self.pk.n_vars {
+            return Err(ProveError::WitnessLength {
+                got: witness.len(),
+                want: self.pk.n_vars,
+            });
+        }
+        Ok(())
+    }
+}
+
+impl PreparedCircuit for CpuCircuit {
+    fn backend_name(&self) -> &'static str {
+        "cpu"
+    }
+    fn n_vars(&self) -> usize {
+        self.pk.n_vars
+    }
+    fn n_public(&self) -> usize {
+        self.pk.n_public
+    }
+    fn domain_size(&self) -> usize {
+        self.domain.size()
+    }
+    fn key(&self) -> &ProvingKey {
+        &self.pk
+    }
+
+    fn compute_h(&self, witness: &[Fr], t: &mut StageTimings) -> Result<HPoly, ProveError> {
+        self.check_witness(witness)?;
+        self.refuse_gnark_key()?;
+
+        // Stage 0. There is no C matrix in the zkey: snarkjs' buildABC1 fills C by
+        // multiplying the A and B evaluations pointwise, which is exact because the R1CS
+        // constraint *is* a*b = c, so on the domain the C evaluations are that product.
+        let start = Instant::now();
+        let (a, b) = stage!(
+            "s0 gather A and B (concurrent)",
+            rayon::join(
+                || self.gather(Matrix::A, witness),
+                || self.gather(Matrix::B, witness)
+            )
+        );
+        let c: Vec<Fr> = stage!(
+            "s0 build C = A*B pointwise",
+            a.par_iter()
+                .zip(b.par_iter())
+                .map(|(x, y)| *x * y)
+                .collect()
+        );
+        t.gather_us += start.elapsed().as_micros() as u64;
+
+        Ok(HPoly::Host(self.coset_h(a, b, c, t)))
     }
 
     fn msms(
@@ -280,6 +347,7 @@ impl PreparedCircuit for CpuCircuit {
         t: &mut StageTimings,
     ) -> Result<MsmOutputs, ProveError> {
         self.check_witness(witness)?;
+        self.refuse_gnark_key()?;
         // The CPU backend has nowhere else to keep H, so a device handle here can only
         // have come from another backend and there is nothing sane to do with it.
         let h = h.to_host().ok_or_else(|| ProveError::Backend {
@@ -307,6 +375,89 @@ impl PreparedCircuit for CpuCircuit {
         };
         stage!("stages 5-9 msms", self.msms_with(witness, len, h_msm, t))
     }
+
+    /// Stages 1-9 from the caller's rows, which is the only way a gnark key proves. The rows
+    /// are copied into domain-sized buffers, zero padded, because the transforms run in
+    /// place; the caller's slices are only read.
+    fn h_and_msms_from_rows(
+        &self,
+        witness: &[Fr],
+        a_rows: &[Fr],
+        b_rows: &[Fr],
+        t: &mut StageTimings,
+    ) -> Result<MsmOutputs, ProveError> {
+        self.check_witness(witness)?;
+        let n = self.domain.size();
+        if a_rows.len() != b_rows.len() || a_rows.len() > n {
+            return Err(ProveError::Backend {
+                backend: "cpu",
+                reason: format!(
+                    "A.w has {} rows and B.w has {}; both must be one per constraint, at most \
+                     the domain size {n}",
+                    a_rows.len(),
+                    b_rows.len()
+                ),
+            });
+        }
+
+        // Stage 0, handed over. C is A*B on the rows for the reason `compute_h` gives, and
+        // the padding rows are zero in all three.
+        let start = Instant::now();
+        let pad = |rows: &[Fr]| {
+            let mut v = Vec::with_capacity(n);
+            v.extend_from_slice(rows);
+            v.resize(n, Fr::zero());
+            v
+        };
+        let (a, b) = stage!(
+            "s0 pad A.w and B.w (concurrent)",
+            rayon::join(|| pad(a_rows), || pad(b_rows))
+        );
+        let c: Vec<Fr> = stage!(
+            "s0 build C = A*B pointwise",
+            a.par_iter()
+                .zip(b.par_iter())
+                .map(|(x, y)| *x * y)
+                .collect()
+        );
+        t.gather_us += start.elapsed().as_micros() as u64;
+
+        // Wrapped at once, so `H` is scrubbed on every return below.
+        let mut h = HPoly::Host(self.coset_h(a, b, c, t));
+        let HPoly::Host(h) = &mut h else {
+            unreachable!("built on the host one line up");
+        };
+        match self.pk.h_basis {
+            HBasis::SnarkjsOddCoset => {
+                let len = h.len();
+                let h_msm = || {
+                    stage!(
+                        "s9 MSM H -> G1",
+                        self.msm.msm_g1_in_place(&self.pk.h_query, h)
+                    )
+                };
+                stage!("stages 5-9 msms", self.msms_with(witness, len, h_msm, t))
+            }
+            HBasis::GnarkBitReversed => {
+                let start = Instant::now();
+                stage!(
+                    "s4 H to gnark's coefficients",
+                    self.to_gnark_coefficients(h)
+                )?;
+                t.ntt_us += start.elapsed().as_micros() as u64;
+                let len = n - 1;
+                // `-1/2` is `1 / t` on the odd coset, see `to_gnark_coefficients`.
+                let scale = -Fr::from(2u64).inverse().expect("2 is invertible mod r");
+                let h_msm = || {
+                    stage!(
+                        "s9 MSM H -> G1",
+                        self.msm.msm_g1_in_place(&self.pk.h_query, &mut h[..len]) * scale
+                    )
+                };
+                stage!("stages 5-9 msms", self.msms_with(witness, len, h_msm, t))
+            }
+        }
+    }
 }
 
 impl CpuCircuit {
@@ -319,14 +470,19 @@ impl CpuCircuit {
         h_msm: impl FnOnce() -> G1Projective + Send,
         t: &mut StageTimings,
     ) -> Result<MsmOutputs, ProveError> {
-        if h_len != self.domain.size() {
+        let n = self.domain.size();
+        let want_h = self.pk.h_basis.bases(n);
+        if h_len != want_h {
             return Err(ProveError::Backend {
                 backend: "cpu",
-                reason: format!(
-                    "h has {} entries, domain size is {}",
-                    h_len,
-                    self.domain.size()
-                ),
+                reason: match self.pk.h_basis {
+                    HBasis::SnarkjsOddCoset => {
+                        format!("h has {h_len} entries, domain size is {n}")
+                    }
+                    HBasis::GnarkBitReversed => format!(
+                        "h has {h_len} entries, a gnark key on a domain of {n} needs {want_h}"
+                    ),
+                },
             });
         }
 
@@ -349,14 +505,18 @@ impl CpuCircuit {
                 });
             }
         }
-        if self.pk.h_query.len() != self.domain.size() {
+        if self.pk.h_query.len() != want_h {
+            let got = self.pk.h_query.len();
             return Err(ProveError::Backend {
                 backend: "cpu",
-                reason: format!(
-                    "h_query has {} bases, domain size is {}",
-                    self.pk.h_query.len(),
-                    self.domain.size()
-                ),
+                reason: match self.pk.h_basis {
+                    HBasis::SnarkjsOddCoset => {
+                        format!("h_query has {got} bases, domain size is {n}")
+                    }
+                    HBasis::GnarkBitReversed => format!(
+                        "h_query has {got} bases, a gnark key on a domain of {n} needs {want_h}"
+                    ),
+                },
             });
         }
 
@@ -479,7 +639,7 @@ mod tests {
     use super::*;
 
     fn csr_key() -> ProvingKey {
-        use snarkrs_formats::{Coefficients, VerifyingKey};
+        use snarkrs_formats::{Coefficients, HBasis, VerifyingKey};
 
         ProvingKey {
             n_vars: 2,
@@ -495,6 +655,7 @@ mod tests {
             b_g2_query: Vec::new(),
             l_query: Vec::new(),
             h_query: Vec::new(),
+            h_basis: HBasis::SnarkjsOddCoset,
             coeffs: Coefficients {
                 row_ptr: [vec![0, 1, 1, 2, 2], vec![0, 1, 1, 2, 2]],
                 signal: [vec![0, 1], vec![0, 1]],

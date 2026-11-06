@@ -9,7 +9,7 @@ use std::process::{Command, Output};
 
 use snarkrs_cli::json;
 use snarkrs_field::Fr;
-use snarkrs_formats::{wtns::Witness, ProvingKey, VerifyingKey};
+use snarkrs_formats::{wtns::Witness, HBasis, ProvingKey, VerifyingKey};
 use snarkrs_groth16::prove::prove_unchecked;
 use snarkrs_groth16::verify::verify;
 use snarkrs_groth16::{Backend, Proof, ProveError, StageTimings};
@@ -85,6 +85,7 @@ fn proof_uses_the_supplied_backend_instance() {
         b_g2_query: vec![g2],
         l_query: vec![],
         h_query: vec![g1],
+        h_basis: HBasis::SnarkjsOddCoset,
         coeffs: Coefficients {
             row_ptr: [vec![0, 0], vec![0, 0]],
             signal: [vec![], vec![]],

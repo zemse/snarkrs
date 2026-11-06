@@ -413,6 +413,27 @@ pub trait PreparedCircuit: Send + Sync {
         stage!("stages 5-9 msms", self.msms(witness, &h, t))
     }
 
+    /// Stages 1-9 with stage 0 done by the caller: `a_rows[i]` and `b_rows[i]` are
+    /// constraint `i`'s `A.w` and `B.w`, one per constraint and at most `domain_size` of
+    /// them, and every row past their end is zero. This is how a gnark witness arrives, as
+    /// the solver's own A and B vectors, and a gnark key has no matrices to gather from.
+    ///
+    /// The default refuses, so a backend that has not implemented it says so rather than
+    /// proving something else.
+    fn h_and_msms_from_rows(
+        &self,
+        witness: &[Fr],
+        a_rows: &[Fr],
+        b_rows: &[Fr],
+        t: &mut StageTimings,
+    ) -> Result<MsmOutputs, ProveError> {
+        let _ = (witness, a_rows, b_rows, t);
+        Err(ProveError::Backend {
+            backend: self.backend_name(),
+            reason: "this backend does not prove from A.w and B.w rows".to_string(),
+        })
+    }
+
     /// `H` in host memory, copying it down if that is where it is not.
     ///
     /// **Debugging only**, and the default is the honest answer for a backend that has not

@@ -27,6 +27,10 @@ Neither variable causes ignored tests to run.
   Metal and CUDA device skip. `setup_metal` needs a `--features metal` release binary;
   `setup.rs` also needs `G16_SNARKJS`. Only `G16_PRODUCTION_BUILDS` stays an opt-in.
 - witness: the artifact wasm tests and their snarkjs half.
+- gnark (`crates/gnark`): the committed `test-support/gnark/toy` fixture, so nothing
+  skips but the gnark half of the prove gate, which runs `go run . verify` in
+  `test-support/gnark` and needs `go` on `PATH`. `go run . gen toy` there regenerates
+  the fixture with a fresh setup.
 - CLI (`bin/snarkrs/tests`, including `campaign.rs`): artifact, snarkjs and circom skips.
 - CLI `fallback.rs` and `json.rs` unit tests: their artifact skips.
 - CUDA and WGPU: artifact skips, and a CUDA device that cannot be opened.

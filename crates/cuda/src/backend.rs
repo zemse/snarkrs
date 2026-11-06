@@ -288,6 +288,14 @@ impl CudaCircuit {
                 return Err(bad(format!("{name} has {got} bases, n_vars is {n_vars}")));
             }
         }
+        // A gnark key's H query is not snarkjs' odd-coset basis, and this backend's stage 9
+        // only computes that one.
+        if pk.h_basis != snarkrs_formats::HBasis::SnarkjsOddCoset {
+            return Err(bad(format!(
+                "the key's H basis is {:?}, which only the CPU backend proves",
+                pk.h_basis
+            )));
+        }
         if pk.h_query.len() != pk.domain_size {
             return Err(bad(format!(
                 "h_query has {} bases, domain size is {}",

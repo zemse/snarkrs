@@ -21,6 +21,7 @@
 //! length says, which is the CVE-2024-50354 class the zkey loader guards against too.
 
 pub mod pk;
+pub mod proof;
 pub mod vk;
 pub mod witness;
 
@@ -394,6 +395,27 @@ pub(crate) fn check_header_g2(
         });
     }
     Ok(())
+}
+
+/// Prove `witness` against a circuit prepared from [`GnarkProvingKey::into_proving_key`],
+/// and check the proof against the circuit's verifying key before returning it, as
+/// `snarkrs_groth16::prove::prove` does. [`proof::write_proof`] writes it for gnark.
+///
+/// Only the CPU backend proves a gnark key today; every other backend refuses it.
+pub fn prove<R: ark_std::rand::RngCore + ark_std::rand::CryptoRng>(
+    circuit: &dyn snarkrs_groth16::PreparedCircuit,
+    witness: &GnarkWitness<'_>,
+    rng: &mut R,
+    timings: &mut snarkrs_groth16::StageTimings,
+) -> Result<snarkrs_groth16::Proof, snarkrs_groth16::ProveError> {
+    snarkrs_groth16::prove::prove_from_rows(
+        circuit,
+        witness.w(),
+        witness.aw(),
+        witness.bw(),
+        rng,
+        timings,
+    )
 }
 
 /// The whole of a file, mapped. Native only, like every path-taking loader in snarkrs.

@@ -52,10 +52,41 @@ pub struct ProvingKey {
     /// Section 9: bases for the H MSM. Length `domain_size`, and all of them are used.
     /// ffjavascript's `multiExp` rejects a scalar vector shorter than the base vector, so
     /// the H MSM runs over the full section rather than `domain_size - 1` of it.
+    ///
+    /// A key read from gnark holds gnark's `Z` here instead; [`ProvingKey::h_basis`] says
+    /// which, and so what stage 9 must pair with these bases.
     pub h_query: Vec<G1Affine>,
+    /// What [`ProvingKey::h_query`] is a basis for. Every zkey is
+    /// [`HBasis::SnarkjsOddCoset`].
+    pub h_basis: HBasis,
     /// Section 4, already sorted into CSR by constraint index. See [`Coefficients`].
     pub coeffs: Coefficients,
     pub vk: VerifyingKey,
+}
+
+/// What a key's H query is a basis for, and so what stage 9 multiplies it by. The two
+/// conventions put the same `[H(tau) t(tau) / delta]_1` into the proof by different routes,
+/// and a key of one kind proved the other way gives a proof that does not verify.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HBasis {
+    /// snarkjs, zkey section 9: `domain_size` bases, the Lagrange polynomials of the odd half
+    /// of the `2n`-th roots of unity, times `t(tau) / delta` folded in at setup. Stage 9
+    /// takes `A*B - C` evaluated on that odd coset as it is, with no division.
+    SnarkjsOddCoset,
+    /// gnark, `pk.G1.Z`: `domain_size - 1` bases `[tau^bitrev(j) t(tau) / delta]_1`. Stage 9
+    /// takes H's coefficients in bit-reversed order, which is how gnark's `computeH` leaves
+    /// them, without the last, which is coefficient `n - 1` and always zero.
+    GnarkBitReversed,
+}
+
+impl HBasis {
+    /// How many H bases a key of this kind holds on a domain of `domain_size`.
+    pub fn bases(self, domain_size: usize) -> usize {
+        match self {
+            HBasis::SnarkjsOddCoset => domain_size,
+            HBasis::GnarkBitReversed => domain_size.saturating_sub(1),
+        }
+    }
 }
 
 /// One of the two constraint matrices a zkey holds. `index` is the position in
@@ -680,6 +711,7 @@ impl ProvingKey {
             b_g2_query,
             l_query: l_query.points,
             h_query: h_query.points,
+            h_basis: HBasis::SnarkjsOddCoset,
             coeffs,
             vk: VerifyingKey {
                 alpha_g1,
