@@ -164,40 +164,63 @@ impl<'a> Reader<'a> {
     }
 
     fn skip_at(&mut self, depth: usize) -> Result<(), String> {
+        // The hot loop of a read: SP1's body is 894 MB of debug information, almost all of
+        // it one- and two-byte items, so this decodes heads inline rather than through
+        // `head`, and checks the count of items left only when a container grows it.
+        let bytes = self.bytes;
+        let mut pos = self.pos;
         let mut pending = 1u64;
+        let past_end = || "CBOR item past the end".to_string();
         while pending > 0 {
             pending -= 1;
-            let h = self.head()?;
-            match (h.major, h.arg) {
-                (UINT | NINT, _) | (SIMPLE, Some(_)) => {}
-                (BYTES | TEXT, Some(n)) => {
-                    self.take(n)?;
+            let b = *bytes.get(pos).ok_or_else(past_end)?;
+            pos += 1;
+            let (major, info) = (b >> 5, b & 0x1f);
+            let arg = match info {
+                0..=23 => u64::from(info),
+                24..=27 => {
+                    let n = 1usize << (info - 24);
+                    let arg = bytes.get(pos..pos + n).ok_or_else(past_end)?;
+                    pos += n;
+                    arg.iter().fold(0u64, |v, &b| v << 8 | u64::from(b))
                 }
-                (ARRAY, Some(n)) => pending = add(pending, n)?,
-                (MAP, Some(n)) => {
-                    pending = add(pending, n.checked_mul(2).ok_or("CBOR map overflows")?)?
-                }
-                (TAG, Some(_)) => pending = add(pending, 1)?,
-                (BYTES | TEXT | ARRAY | MAP, None) => {
+                31 if matches!(major, BYTES | TEXT | ARRAY | MAP) => {
                     if depth == MAX_DEPTH {
                         return Err("CBOR nests too deep".into());
                     }
                     // Items until the break byte; a map's come in pairs, which skipping one
                     // at a time handles the same way.
+                    self.pos = pos;
                     while self.bytes.get(self.pos) != Some(&0xff) {
                         self.skip_at(depth + 1)?;
                     }
-                    self.pos += 1;
+                    pos = self.pos + 1;
+                    continue;
                 }
-                (SIMPLE, None) => return Err("CBOR break outside an indefinite item".into()),
-                _ => unreachable!("head() only returns these"),
-            }
+                31 if major == SIMPLE => return Err("CBOR break outside an indefinite item".into()),
+                _ => return Err(format!("CBOR head 0x{b:02x} is not well formed")),
+            };
+            let grow = match major {
+                UINT | NINT | SIMPLE => continue,
+                BYTES | TEXT => {
+                    if arg > (bytes.len() - pos) as u64 {
+                        return Err(format!("CBOR string of {arg} bytes past the end"));
+                    }
+                    pos += arg as usize;
+                    continue;
+                }
+                ARRAY => arg,
+                MAP => arg.checked_mul(2).ok_or("CBOR map overflows")?,
+                _ => 1,
+            };
+            pending = add(pending, grow)?;
             // Every pending item takes a byte at least, so a count past the bytes left is
             // a lie, and refusing it keeps a hostile count from spinning.
-            if pending > (self.bytes.len() - self.pos) as u64 {
+            if pending > (bytes.len() - pos) as u64 {
                 return Err("CBOR container holds more items than bytes".into());
             }
         }
+        self.pos = pos;
         Ok(())
     }
 }
