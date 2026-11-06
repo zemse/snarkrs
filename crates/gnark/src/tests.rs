@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::pk::DumpHeader;
+use crate::witness::fr_slice;
 use std::path::PathBuf;
 
 fn toy(name: &str) -> PathBuf {
@@ -282,17 +283,55 @@ fn an_off_curve_vk_point_is_refused() {
 fn witness_shape_is_checked() {
     let w = GnarkWitness::read_dump(&toy("witness.bin")).unwrap();
     let (mut ww, aw, bw) = (w.w().to_vec(), w.aw().to_vec(), w.bw().to_vec());
-    assert!(GnarkWitness::from_parts(ww.clone(), aw.clone(), bw[1..].to_vec()).is_err());
+    assert!(GnarkWitness::from_parts(&ww, &aw, &bw[1..]).is_err());
     ww[0] = Fr::from(2u64);
-    let err = GnarkWitness::from_parts(ww, aw, bw)
+    let err = GnarkWitness::from_parts(&ww, &aw, &bw)
         .err()
         .unwrap()
         .to_string();
     assert!(err.contains("W[0]"), "{err}");
 
-    // An element at the modulus.
+    // An element at the modulus, from the file and from memory.
     let mut b = bytes("witness.bin");
     b[16..48].copy_from_slice(&Fr::MODULUS.to_bytes_le());
     let err = GnarkWitness::from_bytes(&b).err().unwrap().to_string();
     assert!(err.contains("not below the scalar modulus"), "{err}");
+    assert!(fr_slice(&[Fr::MODULUS.0]).is_none());
+}
+
+/// What a caller handing in gnark's solver buffers relies on: the dump's raw bytes, read as
+/// limbs and reinterpreted in place, are the same `Fr` values the decoder produces.
+#[test]
+fn dumped_bytes_reinterpret_as_fr() {
+    let w = GnarkWitness::read_dump(&toy("witness.bin")).unwrap();
+    let b = bytes("witness.bin");
+    let limbs = |off: usize, n: usize| -> Vec<[u64; 4]> {
+        b[off..off + 32 * n]
+            .as_chunks::<32>()
+            .0
+            .iter()
+            .map(|c| {
+                std::array::from_fn(|i| u64::from_le_bytes(c[8 * i..8 * i + 8].try_into().unwrap()))
+            })
+            .collect()
+    };
+    let n_w = w.w().len();
+    let n_c = w.n_constraints();
+    let w_limbs = limbs(16, n_w);
+    let aw_limbs = limbs(16 + 32 * n_w + 8, n_c);
+    let bw_limbs = limbs(16 + 32 * n_w + 8 + 32 * n_c + 8, n_c);
+    let (wv, awv, bwv) = (
+        fr_slice(&w_limbs).unwrap(),
+        fr_slice(&aw_limbs).unwrap(),
+        fr_slice(&bw_limbs).unwrap(),
+    );
+    assert_eq!(wv, w.w());
+    assert_eq!(awv, w.aw());
+    assert_eq!(bwv, w.bw());
+    assert_eq!(wv[0], Fr::ONE);
+    // The borrowed witness points at the caller's memory, not a copy of it.
+    let borrowed = GnarkWitness::from_parts(wv, awv, bwv).unwrap();
+    assert_eq!(borrowed.w().as_ptr(), w_limbs.as_ptr().cast());
+    // And the values are the field elements, not just the same bits: the public X is 5.
+    assert_eq!(wv[1] * wv[1], Fr::from(25u64));
 }

@@ -12,18 +12,23 @@
 //! `Aw * Bw`, which is exactly how snarkrs builds C from a zkey's two matrices.
 
 use crate::{GnarkError, Reader, DUMP_MARKER, FR_BYTES};
+use rayon::prelude::*;
 use snarkrs_field::*;
 use snarkrs_formats::binfile::{bigint, decode_records};
+use std::borrow::Cow;
 
 /// A solved witness: the wires and the two constraint-row vectors the prover needs.
-/// Scrubbed on drop, like every other witness image in snarkrs.
-pub struct GnarkWitness {
-    w: Vec<Fr>,
-    aw: Vec<Fr>,
-    bw: Vec<Fr>,
+///
+/// Owned when it came from [`GnarkWitness::read_dump`], and then scrubbed on drop like every
+/// other witness image in snarkrs. Borrowed when it came from [`GnarkWitness::from_parts`],
+/// which copies nothing: the buffers stay the caller's, to scrub when it is done with them.
+pub struct GnarkWitness<'a> {
+    w: Cow<'a, [Fr]>,
+    aw: Cow<'a, [Fr]>,
+    bw: Cow<'a, [Fr]>,
 }
 
-impl GnarkWitness {
+impl GnarkWitness<'static> {
     /// Map a witness dump and decode it. 1.5 GB for SP1's circuit, read once and decoded in
     /// parallel straight into the three vectors.
     pub fn read_dump(path: &std::path::Path) -> Result<Self, GnarkError> {
@@ -49,32 +54,58 @@ impl GnarkWitness {
             || decode(w, "W"),
             || rayon::join(|| decode(aw, "Aw"), || decode(bw, "Bw")),
         );
-        Self::from_parts(w?, aw?, bw?)
+        let witness = Self {
+            w: Cow::Owned(w?),
+            aw: Cow::Owned(aw?),
+            bw: Cow::Owned(bw?),
+        };
+        witness.check_shape()?;
+        Ok(witness)
+    }
+}
+
+impl<'a> GnarkWitness<'a> {
+    /// A witness in the caller's memory, borrowed and not copied. `aw` and `bw` must have
+    /// one entry per constraint, and `w[0]` must be the constant one.
+    ///
+    /// A buffer gnark's solver wrote is already in this form: `fr.Element` and arkworks'
+    /// `Fr` are both four Montgomery limbs with `R = 2^256`, see [`fr_slice`]. Every element
+    /// is checked below the modulus, because that is the one thing a reinterpreted buffer
+    /// can get wrong and arkworks' arithmetic assumes it.
+    pub fn from_parts(w: &'a [Fr], aw: &'a [Fr], bw: &'a [Fr]) -> Result<Self, GnarkError> {
+        for (part, v) in [("W", w), ("Aw", aw), ("Bw", bw)] {
+            if let Some(i) = v.par_iter().position_first(|x| x.0 >= Fr::MODULUS) {
+                return Err(GnarkError::Malformed {
+                    part,
+                    reason: format!("element {i} is not below the scalar modulus"),
+                });
+            }
+        }
+        let witness = Self {
+            w: Cow::Borrowed(w),
+            aw: Cow::Borrowed(aw),
+            bw: Cow::Borrowed(bw),
+        };
+        witness.check_shape()?;
+        Ok(witness)
     }
 
-    /// A witness already in memory. `aw` and `bw` must have one entry per constraint, and
-    /// `w[0]` must be the constant one.
-    pub fn from_parts(w: Vec<Fr>, aw: Vec<Fr>, bw: Vec<Fr>) -> Result<Self, GnarkError> {
-        let witness = Self { w, aw, bw };
-        if witness.aw.len() != witness.bw.len() {
+    fn check_shape(&self) -> Result<(), GnarkError> {
+        if self.aw.len() != self.bw.len() {
             return Err(GnarkError::Malformed {
                 part: "witness",
-                reason: format!(
-                    "Aw has {} rows and Bw has {}",
-                    witness.aw.len(),
-                    witness.bw.len()
-                ),
+                reason: format!("Aw has {} rows and Bw has {}", self.aw.len(), self.bw.len()),
             });
         }
         // Every QAP row and the public-input half of the verifier equation assume it, as in
         // the `.wtns` loader.
-        if witness.w.first() != Some(&Fr::ONE) {
+        if self.w.first() != Some(&Fr::ONE) {
             return Err(GnarkError::Malformed {
                 part: "W",
                 reason: "W[0] is not 1".into(),
             });
         }
-        Ok(witness)
+        Ok(())
     }
 
     /// Every wire, constant first.
@@ -103,12 +134,36 @@ impl GnarkWitness {
     }
 }
 
-impl Drop for GnarkWitness {
+/// Only what this witness owns is scrubbed. A borrowed buffer is the caller's.
+impl Drop for GnarkWitness<'_> {
     fn drop(&mut self) {
-        snarkrs_groth16::scrub(&mut self.w);
-        snarkrs_groth16::scrub(&mut self.aw);
-        snarkrs_groth16::scrub(&mut self.bw);
+        for v in [&mut self.w, &mut self.aw, &mut self.bw] {
+            if let Cow::Owned(v) = v {
+                snarkrs_groth16::scrub(v);
+            }
+        }
     }
+}
+
+/// gnark's `[]fr.Element` memory, as `Fr`, without a copy. `None` unless every element is
+/// below the modulus.
+///
+/// Sound because the two layouts are one: `fr.Element` is `[4]uint64` and arkworks' `Fr` is
+/// a `BigInt<4>`, a `[u64; 4]`, beside a zero-sized marker. The assertions below pin size
+/// and alignment, and a 32-byte struct whose one non-zero-sized field is 32 bytes has that
+/// field at offset 0. The values agree too, since both hold `x * 2^256 mod r`.
+pub fn fr_slice(limbs: &[[u64; 4]]) -> Option<&[Fr]> {
+    const _: () = assert!(std::mem::size_of::<Fr>() == std::mem::size_of::<[u64; 4]>());
+    const _: () = assert!(std::mem::align_of::<Fr>() == std::mem::align_of::<[u64; 4]>());
+    if limbs
+        .par_iter()
+        .any(|l| ark_ff::BigInt::new(*l) >= Fr::MODULUS)
+    {
+        return None;
+    }
+    // SAFETY: same size and alignment as asserted above, every limb set is canonical, and
+    // the lifetime and length carry over from `limbs`.
+    Some(unsafe { std::slice::from_raw_parts(limbs.as_ptr().cast::<Fr>(), limbs.len()) })
 }
 
 /// One dumped `[]fr.Element`: Montgomery limbs, refused at or above the modulus for the
