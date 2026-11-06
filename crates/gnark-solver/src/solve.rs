@@ -7,7 +7,7 @@
 //! gives the same bits.
 
 use crate::hints::Hint;
-use crate::r1cs::{gnark_text, Op, CONSTANT};
+use crate::r1cs::{gnark_text, uvarint, Op, CONSTANT};
 use crate::{GnarkR1cs, Solution, SolveError};
 use rayon::prelude::*;
 use snarkrs_field::raw::RawFr;
@@ -279,24 +279,27 @@ impl Run<'_> {
     }
 
     fn r1c(&self, op: &Op) -> Result<(), SolveError> {
-        let cd = &self.r1cs.calldata[op.start as usize..];
-        let (nl, nr, no) = (cd[1] as usize, cd[2] as usize, cd[3] as usize);
+        let bytes = self.r1cs.calldata.bytes();
+        let mut pos = op.start as usize;
+        // SAFETY (every uvarint below): the op's offset starts an R1C's calldata, which the
+        // reader checked holds 4 + 2 * (nl + nr + no) values.
+        let next = |pos: &mut usize| unsafe { uvarint(bytes, pos) } as usize;
+        let _len = next(&mut pos);
+        let (nl, nr, no) = (next(&mut pos), next(&mut pos), next(&mut pos));
         let (end_l, end_r) = (4 + 2 * nl, 4 + 2 * (nl + nr));
         let end = end_r + 2 * no;
         let skip = op.solve as usize;
+        let mut unknown = (0, 0);
         let mut v = [RawFr::ZERO; 3];
         let mut k = 4;
         for (side, until) in [(0, end_l), (1, end_r), (2, end)] {
             while k < until {
+                let (c, wire) = (next(&mut pos) as u32, next(&mut pos) as u32);
                 if k != skip {
-                    // SAFETY: the reader checked this instruction's calldata and terms.
-                    unsafe {
-                        self.accumulate(
-                            &mut v[side],
-                            *cd.get_unchecked(k),
-                            *cd.get_unchecked(k + 1),
-                        )
-                    };
+                    // SAFETY: the reader checked this instruction's terms.
+                    unsafe { self.accumulate(&mut v[side], c, wire) };
+                } else {
+                    unknown = (c, wire);
                 }
                 k += 2;
             }
@@ -340,13 +343,13 @@ impl Run<'_> {
                 t
             };
             let _ = c;
-            let wire = match cd[skip] {
+            let wire = match unknown.0 {
                 1 => term,
                 3 => -term,
                 id => term * self.r1cs.coefficient_inverses[id as usize],
             };
             // SAFETY: the reader gave this wire to this instruction alone.
-            unsafe { self.w.set(cd[skip + 1] as usize, wire) };
+            unsafe { self.w.set(unknown.1 as usize, wire) };
         }
         // SAFETY: the reader gave this constraint index to this instruction alone.
         unsafe {
@@ -357,8 +360,16 @@ impl Run<'_> {
     }
 
     fn hint(&self, op: &Op) -> Result<(), SolveError> {
-        let cd = &self.r1cs.calldata[op.start as usize..];
-        let cd = &cd[..cd[0] as usize];
+        let bytes = self.r1cs.calldata.bytes();
+        let mut pos = op.start as usize;
+        // SAFETY: the op's offset starts a checked hint instruction, whose first value is
+        // its length.
+        let cd: Vec<u32> = unsafe {
+            let len = uvarint(bytes, &mut pos);
+            std::iter::once(len)
+                .chain((1..len).map(|_| uvarint(bytes, &mut pos)))
+                .collect()
+        };
         let id = cd[1];
         let n_inputs = cd[2] as usize;
         let mut inputs = Vec::with_capacity(n_inputs);

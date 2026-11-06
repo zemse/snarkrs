@@ -8,6 +8,10 @@
 //! calldata (a u64 count and that many uvarints) and a CBOR body holding everything else.
 //! The table is a u64 count and each coefficient's four Montgomery limbs, little-endian,
 //! which is the in-memory layout of an arkworks `Fr`.
+//!
+//! The calldata stays as the file holds it, uvarints, and in the file: [`GnarkR1cs::read`]
+//! maps just that section, so the 592 million values of SP1's circuit are 1.5 GB of clean
+//! file pages rather than 2.4 GB of heap. The solver decodes them as it goes.
 
 use crate::cbor;
 use crate::intcomp;
@@ -51,8 +55,11 @@ const SYSTEM_R1CS: u64 = 1;
 /// A uvarint pass hands each task at least this many bytes.
 const VARINT_CHUNK: usize = 1 << 20;
 
+/// The calldata index keeps the byte offset of every this many values.
+const CHECKPOINT: usize = 64;
+
 /// A level shorter than this is checked on the calling thread.
-const PAR_LEVEL: usize = 256;
+const PAR_LEVEL: usize = 128;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Blueprint {
@@ -60,11 +67,12 @@ enum Blueprint {
     R1c,
 }
 
-/// One instruction, in level order, as the solver runs it. `solve` is what the pass found:
-/// for an R1C, 0 when every wire in it is already known and the constraint is only checked,
-/// or else the offset in the instruction's calldata of the one unknown term's coefficient
-/// ID; [`Op::HINT`] for a hint.
-#[derive(Clone, Copy, Debug)]
+/// One instruction, in level order, as the solver runs it. `start` is the byte offset of
+/// its calldata in [`Calldata`]. `solve` is what the pass found: for an R1C, 0 when every
+/// wire in it is already known and the constraint is only checked, or else the index in
+/// the instruction's calldata of the one unknown term's coefficient ID; [`Op::HINT`] for a
+/// hint.
+#[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Op {
     pub start: u64,
     pub constraint: u32,
@@ -93,7 +101,7 @@ pub struct GnarkR1cs {
     pub(crate) coefficients: Vec<Fr>,
     /// `1 / coefficients[i]`, 0 for 0, which is what gnark's `Div` gives.
     pub(crate) coefficient_inverses: Vec<Fr>,
-    pub(crate) calldata: Vec<u32>,
+    pub(crate) calldata: Calldata,
     pub(crate) ops: Vec<Op>,
     /// Level `l` is `ops[level_ptr[l]..level_ptr[l + 1]]`.
     pub(crate) level_ptr: Vec<usize>,
@@ -102,83 +110,37 @@ pub struct GnarkR1cs {
 }
 
 impl GnarkR1cs {
-    /// Read a file `cs.WriteTo` wrote. The file is mapped, not read into memory; nothing
-    /// borrowed from the mapping outlives this call.
+    /// Read a file `cs.WriteTo` wrote. The file is mapped to parse it, and only the
+    /// calldata section stays mapped once it is read.
     #[cfg(not(target_family = "wasm"))]
     pub fn read(path: &std::path::Path) -> Result<Self, ReadError> {
         let file = std::fs::File::open(path).map_err(|e| ReadError::io(path, e))?;
-        // SAFETY: the mapping is read-only and dropped before this returns. Another process
-        // truncating or rewriting the file meanwhile is outside what any reader of a file
-        // can defend against; the parser bounds-checks every read either way.
+        // SAFETY (both maps): read-only. Another process truncating or rewriting the file
+        // while it is mapped is outside what any reader of a file can defend against; the
+        // file is the one gnark wrote, and the parser bounds-checks every read of it.
         let map = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| ReadError::io(path, e))?;
-        Self::from_bytes(&map)
+        let (parsed, range) = parse(&map)?;
+        drop(map);
+        let calldata = if range.is_empty() {
+            Backing::Owned(Vec::new())
+        } else {
+            Backing::Mapped(
+                unsafe {
+                    memmap2::MmapOptions::new()
+                        .offset(range.start as u64)
+                        .len(range.len())
+                        .map(&file)
+                }
+                .map_err(|e| ReadError::io(path, e))?,
+            )
+        };
+        Ok(parsed.with(Calldata(calldata)))
     }
 
-    /// Parse the bytes of a file `cs.WriteTo` wrote.
+    /// Parse the bytes of a file `cs.WriteTo` wrote. The calldata is copied out of them.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ReadError> {
-        let mut c = Bytes::new(bytes, "file header");
-        let total = c.u64()?;
-        let version = (c.u64()?, c.u64()?, c.u64()?);
-        if version.0 != 0 || version.1 != 14 {
-            return Err(ReadError::UnsupportedVersion(format!(
-                "{}.{}.{}",
-                version.0, version.1, version.2
-            )));
-        }
-        if total != c.rest().len() as u64 {
-            return Err(ReadError::malformed(
-                "file header",
-                format!("says {total} bytes follow, {} do", c.rest().len()),
-            ));
-        }
-
-        let mut s = Bytes::new(c.rest(), "system header");
-        let lens = [s.u64()?, s.u64()?, s.u64()?, s.u64()?];
-        let levels = s.take(lens[0])?;
-        let instructions = s.take(lens[1])?;
-        let calldata = s.take(lens[2])?;
-        let body = s.take(lens[3])?;
-        let coefficients = read_coefficients(s.rest())?;
-
-        // The calldata count bounds the other sections: an instruction takes one word of
-        // calldata at least, and a level entry is an instruction.
-        let (calldata_count, calldata) = split_count(calldata, "calldata")?;
-        let max_instructions = usize::try_from(calldata_count).unwrap_or(usize::MAX);
-        let ((system, calldata), (levels, instructions)) = rayon::join(
-            || {
-                rayon::join(
-                    || read_body(body),
-                    || decode_uvarints(calldata, calldata_count),
-                )
-            },
-            || {
-                rayon::join(
-                    || read_levels(levels, max_instructions),
-                    || read_instructions(instructions, max_instructions),
-                )
-            },
-        );
-        let (system, calldata, levels, instructions) = (system?, calldata?, levels?, instructions?);
-
-        let header_version = format!("{}.{}.{}", version.0, version.1, version.2);
-        if system.gnark_version.trim_start_matches('v') != header_version {
-            return Err(ReadError::malformed(
-                "body",
-                format!(
-                    "GnarkVersion {} disagrees with the header's {header_version}",
-                    system.gnark_version
-                ),
-            ));
-        }
-
-        compile(
-            version,
-            system,
-            coefficients,
-            calldata,
-            levels,
-            instructions,
-        )
+        let (parsed, range) = parse(bytes)?;
+        Ok(parsed.with(Calldata(Backing::Owned(bytes[range].to_vec()))))
     }
 
     /// The gnark version the file was written by.
@@ -239,12 +201,168 @@ impl GnarkR1cs {
     pub fn hint_calls(&self) -> BTreeMap<u32, usize> {
         let mut calls = BTreeMap::new();
         for op in self.ops.iter().filter(|op| op.solve == Op::HINT) {
-            *calls
-                .entry(self.calldata[op.start as usize + 1])
-                .or_default() += 1;
+            *calls.entry(self.calldata.hint_id(op)).or_default() += 1;
         }
         calls
     }
+}
+
+/// The calldata section's uvarints, every one a u32, as the reader checked.
+pub(crate) struct Calldata(Backing);
+
+enum Backing {
+    #[cfg(not(target_family = "wasm"))]
+    Mapped(memmap2::Mmap),
+    Owned(Vec<u8>),
+}
+
+impl Calldata {
+    pub(crate) fn bytes(&self) -> &[u8] {
+        match &self.0 {
+            #[cfg(not(target_family = "wasm"))]
+            Backing::Mapped(m) => m,
+            Backing::Owned(v) => v,
+        }
+    }
+
+    /// A hint instruction's hint ID, its second value.
+    pub(crate) fn hint_id(&self, op: &Op) -> u32 {
+        let mut pos = op.start as usize;
+        // SAFETY: an op's offset starts a hint's calldata, which holds five values at least.
+        unsafe {
+            uvarint(self.bytes(), &mut pos);
+            uvarint(self.bytes(), &mut pos)
+        }
+    }
+}
+
+/// The uvarint at `pos`, advancing past it.
+///
+/// # Safety
+/// `pos` starts a uvarint of the checked calldata: one of at most five bytes, ending inside
+/// `bytes`, whose value is a u32.
+#[inline(always)]
+pub(crate) unsafe fn uvarint(bytes: &[u8], pos: &mut usize) -> u32 {
+    let b = *bytes.get_unchecked(*pos);
+    *pos += 1;
+    if b < 0x80 {
+        return u32::from(b);
+    }
+    let mut v = u32::from(b & 0x7f);
+    let mut shift = 7;
+    loop {
+        let b = *bytes.get_unchecked(*pos);
+        *pos += 1;
+        v |= u32::from(b & 0x7f) << shift;
+        if b < 0x80 {
+            return v;
+        }
+        shift += 7;
+    }
+}
+
+/// Everything [`parse`] reads but the calldata, which the caller keeps its own way.
+struct Parsed {
+    version: (u64, u64, u64),
+    public_names: Vec<String>,
+    secret_names: Vec<String>,
+    n_internal: usize,
+    n_constraints: usize,
+    hint_dependencies: BTreeMap<u32, String>,
+    coefficients: Vec<Fr>,
+    coefficient_inverses: Vec<Fr>,
+    ops: Vec<Op>,
+    level_ptr: Vec<usize>,
+    hint_ids: Vec<u32>,
+}
+
+impl Parsed {
+    fn with(self, calldata: Calldata) -> GnarkR1cs {
+        GnarkR1cs {
+            version: self.version,
+            public_names: self.public_names,
+            secret_names: self.secret_names,
+            n_internal: self.n_internal,
+            n_constraints: self.n_constraints,
+            hint_dependencies: self.hint_dependencies,
+            coefficients: self.coefficients,
+            coefficient_inverses: self.coefficient_inverses,
+            calldata,
+            ops: self.ops,
+            level_ptr: self.level_ptr,
+            hint_ids: self.hint_ids,
+        }
+    }
+}
+
+/// Parse and check a file: it, and where in `bytes` its calldata uvarints are.
+fn parse(bytes: &[u8]) -> Result<(Parsed, std::ops::Range<usize>), ReadError> {
+    let mut c = Bytes::new(bytes, "file header");
+    let total = c.u64()?;
+    let version = (c.u64()?, c.u64()?, c.u64()?);
+    if version.0 != 0 || version.1 != 14 {
+        return Err(ReadError::UnsupportedVersion(format!(
+            "{}.{}.{}",
+            version.0, version.1, version.2
+        )));
+    }
+    if total != c.rest().len() as u64 {
+        return Err(ReadError::malformed(
+            "file header",
+            format!("says {total} bytes follow, {} do", c.rest().len()),
+        ));
+    }
+
+    let mut s = Bytes::new(c.rest(), "system header");
+    let lens = [s.u64()?, s.u64()?, s.u64()?, s.u64()?];
+    let levels = s.take(lens[0])?;
+    let instructions = s.take(lens[1])?;
+    let calldata = s.take(lens[2])?;
+    let body = s.take(lens[3])?;
+    let coefficients = read_coefficients(s.rest())?;
+
+    // The calldata count bounds the other sections: an instruction takes one value of
+    // calldata at least, and a level entry is an instruction.
+    let (count, calldata) = split_count(calldata, "calldata")?;
+    let max_instructions = usize::try_from(count).unwrap_or(usize::MAX);
+    let ((system, checkpoints), (levels, instructions)) = rayon::join(
+        || rayon::join(|| read_body(body), || index_uvarints(calldata, count)),
+        || {
+            rayon::join(
+                || read_levels(levels, max_instructions),
+                || read_instructions(instructions, max_instructions),
+            )
+        },
+    );
+    let (system, checkpoints, levels, instructions) =
+        (system?, checkpoints?, levels?, instructions?);
+
+    let header_version = format!("{}.{}.{}", version.0, version.1, version.2);
+    if system.gnark_version.trim_start_matches('v') != header_version {
+        return Err(ReadError::malformed(
+            "body",
+            format!(
+                "GnarkVersion {} disagrees with the header's {header_version}",
+                system.gnark_version
+            ),
+        ));
+    }
+
+    let start = calldata.as_ptr() as usize - bytes.as_ptr() as usize;
+    let indexed = Indexed {
+        bytes: calldata,
+        count: count as usize,
+        checkpoints,
+    };
+    let parsed = compile(
+        version,
+        system,
+        coefficients,
+        &indexed,
+        levels,
+        instructions,
+    )?;
+    Ok((parsed, start..start + calldata.len()))
 }
 
 /// The CBOR body's fields the solver uses.
@@ -547,10 +665,11 @@ fn read_instructions(bytes: &[u8], max: usize) -> Result<Instructions, ReadError
     })
 }
 
-/// `calldataFromBytes`: `count` uvarints, each a u32. Decoded in parallel: every byte below
-/// 0x80 ends a value, so a count of those per chunk places each chunk's values before any
-/// is decoded, and a chunk boundary moved to just past such a byte starts a value.
-fn decode_uvarints(bytes: &[u8], count: u64) -> Result<Vec<u32>, ReadError> {
+/// `calldataFromBytes`'s `count` uvarints, each a u32, checked and indexed without being
+/// kept: the result is the byte offset of every [`CHECKPOINT`]th value. In parallel, as
+/// every byte below 0x80 ends a value: a count of those per chunk places each chunk's
+/// values, and a chunk boundary moved to just past such a byte starts a value.
+fn index_uvarints(bytes: &[u8], count: u64) -> Result<Vec<u64>, ReadError> {
     const WHAT: &str = "calldata";
     // One byte a value at least.
     if count > bytes.len() as u64 {
@@ -575,10 +694,13 @@ fn decode_uvarints(bytes: &[u8], count: u64) -> Result<Vec<u32>, ReadError> {
         at = b + VARINT_CHUNK;
     }
     bounds.push(bytes.len());
-    let chunks: Vec<&[u8]> = bounds.windows(2).map(|w| &bytes[w[0]..w[1]]).collect();
+    let chunks: Vec<(usize, &[u8])> = bounds
+        .windows(2)
+        .map(|w| (w[0], &bytes[w[0]..w[1]]))
+        .collect();
     let counts: Vec<usize> = chunks
         .par_iter()
-        .map(|c| c.iter().filter(|&&b| b < 0x80).count())
+        .map(|(_, c)| c.iter().filter(|&&b| b < 0x80).count())
         .collect();
     if counts.iter().sum::<usize>() != count {
         return Err(ReadError::malformed(
@@ -587,25 +709,36 @@ fn decode_uvarints(bytes: &[u8], count: u64) -> Result<Vec<u32>, ReadError> {
         ));
     }
 
-    let mut out: Vec<u32> = Vec::with_capacity(count);
-    let mut slots = &mut out.spare_capacity_mut()[..count];
+    let mut checkpoints = vec![0u64; count.div_ceil(CHECKPOINT)];
+    let mut slots = &mut checkpoints[..];
     let mut parts = Vec::with_capacity(chunks.len());
-    for (&chunk, &n) in chunks.iter().zip(&counts) {
-        let (head, tail) = slots.split_at_mut(n);
-        parts.push((chunk, head));
+    let mut first = 0usize;
+    for (&(offset, chunk), &n) in chunks.iter().zip(&counts) {
+        // The checkpoints whose values fall in this chunk.
+        let (lo, hi) = (first.div_ceil(CHECKPOINT), (first + n).div_ceil(CHECKPOINT));
+        let (head, tail) = slots.split_at_mut(hi - lo);
+        parts.push((offset, chunk, first, head));
         slots = tail;
+        first += n;
     }
     parts
         .into_par_iter()
-        .try_for_each(|(chunk, slots)| {
-            let mut i = 0;
+        .try_for_each(|(offset, chunk, first, slots)| {
+            let mut index = first;
+            let mut slot = 0;
             let mut v = 0u64;
             let mut shift = 0u32;
-            for &b in chunk {
+            for (i, &b) in chunk.iter().enumerate() {
+                if shift == 0 && index % CHECKPOINT == 0 {
+                    slots[slot] = (offset + i) as u64;
+                    slot += 1;
+                }
                 v |= u64::from(b & 0x7f) << shift;
                 if b < 0x80 {
-                    slots[i].write(u32::try_from(v).map_err(|_| ())?);
-                    i += 1;
+                    if v > u64::from(u32::MAX) {
+                        return Err(());
+                    }
+                    index += 1;
                     v = 0;
                     shift = 0;
                 } else {
@@ -622,10 +755,49 @@ fn decode_uvarints(bytes: &[u8], count: u64) -> Result<Vec<u32>, ReadError> {
             Ok(())
         })
         .map_err(|()| ReadError::malformed(WHAT, "a uvarint is not a u32"))?;
-    // SAFETY: the counts placed one slot per byte below 0x80, and every chunk wrote one value
-    // per such byte or returned an error, so all `count` slots are initialised.
-    unsafe { out.set_len(count) };
-    Ok(out)
+    Ok(checkpoints)
+}
+
+/// The checked calldata and its index.
+struct Indexed<'a> {
+    bytes: &'a [u8],
+    count: usize,
+    checkpoints: Vec<u64>,
+}
+
+impl Indexed<'_> {
+    /// The byte offset of value `i`, which must be below `count`.
+    fn offset(&self, i: usize) -> usize {
+        let mut pos = self.checkpoints[i / CHECKPOINT] as usize;
+        for _ in 0..i % CHECKPOINT {
+            while self.bytes[pos] >= 0x80 {
+                pos += 1;
+            }
+            pos += 1;
+        }
+        pos
+    }
+
+    /// The instruction whose calldata starts at value `start`, decoded into `out`. Its first
+    /// value is its length, which must fit in what is left of the calldata. Returns its byte
+    /// offset.
+    fn instruction(&self, start: u64, out: &mut Vec<u32>) -> Option<usize> {
+        let start = usize::try_from(start).ok().filter(|&s| s < self.count)?;
+        let offset = self.offset(start);
+        let mut pos = offset;
+        // SAFETY: `offset` starts a value of the checked calldata, and every value read is
+        // inside it: the first, then `len - 1` more, `start + len` being at most `count`.
+        let len = unsafe { uvarint(self.bytes, &mut pos) } as usize;
+        if len == 0 || len > self.count - start {
+            return None;
+        }
+        out.clear();
+        out.push(len as u32);
+        for _ in 1..len {
+            out.push(unsafe { uvarint(self.bytes, &mut pos) });
+        }
+        Some(offset)
+    }
 }
 
 /// The static solve: run every level once without values, tracking only which wires are
@@ -635,10 +807,10 @@ fn compile(
     version: (u64, u64, u64),
     system: System,
     coefficients: Vec<Fr>,
-    calldata: Vec<u32>,
+    calldata: &Indexed,
     levels: Vec<Vec<u32>>,
     instructions: Instructions,
-) -> Result<GnarkR1cs, ReadError> {
+) -> Result<Parsed, ReadError> {
     const UNSOLVED: u32 = u32::MAX;
     let malformed = |reason: String| ReadError::malformed("instructions", reason);
 
@@ -648,19 +820,19 @@ fn compile(
     // so the instructions bound how many there can be before a stamp is allocated for each.
     let solvable = instructions
         .blueprint
-        .iter()
+        .par_iter()
         .zip(&instructions.start)
-        .map(|(&b, &start)| match system.blueprints.get(b as usize) {
-            Some(Blueprint::R1c) => 1,
-            Some(Blueprint::Hint) => usize::try_from(start)
-                .ok()
-                .and_then(|s| calldata.get(s..))
-                .and_then(|rest| rest.get(..*rest.first()? as usize))
-                .and_then(hint_layout)
-                .map_or(0, |(_, from, to)| u64::from(to - from)),
-            None => 0,
+        .map_init(Vec::new, |cd, (&b, &start)| {
+            match system.blueprints.get(b as usize) {
+                Some(Blueprint::R1c) => 1,
+                Some(Blueprint::Hint) => calldata
+                    .instruction(start, cd)
+                    .and_then(|_| hint_layout(cd))
+                    .map_or(0, |(_, from, to)| u64::from(to - from)),
+                None => 0,
+            }
         })
-        .fold(0u64, u64::saturating_add);
+        .reduce(|| 0, u64::saturating_add);
     if n_wires >= u64::from(CONSTANT) || system.n_internal > solvable {
         return Err(malformed(format!("{n_wires} wires")));
     }
@@ -678,14 +850,19 @@ fn compile(
     let n_coefficients = coefficients.len() as u32;
 
     let stamp: Vec<AtomicU32> = (0..n_wires)
+        .into_par_iter()
         .map(|w| AtomicU32::new(if w < n_inputs { 0 } else { UNSOLVED }))
         .collect();
     let placed: Vec<AtomicBool> = (0..n_instructions)
+        .into_par_iter()
         .map(|_| AtomicBool::new(false))
         .collect();
-    let constrained: Vec<AtomicBool> = (0..n_constraints).map(|_| AtomicBool::new(false)).collect();
+    let constrained: Vec<AtomicBool> = (0..n_constraints)
+        .into_par_iter()
+        .map(|_| AtomicBool::new(false))
+        .collect();
 
-    let check = |level: u32, i: u32| -> Result<Op, String> {
+    let check = |cd: &mut Vec<u32>, level: u32, i: u32| -> Result<Op, String> {
         let i = i as usize;
         if i >= n_instructions || placed[i].swap(true, Ordering::Relaxed) {
             return Err(format!("instruction {i} is out of range or in two levels"));
@@ -694,12 +871,10 @@ fn compile(
             .blueprints
             .get(instructions.blueprint[i] as usize)
             .ok_or_else(|| format!("instruction {i}: blueprint {}", instructions.blueprint[i]))?;
-        let start = instructions.start[i];
-        let cd = usize::try_from(start)
-            .ok()
-            .and_then(|s| calldata.get(s..))
-            .and_then(|rest| rest.get(..*rest.first()? as usize))
-            .ok_or_else(|| format!("instruction {i}: calldata out of range"))?;
+        let start = calldata
+            .instruction(instructions.start[i], cd)
+            .ok_or_else(|| format!("instruction {i}: calldata out of range"))?
+            as u64;
         let known = |w: u32| stamp[w as usize].load(Ordering::Relaxed) <= level;
         let claim = |w: u32| {
             stamp[w as usize]
@@ -788,20 +963,25 @@ fn compile(
     let mut ops = Vec::with_capacity(n_instructions);
     let mut level_ptr = Vec::with_capacity(levels.len() + 1);
     level_ptr.push(0);
+    let mut cd = Vec::new();
     for (l, level) in levels.iter().enumerate() {
         let l = u32::try_from(l).map_err(|_| malformed("too many levels".into()))?;
         if level.len() < PAR_LEVEL {
             for &i in level {
-                ops.push(check(l, i).map_err(malformed)?);
+                ops.push(check(&mut cd, l, i).map_err(malformed)?);
             }
         } else {
-            let done: Vec<Op> = level
-                .par_iter()
-                .with_min_len(PAR_LEVEL / 4)
-                .map(|&i| check(l, i))
-                .collect::<Result<_, _>>()
+            let at = ops.len();
+            ops.resize(at + level.len(), Op::default());
+            ops[at..]
+                .par_iter_mut()
+                .zip(level)
+                .with_min_len(8)
+                .try_for_each_init(Vec::new, |cd, (op, &i)| {
+                    *op = check(cd, l, i)?;
+                    Ok::<_, String>(())
+                })
                 .map_err(malformed)?;
-            ops.extend(done);
         }
         level_ptr.push(ops.len());
     }
@@ -814,11 +994,19 @@ fn compile(
     if constrained.par_iter().any(|c| !c.load(Ordering::Relaxed)) {
         return Err(malformed("a constraint index no R1C has".into()));
     }
+    drop((stamp, placed, constrained, levels, instructions));
 
     let mut hint_ids: Vec<u32> = ops
-        .iter()
+        .par_iter()
         .filter(|op| op.solve == Op::HINT)
-        .map(|op| calldata[op.start as usize + 1])
+        .map(|op| {
+            let mut pos = op.start as usize;
+            // SAFETY: the op's offset starts a checked hint instruction.
+            unsafe {
+                uvarint(calldata.bytes, &mut pos);
+                uvarint(calldata.bytes, &mut pos)
+            }
+        })
         .collect();
     hint_ids.sort_unstable();
     hint_ids.dedup();
@@ -827,16 +1015,15 @@ fn compile(
     let mut coefficient_inverses = coefficients.clone();
     ark_ff::batch_inversion(&mut coefficient_inverses);
 
-    Ok(GnarkR1cs {
+    Ok(Parsed {
         version,
         public_names: system.public,
         secret_names: system.secret,
-        n_internal: system.n_internal as usize,
+        n_internal: n_wires - n_inputs,
         n_constraints,
         hint_dependencies: system.hint_dependencies,
         coefficients,
         coefficient_inverses,
-        calldata,
         ops,
         level_ptr,
         hint_ids,
