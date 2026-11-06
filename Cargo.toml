@@ -13,6 +13,7 @@ members = [
     "crates/wgpu",
     "crates/web",
     "crates/witness",
+    "crates/gnark",
     "crates/lib",
     "bin/snarkrs",
 ]
@@ -89,6 +90,7 @@ snarkrs-wgpu  = { path = "crates/wgpu", version = "0.1.0" }
 snarkrs-web  = { path = "crates/web", version = "0.1.0" }
 snarkrs-witness = { path = "crates/witness", version = "0.1.0", default-features = false }
 snarkrs-lib = { path = "crates/lib", version = "0.1.0" }
+snarkrs-gnark = { path = "crates/gnark", version = "0.1.0" }
 
 [profile.release]
 opt-level = 3

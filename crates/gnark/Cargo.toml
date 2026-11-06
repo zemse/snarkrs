@@ -1,0 +1,27 @@
+[package]
+name = "snarkrs-gnark"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "gnark Groth16 BN254 proving key, verifying key and witness parsing for snarkrs"
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+include = ["src/**/*", "LICENSE-MIT", "LICENSE-APACHE"]
+
+[dependencies]
+snarkrs-field.workspace = true
+snarkrs-formats.workspace = true
+snarkrs-groth16.workspace = true
+ark-ff.workspace = true
+ark-ec.workspace = true
+rayon.workspace = true
+thiserror.workspace = true
+memmap2.workspace = true
+
+[dev-dependencies]
+ark-std.workspace = true

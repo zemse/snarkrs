@@ -1,0 +1,298 @@
+//! Parsing the committed toy fixture, and refusing every way of breaking it. The fixture
+//! comes from `test-support/gnark` (`go run . gen toy`).
+
+use super::*;
+use crate::pk::DumpHeader;
+use std::path::PathBuf;
+
+fn toy(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../test-support/gnark/toy")
+        .join(name)
+}
+
+fn bytes(name: &str) -> Vec<u8> {
+    std::fs::read(toy(name)).unwrap()
+}
+
+/// Byte offsets into the toy dump, from the layout in `pk.rs`.
+const DOMAIN: usize = 8;
+const GENERATOR: usize = DOMAIN + 8 + 32;
+const ALPHA: usize = DOMAIN + 169;
+const WIRES: usize = ALPHA + 3 * 64 + 2 * 128;
+const FLAGS: usize = WIRES + 24;
+
+fn wires(pk: &[u8]) -> usize {
+    u64::from_be_bytes(pk[WIRES..WIRES + 8].try_into().unwrap()) as usize
+}
+
+/// Where the `u32` commitment count and then the first dumped slice's length sit.
+fn after_flags(pk: &[u8]) -> usize {
+    FLAGS + 2 * wires(pk)
+}
+
+#[test]
+fn reads_the_toy_dump() {
+    let pk = GnarkProvingKey::read_dump(&toy("pk.dump")).unwrap();
+    let h = &pk.header;
+    assert_eq!(h.domain_size, 4096);
+    assert_eq!(h.n_wires, 3072);
+    // X, Y, Sum, Low and the constant wire.
+    assert_eq!(h.n_public_wires(), 5);
+    assert_eq!(h.g1_z, 4095);
+    // The 64 bits of S[0] appear in no A or B row, so both drop points.
+    assert!(h.nb_infinity_a > 0 && h.nb_infinity_b > 0, "{h:?}");
+    assert_eq!(h.g1_a + h.nb_infinity_a, h.n_wires);
+    assert_eq!(h.g2_b + h.nb_infinity_b, h.n_wires);
+    for v in [&pk.a, &pk.b_g1, &pk.k, &pk.z] {
+        assert!(v.iter().all(|p| p.is_on_curve()));
+    }
+    assert_eq!(pk.a.len(), h.n_wires);
+    assert_eq!(pk.b_g2.len(), h.n_wires);
+    assert_eq!(pk.k.len(), h.n_wires - 5);
+    assert_eq!(
+        pk.a.iter().filter(|p| p.infinity).count(),
+        h.nb_infinity_a,
+        "only the flagged wires are infinity in A"
+    );
+    assert_eq!(DumpHeader::read(&toy("pk.dump")).unwrap(), pk.header);
+}
+
+#[test]
+fn the_verifying_key_matches_the_proving_key() {
+    let pk = GnarkProvingKey::read_dump(&toy("pk.dump")).unwrap();
+    let vk = GnarkVerifyingKey::read(&toy("vk.bin")).unwrap();
+    assert_eq!(vk.alpha_g1, pk.alpha_g1);
+    assert_eq!(vk.beta_g1, pk.beta_g1);
+    assert_eq!(vk.delta_g1, pk.delta_g1);
+    assert_eq!(vk.beta_g2, pk.beta_g2);
+    assert_eq!(vk.delta_g2, pk.delta_g2);
+    assert_eq!(vk.k.len(), pk.header.n_public_wires());
+    assert_eq!(vk.n_public(), 4);
+}
+
+#[test]
+fn compressed_and_raw_points_decode_alike() {
+    let vk = GnarkVerifyingKey::read(&toy("vk.bin")).unwrap();
+    for p in vk.k.iter().chain([&vk.alpha_g1, &vk.beta_g1, &vk.delta_g1]) {
+        assert_eq!(encoded_g1(&raw_g1(p)).unwrap(), *p);
+    }
+    for p in [&vk.beta_g2, &vk.gamma_g2, &vk.delta_g2] {
+        assert_eq!(encoded_g2(&raw_g2(p)).unwrap(), *p);
+    }
+    assert!(encoded_g1(&raw_g1(&G1Affine::identity())).unwrap().infinity);
+    assert!(encoded_g2(&raw_g2(&G2Affine::identity())).unwrap().infinity);
+    // Both signs of Y, through the compressed form gnark writes into vk.bin.
+    let g = G1Affine::generator();
+    let mut c = [0u8; 32];
+    c.copy_from_slice(&raw_g1(&g)[..32]);
+    c[0] |= COMPRESSED_SMALLEST;
+    let small = encoded_g1(&c).unwrap();
+    c[0] |= COMPRESSED_LARGEST;
+    let large = encoded_g1(&c).unwrap();
+    assert_eq!(small, -large);
+    assert!(small == g || large == g);
+}
+
+#[test]
+fn reads_the_toy_witness() {
+    let w = GnarkWitness::read_dump(&toy("witness.bin")).unwrap();
+    assert_eq!(w.w().len(), 3072);
+    assert_eq!(w.n_constraints(), 2071);
+    assert_eq!(w.bw().len(), 2071);
+    let public: Vec<Fr> = bytes("public.bin")
+        .chunks(32)
+        .map(|b| fr_be(b).unwrap())
+        .collect();
+    assert_eq!(w.public(4).unwrap(), &public[..]);
+    // X = 5 is the first public input.
+    assert_eq!(public[0], Fr::from(5u64));
+}
+
+/// Every prefix of each file is refused, and none panics.
+#[test]
+fn every_truncation_is_refused() {
+    let pk = bytes("pk.dump");
+    let step = (pk.len() / 997).max(1);
+    for cut in (0..pk.len()).step_by(step).chain([pk.len() - 1]) {
+        assert!(
+            GnarkProvingKey::from_bytes(&pk[..cut]).is_err(),
+            "pk cut at {cut}"
+        );
+    }
+    let vk = bytes("vk.bin");
+    for cut in 0..vk.len() {
+        assert!(
+            GnarkVerifyingKey::from_bytes(&vk[..cut]).is_err(),
+            "vk cut at {cut}"
+        );
+    }
+    let w = bytes("witness.bin");
+    for cut in (0..w.len()).step_by(97).chain([w.len() - 1]) {
+        assert!(
+            GnarkWitness::from_bytes(&w[..cut]).is_err(),
+            "witness cut at {cut}"
+        );
+    }
+}
+
+#[test]
+fn trailing_bytes_are_refused() {
+    for name in ["pk.dump", "vk.bin", "witness.bin"] {
+        let mut b = bytes(name);
+        b.push(0);
+        let err = match name {
+            "pk.dump" => GnarkProvingKey::from_bytes(&b).err(),
+            "vk.bin" => GnarkVerifyingKey::from_bytes(&b).err(),
+            _ => GnarkWitness::from_bytes(&b).err(),
+        };
+        assert!(err.unwrap().to_string().contains("trailing"), "{name}");
+    }
+}
+
+/// A length that claims more than the file holds is refused before it is allocated. Were
+/// it trusted, `u64::MAX` points would be an abort and 2^40 would be 64 TB.
+#[test]
+fn oversized_lengths_are_refused_without_allocating() {
+    let pk = bytes("pk.dump");
+    for huge in [u64::MAX, 1 << 40, (pk.len() as u64) / 64 + 1] {
+        let mut b = pk.clone();
+        b[WIRES..WIRES + 8].copy_from_slice(&huge.to_be_bytes());
+        assert!(GnarkProvingKey::from_bytes(&b).is_err(), "nbWires {huge}");
+
+        let mut b = pk.clone();
+        let at = after_flags(&pk) + 4;
+        b[at..at + 8].copy_from_slice(&huge.to_le_bytes());
+        let err = GnarkProvingKey::from_bytes(&b).err().unwrap().to_string();
+        assert!(err.contains("G1.A"), "{err}");
+    }
+
+    let w = bytes("witness.bin");
+    for huge in [u64::MAX, 1 << 40] {
+        let mut b = w.clone();
+        b[8..16].copy_from_slice(&huge.to_le_bytes());
+        assert!(GnarkWitness::from_bytes(&b).is_err(), "W length {huge}");
+    }
+
+    let vk = bytes("vk.bin");
+    // G1.K's count follows three compressed G1 and three compressed G2 points.
+    let at = 3 * 32 + 3 * 64;
+    for huge in [u32::MAX, 1 << 24] {
+        let mut b = vk.clone();
+        b[at..at + 4].copy_from_slice(&huge.to_be_bytes());
+        let err = GnarkVerifyingKey::from_bytes(&b).err().unwrap().to_string();
+        assert!(err.contains("G1.K"), "{err}");
+    }
+}
+
+#[test]
+fn a_slice_length_that_disagrees_with_the_flags_is_refused() {
+    // Moving one wire's flag in InfinityA leaves G1.A one point short of the header.
+    let mut b = bytes("pk.dump");
+    let n = wires(&b);
+    let i = (0..n).find(|&i| b[FLAGS + i] == 0).unwrap();
+    b[FLAGS + i] = 1;
+    let err = GnarkProvingKey::from_bytes(&b).err().unwrap().to_string();
+    assert!(err.contains("InfinityA"), "{err}");
+    // And a flag that is not a bool.
+    let mut b = bytes("pk.dump");
+    b[FLAGS] = 2;
+    let err = GnarkProvingKey::from_bytes(&b).err().unwrap().to_string();
+    assert!(err.contains("not a bool"), "{err}");
+}
+
+#[test]
+fn commitments_are_refused() {
+    let mut b = bytes("pk.dump");
+    let at = after_flags(&b);
+    b[at..at + 4].copy_from_slice(&1u32.to_be_bytes());
+    assert!(matches!(
+        GnarkProvingKey::from_bytes(&b),
+        Err(GnarkError::Commitments { count: 1, .. })
+    ));
+    let mut b = bytes("vk.bin");
+    let at = b.len() - 4;
+    b[at..].copy_from_slice(&1u32.to_be_bytes());
+    assert!(matches!(
+        GnarkVerifyingKey::from_bytes(&b),
+        Err(GnarkError::Commitments { count: 1, .. })
+    ));
+}
+
+#[test]
+fn a_foreign_domain_is_refused() {
+    let mut b = bytes("pk.dump");
+    b[GENERATOR + 31] ^= 1;
+    let err = GnarkProvingKey::from_bytes(&b).err().unwrap().to_string();
+    assert!(err.contains("Generator"), "{err}");
+    let mut b = bytes("pk.dump");
+    b[DOMAIN..DOMAIN + 8].copy_from_slice(&3000u64.to_be_bytes());
+    let err = GnarkProvingKey::from_bytes(&b).err().unwrap().to_string();
+    assert!(err.contains("power of two"), "{err}");
+}
+
+#[test]
+fn a_bad_marker_is_refused() {
+    for name in ["pk.dump", "witness.bin"] {
+        let mut b = bytes(name);
+        b[..8].copy_from_slice(&0xdead_beef_u64.to_be_bytes());
+        let err = match name {
+            "pk.dump" => GnarkProvingKey::from_bytes(&b).err(),
+            _ => GnarkWitness::from_bytes(&b).err(),
+        };
+        assert!(matches!(err, Some(GnarkError::BadMarker(_))), "{name}");
+    }
+}
+
+#[test]
+fn a_zeroed_header_point_is_refused() {
+    let mut b = bytes("pk.dump");
+    // G1.Beta, the second raw header point.
+    b[ALPHA + 64..ALPHA + 128].fill(0);
+    let err = GnarkProvingKey::from_bytes(&b).err().unwrap().to_string();
+    assert!(err.contains("G1.Beta is the point at infinity"), "{err}");
+}
+
+#[test]
+fn an_off_curve_query_point_is_refused() {
+    let mut b = bytes("pk.dump");
+    // The first point of G1.A: its x limb 0, one past the slice length.
+    let at = after_flags(&b) + 4 + 8;
+    b[at] ^= 1;
+    let err = GnarkProvingKey::from_bytes(&b).err().unwrap().to_string();
+    assert!(
+        err.contains("G1.A") && err.contains("not on the curve"),
+        "{err}"
+    );
+}
+
+#[test]
+fn an_off_curve_vk_point_is_refused() {
+    let mut b = bytes("vk.bin");
+    // Alpha's x, compressed: most x are not the abscissa of a point, so walk the low byte
+    // until one is refused.
+    let refused = (0..=255u8).any(|v| {
+        b[31] = v;
+        GnarkVerifyingKey::from_bytes(&b).is_err()
+    });
+    assert!(refused);
+}
+
+#[test]
+fn witness_shape_is_checked() {
+    let w = GnarkWitness::read_dump(&toy("witness.bin")).unwrap();
+    let (mut ww, aw, bw) = (w.w().to_vec(), w.aw().to_vec(), w.bw().to_vec());
+    assert!(GnarkWitness::from_parts(ww.clone(), aw.clone(), bw[1..].to_vec()).is_err());
+    ww[0] = Fr::from(2u64);
+    let err = GnarkWitness::from_parts(ww, aw, bw)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(err.contains("W[0]"), "{err}");
+
+    // An element at the modulus.
+    let mut b = bytes("witness.bin");
+    b[16..48].copy_from_slice(&Fr::MODULUS.to_bytes_le());
+    let err = GnarkWitness::from_bytes(&b).err().unwrap().to_string();
+    assert!(err.contains("not below the scalar modulus"), "{err}");
+}
