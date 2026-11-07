@@ -2,6 +2,7 @@
 // and verifies a proof against a gnark verifying key with gnark's own groth16.Verify.
 //
 //	go run . gen <dir>
+//	go run . r1cs <circuit.r1cs>
 //	go run . verify <vk.bin> <public.bin> <proof.bin>
 //
 // gen writes, into <dir>:
@@ -12,9 +13,14 @@
 //	            Aw and Bw (A.w and B.w per constraint), as []fr.Element
 //	public.bin  the public inputs W[1..nbPublic], 32 bytes each, big-endian, canonical
 //	proof.bin   a gnark proof of the same witness, Proof.WriteRawTo
+//	circuit.r1cs the compiled circuit, cs.WriteTo
 //
-// verify reads a proof written by Proof.WriteRawTo or WriteTo, the public inputs in the
-// public.bin layout above, and exits 0 only when groth16.Verify accepts.
+// r1cs writes just circuit.r1cs, which compiling makes the same for every setup.
+//
+// verify reads a verifying key written by VerifyingKey.WriteTo or WriteRawTo, a proof
+// written by Proof.WriteRawTo or WriteTo, the public inputs in the public.bin layout above
+// or as gnark's own public witness (witness.MarshalBinary, told apart by its 12-byte
+// header), and exits 0 only when groth16.Verify accepts.
 package main
 
 import (
@@ -99,10 +105,20 @@ func run(args []string) error {
 	switch {
 	case len(args) == 2 && args[0] == "gen":
 		return gen(args[1])
+	case len(args) == 2 && args[0] == "r1cs":
+		ccs, err := frontend.Compile(ecc.BN254.ScalarField(), r1cs.NewBuilder, &toy{})
+		if err != nil {
+			return fmt.Errorf("compile: %w", err)
+		}
+		var buf bytes.Buffer
+		if _, err := ccs.WriteTo(&buf); err != nil {
+			return err
+		}
+		return os.WriteFile(args[1], buf.Bytes(), 0o644)
 	case len(args) == 4 && args[0] == "verify":
 		return verify(args[1], args[2], args[3])
 	default:
-		return errors.New("usage: gen <dir> | verify <vk.bin> <public.bin> <proof.bin>")
+		return errors.New("usage: gen <dir> | r1cs <circuit.r1cs> | verify <vk.bin> <public.bin> <proof.bin>")
 	}
 }
 
@@ -188,6 +204,13 @@ func gen(dir string) error {
 	if err := write(dir, "proof.bin", buf.Bytes()); err != nil {
 		return err
 	}
+	buf.Reset()
+	if _, err := ccs.WriteTo(&buf); err != nil {
+		return err
+	}
+	if err := write(dir, "circuit.r1cs", buf.Bytes()); err != nil {
+		return err
+	}
 	fmt.Printf("constraints %d, wires %d, public %d (with the constant wire), domain %d\n",
 		r1.GetNbConstraints(), len(sol.W), nbPublic, pk.(*groth16bn254.ProvingKey).Domain.Cardinality)
 	return nil
@@ -205,6 +228,21 @@ func verify(vkPath, publicPath, proofPath string) error {
 	raw, err := os.ReadFile(publicPath)
 	if err != nil {
 		return err
+	}
+	// A public witness is a 12-byte header and whole scalars, so never a multiple of 32.
+	if len(raw)%fr.Bytes == 12 {
+		public, err := witness.New(ecc.BN254.ScalarField())
+		if err != nil {
+			return err
+		}
+		if err := public.UnmarshalBinary(raw); err != nil {
+			return fmt.Errorf("public witness: %w", err)
+		}
+		if err := groth16.Verify(proof, vk, public); err != nil {
+			return fmt.Errorf("groth16.Verify: %w", err)
+		}
+		fmt.Println("ok")
+		return nil
 	}
 	if len(raw)%fr.Bytes != 0 {
 		return fmt.Errorf("public inputs are %d bytes, not a multiple of %d", len(raw), fr.Bytes)
