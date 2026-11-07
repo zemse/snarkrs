@@ -102,16 +102,33 @@ fn fields(zkey: &Path) -> Result<Vec<(&'static str, Value)>, CeremonyError> {
     let ic_bytes = file.unique_section(S_IC)?;
     let n_ic = header.n_public as usize + 1;
     snarkrs_formats::binfile::expect_records(ic_bytes, n_ic, SG1, S_IC)?;
-    let ic: Vec<Value> = ic_bytes
+    let ic: Vec<G1Affine> = ic_bytes
         .as_chunks::<SG1>()
         .0
         .iter()
-        .map(|b| Ok(g1_json(&snarkrs_formats::binfile::g1(b)?)))
+        .map(|b| Ok(snarkrs_formats::binfile::g1(b)?))
         .collect::<Result<_, CeremonyError>>()?;
+    Ok(key_fields(
+        &header.alpha_g1,
+        &header.beta_g2,
+        &header.gamma_g2,
+        &header.delta_g2,
+        &ic,
+    ))
+}
 
+/// [`fields`] for the points themselves, wherever they came from. `nPublic` is
+/// `ic.len() - 1`, which is what section 2 holds for any key whose section 3 parsed.
+fn key_fields(
+    alpha_g1: &G1Affine,
+    beta_g2: &G2Affine,
+    gamma_g2: &G2Affine,
+    delta_g2: &G2Affine,
+    ic: &[G1Affine],
+) -> Vec<(&'static str, Value)> {
     // `e(alpha_1, beta_2)` in F12, nested 2 x 3 x 2 by the tower Fq12 = Fq2(Fq6(Fq2)).
     // Redundant, and only ever a precomputation a verifier may skip the pairing with.
-    let ab = Bn254::pairing(header.alpha_g1, header.beta_g2).0;
+    let ab = Bn254::pairing(*alpha_g1, *beta_g2).0;
     let alphabeta = Value::Array(
         [ab.c0, ab.c1]
             .iter()
@@ -119,19 +136,19 @@ fn fields(zkey: &Path) -> Result<Vec<(&'static str, Value)>, CeremonyError> {
             .collect(),
     );
 
-    Ok(vec![
+    vec![
         ("protocol", Value::String("groth16".into())),
         ("curve", Value::String("bn128".into())),
         // The one field that is not a string: `stringifyBigInts` passes a plain number
         // through untouched (`ffjavascript/src/utils_bigint.js:23-25`).
-        ("nPublic", Value::from(header.n_public)),
-        ("vk_alpha_1", g1_json(&header.alpha_g1)),
-        ("vk_beta_2", g2_json(&header.beta_g2)),
-        ("vk_gamma_2", g2_json(&header.gamma_g2)),
-        ("vk_delta_2", g2_json(&header.delta_g2)),
+        ("nPublic", Value::from(ic.len().saturating_sub(1))),
+        ("vk_alpha_1", g1_json(alpha_g1)),
+        ("vk_beta_2", g2_json(beta_g2)),
+        ("vk_gamma_2", g2_json(gamma_g2)),
+        ("vk_delta_2", g2_json(delta_g2)),
         ("vk_alphabeta_12", alphabeta),
-        ("IC", Value::Array(ic)),
-    ])
+        ("IC", Value::Array(ic.iter().map(g1_json).collect())),
+    ]
 }
 
 /// Build the JSON object from a zkey's section 2 and section 3.
@@ -153,7 +170,23 @@ pub fn verification_key_json(zkey: &Path) -> Result<Value, CeremonyError> {
 /// `cli.js:594` writes with `bfj` at `{space: 1}`, which is `JSON.stringify(v, null, 1)`
 /// with no trailing newline.
 pub fn export_verification_key(zkey: &Path, out: &Path) -> Result<(), CeremonyError> {
-    let fields = fields(zkey)?;
+    let text = render_fields(&fields(zkey)?);
+    crate::write::staged(out, |stage| Ok(std::fs::write(stage, text)?))
+}
+
+/// The text [`export_verification_key`] writes, for a key held in memory rather than read
+/// from a zkey, such as one converted from gnark's.
+pub fn verification_key_text(vk: &snarkrs_formats::VerifyingKey) -> String {
+    render_fields(&key_fields(
+        &vk.alpha_g1,
+        &vk.beta_g2,
+        &vk.gamma_g2,
+        &vk.delta_g2,
+        &vk.ic,
+    ))
+}
+
+fn render_fields(fields: &[(&'static str, Value)]) -> String {
     let mut text = String::from("{\n");
     for (i, (key, value)) in fields.iter().enumerate() {
         text.push_str(&format!(" \"{key}\": "));
@@ -161,7 +194,7 @@ pub fn export_verification_key(zkey: &Path, out: &Path) -> Result<(), CeremonyEr
         text.push_str(if i + 1 == fields.len() { "\n" } else { ",\n" });
     }
     text.push('}');
-    crate::write::staged(out, |stage| Ok(std::fs::write(stage, text)?))
+    text
 }
 
 /// `JSON.stringify` at one space of indent, for the string / number / array tree
