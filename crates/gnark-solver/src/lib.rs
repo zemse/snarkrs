@@ -18,10 +18,12 @@ mod intcomp;
 mod r1cs;
 mod solve;
 pub mod sp1;
+mod terms;
 
 pub use hints::{hint_id, Hint};
 pub use r1cs::GnarkR1cs;
 pub use solve::Solver;
+pub use terms::Term;
 
 use snarkrs_field::Fr;
 
