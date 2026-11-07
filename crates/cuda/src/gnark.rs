@@ -27,17 +27,23 @@
 //! [`GnarkProver::prove`] takes the solver's three vectors borrowed ([`GnarkWitness`]),
 //! stages them through the same 64 MiB pair, and runs stages 1 to 9 on the device
 //! (`h_and_msms_from_rows`), then blinds, assembles and checks the proof against gnark's
-//! verifying key on the host. Proofs are serialized: the reservation holds one proof's
-//! scratch.
+//! verifying key on the host. Stages 1 to 9 are serialized: the reservation holds one
+//! proof's scratch.
+//!
+//! A `GnarkProver` is a [`PreparedCircuit`], so a caller that proves through
+//! `Box<dyn PreparedCircuit>` and `snarkrs_gnark::prove` takes [`prepare`] where it took
+//! `CpuBackend::new().prepare(pk)`; only the key's header and five points stay on the host.
 
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::Instant;
 
 use cudarc::driver::{sys, CudaSlice, CudaStream};
+use snarkrs_field::Fr;
+use snarkrs_formats::ProvingKey;
 use snarkrs_gnark::Query;
 use snarkrs_gnark::{pk::DumpHeader, GnarkDump, GnarkError, GnarkVerifyingKey, GnarkWitness};
-use snarkrs_groth16::{Proof, ProveError, StageTimings};
+use snarkrs_groth16::{HPoly, MsmOutputs, PreparedCircuit, Proof, ProveError, StageTimings};
 
 use crate::backend::{CudaCircuit, PrepareCost, MSM_CHUNK};
 use crate::msm::{resident_scratch, CudaMsm, G1Bases, G2Bases};
@@ -317,9 +323,7 @@ impl GnarkProver {
         rng: &mut R,
         timings: &mut StageTimings,
     ) -> Result<Proof, ProveError> {
-        let _one = self.one.lock().unwrap_or_else(|e| e.into_inner());
-        let _restore = CurrentContext::save();
-        snarkrs_gnark::prove(&self.circuit, witness, rng, timings)
+        snarkrs_gnark::prove(self, witness, rng, timings)
     }
 
     /// The prepared circuit, for its per-proof breakdowns
@@ -352,6 +356,74 @@ impl GnarkProver {
     }
 }
 
+/// The CUDA backend's `prepare` for a gnark key on disk: [`GnarkProver::open_with`] on
+/// `device` with the default runs and warm-up, boxed as the circuit `snarkrs_gnark::prove`
+/// takes. Where a caller would write `CpuBackend::new().prepare(pk)` after
+/// `GnarkProvingKey::read_dump(path)?.into_proving_key(&vk)?`, this reads `path` itself
+/// and never builds that host key.
+pub fn prepare(
+    device: usize,
+    pk_dump: &Path,
+    vk: &GnarkVerifyingKey,
+) -> Result<Box<dyn PreparedCircuit>, ProveError> {
+    let config = GnarkProverConfig {
+        device,
+        ..GnarkProverConfig::default()
+    };
+    Ok(Box::new(GnarkProver::open_with(pk_dump, vk, config)?))
+}
+
+/// The circuit behind [`GnarkProver::prove`], for a caller that holds a
+/// `Box<dyn PreparedCircuit>`. Stages 1 to 9 run under the prover's one-proof lock with the
+/// calling thread's CUDA context put back after; the blinding, assembly and check around
+/// them are the caller's thread's and run unlocked. [`PreparedCircuit::key`] is the host
+/// half only, every query empty.
+impl PreparedCircuit for GnarkProver {
+    fn backend_name(&self) -> &'static str {
+        self.circuit.backend_name()
+    }
+    fn n_vars(&self) -> usize {
+        self.circuit.n_vars()
+    }
+    fn n_public(&self) -> usize {
+        self.circuit.n_public()
+    }
+    fn domain_size(&self) -> usize {
+        self.circuit.domain_size()
+    }
+    fn key(&self) -> &ProvingKey {
+        self.circuit.key()
+    }
+
+    /// Refused, as for any gnark key: it has no constraint matrices.
+    fn compute_h(&self, witness: &[Fr], t: &mut StageTimings) -> Result<HPoly, ProveError> {
+        self.circuit.compute_h(witness, t)
+    }
+
+    /// Refused, as for any gnark key: its H basis is not the odd coset.
+    fn msms(
+        &self,
+        witness: &[Fr],
+        h: &HPoly,
+        t: &mut StageTimings,
+    ) -> Result<MsmOutputs, ProveError> {
+        self.circuit.msms(witness, h, t)
+    }
+
+    fn h_and_msms_from_rows(
+        &self,
+        witness: &[Fr],
+        a_rows: &[Fr],
+        b_rows: &[Fr],
+        t: &mut StageTimings,
+    ) -> Result<MsmOutputs, ProveError> {
+        let _one = self.one.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = CurrentContext::save();
+        self.circuit
+            .h_and_msms_from_rows(witness, a_rows, b_rows, t)
+    }
+}
+
 /// One query read from the dump into a device buffer of its own, a staging chunk at a
 /// time, and refused if it is all identity as `read_dump` refuses it.
 fn upload_query(
@@ -381,6 +453,13 @@ fn upload_query(
     dump.check_not_all_infinity(q, live).map_err(gnark)?;
     Ok(buf)
 }
+
+/// A `Box<dyn PreparedCircuit>` must be `Send + Sync`; checked here rather than at the
+/// coercion, where the error would name the trait instead of the field.
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<GnarkProver>();
+};
 
 /// The calling thread's current CUDA context, put back on drop. `cudarc` makes the
 /// device's primary context current before every call it makes, and a caller with a

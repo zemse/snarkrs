@@ -162,6 +162,29 @@ fn a_gnark_prover_proof_passes_gnark_verify() {
     );
 }
 
+/// The slot a caller that holds `Box<dyn PreparedCircuit>` fills: `gnark::prepare` from the
+/// dump path, then `snarkrs_gnark::prove` through the box, as with the CPU backend.
+#[test]
+fn the_boxed_circuit_proves_through_snarkrs_gnark() {
+    if prover().is_none() {
+        return;
+    }
+    let vk = vk();
+    let circuit: Box<dyn PreparedCircuit> =
+        snarkrs_cuda::gnark::prepare(0, &toy("pk.dump"), &vk).unwrap();
+    assert!(circuit.key().a_query.is_empty() && circuit.key().h_query.is_empty());
+    let witness = GnarkWitness::read_dump(&toy("witness.bin")).unwrap();
+    let mut rng = StdRng::seed_from_u64(12);
+    let proof =
+        snarkrs_gnark::prove(&*circuit, &witness, &mut rng, &mut StageTimings::default()).unwrap();
+    verify(
+        &vk.to_verifying_key(),
+        witness.public(vk.n_public()).unwrap(),
+        &proof,
+    )
+    .unwrap();
+}
+
 /// What construction took from the device is no more than it budgeted. Device memory is
 /// per process, so this only means something with `--test-threads=1`.
 #[test]
