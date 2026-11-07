@@ -69,7 +69,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use ark_ff::{AdditiveGroup, One, Zero};
@@ -495,6 +495,76 @@ pub(crate) fn resident_schedule(
     Ok(out)
 }
 
+/// The words each buffer of one batch allocates, in no particular order: `g2[i]` says
+/// whether job `i` is a G2 MSM, and the jobs share one plan over `n` scalars, every one of
+/// them general. Mirrors `Plan::new` and `Outputs::new`, so a reservation sized from it is
+/// what the batch draws.
+pub(crate) fn batch_words(
+    n: usize,
+    g2: &[bool],
+    window: Option<u32>,
+    work: Work,
+) -> Result<Vec<usize>, ProveError> {
+    let g = Geometry::new(n, 0, n, pick_window(window, n), slice_len(), work)?;
+    let mut words = vec![
+        g.rows(),
+        g.rows(),
+        checked_words(g.n_windows * g.cap, ENTRY_WORDS)?,
+    ];
+    let ones_groups = if g.dummy_rows == 0 {
+        ones_groups_for(n)
+    } else {
+        0
+    };
+    for &is_g2 in g2 {
+        let pw = if is_g2 { G2_WORDS } else { G1_WORDS };
+        for level in g.fold_levels() {
+            let slots = 2 * g.n_windows * level.groups as usize;
+            words.extend([checked_point_words(slots, pw)?, slots]);
+        }
+        words.extend([
+            g.rows() * pw,
+            checked_point_words(g.spill_slots(), pw)?,
+            g.spill_slots(),
+            g.n_windows * pw,
+        ]);
+        if ones_groups > 0 {
+            words.push(ones_groups * pw);
+        }
+    }
+    Ok(words)
+}
+
+/// What [`CudaMsm::with_arena`] must reserve for every batch of [`resident_schedule`] to be
+/// served from it: each batch's buffers sorted largest first, then the largest at each
+/// rank across batches. Any one batch then fits rank for rank, which is what the arena's
+/// smallest-fit draw needs. Sized per batch rather than for the largest run alone, because
+/// a short run can pick a narrower window, more windows and so a larger entry array.
+pub(crate) fn resident_scratch(
+    n_vars: usize,
+    l_len: usize,
+    h_len: usize,
+    chunk: usize,
+    window: Option<u32>,
+) -> Result<Vec<usize>, ProveError> {
+    let mut envelope: Vec<usize> = Vec::new();
+    for (stage, _, n) in resident_schedule(n_vars, l_len, h_len, chunk)? {
+        let g2: &[bool] = match stage {
+            Resident::Witness => &[false, true, false],
+            Resident::L | Resident::H => &[false],
+        };
+        let mut words = batch_words(n, g2, window, Work::Variable)?;
+        words.sort_unstable_by(|a, b| b.cmp(a));
+        if words.len() > envelope.len() {
+            envelope.resize(words.len(), 0);
+        }
+        for (e, w) in envelope.iter_mut().zip(words) {
+            *e = (*e).max(w);
+        }
+    }
+    Ok(envelope)
+}
+
 // ---------------------------------------------------------------------------
 // Device-side structs
 // ---------------------------------------------------------------------------
@@ -663,6 +733,17 @@ impl G1Bases {
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
+    /// `len` points already packed into `buf` by the caller, [`PackedG1Affine`] each.
+    pub(crate) fn from_device(buf: CudaSlice<u32>, len: usize) -> Result<Self, ProveError> {
+        let words = checked_point_words(len, core::mem::size_of::<PackedG1Affine>() / 4)?;
+        if buf.len() < words.max(1) {
+            return Err(bad(format!(
+                "{len} G1 bases need {words} words, the buffer holds {}",
+                buf.len()
+            )));
+        }
+        Ok(Self { buf, len })
+    }
 }
 
 impl G2Bases {
@@ -671,6 +752,17 @@ impl G2Bases {
     }
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+    /// The G2 twin of [`G1Bases::from_device`].
+    pub(crate) fn from_device(buf: CudaSlice<u32>, len: usize) -> Result<Self, ProveError> {
+        let words = checked_point_words(len, core::mem::size_of::<PackedG2Affine>() / 4)?;
+        if buf.len() < words.max(1) {
+            return Err(bad(format!(
+                "{len} G2 bases need {words} words, the buffer holds {}",
+                buf.len()
+            )));
+        }
+        Ok(Self { buf, len })
     }
 }
 
@@ -1011,6 +1103,9 @@ pub struct CudaMsm {
 
     last_device_us: AtomicU64,
     last_combine_us: AtomicU64,
+    /// Scratch reserved once by [`Self::with_arena`], which every batch then draws from and
+    /// hands back instead of allocating. `None`, the default, allocates per batch.
+    arena: Option<Mutex<Vec<CudaSlice<u32>>>>,
 }
 
 #[cfg(test)]
@@ -1180,6 +1275,7 @@ impl CudaMsm {
             n_public: 0,
             last_device_us: AtomicU64::new(0),
             last_combine_us: AtomicU64::new(0),
+            arena: None,
         })
     }
 
@@ -1197,6 +1293,57 @@ impl CudaMsm {
         self.h = upload_g1(&self.stream, &pk.h_query)?;
         self.n_vars = pk.n_vars;
         self.n_public = pk.n_public;
+        Ok(self)
+    }
+
+    /// [`Self::with_key`] for bases already on the device, in stage order, so a caller that
+    /// streamed them there never builds the host vectors. Each length is checked against
+    /// the key's shape the way `CudaCircuit` checks a zkey's.
+    pub(crate) fn with_bases(
+        mut self,
+        bases: (G1Bases, G2Bases, G1Bases, G1Bases, G1Bases),
+        n_vars: usize,
+        n_public: usize,
+    ) -> Result<Self, ProveError> {
+        let (a, b_g2, b_g1, l, h) = bases;
+        let want_l = n_vars.checked_sub(n_public + 1);
+        if a.len != n_vars || b_g2.len != n_vars || b_g1.len != n_vars || Some(l.len) != want_l {
+            return Err(bad(format!(
+                "resident bases A {}, B2 {}, B1 {}, L {} do not fit n_vars {n_vars} and \
+                 n_public {n_public}",
+                a.len, b_g2.len, b_g1.len, l.len
+            )));
+        }
+        (self.a, self.b_g2, self.b_g1, self.l, self.h) = (a, b_g2, b_g1, l, h);
+        self.n_vars = n_vars;
+        self.n_public = n_public;
+        Ok(self)
+    }
+
+    /// Reserve every buffer `words` names now, and from here on serve each batch's scratch
+    /// out of them: a batch then allocates nothing, so a proof cannot run out of device
+    /// memory halfway through. `words` is what [`resident_scratch`] returns for the batches
+    /// this object will run; a batch that asks for more than the reservation holds is
+    /// refused with an error rather than allocated.
+    ///
+    /// Each request takes the smallest free buffer that holds it. Requests in a batch no
+    /// larger, one for one, than the reserved ones always fit that way: if a request takes
+    /// a buffer another request was reserved for, that one's own buffer is at least as
+    /// large and still free.
+    pub(crate) fn with_arena(mut self, words: &[usize]) -> Result<Self, ProveError> {
+        let mut bufs = Vec::with_capacity(words.len());
+        for &w in words {
+            allocation_words(w)?;
+            bufs.push(
+                self.stream
+                    .alloc_zeros::<u32>(w.max(1))
+                    .map_err(|e| drv("reserve MSM scratch", e))?,
+            );
+        }
+        self.stream
+            .synchronize()
+            .map_err(|e| drv("synchronize MSM reservation", e))?;
+        self.arena = Some(Mutex::new(bufs));
         Ok(self)
     }
 
@@ -1282,7 +1429,7 @@ impl CudaMsm {
                 len * SCALAR_WORDS
             )));
         }
-        let out = self.zeros(len.max(1) * SCALAR_WORDS)?;
+        let out = self.alloc_words(len.max(1) * SCALAR_WORDS)?;
         let n = len as u32;
         let cfg = self.k.mont_to_std.cfg_1d(len, WIDE_BLOCK);
         let mut lb = self.stream.launch_builder(&self.k.mont_to_std.f);
@@ -1310,11 +1457,60 @@ impl CudaMsm {
     /// `cuMemsetD8Async` over the block is the cheapest possible way to make that class of
     /// bug impossible. The `max(1)` is because `cuMemAlloc` of zero bytes is documented to
     /// fail with `CUDA_ERROR_INVALID_VALUE`, and an empty MSM reaches here.
+    ///
+    /// With an arena ([`Self::with_arena`]) the buffer is a reserved one, possibly longer
+    /// than `words`, its first `words` zeroed the same way; every kernel is bounded by the
+    /// plan rather than by the buffer, and [`Self::msm_batch`] hands it back.
     fn zeros(&self, words: usize) -> Result<CudaSlice<u32>, ProveError> {
+        let Some(arena) = &self.arena else {
+            return self.alloc_words(words);
+        };
+        allocation_words(words)?;
+        let want = words.max(1);
+        let mut bufs = arena.lock().unwrap_or_else(|e| e.into_inner());
+        let fit = bufs
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.len() >= want)
+            .min_by_key(|(_, b)| b.len())
+            .map(|(i, _)| i)
+            .ok_or_else(|| {
+                bad(format!(
+                    "MSM scratch: a batch asked for {want} words, which no buffer reserved at \
+                     construction holds"
+                ))
+            })?;
+        let mut buf = bufs.swap_remove(fit);
+        drop(bufs);
+        self.stream
+            .memset_zeros(&mut buf.slice_mut(..want))
+            .map_err(|e| drv("zero reserved MSM scratch", e))?;
+        Ok(buf)
+    }
+
+    fn alloc_words(&self, words: usize) -> Result<CudaSlice<u32>, ProveError> {
         allocation_words(words)?;
         self.stream
             .alloc_zeros::<u32>(words.max(1))
             .map_err(|e| drv("allocate MSM scratch", e))
+    }
+
+    /// A finished batch's buffers back into the arena, or freed without one.
+    fn recycle(&self, plans: Vec<Plan<'_>>, outs: Vec<Outputs>) {
+        let Some(arena) = &self.arena else {
+            return;
+        };
+        let mut bufs = arena.lock().unwrap_or_else(|e| e.into_inner());
+        for p in plans {
+            bufs.extend([p.counts, p.cursor, p.entries]);
+        }
+        for o in outs {
+            for f in o.folds {
+                bufs.extend([f.pts, f.rows]);
+            }
+            bufs.extend([o.buckets, o.spill_pts, o.spill_rows, o.window_sums]);
+            bufs.extend(o.ones);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1349,6 +1545,20 @@ impl CudaMsm {
     /// are twelve: that removes eight of the twenty digit launches and, more to the point,
     /// two thirds of the scatter's memory traffic.
     pub fn msm_batch(&self, jobs: &[Job<'_>]) -> Result<Vec<MsmResult>, ProveError> {
+        // Owned out here so the scratch goes back to an arena on every return, an error
+        // included.
+        let (mut plans, mut outs) = (Vec::new(), Vec::new());
+        let result = self.run_batch(jobs, &mut plans, &mut outs);
+        self.recycle(plans, outs);
+        result
+    }
+
+    fn run_batch<'a>(
+        &self,
+        jobs: &[Job<'a>],
+        plans: &mut Vec<Plan<'a>>,
+        outs: &mut Vec<Outputs>,
+    ) -> Result<Vec<MsmResult>, ProveError> {
         if jobs.is_empty() {
             return Ok(Vec::new());
         }
@@ -1394,7 +1604,6 @@ impl CudaMsm {
             .map_err(|e| drv("record MSM start event", e))?;
 
         // ---- plan ----
-        let mut plans: Vec<Plan<'_>> = Vec::new();
         let mut by_key: HashMap<(usize, usize, usize), usize> = HashMap::new();
         let mut job_plan = Vec::with_capacity(jobs.len());
 
@@ -1421,16 +1630,16 @@ impl CudaMsm {
             job_plan.push(idx);
         }
 
-        let mut outs: Vec<Outputs> = Vec::with_capacity(jobs.len());
+        outs.reserve(jobs.len());
         for (i, job) in jobs.iter().enumerate() {
             outs.push(Outputs::new(self, job, &plans[job_plan[i]])?);
         }
 
         // ---- launch ----
-        for p in &plans {
+        for p in plans.iter() {
             self.launch_digits(p)?;
         }
-        for (i, (job, out)) in jobs.iter().zip(&outs).enumerate() {
+        for (i, (job, out)) in jobs.iter().zip(outs.iter()).enumerate() {
             self.launch_points(job, out, &plans[job_plan[i]])?;
         }
         end.record(&self.stream)
@@ -1588,12 +1797,12 @@ impl CudaMsm {
     ///
     /// A batch's scratch is then bounded by the run rather than by the key. Unchunked, a
     /// 2^24 key's five MSMs ask for about 25 GB of entries and spill slots at once; in runs
-    /// of 2^22 the largest batch asks for 3 GB.
+    /// of 2^22 the largest batch asks for 3 GB, which [`resident_scratch`] reserves.
     ///
     /// Nothing is classified on the host, so every scalar counts as general and the plans
     /// are the same for every witness of this shape. That costs no work, as the digit
-    /// pipeline drops zeros and the ones pass takes ones whatever the plan's size, and it
-    /// saves a host pass over the witness and its `n_vars + 1` prefix.
+    /// pipeline drops zeros and the ones pass takes ones whatever the plan's size, and it is
+    /// what makes a reservation made before any witness exists exact.
     pub(crate) fn msms_resident(
         &self,
         witness_std: &CudaSlice<u32>,
@@ -2110,10 +2319,12 @@ impl Outputs {
     /// this to the GPU would cost more in launches than it saves, which is the same place
     /// the Metal twin and zkonduit's Metal MSM both stop.
     fn combine(&self, msm: &CudaMsm, plan: &Plan<'_>) -> Result<MsmResult, ProveError> {
-        let w_words = download(&msm.stream, &self.window_sums)?;
+        // Only the words the plan wrote: a buffer from an arena may be longer.
+        let pw = if self.is_g2 { G2_WORDS } else { G1_WORDS };
+        let w_words = download_prefix(&msm.stream, &self.window_sums, plan.n_windows * pw)?;
         let o_words = match &self.ones {
             Some(ones) => {
-                let words = download(&msm.stream, ones)?;
+                let words = download_prefix(&msm.stream, ones, self.ones_groups * pw)?;
                 #[cfg(test)]
                 msm.activity.ones_readbacks.fetch_add(1, Ordering::Relaxed);
                 words
@@ -2211,6 +2422,27 @@ pub(crate) fn download(
 ) -> Result<Vec<u32>, ProveError> {
     let v = stream
         .clone_dtoh(buf)
+        .map_err(|e| drv("download MSM points", e))?;
+    stream
+        .synchronize()
+        .map_err(|e| drv("synchronize MSM readback", e))?;
+    Ok(v)
+}
+
+/// [`download`] of the first `words` of `buf`, all of it when that is its length.
+fn download_prefix(
+    stream: &Arc<CudaStream>,
+    buf: &CudaSlice<u32>,
+    words: usize,
+) -> Result<Vec<u32>, ProveError> {
+    if words > buf.len() {
+        return Err(bad(format!(
+            "readback of {words} words from a buffer of {}",
+            buf.len()
+        )));
+    }
+    let v = stream
+        .clone_dtoh(&buf.slice(..words))
         .map_err(|e| drv("download MSM points", e))?;
     stream
         .synchronize()

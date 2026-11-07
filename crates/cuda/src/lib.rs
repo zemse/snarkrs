@@ -40,6 +40,9 @@ mod fault;
 /// The group inverse FFT behind `ptau prepare`: `ceremony::CudaGroupFft` is its seam.
 #[cfg(feature = "cuda")]
 pub mod fft;
+/// A gnark key resident on one device: [`GnarkProver`].
+#[cfg(feature = "cuda")]
+pub mod gnark;
 #[cfg(feature = "cuda")]
 pub mod kernels;
 #[cfg(feature = "cuda")]
@@ -58,6 +61,8 @@ pub use context::{Cuda, CudaError};
 /// shipping build carries.
 #[cfg(all(feature = "cuda", feature = "fault-inject"))]
 pub use fault::inject;
+#[cfg(feature = "cuda")]
+pub use gnark::{required_device_bytes, DeviceBudget, GnarkProver, GnarkProverConfig};
 
 #[cfg(feature = "cuda")]
 mod words {

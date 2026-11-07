@@ -396,7 +396,7 @@ struct Scratch {
     unused: CudaSlice<u32>,
     ev: Events,
     /// The witness and row staging of [`CudaStages::compute_h_from_rows`], made there on
-    /// its first use of this scratch.
+    /// its first use of this scratch, or by [`CudaStages::reserve_scratch`].
     staging: Option<Staging>,
 }
 
@@ -662,6 +662,43 @@ impl CudaStages {
             pool: Arc::new(Mutex::new(Vec::new())),
             last_upload_us: AtomicU64::new(0),
         })
+    }
+
+    /// Allocate one proof's scratch now, rows staging included, and pool it, so the first
+    /// proof allocates nothing: what a prover that reserves its device memory up front calls
+    /// once after construction.
+    pub(crate) fn reserve_scratch(&self) -> Result<(), ProveError> {
+        let mut sc = self.take_scratch()?;
+        if sc.staging.is_none() {
+            sc.staging = Some(Staging::new(&self.ctx)?);
+        }
+        self.stream
+            .synchronize()
+            .map_err(|e| drv("synchronize scratch reservation", e))?;
+        self.pool.lock().unwrap_or_else(|e| e.into_inner()).push(sc);
+        Ok(())
+    }
+
+    /// The device buffers [`Self::reserve_scratch`] allocates for a domain of `n` and
+    /// `n_vars` wires, in bytes, as `take_scratch` sizes them: the witness in both forms,
+    /// six domain vectors and the one-element placeholder. The pinned staging is host
+    /// memory and not counted.
+    pub(crate) fn scratch_buffers(n: usize, n_vars: usize) -> Vec<u64> {
+        let fr = |elems: usize| elems.max(1) as u64 * core::mem::size_of::<PackedFr>() as u64;
+        let mut out = vec![fr(n_vars), fr(n_vars)];
+        out.extend([fr(n); 6]);
+        out.push(fr(1));
+        out
+    }
+
+    /// The device buffers a gnark key's [`Self::from_module`] keeps, in bytes: both twiddle
+    /// tables, the coset powers, and the six one-word placeholders where a zkey's matrices
+    /// go.
+    pub(crate) fn rows_table_buffers(n: usize) -> Vec<u64> {
+        let fr = |elems: usize| elems.max(1) as u64 * core::mem::size_of::<PackedFr>() as u64;
+        let mut out = vec![fr(n / 2), fr(n / 2), fr(n)];
+        out.extend([4; 6]);
+        out
     }
 
     pub fn domain_size(&self) -> usize {

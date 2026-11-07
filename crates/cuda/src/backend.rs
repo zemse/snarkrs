@@ -367,6 +367,25 @@ impl CudaCircuit {
         })
     }
 
+    /// A circuit whose stages and bases the caller made resident, as [`crate::GnarkProver`]
+    /// streams them from a dump. `pk` is the host half only: its queries may be empty,
+    /// which [`PreparedCircuit::key`] allows.
+    pub(crate) fn from_parts(
+        pk: ProvingKey,
+        stages: CudaStages,
+        msm: CudaMsm,
+        cost: PrepareCost,
+        msm_chunk: usize,
+    ) -> Self {
+        Self {
+            pk,
+            stages,
+            msm,
+            cost,
+            msm_chunk,
+        }
+    }
+
     /// What [`CudaBackend::prepare`] cost for this key. Excludes the compile, which is a
     /// property of the process and lives on [`CudaBackend::compile_us`].
     pub fn prepare_cost(&self) -> PrepareCost {

@@ -1990,10 +1990,12 @@ version = "0.1.0"
 dependencies = [
  "ark-ec",
  "ark-ff",
+ "ark-std",
  "cudarc",
  "rayon",
  "snarkrs-field",
  "snarkrs-formats",
+ "snarkrs-gnark",
  "snarkrs-gpu-layout",
  "snarkrs-groth16",
  "snarkrs-msm",

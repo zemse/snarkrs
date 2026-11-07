@@ -163,10 +163,36 @@ impl Cuda {
     /// `libcuda`, which `cudarc` reports by panicking; see [`libcuda_loadable`]. Once that
     /// has answered, everything here has a real driver behind it and a real error channel.
     pub fn new(ordinal: usize) -> Result<Self, CudaError> {
+        Self::open(ordinal, false)
+    }
+
+    /// [`Self::new`] on a stream of its own rather than the context's default one, for a
+    /// process where something else already uses the device.
+    ///
+    /// `CudaContext::new` retains the device's primary context, which the CUDA runtime in
+    /// the same process shares, and its default stream is the legacy one that every
+    /// blocking stream in that context waits on and is waited on by. Another tenant's work
+    /// and this backend's would then serialize against each other. A non-blocking stream
+    /// orders only what is issued on it, which is all the ordering this crate relies on.
+    /// Event tracking is turned off before anything is allocated: it exists to order one
+    /// buffer's uses across streams, and here every use is on the one stream.
+    pub fn new_private(ordinal: usize) -> Result<Self, CudaError> {
+        Self::open(ordinal, true)
+    }
+
+    fn open(ordinal: usize, private: bool) -> Result<Self, CudaError> {
         let t_open = std::time::Instant::now();
         libcuda_loadable()?;
         let ctx = CudaContext::new(ordinal).map_err(|e| CudaError::NoDevice(e.to_string()))?;
-        let stream = ctx.default_stream();
+        let stream = if private {
+            // SAFETY: nothing has been allocated on this context handle yet, and every
+            // allocation and launch made through it goes to the one stream below, so no
+            // buffer is ever used from two streams for tracking to order.
+            unsafe { ctx.disable_event_tracking() };
+            ctx.new_stream()?
+        } else {
+            ctx.default_stream()
+        };
         let cc = ctx.compute_capability()?;
         let arch = arch_flag(cc)?;
         let name = ctx.name()?;
@@ -406,7 +432,7 @@ fn compile_log(e: cudarc::nvrtc::CompileError) -> String {
 /// and `cuDeviceGetCount`, no context and no device bring-up. Whether it then reports a
 /// driver error is not this function's business, because the library loaded and answered;
 /// `CudaContext::new` surfaces whatever is actually wrong through its own error channel.
-fn libcuda_loadable() -> Result<(), CudaError> {
+pub(crate) fn libcuda_loadable() -> Result<(), CudaError> {
     static PROBE: OnceLock<Option<String>> = OnceLock::new();
     let failure = PROBE.get_or_init(|| {
         let hook = std::panic::take_hook();

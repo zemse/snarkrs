@@ -19,13 +19,15 @@ include = ["src/**/*", "LICENSE-MIT", "LICENSE-APACHE"]
 snarkrs-groth16 = { workspace = true, features = ["deterministic-blinders"] }
 # The CPU transforms the gnark tail's host model is checked against.
 snarkrs-ntt.workspace = true
+# A seeded RNG for the gnark GPU tests, and the OS one for the gnark prove example.
+ark-std = { workspace = true, features = ["std", "getrandom"] }
 
 [features]
 # Off by default so a macOS workspace build never needs CUDA. With the feature on, this
 # crate COMPILES anywhere (cudarc's dynamic-loading feature dlopens libcuda/libnvrtc at
 # run time rather than linking them), and only RUNNING needs an NVIDIA GPU. That is what
 # lets the backend be developed and typechecked on the M2 Max.
-cuda = ["dep:cudarc"]
+cuda = ["dep:cudarc", "dep:snarkrs-gnark", "dep:ark-std"]
 # Compiles the per-thread fault injector into the library and exports it as `inject`, so a
 # test in another crate can corrupt a chosen readback of the group FFT. Its hook sits on
 # the FFT's download path and is nothing without this feature or `cfg(test)`.
@@ -45,6 +47,11 @@ rayon.workspace = true
 ark-ff.workspace = true
 ark-ec.workspace = true
 thiserror.workspace = true
+# `GnarkProver` reads a gnark key straight to the device; the dump parser and its checks are
+# snarkrs-gnark's, as the zkey loader is snarkrs-formats'.
+snarkrs-gnark = { workspace = true, optional = true }
+# The RNG bound on `GnarkProver::prove`, the one `snarkrs_gnark::prove` takes.
+ark-std = { workspace = true, optional = true }
 cudarc = { version = "0.19", optional = true, default-features = false, features = [
     "driver",
     "nvrtc",
