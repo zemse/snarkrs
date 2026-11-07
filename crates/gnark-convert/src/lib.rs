@@ -5,6 +5,9 @@
 //!   back. No arithmetic: both libraries verify the same equation over the same points.
 //! * [`to_zkey`]: a gnark `WriteDump` proving key, its verifying key and its R1CS to a
 //!   `.zkey` that snarkjs' prover, rapidsnark and snarkrs' zkey path prove with.
+//! * [`to_gnark`]: a `.zkey` to a gnark `WriteDump` proving key and a verifying key, for a
+//!   prover that proves gnark keys from A.w and B.w rows. No gnark R1CS is written, so
+//!   gnark's own prover cannot use the result: it solves the circuit from its R1CS.
 //!
 //! The two keys hold the same toxic waste in the same groups. Everything but the H query
 //! carries over point for point, because both libraries number wires the same way (the
@@ -33,6 +36,7 @@
 
 pub mod basis;
 pub mod proof;
+pub mod to_gnark;
 pub mod to_zkey;
 
 use snarkrs_field::Fr;
