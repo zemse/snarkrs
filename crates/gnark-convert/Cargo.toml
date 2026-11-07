@@ -1,0 +1,33 @@
+[package]
+name = "snarkrs-gnark-convert"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Convert Groth16 BN254 keys and proofs between gnark v0.14 and snarkjs"
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+include = ["src/**/*", "LICENSE-MIT", "LICENSE-APACHE"]
+
+[dependencies]
+snarkrs-field.workspace = true
+snarkrs-formats.workspace = true
+snarkrs-groth16.workspace = true
+snarkrs-gnark.workspace = true
+snarkrs-gnark-solver.workspace = true
+# The zkey writer, the point encoders and the group FFT the H and Z bases go through.
+snarkrs-ceremony.workspace = true
+snarkrs-msm.workspace = true
+rayon.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# The examples and tests prove; `getrandom` is ark-std's name for rand/std.
+ark-std = { workspace = true, features = ["std", "getrandom"] }
+ark-ff.workspace = true
+# The examples' and tests' `.wtns` writer.
+snarkrs-witness.workspace = true

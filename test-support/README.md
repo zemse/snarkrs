@@ -30,7 +30,11 @@ Neither variable causes ignored tests to run.
 - gnark (`crates/gnark`): the committed `test-support/gnark/toy` fixture, so nothing
   skips but the gnark half of the prove gate, which runs `go run . verify` in
   `test-support/gnark` and needs `go` on `PATH`. `go run . gen toy` there regenerates
-  the fixture with a fresh setup.
+  the fixture with a fresh setup, and `go run . r1cs toy/circuit.r1cs` rewrites just the
+  circuit, which compiles the same for every setup.
+- gnark-convert (`crates/gnark-convert`): the toy fixture, plus `tiny_mul` and
+  `js_1x1_d8` under `bench/artifacts` for the zkey side. gnark's verifier needs `go`,
+  and the snarkjs halves need `snarkjs` on `PATH` or `SNARKJS`.
 - CLI (`bin/snarkrs/tests`, including `campaign.rs`): artifact, snarkjs and circom skips.
 - CLI `fallback.rs` and `json.rs` unit tests: their artifact skips.
 - CUDA and WGPU: artifact skips, and a CUDA device that cannot be opened.

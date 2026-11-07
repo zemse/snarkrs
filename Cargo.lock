@@ -2048,6 +2048,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "snarkrs-gnark-convert"
+version = "0.1.0"
+dependencies = [
+ "ark-ff",
+ "ark-std",
+ "rayon",
+ "snarkrs-ceremony",
+ "snarkrs-field",
+ "snarkrs-formats",
+ "snarkrs-gnark",
+ "snarkrs-gnark-solver",
+ "snarkrs-groth16",
+ "snarkrs-msm",
+ "snarkrs-witness",
+ "thiserror",
+]
+
+[[package]]
 name = "snarkrs-gnark-solver"
 version = "0.1.0"
 dependencies = [
