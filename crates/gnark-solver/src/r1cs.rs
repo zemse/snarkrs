@@ -55,9 +55,6 @@ const SYSTEM_R1CS: u64 = 1;
 /// A uvarint pass hands each task at least this many bytes.
 const VARINT_CHUNK: usize = 1 << 20;
 
-/// The calldata index keeps the byte offset of every this many values.
-const CHECKPOINT: usize = 64;
-
 /// A level shorter than this is checked on the calling thread.
 const PAR_LEVEL: usize = 128;
 
@@ -325,17 +322,22 @@ fn parse(bytes: &[u8]) -> Result<(Parsed, std::ops::Range<usize>), ReadError> {
     // calldata at least, and a level entry is an instruction.
     let (count, calldata) = split_count(calldata, "calldata")?;
     let max_instructions = usize::try_from(count).unwrap_or(usize::MAX);
-    let ((system, checkpoints), (levels, instructions)) = rayon::join(
-        || rayon::join(|| read_body(body), || index_uvarints(calldata, count)),
+    // The body is the longest of these by far, and the calldata index wants the
+    // instructions, so the index runs after them and beside the body.
+    let (system, (levels, indexed)) = rayon::join(
+        || read_body(body),
         || {
             rayon::join(
                 || read_levels(levels, max_instructions),
-                || read_instructions(instructions, max_instructions),
+                || {
+                    let instructions = read_instructions(instructions, max_instructions)?;
+                    let offsets = index_uvarints(calldata, count, &instructions.start)?;
+                    Ok::<_, ReadError>((instructions, offsets))
+                },
             )
         },
     );
-    let (system, checkpoints, levels, instructions) =
-        (system?, checkpoints?, levels?, instructions?);
+    let (system, levels, (instructions, offsets)) = (system?, levels?, indexed?);
 
     let header_version = format!("{}.{}.{}", version.0, version.1, version.2);
     if system.gnark_version.trim_start_matches('v') != header_version {
@@ -351,8 +353,9 @@ fn parse(bytes: &[u8]) -> Result<(Parsed, std::ops::Range<usize>), ReadError> {
     let start = calldata.as_ptr() as usize - bytes.as_ptr() as usize;
     let indexed = Indexed {
         bytes: calldata,
-        count: count as usize,
-        checkpoints,
+        count,
+        starts: &instructions.start,
+        offsets,
     };
     let parsed = compile(
         version,
@@ -360,7 +363,7 @@ fn parse(bytes: &[u8]) -> Result<(Parsed, std::ops::Range<usize>), ReadError> {
         coefficients,
         &indexed,
         levels,
-        instructions,
+        &instructions,
     )?;
     Ok((parsed, start..start + calldata.len()))
 }
@@ -665,11 +668,12 @@ fn read_instructions(bytes: &[u8], max: usize) -> Result<Instructions, ReadError
     })
 }
 
-/// `calldataFromBytes`'s `count` uvarints, each a u32, checked and indexed without being
-/// kept: the result is the byte offset of every [`CHECKPOINT`]th value. In parallel, as
-/// every byte below 0x80 ends a value: a count of those per chunk places each chunk's
-/// values, and a chunk boundary moved to just past such a byte starts a value.
-fn index_uvarints(bytes: &[u8], count: u64) -> Result<Vec<u64>, ReadError> {
+/// `calldataFromBytes`'s `count` uvarints, each a u32, checked without being kept, and the
+/// byte offset of each of `starts`, the value at which an instruction's calldata starts
+/// (`u64::MAX` for one past the end). In parallel, as every byte below 0x80 ends a value: a
+/// count of those per chunk places each chunk's values, and a chunk boundary moved to just
+/// past such a byte starts a value.
+fn index_uvarints(bytes: &[u8], count: u64, starts: &[u64]) -> Result<Vec<u64>, ReadError> {
     const WHAT: &str = "calldata";
     // One byte a value at least.
     if count > bytes.len() as u64 {
@@ -678,7 +682,6 @@ fn index_uvarints(bytes: &[u8], count: u64) -> Result<Vec<u64>, ReadError> {
             format!("{count} values in {} bytes", bytes.len()),
         ));
     }
-    let count = count as usize;
     let mut bounds = vec![0];
     let mut at = VARINT_CHUNK;
     while at < bytes.len() {
@@ -698,40 +701,56 @@ fn index_uvarints(bytes: &[u8], count: u64) -> Result<Vec<u64>, ReadError> {
         .windows(2)
         .map(|w| (w[0], &bytes[w[0]..w[1]]))
         .collect();
-    let counts: Vec<usize> = chunks
+    let counts: Vec<u64> = chunks
         .par_iter()
-        .map(|(_, c)| c.iter().filter(|&&b| b < 0x80).count())
+        .map(|(_, c)| c.iter().filter(|&&b| b < 0x80).count() as u64)
         .collect();
-    if counts.iter().sum::<usize>() != count {
+    if counts.iter().sum::<u64>() != count {
         return Err(ReadError::malformed(
             WHAT,
             "the uvarints do not match their count",
         ));
     }
 
-    let mut checkpoints = vec![0u64; count.div_ceil(CHECKPOINT)];
-    let mut slots = &mut checkpoints[..];
+    // gnark appends each instruction's calldata after the last, so the starts ascend and
+    // each chunk finds its own with a binary search. Any other order is sorted first.
+    let order: Option<Vec<u32>> = (!starts.is_sorted()).then(|| {
+        let mut o: Vec<u32> = (0..starts.len() as u32).collect();
+        o.par_sort_unstable_by_key(|&i| starts[i as usize]);
+        o
+    });
+    let sorted: std::borrow::Cow<[u64]> = match &order {
+        None => starts.into(),
+        Some(o) => o
+            .iter()
+            .map(|&i| starts[i as usize])
+            .collect::<Vec<_>>()
+            .into(),
+    };
+
+    let mut offsets = vec![u64::MAX; starts.len()];
+    let mut slots = &mut offsets[..];
     let mut parts = Vec::with_capacity(chunks.len());
-    let mut first = 0usize;
+    let (mut first, mut done) = (0u64, 0usize);
     for (&(offset, chunk), &n) in chunks.iter().zip(&counts) {
-        // The checkpoints whose values fall in this chunk.
-        let (lo, hi) = (first.div_ceil(CHECKPOINT), (first + n).div_ceil(CHECKPOINT));
-        let (head, tail) = slots.split_at_mut(hi - lo);
-        parts.push((offset, chunk, first, head));
+        // The starts whose values fall in this chunk.
+        let end = done + sorted[done..].partition_point(|&s| s < first + n);
+        let (head, tail) = slots.split_at_mut(end - done);
+        parts.push((offset, chunk, first, &sorted[done..end], head));
         slots = tail;
-        first += n;
+        (first, done) = (first + n, end);
     }
     parts
         .into_par_iter()
-        .try_for_each(|(offset, chunk, first, slots)| {
+        .try_for_each(|(offset, chunk, first, starts, slots)| {
             let mut index = first;
-            let mut slot = 0;
+            let mut next = 0;
             let mut v = 0u64;
             let mut shift = 0u32;
             for (i, &b) in chunk.iter().enumerate() {
-                if shift == 0 && index % CHECKPOINT == 0 {
-                    slots[slot] = (offset + i) as u64;
-                    slot += 1;
+                while shift == 0 && next < starts.len() && starts[next] == index {
+                    slots[next] = (offset + i) as u64;
+                    next += 1;
                 }
                 v |= u64::from(b & 0x7f) << shift;
                 if b < 0x80 {
@@ -755,48 +774,68 @@ fn index_uvarints(bytes: &[u8], count: u64) -> Result<Vec<u64>, ReadError> {
             Ok(())
         })
         .map_err(|()| ReadError::malformed(WHAT, "a uvarint is not a u32"))?;
-    Ok(checkpoints)
+    if let Some(order) = order {
+        let mut by_instruction = vec![0; starts.len()];
+        for (&i, &o) in order.iter().zip(&offsets) {
+            by_instruction[i as usize] = o;
+        }
+        offsets = by_instruction;
+    }
+    Ok(offsets)
 }
 
-/// The checked calldata and its index.
+/// The checked calldata, and where each instruction's starts.
 struct Indexed<'a> {
     bytes: &'a [u8],
-    count: usize,
-    checkpoints: Vec<u64>,
+    count: u64,
+    starts: &'a [u64],
+    offsets: Vec<u64>,
 }
 
 impl Indexed<'_> {
-    /// The byte offset of value `i`, which must be below `count`.
-    fn offset(&self, i: usize) -> usize {
-        let mut pos = self.checkpoints[i / CHECKPOINT] as usize;
-        for _ in 0..i % CHECKPOINT {
-            while self.bytes[pos] >= 0x80 {
-                pos += 1;
-            }
-            pos += 1;
-        }
-        pos
-    }
-
-    /// The instruction whose calldata starts at value `start`, decoded into `out`. Its first
-    /// value is its length, which must fit in what is left of the calldata. Returns its byte
-    /// offset.
-    fn instruction(&self, start: u64, out: &mut Vec<u32>) -> Option<usize> {
-        let start = usize::try_from(start).ok().filter(|&s| s < self.count)?;
-        let offset = self.offset(start);
-        let mut pos = offset;
-        // SAFETY: `offset` starts a value of the checked calldata, and every value read is
-        // inside it: the first, then `len - 1` more, `start + len` being at most `count`.
-        let len = unsafe { uvarint(self.bytes, &mut pos) } as usize;
-        if len == 0 || len > self.count - start {
+    /// Instruction `i`'s byte offset and a reader of its values after the first, its length,
+    /// which must fit in what is left of the calldata.
+    fn instruction(&self, i: usize) -> Option<(u64, usize, Values<'_>)> {
+        let offset = self.offsets[i];
+        if offset == u64::MAX {
             return None;
         }
-        out.clear();
-        out.push(len as u32);
-        for _ in 1..len {
-            out.push(unsafe { uvarint(self.bytes, &mut pos) });
+        let mut pos = offset as usize;
+        // SAFETY: `offset` starts a value of the checked calldata.
+        let len = unsafe { uvarint(self.bytes, &mut pos) } as u64;
+        if len == 0 || len > self.count - self.starts[i] {
+            return None;
         }
-        Some(offset)
+        Some((
+            offset,
+            len as usize,
+            Values {
+                bytes: self.bytes,
+                pos,
+                left: len as usize - 1,
+            },
+        ))
+    }
+}
+
+/// The values of one instruction, which [`Indexed::instruction`] checked are all there.
+struct Values<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+    left: usize,
+}
+
+impl Iterator for Values<'_> {
+    type Item = u32;
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<u32> {
+        if self.left == 0 {
+            return None;
+        }
+        self.left -= 1;
+        // SAFETY: one of the values the instruction's length promised, inside the calldata.
+        Some(unsafe { uvarint(self.bytes, &mut self.pos) })
     }
 }
 
@@ -809,7 +848,7 @@ fn compile(
     coefficients: Vec<Fr>,
     calldata: &Indexed,
     levels: Vec<Vec<u32>>,
-    instructions: Instructions,
+    instructions: &Instructions,
 ) -> Result<Parsed, ReadError> {
     const UNSOLVED: u32 = u32::MAX;
     let malformed = |reason: String| ReadError::malformed("instructions", reason);
@@ -821,13 +860,18 @@ fn compile(
     let solvable = instructions
         .blueprint
         .par_iter()
-        .zip(&instructions.start)
-        .map_init(Vec::new, |cd, (&b, &start)| {
+        .enumerate()
+        .map_init(Vec::new, |cd, (i, &b)| {
             match system.blueprints.get(b as usize) {
                 Some(Blueprint::R1c) => 1,
                 Some(Blueprint::Hint) => calldata
-                    .instruction(start, cd)
-                    .and_then(|_| hint_layout(cd))
+                    .instruction(i)
+                    .and_then(|(_, len, values)| {
+                        cd.clear();
+                        cd.push(len as u32);
+                        cd.extend(values);
+                        hint_layout(cd)
+                    })
                     .map_or(0, |(_, from, to)| u64::from(to - from)),
                 None => 0,
             }
@@ -871,10 +915,9 @@ fn compile(
             .blueprints
             .get(instructions.blueprint[i] as usize)
             .ok_or_else(|| format!("instruction {i}: blueprint {}", instructions.blueprint[i]))?;
-        let start = calldata
-            .instruction(instructions.start[i], cd)
-            .ok_or_else(|| format!("instruction {i}: calldata out of range"))?
-            as u64;
+        let (start, len, mut values) = calldata
+            .instruction(i)
+            .ok_or_else(|| format!("instruction {i}: calldata out of range"))?;
         let known = |w: u32| stamp[w as usize].load(Ordering::Relaxed) <= level;
         let claim = |w: u32| {
             stamp[w as usize]
@@ -883,16 +926,18 @@ fn compile(
         };
         match blueprint {
             Blueprint::R1c => {
-                if cd.len() < 4 {
+                if len < 4 {
                     return Err(format!("instruction {i}: short R1C"));
                 }
-                let terms = cd[1] as u64 + cd[2] as u64 + cd[3] as u64;
-                if 4 + 2 * terms != cd.len() as u64 {
+                let mut next = || values.next().unwrap();
+                let terms = next() as u64 + next() as u64 + next() as u64;
+                if 4 + 2 * terms != len as u64 {
                     return Err(format!("instruction {i}: R1C length"));
                 }
                 let mut unknown = 0u32;
-                for k in (4..cd.len()).step_by(2) {
-                    let (c, w) = (cd[k], cd[k + 1]);
+                let mut unknown_wire = 0;
+                for k in (4..len).step_by(2) {
+                    let (c, w) = (next(), next());
                     if c >= n_coefficients || w as usize >= n_wires {
                         return Err(format!("instruction {i}: term out of range"));
                     }
@@ -903,9 +948,10 @@ fn compile(
                             return Err(format!("instruction {i}: R1C cannot be solved"));
                         }
                         unknown = k as u32;
+                        unknown_wire = w;
                     }
                 }
-                if unknown != 0 && !claim(cd[unknown as usize + 1]) {
+                if unknown != 0 && !claim(unknown_wire) {
                     return Err(format!("instruction {i}: wire solved twice"));
                 }
                 let constraint = instructions.constraint[i];
@@ -923,6 +969,9 @@ fn compile(
                 })
             }
             Blueprint::Hint => {
+                cd.clear();
+                cd.push(len as u32);
+                cd.extend(values);
                 let (inputs_end, from, to) =
                     hint_layout(cd).ok_or_else(|| format!("instruction {i}: hint calldata"))?;
                 let mut j = 3;
@@ -973,12 +1022,15 @@ fn compile(
         } else {
             let at = ops.len();
             ops.resize(at + level.len(), Op::default());
+            let task = 8.max(level.len() / (32 * rayon::current_num_threads()));
             ops[at..]
-                .par_iter_mut()
-                .zip(level)
-                .with_min_len(8)
-                .try_for_each_init(Vec::new, |cd, (op, &i)| {
-                    *op = check(cd, l, i)?;
+                .par_chunks_mut(task)
+                .zip(level.par_chunks(task))
+                .try_for_each(|(ops, level)| {
+                    let mut cd = Vec::new();
+                    for (op, &i) in ops.iter_mut().zip(level) {
+                        *op = check(&mut cd, l, i)?;
+                    }
                     Ok::<_, String>(())
                 })
                 .map_err(malformed)?;
@@ -994,7 +1046,7 @@ fn compile(
     if constrained.par_iter().any(|c| !c.load(Ordering::Relaxed)) {
         return Err(malformed("a constraint index no R1C has".into()));
     }
-    drop((stamp, placed, constrained, levels, instructions));
+    drop((stamp, placed, constrained, levels));
 
     let mut hint_ids: Vec<u32> = ops
         .par_iter()
@@ -1057,4 +1109,61 @@ pub(crate) fn gnark_text(x: &Fr) -> String {
         return v.0[0].to_string();
     }
     num_bigint::BigUint::from_bytes_le(&v.to_bytes_le()).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn uvarints(values: &[u32]) -> (Vec<u8>, Vec<usize>) {
+        let (mut bytes, mut at) = (Vec::new(), Vec::new());
+        for &v in values {
+            at.push(bytes.len());
+            let mut v = v;
+            while v >= 0x80 {
+                bytes.push(v as u8 | 0x80);
+                v >>= 7;
+            }
+            bytes.push(v as u8);
+        }
+        (bytes, at)
+    }
+
+    /// Starts in any order, repeated, or past the end, each find their own byte offset,
+    /// across more than one parallel chunk.
+    #[test]
+    fn indexes_starts_in_any_order() {
+        let values: Vec<u32> = (0..800_000u32)
+            .map(|i| i.wrapping_mul(2654435761) >> (i % 32))
+            .collect();
+        let (bytes, at) = uvarints(&values);
+        assert!(bytes.len() > 2 * VARINT_CHUNK);
+        let n = values.len() as u64;
+        for starts in [
+            vec![0, 1, 5, 5, 700_000, n - 1],
+            vec![n - 1, 3, 799_000, 3, 0, 123_456, n, n + 7],
+        ] {
+            let offsets = index_uvarints(&bytes, n, &starts).unwrap();
+            for (&s, &o) in starts.iter().zip(&offsets) {
+                let want = if s < n {
+                    at[s as usize] as u64
+                } else {
+                    u64::MAX
+                };
+                assert_eq!(o, want, "start {s}");
+            }
+        }
+        assert!(index_uvarints(&bytes, n + 1, &[]).is_err());
+        assert!(index_uvarints(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x01], 1, &[]).is_err());
+        assert!(index_uvarints(&[0xff, 0xff, 0xff, 0xff, 0x1f], 1, &[]).is_err());
+        assert!(index_uvarints(&[0xff, 0xff, 0xff, 0xff, 0x0f], 1, &[]).is_ok());
+    }
+
+    #[test]
+    fn text_is_gnarks() {
+        assert_eq!(gnark_text(&Fr::zero()), "0");
+        assert_eq!(gnark_text(&-Fr::from(65535u64)), "-65535");
+        assert_eq!(gnark_text(&-Fr::from(65536u64)).len(), 77);
+        assert_eq!(gnark_text(&Fr::from(u64::MAX)), u64::MAX.to_string());
+    }
 }
