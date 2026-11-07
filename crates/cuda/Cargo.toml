@@ -60,6 +60,10 @@ cudarc = { version = "0.19", optional = true, default-features = false, features
     "std",
 ] }
 
+[[example]]
+name = "gnark_prove"
+required-features = ["cuda"]
+
 # Without `cuda` the crate is an empty shell. It builds with no CUDA installed, since cudarc
 # loads the libraries at run time.
 [package.metadata.docs.rs]
