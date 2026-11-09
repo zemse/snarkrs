@@ -14,12 +14,9 @@ use snarkrs_groth16::ProveError;
 use snarkrs_msm::xyzz::Xyzz;
 use snarkrs_msm::{AccelError, GroupFft};
 
+use crate::context::{bad, BACKEND};
 use crate::fft::FftKernels;
-use crate::msm::bad;
 use crate::{Cuda, CudaError};
-
-/// The name every error on this side reports, and the spelling `--backend cuda` uses.
-const BACKEND: &str = "cuda";
 
 /// The group inverse FFT behind `ptau prepare`, the slowest command in the project.
 ///

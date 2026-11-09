@@ -46,16 +46,10 @@ use snarkrs_gnark::{pk::DumpHeader, GnarkDump, GnarkError, GnarkVerifyingKey, Gn
 use snarkrs_groth16::{HPoly, MsmOutputs, PreparedCircuit, Proof, ProveError, StageTimings};
 
 use crate::backend::{CudaCircuit, PrepareCost, MSM_CHUNK};
+use crate::context::{bad, drv};
 use crate::msm::{resident_scratch, CudaMsm, G1Bases, G2Bases};
 use crate::stages::{CudaStages, Staging};
 use crate::Cuda;
-
-fn bad(reason: impl Into<String>) -> ProveError {
-    ProveError::Backend {
-        backend: "cuda",
-        reason: reason.into(),
-    }
-}
 
 fn gnark(e: GnarkError) -> ProveError {
     bad(format!("gnark key: {e}"))
@@ -210,7 +204,7 @@ impl GnarkProver {
         let (free, total) = cuda
             .context()
             .mem_get_info()
-            .map_err(|e| crate::context::fault(format!("query device memory: {e}"), e))?;
+            .map_err(|e| drv("query device memory", e))?;
         if (free as u64) < budget.total {
             return Err(bad(format!(
                 "this key needs {} bytes of device memory ({budget:?}); device {} ({}) has {free} \
@@ -245,7 +239,7 @@ impl GnarkProver {
         drop(staging);
         stream
             .synchronize()
-            .map_err(|e| crate::context::fault(format!("synchronize key upload: {e}"), e))?;
+            .map_err(|e| drv("synchronize key upload", e))?;
         let bases = (
             G1Bases::from_device(a, dump.len(Query::G1A))?,
             G2Bases::from_device(b_g2, dump.len(Query::G2B))?,
@@ -352,7 +346,7 @@ impl GnarkProver {
         self.cuda
             .context()
             .mem_get_info()
-            .map_err(|e| crate::context::fault(format!("query device memory: {e}"), e))
+            .map_err(|e| drv("query device memory", e))
     }
 }
 
@@ -436,7 +430,7 @@ fn upload_query(
     let words = dump.len(q) * stride / 4;
     let mut buf = stream
         .alloc_zeros::<u32>(words.max(1))
-        .map_err(|e| crate::context::fault(format!("allocate the {q:?} bases: {e}"), e))?;
+        .map_err(|e| drv(&format!("allocate the {q:?} bases"), e))?;
     let mut live = 0;
     staging.upload(stream, &mut buf, 0, words, |start, out| {
         // SAFETY: any `u32` slice is a valid byte slice four times as long, and nothing else

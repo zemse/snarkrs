@@ -47,13 +47,14 @@ use std::time::Instant;
 
 use cudarc::driver::{
     sys, CudaContext, CudaEvent, CudaFunction, CudaModule, CudaSlice, CudaStream, DeviceRepr,
-    DriverError, LaunchConfig, PinnedHostSlice, PushKernelArg,
+    LaunchConfig, PinnedHostSlice, PushKernelArg,
 };
 use snarkrs_field::{Domain, Field, Fr};
 use snarkrs_formats::{HBasis, Matrix, ProvingKey};
 use snarkrs_gpu_layout::{PackedFr, PackedScalar};
 use snarkrs_groth16::{HPoly, ProveError, StageTimings};
 
+use crate::context::{bad, download, drv, elapsed_us, upload_words};
 use crate::{as_words, from_words, kernels, Cuda};
 
 /// The tag on [`snarkrs_groth16::HPoly::Device`] values produced here. A handle carrying any
@@ -82,21 +83,6 @@ const PREFERRED_BLOCK: u32 = 256;
 /// CUDA's 48 KB default rather than copied from Metal's 32 KB threadgroup limit and lands
 /// on the same number.
 const MAX_FUSED_PASSES: u32 = 10;
-
-fn bad(reason: impl Into<String>) -> ProveError {
-    ProveError::Backend {
-        backend: "cuda",
-        reason: reason.into(),
-    }
-}
-
-/// Wraps a driver failure with the operation that produced it. The driver's own message is
-/// `CUDA_ERROR_ILLEGAL_ADDRESS` and nothing else, so without the `what` there is no way to
-/// tell which of fourteen launches died. [`ProveError::Device`] or `Backend` by the code,
-/// per [`crate::context::is_device_fault`].
-fn drv(what: &str, e: DriverError) -> ProveError {
-    crate::context::fault(format!("{what}: {e}"), e)
-}
 
 // ---------------------------------------------------------------------------
 // The kernel argument block
@@ -565,7 +551,7 @@ impl CudaStages {
         let rows_only = pk.h_basis != HBasis::SnarkjsOddCoset;
         if rows_only {
             let mut staging = Staging::new(&ctx)?;
-            let empty = || upload_u32(&stream, &[]);
+            let empty = || upload_words(&stream, &[]);
             let n = domain.size();
             let tw_fwd = upload_powers(&stream, &mut staging, domain.group_gen(), n / 2)?;
             let tw_inv = upload_powers(&stream, &mut staging, domain.group_gen_inv(), n / 2)?;
@@ -619,8 +605,8 @@ impl CudaStages {
 
         // Bound to locals before the struct literal, because the closures borrow `stream`
         // and the struct moves it.
-        let up_u32 = |data: &[u32]| upload_u32(&stream, data);
-        let up_fr = |data: &[Fr]| upload_u32(&stream, as_words(&PackedFr::pack_slice(data)));
+        let up_u32 = |data: &[u32]| upload_words(&stream, data);
+        let up_fr = |data: &[Fr]| upload_words(&stream, as_words(&PackedFr::pack_slice(data)));
         let (a, b) = (Matrix::A.index(), Matrix::B.index());
         let row_ptr = [
             up_u32(&pk.coeffs.row_ptr[a])?,
@@ -1386,38 +1372,6 @@ impl CudaStages {
     }
 }
 
-/// Uploads `data`, padding an empty slice to one word, and waits.
-///
-/// Two things to know. `cuMemAlloc` with a size of zero is documented to fail with
-/// `CUDA_ERROR_INVALID_VALUE`, and two real inputs reach here empty: an all-zero CSR matrix,
-/// and the twiddle table of a size-1 domain (n/2 = 0 entries). One padding word keeps the
-/// allocation legal, and no kernel reads it because every loop that could is bounded by a
-/// row pointer or by a domain size that is itself zero.
-///
-/// And the copy is issued from pageable host memory, which `cudarc` does not synchronize
-/// after (`SyncOnDrop::Sync(None)` for a plain slice). The callers pass temporaries that are
-/// dropped at the end of their statement, so the wait has to happen here, not once at the
-/// end of `new`. This runs at prepare time only, so the cost of waiting is irrelevant.
-fn upload_u32(stream: &Arc<CudaStream>, data: &[u32]) -> Result<CudaSlice<u32>, ProveError> {
-    let src: &[u32] = if data.is_empty() { &[0u32] } else { data };
-    let buf = stream
-        .clone_htod(src)
-        .map_err(|e| drv("upload to device", e))?;
-    stream
-        .synchronize()
-        .map_err(|e| drv("synchronize upload", e))?;
-    Ok(buf)
-}
-
-/// Event-pair elapsed time in microseconds. `elapsed_ms` is GPU measured with about half a
-/// microsecond of resolution, so rounding to whole microseconds loses nothing real.
-fn elapsed_us(start: &CudaEvent, end: &CudaEvent) -> Result<u64, ProveError> {
-    let ms = start
-        .elapsed_ms(end)
-        .map_err(|e| drv("read event elapsed time", e))?;
-    Ok((f64::from(ms) * 1000.0).round().max(0.0) as u64)
-}
-
 // ---------------------------------------------------------------------------
 // The device-resident result
 // ---------------------------------------------------------------------------
@@ -1536,7 +1490,7 @@ impl HHandle {
     /// not, because forcing the copy is exactly the PCIe round trip that
     /// [`snarkrs_groth16::HPoly`] exists to avoid.
     pub fn to_host(&self) -> Result<Vec<Fr>, ProveError> {
-        let words = self.download(self.h_mont())?;
+        let words = download(&self.stream, self.h_mont(), "H")?;
         let packed = from_words::<PackedFr>(&words)
             .ok_or_else(|| bad("H readback is not a whole number of field elements"))?;
         Ok(PackedFr::unpack_slice(&packed))
@@ -1546,24 +1500,10 @@ impl HHandle {
     /// not a canonical residue, which would mean the reduction in `fr_from_mont` is wrong; a
     /// silent modular reduction here would hide exactly that bug.
     pub fn to_host_std(&self) -> Result<Option<Vec<Fr>>, ProveError> {
-        let words = self.download(self.h_std())?;
+        let words = download(&self.stream, self.h_std(), "H")?;
         let packed = from_words::<PackedScalar>(&words)
             .ok_or_else(|| bad("H readback is not a whole number of field elements"))?;
         Ok(packed.iter().map(PackedScalar::to_fr).collect())
-    }
-
-    /// Device to host, then wait. The wait is not optional: `cudarc` issues the copy into a
-    /// plain `Vec` asynchronously and does not synchronize afterwards, so reading the `Vec`
-    /// without this returns whatever was in the uninitialised allocation.
-    fn download(&self, buf: &CudaSlice<u32>) -> Result<Vec<u32>, ProveError> {
-        let v = self
-            .stream
-            .clone_dtoh(buf)
-            .map_err(|e| drv("download H", e))?;
-        self.stream
-            .synchronize()
-            .map_err(|e| drv("synchronize H download", e))?;
-        Ok(v)
     }
 }
 

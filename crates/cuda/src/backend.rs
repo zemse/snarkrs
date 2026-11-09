@@ -61,16 +61,9 @@ use snarkrs_field::{Field, Fr};
 use snarkrs_formats::{HBasis, ProvingKey};
 use snarkrs_groth16::{Backend, HPoly, MsmOutputs, PreparedCircuit, ProveError, StageTimings};
 
-use crate::context::Cuda;
+use crate::context::{bad, Cuda};
 use crate::msm::{CudaMsm, Work};
 use crate::stages::{CudaStages, HHandle, TAG};
-
-fn bad(reason: impl Into<String>) -> ProveError {
-    ProveError::Backend {
-        backend: "cuda",
-        reason: reason.into(),
-    }
-}
 
 /// Where the time in [`CudaBackend::prepare`] went, in microseconds.
 ///

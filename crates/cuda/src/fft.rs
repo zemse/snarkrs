@@ -68,7 +68,8 @@ use snarkrs_msm::glv;
 use snarkrs_msm::xyzz::Xyzz;
 
 use crate::check::{self, CurveField, Reduced};
-use crate::msm::{bad, download, drv, upload_words, Kernel, PackedXyzzG1, PackedXyzzG2};
+use crate::context::{bad, download, drv, upload_words};
+use crate::msm::{Kernel, PackedXyzzG1, PackedXyzzG2};
 use crate::{as_words, from_words, kernels, Cuda};
 
 /// Ladder window of the shipped variant, for both groups.
@@ -933,7 +934,7 @@ fn read_back<P: Packed + Default>(
     stream: &Arc<CudaStream>,
     buf: &CudaSlice<u32>,
 ) -> Result<Vec<P>, ProveError> {
-    let mut words = download(stream, buf)?;
+    let mut words = download(stream, buf, "fft block")?;
     crate::fault::stored(&mut words);
     from_words::<P>(&words).ok_or_else(|| bad("fft read back is not a whole number of points"))
 }

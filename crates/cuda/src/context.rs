@@ -10,7 +10,9 @@
 use std::sync::{Arc, OnceLock};
 
 use cudarc::driver::sys::CUresult;
-use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream, DriverError};
+use cudarc::driver::{
+    CudaContext, CudaEvent, CudaFunction, CudaModule, CudaSlice, CudaStream, DriverError,
+};
 use snarkrs_groth16::ProveError;
 
 #[derive(Debug, thiserror::Error)]
@@ -33,12 +35,80 @@ impl From<CudaError> for ProveError {
         let reason = e.to_string();
         match e {
             CudaError::Driver(d) => fault(reason, d),
-            _ => ProveError::Backend {
-                backend: "cuda",
-                reason,
-            },
+            _ => bad(reason),
         }
     }
+}
+
+/// The name every error from this crate reports, and the spelling `--backend cuda` uses.
+pub(crate) const BACKEND: &str = "cuda";
+
+/// A [`ProveError::Backend`] from this crate.
+pub(crate) fn bad(reason: impl Into<String>) -> ProveError {
+    ProveError::Backend {
+        backend: BACKEND,
+        reason: reason.into(),
+    }
+}
+
+/// Wraps a driver failure with the operation that produced it. The driver's own message is
+/// `CUDA_ERROR_ILLEGAL_ADDRESS` and nothing else, so without the `what` there is no way to
+/// tell which launch died. [`ProveError::Device`] or `Backend` by the code, per
+/// [`is_device_fault`].
+pub(crate) fn drv(what: &str, e: DriverError) -> ProveError {
+    fault(format!("{what}: {e}"), e)
+}
+
+/// Uploads `data`, padding an empty slice to one word, and waits.
+///
+/// Two things to know. `cuMemAlloc` of zero bytes is documented to fail with
+/// `CUDA_ERROR_INVALID_VALUE`, and real inputs reach here empty: `l_query` is empty for a
+/// circuit whose every signal is public, a CSR matrix can be all zero, and a size-1 domain
+/// has no twiddles. No kernel reads the padding word, because every loop that could is
+/// bounded by a length that is itself zero. And the copy is issued from pageable host
+/// memory, which `cudarc` does not synchronize after (`SyncOnDrop::Sync(None)` for a plain
+/// slice), so the wait has to happen before the caller's source `Vec` is dropped at the end
+/// of its statement. Making it asynchronous means staging through page-locked memory, which
+/// is what `stages::CudaStages` does for the witness.
+pub(crate) fn upload_words(
+    stream: &Arc<CudaStream>,
+    data: &[u32],
+) -> Result<CudaSlice<u32>, ProveError> {
+    let src: &[u32] = if data.is_empty() { &[0u32] } else { data };
+    let buf = stream
+        .clone_htod(src)
+        .map_err(|e| drv("upload to device", e))?;
+    stream
+        .synchronize()
+        .map_err(|e| drv("synchronize upload", e))?;
+    Ok(buf)
+}
+
+/// Device to host, then wait. The wait is not optional: `cudarc` issues the copy into a
+/// plain `Vec` asynchronously and does not synchronize afterwards, so reading the `Vec`
+/// without this returns whatever was in the uninitialised allocation. `what` names the
+/// buffer in the error.
+pub(crate) fn download(
+    stream: &Arc<CudaStream>,
+    buf: &CudaSlice<u32>,
+    what: &str,
+) -> Result<Vec<u32>, ProveError> {
+    let v = stream
+        .clone_dtoh(buf)
+        .map_err(|e| drv(&format!("download {what}"), e))?;
+    stream
+        .synchronize()
+        .map_err(|e| drv(&format!("synchronize {what} readback"), e))?;
+    Ok(v)
+}
+
+/// Event-pair elapsed time in microseconds. `elapsed_ms` is GPU measured with about half a
+/// microsecond of resolution, so rounding to whole microseconds loses nothing real.
+pub(crate) fn elapsed_us(start: &CudaEvent, end: &CudaEvent) -> Result<u64, ProveError> {
+    let ms = start
+        .elapsed_ms(end)
+        .map_err(|e| drv("read event elapsed time", e))?;
+    Ok((f64::from(ms) * 1000.0).round().max(0.0) as u64)
 }
 
 /// A driver failure as a [`ProveError`]: [`ProveError::Device`] when [`is_device_fault`]
@@ -52,14 +122,11 @@ pub(crate) fn fault(reason: String, e: DriverError) -> ProveError {
             reason
         };
         ProveError::Device {
-            backend: "cuda",
+            backend: BACKEND,
             reason,
         }
     } else {
-        ProveError::Backend {
-            backend: "cuda",
-            reason,
-        }
+        bad(reason)
     }
 }
 

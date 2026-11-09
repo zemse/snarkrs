@@ -38,7 +38,7 @@ impl Reduced for PackedXyzzG2 {
 /// operation and what was wrong, in the spelling the Metal checks use.
 pub(crate) fn wrong(context: &str, what: impl std::fmt::Display) -> ProveError {
     ProveError::Device {
-        backend: "cuda",
+        backend: crate::context::BACKEND,
         reason: format!("{context}: {what}: a value read back is not one the GPU wrote"),
     }
 }

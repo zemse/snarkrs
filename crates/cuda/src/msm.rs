@@ -74,8 +74,8 @@ use std::time::Instant;
 
 use ark_ff::{AdditiveGroup, One, Zero};
 use cudarc::driver::{
-    sys, CudaContext, CudaEvent, CudaFunction, CudaModule, CudaSlice, CudaStream, DeviceRepr,
-    DriverError, LaunchConfig, PushKernelArg,
+    sys, CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DeviceRepr, LaunchConfig,
+    PushKernelArg,
 };
 
 use snarkrs_field::{Fr, G1Affine, G1Projective, G2Affine, G2Projective};
@@ -85,23 +85,9 @@ use snarkrs_gpu_layout::{
 };
 use snarkrs_groth16::{HPoly, MsmOutputs, ProveError, StageTimings};
 
+use crate::context::{bad, drv, elapsed_us, upload_words};
 use crate::stages::{HHandle, TAG};
 use crate::{as_words, from_words, kernels, Cuda};
-
-pub(crate) fn bad(reason: impl Into<String>) -> ProveError {
-    ProveError::Backend {
-        backend: "cuda",
-        reason: reason.into(),
-    }
-}
-
-/// Wraps a driver failure with the operation that produced it. The driver's own message is
-/// `CUDA_ERROR_ILLEGAL_ADDRESS` and nothing else, so without the `what` there is no way to
-/// tell which of thirty-seven launches died. [`ProveError::Device`] or `Backend` by the
-/// code, per [`crate::context::is_device_fault`].
-pub(crate) fn drv(what: &str, e: DriverError) -> ProveError {
-    crate::context::fault(format!("{what}: {e}"), e)
-}
 
 // ---------------------------------------------------------------------------
 // Window sizing
@@ -2371,30 +2357,6 @@ impl Outputs {
 // Transfer helpers
 // ---------------------------------------------------------------------------
 
-/// Uploads `data`, padding an empty slice to one word, and waits.
-///
-/// Two things to know. `cuMemAlloc` of zero bytes is documented to fail with
-/// `CUDA_ERROR_INVALID_VALUE`, and real inputs reach here empty: `l_query` is empty for a
-/// circuit whose every signal is public. And the copy is issued from pageable host memory,
-/// which `cudarc` does not synchronize after, so the wait has to happen before the source
-/// `Vec` is dropped at the end of the caller's statement. That is a real per-proof cost for
-/// the witness upload and the honest place to pay it; making it asynchronous means staging
-/// through page-locked memory, which is what `stages::CudaStages` does for the witness and
-/// what this file would copy if the upload ever shows up in a profile.
-pub(crate) fn upload_words(
-    stream: &Arc<CudaStream>,
-    data: &[u32],
-) -> Result<CudaSlice<u32>, ProveError> {
-    let src: &[u32] = if data.is_empty() { &[0u32] } else { data };
-    let buf = stream
-        .clone_htod(src)
-        .map_err(|e| drv("upload to device", e))?;
-    stream
-        .synchronize()
-        .map_err(|e| drv("synchronize upload", e))?;
-    Ok(buf)
-}
-
 fn upload_g1(stream: &Arc<CudaStream>, bases: &[G1Affine]) -> Result<G1Bases, ProveError> {
     kernel_range(0, bases.len(), core::mem::size_of::<PackedG1Affine>() / 4)?;
     let packed = PackedG1Affine::pack_slice(bases);
@@ -2411,22 +2373,6 @@ fn upload_g2(stream: &Arc<CudaStream>, bases: &[G2Affine]) -> Result<G2Bases, Pr
         buf: upload_words(stream, as_words(&packed))?,
         len: bases.len(),
     })
-}
-
-/// Device to host, then wait. The wait is not optional: `cudarc` issues the copy into a
-/// plain `Vec` asynchronously and does not synchronize afterwards, so reading the `Vec`
-/// without this returns whatever was in the uninitialised allocation.
-pub(crate) fn download(
-    stream: &Arc<CudaStream>,
-    buf: &CudaSlice<u32>,
-) -> Result<Vec<u32>, ProveError> {
-    let v = stream
-        .clone_dtoh(buf)
-        .map_err(|e| drv("download MSM points", e))?;
-    stream
-        .synchronize()
-        .map_err(|e| drv("synchronize MSM readback", e))?;
-    Ok(v)
 }
 
 /// [`download`] of the first `words` of `buf`, all of it when that is its length.
@@ -2448,15 +2394,6 @@ fn download_prefix(
         .synchronize()
         .map_err(|e| drv("synchronize MSM readback", e))?;
     Ok(v)
-}
-
-/// Event-pair elapsed time in microseconds. `elapsed_ms` is GPU measured with about half a
-/// microsecond of resolution, so rounding to whole microseconds loses nothing real.
-fn elapsed_us(start: &CudaEvent, end: &CudaEvent) -> Result<u64, ProveError> {
-    let ms = start
-        .elapsed_ms(end)
-        .map_err(|e| drv("read event elapsed time", e))?;
-    Ok((f64::from(ms) * 1000.0).round().max(0.0) as u64)
 }
 
 // ---------------------------------------------------------------------------
@@ -2486,6 +2423,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::context::download;
     use snarkrs_gpu_layout::{FQ_MODULUS, FQ_N0};
 
     #[test]
@@ -3340,9 +3278,9 @@ mod tests {
 
     fn gate_inspect_digits(m: &CudaMsm, p: &Plan<'_>, values: &[Fr]) -> Vec<i64> {
         m.launch_digits(p).unwrap();
-        let counts = download(&m.stream, &p.counts).unwrap();
-        let cursors = download(&m.stream, &p.cursor).unwrap();
-        let entries = download(&m.stream, &p.entries).unwrap();
+        let counts = download(&m.stream, &p.counts, "counts").unwrap();
+        let cursors = download(&m.stream, &p.cursor, "cursor").unwrap();
+        let entries = download(&m.stream, &p.entries, "entries").unwrap();
         let digits: Vec<_> = values.iter().map(|s| gate_digits(*s, p.c)).collect();
         let mut expected_counts = vec![0u32; p.rows()];
         let mut dummy_sums = vec![0i64; p.n_windows * p.dummy_rows];
