@@ -53,7 +53,7 @@ use snarkrs_formats::{wtns::Witness, HBasis, ProvingKey, VerifyingKey};
 use snarkrs_groth16::cpu::CpuBackend;
 use snarkrs_groth16::prove::prove_with_blinders;
 use snarkrs_groth16::verify::verify;
-use snarkrs_groth16::{Backend, PreparedCircuit, Proof, StageTimings};
+use snarkrs_groth16::{Backend, HPoly, PreparedCircuit, Proof, StageTimings};
 
 /// NVIDIA gate for the source port. An explicitly requested run must not silently skip.
 #[test]
@@ -1435,4 +1435,79 @@ fn every_domain_size_agrees_with_the_cpu() {
         assert_eq!(got_m.h_g1, want_m.h_g1, "domain 2^{log}: stage 9");
         eprintln!("  domain 2^{log} ({domain}) agrees on H and all five MSMs");
     }
+}
+
+/// A device memory budget below what the five MSMs take at once: `msms` cuts them into
+/// runs that fit and the sum is the CPU's, and a budget no run fits is refused, as a
+/// device fault, before anything is allocated. On a synthetic 2^14 key, so the limit
+/// stands in for a card too small for the circuit; both kinds of work.
+#[test]
+fn a_vram_limit_cuts_the_msms_into_runs_or_refuses_them() {
+    let cpu = CpuBackend::new();
+    on_device(
+        "a_vram_limit_cuts_the_msms_into_runs_or_refuses_them",
+        |cuda| {
+            let (domain, n_vars) = (1usize << 14, 2048usize);
+            let key_seed = 0x7A11_0000_0000_0014u64;
+            let (mut s1, mut s2) = (key_seed, key_seed);
+            let pk = synthetic_key(domain, n_vars, &mut s1);
+            let cpu_circuit = cpu.prepare(synthetic_key(domain, n_vars, &mut s2)).unwrap();
+            let mut wseed = key_seed ^ 0x5EED;
+            let w: Vec<Fr> = (0..n_vars).map(|_| rand_fr(&mut wseed)).collect();
+            let mut t = StageTimings::default();
+            let h = cpu_circuit.compute_h(&w, &mut t).unwrap();
+            let want = cpu_circuit.msms(&w, &h, &mut t).unwrap();
+            let h = HPoly::Host(h.to_host().expect("host vector").to_vec());
+
+            for work in [Work::Variable, Work::Constant] {
+                let module = CudaMsm::compile_with(cuda, work).expect("NVRTC/PTX compilation");
+                let (mut cut, mut refused) = (false, false);
+                for limit in [
+                    u64::MAX,
+                    4 << 20,
+                    1 << 20,
+                    512 << 10,
+                    256 << 10,
+                    128 << 10,
+                    64 << 10,
+                    1,
+                ] {
+                    let m = CudaMsm::from_module(cuda, module.clone()).unwrap();
+                    let m = if work == Work::Constant {
+                        m.constant_work()
+                    } else {
+                        m
+                    };
+                    let m = m.with_key(&pk).unwrap().with_vram_limit(limit);
+                    match m.msms(&w, &h, &mut t) {
+                        Ok(got) => {
+                            assert!(
+                                !refused,
+                                "{work:?}: {limit} fits after a larger limit did not"
+                            );
+                            let runs = m.last_runs();
+                            eprintln!("  {work:?}, limit {limit}: {runs} batches");
+                            assert_eq!(got.a_g1, want.a_g1, "{work:?}, limit {limit}: A");
+                            assert_eq!(got.b_g2, want.b_g2, "{work:?}, limit {limit}: B in G2");
+                            assert_eq!(got.b_g1, want.b_g1, "{work:?}, limit {limit}: B in G1");
+                            assert_eq!(got.l_g1, want.l_g1, "{work:?}, limit {limit}: L");
+                            assert_eq!(got.h_g1, want.h_g1, "{work:?}, limit {limit}: H");
+                            if limit == u64::MAX {
+                                assert_eq!(runs, 1, "{work:?}: an unlimited proof was cut");
+                            }
+                            cut |= runs > 3;
+                        }
+                        Err(e) => {
+                            eprintln!("  {work:?}, limit {limit}: {e}");
+                            assert!(e.is_device_fault(), "{work:?}, limit {limit}: {e}");
+                            assert!(e.to_string().contains("bytes of device memory"), "{e}");
+                            refused = true;
+                        }
+                    }
+                }
+                assert!(cut, "{work:?}: no limit cut the MSMs into runs");
+                assert!(refused, "{work:?}: a one-byte limit was not refused");
+            }
+        },
+    );
 }

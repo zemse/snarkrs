@@ -94,6 +94,8 @@ pub struct CudaBackend {
     /// constant-work unit carries the constant-work kernels (`kernels::unit_msm_with`).
     msm_modules: Mutex<[Option<Arc<CudaModule>>; 2]>,
     compile_us: u64,
+    /// [`Self::with_vram_limit`], or `G16_CUDA_VRAM_LIMIT`.
+    vram_limit: Option<u64>,
 }
 
 impl CudaBackend {
@@ -106,6 +108,16 @@ impl CudaBackend {
     /// [`Self::prepare`] compiles the constant-work MSM unit, which [`Self::new`] does not.
     pub fn with_constant_work(mut self) -> Self {
         self.work = Work::Constant;
+        self
+    }
+
+    /// Cap the device memory one MSM batch of a circuit prepared after this call may
+    /// allocate, below what the driver reports free; see [`CudaMsm::with_vram_limit`]. A
+    /// proof whose MSMs do not fit at once runs them in shorter runs, and one that cannot
+    /// fit at all is refused before anything is allocated. `G16_CUDA_VRAM_LIMIT` (bytes)
+    /// sets the same for a backend that is opened without this call.
+    pub fn with_vram_limit(mut self, bytes: u64) -> Self {
+        self.vram_limit = Some(bytes);
         self
     }
 
@@ -159,6 +171,7 @@ impl CudaBackend {
             stages_module,
             msm_modules: Mutex::new(msm_modules),
             compile_us,
+            vram_limit: env_vram_limit()?,
         })
     }
 
@@ -212,6 +225,18 @@ fn env_ordinal() -> Result<usize, ProveError> {
             ))
         }),
         Err(_) => Ok(0),
+    }
+}
+
+/// `G16_CUDA_VRAM_LIMIT`, in bytes, when it is set.
+fn env_vram_limit() -> Result<Option<u64>, ProveError> {
+    match std::env::var("G16_CUDA_VRAM_LIMIT") {
+        Ok(v) => v.trim().parse::<u64>().map(Some).map_err(|e| {
+            bad(format!(
+                "G16_CUDA_VRAM_LIMIT={v:?} is not a byte count: {e}"
+            ))
+        }),
+        Err(_) => Ok(None),
     }
 }
 
@@ -337,6 +362,10 @@ impl CudaCircuit {
         } else {
             msm
         };
+        let msm = match backend.vram_limit {
+            Some(bytes) => msm.with_vram_limit(bytes),
+            None => msm,
+        };
         let bases_us = t1.elapsed().as_micros() as u64;
 
         let cost = PrepareCost {
@@ -400,6 +429,12 @@ impl CudaCircuit {
     /// includes.
     pub fn last_msm_device_us(&self) -> u64 {
         self.msm.last_device_us()
+    }
+
+    /// Batches the last MSM call ran, one when all five fit the device memory at once; see
+    /// [`CudaBackend::with_vram_limit`].
+    pub fn last_msm_runs(&self) -> u64 {
+        self.msm.last_runs()
     }
 
     fn check_witness(&self, witness: &[Fr]) -> Result<(), ProveError> {

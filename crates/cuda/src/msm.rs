@@ -506,33 +506,87 @@ pub(crate) fn batch_words(
     work: Work,
 ) -> Result<Vec<usize>, ProveError> {
     let g = Geometry::new(n, 0, n, pick_window(window, n), slice_len(), work)?;
-    let mut words = vec![
+    let mut words = plan_words(&g)?.to_vec();
+    for &is_g2 in g2 {
+        words.extend(output_words(&g, if is_g2 { G2_WORDS } else { G1_WORDS })?);
+    }
+    Ok(words)
+}
+
+/// The words `Plan::new` allocates for `g`: counts, cursors, entries.
+fn plan_words(g: &Geometry) -> Result<[usize; 3], ProveError> {
+    Ok([
         g.rows(),
         g.rows(),
         checked_words(g.n_windows * g.cap, ENTRY_WORDS)?,
-    ];
-    let ones_groups = if g.dummy_rows == 0 {
-        ones_groups_for(n)
-    } else {
-        0
-    };
-    for &is_g2 in g2 {
-        let pw = if is_g2 { G2_WORDS } else { G1_WORDS };
-        for level in g.fold_levels() {
-            let slots = 2 * g.n_windows * level.groups as usize;
-            words.extend([checked_point_words(slots, pw)?, slots]);
-        }
-        words.extend([
-            g.rows() * pw,
-            checked_point_words(g.spill_slots(), pw)?,
-            g.spill_slots(),
-            g.n_windows * pw,
-        ]);
-        if ones_groups > 0 {
-            words.push(ones_groups * pw);
-        }
+    ])
+}
+
+/// The words `Outputs::new` allocates for one job of `pw`-word points on a plan of `g`.
+fn output_words(g: &Geometry, pw: usize) -> Result<Vec<usize>, ProveError> {
+    let mut words = Vec::new();
+    for level in g.fold_levels() {
+        let slots = 2 * g.n_windows * level.groups as usize;
+        words.extend([checked_point_words(slots, pw)?, slots]);
+    }
+    words.extend([
+        g.rows() * pw,
+        checked_point_words(g.spill_slots(), pw)?,
+        g.spill_slots(),
+        g.n_windows * pw,
+    ]);
+    if g.dummy_rows == 0 {
+        words.push(ones_groups_for(g.n) * pw);
     }
     Ok(words)
+}
+
+/// Free device memory an MSM batch leaves alone: the local memory the spilling G2 kernels
+/// can still claim at their first launch, the driver's own per-stream state, and the
+/// stream-ordered pool's rounding of each buffer. Not measured; the batches it guards are
+/// hundreds of megabytes.
+const VRAM_HEADROOM: u64 = 256 << 20;
+
+/// Shortest run [`CudaMsm::fit_runs`] cuts an MSM into before it refuses. A run of 2^10
+/// points needs a few megabytes of scratch, so a budget below it is a device with nothing
+/// free rather than a key too large.
+const MIN_RUN: usize = 1 << 10;
+
+/// The bytes buffers of `words` take, each at least the one word `alloc_words` asks for.
+fn vram_bytes(words: &[usize]) -> u64 {
+    words.iter().map(|w| (*w.max(&1) as u64) * 4).sum()
+}
+
+/// The refusal of a batch that does not fit, before anything is allocated. A
+/// [`ProveError::Device`], as the driver's own `CUDA_ERROR_OUT_OF_MEMORY` is: the same key
+/// may fit when another process lets go of the card, and the CPU proves it either way.
+fn too_big(need: u64, budget: u64, what: &str) -> ProveError {
+    ProveError::Device {
+        backend: crate::context::BACKEND,
+        reason: format!(
+            "{what} needs {need} bytes of device memory and {budget} are available to it"
+        ),
+    }
+}
+
+/// The longest run, `cap` or `cap` halved until it is, whose largest batch `need` says fits
+/// in `budget`; `None` when even a run of [`MIN_RUN`] does not.
+fn fit_run(
+    cap: usize,
+    budget: u64,
+    need: impl Fn(usize) -> Result<u64, ProveError>,
+) -> Result<Result<usize, u64>, ProveError> {
+    let mut run = cap.max(1);
+    loop {
+        let bytes = need(run)?;
+        if bytes <= budget {
+            return Ok(Ok(run));
+        }
+        if run <= MIN_RUN {
+            return Ok(Err(bytes));
+        }
+        run = (run / 2).max(MIN_RUN);
+    }
 }
 
 /// What [`CudaMsm::with_arena`] must reserve for every batch of [`resident_schedule`] to be
@@ -1103,6 +1157,11 @@ pub struct CudaMsm {
 
     last_device_us: AtomicU64,
     last_combine_us: AtomicU64,
+    /// Batches the last [`Self::msms`] or `msms_resident` ran: one when nothing was cut.
+    last_runs: AtomicU64,
+    /// A cap on the device memory one batch may allocate, below what the driver says is
+    /// free; see [`Self::with_vram_limit`].
+    vram_limit: Option<u64>,
     /// Scratch reserved once by [`Self::with_arena`], which every batch then draws from and
     /// hands back instead of allocating. `None`, the default, allocates per batch.
     arena: Option<Mutex<Vec<CudaSlice<u32>>>>,
@@ -1176,6 +1235,17 @@ impl CudaMsm {
     /// silently substituted width.
     pub fn with_window(mut self, c: u32) -> Self {
         self.window = Some(c);
+        self
+    }
+
+    /// Allocate at most `bytes` of scratch for one batch, or what the driver reports free
+    /// less a headroom when that is less. A proof whose single batch does not fit is cut
+    /// into runs that do (see [`Self::msms`]), and a batch that cannot fit at all is
+    /// refused before anything is allocated. Without an arena the free memory is queried
+    /// either way; this only lowers it, which is how a test reaches that path on a small
+    /// circuit.
+    pub fn with_vram_limit(mut self, bytes: u64) -> Self {
+        self.vram_limit = Some(bytes);
         self
     }
 
@@ -1275,6 +1345,8 @@ impl CudaMsm {
             n_public: 0,
             last_device_us: AtomicU64::new(0),
             last_combine_us: AtomicU64::new(0),
+            last_runs: AtomicU64::new(0),
+            vram_limit: None,
             arena: None,
         })
     }
@@ -1380,6 +1452,52 @@ impl CudaMsm {
     /// Wall clock of the last batch's readback plus its Horner tail.
     pub fn last_combine_us(&self) -> u64 {
         self.last_combine_us.load(Ordering::Relaxed)
+    }
+
+    /// Batches the last [`Self::msms`] ran: one when the five MSMs fit the device memory
+    /// at once, more when they were cut into runs.
+    pub fn last_runs(&self) -> u64 {
+        self.last_runs.load(Ordering::Relaxed)
+    }
+
+    /// Bytes a batch may allocate now: the free device memory less [`VRAM_HEADROOM`],
+    /// capped by [`Self::with_vram_limit`]. `None` with an arena, whose batches allocate
+    /// nothing.
+    fn vram_budget(&self) -> Result<Option<u64>, ProveError> {
+        if self.arena.is_some() {
+            return Ok(None);
+        }
+        let (free, _) = self
+            .ctx
+            .mem_get_info()
+            .map_err(|e| drv("query device memory", e))?;
+        let budget = (free as u64).saturating_sub(VRAM_HEADROOM);
+        Ok(Some(self.vram_limit.map_or(budget, |l| l.min(budget))))
+    }
+
+    /// What `jobs` allocate as one batch, in bytes, from the same geometry `Plan::new` and
+    /// `Outputs::new` size their buffers from.
+    fn batch_bytes(&self, jobs: &[Job<'_>]) -> Result<u64, ProveError> {
+        let mut plans: HashMap<(usize, usize, usize), Geometry> = HashMap::new();
+        let mut words = Vec::new();
+        for job in jobs {
+            let (scalars, soff, n, pw) = match job {
+                Job::G1(j) => (j.scalars, j.scalar_off, j.n, G1_WORDS),
+                Job::G2(j) => (j.scalars, j.scalar_off, j.n, G2_WORDS),
+            };
+            let key = (scalars.buf as *const CudaSlice<u32> as usize, soff, n);
+            let g = match plans.get(&key) {
+                Some(g) => *g,
+                None => {
+                    let g = Plan::geometry(self, scalars, soff, n)?;
+                    words.extend(plan_words(&g)?);
+                    plans.insert(key, g);
+                    g
+                }
+            };
+            words.extend(output_words(&g, pw)?);
+        }
+        Ok(vram_bytes(&words))
     }
 
     // -----------------------------------------------------------------------
@@ -1588,6 +1706,13 @@ impl CudaMsm {
             }
         }
 
+        if let Some(budget) = self.vram_budget()? {
+            let need = self.batch_bytes(jobs)?;
+            if need > budget {
+                return Err(too_big(need, budget, "an MSM batch"));
+            }
+        }
+
         // The start event is recorded before anything is allocated, so a stream-ordered
         // allocation that waits on the pool is inside the span rather than hidden.
         //
@@ -1680,6 +1805,12 @@ impl CudaMsm {
     /// tagged for a different backend is an error rather than a panic, because the caller
     /// mixing two backends is a recoverable mistake and dereferencing another backend's
     /// pointer is not.
+    ///
+    /// The five MSMs are one batch when its scratch fits the device memory free now (see
+    /// [`Self::with_vram_limit`]). When it does not, they run as the batches of
+    /// `resident_schedule` in the longest runs that fit, and the runs' results are summed;
+    /// when not even a run of 1024 points fits, the proof is refused before anything is
+    /// allocated.
     pub fn msms(
         &self,
         witness: &[Fr],
@@ -1780,21 +1911,134 @@ impl CudaMsm {
                 n: h_n,
             }),
         ];
-        let out = self.msm_batch(&jobs)?;
+        // One batch when the five fit the device memory, which is every key the benchmarks
+        // run; otherwise the batches `resident_schedule` lists, in the longest runs that fit.
+        let budget = self.vram_budget()?;
+        let out = match budget {
+            Some(b) if self.batch_bytes(&jobs)? > b => {
+                let run = self.fit_runs(w, h_scalars, h_n, n.max(h_n), b)?;
+                self.run_schedule(w, h_scalars, h_n, run)?
+            }
+            _ => {
+                let out = self.msm_batch(&jobs)?;
+                self.last_runs.store(1, Ordering::Relaxed);
+                MsmOutputs {
+                    a_g1: out[0].g1()?,
+                    b_g2: out[1].g2()?,
+                    b_g1: out[2].g1()?,
+                    l_g1: out[3].g1()?,
+                    h_g1: out[4].g1()?,
+                }
+            }
+        };
 
         // Host launch time is not added: the launches are asynchronous, so it overlaps the
         // device work the event pair already counted. What is added is the two things that
-        // genuinely happen with the device idle. One event pair over the whole batch, and
-        // A and both B jobs share a digit plan, so `msm_split` stays `None`.
+        // genuinely happen with the device idle. One event pair over each batch, and A and
+        // both B jobs share a digit plan, so `msm_split` stays `None`.
         t.msm_us += upload_us + self.last_device_us() + self.last_combine_us();
 
-        Ok(MsmOutputs {
-            a_g1: out[0].g1()?,
-            b_g2: out[1].g2()?,
-            b_g1: out[2].g1()?,
-            l_g1: out[3].g1()?,
-            h_g1: out[4].g1()?,
+        Ok(out)
+    }
+
+    /// The longest run of at most `cap` points whose every batch in [`resident_schedule`]
+    /// fits `budget`, or the refusal when even [`MIN_RUN`] does not.
+    fn fit_runs(
+        &self,
+        w: Scalars<'_>,
+        h: Scalars<'_>,
+        h_len: usize,
+        cap: usize,
+        budget: u64,
+    ) -> Result<usize, ProveError> {
+        let need = |run: usize| -> Result<u64, ProveError> {
+            let mut most = 0;
+            for (stage, off, n) in resident_schedule(self.n_vars, self.l.len(), h_len, run)? {
+                most = most.max(self.batch_bytes(&self.run_jobs(stage, off, n, w, h))?);
+            }
+            Ok(most)
+        };
+        fit_run(cap, budget, need)?.map_err(|need| {
+            too_big(
+                need,
+                budget,
+                &format!("an MSM cut into runs of {MIN_RUN} points"),
+            )
         })
+    }
+
+    /// The jobs of one batch of [`resident_schedule`]: a run of the witness is A and both B,
+    /// sharing their digit plan; L and H are a batch a run.
+    fn run_jobs<'a>(
+        &'a self,
+        stage: Resident,
+        off: usize,
+        n: usize,
+        w: Scalars<'a>,
+        h: Scalars<'a>,
+    ) -> Vec<Job<'a>> {
+        let g1 = |bases, scalars, scalar_off| {
+            Job::G1(JobG1 {
+                bases,
+                base_off: off,
+                scalars,
+                scalar_off,
+                n,
+            })
+        };
+        match stage {
+            Resident::Witness => vec![
+                g1(&self.a, w, off),
+                Job::G2(JobG2 {
+                    bases: &self.b_g2,
+                    base_off: off,
+                    scalars: w,
+                    scalar_off: off,
+                    n,
+                }),
+                g1(&self.b_g1, w, off),
+            ],
+            Resident::L => vec![g1(&self.l, w, self.n_public + 1 + off)],
+            Resident::H => vec![g1(&self.h, h, off)],
+        }
+    }
+
+    /// The batches [`resident_schedule`] lists for runs of `run` points, one after another,
+    /// each run's result added into the total.
+    fn run_schedule(
+        &self,
+        w: Scalars<'_>,
+        h: Scalars<'_>,
+        h_len: usize,
+        run: usize,
+    ) -> Result<MsmOutputs, ProveError> {
+        let mut out = MsmOutputs {
+            a_g1: G1Projective::zero(),
+            b_g2: G2Projective::zero(),
+            b_g1: G1Projective::zero(),
+            l_g1: G1Projective::zero(),
+            h_g1: G1Projective::zero(),
+        };
+        let (mut device_us, mut combine_us, mut runs) = (0, 0, 0);
+        for (stage, off, n) in resident_schedule(self.n_vars, self.l.len(), h_len, run)? {
+            let r = self.msm_batch(&self.run_jobs(stage, off, n, w, h))?;
+            match stage {
+                Resident::Witness => {
+                    out.a_g1 += r[0].g1()?;
+                    out.b_g2 += r[1].g2()?;
+                    out.b_g1 += r[2].g1()?;
+                }
+                Resident::L => out.l_g1 += r[0].g1()?,
+                Resident::H => out.h_g1 += r[0].g1()?,
+            }
+            device_us += self.last_device_us();
+            combine_us += self.last_combine_us();
+            runs += 1;
+        }
+        self.last_device_us.store(device_us, Ordering::Relaxed);
+        self.last_combine_us.store(combine_us, Ordering::Relaxed);
+        self.last_runs.store(runs, Ordering::Relaxed);
+        Ok(out)
     }
 
     /// Stages 5 to 9 when the standard-form witness and `H` are already on the device, every
@@ -1819,54 +2063,13 @@ impl CudaMsm {
     ) -> Result<MsmOutputs, ProveError> {
         let w = Scalars::device_std(witness_std, self.n_vars)?;
         let h = Scalars::device_std(h_std, h_len)?;
-        let l_off = self.n_public + 1;
-        let mut out = MsmOutputs {
-            a_g1: G1Projective::zero(),
-            b_g2: G2Projective::zero(),
-            b_g1: G1Projective::zero(),
-            l_g1: G1Projective::zero(),
-            h_g1: G1Projective::zero(),
+        // With an arena the runs are the ones it was sized for. Without one, `chunk` is a cap
+        // and a device with less free cuts shorter runs.
+        let run = match self.vram_budget()? {
+            None => chunk,
+            Some(b) => self.fit_runs(w, h, h_len, chunk, b)?,
         };
-        let (mut device_us, mut combine_us) = (0, 0);
-        for (stage, off, n) in resident_schedule(self.n_vars, self.l.len(), h_len, chunk)? {
-            let g1 = |bases, scalars, scalar_off| {
-                Job::G1(JobG1 {
-                    bases,
-                    base_off: off,
-                    scalars,
-                    scalar_off,
-                    n,
-                })
-            };
-            match stage {
-                Resident::Witness => {
-                    let jobs = [
-                        g1(&self.a, w, off),
-                        Job::G2(JobG2 {
-                            bases: &self.b_g2,
-                            base_off: off,
-                            scalars: w,
-                            scalar_off: off,
-                            n,
-                        }),
-                        g1(&self.b_g1, w, off),
-                    ];
-                    let r = self.msm_batch(&jobs)?;
-                    out.a_g1 += r[0].g1()?;
-                    out.b_g2 += r[1].g2()?;
-                    out.b_g1 += r[2].g1()?;
-                }
-                Resident::L => {
-                    out.l_g1 += self.msm_batch(&[g1(&self.l, w, l_off + off)])?[0].g1()?
-                }
-                Resident::H => out.h_g1 += self.msm_batch(&[g1(&self.h, h, off)])?[0].g1()?,
-            }
-            device_us += self.last_device_us();
-            combine_us += self.last_combine_us();
-        }
-        self.last_device_us.store(device_us, Ordering::Relaxed);
-        self.last_combine_us.store(combine_us, Ordering::Relaxed);
-        Ok(out)
+        self.run_schedule(w, h, h_len, run)
     }
 
     // -----------------------------------------------------------------------
@@ -2198,26 +2401,37 @@ impl std::ops::Deref for Plan<'_> {
 }
 
 impl<'a> Plan<'a> {
-    fn new(
+    /// The shape a plan over `n` scalars from `scalar_off` takes, before anything is
+    /// allocated for it.
+    fn geometry(
         msm: &CudaMsm,
-        scalars: Scalars<'a>,
+        scalars: Scalars<'_>,
         scalar_off: usize,
         n: usize,
-    ) -> Result<Self, ProveError> {
+    ) -> Result<Geometry, ProveError> {
         kernel_range(scalar_off, n, SCALAR_WORDS)?;
         let general = if msm.work == Work::Constant {
             n
         } else {
             scalars.general_in(&(scalar_off..scalar_off + n))
         };
-        let geometry = Geometry::new(
+        Geometry::new(
             n,
             scalar_off,
             general,
             pick_window(msm.window, general),
             slice_len(),
             msm.work,
-        )?;
+        )
+    }
+
+    fn new(
+        msm: &CudaMsm,
+        scalars: Scalars<'a>,
+        scalar_off: usize,
+        n: usize,
+    ) -> Result<Self, ProveError> {
+        let geometry = Self::geometry(msm, scalars, scalar_off, n)?;
         Ok(Self {
             counts: msm.scratch(geometry.rows())?,
             cursor: msm.scratch(geometry.rows())?,
@@ -2443,6 +2657,60 @@ mod tests {
     use super::*;
     use crate::context::download;
     use snarkrs_gpu_layout::{FQ_MODULUS, FQ_N0};
+
+    #[test]
+    fn a_run_is_halved_until_its_batches_fit() {
+        // Need proportional to the run: 1 KB a point.
+        let need = |run: usize| Ok(run as u64 * 1024);
+        assert_eq!(fit_run(1 << 20, u64::MAX, need).unwrap(), Ok(1 << 20));
+        assert_eq!(fit_run(1 << 20, (1 << 30) - 1, need).unwrap(), Ok(1 << 19));
+        assert_eq!(fit_run(1 << 20, 1 << 24, need).unwrap(), Ok(1 << 14));
+        // A cap that is not a power of two halves through odd lengths and lands on MIN_RUN.
+        assert_eq!(
+            fit_run(3000, MIN_RUN as u64 * 1024, need).unwrap(),
+            Ok(MIN_RUN)
+        );
+        // Below MIN_RUN's need the refusal carries that need, and stops there.
+        let asked = std::cell::Cell::new(0usize);
+        let counting = |run: usize| {
+            asked.set(asked.get() + 1);
+            assert!(run >= MIN_RUN, "asked for a run of {run}");
+            need(run)
+        };
+        assert_eq!(
+            fit_run(1 << 20, 1000, counting).unwrap(),
+            Err(MIN_RUN as u64 * 1024)
+        );
+        assert_eq!(asked.get(), 11);
+        // A cap already below MIN_RUN is tried as it is, once.
+        assert_eq!(fit_run(5, 0, need).unwrap(), Err(5 * 1024));
+        assert_eq!(fit_run(0, u64::MAX, need).unwrap(), Ok(1));
+    }
+
+    #[test]
+    fn an_oversized_batch_is_refused_as_a_device_fault() {
+        let e = too_big(10, 9, "an MSM batch");
+        assert!(e.is_device_fault(), "{e}");
+        assert!(e.to_string().contains("10 bytes"), "{e}");
+        assert!(e.to_string().contains("9 are available"), "{e}");
+    }
+
+    #[test]
+    fn batch_words_counts_one_plan_and_each_job() {
+        let n = 1 << 12;
+        let one = batch_words(n, &[false], None, Work::Variable).unwrap();
+        let three = batch_words(n, &[false, true, false], None, Work::Variable).unwrap();
+        let g = Geometry::new(n, 0, n, pick_window(None, n), slice_len(), Work::Variable).unwrap();
+        assert_eq!(one.len(), 3 + output_words(&g, G1_WORDS).unwrap().len());
+        assert_eq!(
+            vram_bytes(&three),
+            vram_bytes(&plan_words(&g).unwrap())
+                + 2 * vram_bytes(&output_words(&g, G1_WORDS).unwrap())
+                + vram_bytes(&output_words(&g, G2_WORDS).unwrap())
+        );
+        // An empty buffer still costs the word `alloc_words` pads it to.
+        assert_eq!(vram_bytes(&[0, 1, 2]), 4 + 4 + 8);
+    }
 
     #[test]
     fn constant_geometry_ignores_classification() {
