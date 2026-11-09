@@ -42,14 +42,17 @@
 //! looking field element, so the failure mode is a proof that does not verify, with no
 //! crash and nothing to point at, on some witnesses and not others.
 //!
-//! Three things guard that here. Every allocation goes through [`CudaMsm::zeros`], which is
-//! `alloc_zeros`, a stream-ordered `cuMemsetD8Async` over the whole block. The count
-//! histogram is additionally cleared by `zero_u32` before `msm_count` accumulates onto it.
-//! Every bucket array is additionally run through `msm_clear_g1`/`msm_clear_g2` before an
-//! accumulation writes into it. The last two are redundant with `alloc_zeros` as this file
-//! stands, and are kept anyway: they are the steps the Metal schedule has, and the moment
-//! anyone reuses a buffer across two MSMs they stop being redundant and become the only
-//! thing between this backend and a silent wrong answer.
+//! Two kernels guard that here, and nothing else does: [`CudaMsm::scratch`] hands out
+//! uninitialised memory, a fresh block or a reused one. The count histogram is cleared by
+//! `zero_u32` before `msm_count` accumulates onto it, and every bucket array is run through
+//! `msm_clear_g1`/`msm_clear_g2` before an accumulation writes into it (all of a
+//! constant-work plan's packed projective identity, `zz` alone otherwise). Every other
+//! buffer is written before it is read: `msm_scan` writes every cursor row, the scatter
+//! fills each window's entries up to where the accumulation stops reading, and every spill,
+//! fold, window-sum and ones slot a later kernel reads is stored first, or carries a
+//! `MSM_NO_ROW` tag that keeps its point from being used. `G16_CUDA_MSM_POISON=1` fills
+//! every scratch buffer with `0xa5` bytes instead of leaving it, which is how the device
+//! suites hold that claim.
 //!
 //! # Timings
 //!
@@ -74,8 +77,8 @@ use std::time::Instant;
 
 use ark_ff::{AdditiveGroup, One, Zero};
 use cudarc::driver::{
-    sys, CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DeviceRepr, LaunchConfig,
-    PushKernelArg,
+    sys, CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtrMut, DeviceRepr,
+    LaunchConfig, PushKernelArg,
 };
 
 use snarkrs_field::{Fr, G1Affine, G1Projective, G2Affine, G2Projective};
@@ -314,6 +317,17 @@ fn slice_len() -> usize {
         .filter(|v| *v > 0)
         .unwrap_or(SLICE_LEN)
 }
+
+/// `G16_CUDA_MSM_POISON=1` fills every MSM scratch buffer with [`POISON`] bytes before
+/// handing it out, so a kernel that reads a word nothing wrote reads a value no zeroed or
+/// recycled buffer would supply. A test hook; it costs a memset per buffer.
+fn poison() -> bool {
+    std::env::var("G16_CUDA_MSM_POISON").as_deref() == Ok("1")
+}
+
+/// The byte [`poison`] fills with: `0xa5a5a5a5` limbs are no reduced field element, and
+/// a row of them is no valid tag.
+const POISON: u8 = 0xa5;
 
 /// `G16_CUDA_MSM_LEGACY_ACC=1` swaps the segmented accumulation for the simple
 /// one-thread-per-bucket kernel. Kept only so the load-imbalance claim at the top of
@@ -1434,50 +1448,59 @@ impl CudaMsm {
         })
     }
 
-    /// Every allocation in this module goes through here.
+    /// Every allocation in this module goes through here, and none of it is zeroed.
     ///
-    /// `alloc_zeros` rather than `alloc`, unconditionally, including for buffers a kernel
-    /// fully overwrites. `cudaMalloc` hands back the previous tenant's bytes, an
-    /// uninitialised limb array is a plausible looking field element, and the resulting
-    /// failure is a proof that does not verify rather than a fault. A stream-ordered
-    /// `cuMemsetD8Async` over the block is the cheapest possible way to make that class of
-    /// bug impossible. The `max(1)` is because `cuMemAlloc` of zero bytes is documented to
-    /// fail with `CUDA_ERROR_INVALID_VALUE`, and an empty MSM reaches here.
+    /// `cudaMalloc` hands back the previous tenant's bytes, so whatever reads a buffer has
+    /// to have written it first; the module docs list who writes what. The two buffers an
+    /// algorithm needs to start at zero, the count histogram and the buckets, are cleared by
+    /// their own kernels, which an allocator's zeroing would only duplicate. The `max(1)` is
+    /// because `cuMemAlloc` of zero bytes is documented to fail with
+    /// `CUDA_ERROR_INVALID_VALUE`, and an empty MSM reaches here.
     ///
     /// With an arena ([`Self::with_arena`]) the buffer is a reserved one, possibly longer
-    /// than `words`, its first `words` zeroed the same way; every kernel is bounded by the
-    /// plan rather than by the buffer, and [`Self::msm_batch`] hands it back.
-    fn zeros(&self, words: usize) -> Result<CudaSlice<u32>, ProveError> {
-        let Some(arena) = &self.arena else {
-            return self.alloc_words(words);
+    /// than `words`; every kernel is bounded by the plan rather than by the buffer, and
+    /// [`Self::msm_batch`] hands it back.
+    fn scratch(&self, words: usize) -> Result<CudaSlice<u32>, ProveError> {
+        let mut buf = match &self.arena {
+            None => self.alloc_words(words)?,
+            Some(arena) => {
+                allocation_words(words)?;
+                let want = words.max(1);
+                let mut bufs = arena.lock().unwrap_or_else(|e| e.into_inner());
+                let fit = bufs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, b)| b.len() >= want)
+                    .min_by_key(|(_, b)| b.len())
+                    .map(|(i, _)| i)
+                    .ok_or_else(|| {
+                        bad(format!(
+                            "MSM scratch: a batch asked for {want} words, which no buffer \
+                             reserved at construction holds"
+                        ))
+                    })?;
+                bufs.swap_remove(fit)
+            }
         };
-        allocation_words(words)?;
-        let want = words.max(1);
-        let mut bufs = arena.lock().unwrap_or_else(|e| e.into_inner());
-        let fit = bufs
-            .iter()
-            .enumerate()
-            .filter(|(_, b)| b.len() >= want)
-            .min_by_key(|(_, b)| b.len())
-            .map(|(i, _)| i)
-            .ok_or_else(|| {
-                bad(format!(
-                    "MSM scratch: a batch asked for {want} words, which no buffer reserved at \
-                     construction holds"
-                ))
-            })?;
-        let mut buf = bufs.swap_remove(fit);
-        drop(bufs);
-        self.stream
-            .memset_zeros(&mut buf.slice_mut(..want))
-            .map_err(|e| drv("zero reserved MSM scratch", e))?;
+        if poison() {
+            let bytes = buf.len() * 4;
+            let (ptr, _record) = buf.device_ptr_mut(&self.stream);
+            // SAFETY: `ptr` is `buf`'s own allocation, live for this call, `bytes` long, and
+            // issued on the stream every kernel that reads it runs on. Any byte pattern is a
+            // valid `u32`.
+            unsafe {
+                cudarc::driver::result::memset_d8_async(ptr, POISON, bytes, self.stream.cu_stream())
+            }
+            .map_err(|e| drv("poison MSM scratch", e))?;
+        }
         Ok(buf)
     }
 
     fn alloc_words(&self, words: usize) -> Result<CudaSlice<u32>, ProveError> {
         allocation_words(words)?;
-        self.stream
-            .alloc_zeros::<u32>(words.max(1))
+        // SAFETY: the memory is uninitialised, which `scratch`'s contract allows: every
+        // buffer is written by a kernel before one reads it.
+        unsafe { self.stream.alloc::<u32>(words.max(1)) }
             .map_err(|e| drv("allocate MSM scratch", e))
     }
 
@@ -1565,10 +1588,8 @@ impl CudaMsm {
             }
         }
 
-        // The start event is recorded before anything is allocated, because `zeros()`
-        // queues a `cuMemsetD8Async` over every buffer it hands out and that memset is real
-        // per-proof device work (tens of megabytes of bucket array at 2^18). Leaving it
-        // outside the span would make the MSM look faster than it is.
+        // The start event is recorded before anything is allocated, so a stream-ordered
+        // allocation that waits on the pool is inside the span rather than hidden.
         //
         // The events are created per call rather than kept on `self`. Two concurrent proofs
         // sharing one `CudaMsm` would otherwise record into the same pair and read each
@@ -1867,9 +1888,7 @@ impl CudaMsm {
         let rows = p.rows();
 
         // `msm_count` accumulates onto the histogram with `atomicAdd`, so it must start at
-        // zero. `zeros()` already memset the allocation; this is the explicit step the
-        // Metal schedule has, kept so that the requirement is visible at the call site
-        // rather than buried in an allocator's behaviour.
+        // zero, and the allocation is not zeroed: this is the only thing that zeroes it.
         let len = rows as u32;
         let cfg = self.k.zero_u32.cfg_1d(rows, WIDE_BLOCK);
         let mut lb = self.stream.launch_builder(&self.k.zero_u32.f);
@@ -1968,9 +1987,8 @@ impl CudaMsm {
 
     /// A bucket that no slice writes directly still has to read as the identity, which on
     /// the XYZZ encoding means `zz == 0` and on a constant-work plan's packed projective
-    /// one means (0 : 1 : 0). `zeros()` already guarantees the former for a fresh
-    /// allocation; this is the algorithm's own step and the thing that would still be
-    /// correct if the allocation were ever recycled.
+    /// one means (0 : 1 : 0). The allocation is not zeroed, so this is the only thing that
+    /// makes it so.
     fn launch_clear(
         &self,
         job: &Job<'_>,
@@ -2201,9 +2219,9 @@ impl<'a> Plan<'a> {
             msm.work,
         )?;
         Ok(Self {
-            counts: msm.zeros(geometry.rows())?,
-            cursor: msm.zeros(geometry.rows())?,
-            entries: msm.zeros(checked_words(
+            counts: msm.scratch(geometry.rows())?,
+            cursor: msm.scratch(geometry.rows())?,
+            entries: msm.scratch(checked_words(
                 geometry.n_windows * geometry.cap,
                 ENTRY_WORDS,
             )?)?,
@@ -2268,22 +2286,22 @@ impl Outputs {
             let slots = 2 * plan.n_windows * params.groups as usize;
             folds.push(FoldScratch {
                 params,
-                pts: msm.zeros(checked_point_words(slots, point_words)?)?,
-                rows: msm.zeros(slots)?,
+                pts: msm.scratch(checked_point_words(slots, point_words)?)?,
+                rows: msm.scratch(slots)?,
             });
         }
         // Two spill slots per slice: at most one run of a slice continues backwards and at
         // most one continues forwards.
         let spill_slots = plan.spill_slots();
         Ok(Self {
-            buckets: msm.zeros(rows * point_words)?,
-            spill_pts: msm.zeros(checked_point_words(spill_slots, point_words)?)?,
-            spill_rows: msm.zeros(spill_slots)?,
-            window_sums: msm.zeros(plan.n_windows * point_words)?,
+            buckets: msm.scratch(rows * point_words)?,
+            spill_pts: msm.scratch(checked_point_words(spill_slots, point_words)?)?,
+            spill_rows: msm.scratch(spill_slots)?,
+            window_sums: msm.scratch(plan.n_windows * point_words)?,
             ones: if ones_groups == 0 {
                 None
             } else {
-                let buf = msm.zeros(ones_groups * point_words)?;
+                let buf = msm.scratch(ones_groups * point_words)?;
                 #[cfg(test)]
                 msm.activity
                     .ones_allocations
@@ -3246,10 +3264,10 @@ mod tests {
         // Same checked allocations as Plan::new, with explicit public geometry instead
         // of process-wide window/slice environment overrides.
         Plan {
-            counts: m.zeros(geometry.rows()).unwrap(),
-            cursor: m.zeros(geometry.rows()).unwrap(),
+            counts: m.scratch(geometry.rows()).unwrap(),
+            cursor: m.scratch(geometry.rows()).unwrap(),
             entries: m
-                .zeros(geometry.n_windows * geometry.cap * ENTRY_WORDS)
+                .scratch(geometry.n_windows * geometry.cap * ENTRY_WORDS)
                 .unwrap(),
             geometry,
             scalars: scalars.buf,
