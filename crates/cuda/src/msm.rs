@@ -89,7 +89,7 @@ use snarkrs_gpu_layout::{
 use snarkrs_groth16::{HPoly, MsmOutputs, ProveError, StageTimings};
 
 use crate::context::{bad, drv, elapsed_us, upload_words};
-use crate::stages::{HHandle, TAG};
+use crate::stages::{HHandle, Staging, TAG};
 use crate::{as_words, from_words, kernels, Cuda};
 
 // ---------------------------------------------------------------------------
@@ -1646,11 +1646,11 @@ impl CudaMsm {
             work: Work::Variable,
             window: None,
             shapes: Shapes::from_env(l2_bytes(&ctx)),
-            a: upload_g1(&stream, &[])?,
-            b_g2: upload_g2(&stream, &[])?,
-            b_g1: upload_g1(&stream, &[])?,
-            l: upload_g1(&stream, &[])?,
-            h: upload_g1(&stream, &[])?,
+            a: G1Bases::from_device(upload_words(&stream, &[])?, 0)?,
+            b_g2: G2Bases::from_device(upload_words(&stream, &[])?, 0)?,
+            b_g1: G1Bases::from_device(upload_words(&stream, &[])?, 0)?,
+            l: G1Bases::from_device(upload_words(&stream, &[])?, 0)?,
+            h: G1Bases::from_device(upload_words(&stream, &[])?, 0)?,
             ctx,
             stream,
             module,
@@ -1670,13 +1670,26 @@ impl CudaMsm {
     ///
     /// Sections 5 to 9 of the zkey. Four `n_vars`-long G1 vectors at 64 bytes a point plus
     /// one G2 vector at 128, so tens to hundreds of megabytes across PCIe. Once, at prepare
-    /// time, never per proof.
+    /// time, never per proof. Each is packed straight into one pinned staging pair, so the
+    /// packed vectors never exist on the host.
     pub fn with_key(mut self, pk: &ProvingKey) -> Result<Self, ProveError> {
-        self.a = upload_g1(&self.stream, &pk.a_query)?;
-        self.b_g2 = upload_g2(&self.stream, &pk.b_g2_query)?;
-        self.b_g1 = upload_g1(&self.stream, &pk.b_g1_query)?;
-        self.l = upload_g1(&self.stream, &pk.l_query)?;
-        self.h = upload_g1(&self.stream, &pk.h_query)?;
+        let longest = [&pk.a_query, &pk.b_g1_query, &pk.l_query, &pk.h_query]
+            .map(|q| q.len() * G1_BASE_WORDS)
+            .into_iter()
+            .chain([pk.b_g2_query.len() * G2_BASE_WORDS])
+            .max()
+            .unwrap_or(0);
+        let mut staging = Staging::for_key(&self.ctx, longest)?;
+        let stream = &self.stream;
+        self.a = upload_g1(stream, &mut staging, &pk.a_query)?;
+        self.b_g2 = upload_g2(stream, &mut staging, &pk.b_g2_query)?;
+        self.b_g1 = upload_g1(stream, &mut staging, &pk.b_g1_query)?;
+        self.l = upload_g1(stream, &mut staging, &pk.l_query)?;
+        self.h = upload_g1(stream, &mut staging, &pk.h_query)?;
+        drop(staging);
+        stream
+            .synchronize()
+            .map_err(|e| drv("synchronize key upload", e))?;
         self.n_vars = pk.n_vars;
         self.n_public = pk.n_public;
         Ok(self)
@@ -1823,11 +1836,23 @@ impl CudaMsm {
     /// Repacks and uploads a G1 base vector. See [`G1Bases`] for why the repack is not
     /// optional.
     pub fn upload_g1_bases(&self, bases: &[G1Affine]) -> Result<G1Bases, ProveError> {
-        upload_g1(&self.stream, bases)
+        let mut staging = Staging::for_key(&self.ctx, bases.len() * G1_BASE_WORDS)?;
+        let out = upload_g1(&self.stream, &mut staging, bases)?;
+        drop(staging);
+        self.stream
+            .synchronize()
+            .map_err(|e| drv("synchronize base upload", e))?;
+        Ok(out)
     }
 
     pub fn upload_g2_bases(&self, bases: &[G2Affine]) -> Result<G2Bases, ProveError> {
-        upload_g2(&self.stream, bases)
+        let mut staging = Staging::for_key(&self.ctx, bases.len() * G2_BASE_WORDS)?;
+        let out = upload_g2(&self.stream, &mut staging, bases)?;
+        drop(staging);
+        self.stream
+            .synchronize()
+            .map_err(|e| drv("synchronize base upload", e))?;
+        Ok(out)
     }
 
     /// Packs scalars into standard form and uploads them. Variable work classifies
@@ -2946,20 +2971,32 @@ fn l2_bytes(ctx: &Arc<CudaContext>) -> usize {
         .map_or(L2_BYTES_ASSUMED, |b| b as usize)
 }
 
-fn upload_g1(stream: &Arc<CudaStream>, bases: &[G1Affine]) -> Result<G1Bases, ProveError> {
-    kernel_range(0, bases.len(), core::mem::size_of::<PackedG1Affine>() / 4)?;
-    let packed = PackedG1Affine::pack_slice(bases);
+/// Words in a packed G1 and G2 base.
+const G1_BASE_WORDS: usize = core::mem::size_of::<PackedG1Affine>() / 4;
+const G2_BASE_WORDS: usize = core::mem::size_of::<PackedG2Affine>() / 4;
+
+/// `bases` packed through `staging` into a new device vector. The last copy may still be
+/// in flight on return, ordered before anything queued after it on `stream`.
+fn upload_g1(
+    stream: &Arc<CudaStream>,
+    staging: &mut Staging,
+    bases: &[G1Affine],
+) -> Result<G1Bases, ProveError> {
+    kernel_range(0, bases.len(), G1_BASE_WORDS)?;
     Ok(G1Bases {
-        buf: upload_words(stream, as_words(&packed))?,
+        buf: staging.upload_packed(stream, bases, PackedG1Affine::pack_into)?,
         len: bases.len(),
     })
 }
 
-fn upload_g2(stream: &Arc<CudaStream>, bases: &[G2Affine]) -> Result<G2Bases, ProveError> {
-    kernel_range(0, bases.len(), core::mem::size_of::<PackedG2Affine>() / 4)?;
-    let packed = PackedG2Affine::pack_slice(bases);
+fn upload_g2(
+    stream: &Arc<CudaStream>,
+    staging: &mut Staging,
+    bases: &[G2Affine],
+) -> Result<G2Bases, ProveError> {
+    kernel_range(0, bases.len(), G2_BASE_WORDS)?;
     Ok(G2Bases {
-        buf: upload_words(stream, as_words(&packed))?,
+        buf: staging.upload_packed(stream, bases, PackedG2Affine::pack_into)?,
         len: bases.len(),
     })
 }

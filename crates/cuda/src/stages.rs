@@ -51,11 +51,11 @@ use cudarc::driver::{
 };
 use snarkrs_field::{Domain, Field, Fr};
 use snarkrs_formats::{HBasis, Matrix, ProvingKey};
-use snarkrs_gpu_layout::{PackedFr, PackedScalar};
+use snarkrs_gpu_layout::{Packed, PackedFr, PackedScalar};
 use snarkrs_groth16::{HPoly, ProveError, StageTimings};
 
 use crate::context::{bad, download, drv, elapsed_us, upload_words};
-use crate::{as_words, from_words, kernels, Cuda};
+use crate::{from_words, kernels, Cuda};
 
 /// The tag on [`snarkrs_groth16::HPoly::Device`] values produced here. A handle carrying any
 /// other tag came from a different backend and must not be dereferenced as an [`HHandle`].
@@ -198,12 +198,23 @@ impl Events {
 /// packed point sizes, so a chunk never splits an element.
 const STAGING_WORDS: usize = 8 << 20;
 
+/// Words in each half of the pair [`Staging::for_key`] gives a prepare, 4 MiB: large enough
+/// that each copy runs at the bus's rate, small enough that the pair is a rounding error
+/// beside the key it uploads. Also a whole number of every element size.
+const KEY_STAGING_WORDS: usize = 1 << 20;
+
+/// The largest element a staging chunk carries, a packed G2 point, in words.
+const ELEMENT_WORDS: usize = 32;
+
 /// Two page-locked buffers the host fills in turn while the other is on the wire, for a
 /// vector too large to stage whole: 64 MiB of pinned memory however long the vector is.
 /// The rows path stages the witness and both row vectors through one, and a key whose
-/// bases are streamed from disk goes through one too.
+/// bases are streamed from disk goes through one too. A zkey's prepare packs its resident
+/// vectors through a smaller one, see [`Self::for_key`].
 pub(crate) struct Staging {
     bufs: [PinnedHostSlice<u32>; 2],
+    /// Words in each buffer, a whole number of [`ELEMENT_WORDS`].
+    words: usize,
     /// Recorded after each buffer's copy is queued, and waited on before the host writes
     /// that buffer again. Waiting on one never recorded returns at once.
     done: [CudaEvent; 2],
@@ -211,11 +222,22 @@ pub(crate) struct Staging {
 
 impl Staging {
     pub(crate) fn new(ctx: &Arc<CudaContext>) -> Result<Self, ProveError> {
+        Self::with_words(ctx, STAGING_WORDS)
+    }
+
+    /// A pair for a prepare whose longest vector is `longest` words: [`KEY_STAGING_WORDS`]
+    /// each, or less when the whole vector is shorter. The packed vector is never built
+    /// on the host, so this pair is all the host memory an upload adds to the key.
+    pub(crate) fn for_key(ctx: &Arc<CudaContext>, longest: usize) -> Result<Self, ProveError> {
+        let words = longest.max(1).next_multiple_of(ELEMENT_WORDS);
+        Self::with_words(ctx, words.min(KEY_STAGING_WORDS))
+    }
+
+    fn with_words(ctx: &Arc<CudaContext>, words: usize) -> Result<Self, ProveError> {
         let buf = || {
             // SAFETY: unset on return, and only ever read by a copy of the words `fill`
             // has just written.
-            unsafe { ctx.alloc_pinned::<u32>(STAGING_WORDS) }
-                .map_err(|e| drv("allocate pinned staging", e))
+            unsafe { ctx.alloc_pinned::<u32>(words) }.map_err(|e| drv("allocate pinned staging", e))
         };
         let ev = || {
             ctx.new_event(Some(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING))
@@ -223,6 +245,7 @@ impl Staging {
         };
         Ok(Self {
             bufs: [buf()?, buf()?],
+            words,
             done: [ev()?, ev()?],
         })
     }
@@ -246,8 +269,8 @@ impl Staging {
                 dst.len()
             )));
         }
-        for (i, start) in (0..len).step_by(STAGING_WORDS).enumerate() {
-            let m = STAGING_WORDS.min(len - start);
+        for (i, start) in (0..len).step_by(self.words).enumerate() {
+            let m = self.words.min(len - start);
             let k = i % 2;
             self.done[k]
                 .synchronize()
@@ -280,6 +303,39 @@ impl Staging {
             pack_fr(&src[start / 8..(start + out.len()) / 8], out);
             Ok(())
         })
+    }
+
+    /// `src` into a new device buffer, each element packed by `pack` straight into the
+    /// staging on the pool, so no packed copy of the vector exists on the host. `P` is at
+    /// most [`ELEMENT_WORDS`] words and divides it.
+    pub(crate) fn upload_packed<S: Sync, P: Packed + Send>(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        src: &[S],
+        pack: impl Fn(&[S], &mut [P]) + Sync,
+    ) -> Result<CudaSlice<u32>, ProveError> {
+        use rayon::prelude::*;
+        const PIECE: usize = 1 << 12;
+        let per = core::mem::size_of::<P>() / 4;
+        debug_assert!(ELEMENT_WORDS.is_multiple_of(per));
+        let words = src.len() * per;
+        let mut dst = stream
+            .alloc_zeros::<u32>(words.max(1))
+            .map_err(|e| drv("allocate a resident vector", e))?;
+        self.upload(stream, &mut dst, 0, words, |start, out| {
+            // SAFETY: `Packed` promises plain `u32` words with no padding and every bit
+            // pattern valid, and a chunk is a whole number of `P` because the buffer is a
+            // whole number of `ELEMENT_WORDS`; 4-byte aligned like any `u32` slice.
+            let out = unsafe {
+                core::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<P>(), out.len() / per)
+            };
+            let src = &src[start / per..][..out.len()];
+            out.par_chunks_mut(PIECE)
+                .zip(src.par_chunks(PIECE))
+                .for_each(|(d, s)| pack(s, d));
+            Ok(())
+        })?;
+        Ok(dst)
     }
 }
 
@@ -551,14 +607,26 @@ impl CudaStages {
         // there is nothing to gather from, and the three tables go up a chunk at a time:
         // at 2^24 they are 1 GB, and the host this key is proved on may not have it spare.
         let rows_only = pk.h_basis != HBasis::SnarkjsOddCoset;
+        if !rows_only {
+            pk.coeffs
+                .check_structure(domain.size(), pk.n_vars)
+                .map_err(|e| bad(e.to_string()))?;
+        }
+        // The tables and the matrices' values are packed straight into the staging: none
+        // of them exists on the host as a whole vector. A gnark key has no values here.
+        let n = domain.size();
+        let (a, b) = (Matrix::A.index(), Matrix::B.index());
+        let nnz = pk.coeffs.value_id[a].len().max(pk.coeffs.value_id[b].len());
+        let mut staging = Staging::for_key(&ctx, n.max(nnz) * 8)?;
+        let tw_fwd = upload_powers(&stream, &mut staging, domain.group_gen(), n / 2)?;
+        let tw_inv = upload_powers(&stream, &mut staging, domain.group_gen_inv(), n / 2)?;
+        // shift^j for j in [0, n). Not the twiddles: the twiddles are powers of the domain's
+        // own root of unity and this is a primitive 2n-th root, so no table snarkrs-field
+        // builds can be reused.
+        let coset_pows = upload_powers(&stream, &mut staging, coset_shift, n)?;
         if rows_only {
-            let mut staging = Staging::new(&ctx)?;
-            let empty = || upload_words(&stream, &[]);
-            let n = domain.size();
-            let tw_fwd = upload_powers(&stream, &mut staging, domain.group_gen(), n / 2)?;
-            let tw_inv = upload_powers(&stream, &mut staging, domain.group_gen_inv(), n / 2)?;
-            let coset_pows = upload_powers(&stream, &mut staging, coset_shift, n)?;
             drop(staging);
+            let empty = || upload_words(&stream, &[]);
             return Ok(Self {
                 work: crate::msm::Work::Variable,
                 row_ptr: [empty()?, empty()?],
@@ -592,34 +660,24 @@ impl CudaStages {
             });
         }
 
-        pk.coeffs
-            .check_structure(domain.size(), pk.n_vars)
-            .map_err(|e| bad(e.to_string()))?;
-
-        // shift^j for j in [0, n). Not the twiddles: the twiddles are powers of the domain's
-        // own root of unity and this is a primitive 2n-th root, so no table snarkrs-field builds
-        // can be reused. A running product, one multiply per entry.
-        let mut pows = Vec::with_capacity(domain.size());
-        let mut acc = Fr::ONE;
-        for _ in 0..domain.size() {
-            pows.push(acc);
-            acc *= coset_shift;
-        }
-
-        // Bound to locals before the struct literal, because the closures borrow `stream`
-        // and the struct moves it.
+        // Each nonzero's interned value, looked up as it is packed.
+        let values = &pk.coeffs.values;
+        let mut up_values = |m: usize| {
+            staging.upload_packed(&stream, &pk.coeffs.value_id[m], |ids, out| {
+                for (d, &id) in out.iter_mut().zip(ids) {
+                    *d = PackedFr::from_fr(&values[id as usize]);
+                }
+            })
+        };
+        let value = [up_values(a)?, up_values(b)?];
+        drop(staging);
+        // Already plain words, so the driver copies them from where they are.
         let up_u32 = |data: &[u32]| upload_words(&stream, data);
-        let up_fr = |data: &[Fr]| upload_words(&stream, as_words(&PackedFr::pack_slice(data)));
-        let (a, b) = (Matrix::A.index(), Matrix::B.index());
         let row_ptr = [
             up_u32(&pk.coeffs.row_ptr[a])?,
             up_u32(&pk.coeffs.row_ptr[b])?,
         ];
         let signal = [up_u32(&pk.coeffs.signal[a])?, up_u32(&pk.coeffs.signal[b])?];
-        let value = [up_fr(&pk.coeffs.dense(a))?, up_fr(&pk.coeffs.dense(b))?];
-        let tw_fwd = up_fr(&domain.twiddles())?;
-        let tw_inv = up_fr(&domain.twiddles_inv())?;
-        let coset_pows = up_fr(&pows)?;
 
         Ok(Self {
             work: crate::msm::Work::Variable,
@@ -1530,6 +1588,7 @@ impl Drop for HHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::as_words;
 
     #[test]
     fn constant_metadata_preserves_fingerprint_without_classification() {
