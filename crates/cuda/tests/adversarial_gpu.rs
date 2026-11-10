@@ -1440,7 +1440,9 @@ fn every_domain_size_agrees_with_the_cpu() {
 /// A device memory budget below what the five MSMs take at once: `msms` cuts them into
 /// runs that fit and the sum is the CPU's, and a budget no run fits is refused, as a
 /// device fault, before anything is allocated. On a synthetic 2^14 key, so the limit
-/// stands in for a card too small for the circuit; both kinds of work.
+/// stands in for a card too small for the circuit; both kinds of work. Constant work's
+/// witness batch spills more (its slices shorten toward `slice_len_for`'s thread target):
+/// 6.4 MB against H's 7.8 MB whole, so 7 MB is the limit that cuts it.
 #[test]
 fn a_vram_limit_cuts_the_msms_into_runs_or_refuses_them() {
     let cpu = CpuBackend::new();
@@ -1464,6 +1466,7 @@ fn a_vram_limit_cuts_the_msms_into_runs_or_refuses_them() {
                 let (mut cut, mut refused) = (false, false);
                 for limit in [
                     u64::MAX,
+                    7 << 20,
                     4 << 20,
                     1 << 20,
                     512 << 10,

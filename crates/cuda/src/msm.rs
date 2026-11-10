@@ -197,9 +197,13 @@ const SEG_MIN_LEN: usize = 8;
 /// Variable work keeps [`SLICE_LEN`]. A constant-work accumulation runs every one of a
 /// slice's iterations as a dependent chain of complete additions, so at a small `n` a
 /// window of a few slices is a few threads each owing [`SLICE_LEN`] additions while the
-/// card idles: the slice halves until the grid reaches [`SEG_TARGET_THREADS`] or
-/// [`SEG_MIN_LEN`], the Metal twin's `slice_len_for`. A function of `n` and `c` alone,
-/// which the key fixes. `G16_CUDA_MSM_L` forces one length for both.
+/// card idles: the slice halves while the halved grid stays within
+/// [`SEG_TARGET_THREADS`], down to [`SEG_MIN_LEN`], the Metal twin's `slice_len_for`
+/// without its overshoot. Each slice owns two spill slots, so overshooting doubles the
+/// spill: a 2048-point witness batch at slice 16 needs 9.7 MB against H's 7.8 MB, and
+/// `fit_run` could then never cut it under a budget, where at 32 it needs 6.4. A
+/// function of `n` and `c` alone, which the key fixes. `G16_CUDA_MSM_L` forces one
+/// length for both.
 ///
 /// Measured on a Tesla T4 by `constant_work_phase_flatness`, accumulation plus fold in
 /// ms, G1 / G2: at n = 8 (c = 3) slice 64 reads 1.77 / 6.14 and the halving to 8 reads
@@ -227,7 +231,7 @@ fn slice_len_for(n: usize, c: u32, work: Work) -> usize {
     );
     let n_windows = RECODE_BITS.div_ceil(c as usize);
     let mut l = SLICE_LEN;
-    while l > min && n_windows * n.max(1).div_ceil(l) < target {
+    while l > min && n_windows * n.max(1).div_ceil(l / 2) <= target {
         l /= 2;
     }
     l
@@ -3533,6 +3537,27 @@ mod tests {
             Geometry::new(n, 3, usize::MAX, window_size(n), 64, Work::Constant).unwrap(),
             want
         );
+    }
+
+    #[test]
+    fn constant_slices_shorten_within_the_thread_target() {
+        for n in [0, 1, 8, 512, 1024, 2048, 4096, 1 << 15, 1 << 20] {
+            for c in 2..=MAX_WINDOW {
+                assert_eq!(slice_len_for(n, c, Work::Variable), SLICE_LEN);
+                let l = slice_len_for(n, c, Work::Constant);
+                let w = RECODE_BITS.div_ceil(c as usize);
+                assert!(l.is_power_of_two() && (SEG_MIN_LEN..=SLICE_LEN).contains(&l));
+                let grid = w * n.max(1).div_ceil(l);
+                assert!(l == SLICE_LEN || grid <= SEG_TARGET_THREADS, "n={n} c={c}");
+                assert!(
+                    l == SEG_MIN_LEN || w * n.max(1).div_ceil(l / 2) > SEG_TARGET_THREADS,
+                    "n={n} c={c}"
+                );
+            }
+        }
+        assert_eq!(slice_len_for(8, 3, Work::Constant), SEG_MIN_LEN);
+        assert_eq!(slice_len_for(2048, 7, Work::Constant), 32);
+        assert_eq!(slice_len_for(1 << 15, 11, Work::Constant), SLICE_LEN);
     }
 
     #[test]
