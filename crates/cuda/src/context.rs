@@ -9,7 +9,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
-use cudarc::driver::sys::CUresult;
+use cudarc::driver::sys::{CUctx_flags, CUresult};
 use cudarc::driver::{
     CudaContext, CudaEvent, CudaFunction, CudaModule, CudaSlice, CudaStream, DriverError,
 };
@@ -254,6 +254,9 @@ impl Cuda {
         let t_open = std::time::Instant::now();
         libcuda_loadable()?;
         let ctx = CudaContext::new(ordinal).map_err(|e| CudaError::NoDevice(e.to_string()))?;
+        if let Some(flags) = sync_flags(std::env::var("G16_CUDA_SYNC").ok().as_deref())? {
+            ctx.set_flags(flags)?;
+        }
         let stream = if private {
             // SAFETY: nothing has been allocated on this context handle yet, and every
             // allocation and launch made through it goes to the one stream below, so no
@@ -545,6 +548,24 @@ pub(crate) fn time_enabled() -> bool {
     std::env::var("G16_CUDA_TIME").as_deref() == Ok("1")
 }
 
+/// `G16_CUDA_SYNC=spin|yield|blocking`: how a host thread waits in a synchronize, as the
+/// context's `CU_CTX_SCHED_*` flag. Unset leaves the driver's choice, which spins while
+/// the process has fewer contexts than cores, so a waiting proof holds a whole core.
+/// Blocking frees it for about 1% of a warm proof on a T4, but costs 5 to 13% when other
+/// work keeps every host core busy, since the woken thread then waits for a core.
+fn sync_flags(v: Option<&str>) -> Result<Option<CUctx_flags>, CudaError> {
+    use CUctx_flags::*;
+    match v.map(str::trim) {
+        None => Ok(None),
+        Some("spin") => Ok(Some(CU_CTX_SCHED_SPIN)),
+        Some("yield") => Ok(Some(CU_CTX_SCHED_YIELD)),
+        Some("blocking") => Ok(Some(CU_CTX_SCHED_BLOCKING_SYNC)),
+        Some(other) => Err(CudaError::Other(format!(
+            "G16_CUDA_SYNC={other:?} is not spin, yield or blocking"
+        ))),
+    }
+}
+
 /// `lock`, whether or not a thread panicked while holding it: it guards no data, only the
 /// ordering of queries and allocations.
 pub(crate) fn plan_lock(lock: &Mutex<()>) -> MutexGuard<'_, ()> {
@@ -629,6 +650,22 @@ mod tests {
         // And anything older than Volta is refused rather than silently miscompiled.
         assert!(arch_flag((6, 1)).is_err());
         assert!(arch_flag((5, 0)).is_err());
+    }
+
+    #[test]
+    fn sync_mode_parses_the_three_modes_and_refuses_the_rest() {
+        use CUctx_flags::*;
+        assert_eq!(sync_flags(None).unwrap(), None);
+        assert_eq!(sync_flags(Some("spin")).unwrap(), Some(CU_CTX_SCHED_SPIN));
+        assert_eq!(sync_flags(Some("yield")).unwrap(), Some(CU_CTX_SCHED_YIELD));
+        assert_eq!(
+            sync_flags(Some(" blocking\n")).unwrap(),
+            Some(CU_CTX_SCHED_BLOCKING_SYNC)
+        );
+        for bad in ["", "auto", "Blocking", "block"] {
+            let e = sync_flags(Some(bad)).unwrap_err().to_string();
+            assert!(e.contains("G16_CUDA_SYNC"), "{e}");
+        }
     }
 
     /// The mapping `g16 prove --fallback` retries on, checked code by code so it runs on a
