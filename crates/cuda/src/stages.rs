@@ -41,7 +41,7 @@
 //! table) is witness independent, is uploaded once in [`CudaStages::new`], and stays
 //! resident. A prover that rebuilt this per proof would be measuring its own key upload.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -441,6 +441,8 @@ pub struct CudaStages {
     /// `StageTimings` has no field for it and folding it into `gather_us` without saying so
     /// would hide the one cost the unified-memory Metal backend does not pay at all.
     last_upload_us: AtomicU64,
+    /// Kernel launches issued so far, which a device test holds [`Self::launch_count`] to.
+    launches: AtomicUsize,
 }
 
 impl CudaStages {
@@ -586,6 +588,7 @@ impl CudaStages {
                 block,
                 pool: Arc::new(Mutex::new(Vec::new())),
                 last_upload_us: AtomicU64::new(0),
+                launches: AtomicUsize::new(0),
             });
         }
 
@@ -647,6 +650,7 @@ impl CudaStages {
             block,
             pool: Arc::new(Mutex::new(Vec::new())),
             last_upload_us: AtomicU64::new(0),
+            launches: AtomicUsize::new(0),
         })
     }
 
@@ -719,7 +723,8 @@ impl CudaStages {
     ///
     /// The fused path: the witness mont-to-std, the gather, and one launch per batch for
     /// each of the six transforms. `G16_CUDA_UNFUSED` adds the standalone `g16_h_join`, and
-    /// that is read from the environment inside `compute_h` rather than here.
+    /// that is read from the environment inside `compute_h` rather than here. The device
+    /// test `compute_h_issues_launch_count_launches` counts the launches themselves.
     pub fn launch_count(&self) -> usize {
         2 + 6 * self.batches.len()
     }
@@ -1045,6 +1050,7 @@ impl CudaStages {
         // domain sized, `rows <= n` was checked by the caller, and the kernel guards its
         // tail block.
         unsafe { lb.launch(cfg) }.map_err(|e| drv("launch g16_rows_abc", e))?;
+        self.launches.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -1087,6 +1093,7 @@ impl CudaStages {
         // `n - j` for `j > 0`) is below `n`, and it guards its tail block. `t` and the H
         // buffers are distinct allocations, so no thread reads what another writes.
         unsafe { lb.launch(cfg) }.map_err(|e| drv("launch g16_gnark_coeffs", e))?;
+        self.launches.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -1106,6 +1113,7 @@ impl CudaStages {
         // exactly `n_vars` packed elements and the kernel's `gid >= n` guard covers the
         // tail block.
         unsafe { lb.launch(cfg) }.map_err(|e| drv("launch g16_mont_to_std", e))?;
+        self.launches.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -1136,6 +1144,7 @@ impl CudaStages {
         // against `n_vars` in `new`, so no thread reads out of bounds; the kernel's
         // `gid >= n` guard covers the tail block.
         unsafe { lb.launch(cfg) }.map_err(|e| drv("launch g16_gather_abc", e))?;
+        self.launches.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -1243,6 +1252,7 @@ impl CudaStages {
         // by-value block it expects, the launch's shared memory is exactly the 2^k * 32
         // bytes it indexes, and every buffer this mode dereferences is domain sized.
         unsafe { lb.launch(cfg) }.map_err(|e| drv("launch g16_ntt_head", e))?;
+        self.launches.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -1279,6 +1289,7 @@ impl CudaStages {
         // only occurs as the single batch of a size-1 domain, and `split_passes` gives that
         // domain exactly one batch, which the head serves.
         unsafe { lb.launch(cfg) }.map_err(|e| drv("launch g16_ntt_tail", e))?;
+        self.launches.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -1300,6 +1311,7 @@ impl CudaStages {
             .arg(&nn);
         // SAFETY: six parameters, all domain sized, and the kernel guards its tail block.
         unsafe { lb.launch(cfg) }.map_err(|e| drv("launch g16_h_join", e))?;
+        self.launches.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -1707,6 +1719,39 @@ mod tests {
                 kernels::NTT_CU.contains(&spaced) || kernels::NTT_CU.contains(&tight),
                 "kernels/ntt.cu does not define {name} as {want}"
             );
+        }
+    }
+
+    /// [`CudaStages::launch_count`] is what [`CudaStages::compute_h`] actually issues, on a
+    /// one-batch and a two-batch domain, so a launch added to the pipeline without the count
+    /// fails here rather than only in a report.
+    #[test]
+    #[ignore = "requires a CUDA device and tiny_mul and sha256 under G16_ARTIFACTS or bench/artifacts"]
+    fn compute_h_issues_launch_count_launches() {
+        let root = std::env::var_os("G16_ARTIFACTS")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/artifacts")
+            });
+        let cuda = Cuda::new(0).expect("CUDA device");
+        let unfused = std::env::var_os("G16_CUDA_UNFUSED").is_some();
+        for name in ["tiny_mul", "sha256"] {
+            let dir = root.join(name);
+            let pk = ProvingKey::load(&dir.join("circuit.zkey")).expect("proving key");
+            let w = snarkrs_formats::wtns::Witness::load(&dir.join("circuit.wtns"))
+                .expect("witness")
+                .0;
+            let stages = CudaStages::new(&cuda, &pk).unwrap();
+            for _ in 0..2 {
+                let before = stages.launches.load(Ordering::Relaxed);
+                stages.compute_h(&w, &mut StageTimings::default()).unwrap();
+                let issued = stages.launches.load(Ordering::Relaxed) - before;
+                eprintln!(
+                    "{name}: {issued} launches, batches {:?}",
+                    stages.pass_batches()
+                );
+                assert_eq!(issued, stages.launch_count() + unfused as usize, "{name}");
+            }
         }
     }
 }
