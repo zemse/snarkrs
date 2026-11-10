@@ -414,10 +414,10 @@ extern "C" __global__ void msm_mont_to_std(const Fr* in, Fr* out, u32 len) {
     }
 }
 
-// The position thread `gid` of the digit pipeline reads: `gid` itself, or under a
-// key's live index (`indexed != 0`) the gid-th position whose base is not the point at
-// infinity, which the host fixed from the key at prepare. The scalar is read at it and
-// the scatter's entry names it, so the accumulation reads its base unchanged.
+// The position thread `gid` of the digit pipeline or the ones scan reads: `gid` itself,
+// or under a key's live index (`indexed != 0`) the gid-th position whose base is not the
+// point at infinity, which the host fixed from the key at prepare. The scalar is read at
+// it and the scatter's entry names it, so the accumulation reads its base unchanged.
 __device__ __forceinline__ u32 msm_source(const u32* live, u32 indexed, u32 gid) {
     return indexed != 0u ? live[gid] : gid;
 }
@@ -1323,13 +1323,16 @@ __device__ __forceinline__ void msm_ones_impl(const u32* scalars,
                                               const Aff<F>* bases,
                                               Xyzz<F>* out,
                                               MsmParams p,
+                                              const u32* live,
+                                              u32 indexed,
                                               Xyzz<F>* shared,
                                               u32 g,
                                               u32 tid,
                                               u32 tcount) {
     u32 stride = p.ones_groups * tcount;
     Xyzz<F> acc = pt_zero<F>();
-    for (u32 i = g * tcount + tid; i < p.n; i += stride) {
+    for (u32 gid = g * tcount + tid; gid < p.n; gid += stride) {
+        u32 i = msm_source(live, indexed, gid);
         u32 s[8];
         u32 base = (p.scalar_off + i) * 8u;
 #pragma unroll
@@ -1354,14 +1357,14 @@ __device__ __forceinline__ void msm_ones_impl(const u32* scalars,
     }
 }
 
-extern "C" __global__ void msm_ones_g1(const u32* scalars, const AffG1* bases, PtG1* out, MsmParams p) {
+extern "C" __global__ void msm_ones_g1(const u32* scalars, const AffG1* bases, PtG1* out, MsmParams p, const u32* live, u32 indexed) {
     __shared__ PtG1 shared[REDUCE_TG];
-    msm_ones_impl<Fq>(scalars, bases, out, p, shared, blockIdx.x, threadIdx.x, blockDim.x);
+    msm_ones_impl<Fq>(scalars, bases, out, p, live, indexed, shared, blockIdx.x, threadIdx.x, blockDim.x);
 }
 
-extern "C" __global__ void msm_ones_g2(const u32* scalars, const AffG2* bases, PtG2* out, MsmParams p) {
+extern "C" __global__ void msm_ones_g2(const u32* scalars, const AffG2* bases, PtG2* out, MsmParams p, const u32* live, u32 indexed) {
     __shared__ PtG2 shared[REDUCE_TG];
-    msm_ones_impl<Fq2>(scalars, bases, out, p, shared, blockIdx.x, threadIdx.x, blockDim.x);
+    msm_ones_impl<Fq2>(scalars, bases, out, p, live, indexed, shared, blockIdx.x, threadIdx.x, blockDim.x);
 }
 
 #endif // G16_MSM_CU

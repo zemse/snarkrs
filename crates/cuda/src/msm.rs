@@ -302,6 +302,8 @@ struct Geometry {
     merge_wide_min: usize,
     /// Blocks per window in the reduce; see [`reduce_groups_for`].
     reduce_groups: usize,
+    /// Blocks of the ones scan, 0 under constant work; see [`ones_groups_for`].
+    ones_groups: usize,
 }
 
 impl Geometry {
@@ -370,6 +372,11 @@ impl Geometry {
                 || reduce_groups_for(n_windows, n_buckets),
                 |g| g.clamp(1, n_buckets),
             ),
+            ones_groups: if work == Work::Constant {
+                0
+            } else {
+                ones_groups_for(n)
+            },
         };
         checked_words(g.rows(), G2_WORDS)?;
         checked_words(
@@ -767,8 +774,8 @@ fn output_words(g: &Geometry, pw: usize) -> Result<Vec<usize>, ProveError> {
         g.spill_slots(),
         g.n_windows * pw,
     ]);
-    if g.dummy_rows == 0 {
-        words.push(ones_groups_for(g.n) * pw);
+    if g.ones_groups != 0 {
+        words.push(g.ones_groups * pw);
     }
     Ok(words)
 }
@@ -1273,22 +1280,32 @@ pub struct Scalars<'a> {
 }
 
 /// Ascending positions of a base vector that are not the point at infinity, kept on the
-/// device beside it. A constant-work job over the witness reads only these: a base at
-/// infinity adds nothing whatever its scalar, and which bases are at infinity is the
-/// key's, so the plan's length and every loop it sizes stay the key's too. The CPU
+/// device beside it. A job over the witness reads only these: a base at infinity adds
+/// nothing whatever its scalar, and which bases are at infinity is the key's, so under
+/// constant work the plan's length and every loop it sizes stay the key's too. The CPU
 /// backend drops the same bases (`prescan` in snarkrs-msm). Built at [`CudaMsm::with_key`]
 /// only when some base is at infinity.
+///
+/// Variable work skips a base at infinity in `pt_madd`, but its warp still waits out the
+/// other lanes' additions, so a general scalar there cost a full addition a window; on
+/// railgun-13x01 69% of the general scalars of B sit at such positions. Reading through
+/// the index took the T4's warm variable proof from 116.9 to 80.5 ms there, tornado from
+/// 31.4 to 26.2, anon-aadhaar from 312.1 to 298.8 and sha256 from 15.8 to 14.7.
 struct Live {
     buf: CudaSlice<u32>,
     positions: Vec<u32>,
 }
 
-/// A run of a [`Live`]: `positions` is `buf[off..off + positions.len()]` on the host.
+/// A run of a [`Live`]: `positions` is `buf[off..off + positions.len()]` on the host,
+/// `general` how many of them hold a general scalar (all of them when unclassified), and
+/// `span` the length of the run of the vector they were picked from.
 #[derive(Clone, Copy)]
 struct Index<'a> {
     buf: &'a CudaSlice<u32>,
     off: usize,
     positions: &'a [u32],
+    general: usize,
+    span: usize,
 }
 
 /// The positions of `infinity` that are false, or `None` when none is true.
@@ -1373,10 +1390,20 @@ impl<'a> Scalars<'a> {
         let hi = live
             .positions
             .partition_point(|&p| (p as usize) < range.end);
+        let positions = &live.positions[lo..hi];
+        let general = match self.general_prefix {
+            Some(p) => positions
+                .iter()
+                .map(|&i| (p[i as usize + 1] - p[i as usize]) as usize)
+                .sum(),
+            None => positions.len(),
+        };
         let index = Index {
             buf: &live.buf,
             off: lo,
-            positions: &live.positions[lo..hi],
+            positions,
+            general,
+            span: range.len(),
         };
         let s = Self {
             index: Some(index),
@@ -1387,11 +1414,13 @@ impl<'a> Scalars<'a> {
     }
 
     /// General scalars in `range`, or the whole range's length when the buffer came from the
-    /// device and was never classified on the host. Overestimating is safe.
+    /// device and was never classified on the host. Overestimating is safe. Under an index
+    /// `range` is its whole run, the only range a job reads through it.
     fn general_in(&self, range: &Range<usize>) -> usize {
-        match self.general_prefix {
-            Some(p) => (p[range.end] - p[range.start]) as usize,
-            None => range.len(),
+        match (self.index, self.general_prefix) {
+            (Some(i), _) => i.general,
+            (None, Some(p)) => (p[range.end] - p[range.start]) as usize,
+            (None, None) => range.len(),
         }
     }
 }
@@ -1698,7 +1727,7 @@ pub struct CudaMsm {
 
     n_vars: usize,
     n_public: usize,
-    /// The key's [`Live`] positions of A and of B (both groups), which constant work reads.
+    /// The key's [`Live`] positions of A and of B (both groups), which A and B read through.
     a_live: Option<Live>,
     b_live: Option<Live>,
     /// Bound as the index argument of a plan without one.
@@ -1809,7 +1838,7 @@ impl CudaMsm {
     /// which the key fixes (`Live`), so such a base costs nothing rather than an addition
     /// kept away by select in every window: on the shipped keys 30 to 40% of A and 49 to
     /// 64% of B (both groups) on sha256, keccak256 and anon-aadhaar, 3% on rsa2048. A and
-    /// B then plan separately, where variable work shares one plan. Warm on a T4 that took
+    /// B then plan separately, as they do under variable work. Warm on a T4 that took
     /// sha256 from 109.4 to 75.0 ms, keccak256 from 277.9 to 232.7 and anon-aadhaar from
     /// 1310 to 898.
     pub fn constant_work(mut self) -> Self {
@@ -2555,8 +2584,8 @@ impl CudaMsm {
         // truncating would drop the tail of `H` and produce a proof that only fails at
         // verification.
         let h_n = h_scalars.len();
-        let (wa, a_n, _) = w.select(self.live(&self.a_live), 0..n);
-        let (wb, b_n, _) = w.select(self.live(&self.b_live), 0..n);
+        let (wa, a_n, _) = w.select(self.a_live.as_ref(), 0..n);
+        let (wb, b_n, _) = w.select(self.b_live.as_ref(), 0..n);
         let jobs = vec![
             Job::G1(JobG1 {
                 bases: &self.a,
@@ -2617,16 +2646,11 @@ impl CudaMsm {
 
         // Host launch time is not added: the launches are asynchronous, so it overlaps the
         // device work the event pair already counted. What is added is the two things that
-        // genuinely happen with the device idle. One event pair over each batch, and A and
-        // both B jobs share a digit plan, so `msm_split` stays `None`.
+        // genuinely happen with the device idle. One event pair over each batch, so
+        // `msm_split` stays `None`.
         t.msm_us += upload_us + self.last_device_us() + self.last_combine_us();
 
         Ok(out)
-    }
-
-    /// A [`Live`] index a job of this object reads through: constant work only.
-    fn live<'b>(&self, live: &'b Option<Live>) -> Option<&'b Live> {
-        live.as_ref().filter(|_| self.work == Work::Constant)
     }
 
     /// The longest run of at most `cap` points whose every batch in [`resident_schedule`]
@@ -2656,7 +2680,8 @@ impl CudaMsm {
     }
 
     /// The jobs of one batch of [`resident_schedule`]: a run of the witness is A and both B,
-    /// sharing their digit plan; L and H are a batch a run.
+    /// both B sharing their digit plan and A too when the key has no [`Live`] index; L and
+    /// H are a batch a run.
     fn run_jobs<'a>(
         &'a self,
         stage: Resident,
@@ -2674,8 +2699,8 @@ impl CudaMsm {
                 n,
             })
         };
-        let (wa, a_n, a_off) = w.select(self.live(&self.a_live), off..off + n);
-        let (wb, b_n, b_off) = w.select(self.live(&self.b_live), off..off + n);
+        let (wa, a_n, a_off) = w.select(self.a_live.as_ref(), off..off + n);
+        let (wb, b_n, b_off) = w.select(self.b_live.as_ref(), off..off + n);
         let g1_live = |bases, scalars, off, n| {
             Job::G1(JobG1 {
                 bases,
@@ -2742,8 +2767,8 @@ impl CudaMsm {
 
     /// Stages 5 to 9 when the standard-form witness and `H` are already on the device, every
     /// MSM cut into runs of at most `chunk` points: the batches [`resident_schedule`] lists,
-    /// run one after another. A run of the witness is one batch of A and both B, sharing
-    /// their digit plan as [`Self::msms`] does; L and H are a batch a run.
+    /// run one after another. A run of the witness is one batch of A and both B, planned as
+    /// [`Self::msms`] plans them; L and H are a batch a run.
     ///
     /// A batch's scratch is then bounded by the run rather than by the key. Unchunked, a
     /// 2^24 key's five MSMs ask for about 25 GB of entries and spill slots at once; in runs
@@ -2868,7 +2893,8 @@ impl CudaMsm {
         Ok(())
     }
 
-    /// The index arguments of `msm_count` and `msm_scatter`: the plan's index run and 1,
+    /// The index arguments of `msm_count`, `msm_scatter` and `msm_ones_*`: the plan's index
+    /// run and 1,
     /// or a one-word buffer the kernels never read and 0.
     fn live_arg<'b>(&'b self, p: &Plan<'b>) -> (CudaView<'b, u32>, u32) {
         match p.index {
@@ -3111,11 +3137,18 @@ impl CudaMsm {
         };
         let (ones, (bases, ..)) = (&self.k.group(job.group()).ones, job.bases());
         let cfg = ones.cfg_blocks(out.ones_groups, REDUCE_TG);
+        let (live, indexed) = self.live_arg(p);
         let mut lb = self.stream.launch_builder(&ones.f);
-        lb.arg(p.scalars).arg(bases).arg(ones_out).arg(params);
-        // SAFETY: four parameters in order; the grid is exactly `ones_groups` blocks, which
+        lb.arg(p.scalars)
+            .arg(bases)
+            .arg(ones_out)
+            .arg(params)
+            .arg(&live)
+            .arg(&indexed);
+        // SAFETY: six parameters in order; the grid is exactly `ones_groups` blocks, which
         // is what `blockIdx.x` indexes into `ones`, and the grid-stride loop is bounded by
-        // `p.n`, itself bounds checked against both the scalar and the base vector.
+        // `p.n`, itself bounds checked against both the scalar and the base vector, through
+        // the index when there is one, whose run holds `n` positions.
         unsafe { lb.launch(cfg) }.map_err(|e| drv("launch msm_ones", e))?;
         #[cfg(test)]
         self.activity.ones_launches.fetch_add(1, Ordering::Relaxed);
@@ -3159,7 +3192,7 @@ impl<'a> Plan<'a> {
             scalars.general_in(&(scalar_off..scalar_off + n))
         };
         let c = pick_window(msm.window, general, msm.work);
-        Geometry::with_shapes(
+        let mut g = Geometry::with_shapes(
             n,
             scalar_off,
             general,
@@ -3167,7 +3200,15 @@ impl<'a> Plan<'a> {
             slice_len_for(n, c, msm.work),
             msm.work,
             msm.shapes,
-        )
+        )?;
+        // The ones scan is a dependent chain a thread, latency-bound, so under an index its
+        // grid stays the one the whole run would get: a thread's chain only shortens. Sized
+        // from the index run, sha256's B scan ran 3 blocks where it had 8, at a higher
+        // density of ones, and the proof read 3.6% slower.
+        if let (Some(i), true) = (scalars.index, g.ones_groups != 0) {
+            g.ones_groups = ones_groups_for(i.span);
+        }
+        Ok(g)
     }
 
     fn new(
@@ -3238,11 +3279,7 @@ impl Outputs {
     fn new(msm: &CudaMsm, job: &Job<'_>, plan: &Plan<'_>) -> Result<Self, ProveError> {
         let (group, (_, _, base_off)) = (job.group(), job.bases());
         let point_words = group.words();
-        let ones_groups = if plan.dummy_rows == 0 {
-            ones_groups_for(plan.n)
-        } else {
-            0
-        };
+        let ones_groups = plan.ones_groups;
         let rows = plan.rows();
         let mut folds = Vec::new();
         for params in plan.fold_levels() {
@@ -3795,9 +3832,9 @@ mod tests {
             2
         );
         assert_eq!(src.matches("row = msm_dummy_row(p, w, gid);").count(), 2);
-        // Count and scatter read a scalar, and the scatter names its base, through the
-        // key's live index when there is one.
-        assert_eq!(src.matches("msm_source(live, indexed, gid)").count(), 2);
+        // Count, scatter and the ones scan read a scalar, and the scatter names its base,
+        // through the key's live index when there is one.
+        assert_eq!(src.matches("msm_source(live, indexed, gid)").count(), 3);
         assert!(src.contains("e.y = (src << 1) | (neg ? 1u : 0u);"));
         assert!(src.contains("u32 used = cursor[last] - base;"));
         assert!(src.contains("msm_reduce_impl<Fq, ProjG1>"));
@@ -4896,12 +4933,13 @@ mod tests {
         );
     }
 
-    /// Constant work on the sha256 key, whose A and B queries are 36% and 64% at infinity,
-    /// reads only the live positions, in one batch and cut into runs that do not line up
-    /// with them, and agrees with variable work, which reads every position.
+    /// Variable and constant work on the sha256 key, whose A and B queries are 36% and 64%
+    /// at infinity, read only the live positions, in one batch and cut into runs that do
+    /// not line up with them, and agree with variable work without the index, which reads
+    /// every position.
     #[test]
     #[ignore = "requires a CUDA device and sha256/circuit.zkey under G16_ARTIFACTS or bench/artifacts"]
-    fn constant_work_reads_only_the_live_bases_whole_and_in_runs() {
+    fn both_works_read_only_the_live_bases_whole_and_in_runs() {
         let Some(cuda) = device() else { return };
         let path = std::env::var_os("G16_ARTIFACTS")
             .map(std::path::PathBuf::from)
@@ -4919,30 +4957,40 @@ mod tests {
         let witness: Vec<Fr> = (0..pk.n_vars).map(|_| fr()).collect();
         let h_host: Vec<Fr> = (0..pk.domain_size).map(|_| fr()).collect();
         let h = HPoly::Host(h_host.clone());
-        let want = CudaMsm::new(&cuda, &pk)
-            .unwrap()
+        let mut every = CudaMsm::new(&cuda, &pk).unwrap();
+        (every.a_live, every.b_live) = (None, None);
+        let want = every
             .msms(&witness, &h, &mut StageTimings::default())
             .unwrap();
         let module = CudaMsm::compile_with(&cuda, Work::Constant).unwrap();
-        let m = CudaMsm::from_module(&cuda, module)
+        let constant = CudaMsm::from_module(&cuda, module)
             .unwrap()
             .with_key(&pk)
             .unwrap()
             .constant_work();
-        let (a, b) = (m.a_live.as_ref().unwrap(), m.b_live.as_ref().unwrap());
-        assert_eq!(a.positions.len(), 59170 - 21041);
-        assert_eq!(b.positions.len(), 59170 - 37586);
-        let got = m.msms(&witness, &h, &mut StageTimings::default()).unwrap();
-        assert_eq!(m.last_runs(), 1);
-        assert_eq!(got, want);
-        let w = m.upload_scalars(&witness).unwrap();
-        let hs = m.upload_scalars(&h_host).unwrap();
-        for run in [1000, 1 << 14] {
+        for m in [CudaMsm::new(&cuda, &pk).unwrap(), constant] {
+            let work = m.work;
+            let (a, b) = (m.a_live.as_ref().unwrap(), m.b_live.as_ref().unwrap());
+            assert_eq!(a.positions.len(), 59170 - 21041);
+            assert_eq!(b.positions.len(), 59170 - 37586);
+            let got = m.msms(&witness, &h, &mut StageTimings::default()).unwrap();
+            assert_eq!(m.last_runs(), 1);
+            assert_eq!(got, want, "{work:?}");
+            let w = m.upload_scalars(&witness).unwrap();
+            let hs = m.upload_scalars(&h_host).unwrap();
+            for run in [1000, 1 << 14] {
+                let got = m
+                    .run_schedule(w.as_scalars(), hs.as_scalars(), h_host.len(), run)
+                    .unwrap();
+                assert!(m.last_runs() > 3, "{work:?} run {run}");
+                assert_eq!(got, want, "{work:?} run {run}");
+            }
+            // Unclassified, as `msms_resident` reads the witness.
+            let wd = Scalars::device_std(&w.buf, witness.len()).unwrap();
             let got = m
-                .run_schedule(w.as_scalars(), hs.as_scalars(), h_host.len(), run)
+                .run_schedule(wd, hs.as_scalars(), h_host.len(), 1 << 14)
                 .unwrap();
-            assert!(m.last_runs() > 3, "run {run}");
-            assert_eq!(got, want, "run {run}");
+            assert_eq!(got, want, "{work:?} unclassified");
         }
     }
 
