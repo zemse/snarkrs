@@ -1057,6 +1057,49 @@ pub enum Job<'a> {
     G2(JobG2<'a>),
 }
 
+/// Which group a job's points are in, for the code that does not need their type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Group {
+    G1,
+    G2,
+}
+
+impl Group {
+    /// Words one XYZZ point of this group takes on the device.
+    fn words(self) -> usize {
+        match self {
+            Group::G1 => G1_WORDS,
+            Group::G2 => G2_WORDS,
+        }
+    }
+}
+
+/// The fields the batch reads off a job, the same whichever group it is in.
+impl<'a> Job<'a> {
+    fn group(&self) -> Group {
+        match self {
+            Job::G1(_) => Group::G1,
+            Job::G2(_) => Group::G2,
+        }
+    }
+
+    /// The scalar buffer, the offset into it and the length.
+    fn scalars(&self) -> (Scalars<'a>, usize, usize) {
+        match *self {
+            Job::G1(ref j) => (j.scalars, j.scalar_off, j.n),
+            Job::G2(ref j) => (j.scalars, j.scalar_off, j.n),
+        }
+    }
+
+    /// The packed base buffer, the bases it holds and the offset into it.
+    fn bases(&self) -> (&'a CudaSlice<u32>, usize, usize) {
+        match *self {
+            Job::G1(ref j) => (&j.bases.buf, j.bases.len, j.base_off),
+            Job::G2(ref j) => (&j.bases.buf, j.bases.len, j.base_off),
+        }
+    }
+}
+
 fn validate_job_ranges(
     soff: usize,
     n: usize,
@@ -1172,20 +1215,19 @@ struct Kernels {
     count: Kernel,
     scan: Kernel,
     scatter: Kernel,
-    clear_g1: Kernel,
-    clear_g2: Kernel,
-    accumulate_g1: Kernel,
-    accumulate_g2: Kernel,
-    segmented_g1: Kernel,
-    segmented_g2: Kernel,
-    merge_g1: Kernel,
-    merge_g2: Kernel,
-    merge_wide_g1: Kernel,
-    merge_wide_g2: Kernel,
-    reduce_g1: Kernel,
-    reduce_g2: Kernel,
-    ones_g1: Kernel,
-    ones_g2: Kernel,
+    g1: GroupKernels,
+    g2: GroupKernels,
+}
+
+/// The point kernels of one group, `msm_*_g1` or `msm_*_g2`.
+struct GroupKernels {
+    clear: Kernel,
+    accumulate: Kernel,
+    segmented: Kernel,
+    merge: Kernel,
+    merge_wide: Kernel,
+    reduce: Kernel,
+    ones: Kernel,
     /// Present only in a module from [`CudaMsm::compile_with`] with [`Work::Constant`].
     constant: Option<ConstantKernels>,
 }
@@ -1194,10 +1236,17 @@ struct Kernels {
 struct ConstantKernels {
     /// The accumulation for plans with dummy rows: selects instead of branches and the
     /// complete formulas; see `msm_segmented_constant_impl` in `kernels/msm.cu`.
-    segmented_g1: Kernel,
-    segmented_g2: Kernel,
-    fold_g1: Kernel,
-    fold_g2: Kernel,
+    segmented: Kernel,
+    fold: Kernel,
+}
+
+impl Kernels {
+    fn group(&self, g: Group) -> &GroupKernels {
+        match g {
+            Group::G1 => &self.g1,
+            Group::G2 => &self.g2,
+        }
+    }
 }
 
 /// Threads a block for the trivial kernels. `zero_u32` and the two bucket clears take six
@@ -1402,36 +1451,43 @@ impl CudaMsm {
     /// launched on another context's stream is an invalid-handle failure at launch, not at
     /// bind, which is a long way from the mistake.
     pub fn from_module(cuda: &Cuda, module: Arc<CudaModule>) -> Result<Self, ProveError> {
+        // A variable-work unit has no such entry, and that absence is the whole test:
+        // the reduce's constant branch is compiled under the same define.
+        let has_constant = module.load_function("msm_fold_g1").is_ok();
+        let constant = |segmented, fold| -> Result<_, ProveError> {
+            if !has_constant {
+                return Ok(None);
+            }
+            Ok(Some(ConstantKernels {
+                segmented: Kernel::load(&module, segmented)?,
+                fold: Kernel::load(&module, fold)?,
+            }))
+        };
         let k = Kernels {
             zero_u32: Kernel::load(&module, "zero_u32")?,
             mont_to_std: Kernel::load(&module, "fr_mont_to_std")?,
             count: Kernel::load(&module, "msm_count")?,
             scan: Kernel::load(&module, "msm_scan")?,
             scatter: Kernel::load(&module, "msm_scatter")?,
-            clear_g1: Kernel::load(&module, "msm_clear_g1")?,
-            clear_g2: Kernel::load(&module, "msm_clear_g2")?,
-            accumulate_g1: Kernel::load(&module, "msm_accumulate_g1")?,
-            accumulate_g2: Kernel::load(&module, "msm_accumulate_g2")?,
-            segmented_g1: Kernel::load(&module, "msm_segmented_g1")?,
-            segmented_g2: Kernel::load(&module, "msm_segmented_g2")?,
-            merge_g1: Kernel::load(&module, "msm_merge_g1")?,
-            merge_g2: Kernel::load(&module, "msm_merge_g2")?,
-            merge_wide_g1: Kernel::load(&module, "msm_merge_wide_g1")?,
-            merge_wide_g2: Kernel::load(&module, "msm_merge_wide_g2")?,
-            reduce_g1: Kernel::load(&module, "msm_reduce_g1")?,
-            reduce_g2: Kernel::load(&module, "msm_reduce_g2")?,
-            ones_g1: Kernel::load(&module, "msm_ones_g1")?,
-            ones_g2: Kernel::load(&module, "msm_ones_g2")?,
-            // A variable-work unit has no such entry, and that absence is the whole test:
-            // the reduce's constant branch is compiled under the same define.
-            constant: match module.load_function("msm_fold_g1") {
-                Ok(_) => Some(ConstantKernels {
-                    segmented_g1: Kernel::load(&module, "msm_segmented_constant_g1")?,
-                    segmented_g2: Kernel::load(&module, "msm_segmented_constant_g2")?,
-                    fold_g1: Kernel::load(&module, "msm_fold_g1")?,
-                    fold_g2: Kernel::load(&module, "msm_fold_g2")?,
-                }),
-                Err(_) => None,
+            g1: GroupKernels {
+                clear: Kernel::load(&module, "msm_clear_g1")?,
+                accumulate: Kernel::load(&module, "msm_accumulate_g1")?,
+                segmented: Kernel::load(&module, "msm_segmented_g1")?,
+                merge: Kernel::load(&module, "msm_merge_g1")?,
+                merge_wide: Kernel::load(&module, "msm_merge_wide_g1")?,
+                reduce: Kernel::load(&module, "msm_reduce_g1")?,
+                ones: Kernel::load(&module, "msm_ones_g1")?,
+                constant: constant("msm_segmented_constant_g1", "msm_fold_g1")?,
+            },
+            g2: GroupKernels {
+                clear: Kernel::load(&module, "msm_clear_g2")?,
+                accumulate: Kernel::load(&module, "msm_accumulate_g2")?,
+                segmented: Kernel::load(&module, "msm_segmented_g2")?,
+                merge: Kernel::load(&module, "msm_merge_g2")?,
+                merge_wide: Kernel::load(&module, "msm_merge_wide_g2")?,
+                reduce: Kernel::load(&module, "msm_reduce_g2")?,
+                ones: Kernel::load(&module, "msm_ones_g2")?,
+                constant: constant("msm_segmented_constant_g2", "msm_fold_g2")?,
             },
         };
 
@@ -1593,10 +1649,7 @@ impl CudaMsm {
         let mut plans: HashMap<(usize, usize, usize), Geometry> = HashMap::new();
         let mut words = Vec::new();
         for job in jobs {
-            let (scalars, soff, n, pw) = match job {
-                Job::G1(j) => (j.scalars, j.scalar_off, j.n, G1_WORDS),
-                Job::G2(j) => (j.scalars, j.scalar_off, j.n, G2_WORDS),
-            };
+            let (scalars, soff, n) = job.scalars();
             let key = (scalars.buf as *const CudaSlice<u32> as usize, soff, n);
             let g = match plans.get(&key) {
                 Some(g) => *g,
@@ -1607,7 +1660,7 @@ impl CudaMsm {
                     g
                 }
             };
-            words.extend(output_words(&g, pw)?);
+            words.extend(output_words(&g, job.group().words())?);
         }
         Ok(vram_bytes(&words))
     }
@@ -1769,8 +1822,8 @@ impl CudaMsm {
     /// The constant-work kernels, or why this object cannot run a constant-work plan.
     /// Checked before anything is queued: the reduce of a module without them has no
     /// projective branch, so a plan that reached it would be combined as XYZZ.
-    fn constant_kernels(&self) -> Result<&ConstantKernels, ProveError> {
-        self.k.constant.as_ref().ok_or_else(|| {
+    fn constant_kernels(&self, g: Group) -> Result<&ConstantKernels, ProveError> {
+        self.k.group(g).constant.as_ref().ok_or_else(|| {
             bad("constant work needs a module from CudaMsm::compile_with(.., Work::Constant)")
         })
     }
@@ -1802,14 +1855,12 @@ impl CudaMsm {
             return Ok(Vec::new());
         }
         if self.work == Work::Constant {
-            self.constant_kernels()?;
+            self.constant_kernels(Group::G1)?;
         }
 
         for job in jobs {
-            let (scalars, soff, n, bases_len, boff) = match job {
-                Job::G1(j) => (j.scalars, j.scalar_off, j.n, j.bases.len, j.base_off),
-                Job::G2(j) => (j.scalars, j.scalar_off, j.n, j.bases.len, j.base_off),
-            };
+            let (scalars, soff, n) = job.scalars();
+            let (_, bases_len, boff) = job.bases();
             validate_job_ranges(soff, n, scalars.len, boff, bases_len)?;
             kernel_range(soff, n, SCALAR_WORDS)?;
             kernel_range(boff, n, G2_WORDS)?;
@@ -1852,10 +1903,7 @@ impl CudaMsm {
         let mut job_plan = Vec::with_capacity(jobs.len());
 
         for job in jobs {
-            let (scalars, soff, n) = match job {
-                Job::G1(j) => (j.scalars, j.scalar_off, j.n),
-                Job::G2(j) => (j.scalars, j.scalar_off, j.n),
-            };
+            let (scalars, soff, n) = job.scalars();
             // Identity of the borrowed `CudaSlice` handle, not of its contents and not of
             // the device allocation underneath it: two `Scalars` borrowing distinct handles
             // onto one allocation get separate plans, which is a missed share and never a
@@ -2278,14 +2326,11 @@ impl CudaMsm {
         p: &Plan<'_>,
         params: &MsmParams,
     ) -> Result<(), ProveError> {
-        let (acc, bases) = match job {
-            Job::G1(j) => (&self.k.accumulate_g1, &j.bases.buf),
-            Job::G2(j) => (&self.k.accumulate_g2, &j.bases.buf),
-        };
+        let acc = &self.k.group(job.group()).accumulate;
         let cfg = acc.cfg_1d(p.rows(), POINT_BLOCK);
         let mut lb = self.stream.launch_builder(&acc.f);
         lb.arg(&p.entries)
-            .arg(bases)
+            .arg(job.bases().0)
             .arg(&p.counts)
             .arg(&p.cursor)
             .arg(&out.buckets)
@@ -2311,10 +2356,7 @@ impl CudaMsm {
         p: &Plan<'_>,
         params: &MsmParams,
     ) -> Result<(), ProveError> {
-        let clear = match job {
-            Job::G1(_) => &self.k.clear_g1,
-            Job::G2(_) => &self.k.clear_g2,
-        };
+        let clear = &self.k.group(job.group()).clear;
         let cfg = clear.cfg_1d(p.rows(), WIDE_BLOCK);
         let mut lb = self.stream.launch_builder(&clear.f);
         lb.arg(&out.buckets).arg(params);
@@ -2335,12 +2377,9 @@ impl CudaMsm {
         params: &MsmParams,
     ) -> Result<(), ProveError> {
         let threads = p.n_windows * p.slices;
+        let (bases, ..) = job.bases();
         if p.dummy_rows != 0 {
-            let k = self.constant_kernels()?;
-            let (seg, bases) = match job {
-                Job::G1(j) => (&k.segmented_g1, &j.bases.buf),
-                Job::G2(j) => (&k.segmented_g2, &j.bases.buf),
-            };
+            let seg = &self.constant_kernels(job.group())?.segmented;
             let cfg = seg.cfg_1d(threads, POINT_BLOCK);
             let mut lb = self.stream.launch_builder(&seg.f);
             lb.arg(&p.entries)
@@ -2360,10 +2399,7 @@ impl CudaMsm {
                 .fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
-        let (seg, bases) = match job {
-            Job::G1(j) => (&self.k.segmented_g1, &j.bases.buf),
-            Job::G2(j) => (&self.k.segmented_g2, &j.bases.buf),
-        };
+        let seg = &self.k.group(job.group()).segmented;
         let cfg = seg.cfg_1d(threads, POINT_BLOCK);
         let mut lb = self.stream.launch_builder(&seg.f);
         lb.arg(&p.entries)
@@ -2393,12 +2429,9 @@ impl CudaMsm {
         p: &Plan<'_>,
         params: &MsmParams,
     ) -> Result<(), ProveError> {
+        let group = job.group();
         if p.dummy_rows != 0 {
-            let k = self.constant_kernels()?;
-            let fold = match job {
-                Job::G1(_) => &k.fold_g1,
-                Job::G2(_) => &k.fold_g2,
-            };
+            let fold = &self.constant_kernels(group)?.fold;
             let mut in_pts = &out.spill_pts;
             let mut in_rows = &out.spill_rows;
             for level in &out.folds {
@@ -2422,10 +2455,7 @@ impl CudaMsm {
             }
             return Ok(());
         }
-        let merge = match job {
-            Job::G1(_) => &self.k.merge_g1,
-            Job::G2(_) => &self.k.merge_g2,
-        };
+        let merge = &self.k.group(group).merge;
         let cfg = merge.cfg_1d(p.rows(), POINT_BLOCK);
         let mut lb = self.stream.launch_builder(&merge.f);
         lb.arg(&out.buckets)
@@ -2444,10 +2474,7 @@ impl CudaMsm {
         // One block per row, at most `MERGE_TG` threads, the kernel's shared array.
         // Independent of the launch above: a row's count sends it to exactly one of the
         // two kernels, so they touch disjoint rows of every array they share.
-        let wide = match job {
-            Job::G1(_) => &self.k.merge_wide_g1,
-            Job::G2(_) => &self.k.merge_wide_g2,
-        };
+        let wide = &self.k.group(group).merge_wide;
         let cfg = wide.cfg_blocks(p.n_windows * p.n_buckets, MERGE_TG);
         let mut lb = self.stream.launch_builder(&wide.f);
         lb.arg(&out.buckets)
@@ -2473,10 +2500,7 @@ impl CudaMsm {
         p: &Plan<'_>,
         params: &MsmParams,
     ) -> Result<(), ProveError> {
-        let reduce = match job {
-            Job::G1(_) => &self.k.reduce_g1,
-            Job::G2(_) => &self.k.reduce_g2,
-        };
+        let reduce = &self.k.group(job.group()).reduce;
         let cfg = reduce.cfg_blocks(p.n_windows, REDUCE_TG);
         let mut lb = self.stream.launch_builder(&reduce.f);
         lb.arg(&out.buckets).arg(&out.window_sums).arg(params);
@@ -2499,10 +2523,7 @@ impl CudaMsm {
         let Some(ones_out) = &out.ones else {
             return Ok(());
         };
-        let (ones, bases) = match job {
-            Job::G1(j) => (&self.k.ones_g1, &j.bases.buf),
-            Job::G2(j) => (&self.k.ones_g2, &j.bases.buf),
-        };
+        let (ones, (bases, ..)) = (&self.k.group(job.group()).ones, job.bases());
         let cfg = ones.cfg_blocks(out.ones_groups, REDUCE_TG);
         let mut lb = self.stream.launch_builder(&ones.f);
         lb.arg(p.scalars).arg(bases).arg(ones_out).arg(params);
@@ -2620,15 +2641,13 @@ struct Outputs {
     folds: Vec<FoldScratch>,
     ones_groups: usize,
     base_off: usize,
-    is_g2: bool,
+    group: Group,
 }
 
 impl Outputs {
     fn new(msm: &CudaMsm, job: &Job<'_>, plan: &Plan<'_>) -> Result<Self, ProveError> {
-        let (is_g2, base_off, point_words) = match job {
-            Job::G1(j) => (false, j.base_off, G1_WORDS),
-            Job::G2(j) => (true, j.base_off, G2_WORDS),
-        };
+        let (group, (_, _, base_off)) = (job.group(), job.bases());
+        let point_words = group.words();
         let ones_groups = if plan.dummy_rows == 0 {
             ones_groups_for(plan.n)
         } else {
@@ -2665,7 +2684,7 @@ impl Outputs {
             folds,
             ones_groups,
             base_off,
-            is_g2,
+            group,
         })
     }
 
@@ -2678,7 +2697,7 @@ impl Outputs {
     /// the Metal twin and zkonduit's Metal MSM both stop.
     fn combine(&self, msm: &CudaMsm, plan: &Plan<'_>) -> Result<MsmResult, ProveError> {
         // Only the words the plan wrote: a buffer from an arena may be longer.
-        let pw = if self.is_g2 { G2_WORDS } else { G1_WORDS };
+        let pw = self.group.words();
         let w_words = download_prefix(&msm.stream, &self.window_sums, plan.n_windows * pw)?;
         let o_words = match &self.ones {
             Some(ones) => {
@@ -2689,40 +2708,40 @@ impl Outputs {
             }
             None => Vec::new(),
         };
-        if self.is_g2 {
-            let w = from_words::<PackedXyzzG2>(&w_words)
-                .ok_or_else(|| bad("G2 window sums are not a whole number of points"))?;
-            let o = from_words::<PackedXyzzG2>(&o_words)
-                .ok_or_else(|| bad("G2 ones partials are not a whole number of points"))?;
-            let mut acc = w[plan.n_windows - 1].to_projective();
-            for k in (0..plan.n_windows - 1).rev() {
-                for _ in 0..plan.c {
-                    acc.double_in_place();
-                }
-                acc += w[k].to_projective();
-            }
-            for x in &o {
-                acc += x.to_projective();
-            }
-            Ok(MsmResult::G2(acc))
-        } else {
-            let w = from_words::<PackedXyzzG1>(&w_words)
-                .ok_or_else(|| bad("G1 window sums are not a whole number of points"))?;
-            let o = from_words::<PackedXyzzG1>(&o_words)
-                .ok_or_else(|| bad("G1 ones partials are not a whole number of points"))?;
-            let mut acc = w[plan.n_windows - 1].to_projective();
-            for k in (0..plan.n_windows - 1).rev() {
-                for _ in 0..plan.c {
-                    acc.double_in_place();
-                }
-                acc += w[k].to_projective();
-            }
-            for x in &o {
-                acc += x.to_projective();
-            }
-            Ok(MsmResult::G1(acc))
-        }
+        let (w, o) = (&w_words, &o_words);
+        Ok(match self.group {
+            Group::G1 => MsmResult::G1(horner(w, o, plan, "G1", PackedXyzzG1::to_projective)?),
+            Group::G2 => MsmResult::G2(horner(w, o, plan, "G2", PackedXyzzG2::to_projective)?),
+        })
     }
+}
+
+/// The host half of [`Outputs::combine`] for points of one group, `op` naming it in an error.
+fn horner<P: Packed + Default, G: AdditiveGroup>(
+    w_words: &[u32],
+    o_words: &[u32],
+    plan: &Plan<'_>,
+    op: &str,
+    to_projective: impl Fn(&P) -> G,
+) -> Result<G, ProveError> {
+    let w = from_words::<P>(w_words)
+        .ok_or_else(|| bad(format!("{op} window sums are not a whole number of points")))?;
+    let o = from_words::<P>(o_words).ok_or_else(|| {
+        bad(format!(
+            "{op} ones partials are not a whole number of points"
+        ))
+    })?;
+    let mut acc = to_projective(&w[plan.n_windows - 1]);
+    for k in (0..plan.n_windows - 1).rev() {
+        for _ in 0..plan.c {
+            acc.double_in_place();
+        }
+        acc += to_projective(&w[k]);
+    }
+    for x in &o {
+        acc += to_projective(x);
+    }
+    Ok(acc)
 }
 
 // ---------------------------------------------------------------------------
@@ -3877,7 +3896,7 @@ mod tests {
             m.launch_points(&job, &out, &p).unwrap();
             m.stream.synchronize().unwrap();
             let result = out.combine(m, &p).unwrap();
-            if out.is_g2 {
+            if out.group == Group::G2 {
                 assert_eq!(result.g2().unwrap(), g2 * want);
             } else {
                 assert_eq!(result.g1().unwrap(), g1 * want);
@@ -3885,11 +3904,11 @@ mod tests {
             if p.dummy_rows != 0 {
                 // Read the actual accumulated dummy buckets, not only the reduced MSM. On a
                 // constant-work plan they are packed projective points.
-                let words = if out.is_g2 { G2_WORDS } else { G1_WORDS };
+                let words = out.group.words();
                 let view = out.buckets.slice(p.n_windows * p.n_buckets * words..);
                 let stored = m.stream.clone_dtoh(&view).unwrap();
                 m.stream.synchronize().unwrap();
-                if out.is_g2 {
+                if out.group == Group::G2 {
                     let points = from_words::<PackedXyzzG2>(&stored).unwrap();
                     assert_eq!(points.len(), dummy_sums.len());
                     for (point, sum) in points.iter().zip(&dummy_sums) {
