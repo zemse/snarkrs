@@ -485,8 +485,14 @@ mod tests {
     use std::path::PathBuf;
 
     fn toy(name: &str) -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../test-support/gnark/toy")
+        // `G16_GNARK_HARNESS` first: CARGO_MANIFEST_DIR is baked in at compile time and does
+        // not exist on the GPU box a cross-built test binary runs on.
+        std::env::var_os("G16_GNARK_HARNESS")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test-support/gnark")
+            })
+            .join("toy")
             .join(name)
     }
 

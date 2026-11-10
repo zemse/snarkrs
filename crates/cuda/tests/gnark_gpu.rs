@@ -8,6 +8,8 @@
 //!
 //! Without a device every test skips with a line on stderr, or fails under
 //! `G16_REQUIRE_TESTS=1`. The gnark half of the verify test also needs `go` on `PATH`.
+//! A binary shipped to another machine finds the harness through `G16_GNARK_HARNESS`, a
+//! copy of `test-support/gnark`.
 
 #![cfg(feature = "cuda")]
 
@@ -31,7 +33,13 @@ use snarkrs_groth16::verify::verify;
 use snarkrs_groth16::{Backend, MsmOutputs, PreparedCircuit, ProveError, StageTimings};
 
 fn harness() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test-support/gnark")
+    // `G16_GNARK_HARNESS` first: CARGO_MANIFEST_DIR is baked in at compile time and does not
+    // exist on the GPU box a cross-built test binary runs on.
+    std::env::var_os("G16_GNARK_HARNESS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test-support/gnark")
+        })
 }
 
 fn toy(name: &str) -> PathBuf {
