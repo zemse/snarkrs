@@ -214,6 +214,13 @@ impl CudaBackend {
     pub fn compile_us(&self) -> u64 {
         self.compile_us
     }
+
+    /// [`Backend::prepare`] without the box, for a caller that wants what only the CUDA
+    /// circuit reports: [`CudaCircuit::prepare_cost`], [`CudaCircuit::last_msm_runs`] and
+    /// the rest.
+    pub fn prepare_circuit(&self, pk: ProvingKey) -> Result<CudaCircuit, ProveError> {
+        CudaCircuit::new(self, pk)
+    }
 }
 
 /// Device 0, or the ordinal in `G16_CUDA_DEVICE`.
@@ -257,7 +264,7 @@ impl Backend for CudaBackend {
     }
 
     fn prepare(&self, pk: ProvingKey) -> Result<Box<dyn PreparedCircuit>, ProveError> {
-        Ok(Box::new(CudaCircuit::new(self, pk)?))
+        Ok(Box::new(self.prepare_circuit(pk)?))
     }
 }
 
@@ -439,6 +446,15 @@ impl CudaCircuit {
     /// [`CudaBackend::with_vram_limit`].
     pub fn last_msm_runs(&self) -> u64 {
         self.msm.last_runs()
+    }
+
+    /// [`CudaBackend::with_vram_limit`] for this circuit's MSMs from here on, in place of
+    /// the backend's.
+    pub fn with_vram_limit(self, bytes: u64) -> Self {
+        Self {
+            msm: self.msm.with_vram_limit(bytes),
+            ..self
+        }
     }
 
     fn check_witness(&self, witness: &[Fr]) -> Result<(), ProveError> {

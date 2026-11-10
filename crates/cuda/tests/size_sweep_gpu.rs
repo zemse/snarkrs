@@ -30,63 +30,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use snarkrs_cuda::msm::CudaMsm;
-use snarkrs_cuda::stages::CudaStages;
-use snarkrs_cuda::Cuda;
+use snarkrs_cuda::{Cuda, CudaBackend, CudaCircuit};
 use snarkrs_field::{CurveGroup, Fr, G1Projective, G2Projective, PrimeField, PrimeGroup};
 use snarkrs_formats::{Coefficients, HBasis, ProvingKey, VerifyingKey};
 use snarkrs_groth16::cpu::CpuBackend;
 use snarkrs_groth16::prove::prove_with_blinders;
-use snarkrs_groth16::{
-    Backend, HPoly, MsmOutputs, PreparedCircuit, Proof, ProveError, StageTimings,
-};
-
-/// `CudaCircuit`'s two halves, held here so the MSM half can be rebuilt with a limit and
-/// read for its run count; the proving path is the same `compute_h` then `msms`.
-struct Circuit {
-    pk: ProvingKey,
-    stages: CudaStages,
-    msm: Option<CudaMsm>,
-}
-
-impl Circuit {
-    fn msm(&self) -> &CudaMsm {
-        self.msm.as_ref().expect("an MSM half")
-    }
-    fn limit(&mut self, bytes: u64) {
-        let m = self.msm.take().expect("an MSM half");
-        self.msm = Some(m.with_vram_limit(bytes));
-    }
-}
-
-impl PreparedCircuit for Circuit {
-    fn backend_name(&self) -> &'static str {
-        "cuda"
-    }
-    fn n_vars(&self) -> usize {
-        self.pk.n_vars
-    }
-    fn n_public(&self) -> usize {
-        self.pk.n_public
-    }
-    fn domain_size(&self) -> usize {
-        self.pk.domain_size
-    }
-    fn key(&self) -> &ProvingKey {
-        &self.pk
-    }
-    fn compute_h(&self, witness: &[Fr], t: &mut StageTimings) -> Result<HPoly, ProveError> {
-        self.stages.compute_h(witness, t)
-    }
-    fn msms(
-        &self,
-        witness: &[Fr],
-        h: &HPoly,
-        t: &mut StageTimings,
-    ) -> Result<MsmOutputs, ProveError> {
-        self.msm().msms(witness, h, t)
-    }
-}
+use snarkrs_groth16::{Backend, HPoly, PreparedCircuit, Proof, ProveError, StageTimings};
 
 /// The least free device memory seen since the last [`Sampler::reset`].
 struct Sampler {
@@ -368,35 +317,27 @@ fn cuda_phase(
     proof_path: &std::path::Path,
     rec: &mut Record,
 ) -> Result<Option<Proof>, String> {
-    let cuda = Cuda::new(0).expect("a usable CUDA device");
+    let backend = CudaBackend::new().expect("a usable CUDA device");
+    let cuda: &Cuda = backend.cuda();
     let (free0, total) = cuda.context().mem_get_info().unwrap();
     rec.num("device_total_mib", format!("{:.0}", total as f64 / MIB));
     rec.num("free_at_open_mib", format!("{:.0}", free0 as f64 / MIB));
-    let t = Instant::now();
-    let stages_module = CudaStages::compile(&cuda).expect("NVRTC stages");
-    let msm_module = CudaMsm::compile(&cuda).expect("NVRTC msm");
-    rec.num("compile_s", format!("{:.1}", t.elapsed().as_secs_f64()));
-    let sampler = Sampler::start(&cuda);
+    rec.num(
+        "compile_s",
+        format!("{:.1}", backend.compile_us() as f64 / 1e6),
+    );
+    let sampler = Sampler::start(cuda);
     let mib = |b: u64| format!("{:.1}", b as f64 / MIB);
     let free = || cuda.context().mem_get_info().unwrap().0 as u64;
 
     let t = Instant::now();
-    let prepared = CudaStages::from_module(&cuda, stages_module, &pk).and_then(|stages| {
-        let msm = CudaMsm::from_module(&cuda, msm_module)?.with_key(&pk)?;
-        Ok((stages, msm))
-    });
-    let (stages, msm) = match prepared {
-        Ok(p) => p,
+    let mut c = match backend.prepare_circuit(pk) {
+        Ok(c) => c,
         Err(e) => {
             rec.text("outcome", &format!("prepare_{}", failure(&e)));
             rec.text("error", &e.to_string());
             return clean(&e);
         }
-    };
-    let mut c = Circuit {
-        pk,
-        stages,
-        msm: Some(msm),
     };
     rec.num("prepare_s", format!("{:.1}", t.elapsed().as_secs_f64()));
     rec.num("free_after_prepare_mib", mib(free()));
@@ -412,7 +353,7 @@ fn cuda_phase(
             return clean(&e);
         }
     };
-    let batch = |c: &Circuit, h: &HPoly, st: &mut StageTimings| {
+    let batch = |c: &CudaCircuit, h: &HPoly, st: &mut StageTimings| {
         let before = free();
         sampler.reset();
         let t = Instant::now();
@@ -426,7 +367,7 @@ fn cuda_phase(
         rec.text("error", &e.to_string());
         return clean(&e);
     }
-    rec.num("runs", c.msm().last_runs());
+    rec.num("runs", c.last_msm_runs());
     rec.num("free_before_msm_mib", mib(before));
     rec.num("msm_cold_peak_mib", mib(cold_peak));
     rec.num("msm_cold_ms", format!("{cold_ms:.0}"));
@@ -454,7 +395,7 @@ fn cuda_phase(
     );
     rec.num("min_free_in_prove_mib", mib(sampler.min_free()));
     rec.num("msm_ms", format!("{:.0}", st.msm_us as f64 / 1e3));
-    rec.num("runs_prove", c.msm().last_runs());
+    rec.num("runs_prove", c.last_msm_runs());
     std::fs::write(proof_path, proof_text(&proof)).unwrap();
 
     let mut st = StageTimings::default();
@@ -463,25 +404,33 @@ fn cuda_phase(
     got.map_err(|e| e.to_string())?;
     rec.num("msm_warm_peak_mib", mib(warm_peak));
     rec.num("msm_warm_ms", format!("{warm_ms:.0}"));
-    rec.num("runs_warm", c.msm().last_runs());
+    rec.num("runs_warm", c.last_msm_runs());
     rec.num("free_after_warm_mib", mib(free()));
     rec.num("min_free_in_warm_msm_mib", mib(sampler.min_free()));
 
     // The planned bytes of the one batch: the least limit that still runs one batch,
     // to 64 KiB. Only when unlimited is one batch, since a cut proof plans per run.
-    if c.msm().last_runs() == 1 && env_or("G16_SWEEP_BISECT", 1u32) == 1 {
-        let one = |c: &mut Circuit, limit: u64| {
-            c.limit(limit);
+    if c.last_msm_runs() == 1 && env_or("G16_SWEEP_BISECT", 1u32) == 1 {
+        let one = |c: CudaCircuit, limit: u64| {
+            let c = c.with_vram_limit(limit);
             let mut st = StageTimings::default();
-            c.msms(w, &h, &mut st).is_ok() && c.msm().last_runs() == 1
+            let fits = c.msms(w, &h, &mut st).is_ok() && c.last_msm_runs() == 1;
+            (c, fits)
         };
         let (mut lo, mut hi) = (0u64, warm_peak + (64 << 20));
-        while !one(&mut c, hi) {
+        loop {
+            let fits;
+            (c, fits) = one(c, hi);
+            if fits {
+                break;
+            }
             (lo, hi) = (hi, hi * 2);
         }
         while hi - lo > 64 << 10 {
             let mid = lo + (hi - lo) / 2;
-            if one(&mut c, mid) {
+            let fits;
+            (c, fits) = one(c, mid);
+            if fits {
                 hi = mid;
             } else {
                 lo = mid;
