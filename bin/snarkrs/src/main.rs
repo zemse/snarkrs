@@ -31,7 +31,7 @@
 //!   snarkrs zkey import bellman <old.zkey> <in.mpcparams> <new.zkey> [-n=NAME]    (zkib)
 //!   snarkrs file info <file>                                               (fi)
 //!
-//!   snarkrs bench  --artifacts DIR [--variant NAME]... [--reps 15] [--backend cpu|wgpu|...]
+//!   snarkrs bench  --artifacts DIR [--variant NAME]... [--reps 15] [--backend auto|cpu|...]
 //!                  [--mode cold-inprocess|cold-process|warm|both] [--csv out.csv]
 //!                  [--threads N]
 //!   snarkrs trace  --zkey c.zkey --witness c.wtns [--backend cpu|wgpu|...] [--out t.txt]
@@ -39,7 +39,7 @@
 //!
 //! The snarkjs commands take snarkjs' words, aliases, positionals, defaults and options;
 //! `cli.rs` turns that line into one clap parses, and has the table. Our own options sit on
-//! top as `--` flags: `groth16 prove` and `fullprove` take `--backend cpu|wgpu|metal|cuda`,
+//! top as `--` flags: `groth16 prove` and `fullprove` take `--backend auto|cpu|wgpu|metal|cuda`,
 //! `--stage-timings`, `--self-verify true|false`, `--vkey vkey.json`, `--fallback`,
 //! `--constant-work` and `--threads N`, and the ceremony commands take `--backend cpu|metal`.
 //!
@@ -76,6 +76,7 @@ use snarkrs_cli::{
     bench,
     cli::{self, Parsed, Support},
     fft_backend, json, key_backend, log, make_backend, msm_backend, publish, BackendKind,
+    ProveBackend,
 };
 use snarkrs_field::Fr;
 use snarkrs_formats::{wtns::Witness, ProvingKey, VerifyingKey};
@@ -309,8 +310,10 @@ enum PrepareCmd {
 /// `groth16 prove`'s options of ours, which `fullprove` takes too.
 #[derive(clap::Args)]
 struct ProveOpts {
-    #[arg(long, value_enum, default_value_t = BackendKind::Cpu)]
-    backend: BackendKind,
+    /// `auto` proves on the CPU when the circuit is too small to repay a CUDA device and
+    /// on CUDA otherwise (CUDA builds only; elsewhere it is the CPU). Never chosen for you.
+    #[arg(long, value_enum, default_value_t = ProveBackend::Cpu)]
+    backend: ProveBackend,
     /// Print the per-stage split of the proving time.
     #[arg(long)]
     stage_timings: bool,
@@ -1361,7 +1364,8 @@ fn run_prove(
             make_backend(kind)
         }
     };
-    let prover = backend_of(backend)?;
+    // `auto` needs the key and the witness to choose, so it is built below, at prepare.
+    let explicit = backend.kind().map(backend_of).transpose()?;
     // This process is about to hold the witness in the clear. `panic = "abort"` means a crash
     // runs no destructor, so nothing below gets to scrub it, and a core file would write it
     // to disk.
@@ -1434,6 +1438,14 @@ fn run_prove(
     // A key the device has no room for is refused before anything is uploaded and would be
     // refused again, so under --fallback it goes straight to the CPU, as a proof refused for
     // memory does.
+    let prover = match explicit {
+        Some(prover) => prover,
+        None => {
+            let work = snarkrs_cli::auto::Workload::of(&pk, w, constant_work);
+            let pool = snarkrs_cli::auto::pool_threads(threads);
+            snarkrs_cli::auto::make(&work, snarkrs_cli::auto::Residency::OneShot, pool)?.1
+        }
+    };
     let circuit = match prover.prepare(pk) {
         Err(e @ ProveError::DeviceMemory { .. }) if fallback => {
             let cause = snarkrs_cli::fallback::Cause::DeviceMemory(e.to_string());
@@ -1533,12 +1545,17 @@ fn run_prove(
         let total = elapsed.as_micros() as u64;
         let known =
             t.gather_us + t.ntt_us + t.pointwise_us + t.msm_us + t.assemble_us + t.verify_us;
+        let auto = match backend {
+            ProveBackend::Auto => ", auto",
+            _ => "",
+        };
         match fell_back.get() {
             true => println!(
-                "backend        cpu (fallback from {})",
+                "backend        cpu (fallback from {}{auto})",
                 circuit.backend_name()
             ),
-            false => println!("backend        {}", circuit.backend_name()),
+            false if auto.is_empty() => println!("backend        {}", circuit.backend_name()),
+            false => println!("backend        {} (auto)", circuit.backend_name()),
         }
         println!("domain size    {}", circuit.domain_size());
         println!("gather      us {:>10}", t.gather_us);

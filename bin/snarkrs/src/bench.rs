@@ -36,7 +36,8 @@ use snarkrs_formats::{wtns::Witness, ProvingKey, VerifyingKey};
 use snarkrs_groth16::{prove::prove_unchecked, verify::verify, MsmSplit, StageTimings};
 
 use crate::artifacts::{self, Variant};
-use crate::{BackendKind, HostInfo};
+use crate::auto::{self, Residency, Workload};
+use crate::{HostInfo, ProveBackend};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum Mode {
@@ -61,8 +62,10 @@ pub struct Args {
     pub variant: Vec<String>,
     #[arg(long, default_value_t = 15)]
     pub reps: usize,
-    #[arg(long, value_enum, default_value_t = BackendKind::Cpu)]
-    pub backend: BackendKind,
+    /// `auto` decides per variant and mode as `groth16 prove --backend auto` does, warm as
+    /// a resident service; the rows say `auto` and the log names the backend it chose.
+    #[arg(long, value_enum, default_value_t = ProveBackend::Cpu)]
+    pub backend: ProveBackend,
     #[arg(long, value_enum, default_value_t = Mode::Both)]
     pub mode: Mode,
     /// Time `prove --constant-work` instead: fixed MSM sizing without zero/one fast
@@ -205,11 +208,30 @@ pub fn run(args: Args) -> Result<()> {
     Ok(())
 }
 
-fn backend(args: &Args) -> Result<Box<dyn snarkrs_groth16::Backend>> {
+/// The backend a rep proves on. Under `auto` the choice is printed once per variant and
+/// mode, at its first rep.
+fn backend(
+    args: &Args,
+    pk: &ProvingKey,
+    witness: &[Fr],
+    residency: Residency,
+    first: bool,
+) -> Result<Box<dyn snarkrs_groth16::Backend>> {
+    let Some(kind) = args.backend.kind() else {
+        let (kind, b) = auto::make(
+            &Workload::of(pk, witness, args.constant_work),
+            residency,
+            auto::pool_threads(args.threads),
+        )?;
+        if first {
+            println!("  auto chose {}", kind.as_str());
+        }
+        return Ok(b);
+    };
     if args.constant_work {
-        crate::make_constant_work_backend(args.backend)
+        crate::make_constant_work_backend(kind)
     } else {
-        crate::make_backend(args.backend)
+        crate::make_backend(kind)
     }
 }
 
@@ -293,7 +315,7 @@ fn cold_inprocess(v: &Variant, constraints: i64, args: &Args) -> Result<Vec<Row>
         // Before the prepare, so a witness too short for the key fails here rather than
         // after a full proof. The copy is `n_public` field elements.
         let public = public_of(&witness, n_public)?;
-        let circuit = backend(args)?.prepare(pk)?;
+        let circuit = backend(args, &pk, &witness, Residency::OneShot, rep == 1)?.prepare(pk)?;
         let prepare_ms = ms(start);
 
         let proof = prove_unchecked(circuit.as_ref(), &witness, &mut rng, &mut t)?;
@@ -435,7 +457,7 @@ fn warm(v: &Variant, constraints: i64, args: &Args) -> Result<Vec<Row>> {
     let witness = Witness::load(&v.wtns())
         .with_context(|| format!("{}: loading circuit.wtns", v.name))?
         .0;
-    let circuit = backend(args)?.prepare(pk)?;
+    let circuit = backend(args, &pk, &witness, Residency::Resident, true)?.prepare(pk)?;
     let prepare_ms = ms(start);
     let public = public_of(&witness, n_public)?;
 

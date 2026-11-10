@@ -4,6 +4,7 @@
 //! instead of only through the process boundary.
 
 pub mod artifacts;
+pub mod auto;
 pub mod bench;
 pub mod cli;
 pub mod fallback;
@@ -60,6 +61,34 @@ impl BackendKind {
             BackendKind::Metal => "metal",
             BackendKind::Cuda => "cuda",
         }
+    }
+}
+
+/// `--backend` of `groth16 prove`, `fullprove` and `bench`: one backend, or `auto`, which
+/// picks the CPU or CUDA per proof (`auto.rs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum ProveBackend {
+    Auto,
+    Cpu,
+    Wgpu,
+    Metal,
+    Cuda,
+}
+
+impl ProveBackend {
+    /// The backend named on the command line, or `None` for `auto`.
+    pub fn kind(self) -> Option<BackendKind> {
+        match self {
+            ProveBackend::Auto => None,
+            ProveBackend::Cpu => Some(BackendKind::Cpu),
+            ProveBackend::Wgpu => Some(BackendKind::Wgpu),
+            ProveBackend::Metal => Some(BackendKind::Metal),
+            ProveBackend::Cuda => Some(BackendKind::Cuda),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        self.kind().map_or("auto", |k| k.as_str())
     }
 }
 
@@ -463,6 +492,21 @@ mod tests {
             (BackendKind::Cuda, "cuda"),
         ] {
             assert_eq!(kind.as_str(), want);
+        }
+    }
+
+    /// `--backend` of a proof names the same backend as everywhere else, and `auto` is the
+    /// only spelling that leaves the choice to `auto.rs`.
+    #[test]
+    fn a_named_prove_backend_is_exactly_that_backend() {
+        use clap::ValueEnum;
+        for b in ProveBackend::value_variants() {
+            let name = b.to_possible_value().unwrap().get_name().to_string();
+            assert_eq!(b.as_str(), name);
+            match b.kind() {
+                None => assert_eq!(*b, ProveBackend::Auto),
+                Some(k) => assert_eq!(k.as_str(), name),
+            }
         }
     }
 

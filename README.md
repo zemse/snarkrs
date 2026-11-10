@@ -125,14 +125,26 @@ snarkrs groth16 setup circuit.r1cs powersoftau.ptau circuit_0000.zkey
 snarkrs zkey contribute circuit_0000.zkey circuit_final.zkey -e=...
 snarkrs zkey export verificationkey circuit_final.zkey verification_key.json
 snarkrs groth16 prove circuit_final.zkey witness.wtns proof.json public.json \
-        [--backend cpu|wgpu|metal|cuda] [--stage-timings] [--self-verify true|false] \
+        [--backend auto|cpu|wgpu|metal|cuda] [--stage-timings] [--self-verify true|false] \
         [--vkey verification_key.json] [--constant-work]
 snarkrs groth16 verify verification_key.json public.json proof.json
 
 snarkrs bench --artifacts <DIR> [--variant NAME]... [--reps N] \
-        [--backend cpu|wgpu|metal|cuda] [--mode cold-inprocess|cold-process|warm|both] \
+        [--backend auto|cpu|wgpu|metal|cuda] [--mode cold-inprocess|cold-process|warm|both] \
         [--csv FILE]
 ```
+
+The default backend is `cpu`. `--backend auto` picks the CPU or CUDA per proof: a CUDA proof
+has a floor (about 12 ms warm, about 0.5 s for one proof per process, which is what the CLI
+is) that a small circuit never repays. It counts the CPU's work (the domain size plus the
+witness entries that are not 0 or 1, or every wire under `--constant-work`) per rayon
+thread, and proves on CUDA above about 40,000 a thread for a CLI proof (32,000 under
+`--constant-work`) and above 192 a thread warm. On a g4dn.2xlarge that sends `sha256`,
+`rsa2048` and `keccak256` to the CPU and `railgun-13x01` and `anon-aadhaar` to the T4. The
+thresholds are measured on a T4 (`bench/results/cuda-auto-2026-11-11.md`); `auto` never
+picks Metal or wgpu, is the CPU in a build without `cuda`, and goes to the CPU with a
+warning when the CUDA device does not open. A backend named on the command line is always
+the one that runs.
 
 The short aliases work too (`ptn`, `ptc`, `pt2`, `g16s`, `zkc`, `zkev`, `g16p`, `g16v`, ...),
 and the ceremony commands generally take `--backend cpu|metal`. CUDA supports only the
