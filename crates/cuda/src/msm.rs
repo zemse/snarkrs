@@ -572,11 +572,9 @@ fn output_words(g: &Geometry, pw: usize) -> Result<Vec<usize>, ProveError> {
     Ok(words)
 }
 
-/// Free device memory an MSM batch leaves alone: the local memory the spilling G2 kernels
-/// can still claim at their first launch, the driver's own per-stream state, and the
-/// stream-ordered pool's rounding of each buffer. Not measured; the batches it guards are
-/// hundreds of megabytes.
-const VRAM_HEADROOM: u64 = 256 << 20;
+/// Free device memory an MSM batch leaves alone: the stream-ordered pool's rounding, which
+/// on a T4 took at most 12.7 MiB past the plan at 2^16 to 2^22, cold or warm, in 32 MiB steps.
+const VRAM_HEADROOM: u64 = 64 << 20;
 
 /// Shortest run [`CudaMsm::fit_runs`] cuts an MSM into before it refuses. A run of 2^10
 /// points needs a few megabytes of scratch, so a budget below it is a device with nothing
