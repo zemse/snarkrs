@@ -80,6 +80,21 @@ for c in tiny_mul sha256; do
   done
 done
 
+# A budget refusal goes straight to the CPU and blames no device.
+log "cli vram refusal"
+G16_CUDA_VRAM_LIMIT=1 "$BIN/snarkrs" groth16 prove "$G16_ARTIFACTS/sha256/circuit.zkey" \
+  "$G16_ARTIFACTS/sha256/circuit.wtns" "$OUT/refused.proof.json" "$OUT/refused.public.json" \
+  --backend cuda > "$OUT/refused.prove.txt" 2>&1
+p=$?
+"$BIN/snarkrs" groth16 verify "$G16_ARTIFACTS/sha256/vkey.json" "$OUT/refused.public.json" \
+  "$OUT/refused.proof.json" > "$OUT/refused.verify.txt" 2>&1
+v=$?
+grep "warning" "$OUT/refused.prove.txt" | sed 's/^/  /'
+echo "  refused: prove rc=$p verify rc=$v $(tail -1 "$OUT/refused.verify.txt")"
+(( p == 0 && v == 0 )) || FAILED+=("cli-refused")
+[[ $(grep -c "warning" "$OUT/refused.prove.txt") == 1 ]] || FAILED+=("cli-refused-warnings")
+grep -q "suspect\|proving again" "$OUT/refused.prove.txt" && FAILED+=("cli-refused-retry")
+
 log "result"
 if (( ${#FAILED[@]} )); then echo "GATE FAILED: ${FAILED[*]}"; exit 1; fi
 echo "GATE PASSED"

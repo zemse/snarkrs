@@ -9,7 +9,8 @@
 # The gate: the lib's tests and its ignored device tests, constant_work_legacy_override_gate
 # in its own process with G16_CUDA_MSM_LEGACY_ACC=1, adversarial_gpu and pipeline_gpu with
 # their ignored tests, field_gpu, gnark_gpu, and CLI prove and verify of tiny_mul and sha256,
-# default and --constant-work. fft::tests::every_variant_gives_the_same_points is about 60
+# default and --constant-work, and that a proof refused for VRAM (G16_CUDA_VRAM_LIMIT=1) goes
+# straight to the CPU. fft::tests::every_variant_gives_the_same_points is about 60
 # minutes cold, so it runs only with --every-variant.
 #
 # usage: cuda-gate.sh [--every-variant] [--no-build]

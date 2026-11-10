@@ -53,7 +53,7 @@ use snarkrs_formats::{wtns::Witness, HBasis, ProvingKey, VerifyingKey};
 use snarkrs_groth16::cpu::CpuBackend;
 use snarkrs_groth16::prove::prove_with_blinders;
 use snarkrs_groth16::verify::verify;
-use snarkrs_groth16::{Backend, HPoly, PreparedCircuit, Proof, StageTimings};
+use snarkrs_groth16::{Backend, HPoly, PreparedCircuit, Proof, ProveError, StageTimings};
 
 /// NVIDIA gate for the source port. An explicitly requested run must not silently skip.
 #[test]
@@ -1499,7 +1499,10 @@ fn a_vram_limit_cuts_the_msms_into_runs_or_refuses_them() {
                         }
                         Err(e) => {
                             eprintln!("  {work:?}, limit {limit}: {e}");
-                            assert!(e.is_device_fault(), "{work:?}, limit {limit}: {e}");
+                            assert!(
+                                matches!(e, ProveError::DeviceMemory { .. }),
+                                "{work:?}, limit {limit}: {e}"
+                            );
                             assert!(e.to_string().contains("bytes of device memory"), "{e}");
                             refused = true;
                         }

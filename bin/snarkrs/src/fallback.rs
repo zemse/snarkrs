@@ -14,9 +14,10 @@
 //! and the proof goes to the CPU.
 //!
 //! Only those two are retried ([`ProveError::SelfVerify`] and
-//! [`ProveError::is_device_fault`]). Every other error is deterministic, and a witness that
-//! does not satisfy the circuit fails on the CPU too, which is how the last message tells the
-//! two apart.
+//! [`ProveError::is_device_fault`]). A proof the device refused for want of memory
+//! ([`ProveError::DeviceMemory`]) would be refused again, so it goes straight to the CPU and
+//! blames no device. Every other error is deterministic, and a witness that does not satisfy
+//! the circuit fails on the CPU too, which is how the last message tells the two apart.
 
 use anyhow::{ensure, Result};
 use snarkrs_field::Fr;
@@ -29,6 +30,9 @@ pub enum Cause {
     SelfVerify,
     /// The device did not finish the proof. Carries the error text.
     Device(String),
+    /// The device refused the proof before running it, for want of memory. Carries the
+    /// error text.
+    DeviceMemory(String),
 }
 
 impl Cause {
@@ -36,6 +40,7 @@ impl Cause {
         match attempt {
             Err(ProveError::SelfVerify(_)) => Some(Self::SelfVerify),
             Err(e) if e.is_device_fault() => Some(Self::Device(e.to_string())),
+            Err(e @ ProveError::DeviceMemory { .. }) => Some(Self::DeviceMemory(e.to_string())),
             _ => None,
         }
     }
@@ -46,6 +51,7 @@ impl std::fmt::Display for Cause {
         match self {
             Self::SelfVerify => f.write_str("failed its self-verify"),
             Self::Device(e) => write!(f, "hit a device fault ({e})"),
+            Self::DeviceMemory(e) => write!(f, "did not fit in device memory ({e})"),
         }
     }
 }
@@ -55,6 +61,8 @@ impl std::fmt::Display for Cause {
 pub enum Fallback {
     /// The first proof on `backend` failed; proving again there.
     Retry { backend: &'static str, cause: Cause },
+    /// `backend` refused the proof for want of memory; proving on the CPU without a retry.
+    Refused { backend: &'static str, cause: Cause },
     /// The second one failed too; proving on the CPU.
     Cpu { backend: &'static str, cause: Cause },
     /// The CPU proof verified, so `backend` failed the same proof twice.
@@ -62,7 +70,8 @@ pub enum Fallback {
 }
 
 /// [`prove`], retried once on the same backend and then on the CPU when the proof fails its
-/// self-verify or the device faults. `cpu` builds the CPU circuit only if it is needed: the
+/// self-verify or the device faults, and on the CPU at once when the device has too little
+/// memory for it. `cpu` builds the CPU circuit only if it is needed: the
 /// key has usually moved into the accelerator at prepare, so the caller reloads it.
 /// `timings` describe the attempt that produced the proof.
 pub fn prove_with_fallback<R: ark_std::rand::RngCore + ark_std::rand::CryptoRng>(
@@ -80,14 +89,21 @@ pub fn prove_with_fallback<R: ark_std::rand::RngCore + ark_std::rand::CryptoRng>
         _ => return Ok(attempt?),
     };
 
-    report(Fallback::Retry { backend, cause });
-    *timings = StageTimings::default();
-    let attempt = prove(circuit, witness, rng, timings);
-    let Some(cause) = Cause::of(&attempt) else {
-        return Ok(attempt?);
+    // Only a device that failed the same proof twice is suspect; one short of memory is not.
+    let suspect = if matches!(cause, Cause::DeviceMemory(_)) {
+        report(Fallback::Refused { backend, cause });
+        false
+    } else {
+        report(Fallback::Retry { backend, cause });
+        *timings = StageTimings::default();
+        let attempt = prove(circuit, witness, rng, timings);
+        let Some(cause) = Cause::of(&attempt) else {
+            return Ok(attempt?);
+        };
+        let suspect = !matches!(cause, Cause::DeviceMemory(_));
+        report(Fallback::Cpu { backend, cause });
+        suspect
     };
-
-    report(Fallback::Cpu { backend, cause });
     let cpu = cpu()?;
     ensure!(
         cpu.backend_name() == "cpu",
@@ -117,7 +133,9 @@ pub fn prove_with_fallback<R: ark_std::rand::RngCore + ark_std::rand::CryptoRng>
     );
     *timings = StageTimings::default();
     let proof = prove(cpu.as_ref(), witness, rng, timings)?;
-    report(Fallback::DeviceSuspect { backend });
+    if suspect {
+        report(Fallback::DeviceSuspect { backend });
+    }
     Ok(proof)
 }
 
@@ -146,6 +164,10 @@ mod tests {
         Wrong,
         /// A command buffer the OS killed, past the backend's own retries.
         Device,
+        /// A batch refused before it ran, for want of device memory.
+        Memory,
+        /// A wrong proof, then a refusal.
+        WrongThenMemory,
         /// A key the backend cannot use, which no retry changes.
         Key,
         /// A device fault followed by a deterministic error.
@@ -196,6 +218,13 @@ mod tests {
             t.msm_us += 1 << 60;
             match self.fault {
                 Fault::Wrong => m.a_g1 += G1Projective::generator(),
+                Fault::WrongThenMemory if left > 1 => m.a_g1 += G1Projective::generator(),
+                Fault::Memory | Fault::WrongThenMemory => {
+                    return Err(ProveError::DeviceMemory {
+                        backend: "faulty",
+                        reason: "an MSM batch needs 10 bytes and 9 are available".to_string(),
+                    })
+                }
                 Fault::Device | Fault::DeviceThenKey
                     if left > 1 || matches!(self.fault, Fault::Device) =>
                 {
@@ -434,6 +463,53 @@ mod tests {
                 ]
             );
         }
+    }
+
+    /// A device short of memory refuses the same proof again, so the proof goes to the CPU
+    /// at once, and the device is not called suspect.
+    #[test]
+    fn a_memory_refusal_goes_straight_to_the_cpu_and_blames_no_device() {
+        let Some(dir) = tiny("a_memory_refusal_goes_straight_to_the_cpu_and_blames_no_device")
+        else {
+            return;
+        };
+        let w = Witness::load(&dir.join("circuit.wtns")).unwrap().0;
+        let refused = || {
+            Cause::DeviceMemory(
+                "backend faulty: not enough device memory: an MSM batch needs 10 bytes and 9 \
+                 are available"
+                    .to_string(),
+            )
+        };
+        let (out, steps, built) = run(Fault::Memory, 2, &w, &dir);
+        assert!(out.is_ok());
+        assert!(built);
+        assert_eq!(
+            steps,
+            [Fallback::Refused {
+                backend: "faulty",
+                cause: refused()
+            }]
+        );
+
+        // A refusal on the retry after a wrong proof still goes to the CPU, and blames no
+        // device for a proof it got wrong only once.
+        let (out, steps, built) = run(Fault::WrongThenMemory, 2, &w, &dir);
+        assert!(out.is_ok());
+        assert!(built);
+        assert_eq!(
+            steps,
+            [
+                Fallback::Retry {
+                    backend: "faulty",
+                    cause: Cause::SelfVerify
+                },
+                Fallback::Cpu {
+                    backend: "faulty",
+                    cause: refused()
+                }
+            ]
+        );
     }
 
     /// A key the backend refuses, or a witness whose constant wire is not one, is refused

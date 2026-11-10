@@ -94,6 +94,14 @@ pub enum ProveError {
         backend: &'static str,
         reason: String,
     },
+    /// Work the backend refused before running any of it, because the device has too
+    /// little free memory for it. Not a fault: the same proof is refused again while that
+    /// memory stays taken, and the CPU proves it.
+    #[error("backend {backend}: not enough device memory: {reason}")]
+    DeviceMemory {
+        backend: &'static str,
+        reason: String,
+    },
     #[error("w[0] is the constant-one wire and must be 1")]
     ConstantWire,
     #[error("the RNG produced a zero blinder, which a CSPRNG does with probability 2^-254")]
@@ -138,7 +146,8 @@ pub enum ProveError {
 
 impl ProveError {
     /// Whether the device failed, rather than anything the caller passed. Every other variant
-    /// fails the same way on a second attempt and on the CPU.
+    /// fails the same way on a second attempt, and all but [`Self::DeviceMemory`] on the CPU
+    /// too.
     pub fn is_device_fault(&self) -> bool {
         matches!(self, Self::Device { .. })
     }

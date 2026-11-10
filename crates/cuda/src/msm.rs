@@ -589,10 +589,10 @@ fn vram_bytes(words: &[usize]) -> u64 {
 }
 
 /// The refusal of a batch that does not fit, before anything is allocated. A
-/// [`ProveError::Device`], as the driver's own `CUDA_ERROR_OUT_OF_MEMORY` is: the same key
-/// may fit when another process lets go of the card, and the CPU proves it either way.
+/// [`ProveError::DeviceMemory`] rather than a fault: nothing ran, the same key may fit when
+/// another process lets go of the card, and the CPU proves it either way.
 fn too_big(need: u64, budget: u64, what: &str) -> ProveError {
-    ProveError::Device {
+    ProveError::DeviceMemory {
         backend: crate::context::BACKEND,
         reason: format!(
             "{what} needs {need} bytes of device memory and {budget} are available to it"
@@ -2847,9 +2847,10 @@ mod tests {
     }
 
     #[test]
-    fn an_oversized_batch_is_refused_as_a_device_fault() {
+    fn an_oversized_batch_is_refused_as_too_little_memory_not_a_fault() {
         let e = too_big(10, 9, "an MSM batch");
-        assert!(e.is_device_fault(), "{e}");
+        assert!(matches!(e, ProveError::DeviceMemory { .. }), "{e}");
+        assert!(!e.is_device_fault(), "{e}");
         assert!(e.to_string().contains("10 bytes"), "{e}");
         assert!(e.to_string().contains("9 are available"), "{e}");
     }

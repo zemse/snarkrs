@@ -325,7 +325,8 @@ struct ProveOpts {
     vkey: Option<PathBuf>,
     /// When a GPU proof fails its self-verify or the device faults, prove once more on
     /// the same backend and then on the CPU, reporting each failure. A logic bug fails
-    /// the same way every time; a transient accelerator fault does not. No effect with
+    /// the same way every time; a transient accelerator fault does not. A GPU with too
+    /// little free memory for the proof goes to the CPU at once. No effect with
     /// --self-verify false or --backend cpu.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     fallback: bool,
@@ -1460,13 +1461,16 @@ fn run_prove(
                 },
                 &mut |step| {
                     use snarkrs_cli::fallback::Fallback::*;
-                    if matches!(step, Cpu { .. }) {
+                    if matches!(step, Cpu { .. } | Refused { .. }) {
                         fell_back.set(true);
                     }
                     match step {
                         Retry { backend, cause } => eprintln!(
                             "warning: the {backend} proof {cause}; proving again on {backend}"
                         ),
+                        Refused { backend, cause } => {
+                            eprintln!("warning: the {backend} proof {cause}; proving on the cpu")
+                        }
                         Cpu { backend, cause } => eprintln!(
                             "warning: the second {backend} proof {cause}; proving on the cpu"
                         ),
