@@ -682,7 +682,7 @@ __device__ __forceinline__ Jac<F> jac_add(Jac<F> a, Jac<F> b) {
 // code: never written, but still walked by the running-sum reduction, which shifts every
 // coefficient by one and yields a wrong proof.
 //
-// THE SCALARS READ HERE ARE IN STANDARD FORM, NOT MONTGOMERY. `fr_mont_to_std` exists to
+// THE SCALARS READ HERE ARE IN STANDARD FORM, NOT MONTGOMERY. `msm_mont_to_std` exists to
 // put them there. Feeding Montgomery limbs to this decomposition produces a proof wrong
 // by a factor of R, which fails verification with no other symptom to go on.
 // ---------------------------------------------------------------------------

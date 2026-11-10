@@ -1598,7 +1598,7 @@ impl CudaMsm {
         };
         let k = Kernels {
             zero_u32: Kernel::load(&module, "zero_u32")?,
-            mont_to_std: Kernel::load(&module, "fr_mont_to_std")?,
+            mont_to_std: Kernel::load(&module, "msm_mont_to_std")?,
             count: Kernel::load(&module, "msm_count")?,
             scan: Kernel::load(&module, "msm_scan")?,
             scatter: Kernel::load(&module, "msm_scatter")?,
@@ -1858,10 +1858,10 @@ impl CudaMsm {
         // SAFETY: three parameters bound in order and with matching types; `mont` was
         // checked above to hold at least `len` elements and `out` was allocated with exactly
         // that many; the kernel's `gid < len` guard covers the tail block.
-        unsafe { lb.launch(cfg) }.map_err(|e| drv("launch fr_mont_to_std", e))?;
+        unsafe { lb.launch(cfg) }.map_err(|e| drv("launch msm_mont_to_std", e))?;
         self.stream
             .synchronize()
-            .map_err(|e| drv("synchronize fr_mont_to_std", e))?;
+            .map_err(|e| drv("synchronize msm_mont_to_std", e))?;
         Ok(ScalarBuf {
             buf: out,
             len,
@@ -3654,7 +3654,7 @@ mod tests {
     fn every_kernel_this_host_loads_is_declared_extern_c() {
         for name in [
             "zero_u32",
-            "fr_mont_to_std",
+            "msm_mont_to_std",
             "msm_count",
             "msm_scan",
             "msm_scatter",

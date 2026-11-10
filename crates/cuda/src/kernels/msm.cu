@@ -1,8 +1,9 @@
 // Stages 5-9: Pippenger multi-scalar multiplication over BN254 G1 and G2, in CUDA.
 //
-// Port of crates/metal/src/shaders/msm.metal. Same algorithm, same kernel names, same
-// semantics, so a Metal-versus-CUDA number measures the hardware and the compiler and not
-// two different MSMs.
+// Port of crates/metal/src/shaders/msm.metal. Same algorithm, same kernel names (bar
+// msm_mont_to_std, which carries this unit's prefix, see below), same semantics, so a
+// Metal-versus-CUDA number measures the hardware and the compiler and not two different
+// MSMs.
 //
 // This file is compiled at run time by NVRTC, concatenated AFTER `bn254_fr.cuh` and
 // `bn254_curve.cuh`, which supply `Fr`, the two curve fields and the point arithmetic.
@@ -404,8 +405,9 @@ extern "C" __global__ void zero_u32(u32* buf, u32 len) {
 // The NTT leaves H in Montgomery form on the device; Pippenger needs the integer.
 // Byte-identical twin of g16_mont_to_std in pointwise.cu, and the duplication is forced by
 // the unit split: unit_msm does not carry pointwise.cu. A change to fr_from_mont's callers
-// is made in both.
-extern "C" __global__ void fr_mont_to_std(const Fr* in, Fr* out, u32 len) {
+// is made in both. Each twin carries its unit's prefix (msm_, g16_) so a name says which
+// unit it loads from; the Metal and WebGPU twins, with no unit split, keep fr_mont_to_std.
+extern "C" __global__ void msm_mont_to_std(const Fr* in, Fr* out, u32 len) {
     u32 gid = blockIdx.x * blockDim.x + threadIdx.x;
     if (gid < len) {
         out[gid] = fr_from_mont(in[gid]);
