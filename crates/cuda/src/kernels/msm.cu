@@ -414,15 +414,23 @@ extern "C" __global__ void msm_mont_to_std(const Fr* in, Fr* out, u32 len) {
     }
 }
 
+// The position thread `gid` of the digit pipeline reads: `gid` itself, or under a
+// key's live index (`indexed != 0`) the gid-th position whose base is not the point at
+// infinity, which the host fixed from the key at prepare. The scalar is read at it and
+// the scatter's entry names it, so the accumulation reads its base unchanged.
+__device__ __forceinline__ u32 msm_source(const u32* live, u32 indexed, u32 gid) {
+    return indexed != 0u ? live[gid] : gid;
+}
+
 // Stage 1 of the counting sort: how many points land in each (window, bucket).
 // One thread per scalar. `counts` must have been zeroed first, see zero_u32.
-extern "C" __global__ void msm_count(const u32* scalars, u32* counts, MsmParams p) {
+extern "C" __global__ void msm_count(const u32* scalars, u32* counts, MsmParams p, const u32* live, u32 indexed) {
     u32 gid = blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= p.n) {
         return;
     }
     u32 s[8];
-    u32 base = (p.scalar_off + gid) * 8u;
+    u32 base = (p.scalar_off + msm_source(live, indexed, gid)) * 8u;
 #pragma unroll
     for (u32 i = 0; i < 8u; i++) {
         s[i] = scalars[base + i];
@@ -512,13 +520,14 @@ extern "C" __global__ void msm_scan(const u32* counts, u32* cursor, MsmParams p)
 // rows), 3.3 at c = 11 (24,576 rows), 4.8 at c = 12, 5.8 at c = 13 (81,920 rows, 10 MB
 // of tails). The split is the Metal twin's `SCATTER_SPLIT_ROWS`; see `scatter_rows_for`
 // in msm.rs for what this host picks.
-extern "C" __global__ void msm_scatter(const u32* scalars, u32* cursor, MsmEntry* entries, MsmParams p, u32 w_lo, u32 w_hi) {
+extern "C" __global__ void msm_scatter(const u32* scalars, u32* cursor, MsmEntry* entries, MsmParams p, u32 w_lo, u32 w_hi, const u32* live, u32 indexed) {
     u32 gid = blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= p.n) {
         return;
     }
+    u32 src = msm_source(live, indexed, gid);
     u32 s[8];
-    u32 base = (p.scalar_off + gid) * 8u;
+    u32 base = (p.scalar_off + src) * 8u;
 #pragma unroll
     for (u32 i = 0; i < 8u; i++) {
         s[i] = scalars[base + i];
@@ -541,7 +550,7 @@ extern "C" __global__ void msm_scatter(const u32* scalars, u32* cursor, MsmEntry
         u32 slot = atomicAdd(&cursor[row], 1u);
         MsmEntry e;
         e.x = row;
-        e.y = (gid << 1) | (neg ? 1u : 0u);
+        e.y = (src << 1) | (neg ? 1u : 0u);
         entries[slot] = e;
     }
 }
