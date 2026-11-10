@@ -100,6 +100,20 @@ Do not use the old run-gpu-bench-prebuilt.sh for unattended launches.
 
 AWS behavior: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/Stop_Start.html.
 
+## The CUDA device gate
+
+```sh
+G16_T4=/path/to/t4.sh T4_BOX=mine bash bench/aws/cuda-gate.sh
+G16_T4=/path/to/t4.sh bash bench/aws/cuda-gate.sh --every-variant   # adds the ~60 min FFT sweep
+```
+
+Cross-builds the CUDA test binaries and the CLI, ships them with tiny_mul, sha256 and the
+gnark toy harness, and runs cuda-gate-guest.sh on a T4 leased through t4.sh. The helper owns
+the instance and lives outside the repo; the gate never calls aws, and it releases the lease
+on exit. The lib's legacy accumulator gate runs in its own process, and the CLI proves with
+--fallback false, so a proof the GPU did not make fails. Prints GATE PASSED or names the
+failed steps; full output is in out/ on the box.
+
 ## Nothing survives the sweep
 
 A GPU box left running over a weekend costs more than this entire exercise, so there are

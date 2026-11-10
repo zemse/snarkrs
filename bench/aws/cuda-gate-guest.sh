@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Runs ON the GPU box, from the directory cuda-gate.sh shipped: the CUDA device gate.
+#
+# Every test binary and the CLI were cross-built on the Mac, so nothing here compiles Rust.
+# The first run on a fresh box still pays NVRTC and the driver JIT for each kernel unit
+# (about five minutes for the MSM unit), inside the first step that loads it.
+#
+# usage: cuda-gate-guest.sh [--every-variant]
+set -uo pipefail
+cd "$(dirname "$0")"
+HERE=$(pwd)
+export G16_ARTIFACTS=$HERE/artifacts G16_GNARK_HARNESS=$HERE/gnark RUST_BACKTRACE=1
+BIN=$HERE/bin
+OUT=$HERE/out
+rm -rf "$OUT"; mkdir -p "$OUT"
+EVERY_VARIANT=0
+[[ "${1:-}" == --every-variant ]] && EVERY_VARIANT=1
+FAILED=()
+
+log() { echo; echo "=== $* ($(date -u +%H:%M:%SZ))"; }
+
+# step <name> <minutes> <cmd...>: run under a timeout, keep the whole output in out/<name>.txt,
+# print the test lines and the result line, and record a failure on a non-zero exit.
+step() {
+  local name=$1 min=$2 rc t0=$SECONDS
+  shift 2
+  log "$name"
+  timeout "${min}m" "$@" > "$OUT/$name.txt" 2>&1
+  rc=$?
+  grep -E "^test |^test result|panicked|SKIPPED|gate passed" "$OUT/$name.txt" | grep -vE " \.\.\. (ok|ignored.*)$"
+  echo "  $name: rc=$rc in $((SECONDS - t0)) s"
+  (( rc == 0 )) || FAILED+=("$name")
+}
+
+log "device"
+nvidia-smi --query-gpu=name,driver_version,memory.total,memory.used --format=csv,noheader
+
+# The lib's device tests, without the two that need their own process or an hour: the
+# legacy accumulator gate reads G16_CUDA_MSM_LEGACY_ACC once per process, and the FFT
+# variant sweep is about 60 minutes cold.
+step lib 10 env G16_REQUIRE_TESTS=1 "$BIN/lib" --test-threads=1
+step lib-ignored 20 env G16_REQUIRE_TESTS=1 G16_CUDA_MSM_LEGACY_ACC=0 "$BIN/lib" --ignored \
+  --test-threads=1 --nocapture \
+  --skip constant_work_legacy_override_gate --skip every_variant_gives_the_same_points
+step lib-legacy 5 env G16_CUDA_MSM_LEGACY_ACC=1 "$BIN/lib" --ignored --exact \
+  --test-threads=1 --nocapture msm::tests::constant_work_legacy_override_gate
+if (( EVERY_VARIANT )); then
+  step lib-every-variant 90 "$BIN/lib" --ignored --exact --test-threads=1 --nocapture \
+    fft::tests::every_variant_gives_the_same_points
+fi
+
+step adversarial 15 env G16_REQUIRE_TESTS=1 "$BIN/adversarial_gpu" --include-ignored \
+  --test-threads=1 --nocapture
+step pipeline 15 env G16_REQUIRE_TESTS=1 G16_CUDA_REQUIRED_FIXTURES=tiny_mul,sha256 \
+  "$BIN/pipeline_gpu" --include-ignored --test-threads=1 --nocapture
+step field 10 env G16_REQUIRE_TESTS=1 "$BIN/field_gpu" --test-threads=1
+# gnark's own verifier is `go run` in the harness; without Go that half skips, so coverage is
+# required only when Go is there to give it.
+if command -v go >/dev/null; then
+  step gnark 10 env G16_REQUIRE_TESTS=1 "$BIN/gnark_gpu" --test-threads=1 --nocapture
+else
+  step gnark 10 "$BIN/gnark_gpu" --test-threads=1 --nocapture
+  grep "SKIPPED" "$OUT/gnark.txt" | grep -qv "no \`go\` on PATH" && FAILED+=("gnark-skip")
+fi
+
+# The CLI on CUDA with the fallback off, so a proof the GPU did not make cannot pass.
+log "cli"
+for c in tiny_mul sha256; do
+  for cw in "" --constant-work; do
+    tag=$c${cw:+-cw}
+    "$BIN/snarkrs" groth16 prove "$G16_ARTIFACTS/$c/circuit.zkey" "$G16_ARTIFACTS/$c/circuit.wtns" \
+      "$OUT/$tag.proof.json" "$OUT/$tag.public.json" --backend cuda --fallback false $cw \
+      > "$OUT/$tag.prove.txt" 2>&1
+    p=$?
+    "$BIN/snarkrs" groth16 verify "$G16_ARTIFACTS/$c/vkey.json" "$OUT/$tag.public.json" \
+      "$OUT/$tag.proof.json" > "$OUT/$tag.verify.txt" 2>&1
+    v=$?
+    echo "  $tag: prove rc=$p verify rc=$v $(tail -1 "$OUT/$tag.verify.txt")"
+    (( p == 0 && v == 0 )) || FAILED+=("cli-$tag")
+  done
+done
+
+log "result"
+if (( ${#FAILED[@]} )); then echo "GATE FAILED: ${FAILED[*]}"; exit 1; fi
+echo "GATE PASSED"
