@@ -561,10 +561,16 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "requires a CUDA device and bench/artifacts/tiny_mul/circuit.zkey"]
+    #[ignore = "requires a CUDA device and tiny_mul/circuit.zkey under G16_ARTIFACTS or bench/artifacts"]
     fn key_retention_preserves_cuda_host_storage() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../bench/artifacts/tiny_mul/circuit.zkey");
+        // `G16_ARTIFACTS` first: CARGO_MANIFEST_DIR is baked in at compile time and does not
+        // exist on the GPU box a cross-built test binary runs on.
+        let path = std::env::var_os("G16_ARTIFACTS")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/artifacts")
+            })
+            .join("tiny_mul/circuit.zkey");
         let expected = ProvingKey::load(&path).expect("tiny_mul key");
         let circuit = CudaBackend::new()
             .expect("CUDA device")
