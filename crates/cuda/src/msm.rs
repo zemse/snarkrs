@@ -1635,6 +1635,11 @@ impl CudaMsm {
         if self.arena.is_some() {
             return Ok(None);
         }
+        // A dropped buffer is a `cuMemFreeAsync`, and the pool gives its pages back only at
+        // a synchronize; without one the last batch's scratch still reads as in use.
+        self.stream
+            .synchronize()
+            .map_err(|e| drv("synchronize before the memory query", e))?;
         let (free, _) = self
             .ctx
             .mem_get_info()
