@@ -9,8 +9,8 @@ validation. Historical benchmark tables are not current conformance evidence.
 | --- | --- | --- | --- | --- | --- | --- |
 | CPU | CPU | CPU | host | yes | variable, constant | native Rust |
 | Metal | GPU | G1 GPU, G2 CPU (see below) | device | B-in-G2 bases only | variable, constant | Apple Metal, feature-gated |
-| CUDA | GPU | GPU | device | yes | variable, constant | NVIDIA CUDA/NVRTC, feature-gated |
-| WGPU | GPU | GPU | device | yes | variable, constant | native WGPU or browser WebGPU, feature-gated |
+| CUDA | GPU | GPU | device | no | variable, constant | NVIDIA CUDA/NVRTC, feature-gated |
+| WGPU | GPU | GPU | device | no | variable, constant | native WGPU or browser WebGPU, feature-gated |
 
 The GPU proving paths keep H resident between its computation and the H MSM. Debug
 readback and host-H comparisons are separate from that normal path. A device H handle

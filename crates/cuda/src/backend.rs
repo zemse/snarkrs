@@ -58,7 +58,7 @@ use std::time::Instant;
 
 use cudarc::driver::CudaModule;
 use snarkrs_field::{Field, Fr};
-use snarkrs_formats::{HBasis, ProvingKey};
+use snarkrs_formats::{Coefficients, HBasis, ProvingKey};
 use snarkrs_groth16::{Backend, HPoly, MsmOutputs, PreparedCircuit, ProveError, StageTimings};
 
 use crate::context::{bad, Cuda};
@@ -282,8 +282,10 @@ impl Backend for CudaBackend {
 ///
 /// # What stays on the host
 ///
-/// This backend retains the complete key after upload, including coefficients and query
-/// vectors. That bulk storage is not part of the shared [`PreparedCircuit::key`] contract.
+/// The dimensions, the five header points blinding and assembly use, and the full
+/// verifying key (including `vk.ic`). The coefficients are released once stages 0 to 4
+/// hold them on the device, and the five queries once the bases are resident, so
+/// [`PreparedCircuit::key`] is not a complete key for preparing another backend.
 pub struct CudaCircuit {
     pk: ProvingKey,
     stages: CudaStages,
@@ -299,7 +301,7 @@ pub struct CudaCircuit {
 pub const MSM_CHUNK: usize = 1 << 22;
 
 impl CudaCircuit {
-    fn new(backend: &CudaBackend, pk: ProvingKey) -> Result<Self, ProveError> {
+    fn new(backend: &CudaBackend, mut pk: ProvingKey) -> Result<Self, ProveError> {
         // Shape checks first. `crate::msm` would reject an out-of-range job later, but by
         // then the message names buffer offsets rather than the section of the zkey that is
         // the wrong length, and the mismatch is a property of the key, not of the proof.
@@ -350,6 +352,7 @@ impl CudaCircuit {
         } else {
             stages
         };
+        release_coeffs(&mut pk);
         let stages_us = t0.elapsed().as_micros() as u64;
 
         // Stages 5 to 9. Repacking, not casting: `ark_ec::G1Affine` is 72 bytes on this
@@ -357,6 +360,7 @@ impl CudaCircuit {
         // flag that the packed layout encodes as all-zero coordinates instead.
         let t1 = Instant::now();
         let msm = CudaMsm::from_module(&backend.cuda, backend.msm_module()?)?.with_key(&pk)?;
+        release_queries(&mut pk);
         let msm = if backend.work == Work::Constant {
             msm.constant_work()
         } else {
@@ -545,6 +549,41 @@ impl PreparedCircuit for CudaCircuit {
     }
 }
 
+/// Empties `pk`'s coefficients, which [`CudaStages`] has made resident and nothing reads
+/// from the host again. Through [`snarkrs_groth16::malloc::release`], for the reason it
+/// gives.
+fn release_coeffs(pk: &mut ProvingKey) {
+    let Coefficients {
+        row_ptr,
+        signal,
+        value_id,
+        values,
+    } = std::mem::replace(
+        &mut pk.coeffs,
+        Coefficients {
+            row_ptr: Default::default(),
+            signal: Default::default(),
+            value_id: Default::default(),
+            values: Vec::new(),
+        },
+    );
+    row_ptr
+        .into_iter()
+        .chain(signal)
+        .chain(value_id)
+        .for_each(snarkrs_groth16::malloc::release);
+    snarkrs_groth16::malloc::release(values);
+}
+
+/// Empties `pk`'s five queries once [`CudaMsm::with_key`] has made them resident.
+fn release_queries(pk: &mut ProvingKey) {
+    snarkrs_groth16::malloc::release(std::mem::take(&mut pk.a_query));
+    snarkrs_groth16::malloc::release(std::mem::take(&mut pk.b_g1_query));
+    snarkrs_groth16::malloc::release(std::mem::take(&mut pk.b_g2_query));
+    snarkrs_groth16::malloc::release(std::mem::take(&mut pk.l_query));
+    snarkrs_groth16::malloc::release(std::mem::take(&mut pk.h_query));
+}
+
 /// `Backend` and `PreparedCircuit` both require `Send + Sync`, and the whole reason
 /// `prepare` is a separate call is that one resident key is proved against from many
 /// threads. If a `!Sync` field ever lands on either struct this stops compiling here
@@ -559,10 +598,11 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use snarkrs_formats::Matrix;
 
     #[test]
     #[ignore = "requires a CUDA device and tiny_mul/circuit.zkey under G16_ARTIFACTS or bench/artifacts"]
-    fn key_retention_preserves_cuda_host_storage() {
+    fn key_retention_releases_only_cuda_bulk_storage() {
         // `G16_ARTIFACTS` first: CARGO_MANIFEST_DIR is baked in at compile time and does not
         // exist on the GPU box a cross-built test binary runs on.
         let path = std::env::var_os("G16_ARTIFACTS")
@@ -572,6 +612,8 @@ mod tests {
             })
             .join("tiny_mul/circuit.zkey");
         let expected = ProvingKey::load(&path).expect("tiny_mul key");
+        assert!(!expected.a_query.is_empty());
+        assert!(!expected.vk.ic.is_empty());
         let circuit = CudaBackend::new()
             .expect("CUDA device")
             .prepare(ProvingKey::load(&path).unwrap())
@@ -616,35 +658,44 @@ mod tests {
             )
         );
         assert_eq!(
-            (
-                &key.coeffs.row_ptr,
-                &key.coeffs.signal,
-                &key.coeffs.value_id,
-                &key.coeffs.values
-            ),
-            (
-                &expected.coeffs.row_ptr,
-                &expected.coeffs.signal,
-                &expected.coeffs.value_id,
-                &expected.coeffs.values
-            )
+            [
+                key.a_query.len(),
+                key.b_g1_query.len(),
+                key.b_g2_query.len(),
+                key.l_query.len(),
+                key.h_query.len()
+            ],
+            [0; 5]
         );
         assert_eq!(
-            (
-                &key.a_query,
-                &key.b_g1_query,
-                &key.b_g2_query,
-                &key.l_query,
-                &key.h_query
-            ),
-            (
-                &expected.a_query,
-                &expected.b_g1_query,
-                &expected.b_g2_query,
-                &expected.l_query,
-                &expected.h_query
-            )
+            [
+                key.a_query.capacity(),
+                key.b_g1_query.capacity(),
+                key.b_g2_query.capacity(),
+                key.l_query.capacity(),
+                key.h_query.capacity()
+            ],
+            [0; 5]
         );
+        for m in Matrix::BOTH.map(Matrix::index) {
+            assert_eq!(
+                [
+                    key.coeffs.row_ptr[m].len(),
+                    key.coeffs.signal[m].len(),
+                    key.coeffs.value_id[m].len()
+                ],
+                [0; 3]
+            );
+            assert_eq!(
+                [
+                    key.coeffs.row_ptr[m].capacity(),
+                    key.coeffs.signal[m].capacity(),
+                    key.coeffs.value_id[m].capacity()
+                ],
+                [0; 3]
+            );
+        }
+        assert_eq!(key.coeffs.values.capacity(), 0);
     }
 
     /// The panic-to-error conversion is what makes "no GPU here" a skip rather than an
