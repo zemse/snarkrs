@@ -748,8 +748,21 @@ pub(crate) fn resident_scratch(
 /// slice_len` entries a row merges wide, below it narrow, so a plan mixing both kinds
 /// pays each kernel only for its own rows. A whole-plan range picked from the expected
 /// span, the twin's shape, lost 1.2 to 2 ms on every mid circuit at span 4 for the
-/// same reason. Override with `G16_CUDA_MSM_WIDE`; 0 disables the wide path.
-const MERGE_WIDE_MIN_SPAN: usize = 64;
+/// same reason.
+///
+/// That sweep ran every plan at c = 8, where a uniformly filled 2^18 row spans exactly
+/// 32 slices and span 32 sent every H row wide. Those plans now run at c = 13
+/// ([`window_size`]), where a uniform row is one slice and the fat rows are the top
+/// window's 128 live buckets, 32 slices at 2^18, which span 64 left to the narrow
+/// kernel: `variable_work_phase_timings` at c = 13, 2^18 dense, read the merge at
+/// 2.9 ms G1 / 7.0 G2 at span 64 and 1.9 / 4.2 at span 32 (16 the same), the mixed set
+/// flat. Warm `snarkrs bench`, 2 rounds x 6, span 64 -> 32, prove ms: keccak256 42.9 /
+/// 42.6 -> 41.5 / 41.5, rsa2048 53.7 / 53.6 -> 52.4 / 52.8, anon-aadhaar 313.2 / 313.8
+/// -> 312.9 / 313.7, the four smaller circuits and every constant-work circuit within
+/// 0.3. Below 2^17 general scalars the plans stay at c = 8 with rows of at most 8
+/// slices at 2^16, which neither span reaches. Override with `G16_CUDA_MSM_WIDE`; 0
+/// disables the wide path.
+const MERGE_WIDE_MIN_SPAN: usize = 32;
 
 /// Entries at or above which a bucket merges wide, or 0 when no bucket of the plan can
 /// reach that count, which is when the host skips the wide launch altogether.
