@@ -57,11 +57,18 @@
 #ifndef G16_GATHER_CU
 #define G16_GATHER_CU
 
-// out_a[c] = sum over CSR row c of value_a[k] * witness[signal_a[k]]
+// out_a[c] = sum over CSR row c of values[id_a(k)] * witness[signal_a[k]]
 // out_b[c] = the same for matrix B
 // out_c[c] = out_a[c] * out_b[c]
 //
-// `witness` is Montgomery-form Fr (layout::PackedFr), as are the CSR values, so the
+// A nonzero's value is an entry of one table both matrices share: `value_id_m[k]` when
+// `by_id`, else its own position, `k` in A and `b_first + k` in B. A large key repeats a
+// few thousand values over hundreds of millions of nonzeros, so 4 bytes of id per nonzero
+// replace 32 of value, and the table stays in cache. A key the loader did not intern keeps
+// a value per nonzero, A's then B's, and the ids are a one-word placeholder; `by_id` is
+// the same for every thread, so the select costs no divergence.
+//
+// `witness` is Montgomery-form Fr (layout::PackedFr), as are the values, so the
 // products need no conversion in either direction.
 //
 // LAUNCH: grid_dim.x = ceil(n / block_dim.x), block_dim.x free (256, the Metal twin's
@@ -76,10 +83,13 @@
 extern "C" __global__ void g16_gather_abc(
     const u32* row_ptr_a,
     const u32* signal_a,
-    const Fr*  value_a,
+    const u32* value_id_a,
     const u32* row_ptr_b,
     const u32* signal_b,
-    const Fr*  value_b,
+    const u32* value_id_b,
+    const Fr*  values,
+    const u32  b_first,
+    const u32  by_id,
     const Fr*  witness,
     Fr*        out_a,
     Fr*        out_b,
@@ -101,14 +111,16 @@ extern "C" __global__ void g16_gather_abc(
     u32 lo = row_ptr_a[gid];
     u32 hi = row_ptr_a[gid + 1u];
     for (u32 k = lo; k < hi; k++) {
-        a = fr_add(a, fr_mul(value_a[k], witness[signal_a[k]]));
+        u32 v = by_id ? value_id_a[k] : k;
+        a = fr_add(a, fr_mul(values[v], witness[signal_a[k]]));
     }
 
     Fr b = fr_zero();
     lo = row_ptr_b[gid];
     hi = row_ptr_b[gid + 1u];
     for (u32 k = lo; k < hi; k++) {
-        b = fr_add(b, fr_mul(value_b[k], witness[signal_b[k]]));
+        u32 v = by_id ? value_id_b[k] : b_first + k;
+        b = fr_add(b, fr_mul(values[v], witness[signal_b[k]]));
     }
 
     out_a[gid] = a;

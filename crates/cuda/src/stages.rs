@@ -50,7 +50,7 @@ use cudarc::driver::{
     LaunchConfig, PinnedHostSlice, PushKernelArg,
 };
 use snarkrs_field::{Domain, Field, Fr};
-use snarkrs_formats::{HBasis, Matrix, ProvingKey};
+use snarkrs_formats::{Coefficients, HBasis, Matrix, ProvingKey};
 use snarkrs_gpu_layout::{Packed, PackedFr, PackedScalar};
 use snarkrs_groth16::{HPoly, ProveError, StageTimings};
 
@@ -349,6 +349,19 @@ impl Drop for Staging {
     }
 }
 
+/// Whether every nonzero's value id is its own position, A's then B's, over a table of
+/// exactly those values: a key the loader did not intern. The gather then indexes the table
+/// by position and the ids stay on the host.
+fn ids_are_positions(c: &Coefficients) -> bool {
+    use rayon::prelude::*;
+    let [a, b] = &c.value_id;
+    c.values.len() == a.len() + b.len()
+        && a.par_iter().enumerate().all(|(k, &id)| id as usize == k)
+        && b.par_iter()
+            .enumerate()
+            .all(|(k, &id)| id as usize == a.len() + k)
+}
+
 /// `src` into `out` as [`PackedFr`] words, on the pool for a chunk large enough to be
 /// worth it.
 fn pack_fr(src: &[Fr], out: &mut [u32]) {
@@ -487,7 +500,15 @@ pub struct CudaStages {
 
     row_ptr: [CudaSlice<u32>; 2],
     signal: [CudaSlice<u32>; 2],
-    value: [CudaSlice<u32>; 2],
+    /// Each nonzero's index into `values`, or a one-word placeholder when `by_id` is false.
+    value_id: [CudaSlice<u32>; 2],
+    /// The values both matrices' nonzeros take, as [`PackedFr`].
+    values: CudaSlice<u32>,
+    /// Where B's values start in `values` when it holds one per nonzero.
+    b_first: u32,
+    /// Whether the gather reads `values[value_id[k]]` rather than `values[k]`; see
+    /// [`ids_are_positions`].
+    by_id: bool,
     tw_fwd: CudaSlice<u32>,
     tw_inv: CudaSlice<u32>,
     coset_pows: CudaSlice<u32>,
@@ -629,8 +650,7 @@ impl CudaStages {
         // of them exists on the host as a whole vector. A gnark key has no values here.
         let n = domain.size();
         let (a, b) = (Matrix::A.index(), Matrix::B.index());
-        let nnz = pk.coeffs.value_id[a].len().max(pk.coeffs.value_id[b].len());
-        let mut staging = Staging::for_key(&ctx, n.max(nnz) * 8)?;
+        let mut staging = Staging::for_key(&ctx, n.max(pk.coeffs.values.len()) * 8)?;
         let tw_fwd = upload_powers(&stream, &mut staging, domain.group_gen(), n / 2)?;
         let tw_inv = upload_powers(&stream, &mut staging, domain.group_gen_inv(), n / 2)?;
         // shift^j for j in [0, n). Not the twiddles: the twiddles are powers of the domain's
@@ -644,7 +664,10 @@ impl CudaStages {
                 work: crate::msm::Work::Variable,
                 row_ptr: [empty()?, empty()?],
                 signal: [empty()?, empty()?],
-                value: [empty()?, empty()?],
+                value_id: [empty()?, empty()?],
+                values: empty()?,
+                b_first: 0,
+                by_id: false,
                 tw_fwd,
                 tw_inv,
                 coset_pows,
@@ -675,19 +698,18 @@ impl CudaStages {
             });
         }
 
-        // Each nonzero's interned value, looked up as it is packed.
-        let values = &pk.coeffs.values;
-        let mut up_values = |m: usize| {
-            staging.upload_packed(&stream, &pk.coeffs.value_id[m], |ids, out| {
-                for (d, &id) in out.iter_mut().zip(ids) {
-                    *d = PackedFr::from_fr(&values[id as usize]);
-                }
-            })
-        };
-        let value = [up_values(a)?, up_values(b)?];
+        // The values table once, and each nonzero's id into it unless the id is just its
+        // position: 4 bytes a nonzero where expanding the values took 32.
+        let values = staging.upload_packed(&stream, &pk.coeffs.values, PackedFr::pack_into)?;
         drop(staging);
+        let by_id = !ids_are_positions(&pk.coeffs);
+        // `check_structure` bounds every id below `values.len()`, and an id is a u32, so a
+        // table of one value per nonzero puts B's first below 2^32.
+        let b_first = pk.coeffs.value_id[a].len() as u32;
         // Already plain words, so the driver copies them from where they are.
         let up_u32 = |data: &[u32]| upload_words(&stream, data);
+        let up_ids = |m: usize| up_u32(if by_id { &pk.coeffs.value_id[m] } else { &[] });
+        let value_id = [up_ids(a)?, up_ids(b)?];
         let row_ptr = [
             up_u32(&pk.coeffs.row_ptr[a])?,
             up_u32(&pk.coeffs.row_ptr[b])?,
@@ -698,7 +720,10 @@ impl CudaStages {
             work: crate::msm::Work::Variable,
             row_ptr,
             signal,
-            value,
+            value_id,
+            values,
+            b_first,
+            by_id,
             tw_fwd,
             tw_inv,
             coset_pows,
@@ -757,8 +782,8 @@ impl CudaStages {
     }
 
     /// The device buffers [`Self::from_module`] keeps for `pk`, in bytes: both twiddle
-    /// tables, the coset powers, and each matrix's values, row pointers and signals. A
-    /// gnark key's are [`Self::rows_table_buffers`].
+    /// tables, the coset powers, the values table, and each matrix's value ids, row
+    /// pointers and signals. A gnark key's are [`Self::rows_table_buffers`].
     pub(crate) fn key_buffers(pk: &ProvingKey) -> Vec<u64> {
         let n = pk.domain_size;
         if pk.h_basis != HBasis::SnarkjsOddCoset {
@@ -766,9 +791,14 @@ impl CudaStages {
         }
         let fr = |elems: usize| elems.max(1) as u64 * core::mem::size_of::<PackedFr>() as u64;
         let u32s = |words: usize| words.max(1) as u64 * 4;
-        let mut out = vec![fr(n / 2), fr(n / 2), fr(n)];
+        let by_id = !ids_are_positions(&pk.coeffs);
+        let mut out = vec![fr(n / 2), fr(n / 2), fr(n), fr(pk.coeffs.values.len())];
         for m in Matrix::BOTH.map(Matrix::index) {
-            out.push(fr(pk.coeffs.value_id[m].len()));
+            out.push(u32s(if by_id {
+                pk.coeffs.value_id[m].len()
+            } else {
+                0
+            }));
             out.push(u32s(pk.coeffs.row_ptr[m].len()));
             out.push(u32s(pk.coeffs.signal[m].len()));
         }
@@ -776,12 +806,12 @@ impl CudaStages {
     }
 
     /// The device buffers a gnark key's [`Self::from_module`] keeps, in bytes: both twiddle
-    /// tables, the coset powers, and the six one-word placeholders where a zkey's matrices
+    /// tables, the coset powers, and the seven one-word placeholders where a zkey's matrices
     /// go.
     pub(crate) fn rows_table_buffers(n: usize) -> Vec<u64> {
         let fr = |elems: usize| elems.max(1) as u64 * core::mem::size_of::<PackedFr>() as u64;
         let mut out = vec![fr(n / 2), fr(n / 2), fr(n)];
-        out.extend([4; 6]);
+        out.extend([4; 7]);
         out
     }
 
@@ -1221,22 +1251,27 @@ impl CudaStages {
             block_dim: (block, 1, 1),
             shared_mem_bytes: 0,
         };
+        let by_id = self.by_id as u32;
         let mut lb = self.stream.launch_builder(&self.gather);
         lb.arg(&self.row_ptr[0])
             .arg(&self.signal[0])
-            .arg(&self.value[0])
+            .arg(&self.value_id[0])
             .arg(&self.row_ptr[1])
             .arg(&self.signal[1])
-            .arg(&self.value[1])
+            .arg(&self.value_id[1])
+            .arg(&self.values)
+            .arg(&self.b_first)
+            .arg(&by_id)
             .arg(&sc.witness)
             .arg(&sc.a)
             .arg(&sc.b)
             .arg(&sc.c)
             .arg(&nn);
-        // SAFETY: the kernel's eleven parameters are bound in order and with matching types;
-        // `row_ptr` holds domain_size + 1 entries and every `signal` entry was checked
-        // against `n_vars` in `new`, so no thread reads out of bounds; the kernel's
-        // `gid >= n` guard covers the tail block.
+        // SAFETY: the kernel's fourteen parameters are bound in order and with matching
+        // types; `row_ptr` holds domain_size + 1 entries and every `signal` entry was
+        // checked against `n_vars` and every value id against the table in `new`, and
+        // without ids the table holds a value per nonzero, so no thread reads out of
+        // bounds; the kernel's `gid >= n` guard covers the tail block.
         unsafe { lb.launch(cfg) }.map_err(|e| drv("launch g16_gather_abc", e))?;
         self.launches.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -1826,6 +1861,90 @@ mod tests {
                 kernels::NTT_CU.contains(&spaced) || kernels::NTT_CU.contains(&tight),
                 "kernels/ntt.cu does not define {name} as {want}"
             );
+        }
+    }
+
+    /// The ids stay on the host only for a table of one value per nonzero in order, A's
+    /// then B's; a shared value, a permuted table or B's ids restarting at zero need them.
+    #[test]
+    fn value_ids_are_skipped_only_for_a_value_per_nonzero_in_order() {
+        let f = |x: u64| Fr::from(x);
+        let rp = || [vec![0, 2, 3], vec![0, 1, 1]];
+        let sg = || [vec![0, 1, 1], vec![2]];
+        let distinct = Coefficients::from_values(rp(), sg(), [vec![f(1), f(2), f(3)], vec![f(4)]]);
+        assert_eq!(distinct.value_id, [vec![0, 1, 2], vec![3]]);
+        assert!(ids_are_positions(&distinct));
+        let shared = Coefficients::from_values(rp(), sg(), [vec![f(1), f(2), f(1)], vec![f(2)]]);
+        assert_eq!(shared.values.len(), 2);
+        assert!(!ids_are_positions(&shared));
+        let with = |value_id: [Vec<u32>; 2]| Coefficients {
+            row_ptr: rp(),
+            signal: sg(),
+            value_id,
+            values: vec![f(1), f(2), f(3), f(4)],
+        };
+        assert!(ids_are_positions(&with([vec![0, 1, 2], vec![3]])));
+        assert!(!ids_are_positions(&with([vec![1, 0, 2], vec![3]])));
+        assert!(!ids_are_positions(&with([vec![0, 1, 2], vec![0]])));
+        let empty =
+            Coefficients::from_values(Default::default(), Default::default(), Default::default());
+        assert!(ids_are_positions(&empty));
+    }
+
+    /// One key's matrices gathered through value ids and through a value per nonzero give
+    /// the same H, on a zkey the loader left uninterned and one it interned.
+    #[test]
+    #[ignore = "requires a CUDA device and tiny_mul and sha256 under G16_ARTIFACTS or bench/artifacts"]
+    fn gathering_by_value_id_and_by_position_give_the_same_h() {
+        let root = std::env::var_os("G16_ARTIFACTS")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/artifacts")
+            });
+        let cuda = Cuda::new(0).expect("CUDA device");
+        let h_of = |stages: &CudaStages, w: &[Fr]| {
+            let h = stages.compute_h(w, &mut StageTimings::default()).unwrap();
+            let handle = h.require_handle::<HHandle>(TAG).unwrap().unwrap();
+            handle.to_host().unwrap()
+        };
+        for name in ["tiny_mul", "sha256"] {
+            let dir = root.join(name);
+            let mut pk = ProvingKey::load(&dir.join("circuit.zkey")).expect("proving key");
+            let w = snarkrs_formats::wtns::Witness::load(&dir.join("circuit.wtns"))
+                .expect("witness")
+                .0;
+            let c = &pk.coeffs;
+            let dense = [c.dense(0), c.dense(1)];
+            let interned =
+                Coefficients::from_values(c.row_ptr.clone(), c.signal.clone(), dense.clone());
+            let n_a = dense[0].len() as u32;
+            let positional = Coefficients {
+                row_ptr: c.row_ptr.clone(),
+                signal: c.signal.clone(),
+                value_id: [
+                    (0..n_a).collect(),
+                    (n_a..n_a + dense[1].len() as u32).collect(),
+                ],
+                values: dense.concat(),
+            };
+            eprintln!(
+                "{name}: {} nonzeros, {} values as loaded, {} interned",
+                dense[0].len() + dense[1].len(),
+                c.values.len(),
+                interned.values.len()
+            );
+            let loaded = h_of(&CudaStages::new(&cuda, &pk).unwrap(), &w);
+            pk.coeffs = interned;
+            let stages = CudaStages::new(&cuda, &pk).unwrap();
+            assert!(stages.by_id, "{name}: interned key gathered by position");
+            assert_eq!(h_of(&stages, &w), loaded, "{name}: by value id");
+            pk.coeffs = positional;
+            let stages = CudaStages::new(&cuda, &pk).unwrap();
+            assert!(
+                !stages.by_id,
+                "{name}: one value per nonzero gathered by id"
+            );
+            assert_eq!(h_of(&stages, &w), loaded, "{name}: by position");
         }
     }
 

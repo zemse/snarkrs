@@ -565,7 +565,7 @@ mod tests {
             b.bases,
             (2 * 15_747_144 + 15_747_138 + ((1 << 24) - 1)) * 64 + 15_747_144 * 128
         );
-        assert_eq!(b.tables, (1u64 << 25) * 32 + 24);
+        assert_eq!(b.tables, (1u64 << 25) * 32 + 28);
         assert_eq!(b.scratch, (2 * 15_747_144 + 6 * (1u64 << 24) + 1) * 32);
         assert!(b.total < 24_000_000_000, "{b:?}");
         assert!(b.total > b.bases + b.tables + b.scratch + b.msm);
