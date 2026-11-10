@@ -637,6 +637,18 @@ fn reduce_groups_for(n_windows: usize, n_buckets: usize) -> usize {
     g
 }
 
+/// Threads a reduce block runs: one per bucket of its chunk, rounded up to a power of two,
+/// at most [`REDUCE_TG`].
+///
+/// Every thread of the block takes part in the closing tree, `log2(threads)` levels of
+/// serial additions, whether or not its segment held a bucket. At c = 3 a window is four
+/// buckets, and 64 threads paid six levels for them where four pay two. A function of
+/// `c` and the reduce groups alone, so the same for every witness.
+fn reduce_threads(g: &Geometry) -> u32 {
+    let chunk = g.n_buckets.div_ceil(g.reduce_groups.max(1));
+    (chunk.next_power_of_two() as u32).clamp(1, REDUCE_TG)
+}
+
 /// Which MSMs a batch of [`CudaMsm::msms_resident`] runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Resident {
@@ -3026,7 +3038,7 @@ impl CudaMsm {
 
     /// `reduce_groups` blocks per window, at most `REDUCE_TG` threads. See `REDUCE_TG`: a
     /// wider block indexes past the end of the kernel's shared array with no diagnostic at
-    /// all.
+    /// all. Fewer when a block owns fewer buckets; see [`reduce_threads`].
     fn launch_reduce(
         &self,
         job: &Job<'_>,
@@ -3035,7 +3047,7 @@ impl CudaMsm {
         params: &MsmParams,
     ) -> Result<(), ProveError> {
         let reduce = &self.k.group(job.group()).reduce;
-        let cfg = reduce.cfg_blocks(p.window_sums(), REDUCE_TG);
+        let cfg = reduce.cfg_blocks(p.window_sums(), reduce_threads(p));
         let mut lb = self.stream.launch_builder(&reduce.f);
         lb.arg(&out.buckets).arg(&out.window_sums).arg(params);
         // SAFETY: three parameters in order; the grid is exactly `n_windows *
@@ -3485,6 +3497,24 @@ mod tests {
             Geometry::new(n, 3, usize::MAX, window_size(n), 64, Work::Constant).unwrap(),
             want
         );
+    }
+
+    #[test]
+    fn reduce_threads_cover_each_chunk_up_to_the_block() {
+        for c in 2..=MAX_WINDOW {
+            for work in [Work::Variable, Work::Constant] {
+                let g = Geometry::new(1000, 0, 1000, c, 64, work).unwrap();
+                let t = reduce_threads(&g) as usize;
+                let chunk = g.n_buckets.div_ceil(g.reduce_groups);
+                assert!(t.is_power_of_two() && t <= REDUCE_TG as usize);
+                assert!(t >= chunk.min(REDUCE_TG as usize));
+                assert!(t < 2 * chunk || t == 1);
+            }
+        }
+        let g = Geometry::new(8, 0, 8, 3, 8, Work::Constant).unwrap();
+        assert_eq!(reduce_threads(&g), 4);
+        let g = Geometry::new(8, 0, 8, 8, 8, Work::Constant).unwrap();
+        assert_eq!(reduce_threads(&g), REDUCE_TG);
     }
 
     #[test]
