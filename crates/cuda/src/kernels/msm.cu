@@ -349,9 +349,10 @@ struct MsmParams {
     u32 slices;      // ceil(cap / slice_len), threads per window there
     u32 dummy_rows;  // constant work: zero-digit rows per window
     u32 merge_wide_min; // entries at or above which a bucket merges in msm_merge_wide_*; 0 never
+    u32 reduce_groups;  // blocks per window in msm_reduce_*
 };
 
-static_assert(sizeof(MsmParams) == 48, "MsmParams must be twelve u32 to match the host struct");
+static_assert(sizeof(MsmParams) == 52, "MsmParams must be thirteen u32 to match the host struct");
 
 struct FoldParams {
     u32 slots;
@@ -500,7 +501,16 @@ extern "C" __global__ void msm_scan(const u32* counts, u32* cursor, MsmParams p)
 // cursor is bumped with a relaxed 32-bit atomicAdd, so points land inside their run in an
 // arbitrary order, which is fine because bucket accumulation is commutative. After this
 // kernel `cursor` holds each run's END, and the run's start is `cursor - counts`.
-extern "C" __global__ void msm_scatter(const u32* scalars, u32* cursor, MsmEntry* entries, MsmParams p) {
+//
+// Windows `[w_lo, w_hi)` only, so the host can issue the windows in serial launches. Every
+// store lands on the cache line holding its run's tail, so a launch keeps one line per
+// row live, and once that set outgrows the L2 the partial lines are written back and
+// refetched under the stores. MEASURED on a Tesla T4 (4 MB L2) by `variable_work_phase_timings`
+// at 2^18 dense scalars, the digit pipeline: 1.9 ms at c = 8 through 10 (at most 7,936
+// rows), 3.3 at c = 11 (24,576 rows), 4.8 at c = 12, 5.8 at c = 13 (81,920 rows, 10 MB
+// of tails). The split is the Metal twin's `SCATTER_SPLIT_ROWS`; see `scatter_rows_for`
+// in msm.rs for what this host picks.
+extern "C" __global__ void msm_scatter(const u32* scalars, u32* cursor, MsmEntry* entries, MsmParams p, u32 w_lo, u32 w_hi) {
     u32 gid = blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= p.n) {
         return;
@@ -514,7 +524,7 @@ extern "C" __global__ void msm_scatter(const u32* scalars, u32* cursor, MsmEntry
     if (p.dummy_rows == 0u && (sc_is_zero(s) || sc_is_one(s))) {
         return;
     }
-    for (u32 w = 0; w < p.n_windows; w++) {
+    for (u32 w = w_lo; w < w_hi; w++) {
         u32 mag;
         bool neg;
         sc_signed_digit(s, w, p.c, mag, neg);
@@ -1012,8 +1022,8 @@ extern "C" __global__ void msm_merge_g2(PtG2* buckets,
 //
 // On the Metal side only the top window's live buckets are ever this fat, because its
 // window widths run to 15 bits, so the twin points the kernel at a row range the host
-// picks from the expected span. This port's host caps the width at 8 (`window_size`),
-// where a uniformly filled bucket holds `n / 128` entries, 32 slices at 2^18, but a
+// picks from the expected span. This port's host runs at 8 below 2^17 general scalars
+// (`window_size`), where a uniformly filled bucket holds `n / 128` entries, but a
 // witness MSM is anything but uniform: its small values crowd the low windows, so one
 // plan holds rows spanning dozens of slices beside thousands spanning one, and a block
 // pays the whole tree on either. So the split is by the row's own count: a row at or
@@ -1192,21 +1202,22 @@ extern "C" __global__ void msm_fold_g2(const PtG2* in_pts,
 
 #endif // G16_MSM_CONSTANT_WORK
 
-// Stage 5: collapse one window's 2^(c-1) buckets to one point. ONE BLOCK PER WINDOW.
+// Stage 5: collapse one window's 2^(c-1) buckets to one point.
 //
 // The window sum is sum_j (j+1) B_j. Split the buckets into one segment per thread, at
 // [lo, hi). Inside a segment the reverse running sum gives
 // P = sum_j (j - lo + 1) B_j and Q = sum_j B_j in two additions per bucket, and the
-// segment contributes P + lo * Q. The per-thread results are then tree-reduced in shared
-// memory, so the host reads back one point per window and does nothing but the Horner
-// combination.
+// segment contributes P + lo * Q, with `lo` the window-global bucket index, so the
+// identity holds no matter how the segments are carved up.
 //
-// Not split across blocks the way the Metal twin's `reduce_groups` does. MEASURED on a
-// T4 at the shipped c = 8 (TASKS.local.md, OPT-07): the kernel is 0.55 ms in G1 and 1.8
-// in G2 flat from 2^14 to 2^18, latency, and neither two groups a window (G2 1.59 ms for
-// 0.07 ms more host folding, G1 within noise) nor the twin's warp-scan shape that drops
-// `pt_mul_small` from the chain (device 0.06 to 0.19 ms faster, host 0.13 to 0.41 ms
-// slower on the pair fold) paid for itself.
+// That freedom is what `reduce_groups` uses, as in the Metal twin. One block per window
+// is 32 blocks at c = 8 and 20 at c = 13 on a 40-SM card, and at c = 13 each thread is a
+// dependent chain of 128 full additions: latency, not work. Each window is therefore
+// split across `reduce_groups` blocks, each owning a contiguous chunk of its buckets and
+// writing one partial to `window_sums[w * reduce_groups + g]`; the host adds the
+// partials per window before its Horner combination. At the shipped c = 8 the host's
+// rule keeps one block a window, where the T4 measured two groups flat (TASKS.local.md,
+// OPT-07): a lane then owes its fixed `pt_mul_small` for one bucket less.
 //
 // REDUCE_TG is the shared array size and therefore the largest block the host may launch
 // at these kernels. 64 rather than 128 is an occupancy choice: at 64 the G2 array is
@@ -1221,12 +1232,17 @@ __device__ __forceinline__ void msm_reduce_impl(const Xyzz<F>* buckets,
                                                 Xyzz<F>* window_sums,
                                                 MsmParams p,
                                                 P* shared,
-                                                u32 w,
+                                                u32 tg,
                                                 u32 tid,
                                                 u32 tcount) {
-    u32 seg_len = (p.n_buckets + tcount - 1u) / tcount;
-    u32 lo = tid * seg_len;
-    u32 hi = msm_min(lo + seg_len, p.n_buckets);
+    u32 w = tg / p.reduce_groups;
+    u32 g = tg - w * p.reduce_groups;
+    u32 chunk = (p.n_buckets + p.reduce_groups - 1u) / p.reduce_groups;
+    u32 tg_lo = g * chunk;
+    u32 tg_hi = msm_min(tg_lo + chunk, p.n_buckets);
+    u32 seg_len = (chunk + tcount - 1u) / tcount;
+    u32 lo = tg_lo + tid * seg_len;
+    u32 hi = msm_min(lo + seg_len, tg_hi);
 
     P mine = PtOps<P>::zero();
     if (lo < hi) {
@@ -1251,7 +1267,7 @@ __device__ __forceinline__ void msm_reduce_impl(const Xyzz<F>* buckets,
     }
     __syncthreads();
     if (tid == 0u) {
-        window_sums[w] = PtOps<P>::store(shared[0]);
+        window_sums[tg] = PtOps<P>::store(shared[0]);
     }
 }
 

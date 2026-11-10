@@ -218,11 +218,13 @@ struct Geometry {
     /// Entries at or above which a bucket merges in `msm_merge_wide_*` instead of
     /// `msm_merge_*`, 0 when no bucket can; see [`merge_wide_min_for`].
     merge_wide_min: usize,
+    /// Blocks per window in the reduce; see [`reduce_groups_for`].
+    reduce_groups: usize,
 }
 
 impl Geometry {
-    /// [`Self::with_wide_span`] at the shipped threshold. Sizes are what `batch_words`
-    /// needs and the wide range changes none of them.
+    /// [`Self::with_shapes`] at the shipped shapes. Sizes are what `batch_words`
+    /// needs and the shapes change none of them.
     fn new(
         n: usize,
         scalar_off: usize,
@@ -231,25 +233,25 @@ impl Geometry {
         slice_len: usize,
         work: Work,
     ) -> Result<Self, ProveError> {
-        Self::with_wide_span(
+        Self::with_shapes(
             n,
             scalar_off,
             general,
             c,
             slice_len,
             work,
-            MERGE_WIDE_MIN_SPAN,
+            Shapes::default(),
         )
     }
 
-    fn with_wide_span(
+    fn with_shapes(
         n: usize,
         scalar_off: usize,
         general: usize,
         c: u32,
         slice_len: usize,
         work: Work,
-        wide_span: usize,
+        shapes: Shapes,
     ) -> Result<Self, ProveError> {
         if !(2..=MAX_WINDOW).contains(&c) || slice_len == 0 || slice_len > u32::MAX as usize {
             return Err(bad("invalid MSM window or slice width"));
@@ -280,7 +282,11 @@ impl Geometry {
             } else {
                 0
             },
-            merge_wide_min: merge_wide_min_for(general, slice_len, wide_span),
+            merge_wide_min: merge_wide_min_for(general, slice_len, shapes.wide_span),
+            reduce_groups: shapes.reduce_groups.map_or_else(
+                || reduce_groups_for(n_windows, n_buckets),
+                |g| g.clamp(1, n_buckets),
+            ),
         };
         checked_words(g.rows(), G2_WORDS)?;
         checked_words(
@@ -295,7 +301,7 @@ impl Geometry {
             .and_then(|v| v.checked_mul(2))
             .ok_or_else(|| bad("MSM spill slots overflow"))?;
         checked_point_words(slots, G2_WORDS)?;
-        checked_words(g.n_windows, G2_WORDS)?;
+        checked_words(g.window_sums(), G2_WORDS)?;
         checked_words(g.slices, slice_len)?;
         for level in g.fold_levels() {
             checked_point_words(g.n_windows * level.groups as usize * 2, G2_WORDS)?;
@@ -310,6 +316,11 @@ impl Geometry {
 
     fn spill_slots(&self) -> usize {
         2 * self.n_windows * self.slices
+    }
+
+    /// Points the reduce writes: `reduce_groups` partials a window.
+    fn window_sums(&self) -> usize {
+        self.n_windows * self.reduce_groups
     }
 
     fn fold_levels(&self) -> impl Iterator<Item = FoldParams> {
@@ -367,9 +378,15 @@ fn legacy_accumulate() -> bool {
     std::env::var("G16_CUDA_MSM_LEGACY_ACC").as_deref() == Ok("1")
 }
 
-/// The widest window the T4 sweep found worth using. Distinct from `MAX_WINDOW`, which
-/// is what the kernels can physically address: this is what is fast, and it is smaller.
+/// The widest window the T4 sweep found worth using below [`WIDE_WINDOW_MIN_GENERAL`]
+/// general scalars. Distinct from `MAX_WINDOW`, which is what the kernels can physically
+/// address: this is what is fast, and it is smaller.
 const MEASURED_MAX_WINDOW: u32 = 8;
+
+/// The width [`window_size`] picks from [`WIDE_WINDOW_MIN_GENERAL`] general scalars up,
+/// and the general count it starts at; see the "re-measured" section there.
+const WIDE_WINDOW: u32 = 13;
+const WIDE_WINDOW_MIN_GENERAL: usize = 1 << 17;
 
 /// Meaningful bits of the top window at width `c`.
 ///
@@ -411,6 +428,33 @@ fn top_bits(c: u32) -> u32 {
 /// below argues the shape is architectural rather than Turing-specific, but that is an
 /// argument and the table is a measurement. See TASKS.local.md.
 ///
+/// # Re-measured per MSM, after the wide merge, the reduce groups and the scatter split
+///
+/// That sweep was taken with every bucket merged in one thread, one reduce block a
+/// window and one scatter launch, and the cliffs at 9, 11, 12 and 14 were those three
+/// shapes failing, not the width: the wide merge (`msm_merge_wide_*`) takes the fat top
+/// window, `reduce_groups` the dependent reduce chain and the scatter split the L2
+/// thrash. With all three in, `variable_work_phase_timings` on the same T4, MSM time in
+/// ms per width (G1 / G2), dense random scalars:
+///
+/// ```text
+///   general      c=8          c=10         c=12         c=13
+///   65,536       6.0 / 25.7   6.6 / 26.3   6.7 / 26.6   5.8 / 23.1
+///   262,144     23.6 / 82.0  21.2 / 73.0  18.5 / 72.3  19.3 / 70.8
+///   1,048,576   97.0 / 329   77.0 / 266   69.7 / 244   63.9 / 230
+/// ```
+///
+/// and with a fifth each of 0, 1 and -1 (157k and 629k general of 2^18 and 2^20):
+/// 15.1 / 55.8 -> 12.6 / 47.1 and 57.3 / 197 -> 42.5 / 155 at c = 13; at 2^16 (39k
+/// general) c = 8 keeps 4.7 / 18.2 against 5.7 / 22.9. The width buys accumulation
+/// (fewer windows, 20 at 13 against 32) and pays per bucket in the clear, the merge of
+/// the top window and the reduce, about 2.5 ms in G1 and 8 in G2 at 13; the trade turns
+/// near 10^5 general scalars, so [`WIDE_WINDOW`] is taken from [`WIDE_WINDOW_MIN_GENERAL`]
+/// up and the capped heuristic below it. 13 over 12 because the three largest shapes
+/// read faster at 13 and the fourth within a sample; 14 lost every shape. A plan is
+/// shared by every job of a batch (A, B in both groups, over one witness), so the pick
+/// cannot favour a group.
+///
 /// The Metal twin picks `c` from a three-term cost model whose coefficients (`MADD_US`,
 /// `ROW_US`, `MERGE_US`) were fitted to an M2 Max by forcing five window widths on two
 /// artifacts. Those are Apple silicon microseconds, they are meaningless on a T4, and none
@@ -439,6 +483,9 @@ pub fn window_size(m: usize) -> u32 {
         if let Ok(c) = v.parse::<u32>() {
             return c.clamp(2, MAX_WINDOW);
         }
+    }
+    if m >= WIDE_WINDOW_MIN_GENERAL {
+        return WIDE_WINDOW;
     }
     // floor(log2(m)) + 1 for m >= 1, so `bits - 4` is the usual `log2(m) - 3`.
     let bits = usize::BITS - m.max(1).leading_zeros();
@@ -488,6 +535,27 @@ fn ones_groups_for(n: usize) -> usize {
 
 /// Scalars a thread of the ones kernel scans; see [`ones_groups_for`].
 const ONES_SPT: usize = 32;
+
+/// Blocks per window in the reduce, the Metal twin's rule (`reduce_groups_for` in
+/// crates/metal/src/msm/window.rs): groups double until the grid reaches
+/// [`REDUCE_TARGET_THREADS`], floored so every thread keeps at least two buckets a group.
+///
+/// At c = 8 a window is 128 buckets, which the floor leaves at one group: a thread then
+/// owns two buckets, and halving that into one a lane saves two additions while every
+/// lane still owes its fixed `pt_mul_small`; the T4 measured that split flat (TASKS.local.md,
+/// OPT-07). The rule bites from c = 9 up, where one block a window leaves most of the
+/// card idle on a dependent chain. Override with `G16_CUDA_MSM_RG` to sweep it.
+const REDUCE_TARGET_THREADS: usize = 8192;
+
+fn reduce_groups_for(n_windows: usize, n_buckets: usize) -> usize {
+    let mut g = 1;
+    while n_buckets / (2 * g) >= 2 * REDUCE_TG as usize
+        && n_windows * g * (REDUCE_TG as usize) < REDUCE_TARGET_THREADS
+    {
+        g *= 2;
+    }
+    g
+}
 
 /// Which MSMs a batch of [`CudaMsm::msms_resident`] runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -655,8 +723,9 @@ pub(crate) fn resident_scratch(
 /// dozens of slices holds the whole merge launch open in a single lane while the rest of
 /// the machine waits. The Metal twin meets that only in its top window, at widths up to
 /// 15 bits, and points its wide kernel at a row range picked from the expected span;
-/// here [`window_size`] caps the width at 8, so at the larger domains every bucket of a
-/// uniformly filled window is that fat and the merge is the largest stage of the MSM.
+/// here [`window_size`] runs at 8 below 2^17 general scalars and at 13 above, so at
+/// 2^16 every bucket of a uniformly filled window spans 8 slices and the merge is a
+/// large stage of the MSM, and at 13 the top window's 128 live buckets are the fat ones.
 /// The wide kernel strides the range across [`MERGE_TG`] threads and folds a tree.
 ///
 /// What is fat, MEASURED on a Tesla T4 (g4dn.xlarge). `variable_work_phase_timings`
@@ -699,28 +768,83 @@ fn merge_wide_min_for(general: usize, slice_len: usize, wide_span: usize) -> usi
 struct Shapes {
     /// [`merge_wide_min_for`]'s span; 0 disables the wide merge.
     wide_span: usize,
+    /// `Some` forces every plan's `reduce_groups`; `None` leaves it to [`reduce_groups_for`].
+    reduce_groups: Option<usize>,
+    /// Bucket rows one scatter launch may cover; see [`scatter_rows_for`].
+    scatter_rows: usize,
 }
 
-impl Shapes {
-    /// `G16_CUDA_MSM_WIDE`, falling back to [`MERGE_WIDE_MIN_SPAN`].
-    fn from_env() -> Self {
+impl Default for Shapes {
+    /// The shipped shapes on a card with [`L2_BYTES_ASSUMED`] of L2.
+    fn default() -> Self {
         Self {
-            wide_span: std::env::var("G16_CUDA_MSM_WIDE")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(MERGE_WIDE_MIN_SPAN),
+            wide_span: MERGE_WIDE_MIN_SPAN,
+            reduce_groups: None,
+            scatter_rows: scatter_rows_for(L2_BYTES_ASSUMED),
         }
     }
 }
+
+impl Shapes {
+    /// `G16_CUDA_MSM_WIDE`, `G16_CUDA_MSM_RG` and `G16_CUDA_MSM_SCATTER_SPLIT`, each
+    /// falling back to the shipped shape; the scatter split's shipped shape follows the
+    /// device's L2 size.
+    fn from_env(l2_bytes: usize) -> Self {
+        let num = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+        };
+        Self {
+            wide_span: num("G16_CUDA_MSM_WIDE").unwrap_or(MERGE_WIDE_MIN_SPAN),
+            reduce_groups: num("G16_CUDA_MSM_RG").filter(|g| *g > 0),
+            scatter_rows: match num("G16_CUDA_MSM_SCATTER_SPLIT") {
+                Some(0) => usize::MAX,
+                Some(rows) => rows,
+                None => scatter_rows_for(l2_bytes),
+            },
+        }
+    }
+}
+
+/// Bucket rows one `msm_scatter` launch covers on a card with `l2_bytes` of L2: the
+/// rows whose run tails fit half of it, at one [`L2_LINE_BYTES`] line each.
+///
+/// Every scatter store lands on the line holding its run's tail, so a launch keeps one
+/// line per row of the windows it covers live; past the L2 those partial lines are
+/// written back and refetched under the stores. MEASURED on a Tesla T4 (4 MB L2) by
+/// `variable_work_phase_timings` at 2^18 dense scalars, the whole digit pipeline:
+/// 1.9 ms at c = 8 through 10 (at most 7,936 rows), 3.3 at c = 11 (24,576 rows), 4.8
+/// at c = 12 (45,056), 5.8 at c = 13 (81,920 rows, 10 MB of tails). The Metal twin
+/// splits at a fixed `SCATTER_SPLIT_ROWS` into halves; here the launches are as many
+/// as it takes for each to fit, since the second and later ones only re-read the
+/// scalars, 8 MB at 2^18 against a 320 GB/s bus. Override with
+/// `G16_CUDA_MSM_SCATTER_SPLIT` (rows a launch; 0 keeps every plan in one launch).
+fn scatter_rows_for(l2_bytes: usize) -> usize {
+    (l2_bytes / 2 / L2_LINE_BYTES).max(1)
+}
+
+/// Windows one scatter launch covers: as many as keep its rows at or under
+/// `scatter_rows`, at least one, at most all of them.
+fn scatter_windows(scatter_rows: usize, rows_per_window: usize, n_windows: usize) -> usize {
+    (scatter_rows / rows_per_window.max(1)).clamp(1, n_windows.max(1))
+}
+
+/// What [`Shapes::default`] sizes the scatter split for: the T4's L2, the card the
+/// split was measured on. A live object reads the real attribute.
+const L2_BYTES_ASSUMED: usize = 4 << 20;
+
+/// An L2 line on every NVIDIA card since Fermi.
+const L2_LINE_BYTES: usize = 128;
 
 // ---------------------------------------------------------------------------
 // Device-side structs
 // ---------------------------------------------------------------------------
 
-/// Mirrors `struct MsmParams` in `kernels/msm.cu`: twelve `u32`, 48 bytes, no padding on
+/// Mirrors `struct MsmParams` in `kernels/msm.cu`: thirteen `u32`, 52 bytes, no padding on
 /// either side.
 ///
-/// Passed **by value**. The driver copies these 48 bytes into the kernel's parameter space
+/// Passed **by value**. The driver copies these 52 bytes into the kernel's parameter space
 /// verbatim, so the Rust layout has to match byte for byte; a field inserted on one side
 /// only is read as some other field's value, not as a type error.
 #[repr(C)]
@@ -738,11 +862,12 @@ struct MsmParams {
     slices: u32,
     dummy_rows: u32,
     merge_wide_min: u32,
+    reduce_groups: u32,
 }
 
 // SAFETY: `DeviceRepr` marks a type that may be handed to a kernel as a by-value argument.
-// `MsmParams` is `repr(C)`, is twelve `u32` with no padding and no invalid bit patterns, and
-// its size is asserted below to be the 48 bytes the kernel's parameter slot expects.
+// `MsmParams` is `repr(C)`, is thirteen `u32` with no padding and no invalid bit patterns, and
+// its size is asserted below to be the 52 bytes the kernel's parameter slot expects.
 unsafe impl DeviceRepr for MsmParams {}
 
 /// Mirrors `struct MsmEntry` in `kernels/msm.cu`, which is MSL's `uint2` in the twin. The
@@ -777,7 +902,7 @@ pub struct PackedXyzzG2 {
 }
 
 const _: () = {
-    assert!(core::mem::size_of::<MsmParams>() == 48);
+    assert!(core::mem::size_of::<MsmParams>() == 52);
     assert!(core::mem::size_of::<FoldParams>() == 16);
     assert!(core::mem::size_of::<MsmEntry>() == 8);
     assert!(core::mem::size_of::<PackedXyzzG1>() == 128);
@@ -1259,8 +1384,10 @@ const WIDE_BLOCK: u32 = 256;
 /// stack spill. At 255 registers an SM holds 8 warps out of 32 however the blocks are
 /// shaped, so this number cannot buy occupancy back. 128 is picked because four warps a
 /// block gives the scheduler more independent blocks to interleave across the tail of a
-/// ragged dispatch than 256 would, at no cost. **Not swept on a real card**; it is the
-/// second thing to try after `G16_CUDA_MSM_C`.
+/// ragged dispatch than 256 would, at no cost. Swept on a Tesla T4 for the segmented
+/// accumulation at 64, 128 and 256 by `variable_work_phase_timings` (c = 8, 2^18 and
+/// 2^20, both scalar sets, both groups): flat within 1-3%, every pair inside the run
+/// spread, e.g. G2 at 2^20 dense 284.6 / 284.6 / 285.7 ms. Not a lever.
 const POINT_BLOCK: u32 = 128;
 
 // ---------------------------------------------------------------------------
@@ -1405,6 +1532,14 @@ impl CudaMsm {
         self
     }
 
+    /// Run every plan's reduce at `groups` blocks a window instead of
+    /// [`reduce_groups_for`]'s pick: the per-object form of `G16_CUDA_MSM_RG`, for the
+    /// same reason as [`Self::with_window`]. Clamped to `1..=n_buckets` by the plan.
+    pub fn with_reduce_groups(mut self, groups: usize) -> Self {
+        self.shapes.reduce_groups = Some(groups.max(1));
+        self
+    }
+
     /// Compiles `kernels::unit_msm()` and uploads all five repacked base vectors.
     pub fn new(cuda: &Cuda, pk: &ProvingKey) -> Result<Self, ProveError> {
         Self::without_key(cuda)?.with_key(pk)
@@ -1497,7 +1632,7 @@ impl CudaMsm {
             activity: TestActivity::default(),
             work: Work::Variable,
             window: None,
-            shapes: Shapes::from_env(),
+            shapes: Shapes::from_env(l2_bytes(&ctx)),
             a: upload_g1(&stream, &[])?,
             b_g2: upload_g2(&stream, &[])?,
             b_g1: upload_g1(&stream, &[])?,
@@ -2250,6 +2385,13 @@ impl CudaMsm {
     /// make the plan sharing inexpressible, since three jobs read one plan's `cursor` while
     /// their own kernels write their own buckets.
     fn launch_digits(&self, p: &Plan<'_>) -> Result<(), ProveError> {
+        self.launch_count(p)?;
+        self.launch_scan(p)?;
+        self.launch_scatter(p)
+    }
+
+    /// Zero the histogram and count every digit into it.
+    fn launch_count(&self, p: &Plan<'_>) -> Result<(), ProveError> {
         let params = p.params();
         let rows = p.rows();
 
@@ -2270,9 +2412,13 @@ impl CudaMsm {
         // `msm_batch`; real and dummy row indices are bounded by the checked geometry,
         // and `counts` holds exactly `rows` words.
         unsafe { lb.launch(cfg) }.map_err(|e| drv("launch msm_count", e))?;
+        Ok(())
+    }
 
-        // One block per window, and at most `SCAN_TG` threads because that is the length of
-        // the kernel's shared array.
+    /// One block per window, and at most `SCAN_TG` threads because that is the length of
+    /// the kernel's shared array.
+    fn launch_scan(&self, p: &Plan<'_>) -> Result<(), ProveError> {
+        let params = p.params();
         let cfg = self.k.scan.cfg_blocks(p.n_windows, SCAN_TG);
         let mut lb = self.stream.launch_builder(&self.k.scan.f);
         lb.arg(&p.counts).arg(&p.cursor).arg(&params);
@@ -2280,18 +2426,34 @@ impl CudaMsm {
         // is what the kernel's `blockIdx.x` indexes, and both arrays hold
         // `rows` words, including the constant-work dummy rows.
         unsafe { lb.launch(cfg) }.map_err(|e| drv("launch msm_scan", e))?;
+        Ok(())
+    }
 
+    /// The windows in as many serial launches as keep each one's rows under the
+    /// scatter split (see [`scatter_rows_for`]); one launch when they all fit.
+    fn launch_scatter(&self, p: &Plan<'_>) -> Result<(), ProveError> {
+        let params = p.params();
+        let windows = scatter_windows(
+            self.shapes.scatter_rows,
+            p.n_buckets + p.dummy_rows,
+            p.n_windows,
+        );
         let cfg = self.k.scatter.cfg_1d(p.n, POINT_BLOCK);
-        let mut lb = self.stream.launch_builder(&self.k.scatter.f);
-        lb.arg(p.scalars)
-            .arg(&p.cursor)
-            .arg(&p.entries)
-            .arg(&params);
-        // SAFETY: four parameters in order. `entries` holds `n_windows * cap` records and
-        // `cap` bounds each window: variable work emits at most one per general scalar,
-        // constant work emits exactly one per scalar, including zero digits.
-        unsafe { lb.launch(cfg) }.map_err(|e| drv("launch msm_scatter", e))?;
-
+        for w_lo in (0..p.n_windows).step_by(windows) {
+            let (w_lo, w_hi) = (w_lo as u32, (w_lo + windows).min(p.n_windows) as u32);
+            let mut lb = self.stream.launch_builder(&self.k.scatter.f);
+            lb.arg(p.scalars)
+                .arg(&p.cursor)
+                .arg(&p.entries)
+                .arg(&params)
+                .arg(&w_lo)
+                .arg(&w_hi);
+            // SAFETY: six parameters in order. `entries` holds `n_windows * cap` records
+            // and `cap` bounds each window: variable work emits at most one per general
+            // scalar, constant work exactly one per scalar, including zero digits. The
+            // window ranges tile `0..n_windows` exactly once.
+            unsafe { lb.launch(cfg) }.map_err(|e| drv("launch msm_scatter", e))?;
+        }
         Ok(())
     }
 
@@ -2494,8 +2656,9 @@ impl CudaMsm {
         Ok(())
     }
 
-    /// One block per window, at most `REDUCE_TG` threads. See `REDUCE_TG`: a wider block
-    /// indexes past the end of the kernel's shared array with no diagnostic at all.
+    /// `reduce_groups` blocks per window, at most `REDUCE_TG` threads. See `REDUCE_TG`: a
+    /// wider block indexes past the end of the kernel's shared array with no diagnostic at
+    /// all.
     fn launch_reduce(
         &self,
         job: &Job<'_>,
@@ -2504,11 +2667,11 @@ impl CudaMsm {
         params: &MsmParams,
     ) -> Result<(), ProveError> {
         let reduce = &self.k.group(job.group()).reduce;
-        let cfg = reduce.cfg_blocks(p.n_windows, REDUCE_TG);
+        let cfg = reduce.cfg_blocks(p.window_sums(), REDUCE_TG);
         let mut lb = self.stream.launch_builder(&reduce.f);
         lb.arg(&out.buckets).arg(&out.window_sums).arg(params);
-        // SAFETY: three parameters in order; the grid is exactly `n_windows` blocks, which
-        // is what `blockIdx.x` indexes into `window_sums`.
+        // SAFETY: three parameters in order; the grid is exactly `n_windows *
+        // reduce_groups` blocks, which is what `blockIdx.x` indexes into `window_sums`.
         unsafe { lb.launch(cfg) }.map_err(|e| drv("launch msm_reduce", e))?;
         Ok(())
     }
@@ -2574,14 +2737,14 @@ impl<'a> Plan<'a> {
         } else {
             scalars.general_in(&(scalar_off..scalar_off + n))
         };
-        Geometry::with_wide_span(
+        Geometry::with_shapes(
             n,
             scalar_off,
             general,
             pick_window(msm.window, general),
             slice_len(),
             msm.work,
-            msm.shapes.wide_span,
+            msm.shapes,
         )
     }
 
@@ -2621,6 +2784,7 @@ impl Geometry {
             slices: self.slices as u32,
             dummy_rows: self.dummy_rows as u32,
             merge_wide_min: self.merge_wide_min as u32,
+            reduce_groups: self.reduce_groups as u32,
         }
     }
 }
@@ -2673,7 +2837,7 @@ impl Outputs {
             buckets: msm.scratch(rows * point_words)?,
             spill_pts: msm.scratch(checked_point_words(spill_slots, point_words)?)?,
             spill_rows: msm.scratch(spill_slots)?,
-            window_sums: msm.scratch(plan.n_windows * point_words)?,
+            window_sums: msm.scratch(plan.window_sums() * point_words)?,
             ones: if ones_groups == 0 {
                 None
             } else {
@@ -2691,17 +2855,18 @@ impl Outputs {
         })
     }
 
-    /// Read back `n_windows + ones_groups` points and finish on the host.
+    /// Read back `n_windows * reduce_groups + ones_groups` points and finish on the host.
     ///
-    /// Horner over the windows, high to low, `c` doublings between each. Same order as the
-    /// CPU backend, so the two agree bit for bit and not just up to the group law. A few
-    /// hundred curve additions per proof, against tens of millions on the device: moving
-    /// this to the GPU would cost more in launches than it saves, which is the same place
-    /// the Metal twin and zkonduit's Metal MSM both stop.
+    /// Each window's partials add first, then Horner over the windows, high to low, `c`
+    /// doublings between each. Same order as the CPU backend, so the two agree bit for
+    /// bit and not just up to the group law. A few hundred curve additions per proof,
+    /// against tens of millions on the device: moving this to the GPU would cost more in
+    /// launches than it saves, which is the same place the Metal twin and zkonduit's
+    /// Metal MSM both stop.
     fn combine(&self, msm: &CudaMsm, plan: &Plan<'_>) -> Result<MsmResult, ProveError> {
         // Only the words the plan wrote: a buffer from an arena may be longer.
         let pw = self.group.words();
-        let w_words = download_prefix(&msm.stream, &self.window_sums, plan.n_windows * pw)?;
+        let w_words = download_prefix(&msm.stream, &self.window_sums, plan.window_sums() * pw)?;
         let o_words = match &self.ones {
             Some(ones) => {
                 let words = download_prefix(&msm.stream, ones, self.ones_groups * pw)?;
@@ -2727,19 +2892,28 @@ fn horner<P: Packed + Default, G: AdditiveGroup>(
     op: &str,
     to_projective: impl Fn(&P) -> G,
 ) -> Result<G, ProveError> {
-    let w = from_words::<P>(w_words)
+    let partials = from_words::<P>(w_words)
         .ok_or_else(|| bad(format!("{op} window sums are not a whole number of points")))?;
     let o = from_words::<P>(o_words).ok_or_else(|| {
         bad(format!(
             "{op} ones partials are not a whole number of points"
         ))
     })?;
-    let mut acc = to_projective(&w[plan.n_windows - 1]);
+    if partials.len() != plan.window_sums() {
+        return Err(bad(format!(
+            "{op} window sums are not one point a reduce block"
+        )));
+    }
+    let w: Vec<G> = partials
+        .chunks(plan.reduce_groups)
+        .map(|g| g.iter().map(&to_projective).fold(G::zero(), |a, p| a + p))
+        .collect();
+    let mut acc = w[plan.n_windows - 1];
     for k in (0..plan.n_windows - 1).rev() {
         for _ in 0..plan.c {
             acc.double_in_place();
         }
-        acc += to_projective(&w[k]);
+        acc += w[k];
     }
     for x in &o {
         acc += to_projective(x);
@@ -2750,6 +2924,14 @@ fn horner<P: Packed + Default, G: AdditiveGroup>(
 // ---------------------------------------------------------------------------
 // Transfer helpers
 // ---------------------------------------------------------------------------
+
+/// The device's L2 in bytes, [`L2_BYTES_ASSUMED`] when the driver will not say.
+fn l2_bytes(ctx: &Arc<CudaContext>) -> usize {
+    ctx.attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE)
+        .ok()
+        .filter(|b| *b > 0)
+        .map_or(L2_BYTES_ASSUMED, |b| b as usize)
+}
 
 fn upload_g1(stream: &Arc<CudaStream>, bases: &[G1Affine]) -> Result<G1Bases, ProveError> {
     kernel_range(0, bases.len(), core::mem::size_of::<PackedG1Affine>() / 4)?;
@@ -3059,9 +3241,10 @@ mod tests {
     #[test]
     fn parameter_abi_and_constant_routing_match_the_host() {
         use core::mem::{offset_of, size_of};
-        assert_eq!(size_of::<MsmParams>(), 48);
+        assert_eq!(size_of::<MsmParams>(), 52);
         assert_eq!(offset_of!(MsmParams, dummy_rows), 40);
         assert_eq!(offset_of!(MsmParams, merge_wide_min), 44);
+        assert_eq!(offset_of!(MsmParams, reduce_groups), 48);
         assert_eq!(size_of::<FoldParams>(), 16);
         assert_eq!(offset_of!(FoldParams, last), 12);
         let src = kernels::MSM_CU;
@@ -3091,10 +3274,11 @@ mod tests {
                 "slice_len",
                 "slices",
                 "dummy_rows",
-                "merge_wide_min"
+                "merge_wide_min",
+                "reduce_groups"
             ]
         );
-        assert!(src.contains("static_assert(sizeof(MsmParams) == 48"));
+        assert!(src.contains("static_assert(sizeof(MsmParams) == 52"));
         assert!(src.contains("static_assert(sizeof(FoldParams) == 16"));
         let fold_fields = src
             .split("struct FoldParams {")
@@ -3535,11 +3719,18 @@ mod tests {
         // and steps down to 6. Reachable only between 1024 and 2047 general scalars.
         assert_eq!(window_size(1500), 6);
 
-        // A 140k witness with about 140k general scalars: the heuristic says 14, and
-        // [`MEASURED_MAX_WINDOW`] caps it at the swept 8 (1.09x over 13 there).
-        assert_eq!(window_size(140_261), 8);
-        // A 2^18 H vector, dense by construction: capped the same way.
-        assert_eq!(window_size(1 << 18), 8);
+        // A 2^16 H vector, dense by construction: the heuristic says 13 and
+        // [`MEASURED_MAX_WINDOW`] caps it at the swept 8.
+        assert_eq!(window_size(1 << 16), 8);
+        assert_eq!(window_size(WIDE_WINDOW_MIN_GENERAL - 1), 8);
+        // From 2^17 general scalars the wide width wins: a 140k witness with about 140k
+        // general scalars, a 2^18 H vector, and anon-aadhaar's 2^21 one.
+        assert_eq!(window_size(WIDE_WINDOW_MIN_GENERAL), 13);
+        assert_eq!(window_size(140_261), 13);
+        assert_eq!(window_size(1 << 18), 13);
+        assert_eq!(window_size(1 << 21), 13);
+        // The wide width keeps more than half its top bits, as the correction demands.
+        assert!(2 * top_bits(WIDE_WINDOW) >= WIDE_WINDOW);
         // Small inputs clamp rather than underflow.
         assert_eq!(window_size(0), 3);
         assert_eq!(window_size(1), 3);
@@ -3582,6 +3773,69 @@ mod tests {
         }
     }
 
+    /// One block a window at the shipped c = 8 (the floor keeps two buckets a thread),
+    /// more from c = 9 up, never past the thread target; a forced count is clamped to
+    /// the bucket count and carried to the kernel.
+    #[test]
+    fn reduce_groups_follow_the_twin_rule() {
+        for c in 2..=8u32 {
+            let n_windows = RECODE_BITS.div_ceil(c as usize);
+            assert_eq!(reduce_groups_for(n_windows, 1 << (c - 1)), 1, "c = {c}");
+        }
+        for c in 9..=MAX_WINDOW {
+            let n_windows = RECODE_BITS.div_ceil(c as usize);
+            let n_buckets = 1usize << (c - 1);
+            let g = reduce_groups_for(n_windows, n_buckets);
+            assert!(g >= 2 && g.is_power_of_two(), "c = {c} gave {g}");
+            assert!(n_buckets / g >= 2 * REDUCE_TG as usize, "c = {c} gave {g}");
+            assert!(n_windows * (g / 2) * (REDUCE_TG as usize) < REDUCE_TARGET_THREADS);
+        }
+        assert_eq!(reduce_groups_for(20, 4096), 8);
+        let forced = |groups| Shapes {
+            reduce_groups: Some(groups),
+            ..Shapes::default()
+        };
+        let g = Geometry::with_shapes(1000, 0, 1000, 3, 64, Work::Variable, forced(1000)).unwrap();
+        assert_eq!(g.reduce_groups, 4);
+        assert_eq!(g.params().reduce_groups, 4);
+        assert_eq!(g.window_sums(), 4 * g.n_windows);
+        let g = Geometry::with_shapes(1000, 0, 1000, 8, 64, Work::Variable, forced(2)).unwrap();
+        assert_eq!(g.params().reduce_groups, 2);
+        let g = Geometry::new(1 << 18, 0, 1 << 18, 13, 64, Work::Variable).unwrap();
+        assert_eq!(g.reduce_groups, 8);
+        assert_eq!(g.window_sums(), 160);
+    }
+
+    /// The scatter's launches tile the windows exactly once, each under the row budget
+    /// unless a single window already exceeds it; the budget is half the L2 in lines.
+    #[test]
+    fn the_scatter_split_tiles_the_windows() {
+        assert_eq!(scatter_rows_for(4 << 20), 16384);
+        assert_eq!(scatter_rows_for(0), 1);
+        assert_eq!(Shapes::default().scatter_rows, 16384);
+        for (c, n_windows) in (2..=MAX_WINDOW).map(|c| (c, RECODE_BITS.div_ceil(c as usize))) {
+            let per = 1usize << (c - 1);
+            for rows in [1usize, 16384, usize::MAX] {
+                let windows = scatter_windows(rows, per, n_windows);
+                assert!((1..=n_windows).contains(&windows), "c = {c}");
+                assert!(
+                    windows * per <= rows || windows == 1,
+                    "c = {c}, rows = {rows}"
+                );
+                let covered: usize = (0..n_windows)
+                    .step_by(windows)
+                    .map(|lo| (lo + windows).min(n_windows) - lo)
+                    .sum();
+                assert_eq!(covered, n_windows);
+            }
+        }
+        // c = 8 through 10 fit one launch on the T4; c = 13's 20 windows of 4096 take 5.
+        assert_eq!(scatter_windows(16384, 128, 32), 32);
+        assert_eq!(scatter_windows(16384, 512, 26), 26);
+        assert_eq!(scatter_windows(16384, 4096, 20), 4);
+        assert_eq!(scatter_windows(usize::MAX, 4096, 20), 20);
+    }
+
     /// `ones_groups` is what both the kernel's grid and the host's tail sum are sized from.
     #[test]
     fn ones_groups_stay_in_range() {
@@ -3605,12 +3859,35 @@ mod tests {
         assert_eq!(merge_wide_min_for(1 << 18, 64, usize::MAX), 0);
         assert_eq!(merge_wide_min_for(6007, 64, 4), 256);
         for (general, want) in [(1 << 18, 256), (1000, 256), (100, 0)] {
-            let g =
-                Geometry::with_wide_span(general, 0, general, 8, 64, Work::Variable, 4).unwrap();
+            let g = Geometry::with_shapes(
+                general,
+                0,
+                general,
+                8,
+                64,
+                Work::Variable,
+                Shapes {
+                    wide_span: 4,
+                    ..Shapes::default()
+                },
+            )
+            .unwrap();
             assert_eq!(g.merge_wide_min, want);
             assert_eq!(g.params().merge_wide_min, want as u32);
         }
-        let g = Geometry::with_wide_span(1 << 18, 0, 1 << 18, 8, 64, Work::Variable, 0).unwrap();
+        let g = Geometry::with_shapes(
+            1 << 18,
+            0,
+            1 << 18,
+            8,
+            64,
+            Work::Variable,
+            Shapes {
+                wide_span: 0,
+                ..Shapes::default()
+            },
+        )
+        .unwrap();
         assert_eq!(g.params().merge_wide_min, 0);
         assert_eq!(
             Geometry::new(1 << 18, 0, 1 << 18, 8, 64, Work::Variable)
@@ -4478,11 +4755,13 @@ mod tests {
     /// medians and ranges over the reps after the warm-up. `G16_REVIEW_N` is a
     /// comma-separated list of lengths (2^14, 2^16 and 2^18 by default), `G16_REVIEW_REPS`
     /// the reps (10). The shapes come from the environment, as in a proof, and are
-    /// printed. Dense random scalars with a fifth each of 0, 1 and -1, so the ones scan
-    /// and the recoding's sign both do work; the -1 fifth also lands a fifth of every
-    /// window's entries in one bucket, so the merge phase here is that one fat row's,
-    /// not a uniform one's (see [`MERGE_WIDE_MIN_SPAN`]). The constant-work twin is
-    /// `constant_work_phase_flatness` above.
+    /// printed. Two scalar sets, `G16_REVIEW_SET` picking one or both (`mixed,uniform`):
+    /// `mixed` is dense random scalars with a fifth each of 0, 1 and -1, so the ones scan
+    /// and the recoding's sign both do work, and the -1 fifth lands a fifth of every
+    /// window's entries in one bucket, so its merge phase is that one fat row's (see
+    /// [`MERGE_WIDE_MIN_SPAN`]); `uniform` is every scalar dense and random, which is
+    /// what the H MSM sees, so its rows fill evenly and its merge is a uniform one's. The
+    /// constant-work twin is `constant_work_phase_flatness` above.
     #[test]
     #[ignore = "GPU measurement; run explicitly on the measurement machine"]
     fn variable_work_phase_timings() {
@@ -4496,6 +4775,11 @@ mod tests {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(10);
+        let sets: Vec<String> = std::env::var("G16_REVIEW_SET")
+            .ok()
+            .map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
+            .filter(|v: &Vec<String>| !v.is_empty())
+            .unwrap_or_else(|| vec!["mixed".into(), "uniform".into()]);
         let warm = 2;
         let cuda = Cuda::new(0).expect("GPU measurement requires CUDA");
         let m = CudaMsm::without_key(&cuda).expect("compile MSM unit");
@@ -4514,22 +4798,46 @@ mod tests {
         let g2 = G2Projective::normalize_batch(&g2);
         let b1 = m.upload_g1_bases(&g1).unwrap();
         let b2 = m.upload_g2_bases(&g2).unwrap();
-        let mut seed = 0x7e57_0000_0000_0001u64;
-        let scalars: Vec<Fr> = (0..n_max)
-            .map(|i| match i % 5 {
-                0 => Fr::zero(),
-                1 => Fr::one(),
-                2 => -Fr::one(),
-                _ => {
-                    let mut b = [0u8; 32];
-                    for c in b.chunks_mut(8) {
-                        c.copy_from_slice(&splitmix(&mut seed).to_le_bytes());
-                    }
-                    Fr::from_le_bytes_mod_order(&b)
+        for set in &sets {
+            let mut seed = 0x7e57_0000_0000_0001u64;
+            let mut random = || {
+                let mut b = [0u8; 32];
+                for c in b.chunks_mut(8) {
+                    c.copy_from_slice(&splitmix(&mut seed).to_le_bytes());
                 }
-            })
-            .collect();
-        let ds = m.upload_scalars(&scalars).unwrap();
+                Fr::from_le_bytes_mod_order(&b)
+            };
+            let scalars: Vec<Fr> = (0..n_max)
+                .map(|i| match (set.as_str(), i % 5) {
+                    ("uniform", _) => random(),
+                    ("mixed", 0) => Fr::zero(),
+                    ("mixed", 1) => Fr::one(),
+                    ("mixed", 2) => -Fr::one(),
+                    ("mixed", _) => random(),
+                    _ => panic!("G16_REVIEW_SET names {set}; mixed and uniform exist"),
+                })
+                .collect();
+            phase_timings_over(&m, set, &scalars, &lengths, &b1, &b2, &g1, &g2, warm, reps);
+        }
+    }
+
+    /// One scalar set of [`variable_work_phase_timings`]: every length in both groups.
+    #[allow(clippy::too_many_arguments)]
+    fn phase_timings_over(
+        m: &CudaMsm,
+        set: &str,
+        scalars: &[Fr],
+        lengths: &[usize],
+        b1: &G1Bases,
+        b2: &G2Bases,
+        g1: &[G1Affine],
+        g2: &[G2Affine],
+        warm: usize,
+        reps: usize,
+    ) {
+        use snarkrs_field::CurveGroup;
+        use snarkrs_msm::{CpuMsm, MsmBackend};
+        let ds = m.upload_scalars(scalars).unwrap();
         let time = |f: &dyn Fn() -> Result<(), ProveError>| -> f64 {
             let ev = || {
                 m.ctx
@@ -4544,13 +4852,13 @@ mod tests {
             elapsed_us(&start, &end).unwrap() as f64 / 1e3
         };
         let phases = [
-            "digits", "clear", "accum", "merge", "reduce", "ones", "combine",
+            "count", "scan", "scatter", "clear", "accum", "merge", "reduce", "ones", "combine",
         ];
-        for &n in &lengths {
+        for &n in lengths {
             for group in ["g1", "g2"] {
                 let job = if group == "g1" {
                     Job::G1(JobG1 {
-                        bases: &b1,
+                        bases: b1,
                         base_off: 0,
                         scalars: ds.as_scalars(),
                         scalar_off: 0,
@@ -4558,54 +4866,55 @@ mod tests {
                     })
                 } else {
                     Job::G2(JobG2 {
-                        bases: &b2,
+                        bases: b2,
                         base_off: 0,
                         scalars: ds.as_scalars(),
                         scalar_off: 0,
                         n,
                     })
                 };
-                let plan = Plan::new(&m, ds.as_scalars(), 0, n).unwrap();
-                let out = Outputs::new(&m, &job, &plan).unwrap();
+                let plan = Plan::new(m, ds.as_scalars(), 0, n).unwrap();
+                let out = Outputs::new(m, &job, &plan).unwrap();
                 let params = m.point_params(&out, &plan);
-                let mut t: [Vec<f64>; 7] = Default::default();
+                let mut t: [Vec<f64>; 9] = Default::default();
                 let mut result = None;
                 for rep in 0..warm + reps {
-                    let d = time(&|| m.launch_digits(&plan));
+                    let d0 = time(&|| m.launch_count(&plan));
+                    let d1 = time(&|| m.launch_scan(&plan));
+                    let d2 = time(&|| m.launch_scatter(&plan));
                     let c = time(&|| m.launch_clear(&job, &out, &plan, &params));
                     let a = time(&|| m.launch_accumulate(&job, &out, &plan, &params));
                     let g = time(&|| m.launch_merge(&job, &out, &plan, &params));
                     let r = time(&|| m.launch_reduce(&job, &out, &plan, &params));
                     let o = time(&|| m.launch_ones(&job, &out, &plan, &params));
                     let t0 = Instant::now();
-                    let got = out.combine(&m, &plan).unwrap();
+                    let got = out.combine(m, &plan).unwrap();
                     let h = t0.elapsed().as_secs_f64() * 1e3;
                     result = Some(got);
                     if rep >= warm {
-                        for (v, x) in t.iter_mut().zip([d, c, a, g, r, o, h]) {
+                        for (v, x) in t.iter_mut().zip([d0, d1, d2, c, a, g, r, o, h]) {
                             v.push(x);
                         }
                     }
                 }
-                // The timed launches are the real ones, so the answer is checked too.
+                // The timed launches are the real ones, so the answer is checked too,
+                // against the CPU backend: a naive sum at 2^20 would outlast the timing.
                 let got = result.unwrap();
                 let s = &scalars[..n];
                 if group == "g1" {
-                    let want = g1[..n]
-                        .iter()
-                        .zip(s)
-                        .fold(G1Projective::zero(), |a, (b, s)| a + *b * s);
+                    let want = CpuMsm::new().msm_g1(&g1[..n], s);
                     assert_eq!(got.g1().unwrap().into_affine(), want.into_affine());
                 } else {
-                    let want = g2[..n]
-                        .iter()
-                        .zip(s)
-                        .fold(G2Projective::zero(), |a, (b, s)| a + *b * s);
+                    let want = CpuMsm::new().msm_g2(&g2[..n], s);
                     assert_eq!(got.g2().unwrap().into_affine(), want.into_affine());
                 }
                 let mut line = format!(
-                    "phases {group} n={n} c={} w={} wide={} reps={reps} (ms)",
-                    plan.c, plan.n_windows, plan.merge_wide_min
+                    "phases {set} {group} n={n} c={} w={} wide={} rg={} split={} reps={reps} (ms)",
+                    plan.c,
+                    plan.n_windows,
+                    plan.merge_wide_min,
+                    plan.reduce_groups,
+                    m.shapes.scatter_rows
                 );
                 for (name, v) in phases.iter().zip(&t) {
                     let mut s = v.clone();
