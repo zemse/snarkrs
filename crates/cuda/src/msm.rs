@@ -587,8 +587,44 @@ pub fn window_size(m: usize) -> u32 {
 
 /// The width a plan actually runs at: [`CudaMsm::with_window`] when set, else the
 /// heuristic (and its `G16_CUDA_MSM_C` override) for `general` scalars.
-fn pick_window(forced: Option<u32>, general: usize) -> u32 {
-    forced.unwrap_or_else(|| window_size(general))
+fn pick_window(forced: Option<u32>, general: usize, work: Work) -> u32 {
+    forced.unwrap_or_else(|| match work {
+        Work::Variable => window_size(general),
+        Work::Constant => constant_window_size(general),
+    })
+}
+
+/// Bits below `log2(n)` a constant-work plan's window sits; see [`constant_window_size`].
+const CONSTANT_WINDOW_OFFSET: u32 = 4;
+
+/// Window width of a constant-work plan over `n` scalars: `floor(log2(n)) - 4`, clamped
+/// to 3..=16.
+///
+/// A constant-work entry costs a complete addition and a store in every window whatever
+/// its digit, and its fold follows the slices, not the buckets, so neither the fat top
+/// buckets that [`window_size`]'s guard avoids nor its cap at 8 below 2^17 apply: fewer
+/// windows is fewer entries, paid for in clear and reduce per bucket. `G16_CUDA_MSM_C`
+/// forces a width as for variable work; `G16_CUDA_MSM_CW` moves the offset.
+///
+/// Swept on a Tesla T4, warm `snarkrs bench --constant-work`, 2 rounds, prove ms at
+/// offsets 4 / 5 / 6, against [`window_size`]'s pick in the same session: sha256
+/// 61.6-61.8 / 61.7-61.8 / 69.3-69.5 (74.6), keccak256 208.5-209.0 / 215.0-215.3 /
+/// 214.0-215.5 (232), rsa2048 241.8-242.0 / 259.2-260.2 / 260.7-261.1 (240),
+/// anon-aadhaar 839.6-839.7 / 842.9-847.0 / 875.8-877.7 (871). Forcing one width on
+/// every plan before the key's live index read 91.8 ms at c = 10 on sha256 against
+/// 108.6 at its pick of 8, and 1168 on anon-aadhaar at 15 against 1294 at 13.
+fn constant_window_size(n: usize) -> u32 {
+    if let Ok(v) = std::env::var("G16_CUDA_MSM_C") {
+        if let Ok(c) = v.parse::<u32>() {
+            return c.clamp(2, MAX_WINDOW);
+        }
+    }
+    let offset = std::env::var("G16_CUDA_MSM_CW")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(CONSTANT_WINDOW_OFFSET);
+    let log = usize::BITS - 1 - n.max(1).leading_zeros();
+    log.saturating_sub(offset).clamp(3, MAX_WINDOW)
 }
 
 /// Blocks in the ones kernel: `ONES_SPT` scalars a thread, at most 256 blocks.
@@ -696,7 +732,7 @@ pub(crate) fn batch_words(
     window: Option<u32>,
     work: Work,
 ) -> Result<Vec<usize>, ProveError> {
-    let c = pick_window(window, n);
+    let c = pick_window(window, n, work);
     let g = Geometry::new(n, 0, n, c, slice_len_for(n, c, work), work)?;
     let mut words = plan_words(&g)?.to_vec();
     for group in groups {
@@ -3118,7 +3154,7 @@ impl<'a> Plan<'a> {
         } else {
             scalars.general_in(&(scalar_off..scalar_off + n))
         };
-        let c = pick_window(msm.window, general);
+        let c = pick_window(msm.window, general, msm.work);
         Geometry::with_shapes(
             n,
             scalar_off,
@@ -3441,7 +3477,7 @@ mod tests {
         let one = batch_words(n, &[Group::G1], None, Work::Variable).unwrap();
         let three =
             batch_words(n, &[Group::G1, Group::G2, Group::G1], None, Work::Variable).unwrap();
-        let c = pick_window(None, n);
+        let c = pick_window(None, n, Work::Variable);
         let g = Geometry::new(
             n,
             0,
@@ -4185,10 +4221,16 @@ mod tests {
     /// plan's own range check is what rejects a bad one.
     #[test]
     fn a_forced_window_overrides_the_heuristic() {
-        assert_eq!(pick_window(None, 1500), window_size(1500));
+        assert_eq!(pick_window(None, 1500, Work::Variable), window_size(1500));
+        assert_eq!(
+            pick_window(None, 1500, Work::Constant),
+            constant_window_size(1500)
+        );
         for c in [1u32, 2, 3, 12, 14, MAX_WINDOW, MAX_WINDOW + 1] {
-            assert_eq!(pick_window(Some(c), 1500), c);
-            assert_eq!(pick_window(Some(c), 1 << 18), c);
+            for work in [Work::Variable, Work::Constant] {
+                assert_eq!(pick_window(Some(c), 1500, work), c);
+                assert_eq!(pick_window(Some(c), 1 << 18, work), c);
+            }
         }
         assert!(Geometry::new(65, 0, 65, 1, 64, Work::Variable).is_err());
         assert!(Geometry::new(65, 0, 65, MAX_WINDOW + 1, 64, Work::Variable).is_err());
