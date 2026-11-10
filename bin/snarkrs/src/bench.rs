@@ -439,12 +439,24 @@ fn warm(v: &Variant, constraints: i64, args: &Args) -> Result<Vec<Row>> {
     let prepare_ms = ms(start);
     let public = public_of(&witness, n_public)?;
 
+    let usage = std::env::var_os("G16_BENCH_CPU").is_some_and(|v| !v.is_empty() && v != "0");
     let mut rows = Vec::with_capacity(args.reps);
     for rep in 1..=args.reps {
         let mut t = StageTimings::default();
+        let (cpu0, wall0) = (process_cpu_ms(), epoch_ms());
         let start = Instant::now();
         let proof = prove_unchecked(circuit.as_ref(), &witness, &mut rng, &mut t)?;
         let prove_ms = ms(start);
+        if usage {
+            // One line a rep for bench/aws/coschedule-report.py: the wall-clock span lines
+            // up concurrent processes, and the CPU time says how busy the host was.
+            eprintln!(
+                "cpu-usage: variant={} rep={rep} start_ms={wall0:.3} end_ms={:.3} prove_ms={prove_ms:.3} cpu_ms={:.3}",
+                v.name,
+                epoch_ms(),
+                process_cpu_ms() - cpu0,
+            );
+        }
 
         verify(&vk, &public, &proof).with_context(|| {
             format!(
@@ -472,6 +484,29 @@ fn warm(v: &Variant, constraints: i64, args: &Args) -> Result<Vec<Row>> {
 
 fn ms(since: Instant) -> f64 {
     since.elapsed().as_secs_f64() * 1000.0
+}
+
+fn epoch_ms() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64() * 1000.0)
+}
+
+/// User plus system CPU time of every thread in this process so far, `G16_BENCH_CPU`'s
+/// measure of how much of the host a proof keeps busy. NaN where getrusage does not exist.
+fn process_cpu_ms() -> f64 {
+    #[cfg(unix)]
+    {
+        let mut u = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+        // SAFETY: getrusage writes a whole rusage into the pointer it is given.
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, u.as_mut_ptr()) } == 0 {
+            // SAFETY: initialised by the successful call above.
+            let u = unsafe { u.assume_init() };
+            let tv = |t: libc::timeval| t.tv_sec as f64 * 1000.0 + t.tv_usec as f64 / 1000.0;
+            return tv(u.ru_utime) + tv(u.ru_stime);
+        }
+    }
+    f64::NAN
 }
 
 /// Median the way `statistics.median` does it, so our summary lines and
