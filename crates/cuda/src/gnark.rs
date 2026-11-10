@@ -580,7 +580,7 @@ mod tests {
     /// draw needs to never miss. Includes runs short enough to pick a narrower window.
     #[test]
     fn every_resident_batch_fits_the_reservation() {
-        use crate::msm::{batch_words, resident_schedule, Resident, Work};
+        use crate::msm::{batch_words, resident_schedule, Group, Resident, Work};
         for (n_vars, l, h, chunk) in [
             (3072, 3067, 4095, MSM_CHUNK),
             (15_747_144, 15_747_138, (1 << 24) - 1, MSM_CHUNK),
@@ -590,11 +590,11 @@ mod tests {
         ] {
             let arena = resident_scratch(n_vars, l, h, chunk, None).unwrap();
             for (stage, _, n) in resident_schedule(n_vars, l, h, chunk).unwrap() {
-                let g2: &[bool] = match stage {
-                    Resident::Witness => &[false, true, false],
-                    _ => &[false],
+                let groups: &[Group] = match stage {
+                    Resident::Witness => &[Group::G1, Group::G2, Group::G1],
+                    _ => &[Group::G1],
                 };
-                let mut words = batch_words(n, g2, None, Work::Variable).unwrap();
+                let mut words = batch_words(n, groups, None, Work::Variable).unwrap();
                 words.sort_unstable_by(|a, b| b.cmp(a));
                 assert!(words.len() <= arena.len());
                 for (w, r) in words.iter().zip(&arena) {

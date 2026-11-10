@@ -526,20 +526,20 @@ pub(crate) fn resident_schedule(
     Ok(out)
 }
 
-/// The words each buffer of one batch allocates, in no particular order: `g2[i]` says
-/// whether job `i` is a G2 MSM, and the jobs share one plan over `n` scalars, every one of
-/// them general. Mirrors `Plan::new` and `Outputs::new`, so a reservation sized from it is
+/// The words each buffer of one batch allocates, in no particular order: `groups[i]` is
+/// job `i`'s group, and the jobs share one plan over `n` scalars, every one of them
+/// general. Mirrors `Plan::new` and `Outputs::new`, so a reservation sized from it is
 /// what the batch draws.
 pub(crate) fn batch_words(
     n: usize,
-    g2: &[bool],
+    groups: &[Group],
     window: Option<u32>,
     work: Work,
 ) -> Result<Vec<usize>, ProveError> {
     let g = Geometry::new(n, 0, n, pick_window(window, n), slice_len(), work)?;
     let mut words = plan_words(&g)?.to_vec();
-    for &is_g2 in g2 {
-        words.extend(output_words(&g, if is_g2 { G2_WORDS } else { G1_WORDS })?);
+    for group in groups {
+        words.extend(output_words(&g, group.words())?);
     }
     Ok(words)
 }
@@ -634,11 +634,11 @@ pub(crate) fn resident_scratch(
 ) -> Result<Vec<usize>, ProveError> {
     let mut envelope: Vec<usize> = Vec::new();
     for (stage, _, n) in resident_schedule(n_vars, l_len, h_len, chunk)? {
-        let g2: &[bool] = match stage {
-            Resident::Witness => &[false, true, false],
-            Resident::L | Resident::H => &[false],
+        let groups: &[Group] = match stage {
+            Resident::Witness => &[Group::G1, Group::G2, Group::G1],
+            Resident::L | Resident::H => &[Group::G1],
         };
-        let mut words = batch_words(n, g2, window, Work::Variable)?;
+        let mut words = batch_words(n, groups, window, Work::Variable)?;
         words.sort_unstable_by(|a, b| b.cmp(a));
         if words.len() > envelope.len() {
             envelope.resize(words.len(), 0);
@@ -1059,7 +1059,7 @@ pub enum Job<'a> {
 
 /// Which group a job's points are in, for the code that does not need their type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Group {
+pub(crate) enum Group {
     G1,
     G2,
 }
@@ -2858,8 +2858,9 @@ mod tests {
     #[test]
     fn batch_words_counts_one_plan_and_each_job() {
         let n = 1 << 12;
-        let one = batch_words(n, &[false], None, Work::Variable).unwrap();
-        let three = batch_words(n, &[false, true, false], None, Work::Variable).unwrap();
+        let one = batch_words(n, &[Group::G1], None, Work::Variable).unwrap();
+        let three =
+            batch_words(n, &[Group::G1, Group::G2, Group::G1], None, Work::Variable).unwrap();
         let g = Geometry::new(n, 0, n, pick_window(None, n), slice_len(), Work::Variable).unwrap();
         assert_eq!(one.len(), 3 + output_words(&g, G1_WORDS).unwrap().len());
         assert_eq!(
