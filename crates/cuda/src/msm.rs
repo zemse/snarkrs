@@ -154,8 +154,84 @@ pub enum Work {
 }
 
 const DUMMY_ROWS: usize = 64;
-const FOLD_LEN: usize = 64;
+
+/// Spill slots one thread of `msm_fold_*` adds per level, at most: a level over fewer
+/// slots takes that many, which is the same public `n`'s choice.
+///
+/// Each level is one dependent chain of `len` complete additions per thread on a grid
+/// that shrinks by `len / 2` a level, so the fold's critical path is about
+/// `len * log(slots) / log(len / 2)` additions and a longer group only lengthens it.
+/// Swept on a Tesla T4 by `constant_work_phase_flatness` (dense scalars, medians of 8,
+/// fold phase in ms, G1 / G2):
+///
+/// ```text
+///   n        len 64        len 4         len 8         len 16
+///   4096     1.96 / 6.57   0.93 / 2.99   0.90 / 2.92   1.12 / 3.66
+///   65536    3.92 / 12.6   1.84 / 6.44   1.50 / 5.28   1.80 / 5.62
+///   262144   4.67 / 14.6   3.17 / 11.5   2.60 / 8.88   2.76 / 9.05
+/// ```
+///
+/// (64 at slice 64 throughout, the others at [`slice_len_for`]'s.) 8 is the fastest at
+/// every length, as on the Metal twin (`FOLD_LEN` in crates/metal/src/msm/window.rs).
+/// Override with `G16_CUDA_MSM_FOLD` (at least 3, so every level shrinks the slot count).
+const FOLD_LEN: usize = 8;
 const _: () = assert!(DUMMY_ROWS.is_power_of_two() && FOLD_LEN > 2);
+
+fn fold_len() -> usize {
+    std::env::var("G16_CUDA_MSM_FOLD")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 2)
+        .unwrap_or(FOLD_LEN)
+}
+
+/// Threads a constant-work accumulation is given before its slices stop shortening;
+/// see [`slice_len_for`]. Override with `G16_CUDA_MSM_SEG_THREADS`.
+const SEG_TARGET_THREADS: usize = 4096;
+
+/// The shortest slice [`slice_len_for`] halves to. Override with `G16_CUDA_MSM_SEG_MIN`.
+const SEG_MIN_LEN: usize = 8;
+
+/// Slice length a plan of `n` scalars at width `c` runs at.
+///
+/// Variable work keeps [`SLICE_LEN`]. A constant-work accumulation runs every one of a
+/// slice's iterations as a dependent chain of complete additions, so at a small `n` a
+/// window of a few slices is a few threads each owing [`SLICE_LEN`] additions while the
+/// card idles: the slice halves until the grid reaches [`SEG_TARGET_THREADS`] or
+/// [`SEG_MIN_LEN`], the Metal twin's `slice_len_for`. A function of `n` and `c` alone,
+/// which the key fixes. `G16_CUDA_MSM_L` forces one length for both.
+///
+/// Measured on a Tesla T4 by `constant_work_phase_flatness`, accumulation plus fold in
+/// ms, G1 / G2: at n = 8 (c = 3) slice 64 reads 1.77 / 6.14 and the halving to 8 reads
+/// 0.29 / 1.13; at 512 (c = 6) 2.34 / 7.88 against 1.05 / 3.51; at 4096 (c = 8)
+/// 3.89 / 13.0 against 2.05 / 6.57. A target of 16384 threads halves 4096 to slice 8
+/// and moves the cost into the fold (1.85 / 7.12); a floor of 2 does the same at n = 8
+/// (0.32 / 1.18). From 2^16 up the plan keeps slice 64.
+fn slice_len_for(n: usize, c: u32, work: Work) -> usize {
+    if let Some(l) = forced_slice_len() {
+        return l;
+    }
+    if work == Work::Variable {
+        return SLICE_LEN;
+    }
+    let num = |name: &str, default: usize| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(default)
+    };
+    let (target, min) = (
+        num("G16_CUDA_MSM_SEG_THREADS", SEG_TARGET_THREADS),
+        num("G16_CUDA_MSM_SEG_MIN", SEG_MIN_LEN),
+    );
+    let n_windows = RECODE_BITS.div_ceil(c as usize);
+    let mut l = SLICE_LEN;
+    while l > min && n_windows * n.max(1).div_ceil(l) < target {
+        l /= 2;
+    }
+    l
+}
 
 /// Checked without allocating, before any kernel can index a scalar or point range.
 fn kernel_range(off: usize, n: usize, words: usize) -> Result<(), ProveError> {
@@ -215,6 +291,8 @@ struct Geometry {
     slice_len: usize,
     slices: usize,
     dummy_rows: usize,
+    /// Longest fold group; see [`FOLD_LEN`].
+    fold_len: usize,
     /// Entries at or above which a bucket merges in `msm_merge_wide_*` instead of
     /// `msm_merge_*`, 0 when no bucket can; see [`merge_wide_min_for`].
     merge_wide_min: usize,
@@ -282,6 +360,7 @@ impl Geometry {
             } else {
                 0
             },
+            fold_len: fold_len(),
             merge_wide_min: merge_wide_min_for(general, slice_len, shapes.wide_span),
             reduce_groups: shapes.reduce_groups.map_or_else(
                 || reduce_groups_for(n_windows, n_buckets),
@@ -305,7 +384,7 @@ impl Geometry {
         checked_words(g.slices, slice_len)?;
         for level in g.fold_levels() {
             checked_point_words(g.n_windows * level.groups as usize * 2, G2_WORDS)?;
-            checked_words(level.groups as usize, FOLD_LEN)?;
+            checked_words(level.groups as usize, level.len as usize)?;
         }
         Ok(g)
     }
@@ -325,14 +404,16 @@ impl Geometry {
 
     fn fold_levels(&self) -> impl Iterator<Item = FoldParams> {
         let mut slots = (self.dummy_rows != 0).then_some(2 * self.slices);
+        let fold_len = self.fold_len;
         std::iter::from_fn(move || {
             let m = slots?;
-            let groups = m.div_ceil(FOLD_LEN);
+            let len = fold_len.min(m);
+            let groups = m.div_ceil(len);
             slots = (groups > 1).then_some(2 * groups);
             Some(FoldParams {
                 slots: m as u32,
                 groups: groups as u32,
-                len: FOLD_LEN as u32,
+                len: len as u32,
                 last: (groups == 1) as u32,
             })
         })
@@ -352,12 +433,11 @@ struct FoldParams {
 // SAFETY: repr(C), four u32 fields with no padding or invalid bit patterns.
 unsafe impl DeviceRepr for FoldParams {}
 
-fn slice_len() -> usize {
+fn forced_slice_len() -> Option<usize> {
     std::env::var("G16_CUDA_MSM_L")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|v| *v > 0)
-        .unwrap_or(SLICE_LEN)
 }
 
 /// `G16_CUDA_MSM_POISON=1` fills every MSM scratch buffer with [`POISON`] bytes before
@@ -604,7 +684,8 @@ pub(crate) fn batch_words(
     window: Option<u32>,
     work: Work,
 ) -> Result<Vec<usize>, ProveError> {
-    let g = Geometry::new(n, 0, n, pick_window(window, n), slice_len(), work)?;
+    let c = pick_window(window, n);
+    let g = Geometry::new(n, 0, n, c, slice_len_for(n, c, work), work)?;
     let mut words = plan_words(&g)?.to_vec();
     for group in groups {
         words.extend(output_words(&g, group.words())?);
@@ -2847,12 +2928,13 @@ impl<'a> Plan<'a> {
         } else {
             scalars.general_in(&(scalar_off..scalar_off + n))
         };
+        let c = pick_window(msm.window, general);
         Geometry::with_shapes(
             n,
             scalar_off,
             general,
-            pick_window(msm.window, general),
-            slice_len(),
+            c,
+            slice_len_for(n, c, msm.work),
             msm.work,
             msm.shapes,
         )
@@ -3168,7 +3250,16 @@ mod tests {
         let one = batch_words(n, &[Group::G1], None, Work::Variable).unwrap();
         let three =
             batch_words(n, &[Group::G1, Group::G2, Group::G1], None, Work::Variable).unwrap();
-        let g = Geometry::new(n, 0, n, pick_window(None, n), slice_len(), Work::Variable).unwrap();
+        let c = pick_window(None, n);
+        let g = Geometry::new(
+            n,
+            0,
+            n,
+            c,
+            slice_len_for(n, c, Work::Variable),
+            Work::Variable,
+        )
+        .unwrap();
         assert_eq!(one.len(), 3 + output_words(&g, G1_WORDS).unwrap().len());
         assert_eq!(
             vram_bytes(&three),
@@ -3237,12 +3328,14 @@ mod tests {
                     assert!(!levels.is_empty());
                     let mut slots = 2 * g.slices;
                     for f in levels {
+                        let len = FOLD_LEN.min(slots);
                         assert_eq!(f.slots as usize, slots);
-                        assert_eq!(f.groups as usize, slots.div_ceil(FOLD_LEN));
-                        assert_eq!(f.len as usize, FOLD_LEN);
+                        assert_eq!(f.groups as usize, slots.div_ceil(len));
+                        assert_eq!(f.len as usize, len);
+                        assert!(f.len > 1);
                         assert_eq!(f.last != 0, f.groups == 1);
-                        assert!((f.groups as usize - 1) * FOLD_LEN < slots);
-                        assert!(f.groups as usize * FOLD_LEN >= slots);
+                        assert!((f.groups as usize - 1) * len < slots);
+                        assert!(f.groups as usize * len >= slots);
                         if f.last == 0 {
                             assert!(2 * (f.groups as usize) < slots);
                         }
@@ -4075,8 +4168,15 @@ mod tests {
     }
 
     #[test]
-    fn gate_fold_cases_straddle_all_three_levels() {
-        for (n, want) in [(2048, 1), (2049, 2), (65536, 2), (65537, 3)] {
+    fn gate_fold_cases_straddle_the_first_three_level_boundaries() {
+        for (n, want) in [
+            (256, 1),
+            (257, 2),
+            (1024, 2),
+            (1025, 3),
+            (4096, 3),
+            (4097, 4),
+        ] {
             let geometry = Geometry::new(n, 0, n, 8, 64, Work::Constant).unwrap();
             assert_eq!(geometry.fold_levels().count(), want, "n={n}");
         }
@@ -4399,9 +4499,12 @@ mod tests {
             (0, 2, 3),
             (65, 2, 3),
             (65, 16, 65),
-            (2048, 8, 64),
-            (2049, 8, 64),
-            (65536, 8, 64),
+            (256, 8, 64),
+            (257, 8, 64),
+            (1024, 8, 64),
+            (1025, 8, 64),
+            (4096, 8, 64),
+            (4097, 8, 64),
             (65537, 8, 64),
         ] {
             let corpus = gate_carry_scalars(c);
@@ -4681,22 +4784,27 @@ mod tests {
         }
     }
 
-    /// The constant-work MSM's phases across scalar classes at one `n`, interleaved so a
+    /// The constant-work MSM's phases across scalar classes at each `n`, interleaved so a
     /// drift in the machine lands on every class alike: zeros, ones, bits, dense random,
     /// one dense value everywhere (every entry of a window in one bucket) and small values
     /// (window zero only). Every rep times each class's digit pipeline, clear,
     /// accumulation, fold and reduce between an event pair on the stream; medians and
-    /// ranges over the reps after the warm-up. `G16_REVIEW_N` sets the length (2^18 by
-    /// default) and `G16_REVIEW_REPS` the reps (12). The Metal twin is
+    /// ranges over the reps after the warm-up. `G16_REVIEW_N` is a comma-separated list of
+    /// lengths (2^18 by default), `G16_REVIEW_SET` picks classes by name (all six by
+    /// default) and `G16_REVIEW_REPS` sets the reps (12). The Metal twin is
     /// `constant_work_phase_flatness` in msm_gpu_probes.rs.
     #[test]
     #[ignore = "GPU measurement; run explicitly on the measurement machine"]
     fn constant_work_phase_flatness() {
         use snarkrs_field::{CurveGroup, PrimeField, PrimeGroup};
-        let n: usize = std::env::var("G16_REVIEW_N")
+        let lengths: Vec<usize> = std::env::var("G16_REVIEW_N")
             .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1 << 18);
+            .map(|v| v.split(',').filter_map(|s| s.trim().parse().ok()).collect())
+            .filter(|v: &Vec<usize>| !v.is_empty())
+            .unwrap_or_else(|| vec![1 << 18]);
+        let pick: Option<Vec<String>> = std::env::var("G16_REVIEW_SET")
+            .ok()
+            .map(|v| v.split(',').map(|s| s.trim().to_string()).collect());
         let reps: usize = std::env::var("G16_REVIEW_REPS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -4707,11 +4815,12 @@ mod tests {
         let m = CudaMsm::from_module(&cuda, module)
             .expect("bind the MSM kernels")
             .constant_work();
+        let n_max = *lengths.iter().max().unwrap();
         // Every seventh base at infinity, as the tests' `bases_with_infinity`.
         let mut p1 = G1Projective::generator();
         let mut p2 = G2Projective::generator();
-        let (mut g1, mut g2) = (Vec::with_capacity(n), Vec::with_capacity(n));
-        for _ in 0..n {
+        let (mut g1, mut g2) = (Vec::with_capacity(n_max), Vec::with_capacity(n_max));
+        for _ in 0..n_max {
             p1 += G1Projective::generator();
             p2 += G2Projective::generator();
             g1.push(p1);
@@ -4719,121 +4828,127 @@ mod tests {
         }
         let mut g1 = G1Projective::normalize_batch(&g1);
         let mut g2 = G2Projective::normalize_batch(&g2);
-        for i in (3..n).step_by(7) {
+        for i in (3..n_max).step_by(7) {
             g1[i] = G1Affine::identity();
             g2[i] = G2Affine::identity();
         }
         let b1 = m.upload_g1_bases(&g1).unwrap();
         let b2 = m.upload_g2_bases(&g2).unwrap();
-        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
-        let mut next = || {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            seed
-        };
-        let bits: Vec<Fr> = (0..n).map(|_| Fr::from(next() & 1)).collect();
-        let dense: Vec<Fr> = (0..n)
-            .map(|_| {
-                let mut bytes = [0u8; 32];
-                for b in &mut bytes {
-                    *b = next() as u8;
-                }
-                Fr::from_le_bytes_mod_order(&bytes)
-            })
-            .collect();
-        let one_value = -Fr::from(0x7f3a_19c5_d02b_6e41u64);
-        let sets = [
-            ("zeros", vec![Fr::from(0u64); n]),
-            ("ones", vec![Fr::from(1u64); n]),
-            ("bits", bits),
-            ("dense", dense),
-            ("onevalue", vec![one_value; n]),
-            ("small", (0..n).map(|i| Fr::from((i % 5) as u64)).collect()),
-        ];
-        let time = |f: &dyn Fn() -> Result<(), ProveError>| -> f64 {
-            let ev = || {
-                m.ctx
-                    .new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
-                    .unwrap()
+        for &n in &lengths {
+            let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+            let mut next = || {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed
             };
-            let (start, end) = (ev(), ev());
-            start.record(&m.stream).unwrap();
-            f().unwrap();
-            end.record(&m.stream).unwrap();
-            m.stream.synchronize().unwrap();
-            elapsed_us(&start, &end).unwrap() as f64 / 1e3
-        };
-        let phases = ["digits", "clear", "accum", "fold", "reduce"];
-        for group in ["g1", "g2"] {
-            let scalars: Vec<ScalarBuf> = sets
-                .iter()
-                .map(|(_, s)| m.upload_scalars(s).unwrap())
-                .collect();
-            let jobs: Vec<Job<'_>> = scalars
-                .iter()
-                .map(|s| {
-                    if group == "g1" {
-                        Job::G1(JobG1 {
-                            bases: &b1,
-                            base_off: 0,
-                            scalars: s.as_scalars(),
-                            scalar_off: 0,
-                            n,
-                        })
-                    } else {
-                        Job::G2(JobG2 {
-                            bases: &b2,
-                            base_off: 0,
-                            scalars: s.as_scalars(),
-                            scalar_off: 0,
-                            n,
-                        })
+            let bits: Vec<Fr> = (0..n).map(|_| Fr::from(next() & 1)).collect();
+            let dense: Vec<Fr> = (0..n)
+                .map(|_| {
+                    let mut bytes = [0u8; 32];
+                    for b in &mut bytes {
+                        *b = next() as u8;
                     }
+                    Fr::from_le_bytes_mod_order(&bytes)
                 })
                 .collect();
-            let plans: Vec<Plan<'_>> = scalars
-                .iter()
-                .map(|s| Plan::new(&m, s.as_scalars(), 0, n).unwrap())
+            let one_value = -Fr::from(0x7f3a_19c5_d02b_6e41u64);
+            let sets = [
+                ("zeros", vec![Fr::from(0u64); n]),
+                ("ones", vec![Fr::from(1u64); n]),
+                ("bits", bits),
+                ("dense", dense),
+                ("onevalue", vec![one_value; n]),
+                ("small", (0..n).map(|i| Fr::from((i % 5) as u64)).collect()),
+            ];
+            let sets: Vec<_> = sets
+                .into_iter()
+                .filter(|(name, _)| pick.as_ref().is_none_or(|p| p.iter().any(|q| q == name)))
                 .collect();
-            let outs: Vec<Outputs> = jobs
-                .iter()
-                .zip(&plans)
-                .map(|(job, plan)| Outputs::new(&m, job, plan).unwrap())
-                .collect();
-            let mut t: Vec<[Vec<f64>; 5]> = sets.iter().map(|_| Default::default()).collect();
-            for rep in 0..warm + reps {
-                for (i, ((job, plan), out)) in jobs.iter().zip(&plans).zip(&outs).enumerate() {
-                    let params = m.point_params(out, plan);
-                    let d = time(&|| m.launch_digits(plan));
-                    let c = time(&|| m.launch_clear(job, out, plan, &params));
-                    let a = time(&|| m.launch_accumulate(job, out, plan, &params));
-                    let g = time(&|| m.launch_merge(job, out, plan, &params));
-                    let r = time(&|| m.launch_reduce(job, out, plan, &params));
-                    if rep >= warm {
-                        for (v, x) in t[i].iter_mut().zip([d, c, a, g, r]) {
-                            v.push(x);
+            let time = |f: &dyn Fn() -> Result<(), ProveError>| -> f64 {
+                let ev = || {
+                    m.ctx
+                        .new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+                        .unwrap()
+                };
+                let (start, end) = (ev(), ev());
+                start.record(&m.stream).unwrap();
+                f().unwrap();
+                end.record(&m.stream).unwrap();
+                m.stream.synchronize().unwrap();
+                elapsed_us(&start, &end).unwrap() as f64 / 1e3
+            };
+            let phases = ["digits", "clear", "accum", "fold", "reduce"];
+            for group in ["g1", "g2"] {
+                let scalars: Vec<ScalarBuf> = sets
+                    .iter()
+                    .map(|(_, s)| m.upload_scalars(s).unwrap())
+                    .collect();
+                let jobs: Vec<Job<'_>> = scalars
+                    .iter()
+                    .map(|s| {
+                        if group == "g1" {
+                            Job::G1(JobG1 {
+                                bases: &b1,
+                                base_off: 0,
+                                scalars: s.as_scalars(),
+                                scalar_off: 0,
+                                n,
+                            })
+                        } else {
+                            Job::G2(JobG2 {
+                                bases: &b2,
+                                base_off: 0,
+                                scalars: s.as_scalars(),
+                                scalar_off: 0,
+                                n,
+                            })
+                        }
+                    })
+                    .collect();
+                let plans: Vec<Plan<'_>> = scalars
+                    .iter()
+                    .map(|s| Plan::new(&m, s.as_scalars(), 0, n).unwrap())
+                    .collect();
+                let outs: Vec<Outputs> = jobs
+                    .iter()
+                    .zip(&plans)
+                    .map(|(job, plan)| Outputs::new(&m, job, plan).unwrap())
+                    .collect();
+                let mut t: Vec<[Vec<f64>; 5]> = sets.iter().map(|_| Default::default()).collect();
+                for rep in 0..warm + reps {
+                    for (i, ((job, plan), out)) in jobs.iter().zip(&plans).zip(&outs).enumerate() {
+                        let params = m.point_params(out, plan);
+                        let d = time(&|| m.launch_digits(plan));
+                        let c = time(&|| m.launch_clear(job, out, plan, &params));
+                        let a = time(&|| m.launch_accumulate(job, out, plan, &params));
+                        let g = time(&|| m.launch_merge(job, out, plan, &params));
+                        let r = time(&|| m.launch_reduce(job, out, plan, &params));
+                        if rep >= warm {
+                            for (v, x) in t[i].iter_mut().zip([d, c, a, g, r]) {
+                                v.push(x);
+                            }
                         }
                     }
                 }
-            }
-            println!(
-                "flatness {group} n={n} c={} w={} slices/window={} reps={reps} (median, min-max, ms)",
-                plans[0].c, plans[0].n_windows, plans[0].slices
+                println!(
+                "flatness {group} n={n} c={} w={} slice={} slices/window={} folds={} reps={reps} (median, min-max, ms)",
+                plans[0].c, plans[0].n_windows, plans[0].slice_len, plans[0].slices, plans[0].fold_levels().map(|f| f.len.to_string()).collect::<Vec<_>>().join("+")
             );
-            for (i, (label, _)) in sets.iter().enumerate() {
-                let mut line = format!("  {label:<9}");
-                for (name, v) in phases.iter().zip(&t[i]) {
-                    let mut s = v.clone();
-                    s.sort_by(f64::total_cmp);
-                    line += &format!(
-                        "  {name} {:.2} ({:.2}-{:.2})",
-                        median(v.clone()),
-                        s[0],
-                        s[s.len() - 1]
-                    );
+                for (i, (label, _)) in sets.iter().enumerate() {
+                    let mut line = format!("  {label:<9}");
+                    for (name, v) in phases.iter().zip(&t[i]) {
+                        let mut s = v.clone();
+                        s.sort_by(f64::total_cmp);
+                        line += &format!(
+                            "  {name} {:.2} ({:.2}-{:.2})",
+                            median(v.clone()),
+                            s[0],
+                            s[s.len() - 1]
+                        );
+                    }
+                    println!("{line}");
                 }
-                println!("{line}");
             }
         }
     }
