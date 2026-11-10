@@ -88,7 +88,7 @@ use snarkrs_gpu_layout::{
 };
 use snarkrs_groth16::{HPoly, MsmOutputs, ProveError, StageTimings};
 
-use crate::context::{bad, drv, elapsed_us, upload_words};
+use crate::context::{bad, drv, elapsed_us, plan_lock, upload_words};
 use crate::stages::{HHandle, Staging, TAG};
 use crate::{as_words, from_words, kernels, Cuda};
 
@@ -1472,11 +1472,19 @@ pub struct CudaMsm {
     /// Scratch reserved once by [`Self::with_arena`], which every batch then draws from and
     /// hands back instead of allocating. `None`, the default, allocates per batch.
     arena: Option<Mutex<Vec<CudaSlice<u32>>>>,
+    /// [`Cuda::plan_memory`]: held without an arena from an MSM call's first memory query
+    /// until its last batch's scratch is freed, so concurrent proofs run their MSMs one at a
+    /// time, each against the memory the last one gave back.
+    memory: Arc<Mutex<()>>,
 }
 
 #[cfg(test)]
 #[derive(Default)]
 struct TestActivity {
+    /// Bytes of planned scratch allocated and not yet freed, over every thread, and the
+    /// most that ever was.
+    in_flight: AtomicU64,
+    peak_in_flight: AtomicU64,
     ones_allocations: AtomicU64,
     ones_launches: AtomicU64,
     ones_readbacks: AtomicU64,
@@ -1484,6 +1492,32 @@ struct TestActivity {
     segmented_launches: AtomicU64,
     constant_launches: AtomicU64,
     fold_launches: AtomicU64,
+}
+
+/// One batch's planned bytes counted in [`TestActivity::in_flight`] until it drops, after
+/// the batch's own scratch.
+#[cfg(test)]
+struct InFlight<'a> {
+    activity: &'a TestActivity,
+    bytes: u64,
+}
+
+#[cfg(test)]
+impl<'a> InFlight<'a> {
+    fn new(activity: &'a TestActivity, bytes: u64) -> Self {
+        let now = activity.in_flight.fetch_add(bytes, Ordering::SeqCst) + bytes;
+        activity.peak_in_flight.fetch_max(now, Ordering::SeqCst);
+        Self { activity, bytes }
+    }
+}
+
+#[cfg(test)]
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.activity
+            .in_flight
+            .fetch_sub(self.bytes, Ordering::SeqCst);
+    }
 }
 
 impl CudaMsm {
@@ -1662,6 +1696,7 @@ impl CudaMsm {
         Ok(Self {
             #[cfg(test)]
             activity: TestActivity::default(),
+            memory: cuda.plan_memory(),
             work: Work::Variable,
             window: None,
             shapes: Shapes::from_env(l2_bytes(&ctx)),
@@ -1815,6 +1850,11 @@ impl CudaMsm {
     /// at once, more when they were cut into runs.
     pub fn last_runs(&self) -> u64 {
         self.last_runs.load(Ordering::Relaxed)
+    }
+
+    /// [`Self::memory`] held, or nothing with an arena, whose batches allocate nothing.
+    fn plan_guard(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+        self.arena.is_none().then(|| plan_lock(&self.memory))
     }
 
     /// Bytes a batch may allocate now, [`device_budget`] under [`Self::with_vram_limit`].
@@ -2032,6 +2072,12 @@ impl CudaMsm {
     /// are twelve: that removes eight of the twenty digit launches and, more to the point,
     /// two thirds of the scatter's memory traffic.
     pub fn msm_batch(&self, jobs: &[Job<'_>]) -> Result<Vec<MsmResult>, ProveError> {
+        let _plan = self.plan_guard();
+        self.batch(jobs)
+    }
+
+    /// [`Self::msm_batch`] under a [`Self::plan_guard`] the caller holds.
+    fn batch(&self, jobs: &[Job<'_>]) -> Result<Vec<MsmResult>, ProveError> {
         // Owned out here so the scratch goes back to an arena on every return, an error
         // included.
         let (mut plans, mut outs) = (Vec::new(), Vec::new());
@@ -2070,6 +2116,11 @@ impl CudaMsm {
                 return Err(too_big(need, budget, "an MSM batch"));
             }
         }
+        #[cfg(test)]
+        let _flight = match self.arena {
+            None => InFlight::new(&self.activity, self.batch_bytes(jobs)?),
+            Some(_) => InFlight::new(&self.activity, 0),
+        };
 
         // The start event is recorded before anything is allocated, so a stream-ordered
         // allocation that waits on the pool is inside the span rather than hidden.
@@ -2178,6 +2229,7 @@ impl CudaMsm {
                 want: self.n_vars,
             });
         }
+        let _plan = self.plan_guard();
 
         let t0 = Instant::now();
         // The witness the gather already uploaded is reused when `h` is our own device
@@ -2275,7 +2327,7 @@ impl CudaMsm {
                 self.run_schedule(w, h_scalars, h_n, run)?
             }
             _ => {
-                let out = self.msm_batch(&jobs)?;
+                let out = self.batch(&jobs)?;
                 self.last_runs.store(1, Ordering::Relaxed);
                 MsmOutputs {
                     a_g1: out[0].g1()?,
@@ -2376,7 +2428,7 @@ impl CudaMsm {
         };
         let (mut device_us, mut combine_us, mut runs) = (0, 0, 0);
         for (stage, off, n) in resident_schedule(self.n_vars, self.l.len(), h_len, run)? {
-            let r = self.msm_batch(&self.run_jobs(stage, off, n, w, h))?;
+            let r = self.batch(&self.run_jobs(stage, off, n, w, h))?;
             match stage {
                 Resident::Witness => {
                     out.a_g1 += r[0].g1()?;
@@ -2418,6 +2470,7 @@ impl CudaMsm {
     ) -> Result<MsmOutputs, ProveError> {
         let w = Scalars::device_std(witness_std, self.n_vars)?;
         let h = Scalars::device_std(h_std, h_len)?;
+        let _plan = self.plan_guard();
         // With an arena the runs are the ones it was sized for. Without one, `chunk` is a cap
         // and a device with less free cuts shorter runs.
         let run = match self.vram_budget()? {
@@ -4395,6 +4448,57 @@ mod tests {
                 None
             }
         }
+    }
+
+    /// Two proofs' MSMs on one key at once, under a limit that holds one batch of them and
+    /// not two: both run whole and right, and the two batches are never allocated together.
+    /// Without the plan lock both read the same free memory, both plan a whole batch, and
+    /// both allocate it.
+    #[test]
+    #[ignore = "requires a CUDA device and sha256/circuit.zkey under G16_ARTIFACTS or bench/artifacts"]
+    fn concurrent_msms_plan_their_memory_one_at_a_time() {
+        let Some(cuda) = device() else { return };
+        let path = std::env::var_os("G16_ARTIFACTS")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/artifacts")
+            })
+            .join("sha256/circuit.zkey");
+        let pk = ProvingKey::load(&path).expect("sha256 key");
+        let mut seed = 0x0C0C_0C0Cu64;
+        let mut fr = || Fr::from(splitmix(&mut seed));
+        let witness: Vec<Fr> = (0..pk.n_vars).map(|_| fr()).collect();
+        let h = HPoly::Host((0..pk.domain_size).map(|_| fr()).collect());
+        let mut msm = CudaMsm::new(&cuda, &pk).unwrap();
+        let alone = msm
+            .msms(&witness, &h, &mut StageTimings::default())
+            .unwrap();
+        assert_eq!(msm.last_runs(), 1);
+        let one = msm.activity.peak_in_flight.load(Ordering::SeqCst);
+        assert!(one > 0, "no batch was counted");
+
+        msm.vram_limit = Some(one + one / 2);
+        msm.activity.peak_in_flight.store(0, Ordering::SeqCst);
+        let both = std::sync::Barrier::new(2);
+        for _ in 0..4 {
+            std::thread::scope(|s| {
+                let proofs = [0, 1].map(|_| {
+                    s.spawn(|| {
+                        both.wait();
+                        msm.msms(&witness, &h, &mut StageTimings::default())
+                    })
+                });
+                for p in proofs {
+                    assert_eq!(p.join().unwrap().unwrap(), alone);
+                }
+            });
+        }
+        assert_eq!(
+            msm.activity.peak_in_flight.load(Ordering::SeqCst),
+            one,
+            "two MSM batches of {one} bytes were allocated at once under a limit of {}",
+            one + one / 2
+        );
     }
 
     fn splitmix(seed: &mut u64) -> u64 {

@@ -7,7 +7,7 @@
 //! way `cargo build --features cuda` works on a laptop with no CUDA at all, and the binary
 //! runs on whatever card it finds.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use cudarc::driver::sys::CUresult;
 use cudarc::driver::{
@@ -221,6 +221,9 @@ pub struct Cuda {
     name: String,
     cc: (i32, i32),
     sm_count: i32,
+    /// Held from reading the free device memory to allocating against it; see
+    /// [`Self::plan_memory`]. Shared with every object built on this context.
+    memory: Arc<Mutex<()>>,
 }
 
 impl Cuda {
@@ -284,6 +287,7 @@ impl Cuda {
             name,
             cc,
             sm_count,
+            memory: Arc::new(Mutex::new(())),
         })
     }
 
@@ -297,6 +301,14 @@ impl Cuda {
 
     pub fn device_name(&self) -> &str {
         &self.name
+    }
+
+    /// The lock every allocation planned against the free device memory holds, from the
+    /// query until its buffers are allocated (an MSM batch: until they are freed), so two
+    /// proofs on this context, or a proof and a prepare, never plan against the same free
+    /// bytes. Each object built here keeps a clone.
+    pub(crate) fn plan_memory(&self) -> Arc<Mutex<()>> {
+        self.memory.clone()
     }
 
     pub fn compute_capability(&self) -> (i32, i32) {
@@ -531,6 +543,12 @@ fn cache_disabled() -> bool {
 /// before the first kernel runs, which at small powers is most of the command.
 pub(crate) fn time_enabled() -> bool {
     std::env::var("G16_CUDA_TIME").as_deref() == Ok("1")
+}
+
+/// `lock`, whether or not a thread panicked while holding it: it guards no data, only the
+/// ordering of queries and allocations.
+pub(crate) fn plan_lock(lock: &Mutex<()>) -> MutexGuard<'_, ()> {
+    lock.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// FNV-1a over the source and the architecture.

@@ -54,7 +54,7 @@ use snarkrs_formats::{HBasis, Matrix, ProvingKey};
 use snarkrs_gpu_layout::{Packed, PackedFr, PackedScalar};
 use snarkrs_groth16::{HPoly, ProveError, StageTimings};
 
-use crate::context::{bad, download, drv, elapsed_us, upload_words};
+use crate::context::{bad, download, drv, elapsed_us, plan_lock, upload_words};
 use crate::{from_words, kernels, Cuda};
 
 /// The tag on [`snarkrs_groth16::HPoly::Device`] values produced here. A handle carrying any
@@ -502,6 +502,8 @@ pub struct CudaStages {
     /// A cap on the device memory a new scratch may take, below what the driver says is
     /// free; see [`Self::with_vram_limit`].
     vram_limit: Option<u64>,
+    /// [`Cuda::plan_memory`], held while a new scratch is checked and allocated.
+    memory: Arc<Mutex<()>>,
 }
 
 impl CudaStages {
@@ -669,6 +671,7 @@ impl CudaStages {
                 last_upload_us: AtomicU64::new(0),
                 launches: AtomicUsize::new(0),
                 vram_limit: None,
+                memory: cuda.plan_memory(),
             });
         }
 
@@ -722,6 +725,7 @@ impl CudaStages {
             last_upload_us: AtomicU64::new(0),
             launches: AtomicUsize::new(0),
             vram_limit: None,
+            memory: cuda.plan_memory(),
         })
     }
 
@@ -1435,6 +1439,7 @@ impl CudaStages {
         // Refused before the first allocation, as the MSM refuses a batch: a scratch the
         // card cannot hold would otherwise be the driver's out-of-memory partway through.
         let need = Self::scratch_buffers(n, self.n_vars).iter().sum::<u64>();
+        let _plan = plan_lock(&self.memory);
         let budget = crate::msm::device_budget(&self.ctx, &self.stream, self.vram_limit)?;
         if need > budget {
             return Err(crate::msm::too_big(

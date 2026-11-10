@@ -61,7 +61,7 @@ use snarkrs_field::{Field, Fr};
 use snarkrs_formats::{Coefficients, HBasis, ProvingKey};
 use snarkrs_groth16::{Backend, HPoly, MsmOutputs, PreparedCircuit, ProveError, StageTimings};
 
-use crate::context::{bad, Cuda};
+use crate::context::{bad, plan_lock, Cuda};
 use crate::msm::{device_budget, too_big, CudaMsm, Work};
 use crate::stages::{CudaStages, HHandle, TAG};
 
@@ -280,7 +280,10 @@ impl Backend for CudaBackend {
 /// behind a mutex inside [`CudaStages`] and handed back when the handle inside the
 /// [`HPoly`] drops, so two in-flight proofs cannot be given the same `A`, `B`, `C` or `H`
 /// buffer. Stages 5 to 9 allocate their scratch per call out of the driver's own
-/// stream-ordered pool and free it at the end, so there is nothing to share.
+/// stream-ordered pool and free it at the end, so there is nothing to share; but each call
+/// plans that scratch against the free device memory, so the calls of concurrent proofs run
+/// one at a time under the context's plan lock ([`Cuda::plan_memory`]), and a new stage
+/// scratch and a prepare take the same lock.
 ///
 /// What concurrent proofs do share is the stream. That is safe, because a stream executes
 /// in issue order and the two proofs own disjoint buffers, so neither can observe the
@@ -350,7 +353,10 @@ impl CudaCircuit {
         // before the first upload when it does not fit: a key too large for the card is
         // then a `DeviceMemory` refusal in milliseconds, not the driver's out-of-memory
         // after minutes of upload. The MSMs fit themselves to what is left, see
-        // `CudaMsm::msms`.
+        // `CudaMsm::msms`. The plan lock is held through the uploads, so a proof on another
+        // circuit of this backend does not plan against memory this key is about to take.
+        let memory = backend.cuda.plan_memory();
+        let _plan = plan_lock(&memory);
         let need = resident_bytes(&pk);
         let budget = device_budget(
             backend.cuda.context(),
