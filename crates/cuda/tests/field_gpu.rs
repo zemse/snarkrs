@@ -15,7 +15,9 @@ mod resources {
     ));
 }
 
-use ark_ff::{AdditiveGroup, BigInt, BigInteger, Field, One, PrimeField, Zero};
+use ark_ff::{
+    AdditiveGroup, BigInt, BigInteger, Field, Fp, MontBackend, MontConfig, One, PrimeField, Zero,
+};
 use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 use snarkrs_cuda::{as_words, from_words, Cuda};
 use snarkrs_field::{Fq, Fq2, Fr};
@@ -55,29 +57,12 @@ fn fr_arithmetic_matches_arkworks_on_device() {
         .expect("NVRTC compile of the field probe");
     let probe = &funcs[0];
 
-    // Inputs worth having alongside random ones: the identities, the boundary at r-1, and
-    // pairs whose sum and difference cross zero and the modulus.
+    // Every ordered pair of the limb-pattern edges (the identities, r-1, r-2, the halves,
+    // 2^253, the largest all-ones tail below r), then random pairs. `a` is what fr_sqr
+    // squares, so every edge is squared.
     let mut rng = SplitMix64(0xF1E1D0);
-    let mut a: Vec<Fr> = vec![
-        Fr::zero(),
-        Fr::one(),
-        -Fr::one(),
-        Fr::zero(),
-        -Fr::one(),
-        Fr::from(2u64),
-    ];
-    let mut b: Vec<Fr> = vec![
-        Fr::zero(),
-        Fr::one(),
-        Fr::one(),
-        -Fr::one(),
-        -Fr::one(),
-        -Fr::one(),
-    ];
-    while a.len() < N {
-        a.push(rng.next_fr());
-        b.push(rng.next_fr());
-    }
+    let fr_edges: Vec<Fr> = edges();
+    let (a, b) = pairs(&fr_edges, N, || rng.next_fr());
 
     let pa = PackedFr::pack_slice(&a);
     let pb = PackedFr::pack_slice(&b);
@@ -130,7 +115,10 @@ fn fr_arithmetic_matches_arkworks_on_device() {
         assert_eq!(got[3][i], -a[i], "fr_neg mismatch at {i}");
         assert_eq!(got[4][i], a[i].square(), "fr_sqr mismatch at {i}");
     }
-    eprintln!("{N} elements x 5 operations agree with arkworks");
+    eprintln!(
+        "{N} Fr pairs ({} edge pairs) x 5 operations agree with arkworks",
+        fr_edges.len().pow(2)
+    );
 }
 
 #[test]
@@ -184,14 +172,17 @@ const N_Q: usize = 16384;
 const FLAG_IS_ZERO: u32 = 1;
 const FLAG_EQ: u32 = 2;
 
+/// Fr and Fq are both this type; the edge helpers below are written once over it.
+type Mont<T> = Fp<MontBackend<T, 4>, 4>;
+
 /// An element from the raw Montgomery limbs it will carry on the device. The carry chain
 /// and the conditional subtraction see limbs, not decoded values, so the edge cases worth
-/// having are limb patterns: every pattern below q is some element's representative, and
-/// arkworks' arithmetic on that element is the right oracle for the device's arithmetic
-/// on those limbs.
-fn fq_from_limbs(limbs: BigInt<4>) -> Fq {
-    assert!(limbs < Fq::MODULUS, "not a reduced representative");
-    Fq::new_unchecked(limbs)
+/// having are limb patterns: every pattern below the modulus is some element's
+/// representative, and arkworks' arithmetic on that element is the right oracle for the
+/// device's arithmetic on those limbs.
+fn from_limbs<T: MontConfig<4>>(limbs: BigInt<4>) -> Mont<T> {
+    assert!(limbs < T::MODULUS, "not a reduced representative");
+    Fp::new_unchecked(limbs)
 }
 
 /// Uniform on `[0, q)` up to the usual negligible bias.
@@ -205,9 +196,10 @@ fn next_fq(rng: &mut SplitMix64) -> Fq {
 
 /// Limb patterns at the edges of the carry chain, plus the decoded-value identities.
 /// Everything that can force or just miss the conditional subtraction after an add, a
-/// borrow through every limb in a sub, and a top limb at or near q's in a mul.
-fn fq_edges() -> Vec<Fq> {
-    let q = Fq::MODULUS;
+/// borrow through every limb in a sub, and a top limb at or near q's in a mul or a square.
+/// `q` is the field's modulus: the same list serves Fr and Fq.
+fn edges<T: MontConfig<4>>() -> Vec<Mont<T>> {
+    let q = Mont::<T>::MODULUS;
     let minus = |k: u64| {
         let mut x = q;
         x.sub_with_borrow(&BigInt::from(k));
@@ -219,36 +211,36 @@ fn fq_edges() -> Vec<Fq> {
     half_q_plus_1.add_with_carry(&BigInt::from(1u64));
     let mut two_254_mod_q = BigInt::<4>([0, 0, 0, 1 << 62]); // 2^254 - q
     two_254_mod_q.sub_with_borrow(&q);
-    let two = Fq::from(2u64);
+    let two = Mont::<T>::from(2u64);
     vec![
-        Fq::zero(),
-        Fq::one(),      // limbs R
-        -Fq::one(),     // limbs q - R
-        two.pow([256]), // the element R: limbs R^2 mod q
-        fq_from_limbs(BigInt::from(1u64)),
-        fq_from_limbs(BigInt::from(u32::MAX as u64)),
-        fq_from_limbs(minus(1)),
-        fq_from_limbs(minus(2)),
-        fq_from_limbs(half_q_minus_1),
-        fq_from_limbs(half_q_plus_1),
-        fq_from_limbs(BigInt([0, 0, 0, 1 << 61])), // 2^253
-        fq_from_limbs(BigInt([1, 0, 0, 1 << 61])), // 2^253 + 1
-        fq_from_limbs(two_254_mod_q),
-        // q's top limb is 0x30644e72 and the ones below it are not all set, so this is the
+        Mont::<T>::zero(),
+        Mont::<T>::one(),  // limbs R
+        -Mont::<T>::one(), // limbs q - R
+        two.pow([256]),    // the element R: limbs R^2 mod q
+        from_limbs(BigInt::from(1u64)),
+        from_limbs(BigInt::from(u32::MAX as u64)),
+        from_limbs(minus(1)),
+        from_limbs(minus(2)),
+        from_limbs(half_q_minus_1),
+        from_limbs(half_q_plus_1),
+        from_limbs(BigInt([0, 0, 0, 1 << 61])), // 2^253
+        from_limbs(BigInt([1, 0, 0, 1 << 61])), // 2^253 + 1
+        from_limbs(two_254_mod_q),
+        // Both moduli have top limb 0x30644e72 and the ones below it not all set, so this is the
         // largest all-ones tail that is still below q.
-        fq_from_limbs(BigInt([
+        from_limbs(BigInt([
             u64::MAX,
             u64::MAX,
             u64::MAX,
             0x3064_4e71_ffff_ffff,
         ])),
-        fq_from_limbs(BigInt([
+        from_limbs(BigInt([
             u64::MAX,
             u64::MAX,
             u64::MAX,
             0x0000_0000_ffff_ffff,
         ])), // 2^224 - 1
-        fq_from_limbs(BigInt([
+        from_limbs(BigInt([
             0xaaaa_aaaa_aaaa_aaaa,
             0xaaaa_aaaa_aaaa_aaaa,
             0xaaaa_aaaa_aaaa_aaaa,
@@ -334,7 +326,8 @@ fn fq_arithmetic_matches_arkworks_on_device() {
     let Some(cuda) = device() else { return };
 
     let mut rng = SplitMix64(0xF0_0D15);
-    let (a, b) = pairs(&fq_edges(), N_Q, || next_fq(&mut rng));
+    let fq_edges: Vec<Fq> = edges();
+    let (a, b) = pairs(&fq_edges, N_Q, || next_fq(&mut rng));
     let pa: Vec<PackedFq> = a.iter().map(PackedFq::from_fq).collect();
     let pb: Vec<PackedFq> = b.iter().map(PackedFq::from_fq).collect();
 
@@ -359,7 +352,7 @@ fn fq_arithmetic_matches_arkworks_on_device() {
     }
     eprintln!(
         "{N_Q} Fq pairs ({} edge pairs) x 6 operations + 2 predicates agree with arkworks",
-        fq_edges().len().pow(2)
+        fq_edges.len().pow(2)
     );
 }
 
@@ -369,7 +362,7 @@ fn fq2_arithmetic_matches_arkworks_on_device() {
 
     // Fq2 edges are every (c0, c1) pair from a shorter Fq list: the cross product of the
     // full list would exceed N_Q on its own, and the Fq test already walks that list.
-    let fq = fq_edges();
+    let fq: Vec<Fq> = edges();
     let short: Vec<Fq> = [0usize, 1, 2, 4, 6, 10, 13]
         .iter()
         .map(|&k| fq[k])
