@@ -329,7 +329,7 @@ struct PtOps<Proj<F>> {
 
 // ---------------------------------------------------------------------------
 // Kernel parameters. Mirrors `msm::MsmParams` on the host, which must be `#[repr(C)]`
-// with these eleven `u32` fields in this order. Passed by value: CUDA kernel arguments live
+// with these twelve `u32` fields in this order. Passed by value: CUDA kernel arguments live
 // in a small parameter space, so there is no constant buffer to bind and no
 // `[[buffer(n)]]` index to keep in sync, which removes a whole class of Metal-side
 // mistake. The host declares it locally and can therefore implement cudarc's `DeviceRepr`
@@ -348,9 +348,10 @@ struct MsmParams {
     u32 slice_len;   // entries per thread in the segmented accumulation
     u32 slices;      // ceil(cap / slice_len), threads per window there
     u32 dummy_rows;  // constant work: zero-digit rows per window
+    u32 merge_wide_min; // entries at or above which a bucket merges in msm_merge_wide_*; 0 never
 };
 
-static_assert(sizeof(MsmParams) == 44, "MsmParams must be eleven u32 to match the host struct");
+static_assert(sizeof(MsmParams) == 48, "MsmParams must be twelve u32 to match the host struct");
 
 struct FoldParams {
     u32 slots;
@@ -959,6 +960,9 @@ __device__ __forceinline__ void msm_merge_impl(Xyzz<F>* buckets,
     if (cnt == 0u) {
         return;
     }
+    if (p.merge_wide_min != 0u && cnt >= p.merge_wide_min) {
+        return;
+    }
     u32 w = row / p.n_buckets;
     u32 base = w * p.cap;
     u32 start = cursor[row] - cnt - base;
@@ -997,6 +1001,95 @@ extern "C" __global__ void msm_merge_g2(PtG2* buckets,
                                         MsmParams p) {
     u32 row = blockIdx.x * blockDim.x + threadIdx.x;
     msm_merge_impl<Fq2>(buckets, spill_pts, spill_rows, counts, cursor, p, row);
+}
+
+// The wide merge, ported from the Metal twin, for buckets whose runs span many slices.
+// `msm_merge_*` walks a bucket's whole slice range in one thread, which is fine while a
+// run crosses one slice boundary and is the critical path once it crosses dozens. Here
+// one BLOCK owns one bucket: the threads stride the slice range in parallel and a tree
+// folds their partials, so the fattest bucket costs `ceil(span / MERGE_TG)` additions
+// plus a log2(MERGE_TG) tree instead of `span` dependent iterations in a single lane.
+//
+// On the Metal side only the top window's live buckets are ever this fat, because its
+// window widths run to 15 bits, so the twin points the kernel at a row range the host
+// picks from the expected span. This port's host caps the width at 8 (`window_size`),
+// where a uniformly filled bucket holds `n / 128` entries, 32 slices at 2^18, but a
+// witness MSM is anything but uniform: its small values crowd the low windows, so one
+// plan holds rows spanning dozens of slices beside thousands spanning one, and a block
+// pays the whole tree on either. So the split is by the row's own count: a row at or
+// above `merge_wide_min` entries merges here and `msm_merge_*` skips it, a row below
+// exits here before the barriers and merges there. Both kernels run over every row;
+// the host launches this one only when some row can reach the count. MEASURED on a T4
+// (see msm.rs for the numbers and the whole-plan range they refute).
+#define MERGE_TG 64
+
+template <typename F>
+__device__ __forceinline__ void msm_merge_wide_impl(Xyzz<F>* buckets,
+                                                    const Xyzz<F>* spill_pts,
+                                                    const u32* spill_rows,
+                                                    const u32* counts,
+                                                    const u32* cursor,
+                                                    MsmParams p,
+                                                    Xyzz<F>* shared,
+                                                    u32 tg,
+                                                    u32 tid,
+                                                    u32 tcount) {
+    u32 row = tg;
+    u32 cnt = counts[row];
+    // Uniform across the block, so returning before the barriers is safe. The host never
+    // launches this kernel with `merge_wide_min == 0`, so an empty row leaves here too.
+    if (cnt < p.merge_wide_min) {
+        return;
+    }
+    u32 w = row / p.n_buckets;
+    u32 base = w * p.cap;
+    u32 start = cursor[row] - cnt - base;
+    u32 end = cursor[row] - base;
+    u32 k_lo = start / p.slice_len;
+    u32 k_hi = (end - 1u) / p.slice_len;
+
+    Xyzz<F> acc = pt_zero<F>();
+    for (u32 k = k_lo + tid; k <= k_hi; k += tcount) {
+        u32 slot = 2u * (w * p.slices + k);
+        if (spill_rows[slot] == row) {
+            acc = pt_add(acc, spill_pts[slot]);
+        }
+        if (spill_rows[slot + 1u] == row) {
+            acc = pt_add(acc, spill_pts[slot + 1u]);
+        }
+    }
+    shared[tid] = acc;
+
+    for (u32 s = 1; s < tcount; s <<= 1) {
+        __syncthreads();
+        if ((tid & ((s << 1) - 1u)) == 0u && tid + s < tcount) {
+            shared[tid] = pt_add(shared[tid], shared[tid + s]);
+        }
+    }
+    __syncthreads();
+    if (tid == 0u) {
+        buckets[row] = pt_add(buckets[row], shared[0]);
+    }
+}
+
+extern "C" __global__ void msm_merge_wide_g1(PtG1* buckets,
+                                             const PtG1* spill_pts,
+                                             const u32* spill_rows,
+                                             const u32* counts,
+                                             const u32* cursor,
+                                             MsmParams p) {
+    __shared__ PtG1 shared[MERGE_TG];
+    msm_merge_wide_impl<Fq>(buckets, spill_pts, spill_rows, counts, cursor, p, shared, blockIdx.x, threadIdx.x, blockDim.x);
+}
+
+extern "C" __global__ void msm_merge_wide_g2(PtG2* buckets,
+                                             const PtG2* spill_pts,
+                                             const u32* spill_rows,
+                                             const u32* counts,
+                                             const u32* cursor,
+                                             MsmParams p) {
+    __shared__ PtG2 shared[MERGE_TG];
+    msm_merge_wide_impl<Fq2>(buckets, spill_pts, spill_rows, counts, cursor, p, shared, blockIdx.x, threadIdx.x, blockDim.x);
 }
 
 #ifdef G16_MSM_CONSTANT_WORK
@@ -1107,6 +1200,13 @@ extern "C" __global__ void msm_fold_g2(const PtG2* in_pts,
 // segment contributes P + lo * Q. The per-thread results are then tree-reduced in shared
 // memory, so the host reads back one point per window and does nothing but the Horner
 // combination.
+//
+// Not split across blocks the way the Metal twin's `reduce_groups` does. MEASURED on a
+// T4 at the shipped c = 8 (TASKS.local.md, OPT-07): the kernel is 0.55 ms in G1 and 1.8
+// in G2 flat from 2^14 to 2^18, latency, and neither two groups a window (G2 1.59 ms for
+// 0.07 ms more host folding, G1 within noise) nor the twin's warp-scan shape that drops
+// `pt_mul_small` from the chain (device 0.06 to 0.19 ms faster, host 0.13 to 0.41 ms
+// slower on the pair fold) paid for itself.
 //
 // REDUCE_TG is the shared array size and therefore the largest block the host may launch
 // at these kernels. 64 rather than 128 is an occupancy choice: at 64 the G2 array is

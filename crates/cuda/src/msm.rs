@@ -117,6 +117,9 @@ const REDUCE_TG: u32 = 64;
 /// Shared array size of the prefix-sum kernel. Same contract as [`REDUCE_TG`].
 const SCAN_TG: u32 = 256;
 
+/// Shared array size of the wide merge. Same contract as [`REDUCE_TG`].
+const MERGE_TG: u32 = 64;
+
 /// Entries one thread of the segmented accumulation owns.
 ///
 /// Accumulation costs `SLICE_LEN` mixed additions per thread and the merge costs
@@ -212,9 +215,14 @@ struct Geometry {
     slice_len: usize,
     slices: usize,
     dummy_rows: usize,
+    /// Entries at or above which a bucket merges in `msm_merge_wide_*` instead of
+    /// `msm_merge_*`, 0 when no bucket can; see [`merge_wide_min_for`].
+    merge_wide_min: usize,
 }
 
 impl Geometry {
+    /// [`Self::with_wide_span`] at the shipped threshold. Sizes are what `batch_words`
+    /// needs and the wide range changes none of them.
     fn new(
         n: usize,
         scalar_off: usize,
@@ -222,6 +230,26 @@ impl Geometry {
         c: u32,
         slice_len: usize,
         work: Work,
+    ) -> Result<Self, ProveError> {
+        Self::with_wide_span(
+            n,
+            scalar_off,
+            general,
+            c,
+            slice_len,
+            work,
+            MERGE_WIDE_MIN_SPAN,
+        )
+    }
+
+    fn with_wide_span(
+        n: usize,
+        scalar_off: usize,
+        general: usize,
+        c: u32,
+        slice_len: usize,
+        work: Work,
+        wide_span: usize,
     ) -> Result<Self, ProveError> {
         if !(2..=MAX_WINDOW).contains(&c) || slice_len == 0 || slice_len > u32::MAX as usize {
             return Err(bad("invalid MSM window or slice width"));
@@ -236,12 +264,14 @@ impl Geometry {
             return Err(bad("MSM general count exceeds scalar count"));
         }
         let cap = general.max(1);
+        let n_windows = RECODE_BITS.div_ceil(c as usize);
+        let n_buckets = 1usize << (c - 1);
         let g = Self {
             n,
             scalar_off,
             c,
-            n_windows: RECODE_BITS.div_ceil(c as usize),
-            n_buckets: 1usize << (c - 1),
+            n_windows,
+            n_buckets,
             cap,
             slice_len,
             slices: cap.div_ceil(slice_len),
@@ -250,6 +280,7 @@ impl Geometry {
             } else {
                 0
             },
+            merge_wide_min: merge_wide_min_for(general, slice_len, wide_span),
         };
         checked_words(g.rows(), G2_WORDS)?;
         checked_words(
@@ -619,14 +650,79 @@ pub(crate) fn resident_scratch(
     Ok(envelope)
 }
 
+/// Slices a bucket's run has to span, by its own count, for its merge to move to
+/// `msm_merge_wide_*`, one block per bucket instead of one thread.
+///
+/// `msm_merge_*` walks a bucket's slice range serially, so a bucket whose run spans
+/// dozens of slices holds the whole merge launch open in a single lane while the rest of
+/// the machine waits. The Metal twin meets that only in its top window, at widths up to
+/// 15 bits, and points its wide kernel at a row range picked from the expected span;
+/// here [`window_size`] caps the width at 8, so at the larger domains every bucket of a
+/// uniformly filled window is that fat and the merge is the largest stage of the MSM.
+/// The wide kernel strides the range across [`MERGE_TG`] threads and folds a tree.
+///
+/// What is fat, MEASURED on a Tesla T4 (g4dn.xlarge). `variable_work_phase_timings`
+/// puts a fifth of its scalars at -1, which lands 52k of 2^18 entries in one bucket a
+/// window, a run of 820 slices; one thread a bucket read that merge at 23.2 ms in G1
+/// and 71.0 in G2, one block a bucket on every row 3.9 and 12.5. A uniformly filled row
+/// is not fat: at 2^18 it spans 32 slices, and whole proofs with every such row wide
+/// lost. Warm `snarkrs bench` against main, 2 rounds x 6, prove ms at a per-row span of
+/// 4 / 16 / 32 against base: sha256 (H at 2^16) 17.7 / 15.5 / 15.7 against 15.7,
+/// keccak256 (2^18) 52.2 / 52.3 / 51.3 against 50.3, rsa2048 (2^18) 62.5 / 63.5 / 62.6
+/// against 61.2, railgun-01x01 24.1 / 22.8 / 22.8 against 22.8, tornado 32.1 / 31.2 /
+/// 31.0 against 31.3, anon-aadhaar (2^21) 369.8 / 368.5 / 370.8 against 396.6. At 64 /
+/// 128 / 256: sha256 15.6 / 15.6 / 15.6, keccak256 48.6 / 49.6 / 49.8, rsa2048 59.3 /
+/// 60.9 / 60.7, railgun 22.7 / 22.8 / 22.6, tornado 31.1 / 31.1 / 30.9, anon-aadhaar
+/// 370.4 / 383.0 / 379.0 (round 1; round 2 within 0.5). 64 is the span no circuit
+/// reads slower at and the two 2^18 circuits and anon-aadhaar read faster at; what
+/// goes wide there is anon-aadhaar's H rows (16k entries) and the witness rows that a
+/// value shared by thousands of signals fills. The split is per row, by the row's own
+/// count in `counts`, which both kernels read: at or above `MERGE_WIDE_MIN_SPAN *
+/// slice_len` entries a row merges wide, below it narrow, so a plan mixing both kinds
+/// pays each kernel only for its own rows. A whole-plan range picked from the expected
+/// span, the twin's shape, lost 1.2 to 2 ms on every mid circuit at span 4 for the
+/// same reason. Override with `G16_CUDA_MSM_WIDE`; 0 disables the wide path.
+const MERGE_WIDE_MIN_SPAN: usize = 64;
+
+/// Entries at or above which a bucket merges wide, or 0 when no bucket of the plan can
+/// reach that count, which is when the host skips the wide launch altogether.
+fn merge_wide_min_for(general: usize, slice_len: usize, wide_span: usize) -> usize {
+    let min = wide_span.saturating_mul(slice_len);
+    if wide_span > 0 && general >= min {
+        min
+    } else {
+        0
+    }
+}
+
+/// The launch shapes a [`CudaMsm`] plans with, read once from the environment and
+/// overridable per object so a test can hold two in one process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Shapes {
+    /// [`merge_wide_min_for`]'s span; 0 disables the wide merge.
+    wide_span: usize,
+}
+
+impl Shapes {
+    /// `G16_CUDA_MSM_WIDE`, falling back to [`MERGE_WIDE_MIN_SPAN`].
+    fn from_env() -> Self {
+        Self {
+            wide_span: std::env::var("G16_CUDA_MSM_WIDE")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(MERGE_WIDE_MIN_SPAN),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Device-side structs
 // ---------------------------------------------------------------------------
 
-/// Mirrors `struct MsmParams` in `kernels/msm.cu`: eleven `u32`, 44 bytes, no padding on
+/// Mirrors `struct MsmParams` in `kernels/msm.cu`: twelve `u32`, 48 bytes, no padding on
 /// either side.
 ///
-/// Passed **by value**. The driver copies these 44 bytes into the kernel's parameter space
+/// Passed **by value**. The driver copies these 48 bytes into the kernel's parameter space
 /// verbatim, so the Rust layout has to match byte for byte; a field inserted on one side
 /// only is read as some other field's value, not as a type error.
 #[repr(C)]
@@ -643,11 +739,12 @@ struct MsmParams {
     slice_len: u32,
     slices: u32,
     dummy_rows: u32,
+    merge_wide_min: u32,
 }
 
 // SAFETY: `DeviceRepr` marks a type that may be handed to a kernel as a by-value argument.
-// `MsmParams` is `repr(C)`, is eleven `u32` with no padding and no invalid bit patterns, and
-// its size is asserted below to be the 44 bytes the kernel's parameter slot expects.
+// `MsmParams` is `repr(C)`, is twelve `u32` with no padding and no invalid bit patterns, and
+// its size is asserted below to be the 48 bytes the kernel's parameter slot expects.
 unsafe impl DeviceRepr for MsmParams {}
 
 /// Mirrors `struct MsmEntry` in `kernels/msm.cu`, which is MSL's `uint2` in the twin. The
@@ -682,7 +779,7 @@ pub struct PackedXyzzG2 {
 }
 
 const _: () = {
-    assert!(core::mem::size_of::<MsmParams>() == 44);
+    assert!(core::mem::size_of::<MsmParams>() == 48);
     assert!(core::mem::size_of::<FoldParams>() == 16);
     assert!(core::mem::size_of::<MsmEntry>() == 8);
     assert!(core::mem::size_of::<PackedXyzzG1>() == 128);
@@ -1083,6 +1180,8 @@ struct Kernels {
     segmented_g2: Kernel,
     merge_g1: Kernel,
     merge_g2: Kernel,
+    merge_wide_g1: Kernel,
+    merge_wide_g2: Kernel,
     reduce_g1: Kernel,
     reduce_g2: Kernel,
     ones_g1: Kernel,
@@ -1137,6 +1236,8 @@ pub struct CudaMsm {
     work: Work,
     /// A forced window width, see [`Self::with_window`]. `None` leaves it to [`window_size`].
     window: Option<u32>,
+    /// The launch shapes every plan of this object takes; see [`Shapes`].
+    shapes: Shapes,
     ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
     /// Kept alive explicitly. `CudaFunction` holds an `Arc<CudaModule>` internally, so this
@@ -1249,6 +1350,14 @@ impl CudaMsm {
         self
     }
 
+    /// Move every bucket's merge to `msm_merge_wide_*` once an ordinary bucket's expected
+    /// slice span reaches `span`: the per-object form of `G16_CUDA_MSM_WIDE`, for the same
+    /// reason as [`Self::with_window`]. 0 keeps every row on `msm_merge_*`.
+    pub fn with_merge_wide_span(mut self, span: usize) -> Self {
+        self.shapes.wide_span = span;
+        self
+    }
+
     /// Compiles `kernels::unit_msm()` and uploads all five repacked base vectors.
     pub fn new(cuda: &Cuda, pk: &ProvingKey) -> Result<Self, ProveError> {
         Self::without_key(cuda)?.with_key(pk)
@@ -1307,6 +1416,8 @@ impl CudaMsm {
             segmented_g2: Kernel::load(&module, "msm_segmented_g2")?,
             merge_g1: Kernel::load(&module, "msm_merge_g1")?,
             merge_g2: Kernel::load(&module, "msm_merge_g2")?,
+            merge_wide_g1: Kernel::load(&module, "msm_merge_wide_g1")?,
+            merge_wide_g2: Kernel::load(&module, "msm_merge_wide_g2")?,
             reduce_g1: Kernel::load(&module, "msm_reduce_g1")?,
             reduce_g2: Kernel::load(&module, "msm_reduce_g2")?,
             ones_g1: Kernel::load(&module, "msm_ones_g1")?,
@@ -1332,6 +1443,7 @@ impl CudaMsm {
             activity: TestActivity::default(),
             work: Work::Variable,
             window: None,
+            shapes: Shapes::from_env(),
             a: upload_g1(&stream, &[])?,
             b_g2: upload_g2(&stream, &[])?,
             b_g1: upload_g1(&stream, &[])?,
@@ -2326,6 +2438,29 @@ impl CudaMsm {
         // the spill slots of the slices its own run overlaps, which are inside the
         // `2 * n_windows * slices` allocated.
         unsafe { lb.launch(cfg) }.map_err(|e| drv("launch msm_merge", e))?;
+        if p.merge_wide_min == 0 {
+            return Ok(());
+        }
+        // One block per row, at most `MERGE_TG` threads, the kernel's shared array.
+        // Independent of the launch above: a row's count sends it to exactly one of the
+        // two kernels, so they touch disjoint rows of every array they share.
+        let wide = match job {
+            Job::G1(_) => &self.k.merge_wide_g1,
+            Job::G2(_) => &self.k.merge_wide_g2,
+        };
+        let cfg = wide.cfg_blocks(p.n_windows * p.n_buckets, MERGE_TG);
+        let mut lb = self.stream.launch_builder(&wide.f);
+        lb.arg(&out.buckets)
+            .arg(&out.spill_pts)
+            .arg(&out.spill_rows)
+            .arg(&p.counts)
+            .arg(&p.cursor)
+            .arg(params);
+        // SAFETY: six parameters in order; the grid is exactly `n_windows * n_buckets`
+        // blocks, so `blockIdx.x` names a real row, `merge_wide_min` is nonzero so an
+        // empty row leaves before touching anything, and every slot a thread reads is
+        // inside the slice range of its row's run.
+        unsafe { lb.launch(cfg) }.map_err(|e| drv("launch msm_merge_wide", e))?;
         Ok(())
     }
 
@@ -2415,13 +2550,14 @@ impl<'a> Plan<'a> {
         } else {
             scalars.general_in(&(scalar_off..scalar_off + n))
         };
-        Geometry::new(
+        Geometry::with_wide_span(
             n,
             scalar_off,
             general,
             pick_window(msm.window, general),
             slice_len(),
             msm.work,
+            msm.shapes.wide_span,
         )
     }
 
@@ -2443,7 +2579,10 @@ impl<'a> Plan<'a> {
             scalars: scalars.buf,
         })
     }
+}
 
+impl Geometry {
+    /// The kernel's view of this geometry; `base_off` and `ones_groups` are the job's.
     fn params(&self) -> MsmParams {
         MsmParams {
             n: self.n as u32,
@@ -2457,6 +2596,7 @@ impl<'a> Plan<'a> {
             slice_len: self.slice_len as u32,
             slices: self.slices as u32,
             dummy_rows: self.dummy_rows as u32,
+            merge_wide_min: self.merge_wide_min as u32,
         }
     }
 }
@@ -2895,8 +3035,9 @@ mod tests {
     #[test]
     fn parameter_abi_and_constant_routing_match_the_host() {
         use core::mem::{offset_of, size_of};
-        assert_eq!(size_of::<MsmParams>(), 44);
+        assert_eq!(size_of::<MsmParams>(), 48);
         assert_eq!(offset_of!(MsmParams, dummy_rows), 40);
+        assert_eq!(offset_of!(MsmParams, merge_wide_min), 44);
         assert_eq!(size_of::<FoldParams>(), 16);
         assert_eq!(offset_of!(FoldParams, last), 12);
         let src = kernels::MSM_CU;
@@ -2925,10 +3066,11 @@ mod tests {
                 "ones_groups",
                 "slice_len",
                 "slices",
-                "dummy_rows"
+                "dummy_rows",
+                "merge_wide_min"
             ]
         );
-        assert!(src.contains("static_assert(sizeof(MsmParams) == 44"));
+        assert!(src.contains("static_assert(sizeof(MsmParams) == 48"));
         assert!(src.contains("static_assert(sizeof(FoldParams) == 16"));
         let fold_fields = src
             .split("struct FoldParams {")
@@ -3257,7 +3399,11 @@ mod tests {
     /// MSM outputs wrong, so the proof stops verifying with nothing to point at.
     #[test]
     fn the_kernel_declares_the_same_block_sizes() {
-        for (name, want) in [("REDUCE_TG", REDUCE_TG), ("SCAN_TG", SCAN_TG)] {
+        for (name, want) in [
+            ("REDUCE_TG", REDUCE_TG),
+            ("SCAN_TG", SCAN_TG),
+            ("MERGE_TG", MERGE_TG),
+        ] {
             let line = format!("#define {name} {want}");
             assert!(
                 kernels::MSM_CU.contains(&line),
@@ -3314,6 +3460,8 @@ mod tests {
             "msm_segmented_constant_g2",
             "msm_merge_g1",
             "msm_merge_g2",
+            "msm_merge_wide_g1",
+            "msm_merge_wide_g2",
             "msm_fold_g1",
             "msm_fold_g2",
             "msm_reduce_g1",
@@ -3417,6 +3565,35 @@ mod tests {
             let g = ones_groups_for(n);
             assert!((1..=256).contains(&g), "n = {n} gave {g} groups");
         }
+    }
+
+    /// The wide count is `span * slice_len` whenever some bucket of the plan can hold
+    /// that many entries, and 0 (no wide launch) below that or with the path disabled;
+    /// the geometry carries it to the kernel.
+    #[test]
+    fn merge_wide_min_follows_the_span_and_the_general_count() {
+        assert_eq!(merge_wide_min_for(1 << 18, 64, 4), 256);
+        assert_eq!(merge_wide_min_for(256, 64, 4), 256);
+        assert_eq!(merge_wide_min_for(255, 64, 4), 0);
+        assert_eq!(merge_wide_min_for(1 << 18, 64, 0), 0);
+        assert_eq!(merge_wide_min_for(1 << 18, 64, 32), 2048);
+        assert_eq!(merge_wide_min_for(1 << 18, 64, 1 << 13), 0);
+        assert_eq!(merge_wide_min_for(1 << 18, 64, usize::MAX), 0);
+        assert_eq!(merge_wide_min_for(6007, 64, 4), 256);
+        for (general, want) in [(1 << 18, 256), (1000, 256), (100, 0)] {
+            let g =
+                Geometry::with_wide_span(general, 0, general, 8, 64, Work::Variable, 4).unwrap();
+            assert_eq!(g.merge_wide_min, want);
+            assert_eq!(g.params().merge_wide_min, want as u32);
+        }
+        let g = Geometry::with_wide_span(1 << 18, 0, 1 << 18, 8, 64, Work::Variable, 0).unwrap();
+        assert_eq!(g.params().merge_wide_min, 0);
+        assert_eq!(
+            Geometry::new(1 << 18, 0, 1 << 18, 8, 64, Work::Variable)
+                .unwrap()
+                .merge_wide_min,
+            MERGE_WIDE_MIN_SPAN * 64
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -4177,6 +4354,240 @@ mod tests {
                     s.sort_by(f64::total_cmp);
                     line += &format!(
                         "  {name} {:.2} ({:.2}-{:.2})",
+                        median(v.clone()),
+                        s[0],
+                        s[s.len() - 1]
+                    );
+                }
+                println!("{line}");
+            }
+        }
+    }
+
+    /// The wide merge off and on every row, forced per object, against a naive sum in
+    /// both groups, at a width where buckets are fat (c = 3) and at the shipped cap
+    /// (c = 8), on lengths that leave a window's last slice partial. Scalars are dense in
+    /// 0 and 1, as a witness is. The window-width sweep in adversarial_gpu.rs covers the
+    /// chooser's own picks; this pins both shapes at every width here.
+    #[test]
+    #[ignore = "needs an NVIDIA device"]
+    fn the_wide_merge_agrees_with_the_narrow_one_and_a_naive_sum() {
+        use snarkrs_field::{CurveGroup, PrimeField, PrimeGroup};
+        let Some(cuda) = device() else { return };
+        let module = CudaMsm::compile(&cuda).expect("compile MSM unit");
+        let mut seed = 0x5ca1_ab1e_0000_0042u64;
+        for n in [1000usize, 6007, 20_000] {
+            let mut b1 = Vec::with_capacity(n);
+            let mut b2 = Vec::with_capacity(n);
+            let mut scalars = Vec::with_capacity(n);
+            let mut cur1 = G1Projective::generator();
+            let mut cur2 = G2Projective::generator();
+            for i in 0..n {
+                cur1 += G1Projective::generator();
+                cur2 += G2Projective::generator();
+                b1.push(cur1);
+                b2.push(cur2);
+                scalars.push(match i % 5 {
+                    0 => Fr::zero(),
+                    1 => Fr::one(),
+                    2 => -Fr::one(),
+                    _ => {
+                        let mut b = [0u8; 32];
+                        for c in b.chunks_mut(8) {
+                            c.copy_from_slice(&splitmix(&mut seed).to_le_bytes());
+                        }
+                        Fr::from_le_bytes_mod_order(&b)
+                    }
+                });
+            }
+            let b1 = G1Projective::normalize_batch(&b1);
+            let b2 = G2Projective::normalize_batch(&b2);
+            let want1 = b1
+                .iter()
+                .zip(&scalars)
+                .fold(G1Projective::zero(), |a, (b, s)| a + *b * s)
+                .into_affine();
+            let want2 = b2
+                .iter()
+                .zip(&scalars)
+                .fold(G2Projective::zero(), |a, (b, s)| a + *b * s)
+                .into_affine();
+            for c in [3u32, 8] {
+                for wide in [0usize, 1] {
+                    let m = CudaMsm::from_module(&cuda, module.clone())
+                        .expect("bind the MSM kernels")
+                        .with_window(c)
+                        .with_merge_wide_span(wide);
+                    let label = format!("n = {n}, c = {c}, wide {wide}");
+                    let db1 = m.upload_g1_bases(&b1).expect("upload bases");
+                    let db2 = m.upload_g2_bases(&b2).expect("upload bases");
+                    let ds = m.upload_scalars(&scalars).expect("upload scalars");
+                    let got = m
+                        .msm_batch(&[
+                            Job::G1(JobG1 {
+                                bases: &db1,
+                                base_off: 0,
+                                scalars: ds.as_scalars(),
+                                scalar_off: 0,
+                                n,
+                            }),
+                            Job::G2(JobG2 {
+                                bases: &db2,
+                                base_off: 0,
+                                scalars: ds.as_scalars(),
+                                scalar_off: 0,
+                                n,
+                            }),
+                        ])
+                        .expect("msm batch");
+                    assert_eq!(got[0].g1().unwrap().into_affine(), want1, "G1 {label}");
+                    assert_eq!(got[1].g2().unwrap().into_affine(), want2, "G2 {label}");
+                }
+            }
+            eprintln!("  n = {n}: both merges agree in both groups");
+        }
+    }
+
+    /// The variable-work MSM's phases at a few lengths, for a launch-shape A/B: every rep
+    /// times each job's digit pipeline, clear, accumulation, merge, reduce and ones scan
+    /// between an event pair on the stream, then the host combine on the wall clock;
+    /// medians and ranges over the reps after the warm-up. `G16_REVIEW_N` is a
+    /// comma-separated list of lengths (2^14, 2^16 and 2^18 by default), `G16_REVIEW_REPS`
+    /// the reps (10). The shapes come from the environment, as in a proof, and are
+    /// printed. Dense random scalars with a fifth each of 0, 1 and -1, so the ones scan
+    /// and the recoding's sign both do work; the -1 fifth also lands a fifth of every
+    /// window's entries in one bucket, so the merge phase here is that one fat row's,
+    /// not a uniform one's (see [`MERGE_WIDE_MIN_SPAN`]). The constant-work twin is
+    /// `constant_work_phase_flatness` above.
+    #[test]
+    #[ignore = "GPU measurement; run explicitly on the measurement machine"]
+    fn variable_work_phase_timings() {
+        use snarkrs_field::{CurveGroup, PrimeField, PrimeGroup};
+        let lengths: Vec<usize> = std::env::var("G16_REVIEW_N")
+            .ok()
+            .map(|v| v.split(',').filter_map(|s| s.trim().parse().ok()).collect())
+            .filter(|v: &Vec<usize>| !v.is_empty())
+            .unwrap_or_else(|| vec![1 << 14, 1 << 16, 1 << 18]);
+        let reps: usize = std::env::var("G16_REVIEW_REPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+        let warm = 2;
+        let cuda = Cuda::new(0).expect("GPU measurement requires CUDA");
+        let m = CudaMsm::without_key(&cuda).expect("compile MSM unit");
+        println!("shapes {:?}", m.shapes);
+        let n_max = *lengths.iter().max().unwrap();
+        let mut p1 = G1Projective::generator();
+        let mut p2 = G2Projective::generator();
+        let (mut g1, mut g2) = (Vec::with_capacity(n_max), Vec::with_capacity(n_max));
+        for _ in 0..n_max {
+            p1 += G1Projective::generator();
+            p2 += G2Projective::generator();
+            g1.push(p1);
+            g2.push(p2);
+        }
+        let g1 = G1Projective::normalize_batch(&g1);
+        let g2 = G2Projective::normalize_batch(&g2);
+        let b1 = m.upload_g1_bases(&g1).unwrap();
+        let b2 = m.upload_g2_bases(&g2).unwrap();
+        let mut seed = 0x7e57_0000_0000_0001u64;
+        let scalars: Vec<Fr> = (0..n_max)
+            .map(|i| match i % 5 {
+                0 => Fr::zero(),
+                1 => Fr::one(),
+                2 => -Fr::one(),
+                _ => {
+                    let mut b = [0u8; 32];
+                    for c in b.chunks_mut(8) {
+                        c.copy_from_slice(&splitmix(&mut seed).to_le_bytes());
+                    }
+                    Fr::from_le_bytes_mod_order(&b)
+                }
+            })
+            .collect();
+        let ds = m.upload_scalars(&scalars).unwrap();
+        let time = |f: &dyn Fn() -> Result<(), ProveError>| -> f64 {
+            let ev = || {
+                m.ctx
+                    .new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+                    .unwrap()
+            };
+            let (start, end) = (ev(), ev());
+            start.record(&m.stream).unwrap();
+            f().unwrap();
+            end.record(&m.stream).unwrap();
+            m.stream.synchronize().unwrap();
+            elapsed_us(&start, &end).unwrap() as f64 / 1e3
+        };
+        let phases = [
+            "digits", "clear", "accum", "merge", "reduce", "ones", "combine",
+        ];
+        for &n in &lengths {
+            for group in ["g1", "g2"] {
+                let job = if group == "g1" {
+                    Job::G1(JobG1 {
+                        bases: &b1,
+                        base_off: 0,
+                        scalars: ds.as_scalars(),
+                        scalar_off: 0,
+                        n,
+                    })
+                } else {
+                    Job::G2(JobG2 {
+                        bases: &b2,
+                        base_off: 0,
+                        scalars: ds.as_scalars(),
+                        scalar_off: 0,
+                        n,
+                    })
+                };
+                let plan = Plan::new(&m, ds.as_scalars(), 0, n).unwrap();
+                let out = Outputs::new(&m, &job, &plan).unwrap();
+                let params = m.point_params(&out, &plan);
+                let mut t: [Vec<f64>; 7] = Default::default();
+                let mut result = None;
+                for rep in 0..warm + reps {
+                    let d = time(&|| m.launch_digits(&plan));
+                    let c = time(&|| m.launch_clear(&job, &out, &plan, &params));
+                    let a = time(&|| m.launch_accumulate(&job, &out, &plan, &params));
+                    let g = time(&|| m.launch_merge(&job, &out, &plan, &params));
+                    let r = time(&|| m.launch_reduce(&job, &out, &plan, &params));
+                    let o = time(&|| m.launch_ones(&job, &out, &plan, &params));
+                    let t0 = Instant::now();
+                    let got = out.combine(&m, &plan).unwrap();
+                    let h = t0.elapsed().as_secs_f64() * 1e3;
+                    result = Some(got);
+                    if rep >= warm {
+                        for (v, x) in t.iter_mut().zip([d, c, a, g, r, o, h]) {
+                            v.push(x);
+                        }
+                    }
+                }
+                // The timed launches are the real ones, so the answer is checked too.
+                let got = result.unwrap();
+                let s = &scalars[..n];
+                if group == "g1" {
+                    let want = g1[..n]
+                        .iter()
+                        .zip(s)
+                        .fold(G1Projective::zero(), |a, (b, s)| a + *b * s);
+                    assert_eq!(got.g1().unwrap().into_affine(), want.into_affine());
+                } else {
+                    let want = g2[..n]
+                        .iter()
+                        .zip(s)
+                        .fold(G2Projective::zero(), |a, (b, s)| a + *b * s);
+                    assert_eq!(got.g2().unwrap().into_affine(), want.into_affine());
+                }
+                let mut line = format!(
+                    "phases {group} n={n} c={} w={} wide={} reps={reps} (ms)",
+                    plan.c, plan.n_windows, plan.merge_wide_min
+                );
+                for (name, v) in phases.iter().zip(&t) {
+                    let mut s = v.clone();
+                    s.sort_by(f64::total_cmp);
+                    line += &format!(
+                        "  {name} {:.3} ({:.3}-{:.3})",
                         median(v.clone()),
                         s[0],
                         s[s.len() - 1]
