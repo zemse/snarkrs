@@ -2,8 +2,10 @@
 # Runs ON the GPU box, from the directory cuda-gate.sh shipped: the CUDA device gate.
 #
 # Every test binary and the CLI were cross-built on the Mac, so nothing here compiles Rust.
-# The first run on a fresh box still pays NVRTC and the driver JIT for each kernel unit
-# (about five minutes for the MSM unit), inside the first step that loads it.
+# The first run on a fresh box, or after a .cu/.cuh edit, still pays NVRTC and the driver
+# JIT for each kernel unit (six to eleven minutes each for the MSM, constant-work MSM and
+# FFT units on a T4). The warm step pays it, every unit at once, so the capped steps after
+# it always load warm.
 #
 # usage: cuda-gate-guest.sh [--every-variant]
 set -uo pipefail
@@ -35,13 +37,21 @@ step() {
 log "device"
 nvidia-smi --query-gpu=name,driver_version,memory.total,memory.used --format=csv,noheader
 
+# Every kernel unit compiled into the PTX and driver caches, outside the steps below. Cold
+# on a g4dn.xlarge this is 21 minutes, the five units at once (26.5 one after another);
+# warm, a few seconds.
+step warm 30 env G16_CUDA_TIME=1 "$BIN/lib" --ignored --exact --test-threads=1 --nocapture \
+  kernels::tests::every_unit_compiles_on_the_device
+grep -E "^unit |^every unit" "$OUT/warm.txt" | sed 's/^/  /'
+
 # The lib's device tests, without the two that need their own process or an hour: the
 # legacy accumulator gate reads G16_CUDA_MSM_LEGACY_ACC once per process, and the FFT
 # variant sweep is about 60 minutes cold.
 step lib 10 env G16_REQUIRE_TESTS=1 "$BIN/lib" --test-threads=1
 step lib-ignored 20 env G16_REQUIRE_TESTS=1 G16_CUDA_MSM_LEGACY_ACC=0 "$BIN/lib" --ignored \
   --test-threads=1 --nocapture \
-  --skip constant_work_legacy_override_gate --skip every_variant_gives_the_same_points
+  --skip constant_work_legacy_override_gate --skip every_variant_gives_the_same_points \
+  --skip every_unit_compiles_on_the_device
 step lib-legacy 5 env G16_CUDA_MSM_LEGACY_ACC=1 "$BIN/lib" --ignored --exact \
   --test-threads=1 --nocapture msm::tests::constant_work_legacy_override_gate
 if (( EVERY_VARIANT )); then

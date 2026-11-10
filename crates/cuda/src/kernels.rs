@@ -165,4 +165,44 @@ mod tests {
         assert!(fq < probe);
         assert!(!FIELD_PROBE_CU.contains("struct Fq"));
     }
+
+    /// Every unit the device gate loads, compiled at once on a thread each, which is the
+    /// gate's warm-up step: on a fresh box or after a `.cu` edit the first compile is
+    /// minutes a unit (NVRTC, then the driver JIT), and paid here it falls outside the
+    /// timed steps. Warm, each is a cache hit and a module load. The FFT experiment set is
+    /// left out; `fft::tests::every_variant_gives_the_same_points` compiles it.
+    #[test]
+    #[ignore = "needs an NVIDIA device; minutes a unit cold"]
+    fn every_unit_compiles_on_the_device() {
+        let cuda = crate::Cuda::new(0).expect("a usable CUDA device");
+        let units: [(&'static str, String); 5] = [
+            ("msm", unit_msm_with(false)),
+            ("msm-constant", unit_msm_with(true)),
+            ("stages", unit_stages()),
+            ("fft", unit_fft_with(false)),
+            ("field_probe", unit_field_probe()),
+        ];
+        let t_all = std::time::Instant::now();
+        std::thread::scope(|s| {
+            let cuda = &cuda;
+            let threads: Vec<_> = units
+                .iter()
+                .map(|(unit, src)| {
+                    s.spawn(move || {
+                        let t = std::time::Instant::now();
+                        let got = cuda.compile(unit, src).map(|_| ());
+                        eprintln!("unit {unit}: {:.1} s", t.elapsed().as_secs_f64());
+                        (*unit, got)
+                    })
+                })
+                .collect();
+            for t in threads {
+                let (unit, got) = t.join().expect("compile thread panicked");
+                if let Err(e) = got {
+                    panic!("unit {unit}: {e}");
+                }
+            }
+        });
+        eprintln!("every unit: {:.1} s", t_all.elapsed().as_secs_f64());
+    }
 }
