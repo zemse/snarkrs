@@ -670,8 +670,8 @@ impl WgpuHandle {
     /// Copies `H` down to the host in Montgomery form.
     ///
     /// **Tests and cross-checks only.** Forcing this copy is exactly the round trip
-    /// [`snarkrs_groth16::HPoly`] exists to avoid, and at 2^18 it moves 8 MB where design §3 caps
-    /// the whole per-proof readback at 64 KiB. On wasm `get_mapped_range` copies the entire
+    /// [`snarkrs_groth16::HPoly`] exists to avoid, and at 2^18 it moves 8 MB where a whole
+    /// proof's MSM readback is at most 144 KiB. On wasm `get_mapped_range` copies the entire
     /// mapped `ArrayBuffer` into linear memory, measured at 33.8 ms for 64 MiB, so this is
     /// also the wrong tool there.
     pub async fn to_host(&self, backend: &WgpuBackend) -> Result<Vec<Fr>, ProveError> {

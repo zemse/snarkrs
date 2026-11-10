@@ -63,10 +63,11 @@
 //! submission: +3 to 5% of MSM time at 300 ms on `js_16x16_d32` and none on `anon-aadhaar`,
 //! +12 to 17% at 100 ms on both.
 //!
-//! The readback is still one staging buffer, one window of it per sub-MSM, and design §3's
-//! 64 KiB cap on it still applies: [`MsmBatch::last_readback_bytes`] reports what a given
-//! proof actually asked for and [`MsmBatch::last_submits`] how many submissions it took, so
-//! both claims are checkable rather than asserted.
+//! The readback is still one staging buffer, one window of it per sub-MSM, each at most
+//! [`crate::points::SUB_MSM_READBACK_G1`] or [`crate::points::SUB_MSM_READBACK_G2`]:
+//! [`MsmBatch::last_readback_bytes`] reports what a given proof actually asked for and
+//! [`MsmBatch::last_submits`] how many submissions it took, so both claims are checkable
+//! rather than asserted.
 //!
 //! # Why the caller groups the jobs instead of this file deducing the grouping
 //!
@@ -679,9 +680,9 @@ impl MsmBatch {
 
     /// Bytes the most recent [`Self::run`] copied from the device.
     ///
-    /// Design §3 caps the whole per-proof readback at 64 KiB, and that is a claim about this
-    /// code rather than about the design, so it is reported and checked rather than asserted
-    /// in a comment. It is what actually happened and not a prediction, which is the useful
+    /// Each sub-MSM reads back at most [`crate::points::SUB_MSM_READBACK_G1`] or
+    /// [`crate::points::SUB_MSM_READBACK_G2`], and that is a claim about this code, so it is
+    /// reported and checked rather than asserted in a comment. It is what actually happened and not a prediction, which is the useful
     /// direction: a plan that got `ones_groups` wrong would show up here.
     ///
     /// One number for the whole batch, so it is only attributable while one proof at a time

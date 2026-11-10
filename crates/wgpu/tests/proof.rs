@@ -858,7 +858,8 @@ fn an_empty_group_dispatches_nothing_and_keeps_its_result_slots() {
 /// one per sub-MSM window plus one, and one when the whole batch fits the budget, which the
 /// small artifacts do.
 ///
-/// Design §3 also caps the whole per-proof readback at 64 KiB, and that is wrong; see below.
+/// Design §3 also caps the whole per-proof readback at 64 KiB. That is wrong, see below;
+/// the bound held here is `SUB_MSM_READBACK_G1` and `_G2` per sub-MSM.
 ///
 /// # Why the submit count needs [`exclusive`] and not a second device
 ///
@@ -870,38 +871,48 @@ fn an_empty_group_dispatches_nothing_and_keeps_its_result_slots() {
 ///
 /// # Design §3's 64 KiB readback budget does not hold, and the reason is not a bug
 ///
-/// The readback is `n_windows` points per MSM plus up to `ones_groups` partials, and
-/// `n_windows` is `ceil(255 / c)`. Design §3 quotes "20 window sums plus up to 64
-/// `ones_groups` partials per MSM, four G1 and one G2", which is `c = 13`. But `c` is chosen
-/// from the count of scalars that are neither 0 nor 1, and a **small** circuit gets a
-/// **small** `c`: the bucket clear and reduction dominate its cost model, so
-/// `msm::window_size` picks 3 and the proof reads back 85 window sums per MSM instead of 20.
-/// Measured over the artifacts:
+/// The readback is `n_windows * reduce_groups` window partials per sub-MSM plus up to
+/// `ones_groups` partials, and `n_windows` is `ceil(255 / c)`. Design §3 quotes "20 window
+/// sums plus up to 64 `ones_groups` partials per MSM, four G1 and one G2", which is `c = 13`
+/// with one group. But `c` is chosen from the count of scalars that are neither 0 nor 1, and a
+/// circuit whose witness is mostly bits gets a **small** `c` however many constraints it has:
+/// the bucket clear and reduction dominate its cost model, so `msm::window_size` picks 3 and
+/// each of A, B and L reads back 85 window sums. The reduce also splits a wide window into up
+/// to 8 groups (`reduce_groups_for`), and `ones_groups` grows with `n` to 64. Measured over
+/// the artifacts on an M2 Max, 2026-11-10:
 ///
 /// ```text
-/// artifact       constraints   readback B
-/// tiny_mul                 8        67072   <- over 65536
-/// js_1x1_d8             3359        25856
-/// js_2x2_d16           10153        26368
-/// js_2x2_d32           17929        27136
-/// js_8x8_d32           70357        25856
-/// js_16x16_d32        140261        35328
+/// artifact       constraints  sub-MSMs   readback B
+/// tiny_mul                 2       4+1        67072   <- over 65536
+/// js_1x1_d8             3359       4+1        25856
+/// js_2x2_d16           10153       4+1        27392
+/// js_2x2_d32           17929       4+1        29184
+/// railgun-01x01        20135       4+1        29184
+/// tornado              28275       4+1        30464
+/// sha256               59281       4+1        70912   <- over
+/// js_8x8_d32           70357       4+1        40192
+/// js_16x16_d32        140261       4+1        61696
+/// railgun-13x01       141276       4+1        61696
+/// rsa2048             190945       4+1        69376   <- over
+/// keccak256           239176       4+1       111360   <- over, c = 3 on A, B, L
+/// anon-aadhaar       1115080      10+2       164352   <- cut, so more sub-MSMs
 /// ```
 ///
-/// So the budget holds on every real circuit and is exceeded by 2% on an 8-constraint one,
-/// which is the shape nobody will ever prove in a browser and which reads back more bytes
-/// than its witness contains. It costs nothing measurable either way, because the cost of a
-/// readback is one `mapAsync` round trip at about 0.3 ms and not the byte count, and the
-/// wasm ceiling that number is really defending (`get_mapped_range` copies the whole mapped
-/// `ArrayBuffer` into linear memory, 33.8 ms for 64 MiB) is three orders of magnitude away.
+/// `keccak256` is 3 x 18,560 B for A, B-in-G1 and L (85 window sums and 59 ones partials at
+/// 128 B), 36,864 for B-in-G2 (the same at 256 B) and 18,432 for H (c = 13, 20 windows by 4
+/// groups and 64 ones partials): 41% of it is ones partials. Cutting it under 64 KiB would
+/// take a second reduction on the device for both the ones partials and the window sums, and
+/// it would buy nothing measurable. The cost of a readback is one `mapAsync` round trip at
+/// about 0.3 ms, not the byte count, and the wasm cost that is per byte (`get_mapped_range`
+/// copies the whole mapped `ArrayBuffer` into linear memory, 33.8 ms for 64 MiB, 0.5 ns a
+/// byte) is 56 us for `keccak256`'s 111,360 B against 33 us at 64 KiB.
 ///
-/// This asserts a bound that is a theorem about the code rather than the design's constant:
-/// `ceil(255/c_min)` windows plus `ones_groups` partials, per sub-MSM, with `c_min = 3`
-/// because `msm::window_size` searches `3..=16`. That is loose, because a `c` low enough to
-/// give 85 windows only happens for an `n` far too small to give 64 ones groups, and it is
-/// still the honest ceiling. A key that fits the binding limit is four G1 sub-MSMs and one
-/// G2; `anon-aadhaar` at the floor is cut into more (`snarkrs_wgpu::batch`), each with its own
-/// window sums, and the batch reports how many it ran.
+/// So the bound is the code's, per sub-MSM: the largest `windows * groups` over every `c`
+/// `msm::window_size` searches (16 windows by 8 groups at c = 16), aligned, plus 64 ones
+/// partials, which is `SUB_MSM_READBACK_G1` (24 KiB) and `SUB_MSM_READBACK_G2` (48 KiB), 144
+/// KiB for a key that fits the binding limit as four G1 sub-MSMs and one G2. This derives
+/// both from the planners and fails if either constant disagrees, then holds every artifact's
+/// readback to them over the sub-MSMs the batch reports it ran.
 #[test]
 fn a_whole_proof_submits_once_for_h_then_per_msm_slab_and_the_readback_is_bounded() {
     let _one_at_a_time = exclusive();
@@ -909,8 +920,6 @@ fn a_whole_proof_submits_once_for_h_then_per_msm_slab_and_the_readback_is_bounde
     const C_MIN: u32 = 3;
     /// `ones_groups_for` clamps to this.
     const MAX_ONES_GROUPS: u64 = 64;
-    /// Design §3's figure, printed against the measurement rather than asserted.
-    const DESIGN_BUDGET: u64 = 64 * 1024;
     /// The widest window `msm::window_size` will return, so the fewest windows a sub-MSM
     /// can have and the most submissions one can take: one per window and one more for a
     /// submission holding only the conversion.
@@ -943,6 +952,19 @@ fn a_whole_proof_submits_once_for_h_then_per_msm_slab_and_the_readback_is_bounde
             + u64::from(g2) * per_job(snarkrs_wgpu::gen::points::G2)
     };
 
+    assert_eq!(
+        (
+            per_job(snarkrs_wgpu::gen::points::G1),
+            per_job(snarkrs_wgpu::gen::points::G2)
+        ),
+        (
+            snarkrs_wgpu::points::SUB_MSM_READBACK_G1,
+            snarkrs_wgpu::points::SUB_MSM_READBACK_G2
+        ),
+        "the planners' per sub-MSM readback ceiling moved; update SUB_MSM_READBACK_G1 and _G2 \
+         and the docs that quote them"
+    );
+
     let found = artifacts();
     if found.is_empty() {
         resources::skip(
@@ -954,7 +976,7 @@ fn a_whole_proof_submits_once_for_h_then_per_msm_slab_and_the_readback_is_bounde
     let device = device();
     let prover = prover();
 
-    println!("artifact       constraints  submits  msm submits  sub-MSMs   readback B  over design 64 KiB");
+    println!("artifact       constraints  submits  msm submits  sub-MSMs   readback B   ceiling B");
     for a in &found {
         let circuit = prover.prepare(a.key()).expect("prepare");
         let witness = a.witness();
@@ -1013,7 +1035,7 @@ fn a_whole_proof_submits_once_for_h_then_per_msm_slab_and_the_readback_is_bounde
         );
         verify(&a.vkey(), &public_of(&witness, circuit.n_public()), &proof).expect("verify");
         println!(
-            "{:14} {:>11}  {:>7}  {:>11}  {:>5}+{:<3}  {:>10}  {}",
+            "{:14} {:>11}  {:>7}  {:>11}  {:>5}+{:<3}  {:>10}  {:>10}",
             a.name,
             a.constraints(),
             after - before,
@@ -1021,7 +1043,7 @@ fn a_whole_proof_submits_once_for_h_then_per_msm_slab_and_the_readback_is_bounde
             g1,
             g2,
             read,
-            if read > DESIGN_BUDGET { "yes" } else { "no" }
+            ceiling
         );
     }
     println!(

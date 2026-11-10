@@ -27,14 +27,13 @@
 //!
 //! `msm_reduce_*` writes `n_windows` points and `msm_ones_*` writes `ones_groups` points, and
 //! both go into **one** buffer, so the whole result of an MSM is one `copy_buffer_to_buffer`
-//! and one `mapAsync`. One MSM is therefore `n_windows + ones_groups` points: `n_windows` is
-//! `ceil(RECODE_BITS / c)` and so at most 85 at the narrowest `c`
-//! [`crate::msm::window_size`] searches, and `ones_groups_for` clamps at 64. Over four G1
-//! jobs and one G2 that is 112 KiB, against the 64 KiB per-proof ceiling design §3 puts on
-//! the readback. Measured, every artifact in the repo is well inside 64 KiB except
-//! `keccak256` at 86 KiB and `tiny_mul` at 65.5 KiB;
+//! and one `mapAsync`. One MSM is therefore `n_windows * reduce_groups + ones_groups` points,
+//! and at most [`SUB_MSM_READBACK_G1`] or [`SUB_MSM_READBACK_G2`] bytes: 144 KiB for a proof
+//! whose five MSMs are one sub-MSM each. Design §3's 64 KiB per-proof budget does not hold
+//! and is not the bound;
 //! `tests/proof.rs::a_whole_proof_submits_once_for_h_then_per_msm_slab_and_the_readback_is_bounded`
-//! prints the table and asserts the derived ceiling rather than the design's constant.
+//! derives the two constants from the planners and asserts every artifact's readback
+//! against them.
 //!
 //! The two bindings are windows into that one buffer at different offsets, and a storage
 //! binding offset must be a multiple of `minStorageBufferOffsetAlignment`, which is **256** in
@@ -152,6 +151,15 @@ const REDUCE_TARGET_GROUPS: u32 = 128;
 /// and both climb one halving later, where the `pt_mul_small` by the segment's start is
 /// most of what a thread does. Metal floors at 2.
 const REDUCE_MIN_SEGMENT: u32 = 8;
+
+/// Bytes one G1 sub-MSM reads back at most: the most window partials any `c` in
+/// [`crate::msm::window_size`]'s range gives (16 windows of 8 groups at c = 16), rounded up
+/// to the binding alignment, plus `ones_groups_for`'s clamp of 64 partials, at 128 bytes a
+/// point. A small key's c = 3 gives 85 partials and stays under it.
+pub const SUB_MSM_READBACK_G1: u64 = 24 * 1024;
+
+/// The G2 twin of [`SUB_MSM_READBACK_G1`], at 256 bytes a point.
+pub const SUB_MSM_READBACK_G2: u64 = 48 * 1024;
 
 /// Workgroups per window in `msm_reduce_*` for a plan of `n_windows` by `n_buckets` at
 /// `tg` threads a workgroup. Public so the readback ceiling in `tests/proof.rs` can be

@@ -208,7 +208,8 @@ impl WgpuProver {
 
     /// The shared MSM pipelines, for a report. `tests/proof.rs` reads
     /// [`MsmBatch::last_readback_bytes`] through it, which is the only way to hold this
-    /// backend to design §3's 64 KiB per-proof readback budget from outside.
+    /// backend's per-proof readback to [`crate::points::SUB_MSM_READBACK_G1`] and
+    /// [`crate::points::SUB_MSM_READBACK_G2`] from outside.
     pub fn msm(&self) -> &MsmBatch {
         &self.msm
     }

@@ -1500,10 +1500,10 @@ fn what_one_g1_msm_costs_against_the_cpu() {
             run.result, want,
             "n = {n}: the timed run disagreed with the CPU"
         );
-        // The readback is one copy of both outputs, and design §3 caps it at 64 KiB across
-        // all five MSMs of a proof.
+        // The readback is one copy of both outputs, at most `SUB_MSM_READBACK_G1` for one
+        // G1 MSM.
         assert!(
-            run.results_bytes < 65_536,
+            run.results_bytes as u64 <= snarkrs_wgpu::points::SUB_MSM_READBACK_G1,
             "one G1 MSM read back {} bytes: {} windows plus {} ones groups from {}",
             run.results_bytes,
             run.n_windows,
