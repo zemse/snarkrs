@@ -62,7 +62,7 @@ use snarkrs_formats::{Coefficients, HBasis, ProvingKey};
 use snarkrs_groth16::{Backend, HPoly, MsmOutputs, PreparedCircuit, ProveError, StageTimings};
 
 use crate::context::{bad, Cuda};
-use crate::msm::{CudaMsm, Work};
+use crate::msm::{device_budget, too_big, CudaMsm, Work};
 use crate::stages::{CudaStages, HHandle, TAG};
 
 /// Where the time in [`CudaBackend::prepare`] went, in microseconds.
@@ -111,11 +111,13 @@ impl CudaBackend {
         self
     }
 
-    /// Cap the device memory one MSM batch of a circuit prepared after this call may
-    /// allocate, below what the driver reports free; see [`CudaMsm::with_vram_limit`]. A
-    /// proof whose MSMs do not fit at once runs them in shorter runs, and one that cannot
-    /// fit at all is refused before anything is allocated. `G16_CUDA_VRAM_LIMIT` (bytes)
-    /// sets the same for a backend that is opened without this call.
+    /// Cap the device memory a circuit prepared after this call may plan against, below
+    /// what the driver reports free: its resident key and one proof's stage scratch at
+    /// prepare, a further proof's scratch, and each MSM batch (see
+    /// [`CudaMsm::with_vram_limit`]). A key over it is refused at prepare and a proof whose
+    /// MSMs do not fit at once runs them in shorter runs, each refusal a
+    /// [`ProveError::DeviceMemory`] before anything is allocated. `G16_CUDA_VRAM_LIMIT`
+    /// (bytes) sets the same for a backend that is opened without this call.
     pub fn with_vram_limit(mut self, bytes: u64) -> Self {
         self.vram_limit = Some(bytes);
         self
@@ -344,6 +346,25 @@ impl CudaCircuit {
             )));
         }
 
+        // Everything this key keeps on the device and one proof's stage scratch, refused
+        // before the first upload when it does not fit: a key too large for the card is
+        // then a `DeviceMemory` refusal in milliseconds, not the driver's out-of-memory
+        // after minutes of upload. The MSMs fit themselves to what is left, see
+        // `CudaMsm::msms`.
+        let need = resident_bytes(&pk);
+        let budget = device_budget(
+            backend.cuda.context(),
+            backend.cuda.stream(),
+            backend.vram_limit,
+        )?;
+        if need > budget {
+            return Err(too_big(
+                need,
+                budget,
+                "this key's resident data and one proof's stage scratch",
+            ));
+        }
+
         let t_all = Instant::now();
 
         // Stages 0 to 4. This also validates the key the way the CPU backend does (domain a
@@ -358,6 +379,10 @@ impl CudaCircuit {
             stages.constant_work()
         } else {
             stages
+        };
+        let stages = match backend.vram_limit {
+            Some(bytes) => stages.with_vram_limit(bytes),
+            None => stages,
         };
         release_coeffs(&mut pk);
         let stages_us = t0.elapsed().as_micros() as u64;
@@ -565,6 +590,19 @@ impl PreparedCircuit for CudaCircuit {
     }
 }
 
+/// Device bytes a zkey's [`CudaCircuit`] takes before its first MSM: what
+/// [`CudaStages::from_module`] and [`CudaMsm::with_key`] upload, and the scratch of one proof,
+/// each buffer rounded up to the 2 MiB pages the driver maps it in.
+fn resident_bytes(pk: &ProvingKey) -> u64 {
+    const PAGE: u64 = 2 << 20;
+    CudaStages::key_buffers(pk)
+        .into_iter()
+        .chain(CudaMsm::key_buffers(pk))
+        .chain(CudaStages::scratch_buffers(pk.domain_size, pk.n_vars))
+        .map(|b| b.div_ceil(PAGE) * PAGE)
+        .sum()
+}
+
 /// Empties `pk`'s coefficients, which [`CudaStages`] has made resident and nothing reads
 /// from the host again. Through [`snarkrs_groth16::malloc::release`], for the reason it
 /// gives.
@@ -616,17 +654,82 @@ mod tests {
     use super::*;
     use snarkrs_formats::Matrix;
 
-    #[test]
-    #[ignore = "requires a CUDA device and tiny_mul/circuit.zkey under G16_ARTIFACTS or bench/artifacts"]
-    fn key_retention_releases_only_cuda_bulk_storage() {
-        // `G16_ARTIFACTS` first: CARGO_MANIFEST_DIR is baked in at compile time and does not
-        // exist on the GPU box a cross-built test binary runs on.
-        let path = std::env::var_os("G16_ARTIFACTS")
+    /// `G16_ARTIFACTS` first: CARGO_MANIFEST_DIR is baked in at compile time and does not
+    /// exist on the GPU box a cross-built test binary runs on.
+    fn tiny_mul_zkey() -> std::path::PathBuf {
+        std::env::var_os("G16_ARTIFACTS")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| {
                 std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/artifacts")
             })
-            .join("tiny_mul/circuit.zkey");
+            .join("tiny_mul/circuit.zkey")
+    }
+
+    /// Free device memory once the stream has drained, which is when freed pages count.
+    fn free_now(cuda: &Cuda) -> usize {
+        cuda.stream().synchronize().unwrap();
+        cuda.context().mem_get_info().unwrap().0
+    }
+
+    /// A key over the budget is refused as `DeviceMemory` with nothing allocated, a key at
+    /// it prepares and proves, and a proof's first scratch over the stages' own budget is
+    /// refused the same way. The budget is `with_vram_limit`, so this stands in for a key
+    /// too large for the card (2^25 on a T4) at the cost of tiny_mul.
+    #[test]
+    #[ignore = "requires a CUDA device and tiny_mul/circuit.zkey under G16_ARTIFACTS or bench/artifacts"]
+    fn a_key_over_the_vram_budget_is_refused_before_anything_is_allocated() {
+        let path = tiny_mul_zkey();
+        let pk = ProvingKey::load(&path).expect("tiny_mul key");
+        let need = resident_bytes(&pk);
+        let backend = CudaBackend::new()
+            .expect("CUDA device")
+            .with_vram_limit(need - 1);
+        let before = free_now(backend.cuda());
+        match backend.prepare_circuit(pk) {
+            Err(ProveError::DeviceMemory { reason, .. }) => {
+                assert!(reason.contains(&need.to_string()), "{reason}")
+            }
+            Err(e) => panic!("refused as {e}, not DeviceMemory"),
+            Ok(_) => panic!(
+                "prepared a key of {need} bytes under a limit of {}",
+                need - 1
+            ),
+        }
+        assert_eq!(free_now(backend.cuda()), before, "the refusal allocated");
+
+        let backend = backend.with_vram_limit(need);
+        let pk = ProvingKey::load(&path).unwrap();
+        let witness: Vec<Fr> = (0..pk.n_vars as u64).map(Fr::from).collect();
+        let circuit = backend
+            .prepare_circuit(pk)
+            .expect("a key that fits its budget");
+        let mut t = StageTimings::default();
+        let h = circuit.compute_h(&witness, &mut t).unwrap();
+        circuit.msms(&witness, &h, &mut t).unwrap();
+        drop(h);
+
+        let pk = ProvingKey::load(&path).unwrap();
+        let scratch: u64 = CudaStages::scratch_buffers(pk.domain_size, pk.n_vars)
+            .iter()
+            .sum();
+        let stages = CudaStages::from_module(&backend.cuda, backend.stages_module.clone(), &pk)
+            .unwrap()
+            .with_vram_limit(scratch - 1);
+        let before = free_now(backend.cuda());
+        match stages.compute_h(&witness, &mut t) {
+            Err(ProveError::DeviceMemory { reason, .. }) => {
+                assert!(reason.contains("stage scratch"), "{reason}")
+            }
+            Err(e) => panic!("refused as {e}, not DeviceMemory"),
+            Ok(_) => panic!("allocated {scratch} bytes of scratch under a limit one less"),
+        }
+        assert_eq!(free_now(backend.cuda()), before, "the refusal allocated");
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA device and tiny_mul/circuit.zkey under G16_ARTIFACTS or bench/artifacts"]
+    fn key_retention_releases_only_cuda_bulk_storage() {
+        let path = tiny_mul_zkey();
         let expected = ProvingKey::load(&path).expect("tiny_mul key");
         assert!(!expected.a_query.is_empty());
         assert!(!expected.vk.ic.is_empty());

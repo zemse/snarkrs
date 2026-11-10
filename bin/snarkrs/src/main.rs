@@ -82,7 +82,7 @@ use snarkrs_formats::{wtns::Witness, ProvingKey, VerifyingKey};
 use snarkrs_groth16::{
     prove::{prove, prove_trace, prove_unchecked},
     verify::{verify, VerifyError},
-    StageTimings,
+    ProveError, StageTimings,
 };
 #[cfg(feature = "witness-wasm")]
 use snarkrs_witness::Input;
@@ -1431,7 +1431,22 @@ fn run_prove(
         "witness has {} entries, too short for {n_public} public signals",
         w.len()
     );
-    let circuit = prover.prepare(pk)?;
+    // A key the device has no room for is refused before anything is uploaded and would be
+    // refused again, so under --fallback it goes straight to the CPU, as a proof refused for
+    // memory does.
+    let circuit = match prover.prepare(pk) {
+        Err(e @ ProveError::DeviceMemory { .. }) if fallback => {
+            let cause = snarkrs_cli::fallback::Cause::DeviceMemory(e.to_string());
+            eprintln!(
+                "warning: the {} proof {cause}; proving on the cpu",
+                prover.name()
+            );
+            let pk =
+                ProvingKey::load(zkey).with_context(|| format!("loading {}", zkey.display()))?;
+            backend_of(BackendKind::Cpu)?.prepare(pk)?
+        }
+        prepared => prepared?,
+    };
 
     // Stage 10's blinders come from the OS CSPRNG. Nothing on this command offers a seed
     // override: a reused (r, s) across two proofs of different witnesses leaks the witness.

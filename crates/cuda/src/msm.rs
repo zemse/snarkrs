@@ -644,6 +644,25 @@ fn output_words(g: &Geometry, pw: usize) -> Result<Vec<usize>, ProveError> {
 /// on a T4 took at most 12.7 MiB past the plan at 2^16 to 2^22, cold or warm, in 32 MiB steps.
 const VRAM_HEADROOM: u64 = 64 << 20;
 
+/// Bytes an allocation may take now: the free device memory less [`VRAM_HEADROOM`], capped
+/// by `limit`. The MSM batches, a prepare's uploads and the stage scratch all ask here.
+pub(crate) fn device_budget(
+    ctx: &CudaContext,
+    stream: &CudaStream,
+    limit: Option<u64>,
+) -> Result<u64, ProveError> {
+    // A dropped buffer is a `cuMemFreeAsync`, and the pool gives its pages back only at
+    // a synchronize; without one the last batch's scratch still reads as in use.
+    stream
+        .synchronize()
+        .map_err(|e| drv("synchronize before the memory query", e))?;
+    let (free, _) = ctx
+        .mem_get_info()
+        .map_err(|e| drv("query device memory", e))?;
+    let budget = (free as u64).saturating_sub(VRAM_HEADROOM);
+    Ok(limit.map_or(budget, |l| l.min(budget)))
+}
+
 /// Shortest run [`CudaMsm::fit_runs`] cuts an MSM into before it refuses. A run of 2^10
 /// points needs a few megabytes of scratch, so a budget below it is a device with nothing
 /// free rather than a key too large.
@@ -657,7 +676,7 @@ fn vram_bytes(words: &[usize]) -> u64 {
 /// The refusal of a batch that does not fit, before anything is allocated. A
 /// [`ProveError::DeviceMemory`] rather than a fault: nothing ran, the same key may fit when
 /// another process lets go of the card, and the CPU proves it either way.
-fn too_big(need: u64, budget: u64, what: &str) -> ProveError {
+pub(crate) fn too_big(need: u64, budget: u64, what: &str) -> ProveError {
     ProveError::DeviceMemory {
         backend: crate::context::BACKEND,
         reason: format!(
@@ -1695,6 +1714,17 @@ impl CudaMsm {
         Ok(self)
     }
 
+    /// The device buffers [`Self::with_key`] allocates for `pk`, in bytes: the five base
+    /// vectors, each at least the one word an empty one takes.
+    pub(crate) fn key_buffers(pk: &ProvingKey) -> Vec<u64> {
+        let words = |w: usize| w.max(1) as u64 * 4;
+        let mut out: Vec<u64> = [&pk.a_query, &pk.b_g1_query, &pk.l_query, &pk.h_query]
+            .map(|q| words(q.len() * G1_BASE_WORDS))
+            .into();
+        out.push(words(pk.b_g2_query.len() * G2_BASE_WORDS));
+        out
+    }
+
     /// [`Self::with_key`] for bases already on the device, in stage order, so a caller that
     /// streamed them there never builds the host vectors. Each length is checked against
     /// the key's shape the way `CudaCircuit` checks a zkey's.
@@ -1787,24 +1817,13 @@ impl CudaMsm {
         self.last_runs.load(Ordering::Relaxed)
     }
 
-    /// Bytes a batch may allocate now: the free device memory less [`VRAM_HEADROOM`],
-    /// capped by [`Self::with_vram_limit`]. `None` with an arena, whose batches allocate
-    /// nothing.
+    /// Bytes a batch may allocate now, [`device_budget`] under [`Self::with_vram_limit`].
+    /// `None` with an arena, whose batches allocate nothing.
     fn vram_budget(&self) -> Result<Option<u64>, ProveError> {
         if self.arena.is_some() {
             return Ok(None);
         }
-        // A dropped buffer is a `cuMemFreeAsync`, and the pool gives its pages back only at
-        // a synchronize; without one the last batch's scratch still reads as in use.
-        self.stream
-            .synchronize()
-            .map_err(|e| drv("synchronize before the memory query", e))?;
-        let (free, _) = self
-            .ctx
-            .mem_get_info()
-            .map_err(|e| drv("query device memory", e))?;
-        let budget = (free as u64).saturating_sub(VRAM_HEADROOM);
-        Ok(Some(self.vram_limit.map_or(budget, |l| l.min(budget))))
+        device_budget(&self.ctx, &self.stream, self.vram_limit).map(Some)
     }
 
     /// What `jobs` allocate as one batch, in bytes, from the same geometry `Plan::new` and

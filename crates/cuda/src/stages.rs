@@ -499,12 +499,23 @@ pub struct CudaStages {
     last_upload_us: AtomicU64,
     /// Kernel launches issued so far, which a device test holds [`Self::launch_count`] to.
     launches: AtomicUsize,
+    /// A cap on the device memory a new scratch may take, below what the driver says is
+    /// free; see [`Self::with_vram_limit`].
+    vram_limit: Option<u64>,
 }
 
 impl CudaStages {
     /// Disable witness classification while preserving the reuse fingerprint.
     pub fn constant_work(mut self) -> Self {
         self.work = crate::msm::Work::Constant;
+        self
+    }
+
+    /// Allocate a proof's scratch only when it fits in at most `bytes`, or in what the
+    /// driver reports free less a headroom when that is less, and refuse the proof before
+    /// allocating otherwise. A pooled scratch is reused without asking.
+    pub fn with_vram_limit(mut self, bytes: u64) -> Self {
+        self.vram_limit = Some(bytes);
         self
     }
 
@@ -657,6 +668,7 @@ impl CudaStages {
                 pool: Arc::new(Mutex::new(Vec::new())),
                 last_upload_us: AtomicU64::new(0),
                 launches: AtomicUsize::new(0),
+                vram_limit: None,
             });
         }
 
@@ -709,6 +721,7 @@ impl CudaStages {
             pool: Arc::new(Mutex::new(Vec::new())),
             last_upload_us: AtomicU64::new(0),
             launches: AtomicUsize::new(0),
+            vram_limit: None,
         })
     }
 
@@ -736,6 +749,25 @@ impl CudaStages {
         let mut out = vec![fr(n_vars), fr(n_vars)];
         out.extend([fr(n); 6]);
         out.push(fr(1));
+        out
+    }
+
+    /// The device buffers [`Self::from_module`] keeps for `pk`, in bytes: both twiddle
+    /// tables, the coset powers, and each matrix's values, row pointers and signals. A
+    /// gnark key's are [`Self::rows_table_buffers`].
+    pub(crate) fn key_buffers(pk: &ProvingKey) -> Vec<u64> {
+        let n = pk.domain_size;
+        if pk.h_basis != HBasis::SnarkjsOddCoset {
+            return Self::rows_table_buffers(n);
+        }
+        let fr = |elems: usize| elems.max(1) as u64 * core::mem::size_of::<PackedFr>() as u64;
+        let u32s = |words: usize| words.max(1) as u64 * 4;
+        let mut out = vec![fr(n / 2), fr(n / 2), fr(n)];
+        for m in Matrix::BOTH.map(Matrix::index) {
+            out.push(fr(pk.coeffs.value_id[m].len()));
+            out.push(u32s(pk.coeffs.row_ptr[m].len()));
+            out.push(u32s(pk.coeffs.signal[m].len()));
+        }
         out
     }
 
@@ -1400,6 +1432,17 @@ impl CudaStages {
             return Ok(s);
         }
         let n = self.domain.size();
+        // Refused before the first allocation, as the MSM refuses a batch: a scratch the
+        // card cannot hold would otherwise be the driver's out-of-memory partway through.
+        let need = Self::scratch_buffers(n, self.n_vars).iter().sum::<u64>();
+        let budget = crate::msm::device_budget(&self.ctx, &self.stream, self.vram_limit)?;
+        if need > budget {
+            return Err(crate::msm::too_big(
+                need,
+                budget,
+                "one proof's stage scratch",
+            ));
+        }
         let words = |elems: usize| -> Result<CudaSlice<u32>, ProveError> {
             // alloc_zeros, not alloc. Nothing in this stage group reads a buffer before
             // writing it: the gather writes every row of A, B and C, batch 0 of every
