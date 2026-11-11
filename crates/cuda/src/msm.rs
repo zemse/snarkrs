@@ -4634,7 +4634,7 @@ mod tests {
     #[test]
     fn gate_recoding_oracle_reconstructs_carry_boundaries() {
         use snarkrs_field::Field;
-        for c in [2, 3, 8, 16] {
+        for c in [2, 3, 8, 13, 16] {
             for scalar in gate_carry_scalars(c) {
                 let digits = gate_digits(scalar, c);
                 assert_eq!(digits.len(), RECODE_BITS.div_ceil(c as usize));
@@ -5705,6 +5705,252 @@ mod tests {
                     g.n_windows, g.n_buckets, g.slices, g.spill_slots(),
                     g.n_windows * g.cap, L2_BYTES_ASSUMED, threads.ilog2() + 1,
                 );
+            }
+        }
+    }
+
+    // Mathematical source branches, not physical warp instructions or a timing floor.
+    #[derive(Default, Debug)]
+    struct ReduceCounts {
+        // First identity guard (including both zero), right identity, equal, cancel, generic.
+        adds: [u64; 5],
+        ladder_doubles: [u64; 2],
+        ladder_adds: u64,
+        ladders: u64,
+    }
+
+    impl ReduceCounts {
+        fn add(&mut self, a: i64, b: i64) -> i64 {
+            let kind = if a == 0 {
+                0
+            } else if b == 0 {
+                1
+            } else if a == b {
+                2
+            } else if a == b.checked_neg().unwrap() {
+                3
+            } else {
+                4
+            };
+            self.adds[kind] += 1;
+            a.checked_add(b).unwrap()
+        }
+
+        fn mul(&mut self, p: i64, k: usize) -> i64 {
+            self.ladders += 1;
+            let mut acc = 0i64;
+            if k != 0 && p != 0 {
+                for bit in (0..=k.ilog2()).rev() {
+                    self.ladder_doubles[usize::from(acc != 0)] += 1;
+                    acc = acc.checked_mul(2).unwrap();
+                    if (k >> bit) & 1 != 0 {
+                        self.ladder_adds += 1;
+                        acc = self.add(acc, p);
+                    }
+                }
+            }
+            acc
+        }
+
+        fn fq2(&self) -> (u64, u64) {
+            let [_, _, equal, cancel, generic] = self.adds;
+            let dbl = self.ladder_doubles[1] + equal;
+            (
+                4 * (equal + cancel) + 12 * generic + 6 * dbl,
+                2 * generic + 3 * dbl,
+            )
+        }
+    }
+
+    fn reduce_geometry(n: usize, general: usize, c: u32, rg: usize) -> Geometry {
+        Geometry::with_shapes(
+            n,
+            0,
+            general,
+            c,
+            64,
+            Work::Variable,
+            Shapes {
+                reduce_groups: Some(rg),
+                ..Shapes::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn reduce_coefficient_bound(n: usize, c: u32) -> i64 {
+        use snarkrs_field::{BigInteger, PrimeField};
+        assert!(n <= 262144 && (2..=13).contains(&c));
+        // Sum of base weights 2..n+1, times the largest bucket weight.
+        let n = i64::try_from(n).unwrap();
+        let bound = n.checked_mul(n.checked_add(3).unwrap()).unwrap() / 2;
+        let bound = bound.checked_mul(1i64 << (c - 1)).unwrap();
+        assert!(Fr::MODULUS.num_bits() > 64);
+        bound
+    }
+
+    fn reduce_coefficients(values: &[Fr], c: u32) -> (Vec<Vec<i64>>, u64) {
+        let bound = reduce_coefficient_bound(values.len(), c);
+        let mut buckets = vec![vec![0i64; 1 << (c - 1)]; RECODE_BITS.div_ceil(c as usize)];
+        let mut emitted = 0;
+        for (i, &s) in values.iter().enumerate() {
+            if s.is_zero() || s.is_one() {
+                continue;
+            }
+            for (w, digit) in gate_digits(s, c).into_iter().enumerate() {
+                if digit == 0 {
+                    continue;
+                }
+                emitted += 1;
+                let b = &mut buckets[w][digit.unsigned_abs() as usize - 1];
+                let weight = i64::try_from(i).unwrap().checked_add(2).unwrap();
+                *b = b
+                    .checked_add(weight.checked_mul(i64::from(digit.signum())).unwrap())
+                    .unwrap();
+                assert!(b.unsigned_abs() <= bound as u64);
+            }
+        }
+        (buckets, emitted)
+    }
+
+    fn reduce_replay(buckets: &[Vec<i64>], g: &Geometry) -> (Vec<i64>, ReduceCounts) {
+        let mut counts = ReduceCounts::default();
+        let threads = reduce_threads(g) as usize;
+        assert!(threads.is_power_of_two());
+        assert_eq!(buckets.len(), g.n_windows);
+        let chunk = g.n_buckets.div_ceil(g.reduce_groups);
+        let seg = chunk.div_ceil(threads);
+        let mut windows = Vec::new();
+        for row in buckets {
+            assert_eq!(row.len(), g.n_buckets);
+            let mut window = 0i64;
+            for group in 0..g.reduce_groups {
+                let start = group * chunk;
+                let end = (start + chunk).min(g.n_buckets);
+                let mut shared = vec![0; threads];
+                for (tid, mine) in shared.iter_mut().enumerate() {
+                    let lo = start + tid * seg;
+                    let hi = (lo + seg).min(end);
+                    if lo < hi {
+                        let (mut run, mut tot) = (0, 0);
+                        for j in (lo..hi).rev() {
+                            run = counts.add(run, row[j]);
+                            tot = counts.add(tot, run);
+                        }
+                        let offset = counts.mul(run, lo);
+                        *mine = counts.add(tot, offset);
+                    }
+                }
+                let mut stride = 1;
+                while stride < threads {
+                    for tid in (0..threads).step_by(2 * stride) {
+                        if tid + stride < threads {
+                            shared[tid] = counts.add(shared[tid], shared[tid + stride]);
+                        }
+                    }
+                    stride *= 2;
+                }
+                // Host group folding is not a CUDA reduce call.
+                window = window.checked_add(shared[0]).unwrap();
+            }
+            let direct = row.iter().enumerate().fold(0i64, |sum, (j, b)| {
+                sum.checked_add(b.checked_mul((j + 1) as i64).unwrap())
+                    .unwrap()
+            });
+            assert_eq!(window, direct);
+            windows.push(window);
+        }
+        let fixed = 2 * g.rows() + counts.ladders as usize + g.window_sums() * (threads - 1);
+        assert_eq!(
+            counts.adds.iter().sum::<u64>(),
+            fixed as u64 + counts.ladder_adds
+        );
+        (windows, counts)
+    }
+
+    #[test]
+    fn reduce_count_branches_and_ladders() {
+        let mut c = ReduceCounts::default();
+        for (a, b, want) in [
+            (0, 0, 0),
+            (0, 3, 3),
+            (3, 0, 3),
+            (3, 3, 6),
+            (3, -3, 0),
+            (3, 4, 7),
+        ] {
+            assert_eq!(c.add(a, b), want);
+        }
+        assert_eq!(c.adds, [2, 1, 1, 1, 1]);
+        assert_eq!(c.fq2(), (26, 5));
+        let mut c = ReduceCounts::default();
+        assert_eq!(c.mul(7, 0), 0);
+        assert_eq!(c.mul(0, 13), 0);
+        assert_eq!(c.mul(-7, 1), -7);
+        assert_eq!(c.mul(7, 13), 91);
+        assert_eq!(c.ladder_doubles, [2, 3]);
+        assert_eq!(c.ladder_adds, 4);
+        assert_eq!(c.adds, [2, 0, 0, 0, 2]);
+    }
+
+    #[test]
+    fn reduce_count_bounds_and_cpu_oracles() {
+        use snarkrs_field::{CurveGroup, PrimeGroup};
+        use snarkrs_msm::{CpuMsm, MsmBackend};
+        assert_eq!(reduce_coefficient_bound(262144, 13), 140739098968064);
+        for c in [2, 3, 13] {
+            let mut values = gate_carry_scalars(c);
+            values.extend(review_scalars(19, "mixed"));
+            values.extend([Fr::zero(), Fr::one(), -Fr::one()]);
+            let (buckets, _) = reduce_coefficients(&values, c);
+            let bases: Vec<_> = (0..values.len())
+                .map(|i| (G2Projective::generator() * Fr::from((i + 2) as u64)).into_affine())
+                .collect();
+            let want = values.iter().enumerate().fold(Fr::zero(), |sum, (i, s)| {
+                sum + *s * Fr::from((i + 2) as u64)
+            });
+            for rg in [1, 4, 8, 16, 32] {
+                let g = reduce_geometry(values.len(), values.len(), c, rg);
+                let (windows, _) = reduce_replay(&buckets, &g);
+                let mut result = windows.iter().rev().fold(Fr::zero(), |sum, &w| {
+                    sum * Fr::from(1u64 << c) + gate_signed_scalar(w)
+                });
+                for (i, s) in values.iter().enumerate() {
+                    if s.is_one() {
+                        result += Fr::from((i + 2) as u64);
+                    }
+                }
+                assert_eq!(result, want);
+                assert_eq!(
+                    G2Projective::generator() * result,
+                    CpuMsm::new().msm_g2(&bases, &values)
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "prints source branch counts; no CUDA device required"]
+    fn variable_work_reduce_counts() {
+        println!("reduce_counts set,n,c,slice,windows,buckets,rg,threads,blocks,emitted,nonzero_buckets,ladders,ladder_adds,left_identity,right_identity,equal,cancel,generic,ladder_double_identity,ladder_double_generic,fq2_m,fq2_s,fq_m_equivalent");
+        for n in [65536, 262144] {
+            for set in ["uniform", "mixed"] {
+                let values = review_scalars(n, set);
+                let general = values
+                    .iter()
+                    .filter(|s| !s.is_zero() && !s.is_one())
+                    .count();
+                let (buckets, emitted) = reduce_coefficients(&values, 13);
+                let nonzero = buckets.iter().flatten().filter(|&&b| b != 0).count();
+                for rg in [4, 8, 16, 32] {
+                    let g = reduce_geometry(n, general, 13, rg);
+                    let (_, c) = reduce_replay(&buckets, &g);
+                    let (m, s) = c.fq2();
+                    let [left, right, equal, cancel, generic] = c.adds;
+                    println!("reduce_counts {set},{n},13,{},{},{},{rg},{},{},{emitted},{nonzero},{},{},{left},{right},{equal},{cancel},{generic},{},{},{m},{s},{}",
+                        g.slice_len, g.n_windows, g.n_buckets, reduce_threads(&g), g.window_sums(),
+                        c.ladders, c.ladder_adds, c.ladder_doubles[0], c.ladder_doubles[1], 3*m+2*s);
+                }
             }
         }
     }
