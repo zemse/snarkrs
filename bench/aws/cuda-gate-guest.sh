@@ -19,6 +19,28 @@ EVERY_VARIANT=0
 [[ "${1:-}" == --every-variant ]] && EVERY_VARIANT=1
 FAILED=()
 
+[[ -x "$BIN/gnark-verifier" ]] || { echo "missing bin/gnark-verifier" >&2; exit 2; }
+# The Rust harness calls `go version` and `go run . verify`. Dispatch only those
+# calls to the shipped binary, never a remote compiler or module download.
+mkdir -p "$OUT/oracle"
+cat > "$OUT/oracle/go" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ $# == 1 && $1 == version ]]; then
+  echo "gnark prebuilt verifier adapter"
+elif [[ $# == 6 && $1 == run && $2 == . && $3 == verify ]]; then
+  shift 2
+  "$G16_GNARK_VERIFIER" "$@"
+  touch "$G16_GNARK_VERIFIED"
+else
+  echo "unsupported gnark harness invocation: $*" >&2
+  exit 2
+fi
+SH
+chmod +x "$OUT/oracle/go"
+export PATH="$OUT/oracle:$PATH"
+export G16_GNARK_VERIFIER="$BIN/gnark-verifier" G16_GNARK_VERIFIED="$OUT/gnark-verified"
+
 log() { echo; echo "=== $* ($(date -u +%H:%M:%SZ))"; }
 
 # step <name> <minutes> <cmd...>: run under a timeout, keep the whole output in out/<name>.txt,
@@ -64,14 +86,10 @@ step adversarial 15 env G16_REQUIRE_TESTS=1 "$BIN/adversarial_gpu" --include-ign
 step pipeline 15 env G16_REQUIRE_TESTS=1 G16_CUDA_REQUIRED_FIXTURES=tiny_mul,sha256 \
   "$BIN/pipeline_gpu" --include-ignored --test-threads=1 --nocapture
 step field 10 env G16_REQUIRE_TESTS=1 "$BIN/field_gpu" --test-threads=1
-# gnark's own verifier is `go run` in the harness; without Go that half skips, so coverage is
-# required only when Go is there to give it.
-if command -v go >/dev/null; then
-  step gnark 10 env G16_REQUIRE_TESTS=1 "$BIN/gnark_gpu" --test-threads=1 --nocapture
-else
-  step gnark 10 "$BIN/gnark_gpu" --test-threads=1 --nocapture
-  grep "SKIPPED" "$OUT/gnark.txt" | grep -qv "no \`go\` on PATH" && FAILED+=("gnark-skip")
-fi
+# A passing test process alone does not prove that gnark's independent oracle ran.
+step gnark 10 env G16_REQUIRE_TESTS=1 "$BIN/gnark_gpu" --test-threads=1 --nocapture
+[[ -f "$G16_GNARK_VERIFIED" ]] || FAILED+=("gnark-oracle-not-run")
+grep -q "SKIPPED" "$OUT/gnark.txt" && FAILED+=("gnark-skip")
 
 # The CLI on CUDA with the fallback off, so a proof the GPU did not make cannot pass.
 log "cli"

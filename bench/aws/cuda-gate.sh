@@ -20,6 +20,9 @@
 #        G16_T4_LANE       lease name on the box (default gate)
 #        G16_ARTIFACTS     artifact root with tiny_mul and sha256 (default bench/artifacts)
 #        CARGO_TARGET_DIR  (default target/cuda-gate)
+#        G16_GNARK_VERIFIER prebuilt Linux amd64 harness (default $CARGO_TARGET_DIR/gnark-verifier)
+# Go builds are local, offline, and require Go >= 1.24 and cached modules. --no-build
+# reuses the verifier too. An explicit G16_GNARK_VERIFIER is never rebuilt.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")/../.." && pwd)"
 T4="${G16_T4:?set G16_T4 to the t4.sh helper}"
@@ -46,6 +49,18 @@ done
 SHIP="$CARGO_TARGET_DIR/ship"
 JSON="$CARGO_TARGET_DIR/build.json"
 cd "$HERE"
+VERIFIER="${G16_GNARK_VERIFIER:-$CARGO_TARGET_DIR/gnark-verifier}"
+if (( BUILD )) && [[ -z "${G16_GNARK_VERIFIER:-}" ]]; then
+  echo "==> cross-compiling gnark's verifier locally for Linux amd64 (offline)"
+  mkdir -p "$(dirname "$VERIFIER")"
+  VERIFIER="$(cd "$(dirname "$VERIFIER")" && pwd)/$(basename "$VERIFIER")"
+  (cd test-support/gnark && env CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOTOOLCHAIN=local \
+    GOPROXY=off GOSUMDB=off go build -mod=readonly -o "$VERIFIER" .)
+fi
+[[ -x "$VERIFIER" ]] || { echo "missing executable $VERIFIER (build locally or set G16_GNARK_VERIFIER)" >&2; exit 2; }
+file "$VERIFIER" | grep -q 'ELF 64-bit.*x86-64.*statically linked' || {
+  echo "gnark verifier must be a static Linux x86-64 ELF" >&2; exit 2;
+}
 if (( BUILD )); then
   echo "==> cross-compiling the CUDA tests and the CLI for $TARGET"
   mkdir -p "$CARGO_TARGET_DIR"
@@ -82,7 +97,8 @@ for c in tiny_mul sha256; do
   cp -L "$ART/$c"/{circuit.zkey,circuit.wtns,vkey.json} "$SHIP/artifacts/$c/"
 done
 mkdir -p "$SHIP/gnark"
-cp -RL test-support/gnark/{go.mod,go.sum,main.go,toy} "$SHIP/gnark/"
+cp -RL test-support/gnark/toy "$SHIP/gnark/"
+cp "$VERIFIER" "$SHIP/bin/gnark-verifier"
 cp bench/aws/cuda-gate-guest.sh "$SHIP/"
 echo "    $(du -sh "$SHIP" | cut -f1) to ship, $(git rev-parse --short HEAD)$(git diff --quiet HEAD || echo ' (dirty)')"
 
