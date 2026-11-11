@@ -5601,7 +5601,7 @@ mod tests {
     #[test]
     #[ignore = "GPU measurement; run explicitly on the measurement machine"]
     fn variable_work_phase_timings() {
-        use snarkrs_field::{CurveGroup, PrimeField, PrimeGroup};
+        use snarkrs_field::{CurveGroup, PrimeGroup};
         let lengths: Vec<usize> = std::env::var("G16_REVIEW_N")
             .ok()
             .map(|v| v.split(',').filter_map(|s| s.trim().parse().ok()).collect())
@@ -5640,25 +5640,72 @@ mod tests {
         let b1 = m.upload_g1_bases(&g1).unwrap();
         let b2 = m.upload_g2_bases(&g2).unwrap();
         for set in &sets {
-            let mut seed = 0x7e57_0000_0000_0001u64;
-            let mut random = || {
-                let mut b = [0u8; 32];
-                for c in b.chunks_mut(8) {
-                    c.copy_from_slice(&splitmix(&mut seed).to_le_bytes());
-                }
-                Fr::from_le_bytes_mod_order(&b)
-            };
-            let scalars: Vec<Fr> = (0..n_max)
-                .map(|i| match (set.as_str(), i % 5) {
-                    ("uniform", _) => random(),
-                    ("mixed", 0) => Fr::zero(),
-                    ("mixed", 1) => Fr::one(),
-                    ("mixed", 2) => -Fr::one(),
-                    ("mixed", _) => random(),
-                    _ => panic!("G16_REVIEW_SET names {set}; mixed and uniform exist"),
-                })
-                .collect();
+            let scalars = review_scalars(n_max, set);
             phase_timings_over(&m, set, &scalars, &lengths, &b1, &b2, &g1, &g2, warm, reps);
+        }
+    }
+
+    fn review_scalars(n: usize, set: &str) -> Vec<Fr> {
+        use snarkrs_field::PrimeField;
+        let mut seed = 0x7e57_0000_0000_0001u64;
+        let mut random = || {
+            let mut b = [0u8; 32];
+            for c in b.chunks_mut(8) {
+                c.copy_from_slice(&splitmix(&mut seed).to_le_bytes());
+            }
+            Fr::from_le_bytes_mod_order(&b)
+        };
+        (0..n)
+            .map(|i| match (set, i % 5) {
+                ("uniform", _) => random(),
+                ("mixed", 0) => Fr::zero(),
+                ("mixed", 1) => Fr::one(),
+                ("mixed", 2) => -Fr::one(),
+                ("mixed", _) => random(),
+                _ => panic!("G16_REVIEW_SET names {set}; mixed and uniform exist"),
+            })
+            .collect()
+    }
+
+    /// CPU-only structural counts for the c13 timing inputs, no device or timings.
+    /// Entry capacity is an upper bound, not the emitted digit count. Add call sites
+    /// exclude the offset ladders; identities and equal points change their arithmetic.
+    #[test]
+    #[ignore = "prints structural counts; no CUDA device required"]
+    fn variable_work_operation_counts() {
+        let shapes = Shapes::default();
+        println!("counts set,n,zero,one,general,windows,buckets,slices,spill_slots,entry_capacity,l2_assumed_bytes,kernel_launches,reduce_blocks,reduce_threads,reduce_add_calls,offset_ladders,barriers_per_block,g2_clear_store_bytes,g2_clear_span_bytes,g2_download_bytes");
+        for n in [1 << 16, 1 << 18] {
+            for set in ["uniform", "mixed"] {
+                let scalars = review_scalars(n, set);
+                let zero = scalars.iter().filter(|s| s.is_zero()).count();
+                let one = scalars.iter().filter(|s| s.is_one()).count();
+                let general = n - zero - one;
+                let g = Geometry::new(n, 0, general, 13, SLICE_LEN, Work::Variable).unwrap();
+                let threads = reduce_threads(&g) as usize;
+                let blocks = g.window_sums();
+                let ladders = blocks * threads;
+                assert_eq!(g.n_buckets % (g.reduce_groups * threads), 0);
+                let reduce_add_calls = 2 * g.rows() + ladders + blocks * (threads - 1);
+                let scatter = g.n_windows.div_ceil(scatter_windows(
+                    shapes.scatter_rows,
+                    g.n_buckets,
+                    g.n_windows,
+                ));
+                let launches = 2 + 1 + scatter + 1 + 1 + 2 + 1 + 1;
+                let clear_bytes = g.rows() * std::mem::size_of::<PackedFq2>();
+                let span_bytes = g.rows() * std::mem::size_of::<PackedXyzzG2>();
+                let download_bytes = (blocks + g.ones_groups) * std::mem::size_of::<PackedXyzzG2>();
+                assert_eq!(reduce_add_calls, 184160);
+                assert_eq!(clear_bytes, 5 << 20);
+                assert_eq!(span_bytes, 20 << 20);
+                assert_eq!(launches, 14);
+                println!(
+                    "counts {set},{n},{zero},{one},{general},{},{},{},{},{},{},{launches},{blocks},{threads},{reduce_add_calls},{ladders},{},{clear_bytes},{span_bytes},{download_bytes}",
+                    g.n_windows, g.n_buckets, g.slices, g.spill_slots(),
+                    g.n_windows * g.cap, L2_BYTES_ASSUMED, threads.ilog2() + 1,
+                );
+            }
         }
     }
 
