@@ -50,6 +50,26 @@ equality and cancellation branches, and the offset ladders, must be accounted
 for before deriving an arithmetic floor. No measured G2 or strided-store floor
 is accepted yet.
 
+## Source arithmetic, not machine throughput
+
+The shared curve implementation uses these nonexceptional operation counts:
+
+| operation | Fq2 multiplies | Fq2 squares | equivalent Fq multiplies |
+|---|---:|---:|---:|
+| mixed addition | 8 | 2 | 28 |
+| XYZZ addition | 12 | 2 | 40 |
+| XYZZ doubling | 6 | 3 | 24 |
+
+`fq2_mul` uses three Fq multiplies and `fq2_sqr` uses two. These are source-level
+counts, not instruction counts or interchangeable measured throughputs.
+Identity branches skip arithmetic; equality/cancellation checks can perform
+products before taking their shortcut. For nonzero P in the prime-order subgroup
+and 0 < k < 2^16, `pt_mul_small` starts from infinity: its first doubling and
+addition are identity cases.
+Thus a ladder has `bit_length(k)-1` nonexceptional doublings and
+`popcount(k)-1` nonexceptional additions, not the full source call counts.
+The probe's ladder call fields must be interpreted with this distinction.
+
 ## Collecting phase samples on the GPU host
 
 The timing harness emits every measured sample after checking all warm and

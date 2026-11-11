@@ -424,7 +424,7 @@ __device__ __forceinline__ Xyzz<F> pt_dbl(Xyzz<F> p) {
     return r;
 }
 
-// madd-2008-s: XYZZ += affine, 7M + 2S. This is the inner loop of bucket accumulation and
+// madd-2008-s: XYZZ += affine, 8M + 2S. This is the inner loop of bucket accumulation and
 // therefore the single hottest routine in the whole backend.
 //
 // Every guard below is load-bearing and none may be dropped as unreachable. The
