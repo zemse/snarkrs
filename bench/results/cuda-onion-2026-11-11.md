@@ -1,8 +1,10 @@
 # Real onion CUDA correctness on a T4, 2026-11-11 UTC
 
-Partial validation, not a complete ladder or a performance result. Real p21, p22
-and p23 proofs passed; p24 remains open because both attempts crossed the existing
-headroom guard. No default tuning or safety threshold was changed.
+Earlier partial validation, not a complete ladder or a performance result. Real
+p21, p22 and p23 proofs passed; p24 was still open because both attempts crossed
+the existing headroom guard. No default tuning or safety threshold was changed.
+The later [capacity validation](cuda-capacity-2026-11-11.md) completed p24 with an
+explicit extra VRAM reserve and the same guard.
 
 One g4dn.2xlarge, 32 GiB host RAM, Tesla T4 reporting 15360 MiB, driver 595.112.07,
 CUDA 13.2. The locally zigbuilt binary is from `792eb10`, target
@@ -51,6 +53,6 @@ left armed, and only this session's SSH ingress rule was revoked. The stopped
 instance and its EBS volume are retained. Temporary private S3 staging remains
 pending explicit deletion approval; no original local fixtures were removed.
 
-Next: locate and reduce p24's peak allocation without relaxing the headroom gate,
-then independently verify the resulting proof. The full T4 table refresh and
-remaining optimisation work are separate, unfinished tasks.
+Follow-up: the [capacity validation](cuda-capacity-2026-11-11.md) completed and
+independently verified p24 without relaxing the headroom gate. The full T4 table
+refresh and remaining optimisation work are separate, unfinished tasks.
