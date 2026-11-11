@@ -100,7 +100,7 @@ pub static CUTS: AtomicU32 = AtomicU32::new(0);
 /// [`dispatch`] so far.
 static CUT_ENCODED: AtomicU32 = AtomicU32::new(0);
 
-/// Every dispatch that has gone through [`dispatch`] since the process started, cut or
+/// Every dispatch that has gone through `dispatch` since the process started, cut or
 /// not, and the workgroups they asked for. What `tests/constant_work.rs` holds two
 /// witnesses' geometry to, since every proving dispatch passes here.
 pub static DISPATCHES: AtomicU64 = AtomicU64::new(0);

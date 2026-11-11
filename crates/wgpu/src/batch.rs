@@ -23,7 +23,7 @@
 //!
 //! So the batch is cut into submissions of about [`SUBMISSION_US`] of estimated GPU time,
 //! each sealed and checked on its own, and a submission the GPU cut short is the only thing
-//! run again, up to [`ATTEMPTS`] times. The cut is by **window slabs** of the point stage,
+//! run again, up to `ATTEMPTS` times. The cut is by **window slabs** of the point stage,
 //! not by sub-MSMs: a G2 MSM over `js_16x16_d32` is 520 ms of the stage's 700, and cutting
 //! it into five sub-MSMs measured 693 ms, into nine 1,138 ms, because every sub-MSM pays a
 //! bucket clear, merge and reduction of its own and under-occupies the GPU while it runs. A
@@ -143,8 +143,8 @@ const FR_BYTES: u64 = (LIMBS * 4) as u64;
 /// it lines up with the buffers it came from.
 const SLICE_ALIGN: u64 = 256;
 
-/// GPU time one submission of the batch may hold, in microseconds of [`slab_us`]'s
-/// estimate, unless a single window is over it (see [`MsmBatch::pieces`]).
+/// GPU time one submission of the batch may hold, in microseconds of `slab_us`'s
+/// estimate, unless a single window is over it (see `MsmBatch::pieces`).
 /// `G16_WGPU_SUBMIT_US` overrides it.
 ///
 /// 300 ms and not the 100 the task asked for, from the measurement in the module docs: the
@@ -732,7 +732,7 @@ impl MsmBatch {
     /// # A submission the GPU cuts short is run again, alone
     ///
     /// Every submission ends with [`crate::readback::Seal`]'s token and is refused without
-    /// it. On native it is then re-encoded and submitted again, up to [`ATTEMPTS`] times with
+    /// it. On native it is then re-encoded and submitted again, up to `ATTEMPTS` times with
     /// a backoff, and only it: everything before it was verified complete and nothing it
     /// writes is read by anything before it. It can be run again because each of its parts
     /// is complete from its own first write: the conversion is a pure map, a sort zeroes its
@@ -749,7 +749,7 @@ impl MsmBatch {
     /// Everything a sub-MSM allocates grows with its scalar count: the entry array is
     /// `n_windows * general * 8` bytes, 20 windows at c = 13, so 4.19 million general scalars
     /// want 671 MB of it against a 128 MiB binding at the floor, and the spill points and the
-    /// base buffers follow. So each group's range is cut into [`Piece`]s, the largest power
+    /// base buffers follow. So each group's range is cut into `Piece`s, the largest power
     /// of two whose plan fits every binding, and cut again wherever a job's base vector moves
     /// to its next buffer. Every piece is a whole counting sort plus a whole point stage for
     /// each job, encoded into the same pass, and the host sums a job's pieces after the
