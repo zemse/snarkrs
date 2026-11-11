@@ -5595,7 +5595,9 @@ mod tests {
     /// window's entries in one bucket, so its merge phase is that one fat row's (see
     /// [`MERGE_WIDE_MIN_SPAN`]); `uniform` is every scalar dense and random, which is
     /// what the H MSM sees, so its rows fill evenly and its merge is a uniform one's. The
-    /// constant-work twin is `constant_work_phase_flatness` above.
+    /// constant-work twin is `constant_work_phase_flatness` above. Every repetition is
+    /// checked against the CPU outside the clocks. `batch_device` and `batch_wall` run
+    /// the normal allocating batch with resident inputs, without per-phase waits.
     #[test]
     #[ignore = "GPU measurement; run explicitly on the measurement machine"]
     fn variable_work_phase_timings() {
@@ -5609,6 +5611,11 @@ mod tests {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(10);
+        assert!(reps > 0, "G16_REVIEW_REPS must be positive");
+        assert!(
+            !memory_trace_enabled(),
+            "disable memory tracing for timings"
+        );
         let sets: Vec<String> = std::env::var("G16_REVIEW_SET")
             .ok()
             .map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
@@ -5671,6 +5678,11 @@ mod tests {
     ) {
         use snarkrs_field::CurveGroup;
         use snarkrs_msm::{CpuMsm, MsmBackend};
+        assert!(reps > 0, "phase timings need measured repetitions");
+        assert!(
+            !memory_trace_enabled(),
+            "disable memory tracing for timings"
+        );
         let ds = m.upload_scalars(scalars).unwrap();
         let time = |f: &dyn Fn() -> Result<(), ProveError>| -> f64 {
             let ev = || {
@@ -5686,7 +5698,17 @@ mod tests {
             elapsed_us(&start, &end).unwrap() as f64 / 1e3
         };
         let phases = [
-            "count", "scan", "scatter", "clear", "accum", "merge", "reduce", "ones", "combine",
+            "count",
+            "scan",
+            "scatter",
+            "clear",
+            "accum",
+            "merge",
+            "reduce",
+            "ones",
+            "combine",
+            "batch_device",
+            "batch_wall",
         ];
         for &n in lengths {
             for group in ["g1", "g2"] {
@@ -5707,11 +5729,32 @@ mod tests {
                         n,
                     })
                 };
+                let s = &scalars[..n];
+                let want = if group == "g1" {
+                    MsmResult::G1(CpuMsm::new().msm_g1(&g1[..n], s))
+                } else {
+                    MsmResult::G2(CpuMsm::new().msm_g2(&g2[..n], s))
+                };
+                let check = |got: MsmResult, rep: usize, scope: &str| {
+                    if group == "g1" {
+                        assert_eq!(
+                            got.g1().unwrap().into_affine(),
+                            want.g1().unwrap().into_affine(),
+                            "{scope} {set} {group} n={n} rep={rep}",
+                        );
+                    } else {
+                        assert_eq!(
+                            got.g2().unwrap().into_affine(),
+                            want.g2().unwrap().into_affine(),
+                            "{scope} {set} {group} n={n} rep={rep}",
+                        );
+                    }
+                };
                 let plan = Plan::new(m, ds.as_scalars(), 0, n).unwrap();
+                let geometry = plan.geometry;
                 let out = Outputs::new(m, &job, &plan).unwrap();
                 let params = m.point_params(&out, &plan);
-                let mut t: [Vec<f64>; 9] = Default::default();
-                let mut result = None;
+                let mut t: [Vec<f64>; 11] = Default::default();
                 for rep in 0..warm + reps {
                     let d0 = time(&|| m.launch_count(&plan));
                     let d1 = time(&|| m.launch_scan(&plan));
@@ -5724,30 +5767,32 @@ mod tests {
                     let t0 = Instant::now();
                     let got = out.combine(m, &plan).unwrap();
                     let h = t0.elapsed().as_secs_f64() * 1e3;
-                    result = Some(got);
+                    check(got, rep, "isolated");
                     if rep >= warm {
                         for (v, x) in t.iter_mut().zip([d0, d1, d2, c, a, g, r, o, h]) {
                             v.push(x);
                         }
                     }
                 }
-                // The timed launches are the real ones, so the answer is checked too,
-                // against the CPU backend: a naive sum at 2^20 would outlast the timing.
-                let got = result.unwrap();
-                let s = &scalars[..n];
-                if group == "g1" {
-                    let want = CpuMsm::new().msm_g1(&g1[..n], s);
-                    assert_eq!(got.g1().unwrap().into_affine(), want.into_affine());
-                } else {
-                    let want = CpuMsm::new().msm_g2(&g2[..n], s);
-                    assert_eq!(got.g2().unwrap().into_affine(), want.into_affine());
+                drop(out);
+                drop(plan);
+                for rep in 0..warm + reps {
+                    let start = Instant::now();
+                    let got = m.msm_batch(std::slice::from_ref(&job)).unwrap()[0];
+                    let wall = start.elapsed().as_secs_f64() * 1e3;
+                    let device = m.last_device_us() as f64 / 1e3;
+                    check(got, rep, "batch");
+                    if rep >= warm {
+                        t[9].push(device);
+                        t[10].push(wall);
+                    }
                 }
                 let mut line = format!(
                     "phases {set} {group} n={n} c={} w={} wide={} rg={} split={} reps={reps} (ms)",
-                    plan.c,
-                    plan.n_windows,
-                    plan.merge_wide_min,
-                    plan.reduce_groups,
+                    geometry.c,
+                    geometry.n_windows,
+                    geometry.merge_wide_min,
+                    geometry.reduce_groups,
                     m.shapes.scatter_rows
                 );
                 for (name, v) in phases.iter().zip(&t) {
