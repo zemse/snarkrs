@@ -163,7 +163,8 @@ pub struct GnarkProverCost {
 }
 
 /// A gnark key resident on one device, every byte a proof needs reserved; see the module
-/// docs.
+/// docs. `G16_CUDA_VRAM_RESERVE` leaves extra bytes free at construction, on top of
+/// [`DEVICE_MARGIN`]; it does not change [`required_device_bytes`].
 pub struct GnarkProver {
     circuit: CudaCircuit,
     cuda: Cuda,
@@ -205,10 +206,11 @@ impl GnarkProver {
             .context()
             .mem_get_info()
             .map_err(|e| drv("query device memory", e))?;
-        if (free as u64) < budget.total {
+        let available = (free as u64).saturating_sub(crate::msm::env_vram_reserve()?);
+        if available < budget.total {
             return Err(bad(format!(
-                "this key needs {} bytes of device memory ({budget:?}); device {} ({}) has {free} \
-                 of {total} free",
+                "this key needs {} bytes of device memory ({budget:?}); device {} ({}) has {available} \
+                 of {total} available after the configured reserve",
                 budget.total,
                 config.device,
                 cuda.device_name()

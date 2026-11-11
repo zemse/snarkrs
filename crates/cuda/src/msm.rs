@@ -783,13 +783,34 @@ fn output_words(g: &Geometry, pw: usize) -> Result<Vec<usize>, ProveError> {
 /// on a T4 took at most 12.7 MiB past the plan at 2^16 to 2^22, cold or warm, in 32 MiB steps.
 const VRAM_HEADROOM: u64 = 64 << 20;
 
-/// Bytes an allocation may take now: the free device memory less [`VRAM_HEADROOM`], capped
-/// by `limit`. The MSM batches, a prepare's uploads and the stage scratch all ask here.
+/// `G16_CUDA_VRAM_RESERVE`, extra bytes each memory plan leaves free.
+pub(crate) fn env_vram_reserve() -> Result<u64, ProveError> {
+    parse_vram_reserve(std::env::var_os("G16_CUDA_VRAM_RESERVE").as_deref())
+}
+
+fn parse_vram_reserve(value: Option<&std::ffi::OsStr>) -> Result<u64, ProveError> {
+    match value {
+        None => Ok(0),
+        Some(v) => v
+            .to_str()
+            .and_then(|s| s.parse::<u64>().ok())
+            .ok_or_else(|| bad(format!("G16_CUDA_VRAM_RESERVE={v:?} is not a byte count"))),
+    }
+}
+
+fn budget_bytes(free: u64, limit: Option<u64>, reserve: u64) -> u64 {
+    let budget = free.saturating_sub(VRAM_HEADROOM).saturating_sub(reserve);
+    limit.map_or(budget, |l| l.min(budget))
+}
+
+/// Bytes an allocation may take now: the free device memory less [`VRAM_HEADROOM`] and
+/// `G16_CUDA_VRAM_RESERVE`, capped by `limit`. Preparation, stage scratch and MSMs ask here.
 pub(crate) fn device_budget(
     ctx: &CudaContext,
     stream: &CudaStream,
     limit: Option<u64>,
 ) -> Result<u64, ProveError> {
+    let reserve = env_vram_reserve()?;
     // A dropped buffer is a `cuMemFreeAsync`, and the pool gives its pages back only at
     // a synchronize; without one the last batch's scratch still reads as in use.
     stream
@@ -798,8 +819,7 @@ pub(crate) fn device_budget(
     let (free, _) = ctx
         .mem_get_info()
         .map_err(|e| drv("query device memory", e))?;
-    let budget = (free as u64).saturating_sub(VRAM_HEADROOM);
-    Ok(limit.map_or(budget, |l| l.min(budget)))
+    Ok(budget_bytes(free as u64, limit, reserve))
 }
 
 /// Shortest run [`CudaMsm::fit_runs`] cuts an MSM into before it refuses. A run of 2^10
@@ -2096,9 +2116,18 @@ impl CudaMsm {
     /// a buffer another request was reserved for, that one's own buffer is at least as
     /// large and still free.
     pub(crate) fn with_arena(mut self, words: &[usize]) -> Result<Self, ProveError> {
-        let mut bufs = Vec::with_capacity(words.len());
         for &w in words {
             allocation_words(w)?;
+        }
+        let memory = self.memory.clone();
+        let _plan = plan_lock(&memory);
+        let need = vram_bytes(words);
+        let budget = device_budget(&self.ctx, &self.stream, self.vram_limit)?;
+        if need > budget {
+            return Err(too_big(need, budget, "reserved MSM scratch"));
+        }
+        let mut bufs = Vec::with_capacity(words.len());
+        for &w in words {
             bufs.push(
                 self.stream
                     .alloc_zeros::<u32>(w.max(1))
@@ -3472,6 +3501,53 @@ mod tests {
     use super::*;
     use crate::context::download;
     use snarkrs_gpu_layout::{FQ_MODULUS, FQ_N0};
+
+    #[test]
+    fn extra_vram_reserve_parses_bytes_without_changing_the_environment() {
+        use std::ffi::OsStr;
+
+        assert_eq!(parse_vram_reserve(None).unwrap(), 0);
+        for (value, bytes) in [
+            ("0", 0),
+            ("1610612736", 1536 << 20),
+            ("18446744073709551615", u64::MAX),
+        ] {
+            assert_eq!(parse_vram_reserve(Some(OsStr::new(value))).unwrap(), bytes);
+        }
+        for value in ["", "-1", "1MiB", " 1", "18446744073709551616"] {
+            assert!(parse_vram_reserve(Some(OsStr::new(value))).is_err());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert!(parse_vram_reserve(Some(OsStr::from_bytes(b"\xff"))).is_err());
+        }
+    }
+
+    #[test]
+    fn memory_budget_leaves_the_extra_reserve_and_existing_headroom() {
+        let total = 15360 << 20;
+        let reserve = total / 10;
+        assert_eq!(budget_bytes(total, None, 0), total - VRAM_HEADROOM);
+        assert_eq!(
+            budget_bytes(total, None, reserve),
+            (13824 << 20) - VRAM_HEADROOM
+        );
+        assert_eq!(
+            budget_bytes(total - (10133 << 20), None, reserve),
+            (3691 << 20) - VRAM_HEADROOM
+        );
+        assert_eq!(budget_bytes(total, Some(1 << 30), reserve), 1 << 30);
+        assert_eq!(
+            budget_bytes(total, Some(u64::MAX), reserve),
+            (13824 << 20) - VRAM_HEADROOM
+        );
+        for free in [0, 1, VRAM_HEADROOM - 1, VRAM_HEADROOM, total, u64::MAX] {
+            assert_eq!(budget_bytes(free, None, u64::MAX), 0);
+            assert_eq!(budget_bytes(free, Some(0), reserve), 0);
+            assert!(budget_bytes(free, None, reserve) <= budget_bytes(free, None, 0));
+        }
+    }
 
     #[test]
     fn a_run_is_halved_until_its_batches_fit() {

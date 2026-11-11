@@ -85,6 +85,10 @@ pub struct PrepareCost {
 /// Built once per process. Deliberately not `Clone`: the compiles are what make it
 /// expensive, and [`Self::prepare`] shares them by handing each circuit an `Arc` of the
 /// same module rather than by duplicating anything.
+///
+/// `G16_CUDA_VRAM_RESERVE` leaves extra bytes free when planning uploads, stage scratch
+/// and MSMs, in addition to the existing 64 MiB allowance. It defaults to zero and is not
+/// a process-wide allocation cap; other contexts and processes can still consume memory.
 pub struct CudaBackend {
     work: Work,
     cuda: Cuda,
