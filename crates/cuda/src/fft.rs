@@ -26,7 +26,7 @@
 //!   behind the launch and ahead of the pass that overwrites the source. The host then
 //!   probes every pass from the one download at the end and scans every finished block
 //!   on the curve. A refused readback re-runs the whole transform from the caller's
-//!   slice, which nothing has written yet, up to [`RETRIES`] times; a persistent one
+//!   slice, which nothing has written yet, up to `RETRIES` times; a persistent one
 //!   fails the call with the caller's points as they were.
 //! * **The pack lands in a host `Vec` and crosses PCIe.** Metal writes the bit-reversed
 //!   points straight into shared memory. Here the copy is real but small next to the
@@ -40,8 +40,10 @@
 //! over N streams instead; 1 stays the default until a measurement on a real card says
 //! what the fill is worth.
 //!
+//! [`FftKernels::with_streams`]: crate::fft::FftKernels::with_streams
+//!
 //! The experiment knobs, all run-time and none costing a recompile:
-//! `G16_CUDA_FFT_VARIANT` picks a kernel variant ([`VARIANTS`]), `G16_CUDA_FFT_BLOCK`
+//! `G16_CUDA_FFT_VARIANT` picks a kernel variant (`VARIANTS`), `G16_CUDA_FFT_BLOCK`
 //! the threads per block, `G16_CUDA_FFT_STREAMS` the stream count, and
 //! `G16_CUDA_FFT_TIME=1` wraps every launch in CUDA events and prints per-pass device
 //! times. The one thing that does cost a compile is `G16_CUDA_FFT_VARIANTS=1`, which
@@ -76,7 +78,7 @@ use crate::{as_words, from_words, kernels, Cuda};
 ///
 /// 5 is the Metal sweep's answer for both groups over a whole `ppot_0080_16.ptau`
 /// prepare (`crates/metal/src/fft.rs`, `FFT_WINDOW_G1`), carried over rather than re-swept:
-/// there is no NVIDIA sweep yet. The sweep exists as [`VARIANTS`] behind
+/// there is no NVIDIA sweep yet. The sweep exists as `VARIANTS` behind
 /// `G16_CUDA_FFT_VARIANTS=1`, one compile for the whole set; this constant names the
 /// default until that sweep says otherwise.
 const FFT_WINDOW: u32 = 5;
@@ -459,7 +461,7 @@ impl FftKernels {
         }
     }
 
-    /// Selects the kernel variant every later transform launches. See [`VARIANTS`].
+    /// Selects the kernel variant every later transform launches. See `VARIANTS`.
     pub fn with_variant(mut self, name: &str) -> Result<Self, ProveError> {
         match self.variants.iter().position(|v| v.name == name) {
             Some(i) => {
@@ -487,12 +489,12 @@ impl FftKernels {
         self.variants[self.active].name
     }
 
-    /// Every variant the compiled unit carries, in [`VARIANTS`] order.
+    /// Every variant the compiled unit carries, in `VARIANTS` order.
     pub fn variant_names(&self) -> Vec<&'static str> {
         self.variants.iter().map(|v| v.name).collect()
     }
 
-    /// Threads per block for every launch. See [`FFT_BLOCK`].
+    /// Threads per block for every launch. See `FFT_BLOCK`.
     pub fn with_block(mut self, threads: u32) -> Self {
         self.block = threads.max(1);
         self
@@ -511,13 +513,13 @@ impl FftKernels {
         self
     }
 
-    /// Shortest block this instance will run on the device. See [`MIN_BLOCK`].
+    /// Shortest block this instance will run on the device. See `MIN_BLOCK`.
     pub fn min_block(&self) -> usize {
         self.min_block
     }
 
     /// The ladder window, the same for both groups and for every instance. See
-    /// [`FFT_WINDOW`].
+    /// `FFT_WINDOW`.
     pub fn window(&self) -> u32 {
         FFT_WINDOW
     }
@@ -554,7 +556,7 @@ impl FftKernels {
     /// own depth `exp == bits` is its fused mix+scale pass, so each block retires in its
     /// own last round and no scaling round follows.
     ///
-    /// The rounds, the downloads and the checks are one attempt; see [`RETRIES`] for
+    /// The rounds, the downloads and the checks are one attempt; see `RETRIES` for
     /// what a refused readback does, and [`probe`] and [`scan`] for the checks. The
     /// caller's points are written only after every block has passed both.
     fn ifft_many<G: FftGroup>(&self, blocks: &mut [&mut [Xyzz<G::Raw>]]) -> Result<(), ProveError> {
@@ -1060,7 +1062,7 @@ fn bit_reverse_index(i: usize, bits: u32) -> usize {
     ((i as u32).reverse_bits() >> (u32::BITS - bits)) as usize
 }
 
-/// `G16_CUDA_FFT_MIN_BLOCK` overrides [`MIN_BLOCK`], which is how the crossover gets
+/// `G16_CUDA_FFT_MIN_BLOCK` overrides `MIN_BLOCK`, which is how the crossover gets
 /// swept on a real card without a rebuild and how a test forces a small file onto the
 /// device.
 fn env_min_block() -> usize {
@@ -1070,7 +1072,7 @@ fn env_min_block() -> usize {
         .unwrap_or(MIN_BLOCK)
 }
 
-/// `G16_CUDA_FFT_BLOCK` overrides [`FFT_BLOCK`], the threads-per-block sweep knob.
+/// `G16_CUDA_FFT_BLOCK` overrides `FFT_BLOCK`, the threads-per-block sweep knob.
 fn env_block() -> u32 {
     std::env::var("G16_CUDA_FFT_BLOCK")
         .ok()

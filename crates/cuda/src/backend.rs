@@ -288,7 +288,7 @@ impl Backend for CudaBackend {
 /// buffer. Stages 5 to 9 allocate their scratch per call out of the driver's own
 /// stream-ordered pool and free it at the end, so there is nothing to share; but each call
 /// plans that scratch against the free device memory, so the calls of concurrent proofs run
-/// one at a time under the context's plan lock ([`Cuda::plan_memory`]), and a new stage
+/// one at a time under the context's plan lock (`Cuda::plan_memory`), and a new stage
 /// scratch and a prepare take the same lock.
 ///
 /// What concurrent proofs do share is the stream. That is safe, because a stream executes

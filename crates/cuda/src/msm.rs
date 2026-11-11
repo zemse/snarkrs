@@ -42,7 +42,7 @@
 //! looking field element, so the failure mode is a proof that does not verify, with no
 //! crash and nothing to point at, on some witnesses and not others.
 //!
-//! Two kernels guard that here, and nothing else does: [`CudaMsm::scratch`] hands out
+//! Two kernels guard that here, and nothing else does: `CudaMsm::scratch` hands out
 //! uninitialised memory, a fresh block or a reused one. The count histogram is cleared by
 //! `zero_u32` before `msm_count` accumulates onto it, and every bucket array is run through
 //! `msm_clear_g1`/`msm_clear_g2` before an accumulation writes into it (all of a
@@ -541,7 +541,7 @@ fn top_bits(c: u32) -> u32 {
 /// general) c = 8 keeps 4.7 / 18.2 against 5.7 / 22.9. The width buys accumulation
 /// (fewer windows, 20 at 13 against 32) and pays per bucket in the clear, the merge of
 /// the top window and the reduce, about 2.5 ms in G1 and 8 in G2 at 13; the trade turns
-/// near 10^5 general scalars, so [`WIDE_WINDOW`] is taken from [`WIDE_WINDOW_MIN_GENERAL`]
+/// near 10^5 general scalars, so `WIDE_WINDOW` is taken from `WIDE_WINDOW_MIN_GENERAL`
 /// up and the capped heuristic below it. 13 over 12 because the three largest shapes
 /// read faster at 13 and the fourth within a sample; 14 lost every shape. A plan is
 /// shared by every job of a batch (A, B in both groups, over one witness), so the pick
@@ -1905,7 +1905,7 @@ impl CudaMsm {
     }
 
     /// Run every plan's reduce at `groups` blocks a window instead of
-    /// [`reduce_groups_for`]'s pick: the per-object form of `G16_CUDA_MSM_RG`, for the
+    /// `reduce_groups_for`'s pick: the per-object form of `G16_CUDA_MSM_RG`, for the
     /// same reason as [`Self::with_window`]. Clamped to `1..=n_buckets` by the plan.
     pub fn with_reduce_groups(mut self, groups: usize) -> Self {
         self.shapes.reduce_groups = Some(groups.max(1));

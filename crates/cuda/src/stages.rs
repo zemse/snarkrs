@@ -1017,10 +1017,10 @@ impl CudaStages {
     /// reversed, coefficient `n - 1` checked zero here. Otherwise it stays on the odd coset,
     /// as [`Self::compute_h`] leaves it.
     ///
-    /// The witness and both row vectors cross through the scratch's [`Staging`] pair, so
+    /// The witness and both row vectors cross through the scratch's `Staging` pair, so
     /// beyond the caller's own buffers this holds 64 MiB of pinned host memory, not a copy
     /// of either. The handle carries the standard-form witness for the MSMs, which read it
-    /// through [`HHandle::witness_std`]; [`HHandle::witness_std_for`] refuses it, since no
+    /// through `HHandle::witness_std`; [`HHandle::witness_std_for`] refuses it, since no
     /// fingerprint was taken.
     ///
     /// Timings as [`Self::compute_h`]: `gather_us` is the staged uploads, overlapped with the

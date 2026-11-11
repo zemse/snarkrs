@@ -33,6 +33,11 @@
 //! A `GnarkProver` is a [`PreparedCircuit`], so a caller that proves through
 //! `Box<dyn PreparedCircuit>` and `snarkrs_gnark::prove` takes [`prepare`] where it took
 //! `CpuBackend::new().prepare(pk)`; only the key's header and five points stay on the host.
+//!
+//! [`GnarkDump`]: snarkrs_gnark::GnarkDump
+//! [`GnarkWitness`]: snarkrs_gnark::GnarkWitness
+//! [`PreparedCircuit`]: snarkrs_groth16::PreparedCircuit
+//! [`prepare`]: crate::gnark::prepare
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -100,7 +105,7 @@ pub struct DeviceBudget {
     pub scratch: u64,
     /// The MSM arena, sized for the largest batch of a run of `msm_chunk` points.
     pub msm: u64,
-    /// The above with every buffer rounded up to [`PAGE`], plus [`DEVICE_MARGIN`]: what
+    /// The above with every buffer rounded up to `PAGE`, plus [`DEVICE_MARGIN`]: what
     /// construction checks against the device's free memory.
     pub total: u64,
 }

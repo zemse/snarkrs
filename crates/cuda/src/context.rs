@@ -230,7 +230,7 @@ impl Cuda {
     /// Opens a context on `ordinal`, or says why it could not.
     ///
     /// The one reason this can fail without the driver having said so is a missing
-    /// `libcuda`, which `cudarc` reports by panicking; see [`libcuda_loadable`]. Once that
+    /// `libcuda`, which `cudarc` reports by panicking; see `libcuda_loadable`. Once that
     /// has answered, everything here has a real driver behind it and a real error channel.
     pub fn new(ordinal: usize) -> Result<Self, CudaError> {
         Self::open(ordinal, false)
