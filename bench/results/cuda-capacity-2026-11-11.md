@@ -115,5 +115,6 @@ The expanded executable-file search found no `node` under `/home/ubuntu`,
 installation has not been approved.
 
 Next: serial intrinsic-led CUDA work, then the final T4 table with the required
-repetitions and accurate machine stamps. The current 8-vCPU host must not be
-silently reported as the published 4-vCPU machine.
+repetitions and accurate machine stamps. The published README row and its
+`g4dn.2xlarge-98eb883.md` source use 8 vCPUs. Smaller 4-vCPU calibration runs must
+be labeled separately, not treated as direct CPU timing comparisons with it.
