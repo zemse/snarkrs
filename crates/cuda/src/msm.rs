@@ -5843,6 +5843,11 @@ mod tests {
                     m.shapes.scatter_rows
                 );
                 for (name, v) in phases.iter().zip(&t) {
+                    assert_eq!(v.len(), reps);
+                    println!(
+                        "phase_samples {set} {group} n={n} c={} phase={name} ms={v:?}",
+                        geometry.c,
+                    );
                     let mut s = v.clone();
                     s.sort_by(f64::total_cmp);
                     line += &format!(

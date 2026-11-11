@@ -49,3 +49,27 @@ Addition call sites are not counts of generic field arithmetic. Identity,
 equality and cancellation branches, and the offset ladders, must be accounted
 for before deriving an arithmetic floor. No measured G2 or strided-store floor
 is accepted yet.
+
+## Collecting phase samples on the GPU host
+
+The timing harness emits every measured sample after checking all warm and
+measured answers against the CPU. The parser requires all 88 phase rows, exact
+repetition counts and successful single-test completion. It rejects duplicates,
+unexpected shapes, missing phases and invalid numeric samples. It does not
+replace the independent full-proof oracle or attest the build provenance.
+
+```sh
+G16_CUDA_MEMORY_TRACE=0 G16_CUDA_MSM_C=13 \
+G16_REVIEW_N=65536,262144 G16_REVIEW_SET=mixed,uniform G16_REVIEW_REPS=15 \
+cargo test --locked -p snarkrs-cuda --features cuda --release --lib -- \
+  --ignored --exact msm::tests::variable_work_phase_timings --nocapture \
+  > "$TMPDIR/msm-phases.log" 2>&1 &&
+python3 bench/scripts/cuda_phase_samples.py "$TMPDIR/msm-phases.log" --reps 15
+```
+
+For a cross-built batch, invoke the matching prebuilt library test executable
+with the same test filter and environment instead of Cargo. `combine` and
+`batch_wall` use host wall time; other phases use CUDA events. Isolated phases
+insert waits and reuse scratch. The separate normal batch allocates scratch,
+so its device time need not equal the sum of isolated phase medians. These
+commands define the protocol; no GPU sample has yet been accepted for it.
