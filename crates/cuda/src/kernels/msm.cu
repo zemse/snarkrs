@@ -965,7 +965,10 @@ extern "C" __global__ void msm_segmented_constant_g2(const MsmEntry* entries,
 #endif // G16_MSM_CONSTANT_WORK
 
 // Fold each bucket's spilled partials into it. One thread per bucket row, and it looks
-// only at the slices its own run overlaps, so there is no search and no atomic.
+// only at the slices its own run overlaps, so there is no search and no atomic. The walk
+// is over the two spill slots of each such slice, in order, with one `pt_add` site: a
+// site per slot made this kernel twice the PTX for the same additions, and the driver
+// pays for PTX at every cold start.
 template <typename F>
 __device__ __forceinline__ void msm_merge_impl(Xyzz<F>* buckets,
                                                const Xyzz<F>* spill_pts,
@@ -992,13 +995,10 @@ __device__ __forceinline__ void msm_merge_impl(Xyzz<F>* buckets,
     u32 k_hi = (end - 1u) / p.slice_len;
 
     Xyzz<F> acc = buckets[row];
-    for (u32 k = k_lo; k <= k_hi; k++) {
-        u32 slot = 2u * (w * p.slices + k);
+    u32 last = 2u * (w * p.slices + k_hi) + 1u;
+    for (u32 slot = 2u * (w * p.slices + k_lo); slot <= last; slot++) {
         if (spill_rows[slot] == row) {
             acc = pt_add(acc, spill_pts[slot]);
-        }
-        if (spill_rows[slot + 1u] == row) {
-            acc = pt_add(acc, spill_pts[slot + 1u]);
         }
     }
     buckets[row] = acc;
@@ -1044,6 +1044,16 @@ extern "C" __global__ void msm_merge_g2(PtG2* buckets,
 // (see msm.rs for the numbers and the whole-plan range they refute).
 #define MERGE_TG 64
 
+// `pt_add` out of line, for the wide merge only. Inlined at its four call sites it made
+// msm_merge_wide_g2 8.96 MB and msm_merge_wide_g1 2.78 MB of PTX, 11.7 of the variable
+// unit's 43.0 MB, and `cuModuleLoadData` pays for PTX at every cold start even on a warm
+// cache hit (on a T4, 112 ms at 31.2 MB, 167 ms at 43.0). The wide merge runs only on
+// rows spanning dozens of slices, so its additions are few.
+template <typename F>
+__device__ __noinline__ Xyzz<F> msm_wide_add(Xyzz<F> a, Xyzz<F> b) {
+    return pt_add(a, b);
+}
+
 template <typename F>
 __device__ __forceinline__ void msm_merge_wide_impl(Xyzz<F>* buckets,
                                                     const Xyzz<F>* spill_pts,
@@ -1073,10 +1083,10 @@ __device__ __forceinline__ void msm_merge_wide_impl(Xyzz<F>* buckets,
     for (u32 k = k_lo + tid; k <= k_hi; k += tcount) {
         u32 slot = 2u * (w * p.slices + k);
         if (spill_rows[slot] == row) {
-            acc = pt_add(acc, spill_pts[slot]);
+            acc = msm_wide_add(acc, spill_pts[slot]);
         }
         if (spill_rows[slot + 1u] == row) {
-            acc = pt_add(acc, spill_pts[slot + 1u]);
+            acc = msm_wide_add(acc, spill_pts[slot + 1u]);
         }
     }
     shared[tid] = acc;
@@ -1084,12 +1094,12 @@ __device__ __forceinline__ void msm_merge_wide_impl(Xyzz<F>* buckets,
     for (u32 s = 1; s < tcount; s <<= 1) {
         __syncthreads();
         if ((tid & ((s << 1) - 1u)) == 0u && tid + s < tcount) {
-            shared[tid] = pt_add(shared[tid], shared[tid + s]);
+            shared[tid] = msm_wide_add(shared[tid], shared[tid + s]);
         }
     }
     __syncthreads();
     if (tid == 0u) {
-        buckets[row] = pt_add(buckets[row], shared[0]);
+        buckets[row] = msm_wide_add(buckets[row], shared[0]);
     }
 }
 
