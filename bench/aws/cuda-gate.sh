@@ -2,9 +2,9 @@
 # The CUDA device gate on a T4, from this Mac: cross-build the CUDA test binaries and the CLI,
 # ship them with the fixtures, and run cuda-gate-guest.sh on the box.
 #
-# This never calls aws. The box comes from t4.sh, which lives outside the repo: it starts the
-# instance, holds the GPU lock while the gate runs, and stops the box at the last release.
-# T4_BOX (and anything else t4.sh reads) passes through, so a lane gates on its own box.
+# t4.sh uses an already-running, independently deadline-armed instance. Its detached job
+# supervisor holds the guest GPU lock; exact-token cleanup stops the last released lease.
+# A disconnect leaves the batch and lease intact for resume, never an unconditional release.
 #
 # The gate: a warm-up that compiles every kernel unit into the box's caches (so a cold box
 # or a .cu edit costs time, never a step's cap), the lib's tests and its ignored device
@@ -16,7 +16,7 @@
 # minutes cold, so it runs only with --every-variant.
 #
 # usage: cuda-gate.sh [--every-variant] [--no-build]
-#   env: G16_T4            path to t4.sh (required)
+#   env: G16_T4            path to t4.sh (default bench/aws/t4.sh)
 #        G16_T4_LANE       lease name on the box (default gate)
 #        G16_ARTIFACTS     artifact root with tiny_mul and sha256 (default bench/artifacts)
 #        CARGO_TARGET_DIR  (default target/cuda-gate)
@@ -25,7 +25,7 @@
 # reuses the verifier too. An explicit G16_GNARK_VERIFIER is never rebuilt.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")/../.." && pwd)"
-T4="${G16_T4:?set G16_T4 to the t4.sh helper}"
+T4="${G16_T4:-$HERE/bench/aws/t4.sh}"
 LANE="${G16_T4_LANE:-gate}"
 ART="${G16_ARTIFACTS:-$HERE/bench/artifacts}"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HERE/target/cuda-gate}"
@@ -102,6 +102,7 @@ cp "$VERIFIER" "$SHIP/bin/gnark-verifier"
 cp bench/aws/cuda-gate-guest.sh "$SHIP/"
 echo "    $(du -sh "$SHIP" | cut -f1) to ship, $(git rev-parse --short HEAD)$(git diff --quiet HEAD || echo ' (dirty)')"
 
-# Released on every exit, so the box stops as soon as the gate is done or fails.
-trap '"$T4" release "$LANE" || true' EXIT
-"$T4" run "$LANE" "$SHIP" -- bash cuda-gate-guest.sh ${GUEST_ARGS[@]+"${GUEST_ARGS[@]}"}
+# The runner releases its exact token only after terminal status and results are retrieved.
+"$T4" run "$LANE" "$SHIP" -- bash -c \
+  'set -euo pipefail; source "$HOME/g16-env.sh"; exec bash cuda-gate-guest.sh "$@"' \
+  cuda-gate ${GUEST_ARGS[@]+"${GUEST_ARGS[@]}"}
