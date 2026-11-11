@@ -187,6 +187,35 @@ class JobTests(unittest.TestCase):
         self.assertFalse(job.status("a")["terminal"])
 
 
+class TransferTests(unittest.TestCase):
+    def setUp(self):
+        self.remote = object.__new__(t4.Remote)
+        self.remote.options = []
+        self.remote.host = "ubuntu@192.0.2.1"
+        self.job = {"token": "0" * 32, "deadline": "1970-01-01T01:16:40+00:00"}
+
+    def test_large_payload_uses_remaining_deadline_not_ten_minute_cap(self):
+        with patch.object(t4.time, "time", return_value=1000), \
+                patch.object(self.remote, "call") as call:
+            self.remote.prepare(self.job, Path("payload"))
+        self.assertEqual([c.kwargs["timeout"] for c in call.call_args_list], [30, 600, 3300])
+
+    def test_expiring_deadline_makes_no_transfer_calls(self):
+        with patch.object(t4.time, "time", return_value=4301), \
+                patch.object(self.remote, "call") as call:
+            with self.assertRaisesRegex(ValueError, "insufficient deadline"):
+                self.remote.prepare(self.job, Path("payload"))
+        call.assert_not_called()
+
+    def test_budget_is_rechecked_before_payload(self):
+        with patch.object(t4.time, "time", side_effect=[1000, 1000, 4301]), \
+                patch.object(self.remote, "call") as call:
+            with self.assertRaisesRegex(ValueError, "insufficient deadline"):
+                self.remote.prepare(self.job, Path("payload"))
+        self.assertEqual(call.call_count, 2)
+        self.assertNotIn("-r", call.call_args.args[0])
+
+
 class RunnerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

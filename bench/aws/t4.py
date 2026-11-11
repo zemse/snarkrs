@@ -46,14 +46,21 @@ class Remote:
         return result
 
     def prepare(self, job, ship):
+        def transfer_budget():
+            seconds = datetime.fromisoformat(job["deadline"]).timestamp() - time.time() - 300
+            if seconds < 30:
+                raise ValueError("insufficient deadline remaining for transfer and workload")
+            return seconds
+
         root = f".cache/snarkrs/t4-jobs/{job['token']}"
         code = f"from pathlib import Path; (Path.home() / {root!r} / 'work').mkdir(parents=True, exist_ok=True)"
         self.call(["ssh", *self.options, self.host, shlex.join(["python3", "-c", code])],
-                  stdout=subprocess.PIPE)
+                  stdout=subprocess.PIPE, timeout=min(30, transfer_budget()))
         self.call(["scp", *self.options, str(Path(__file__).with_name("t4-job.py")),
-                   f"{self.host}:{root}/helper.py"], stdout=subprocess.PIPE, timeout=600)
+                   f"{self.host}:{root}/helper.py"], stdout=subprocess.PIPE,
+                  timeout=min(600, transfer_budget()))
         self.call(["scp", *self.options, "-r", str(ship) + "/.", f"{self.host}:{root}/work/"],
-                  stdout=subprocess.PIPE, timeout=600)
+                  stdout=subprocess.PIPE, timeout=transfer_budget())
 
     def argv(self, job, action):
         helper = f".cache/snarkrs/t4-jobs/{job['token']}/helper.py"
