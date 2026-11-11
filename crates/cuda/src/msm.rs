@@ -307,8 +307,7 @@ struct Geometry {
 }
 
 impl Geometry {
-    /// [`Self::with_shapes`] at the shipped shapes. Sizes are what `batch_words`
-    /// needs and the shapes change none of them.
+    /// [`Self::with_shapes`] at the shipped shapes.
     fn new(
         n: usize,
         scalar_off: usize,
@@ -772,7 +771,7 @@ fn output_words(g: &Geometry, pw: usize) -> Result<Vec<usize>, ProveError> {
         g.rows() * pw,
         checked_point_words(g.spill_slots(), pw)?,
         g.spill_slots(),
-        g.n_windows * pw,
+        g.window_sums() * pw,
     ]);
     if g.ones_groups != 0 {
         words.push(g.ones_groups * pw);
@@ -3537,6 +3536,32 @@ mod tests {
         );
         // An empty buffer still costs the word `alloc_words` pads it to.
         assert_eq!(vram_bytes(&[0, 1, 2]), 4 + 4 + 8);
+    }
+
+    #[test]
+    fn output_words_reserve_every_reduce_partial() {
+        for work in [Work::Variable, Work::Constant] {
+            for groups in [1, 2, 8, 32] {
+                let g = Geometry::with_shapes(
+                    1 << 16,
+                    0,
+                    1 << 16,
+                    13,
+                    SLICE_LEN,
+                    work,
+                    Shapes {
+                        reduce_groups: Some(groups),
+                        ..Shapes::default()
+                    },
+                )
+                .unwrap();
+                for pw in [G1_WORDS, G2_WORDS] {
+                    let words = output_words(&g, pw).unwrap();
+                    let window_slot = 2 * g.fold_levels().count() + 3;
+                    assert_eq!(words[window_slot], g.n_windows * groups * pw);
+                }
+            }
+        }
     }
 
     #[test]
