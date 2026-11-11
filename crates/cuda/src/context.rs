@@ -283,6 +283,7 @@ impl Cuda {
                 cc.1
             );
         }
+        trace_memory(&ctx, &stream, "after context open")?;
         Ok(Self {
             ctx,
             stream,
@@ -546,6 +547,24 @@ fn cache_disabled() -> bool {
 /// before the first kernel runs, which at small powers is most of the command.
 pub(crate) fn time_enabled() -> bool {
     std::env::var("G16_CUDA_TIME").as_deref() == Ok("1")
+}
+
+pub(crate) fn memory_trace_enabled() -> bool {
+    std::env::var("G16_CUDA_MEMORY_TRACE").as_deref() == Ok("1")
+}
+
+/// A synchronized free/total snapshot under `G16_CUDA_MEMORY_TRACE=1`, not a timing probe.
+pub(crate) fn trace_memory(
+    ctx: &CudaContext,
+    stream: &CudaStream,
+    phase: &str,
+) -> Result<(), DriverError> {
+    if memory_trace_enabled() {
+        stream.synchronize()?;
+        let (free, total) = ctx.mem_get_info()?;
+        eprintln!("cuda memory {phase}: free {free}, total {total} bytes");
+    }
+    Ok(())
 }
 
 /// `G16_CUDA_SYNC=spin|yield|blocking`: how a host thread waits in a synchronize, as the

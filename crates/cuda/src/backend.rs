@@ -61,7 +61,7 @@ use snarkrs_field::{Field, Fr};
 use snarkrs_formats::{Coefficients, HBasis, ProvingKey};
 use snarkrs_groth16::{Backend, HPoly, MsmOutputs, PreparedCircuit, ProveError, StageTimings};
 
-use crate::context::{bad, plan_lock, Cuda};
+use crate::context::{bad, drv, memory_trace_enabled, plan_lock, trace_memory, Cuda};
 use crate::msm::{device_budget, too_big, CudaMsm, Work};
 use crate::stages::{CudaStages, HHandle, TAG};
 
@@ -89,6 +89,8 @@ pub struct PrepareCost {
 /// `G16_CUDA_VRAM_RESERVE` leaves extra bytes free when planning uploads, stage scratch
 /// and MSMs, in addition to the existing 64 MiB allowance. It defaults to zero and is not
 /// a process-wide allocation cap; other contexts and processes can still consume memory.
+/// `G16_CUDA_MEMORY_TRACE=1` prints synchronized phase snapshots and requested/allocated
+/// buffer sizes. Its extra synchronization makes those runs unsuitable for timing.
 pub struct CudaBackend {
     work: Work,
     cuda: Cuda,
@@ -385,6 +387,12 @@ impl CudaCircuit {
         // in-flight proof down with it.
         let t0 = Instant::now();
         let stages = CudaStages::from_module(&backend.cuda, backend.stages_module.clone(), &pk)?;
+        trace_memory(
+            backend.cuda.context(),
+            backend.cuda.stream(),
+            "after stage uploads",
+        )
+        .map_err(|e| drv("trace stage upload memory", e))?;
         let stages = if backend.work == Work::Constant {
             stages.constant_work()
         } else {
@@ -402,6 +410,12 @@ impl CudaCircuit {
         // flag that the packed layout encodes as all-zero coordinates instead.
         let t1 = Instant::now();
         let msm = CudaMsm::from_module(&backend.cuda, backend.msm_module()?)?.with_key(&pk)?;
+        trace_memory(
+            backend.cuda.context(),
+            backend.cuda.stream(),
+            "after base uploads",
+        )
+        .map_err(|e| drv("trace base upload memory", e))?;
         release_queries(&mut pk);
         let msm = if backend.work == Work::Constant {
             msm.constant_work()
@@ -605,10 +619,19 @@ impl PreparedCircuit for CudaCircuit {
 /// each buffer rounded up to the 2 MiB pages the driver maps it in.
 fn resident_bytes(pk: &ProvingKey) -> u64 {
     const PAGE: u64 = 2 << 20;
-    CudaStages::key_buffers(pk)
+    let tables = CudaStages::key_buffers(pk);
+    let bases = CudaMsm::key_buffers(pk);
+    let scratch = CudaStages::scratch_buffers(pk.domain_size, pk.n_vars);
+    if memory_trace_enabled() {
+        eprintln!(
+            "cuda memory resident plan: domain {}, vars {}, tables {tables:?}, bases {bases:?}, stage scratch {scratch:?} bytes",
+            pk.domain_size, pk.n_vars,
+        );
+    }
+    tables
         .into_iter()
-        .chain(CudaMsm::key_buffers(pk))
-        .chain(CudaStages::scratch_buffers(pk.domain_size, pk.n_vars))
+        .chain(bases)
+        .chain(scratch)
         .map(|b| b.div_ceil(PAGE) * PAGE)
         .sum()
 }

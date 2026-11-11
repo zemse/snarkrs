@@ -88,7 +88,9 @@ use snarkrs_gpu_layout::{
 };
 use snarkrs_groth16::{HPoly, MsmOutputs, ProveError, StageTimings};
 
-use crate::context::{bad, drv, elapsed_us, plan_lock, upload_words};
+use crate::context::{
+    bad, drv, elapsed_us, memory_trace_enabled, plan_lock, trace_memory, upload_words,
+};
 use crate::stages::{HHandle, Staging, TAG};
 use crate::{as_words, from_words, kernels, Cuda};
 
@@ -816,10 +818,16 @@ pub(crate) fn device_budget(
     stream
         .synchronize()
         .map_err(|e| drv("synchronize before the memory query", e))?;
-    let (free, _) = ctx
+    let (free, total) = ctx
         .mem_get_info()
         .map_err(|e| drv("query device memory", e))?;
-    Ok(budget_bytes(free as u64, limit, reserve))
+    let budget = budget_bytes(free as u64, limit, reserve);
+    if memory_trace_enabled() {
+        eprintln!(
+            "cuda memory budget: free {free}, total {total}, reserve {reserve}, limit {limit:?}, available {budget} bytes"
+        );
+    }
+    Ok(budget)
 }
 
 /// Shortest run [`CudaMsm::fit_runs`] cuts an MSM into before it refuses. A run of 2^10
@@ -2413,7 +2421,10 @@ impl CudaMsm {
         let (mut plans, mut outs) = (Vec::new(), Vec::new());
         let result = self.run_batch(jobs, &mut plans, &mut outs);
         self.recycle(plans, outs);
-        result
+        let out = result?;
+        trace_memory(&self.ctx, &self.stream, "after MSM scratch recycle")
+            .map_err(|e| drv("trace recycled MSM memory", e))?;
+        Ok(out)
     }
 
     fn run_batch<'a>(
@@ -2441,6 +2452,14 @@ impl CudaMsm {
             }
         }
 
+        if memory_trace_enabled() {
+            eprintln!(
+                "cuda memory MSM batch: jobs {}, requested {} bytes, arena {}",
+                jobs.len(),
+                self.batch_bytes(jobs)?,
+                self.arena.is_some(),
+            );
+        }
         if let Some(budget) = self.vram_budget()? {
             let need = self.batch_bytes(jobs)?;
             if need > budget {
@@ -2502,6 +2521,38 @@ impl CudaMsm {
         outs.reserve(jobs.len());
         for (i, job) in jobs.iter().enumerate() {
             outs.push(Outputs::new(self, job, &plans[job_plan[i]])?);
+        }
+
+        if memory_trace_enabled() {
+            for (i, plan) in plans.iter().enumerate() {
+                eprintln!(
+                    "cuda memory MSM plan {i}: {:?}, buffers {:?} words",
+                    plan.geometry,
+                    [plan.counts.len(), plan.cursor.len(), plan.entries.len()],
+                );
+            }
+            for (i, (job, out)) in jobs.iter().zip(outs.iter()).enumerate() {
+                let plan = &plans[job_plan[i]];
+                let mut allocated = Vec::new();
+                for fold in &out.folds {
+                    allocated.extend([fold.pts.len(), fold.rows.len()]);
+                }
+                allocated.extend([
+                    out.buckets.len(),
+                    out.spill_pts.len(),
+                    out.spill_rows.len(),
+                    out.window_sums.len(),
+                ]);
+                if let Some(ones) = &out.ones {
+                    allocated.push(ones.len());
+                }
+                eprintln!(
+                    "cuda memory MSM job {i}: plan {}, group {:?}, requested {:?}, allocated {allocated:?} words",
+                    job_plan[i], job.group(), output_words(plan, job.group().words())?,
+                );
+            }
+            trace_memory(&self.ctx, &self.stream, "after MSM batch allocation")
+                .map_err(|e| drv("trace MSM batch memory", e))?;
         }
 
         // ---- launch ----
@@ -2698,13 +2749,17 @@ impl CudaMsm {
             }
             Ok(most)
         };
-        fit_run(cap, budget, need)?.map_err(|need| {
+        let run = fit_run(cap, budget, need)?.map_err(|need| {
             too_big(
                 need,
                 budget,
                 &format!("an MSM cut into runs of {MIN_RUN} points"),
             )
-        })
+        })?;
+        if memory_trace_enabled() {
+            eprintln!("cuda memory MSM selected run: cap {cap}, run {run}, budget {budget} bytes");
+        }
+        Ok(run)
     }
 
     /// The jobs of one batch of [`resident_schedule`]: a run of the witness is A and both B,

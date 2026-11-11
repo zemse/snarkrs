@@ -54,7 +54,7 @@ use snarkrs_formats::{Coefficients, HBasis, Matrix, ProvingKey};
 use snarkrs_gpu_layout::{Packed, PackedFr, PackedScalar};
 use snarkrs_groth16::{HPoly, ProveError, StageTimings};
 
-use crate::context::{bad, download, drv, elapsed_us, plan_lock, upload_words};
+use crate::context::{bad, download, drv, elapsed_us, plan_lock, trace_memory, upload_words};
 use crate::{from_words, kernels, Cuda};
 
 /// The tag on [`snarkrs_groth16::HPoly::Device`] values produced here. A handle carrying any
@@ -1508,7 +1508,7 @@ impl CudaStages {
         };
         let host_witness = unsafe { self.ctx.alloc_pinned::<u32>(host_words) }
             .map_err(|e| drv("allocate pinned witness staging", e))?;
-        Ok(Scratch {
+        let sc = Scratch {
             host_witness,
             witness: words(self.n_vars)?,
             witness_std: words(self.n_vars)?,
@@ -1521,7 +1521,10 @@ impl CudaStages {
             unused: words(1)?,
             ev: Events::new(&self.ctx)?,
             staging: None,
-        })
+        };
+        trace_memory(&self.ctx, &self.stream, "after stage scratch allocation")
+            .map_err(|e| drv("trace stage scratch memory", e))?;
+        Ok(sc)
     }
 }
 
