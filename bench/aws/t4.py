@@ -209,15 +209,23 @@ class T4:
 
     def stop_locked(self):
         # A failed or timed-out stop never clears the last lease.
-        self.aws("ec2", "stop-instances", "--instance-ids", self.instance)
         try:
-            self.wait_stopped()
-        except TimeoutError:
-            if self.describe()["State"]["Name"] != "stopping":
-                raise ValueError("instance changed before forced stop")
-            self.aws("ec2", "stop-instances", "--instance-ids", self.instance,
-                     "--force", "--skip-os-shutdown")
-            self.wait_stopped()
+            self.aws("ec2", "stop-instances", "--instance-ids", self.instance)
+            try:
+                self.wait_stopped()
+            except TimeoutError:
+                if self.describe()["State"]["Name"] != "stopping":
+                    raise ValueError("instance changed before forced stop")
+                self.aws("ec2", "stop-instances", "--instance-ids", self.instance,
+                         "--force", "--skip-os-shutdown")
+                self.wait_stopped()
+        except RuntimeError as error:
+            if not re.match(r"^AWS ec2 stop-instances failed: An error occurred "
+                            r"\(IncorrectInstanceState\) when calling the StopInstances operation:", str(error)):
+                raise
+            if self.describe()["State"]["Name"] != "stopped":
+                raise
+            print(f"t4: WARNING: {error}; independently confirmed stopped", file=sys.stderr)
 
     def release(self, lane, token):
         with self.locked():

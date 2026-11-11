@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Host-only T4 lifecycle tests. Every AWS request uses an in-process fake."""
 import importlib.util
+import io
 import json
 import multiprocessing
 import os
@@ -37,6 +38,7 @@ class AWS:
         self.owner = "bench-runner"
         self.identity = f"arn:aws:iam::{ACCOUNT}:user/bench-runner"
         self.fail_stop = False
+        self.stop_responses = []
         self.stop_at = datetime.now(timezone.utc) + timedelta(minutes=30)
         self.schedule_patch = {}
         self.payload = {"InstanceIds": [INSTANCE], "Force": True, "SkipOsShutdown": True}
@@ -62,6 +64,9 @@ class AWS:
                                  "Input": json.dumps(self.payload)}}
             result.update(self.schedule_patch)
         elif action == ("ec2", "stop-instances"):
+            if self.stop_responses:
+                code, self.state, diagnostic = self.stop_responses.pop(0)
+                return subprocess.CompletedProcess(args, code, "{}" if code == 0 else "", diagnostic)
             if self.fail_stop:
                 return subprocess.CompletedProcess(args, 1, "", "mock stop failure")
             self.state = "stopped"
@@ -230,6 +235,58 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(self.controller.load()["leases"], {"a": lease["token"]})
         with self.assertRaisesRegex(ValueError, "leases exist"):
             self.controller.stop_idle()
+
+    def test_incorrect_instance_state_accepts_only_confirmed_stopped(self):
+        diagnostic = ("An error occurred (IncorrectInstanceState) when calling the "
+                      "StopInstances operation: instance is not in a stoppable state")
+        lease = self.controller.acquire("a")
+        for state in ("running", "stopping", "pending"):
+            with self.subTest(state=state):
+                self.aws.state = "running"
+                self.aws.stop_responses = [(254, state, diagnostic)]
+                with self.assertRaisesRegex(RuntimeError, "IncorrectInstanceState"):
+                    self.controller.release("a", lease["token"])
+                self.assertEqual(self.controller.load()["leases"], {"a": lease["token"]})
+                self.assertTrue(all("--force" not in call for call in self.stops()))
+        self.aws.state = "running"
+        self.aws.stop_responses = [(254, "stopped", diagnostic)]
+        with patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            self.assertTrue(self.controller.release("a", lease["token"])["released"])
+        self.assertIn("WARNING", stderr.getvalue())
+        self.assertIn(diagnostic, stderr.getvalue())
+        self.assertEqual(self.controller.load()["leases"], {})
+        calls = len(self.aws.calls)
+        self.assertFalse(self.controller.release("a", lease["token"])["released"])
+        self.assertEqual(len(self.aws.calls), calls)
+
+    def test_other_stop_errors_remain_errors_even_when_stopped(self):
+        lease = self.controller.acquire("a")
+        for code, diagnostic in (
+                (254, "An error occurred (UnauthorizedOperation) when calling the StopInstances operation: denied"),
+                (255, "Could not connect to the endpoint URL"),
+                (255, "connection failed: IncorrectInstanceState")):
+            with self.subTest(code=code, diagnostic=diagnostic):
+                self.aws.state = "running"
+                self.aws.stop_responses = [(code, "stopped", diagnostic)]
+                with self.assertRaises(RuntimeError) as error:
+                    self.controller.release("a", lease["token"])
+                self.assertIn(diagnostic, str(error.exception))
+                self.assertEqual(self.aws.calls[-1][:2], ["ec2", "stop-instances"])
+                self.assertEqual(self.controller.load()["leases"], {"a": lease["token"]})
+                self.assertTrue(all("--force" not in call for call in self.stops()))
+
+    def test_forced_stop_state_race_warns_after_confirming_stopped(self):
+        diagnostic = ("An error occurred (IncorrectInstanceState) when calling the "
+                      "StopInstances operation: independent shutdown completed")
+        lease = self.controller.acquire("a")
+        self.aws.stop_responses = [(0, "stopping", ""), (254, "stopped", diagnostic)]
+        with patch.object(self.controller, "wait_stopped", side_effect=TimeoutError):
+            with patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                self.assertTrue(self.controller.release("a", lease["token"])["released"])
+        self.assertIn(diagnostic, stderr.getvalue())
+        self.assertEqual(len(self.stops()), 2)
+        self.assertIn("--force", self.stops()[1])
+        self.assertEqual(self.controller.load()["leases"], {})
 
     def test_timeout_rechecks_state_before_force(self):
         lease = self.controller.acquire("a")
