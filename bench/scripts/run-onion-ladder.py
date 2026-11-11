@@ -27,7 +27,7 @@ def observe(variant):
     proof, public = OUT / f"{variant}-proof.json", OUT / f"{variant}-public.json"
     command = [str(ROOT / "target/release/snarkrs"), "groth16", "prove",
                str(artifact / "circuit.zkey"), str(artifact / "circuit.wtns"),
-               str(proof), str(public), "--backend", "cuda"]
+               str(proof), str(public), "--backend", "cuda", "--fallback", "false"]
     samples = []
     started = time.monotonic()
     with (OUT / f"{variant}-first.log").open("w") as log:

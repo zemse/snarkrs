@@ -71,6 +71,8 @@ class ComparisonOracleTests(unittest.TestCase):
                         contextlib.redirect_stdout(io.StringIO()):
                     comparison.main()
                     self.assertEqual(cold_call.call_args.args[1], cold)
+                    self.assertEqual(cold_call.call_args.args[0][-4:],
+                                     ["--backend", "cpu", "--fallback", "false"])
             except SystemExit as error:
                 status = error.code
             finally:
@@ -119,6 +121,40 @@ class ComparisonOracleTests(unittest.TestCase):
         missing = dict(row)
         del missing["ms"]
         self.assertFalse(comparison.valid_warm_rows([missing], "tiny", "cuda", 1))
+
+    def test_cold_cuda_refusal_disables_fallback_and_fails_without_verification(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            variant = root / "bench/artifacts/refused"
+            variant.mkdir(parents=True)
+            binary = root / "target/release/snarkrs"
+            binary.parent.mkdir(parents=True)
+            binary.touch()
+            args = ["run-comparison.py", "--variants", "refused", "--reps", "1",
+                    "--backends", "cuda", "--csv", str(root / "result.csv"),
+                    "--skip-rapidsnark", "--fail-fast"]
+            with mock.patch.object(sys, "argv", args), \
+                    mock.patch.object(comparison, "HERE", root / "bench"), \
+                    mock.patch.object(comparison, "ART", variant.parent), \
+                    mock.patch.object(comparison, "detect_machine", return_value="fixture"), \
+                    mock.patch.object(comparison, "detect_gpu", return_value="fixture"), \
+                    mock.patch.object(comparison, "load_average", return_value=0), \
+                    mock.patch.object(comparison, "sh", return_value=subprocess.CompletedProcess(
+                        [], 1, "", "device memory refused")) as launch, \
+                    mock.patch.object(comparison, "matches_reference") as reference, \
+                    mock.patch.object(comparison, "verify_fast") as verify, \
+                    mock.patch.object(comparison, "verify_snarkjs") as snarkjs, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(SystemExit, "refused/ours/cuda/cold: exit 1"):
+                    comparison.main()
+            launch.assert_called_once_with([
+                str(binary), "groth16", "prove", str(variant / "circuit.zkey"),
+                str(variant / "circuit.wtns"), "/tmp/g16bench_proof.json",
+                "/tmp/g16bench_public.json", "--backend", "cuda", "--fallback", "false"])
+            reference.assert_not_called()
+            verify.assert_not_called()
+            snarkjs.assert_not_called()
+            self.assertFalse((root / "result.csv").exists())
 
     def test_cold_proof_for_different_public_digest_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -274,7 +274,7 @@ def main():
             configs.append((f"ours", b, "cold",
                             [str(g16), "groth16", "prove", str(zkey), str(wtns),
                              "/tmp/g16bench_proof.json", "/tmp/g16bench_public.json",
-                             "--backend", b]))
+                             "--backend", b, "--fallback", "false"]))
 
         for prover, backend, mode, cmd in configs:
             ms, err = time_cold(cmd, cold_reps, vkey,

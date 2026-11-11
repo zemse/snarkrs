@@ -3,6 +3,7 @@ import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 
 spec = importlib.util.spec_from_file_location("ladder", Path(__file__).with_name("run-onion-ladder.py"))
@@ -26,6 +27,39 @@ class OnionLadderTests(unittest.TestCase):
                 writer.writeheader()
                 writer.writerows(rows)
             return ladder.validate(path, [f"onion_p{p}" for p in range(21, 25)], 3, 5)
+
+    def test_cuda_observation_disables_fallback_and_refusal_skips_verification(self):
+        for code in (0, 1):
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                artifact = root / "bench/artifacts/onion_p21"
+                process = mock.Mock(pid=123, returncode=code)
+                process.poll.side_effect = [None, code, code]
+                with mock.patch.object(ladder, "ROOT", root), \
+                        mock.patch.object(ladder, "OUT", root), \
+                        mock.patch.object(ladder.subprocess, "Popen", return_value=process) as launch, \
+                        mock.patch.object(Path, "read_text", return_value="VmHWM: 1024 kB\nMemAvailable: 8388608 kB\n"), \
+                        mock.patch.object(ladder, "device_memory", return_value=[1024, 15360]), \
+                        mock.patch.object(ladder.time, "sleep"), \
+                        mock.patch.object(ladder, "matches_reference", return_value=True) as reference, \
+                        mock.patch.object(ladder.subprocess, "run", return_value=mock.Mock(
+                            returncode=0, stdout="Result: Valid proof", stderr="")) as verify:
+                    if code:
+                        with self.assertRaisesRegex(RuntimeError, "CUDA first proof failed: 1"):
+                            ladder.observe("onion_p21")
+                        reference.assert_not_called()
+                        verify.assert_not_called()
+                    else:
+                        result = ladder.observe("onion_p21")
+                        self.assertTrue(result["independently_verified"])
+                        self.assertEqual(verify.call_count, 2)
+                    self.assertEqual(launch.call_args.args[0], [
+                        str(root / "target/release/snarkrs"), "groth16", "prove",
+                        str(artifact / "circuit.zkey"), str(artifact / "circuit.wtns"),
+                        str(root / "onion_p21-proof.json"), str(root / "onion_p21-public.json"),
+                        "--backend", "cuda", "--fallback", "false"])
+                    process.wait.assert_called_once()
+                    process.kill.assert_not_called()
 
     def test_complete_ladder(self):
         summary = self.validate(self.rows())
