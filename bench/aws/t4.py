@@ -75,7 +75,7 @@ class T4:
         instance = instances[0]
         tags = {t["Key"]: t["Value"] for t in instance.get("Tags", [])}
         if (instance.get("InstanceId") != self.instance or tags.get("Owner") != self.owner or
-                instance.get("InstanceType") != "g4dn.xlarge"):
+                instance.get("InstanceType") not in ("g4dn.xlarge", "g4dn.2xlarge", "g4dn.4xlarge")):
             raise ValueError("instance ID, Owner or T4 type mismatch")
         return instance
 
@@ -98,7 +98,8 @@ class T4:
         target = actual.get("Target", {})
         payload = json.loads(target.get("Input", "null"))
         if (target.get("Arn") != deadline.TARGET or target.get("RoleArn") != self.role or
-                not isinstance(payload, dict) or payload.get("InstanceIds") != [self.instance]):
+                not isinstance(payload, dict) or payload.get("InstanceIds") != [self.instance] or
+                payload.get("Force") is not True or payload.get("SkipOsShutdown") is not True):
             raise ValueError("independent deadline target mismatch")
         return stop_at.isoformat()
 
@@ -183,8 +184,9 @@ class T4:
         with self.locked():
             state = self.load()
             instance = self.describe()
-            return {"instance": self.instance, "state": instance["State"]["Name"],
-                    "leases": sorted(state["leases"]), "boot": state.get("boot")}
+            return {"instance": self.instance, "instance_type": instance["InstanceType"],
+                    "state": instance["State"]["Name"], "leases": sorted(state["leases"]),
+                    "boot": state.get("boot")}
 
 
 def main():

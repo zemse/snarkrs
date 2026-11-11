@@ -32,6 +32,7 @@ class AWS:
     def __init__(self):
         self.calls = []
         self.state = "running"
+        self.instance_type = "g4dn.xlarge"
         self.boot = "2026-01-01T00:00:00Z"
         self.owner = "bench-runner"
         self.identity = f"arn:aws:iam::{ACCOUNT}:user/bench-runner"
@@ -49,7 +50,7 @@ class AWS:
             result = {"Account": ACCOUNT, "Arn": self.identity}
         elif action == ("ec2", "describe-instances"):
             result = {"Reservations": [{"Instances": [{"InstanceId": INSTANCE,
-                      "InstanceType": "g4dn.xlarge", "State": {"Name": self.state},
+                      "InstanceType": self.instance_type, "State": {"Name": self.state},
                       "Tags": [{"Key": "Owner", "Value": self.owner}],
                       "PublicIpAddress": "192.0.2.1", "LaunchTime": self.boot}]}]}
         elif action == ("scheduler", "get-schedule"):
@@ -155,6 +156,41 @@ class LifecycleTests(unittest.TestCase):
         self.controller.acquire("a")
         with self.assertRaisesRegex(ValueError, "already leased"):
             self.controller.acquire("a")
+        self.assertFalse(self.stops())
+
+    def test_supported_single_t4_types_report_actual_type(self):
+        for instance_type in ("g4dn.xlarge", "g4dn.2xlarge", "g4dn.4xlarge"):
+            with self.subTest(instance_type=instance_type):
+                self.aws.instance_type = instance_type
+                lease = self.controller.acquire("a")
+                self.assertEqual(self.controller.status()["instance_type"], instance_type)
+                self.controller.release("a", lease["token"])
+                self.aws.state = "running"
+
+    def test_unsupported_types_refuse_acquire_and_stop(self):
+        for instance_type in ("g5.xlarge", "g4dn.12xlarge", "c6i.2xlarge"):
+            with self.subTest(instance_type=instance_type):
+                self.aws.instance_type = instance_type
+                with self.assertRaisesRegex(ValueError, "T4 type mismatch"):
+                    self.controller.acquire("a")
+                with self.assertRaisesRegex(ValueError, "T4 type mismatch"):
+                    self.controller.stop_idle()
+                self.assertFalse(self.controller.load()["leases"])
+                self.assertFalse(self.stops())
+
+    def test_deadline_requires_boolean_force_and_skip_os_shutdown(self):
+        for flag in ("Force", "SkipOsShutdown"):
+            for value in (None, False, 0, 1, "true"):
+                with self.subTest(flag=flag, value=value):
+                    self.aws.payload = {"InstanceIds": [INSTANCE], "Force": True,
+                                        "SkipOsShutdown": True}
+                    if value is None:
+                        del self.aws.payload[flag]
+                    else:
+                        self.aws.payload[flag] = value
+                    with self.assertRaisesRegex(ValueError, "target mismatch"):
+                        self.controller.acquire("a")
+                    self.assertFalse(self.controller.load()["leases"])
         self.assertFalse(self.stops())
 
     def test_deadline_failures_never_grant_lease(self):
