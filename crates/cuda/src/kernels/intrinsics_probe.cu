@@ -3,12 +3,12 @@
 
 #ifdef G16_PROBE_G2
 extern "C" __global__ void intrinsic_g2(
-    const AffG2* input, PtG2* output, u32 steps, u32 offset)
+    const PtG2* input, PtG2* output, u32 steps, u32 offset)
 {
     u32 gid = blockIdx.x * blockDim.x + threadIdx.x;
-    PtG2 p = pt_from_affine(input[gid]);
+    PtG2 p = input[gid];
 #if G16_PROBE_G2 == 0
-    PtG2 q = pt_from_affine(input[gid + gridDim.x * blockDim.x]);
+    PtG2 q = input[gid + gridDim.x * blockDim.x];
 #endif
 #pragma unroll 1
     for (u32 i = 0; i < steps; i++) {

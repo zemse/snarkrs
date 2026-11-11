@@ -16,7 +16,9 @@
 //! queued timings may include host submission gaps. Launch builders are prepared before
 //! timing. Host submission includes intermediate waits in the per-launch-sync case;
 //! launch_sync_wall includes the end-event record and stream wait, not the start-event
-//! record. No-op work is explicitly separate from arithmetic/stores.
+//! record. No-op work is explicitly separate from arithmetic/stores. Reused/rotated
+//! stores describe buffer addresses: every sample follows a full-span host poison
+//! upload, not a fully cache-warm floor measurement.
 //! Timing method: NVIDIA CUDA Best Practices Guide, section 9.1.2:
 //! https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#using-cuda-gpu-timers
 //! Event precision: https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__EVENT.html
@@ -27,9 +29,9 @@ use ark_ec::AdditiveGroup;
 use cudarc::driver::{sys, CudaEvent, CudaFunction, LaunchConfig, PushKernelArg};
 use snarkrs_cuda::{as_words, from_words, Cuda};
 use snarkrs_field::{
-    AffineRepr, CurveGroup, Field, Fq, Fr, G2Affine, G2Projective, PrimeGroup, Zero,
+    AffineRepr, CurveGroup, Field, Fq, Fq2, Fr, G2Affine, G2Projective, PrimeGroup, Zero,
 };
-use snarkrs_gpu_layout::{PackedFq, PackedFq2, PackedG2Affine, Reduced};
+use snarkrs_gpu_layout::{PackedFq, PackedFq2, Reduced};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 const POISON: u32 = 0xa5c3_7e19;
@@ -326,11 +328,24 @@ fn verify_g2(words: &[u32], expected: G2Affine, n: usize) -> Result<()> {
     Ok(())
 }
 
+fn g2_xyzz_inputs(p: G2Affine, q: G2Affine, seed: u64) -> [[PackedFq2; 4]; 2] {
+    let zp = Fq2::new(Fq::from(seed) + Fq::from(3u32), Fq::from(5u32));
+    let zq = Fq2::new(Fq::from(seed) + Fq::from(11u32), Fq::from(7u32));
+    [(p, zp), (q, zq)].map(|(p, z)| {
+        let zz = z.square();
+        let zzz = zz * z;
+        [p.x * zz, p.y * zzz, zz, zzz].map(|v| PackedFq2::from_fq2(&v))
+    })
+}
+
 fn g2(cuda: &Cuda, c: &Config) -> Result<()> {
-    // Different nonidentity points avoid the first-add equality shortcut. All threads
-    // load valid runtime inputs; the oracle is shared because their chains are identical.
+    // Different nonidentity points avoid the first-add equality shortcut. Full runtime
+    // XYZZ inputs have distinct non-unit Fq2 scales; every thread has the same chain.
     let p = (G2Projective::generator() * Fr::from(c.seed)).into_affine();
     let q = (G2Projective::generator() * (Fr::from(c.seed) + Fr::from(17u32))).into_affine();
+    let [packed_p, packed_q] = g2_xyzz_inputs(p, q, c.seed);
+    verify_g2(as_words(&packed_p), p, 1)?;
+    verify_g2(as_words(&packed_q), q, 1)?;
     for (op, define, unit) in [
         ("add", "#define G16_PROBE_G2 0", "intrinsic_g2_add"),
         ("double", "#define G16_PROBE_G2 1", "intrinsic_g2_double"),
@@ -343,15 +358,17 @@ fn g2(cuda: &Cuda, c: &Config) -> Result<()> {
         let expected = expected_g2(p, q, op, c.steps, c.offset);
         for (shape_name, shape) in shapes(c, cuda)? {
             let n = shape.grid_dim.0 as usize * shape.block_dim.0 as usize;
-            let mut points = vec![PackedG2Affine::from_affine(&p); n];
-            points.extend(vec![PackedG2Affine::from_affine(&q); n]);
+            let points: Vec<PackedFq2> = std::iter::repeat_n(packed_p, n)
+                .chain(std::iter::repeat_n(packed_q, n))
+                .flatten()
+                .collect();
             let input = cuda.stream().clone_htod(as_words(&points))?;
             let poison = vec![POISON; n * 64];
             let mut output = cuda.stream().clone_htod(&poison)?;
             let label = format!("g2_{op}_{shape_name}");
             let calls = n as u64 * u64::from(c.steps);
             let bits = 32 - c.offset.leading_zeros();
-            println!("config label={label} blocks={} threads={} outputs={n} steps={} top_level_calls={calls} offset={} ladder_dbl_calls={} ladder_add_calls={} input_case=nonidentity_runtime_uniform exceptional_paths=possible_not_assumed_away", shape.grid_dim.0, shape.block_dim.0, c.steps, c.offset, if op == "offset" { calls * u64::from(bits) } else { 0 }, if op == "offset" { calls * u64::from(c.offset.count_ones()) } else { 0 });
+            println!("config label={label} blocks={} threads={} outputs={n} steps={} top_level_calls={calls} offset={} ladder_dbl_calls={} ladder_add_calls={} input_case=nonidentity_runtime_xyzz_distinct_nonunit_fq2_scales_uniform exceptional_paths=possible_not_assumed_away", shape.grid_dim.0, shape.block_dim.0, c.steps, c.offset, if op == "offset" { calls * u64::from(bits) } else { 0 }, if op == "offset" { calls * u64::from(c.offset.count_ones()) } else { 0 });
             measure(cuda, c, &label, |_, timer| {
                 cuda.stream().memcpy_htod(&poison, &mut output)?;
                 let sample = {
@@ -362,7 +379,8 @@ fn g2(cuda: &Cuda, c: &Config) -> Result<()> {
                         .arg(&c.steps)
                         .arg(&c.offset);
                     timer.run(|| {
-                        // SAFETY: input has two affine arrays; output has n complete XYZZ points.
+                        // SAFETY: input has two n-point XYZZ arrays, four packed Fq2 per 256B
+                        // record in x/y/zz/zzz order; output has n complete XYZZ points.
                         unsafe { launch.launch(shape) }?;
                         Ok(())
                     })?
@@ -589,7 +607,34 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use snarkrs_field::Fq2;
+    use snarkrs_gpu_layout::PackedG2Affine;
+
+    #[test]
+    fn scaled_xyzz_inputs_round_trip() {
+        assert_eq!(std::mem::size_of::<[PackedFq2; 4]>(), 256);
+        for seed in [1, 73, u64::MAX] {
+            let p = (G2Projective::generator() * Fr::from(seed)).into_affine();
+            let q = (G2Projective::generator() * (Fr::from(seed) + Fr::from(17u32))).into_affine();
+            let inputs = g2_xyzz_inputs(p, q, seed);
+            let mut scales = Vec::new();
+            for (packed, expected) in inputs.iter().zip([p, q]) {
+                verify_g2(as_words(packed), expected, 1).unwrap();
+                let decoded: Vec<PackedFq2> = from_words(as_words(packed)).unwrap();
+                let zz = decoded[2].to_fq2();
+                let zzz = decoded[3].to_fq2();
+                let z = zzz / zz;
+                assert!(!z.is_zero());
+                assert_ne!(z, Fq2::from(1u32));
+                assert!(!z.c0.is_zero() && !z.c1.is_zero());
+                assert_eq!(zz, z.square());
+                assert_eq!(zzz, z.square() * z);
+                assert_eq!(decoded[0].to_fq2() / zz, expected.x);
+                assert_eq!(decoded[1].to_fq2() / zzz, expected.y);
+                scales.push(z);
+            }
+            assert_ne!(scales[0], scales[1]);
+        }
+    }
 
     #[test]
     fn invalid_config_values_fail() {
