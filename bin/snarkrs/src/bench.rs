@@ -435,7 +435,14 @@ fn prove_command(
         .arg(v.wtns())
         .arg(proof)
         .arg(public)
-        .args(["--backend", args.backend.as_str(), "--self-verify", "false"]);
+        .args([
+            "--backend",
+            args.backend.as_str(),
+            "--self-verify",
+            "false",
+            "--fallback",
+            "false",
+        ]);
     if args.constant_work {
         cmd.arg("--constant-work");
     }
@@ -700,6 +707,56 @@ mod tests {
         let adx = if ADX_BMI2 { "yes" } else { "no" };
         assert!(line.ends_with(&format!(",{adx},6,7,8,9,10,yes")), "{line}");
         assert!(line.contains(",ours,cpu,warm,3,1.500,2.250,"), "{line}");
+    }
+
+    #[test]
+    fn cold_process_command_disables_fallback_and_leaves_verification_to_parent() {
+        for backend in [ProveBackend::Cpu, ProveBackend::Cuda] {
+            for constant_work in [false, true] {
+                let args = Args {
+                    artifacts: "artifacts".into(),
+                    variant: vec!["v".into()],
+                    reps: 1,
+                    backend,
+                    mode: Mode::ColdProcess,
+                    constant_work,
+                    csv: None,
+                    snarkjs: Some("independent verifier".into()),
+                    threads: Some(2),
+                };
+                let v = Variant {
+                    name: "v".into(),
+                    dir: args.artifacts.join("v"),
+                };
+                let cmd = prove_command(
+                    Path::new("snarkrs"),
+                    &v,
+                    &args,
+                    Path::new("proof.json"),
+                    Path::new("public.json"),
+                );
+                let mut expected = vec![
+                    "groth16".into(),
+                    "prove".into(),
+                    v.zkey().into_os_string(),
+                    v.wtns().into_os_string(),
+                    "proof.json".into(),
+                    "public.json".into(),
+                    "--backend".into(),
+                    backend.as_str().into(),
+                    "--self-verify".into(),
+                    "false".into(),
+                    "--fallback".into(),
+                    "false".into(),
+                ];
+                if constant_work {
+                    expected.push("--constant-work".into());
+                }
+                expected.extend(["--threads".into(), "2".into()]);
+                assert_eq!(cmd.get_program(), "snarkrs");
+                assert_eq!(cmd.get_args().collect::<Vec<_>>(), expected);
+            }
+        }
     }
 
     #[test]
