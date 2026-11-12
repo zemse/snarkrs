@@ -3,7 +3,7 @@
 #
 #   bench/scripts/run-benchmark.sh [--reps N] [--circuits "a b c"] [--no-download]
 #                                  [--snarkjs-reps N] [--skip-external]
-#                                  [--out FILE] [--note TEXT]
+#                                  [--out FILE] [--raw-dir DIR] [--note TEXT]
 #                                  [--no-build] [--commit SHA]
 #                                  [--max-foreign PCT] [--allow-loaded] [--guard-only]
 #
@@ -12,7 +12,8 @@
 # for against rapidsnark and snarkjs as well as our own backends, and writes one markdown
 # file named after the machine. Anything the box does not have is left blank in the table
 # rather than reported as a zero or an error, because a missing measurement and a
-# measurement of zero are not the same claim.
+# measurement of zero are not the same claim. Raw CSVs remain beside the report in a fresh
+# .raw.* directory, or in --raw-dir DIR (which must not exist), even if the run fails.
 #
 # The foreign CPU ceiling defaults to max(3x the median, highest + 50) over fifteen samples
 # taken at startup, capped at 200% of a core, and a run stops only when two checks in a row
@@ -36,6 +37,7 @@ SNARKJS_REPS="${G16_SNARKJS_REPS:-3}"
 DOWNLOAD=1
 EXTERNAL=1
 OUT_OVERRIDE=""
+RAW_DIR=""
 NOTE=""
 CIRCUITS="${G16_CIRCUITS:-sha256 keccak256 tornado rsa2048 anon-aadhaar}"
 
@@ -47,6 +49,7 @@ while [ $# -gt 0 ]; do
     --no-download)  DOWNLOAD=0; shift ;;
     --skip-external) EXTERNAL=0; shift ;;
     --out)          OUT_OVERRIDE="$2"; shift 2 ;;
+    --raw-dir)      RAW_DIR="$2"; shift 2 ;;
     --note)         NOTE="$2"; shift 2 ;;
     --max-foreign)  MAX_FOREIGN="$2"; shift 2 ;;
     --allow-loaded) ALLOW_LOADED=1; shift ;;
@@ -422,8 +425,15 @@ READY="$(echo "$READY" | xargs || true)"
 [ -n "$READY" ] || { echo "no circuits available, nothing to benchmark" >&2; exit 1; }
 
 # ---------------------------------------------------------------- benchmark
-TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+# Keep raw evidence on failure too. Each run owns a fresh directory, never an old CSV.
+mkdir -p "$(dirname "$OUT")"
+if [ -n "$RAW_DIR" ]; then
+  mkdir -- "$RAW_DIR"
+  TMP="$(cd -- "$RAW_DIR" && pwd)"
+else
+  TMP="$(mktemp -d "${OUT%.md}.raw.XXXXXX")"
+fi
+log "raw CSVs retained at $TMP"
 for b in $BACKENDS; do
   for c in $READY; do
     log "$c on $b"
