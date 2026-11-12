@@ -636,6 +636,10 @@ fn resident_bytes(pk: &ProvingKey) -> u64 {
         .sum()
 }
 
+#[cfg(test)]
+#[path = "pair_count_probe.rs"]
+mod pair_count_probe;
+
 /// Empties `pk`'s coefficients, which [`CudaStages`] has made resident and nothing reads
 /// from the host again. Through [`snarkrs_groth16::malloc::release`], for the reason it
 /// gives.

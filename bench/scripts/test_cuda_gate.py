@@ -118,7 +118,8 @@ exit "$VERIFIER_RC"
         for name in ("constant_work_legacy_override_gate",
                      "every_variant_gives_the_same_points",
                      "every_unit_compiles_on_the_device",
-                     "full_clear_device_poisoned_scope", "full_clear_device_msms"):
+                     "full_clear_device_poisoned_scope", "full_clear_device_msms",
+                     "pair_inventory_count_only"):
             self.assertIn(f"--skip {name}", generic)
         self.assertIn(":full=0:poison=0:legacy=0:required=1:", generic)
         for name in ("full_clear_device_poisoned_scope", "full_clear_device_msms"):

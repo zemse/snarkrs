@@ -156,6 +156,32 @@ fn split_passes(log_n: u32, max_fused: u32) -> Vec<Batch> {
     out
 }
 
+fn coefficient_launch_count(batches: &[Batch]) -> usize {
+    2 + 6 * batches.len()
+}
+
+#[cfg(test)]
+pub(crate) fn probe_coefficient_schedule(
+    n: usize,
+    max_fused: u32,
+) -> Result<(Vec<(u32, u32)>, usize), ProveError> {
+    if !n.is_power_of_two() || u32::try_from(n).is_err() {
+        return Err(bad("probe domain must be a power of two below 2^32"));
+    }
+    if !(1..=MAX_FUSED_PASSES).contains(&max_fused) {
+        return Err(bad(
+            "probe fused pass cap is outside the implementation limit",
+        ));
+    }
+    let domain = Domain::new(n).map_err(|e| bad(e.to_string()))?;
+    domain
+        .proving_coset_shift()
+        .map_err(|e| bad(format!("no 2n-th root of unity: {e}")))?;
+    let batches = split_passes(domain.log_size(), max_fused);
+    let launches = coefficient_launch_count(&batches);
+    Ok((batches.iter().map(|b| (b.s0, b.k)).collect(), launches))
+}
+
 // ---------------------------------------------------------------------------
 // Per-proof scratch
 // ---------------------------------------------------------------------------
@@ -850,7 +876,7 @@ impl CudaStages {
     /// that is read from the environment inside `compute_h` rather than here. The device
     /// test `compute_h_issues_launch_count_launches` counts the launches themselves.
     pub fn launch_count(&self) -> usize {
-        2 + 6 * self.batches.len()
+        coefficient_launch_count(&self.batches)
     }
 
     /// The `(s0, k)` pass split, for reporting.

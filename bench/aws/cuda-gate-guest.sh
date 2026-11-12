@@ -68,13 +68,15 @@ grep -E "^unit |^every unit" "$OUT/warm.txt" | sed 's/^/  /'
 
 # The lib's device tests, without those needing their own process or an hour: the
 # legacy and full-clear gates read their environment once per process, and the FFT
-# variant sweep is about 60 minutes cold.
+# variant sweep is about 60 minutes cold. The host-only pair inventory requires its
+# own explicit output and geometry configuration; it is not a device gate.
 step lib 10 env G16_REQUIRE_TESTS=1 "$BIN/lib" --test-threads=1
 step lib-ignored 20 env G16_REQUIRE_TESTS=1 G16_CUDA_MSM_LEGACY_ACC=0 "$BIN/lib" --ignored \
   --test-threads=1 --nocapture \
   --skip constant_work_legacy_override_gate --skip every_variant_gives_the_same_points \
   --skip every_unit_compiles_on_the_device \
-  --skip full_clear_device_poisoned_scope --skip full_clear_device_msms
+  --skip full_clear_device_poisoned_scope --skip full_clear_device_msms \
+  --skip pair_inventory_count_only
 
 # These gates need fresh processes with full clear and poison on, legacy off.
 # Require the named test and its one-test result, not just a successful process.
