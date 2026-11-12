@@ -6,6 +6,7 @@
 #                                  [--out FILE] [--raw-dir DIR] [--note TEXT]
 #                                  [--no-build] [--commit SHA]
 #                                  [--max-foreign PCT] [--allow-loaded] [--guard-only]
+#                                  [--strict-t4 --expected-host HOST]
 #
 # It works out what backends the box can actually run, builds only those, fetches any
 # missing proving keys from S3, benchmarks every circuit it has a complete artifact set
@@ -36,6 +37,8 @@ REPS="${G16_REPS:-15}"
 SNARKJS_REPS="${G16_SNARKJS_REPS:-3}"
 DOWNLOAD=1
 EXTERNAL=1
+STRICT_T4=0
+EXPECTED_HOST=""
 OUT_OVERRIDE=""
 RAW_DIR=""
 NOTE=""
@@ -48,6 +51,8 @@ while [ $# -gt 0 ]; do
     --snarkjs-reps) SNARKJS_REPS="$2"; shift 2 ;;
     --no-download)  DOWNLOAD=0; shift ;;
     --skip-external) EXTERNAL=0; shift ;;
+    --strict-t4)    STRICT_T4=1; shift ;;
+    --expected-host) EXPECTED_HOST="$2"; shift 2 ;;
     --out)          OUT_OVERRIDE="$2"; shift 2 ;;
     --raw-dir)      RAW_DIR="$2"; shift 2 ;;
     --note)         NOTE="$2"; shift 2 ;;
@@ -353,6 +358,47 @@ if [ "$EXTERNAL" -eq 1 ]; then
 fi
 PROVERS="$(echo "$PROVERS" | xargs || true)"
 
+# ---------------------------------------------------------------- strict T4 preflight
+strict_t4_preflight() {
+  [ "$STRICT_T4" = 1 ] || return 0
+  [ -n "$EXPECTED_HOST" ] && [ "$EXPECTED_HOST" != unknown ] && \
+    [ "$(hostname)" = "$EXPECTED_HOST" ] || {
+      echo "strict T4 requires --expected-host matching the live hostname" >&2; exit 2;
+    }
+  [ "$(uname -s)" = Linux ] && [ "$(uname -m)" = x86_64 ] && \
+    [ "$CORES" = 8 ] && [ "$MACHINE" = g4dn.2xlarge ] || {
+      echo "strict T4 requires Linux/x86_64, 8 logical cores, g4dn.2xlarge" >&2; exit 2;
+    }
+  [ "$BACKENDS" = "cpu cuda" ] || {
+    echo "strict T4 requires exactly cpu and cuda backends" >&2; exit 2;
+  }
+  [ "$EXTERNAL" = 1 ] && [ -n "$RAPIDSNARK" ] && [ -n "$RAPIDSNARK_WARM" ] && \
+    [ -n "$RAPIDSNARK_VERIFY" ] && [ -n "$SNARKJS" ] || {
+      echo "strict T4 requires all three rapidsnark binaries and SnarkJS" >&2; exit 2;
+    }
+  [ "$REPS" = 10 ] && [ "$SNARKJS_REPS" = 3 ] || {
+    echo "strict T4 requires exactly 10 reps and 3 SnarkJS reps" >&2; exit 2;
+  }
+  [ "${ALLOW_LOADED:-0}" = 0 ] || {
+    echo "strict T4 refuses --allow-loaded" >&2; exit 2;
+  }
+  local c seen="" count=0
+  for c in $CIRCUITS; do
+    case "$c" in
+      railgun-01x01|tornado|sha256|railgun-13x01|rsa2048|keccak256|anon-aadhaar) ;;
+      *) echo "strict T4: unexpected circuit $c" >&2; exit 2 ;;
+    esac
+    case " $seen " in
+      *" $c "*) echo "strict T4: duplicate circuit $c" >&2; exit 2 ;;
+    esac
+    seen="$seen $c"; count=$((count + 1))
+  done
+  [ "$count" = 7 ] || { echo "strict T4 requires all seven circuits" >&2; exit 2; }
+  # Presence is not proof of a working Node runtime or independent verification.
+  log "strict T4: CSV checks only, runtime/provenance/receipts and memory guards need separate attestation"
+}
+strict_t4_preflight
+
 # snarkjs never gets more reps than the run asked for overall.
 if [ "$SNARKJS_REPS" -gt "$REPS" ]; then SNARKJS_REPS="$REPS"; fi
 
@@ -422,6 +468,14 @@ for c in $CIRCUITS; do
   fi
 done
 READY="$(echo "$READY" | xargs || true)"
+if [ "$STRICT_T4" = 1 ]; then
+  for c in $CIRCUITS; do
+    case " $READY " in
+      *" $c "*) ;;
+      *) echo "strict T4: missing READY artifacts for $c, refusing all timings" >&2; exit 2 ;;
+    esac
+  done
+fi
 [ -n "$READY" ] || { echo "no circuits available, nothing to benchmark" >&2; exit 1; }
 
 # ---------------------------------------------------------------- benchmark
@@ -442,19 +496,21 @@ for b in $BACKENDS; do
     "$G16" bench --artifacts "$ARTIFACTS" --variant "$c" --backend "$b" \
                  --mode both --reps "$REPS" --csv "$TMP/${b}-${c}.csv" \
                  ${SNARKJS:+--snarkjs "$SNARKJS"} || \
-      echo "    $c on $b failed, leaving it out of the table"
+      { status=$?; [ "${STRICT_T4:-0}" != 1 ] || exit "$status";
+        echo "    $c on $b failed, leaving it out of the table"; }
     # `both` is cold-inprocess and warm. The table's cold column is one fresh process per
     # proof, the only cold rapidsnark and snarkjs have, so ours is measured that way too.
     "$G16" bench --artifacts "$ARTIFACTS" --variant "$c" --backend "$b" \
                  --mode cold-process --reps "$REPS" --csv "$TMP/${b}-${c}-process.csv" \
                  ${SNARKJS:+--snarkjs "$SNARKJS"} || \
-      echo "    $c on $b cold-process failed, leaving it out of the table"
+      { status=$?; [ "${STRICT_T4:-0}" != 1 ] || exit "$status";
+        echo "    $c on $b cold-process failed, leaving it out of the table"; }
   done
 done
 
-# The external provers write into the same directory in the same schema, so the renderer
-# reads all of it as one pile of rows and tells the tools apart by the `prover` column.
-# A failure here must not take the run down: our own numbers are still worth writing out.
+# The external provers write separate CSVs into the same directory with their own schema.
+# The renderer tells the tools apart by the `prover` column. Outside strict mode, a failure
+# here must not take the run down: our own numbers are still worth writing out.
 if [ -n "$PROVERS" ]; then
   for c in $READY; do
     log "$c on external provers ($PROVERS)"
@@ -464,10 +520,21 @@ if [ -n "$PROVERS" ]; then
       --reps "$REPS" --snarkjs-reps "$SNARKJS_REPS" \
       --rapidsnark "$RAPIDSNARK" --rapidsnark-warm "$RAPIDSNARK_WARM" \
       --rapidsnark-verify "$RAPIDSNARK_VERIFY" --g16 "$G16" --snarkjs "$SNARKJS" \
-      || echo "    external provers on $c failed, leaving those cells empty"
+      || { status=$?; [ "${STRICT_T4:-0}" != 1 ] || exit "$status";
+           echo "    external provers on $c failed, leaving those cells empty"; }
   done
 else
   log "no external provers found, rapidsnark and snarkjs columns will be blank"
+fi
+
+# ---------------------------------------------------------------- strict T4 publication gate
+if [ "$STRICT_T4" = 1 ]; then
+  [ "$LOADED_ANYWAY" = 0 ] && [ -z "$UNMEASURED" ] && [ "$ALLOW_LOADED" = 0 ] || {
+    echo "strict T4: SUSPECT/UNCHECKED contention state, refusing publication" >&2; exit 2;
+  }
+  python3 "$BENCH/scripts/validate_t4_benchmark.py" "$TMP"/*.csv \
+    --expected-host "$EXPECTED_HOST" --expected-os Linux --expected-arch x86_64 \
+    --expected-cores 8 > "$TMP/validation.json"
 fi
 
 # ---------------------------------------------------------------- report
