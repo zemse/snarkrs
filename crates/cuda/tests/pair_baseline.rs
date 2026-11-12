@@ -1,6 +1,6 @@
-//! Canonical serial proof pairs. Explicit GPU invocation only; never a skip or fallback.
+//! Unix-only canonical serial proof pairs with ELF/Mach-O oracles; never a skip or fallback.
 
-#![cfg(feature = "cuda")]
+#![cfg(all(feature = "cuda", unix))]
 
 use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
