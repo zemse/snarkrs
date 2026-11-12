@@ -109,7 +109,7 @@ impl Inventory {
         })
     }
 
-    fn json(&self, name: &str, cap: u32, msm: &str) -> String {
+    fn json(&self, name: &str, cap: u32, msm: &str, coefficient: &str) -> String {
         // Names are the two fixed fixture names, not caller-provided JSON text.
         assert!(["tiny_mul", "sha256"].contains(&name));
         let batches = self
@@ -131,6 +131,7 @@ impl Inventory {
                 "\"production_resident_admission_estimate_bytes\":{},",
                 "\"resident_estimate_scope\":\"one-key-one-stage-scratch-each-buffer-rounded-2MiB\",",
                 "\"canonical_msm_trace\":{},",
+                "\"host_coefficient_trace\":{},",
                 "\"unknown\":{{\"msm_schedule\":null,\"msm_scratch_and_arena_bytes\":null,",
                 "\"pinned_host_staging_total_bytes\":null,\"module_and_context_bytes\":null,",
                 "\"total_pair_traffic_bytes\":null,\"total_pair_launches\":null,",
@@ -150,6 +151,7 @@ impl Inventory {
             self.scratch,
             self.admission,
             msm,
+            coefficient,
         )
     }
 }
@@ -172,7 +174,9 @@ fn fixture_inventory(
     }
     let msm = crate::msm::count_probe::canonical_json(&pk, &witness.0, profile, inventory.launches)
         .map_err(|e| e.to_string())?;
-    Ok(inventory.json(name, cap, &msm))
+    let coefficient = crate::stages::coefficient_count_probe::canonical_json(&pk, &witness.0, cap)
+        .map_err(|e| e.to_string())?;
+    Ok(inventory.json(name, cap, &msm, &coefficient))
 }
 
 fn write_inventory(config: &Config) -> Result<(), String> {
@@ -269,7 +273,7 @@ fn synthetic_inventory_keeps_unmeasured_work_unknown() {
         batches: vec![(0, 0)],
         launches: 8,
     };
-    let json = synthetic.json("tiny_mul", 1, "null");
+    let json = synthetic.json("tiny_mul", 1, "null", "null");
     for field in [
         "msm_schedule",
         "msm_scratch_and_arena_bytes",

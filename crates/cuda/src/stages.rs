@@ -156,6 +156,10 @@ fn split_passes(log_n: u32, max_fused: u32) -> Vec<Batch> {
     out
 }
 
+#[cfg(test)]
+#[path = "coefficient_count_probe.rs"]
+pub(crate) mod coefficient_count_probe;
+
 fn coefficient_launch_count(batches: &[Batch]) -> usize {
     2 + 6 * batches.len()
 }
