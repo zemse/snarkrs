@@ -15,8 +15,9 @@ ADX/BMI2 cross-builds were prepared locally. This is not the README's published
 8-vCPU g4dn.2xlarge benchmark protocol.
 
 - Controller exit zero; all 46 guarded commands completed. All 27 frozen payload
-  hashes and retrieved worker sources match the manifest. The seven executables
-  are unchanged from the earlier attempt.
+  hashes and retrieved worker sources match the manifest. All nine ELF files
+  (seven Rust executables and two foreign verifiers) are unchanged from the
+  earlier attempt.
 - Standard gate: 124 executions, comprising ordinary library 63, selected ignored
   library 24, legacy 1, warm 1, adversarial 15, pipeline 11, field 5 and gnark 4.
   The fresh per-job independent gnark success marker was checked.
