@@ -1348,6 +1348,23 @@ fn live_positions(infinity: impl ExactSizeIterator<Item = bool>) -> Option<Vec<u
     (live.len() < n).then_some(live)
 }
 
+fn selected_metadata(
+    positions: &[u32],
+    prefix: Option<&[u32]>,
+    range: &Range<usize>,
+) -> (usize, usize, usize) {
+    let lo = positions.partition_point(|&p| (p as usize) < range.start);
+    let hi = positions.partition_point(|&p| (p as usize) < range.end);
+    let general = match prefix {
+        Some(p) => positions[lo..hi]
+            .iter()
+            .map(|&i| (p[i as usize + 1] - p[i as usize]) as usize)
+            .sum(),
+        None => hi - lo,
+    };
+    (lo, hi, general)
+}
+
 impl<'a> Scalars<'a> {
     /// Wraps a device buffer that already holds `len` standard-form scalars.
     ///
@@ -1413,20 +1430,8 @@ impl<'a> Scalars<'a> {
         let Some(live) = live else {
             return (self, range.len(), range.start);
         };
-        let lo = live
-            .positions
-            .partition_point(|&p| (p as usize) < range.start);
-        let hi = live
-            .positions
-            .partition_point(|&p| (p as usize) < range.end);
+        let (lo, hi, general) = selected_metadata(&live.positions, self.general_prefix, &range);
         let positions = &live.positions[lo..hi];
-        let general = match self.general_prefix {
-            Some(p) => positions
-                .iter()
-                .map(|&i| (p[i as usize + 1] - p[i as usize]) as usize)
-                .sum(),
-            None => positions.len(),
-        };
         let index = Index {
             buf: &live.buf,
             off: lo,
@@ -1531,13 +1536,23 @@ fn plan_key(scalars: &Scalars<'_>, soff: usize, n: usize) -> (usize, usize, usiz
     let (ix, ix_off) = scalars
         .index
         .map_or((0, 0), |i| (i.buf as *const CudaSlice<u32> as usize, i.off));
-    (
+    plan_identity(
         scalars.buf as *const CudaSlice<u32> as usize,
         soff,
         n,
         ix,
         ix_off,
     )
+}
+
+fn plan_identity(
+    buf: usize,
+    soff: usize,
+    n: usize,
+    index: usize,
+    index_off: usize,
+) -> (usize, usize, usize, usize, usize) {
+    (buf, soff, n, index, index_off)
 }
 
 /// Positions a job reaches past its offsets: its length, or under an index the last
@@ -3305,6 +3320,36 @@ impl std::ops::Deref for Plan<'_> {
     }
 }
 
+fn geometry_for_metadata(
+    n: usize,
+    scalar_off: usize,
+    general: usize,
+    index_span: Option<usize>,
+    window: Option<u32>,
+    work: Work,
+    shapes: Shapes,
+) -> Result<Geometry, ProveError> {
+    let c = pick_window(window, general, work);
+    let mut g = Geometry::with_shapes(
+        n,
+        scalar_off,
+        general,
+        c,
+        slice_len_for(n, c, work),
+        work,
+        shapes,
+    )?;
+    // The indexed ones grid follows the original span, not the selected point count.
+    if let (Some(span), true) = (index_span, g.ones_groups != 0) {
+        g.ones_groups = ones_groups_for(span);
+    }
+    Ok(g)
+}
+
+#[cfg(test)]
+#[path = "msm_count_probe.rs"]
+pub(crate) mod count_probe;
+
 impl<'a> Plan<'a> {
     /// The shape a plan over `n` scalars from `scalar_off` takes, before anything is
     /// allocated for it.
@@ -3320,24 +3365,15 @@ impl<'a> Plan<'a> {
         } else {
             scalars.general_in(&(scalar_off..scalar_off + n))
         };
-        let c = pick_window(msm.window, general, msm.work);
-        let mut g = Geometry::with_shapes(
+        geometry_for_metadata(
             n,
             scalar_off,
             general,
-            c,
-            slice_len_for(n, c, msm.work),
+            scalars.index.map(|i| i.span),
+            msm.window,
             msm.work,
             msm.shapes,
-        )?;
-        // The ones scan is a dependent chain a thread, latency-bound, so under an index its
-        // grid stays the one the whole run would get: a thread's chain only shortens. Sized
-        // from the index run, sha256's B scan ran 3 blocks where it had 8, at a higher
-        // density of ones, and the proof read 3.6% slower.
-        if let (Some(i), true) = (scalars.index, g.ones_groups != 0) {
-            g.ones_groups = ones_groups_for(i.span);
-        }
-        Ok(g)
+        )
     }
 
     fn new(

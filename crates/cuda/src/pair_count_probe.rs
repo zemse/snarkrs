@@ -109,7 +109,7 @@ impl Inventory {
         })
     }
 
-    fn json(&self, name: &str, cap: u32) -> String {
+    fn json(&self, name: &str, cap: u32, msm: &str) -> String {
         // Names are the two fixed fixture names, not caller-provided JSON text.
         assert!(["tiny_mul", "sha256"].contains(&name));
         let batches = self
@@ -130,6 +130,7 @@ impl Inventory {
                 "\"one_reusable_stage_scratch_buffer_bytes\":{:?},",
                 "\"production_resident_admission_estimate_bytes\":{},",
                 "\"resident_estimate_scope\":\"one-key-one-stage-scratch-each-buffer-rounded-2MiB\",",
+                "\"canonical_msm_trace\":{},",
                 "\"unknown\":{{\"msm_schedule\":null,\"msm_scratch_and_arena_bytes\":null,",
                 "\"pinned_host_staging_total_bytes\":null,\"module_and_context_bytes\":null,",
                 "\"total_pair_traffic_bytes\":null,\"total_pair_launches\":null,",
@@ -148,11 +149,17 @@ impl Inventory {
             self.bases_and_live,
             self.scratch,
             self.admission,
+            msm,
         )
     }
 }
 
-fn fixture_inventory(root: &Path, name: &str, cap: u32) -> Result<String, String> {
+fn fixture_inventory(
+    root: &Path,
+    name: &str,
+    cap: u32,
+    profile: crate::msm::count_probe::Profile,
+) -> Result<String, String> {
     let dir = root.join(name);
     let pk = ProvingKey::load(&dir.join("circuit.zkey")).map_err(|e| e.to_string())?;
     let inventory = Inventory::new(&pk, cap)?;
@@ -163,13 +170,20 @@ fn fixture_inventory(root: &Path, name: &str, cap: u32) -> Result<String, String
             "{name}: witness or verifying key dimensions disagree"
         ));
     }
-    Ok(inventory.json(name, cap))
+    let msm = crate::msm::count_probe::canonical_json(&pk, &witness.0, profile, inventory.launches)
+        .map_err(|e| e.to_string())?;
+    Ok(inventory.json(name, cap, &msm))
 }
 
 fn write_inventory(config: &Config) -> Result<(), String> {
     // No CUDA constructor, clocks, proof generation or performance acceptance here.
-    let tiny = fixture_inventory(&config.root, "tiny_mul", config.max_fused)?;
-    let sha = fixture_inventory(&config.root, "sha256", config.max_fused)?;
+    let profile = crate::msm::count_probe::Profile::parse(
+        std::env::var("G16_PAIR_L2_BYTES").ok().as_deref(),
+        std::env::var("G16_PAIR_MSM_BRANCH").ok().as_deref(),
+    )
+    .map_err(|e| e.to_string())?;
+    let tiny = fixture_inventory(&config.root, "tiny_mul", config.max_fused, profile)?;
+    let sha = fixture_inventory(&config.root, "sha256", config.max_fused, profile)?;
     let json = format!(
         concat!(
             "{{\"schema\":1,\"mode\":\"partial-serial-pair-inventory\",",
@@ -255,7 +269,7 @@ fn synthetic_inventory_keeps_unmeasured_work_unknown() {
         batches: vec![(0, 0)],
         launches: 8,
     };
-    let json = synthetic.json("tiny_mul", 1);
+    let json = synthetic.json("tiny_mul", 1, "null");
     for field in [
         "msm_schedule",
         "msm_scratch_and_arena_bytes",
