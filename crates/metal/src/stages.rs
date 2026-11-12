@@ -38,6 +38,7 @@
 //! tables, the coset power table) is witness independent and is packed once in
 //! [`HStages::prepare`].
 
+use std::cell::Cell;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -676,6 +677,26 @@ impl HResident {
         work: Work,
         t: &mut StageTimings,
     ) -> Result<HPoly, ProveError> {
+        self.compute_h_ahead_of(st, witness, work, t, &mut |_, _, wait| wait())
+    }
+
+    /// [`Self::compute_h_with`], with `behind` called on every attempt once stages 0 to 4
+    /// are committed and before they are waited on.
+    ///
+    /// `behind` gets the queue they went out on, `H` and the wait. What it commits on
+    /// that queue runs behind stage 4 with no host round trip between the two, and may
+    /// read `H`. It must call the wait before it reads anything back, must have waited
+    /// on everything it committed when it returns, and must be re-runnable: the attempt
+    /// that [`crate::cb::with_retry`] repeats is the transforms and `behind` together,
+    /// from the gather.
+    pub(crate) fn compute_h_ahead_of(
+        &self,
+        st: &HStages,
+        witness: &[Fr],
+        work: Work,
+        t: &mut StageTimings,
+        behind: &mut Behind<'_>,
+    ) -> Result<HPoly, ProveError> {
         if witness.len() != self.n_vars {
             return Err(ProveError::WitnessLength {
                 got: witness.len(),
@@ -702,6 +723,20 @@ impl HResident {
         PackedFr::pack_into(witness, dst);
         let pack_us = start.elapsed().as_micros() as u64;
 
+        // `H` exists before the transforms have run so `behind` can encode against it.
+        let mut handle = Arc::new(HHandle {
+            scratch: Some(sc),
+            pool: Arc::clone(&self.pool),
+            len: n,
+            lent: Arc::new(AtomicBool::new(false)),
+        });
+        let h = HPoly::Device {
+            tag: TAG,
+            len: n,
+            data: handle.clone(),
+        };
+        let sc = handle.sc();
+
         let profile = std::env::var_os("G16_METAL_PROFILE").is_some();
         // One autorelease pool per proof, around every submission below.
         //
@@ -711,12 +746,14 @@ impl HResident {
         // here the objc runtime installs a page nothing ever drains and every submission
         // leaks its command buffer and its encoder for the life of the process;
         // `OBJC_DEBUG_MISSING_POOLS=YES` names both classes.
-        autoreleasepool(|_| -> Result<(), ProveError> {
+        let done = autoreleasepool(|_| -> Result<(), ProveError> {
             if profile {
-                return self.run_profiled(st, &sc, n, work, t, pack_us);
+                self.run_profiled(st, sc, n, work, t, pack_us)?;
+                return behind(&st.queue.get(), &h, &mut || Ok(()));
             }
             t.gather_us += pack_us;
             let start = Instant::now();
+            let ntt_us = Cell::new(0);
 
             // One command buffer per stage group, not one for all of them.
             //
@@ -752,7 +789,7 @@ impl HResident {
                 let cb = crate::cb::command_buffer(queue);
                 let enc = mtl::encoder(&cb);
                 mtl::set_label(&enc, "stages 0-1 (gather)");
-                self.encode_gather(st, &enc, &sc, n, work);
+                self.encode_gather(st, &enc, sc, n, work);
                 let token = st.seal.encode(&enc);
                 enc.endEncoding();
                 cb.commit();
@@ -762,7 +799,13 @@ impl HResident {
                     let cb = crate::cb::command_buffer(queue);
                     let enc = mtl::encoder(&cb);
                     mtl::set_label(&enc, "stages 2-4 (transforms)");
-                    self.encode_transforms_vector(st, &enc, &sc, n, vi, true);
+                    self.encode_transforms_vector(st, &enc, sc, n, vi, true);
+                    if vi + 1 == N_DOMAIN_VECTORS {
+                        // Stage 4's store. `behind` may have the device read it before
+                        // the waits below, so this stands where `cb::stored` would.
+                        st.seal
+                            .stored_ahead(&enc, &sc.h_std, (1 + N_DOMAIN_VECTORS) as u32);
+                    }
                     let token = st.seal.encode(&enc);
                     enc.endEncoding();
                     cb.commit();
@@ -773,39 +816,48 @@ impl HResident {
                 // dispatch of this attempt is still writing the scratch when the next
                 // one is encoded. The error kept is the first in submission order, which
                 // is the first that happened.
-                let mut first = Ok(());
-                for (context, cb, token) in cbs {
-                    let r = st.seal.wait(&cb, token, context);
-                    if first.is_ok() {
-                        first = r;
+                let waited = Cell::new(false);
+                let mut wait = || {
+                    waited.set(true);
+                    let mut first = Ok(());
+                    for (context, cb, token) in &cbs {
+                        let r = st.seal.wait(cb, *token, context);
+                        if first.is_ok() {
+                            first = r;
+                        }
                     }
+                    first?;
+                    // Every buffer ran to its end. Whether H is there is a separate
+                    // question (BUG-28: words outside the field under a GPU recovery,
+                    // with every token present), and a wrong answer to it is retried
+                    // like a kill.
+                    let r = match h_off_field(&sc.h_std, n) {
+                        Some((count, at)) => {
+                            Err(off_field_error("stages 2-4 (transforms)", count, n, at))
+                        }
+                        None => Ok(()),
+                    };
+                    ntt_us.set(start.elapsed().as_micros() as u64);
+                    r
+                };
+                let r = behind(queue, &h, &mut wait);
+                if !waited.get() {
+                    wait()?;
                 }
-                first?;
-                crate::cb::stored(&sc.h_std);
-                // Every buffer ran to its end. Whether H is there is a separate question
-                // (BUG-28: words outside the field under a GPU recovery, with every
-                // token present), and a wrong answer to it is retried like a kill.
-                match h_off_field(&sc.h_std, n) {
-                    Some((count, at)) => {
-                        Err(off_field_error("stages 2-4 (transforms)", count, n, at))
-                    }
-                    None => Ok(()),
-                }
+                r
             })?;
-            t.ntt_us += start.elapsed().as_micros() as u64;
+            t.ntt_us += ntt_us.get();
             Ok(())
-        })?;
-
-        Ok(HPoly::Device {
-            tag: TAG,
-            len: n,
-            data: Arc::new(HHandle {
-                scratch: Some(sc),
-                pool: Arc::clone(&self.pool),
-                len: n,
-                lent: Arc::new(AtomicBool::new(false)),
-            }),
-        })
+        });
+        if let Err(e) = done {
+            // What a failed proof left in the scratch is dropped, not pooled.
+            drop(h);
+            if let Some(handle) = Arc::get_mut(&mut handle) {
+                drop(handle.scratch.take());
+            }
+            return Err(e);
+        }
+        Ok(h)
     }
 
     /// A wait per stage group, so the three get honest separate numbers. Costs two extra
@@ -1044,6 +1096,15 @@ impl HResident {
 // The device-resident result
 // ---------------------------------------------------------------------------
 
+/// What [`HResident::compute_h_ahead_of`] calls behind the committed transforms: the
+/// queue they are on, `H`, and the wait on them.
+pub(crate) type Behind<'a> = dyn FnMut(
+        &crate::mtl::CommandQueueRef,
+        &HPoly,
+        &mut dyn FnMut() -> Result<(), ProveError>,
+    ) -> Result<(), ProveError>
+    + 'a;
+
 /// What [`snarkrs_groth16::HPoly::Device`] carries out of stage 4, under the tag [`TAG`].
 ///
 /// Recover it with `h.device_handle::<HHandle>(snarkrs_metal::stages::TAG)`. It owns the
@@ -1085,8 +1146,9 @@ impl HHandle {
     ///
     /// The handle must outlive the batch the loan goes into, which it already has to for
     /// `h_std`. A retried batch re-encodes from its zeroing dispatches and rewrites every
-    /// entry, and a retried `compute_h` happens before this can be called, so no retry
-    /// reads what the other wrote.
+    /// entry, and a retried `compute_h` either happens before this can be called or
+    /// re-runs the batch behind it from the gather, so no retry reads what the other
+    /// wrote.
     pub(crate) fn lend_entries(&self) -> Option<crate::msm::Lent> {
         crate::msm::Lent::claim(&self.sc().vectors, &self.lent)
     }

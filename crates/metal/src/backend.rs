@@ -619,6 +619,84 @@ impl MetalCircuit {
         })
     }
 
+    /// Stages 0-9 with the five-job batch committed behind the transforms, on their
+    /// queue, before they are waited on. The GPU sequence is [`Self::msms_with`]'s after
+    /// `compute_h`, without the host round trip between the two: js_2x2_d32's batch
+    /// started 1.2 ms after stage 4 ended, and here it starts as stage 4 ends.
+    ///
+    /// The price is the retry: a fault in either half re-runs both, from the gather.
+    /// Variable work only. A constant-work batch goes out in pieces with a wait on each
+    /// (see `Submission`), which is the queue depth this would add to.
+    fn msms_behind_h<'s>(
+        &self,
+        witness: &[Fr],
+        t: &mut StageTimings,
+        w: std::thread::ScopedJoinHandle<'s, Result<ScalarBuf, ProveError>>,
+        cpu_b_g2: Option<std::thread::ScopedJoinHandle<'s, G2Projective>>,
+    ) -> Result<MsmOutputs, ProveError> {
+        let start = Instant::now();
+        let h_us = t.gather_us + t.ntt_us;
+
+        let mut upload = Some(w);
+        let mut w = None;
+        let mut out = None;
+        // A refusal that is not the device's is not `with_retry`'s to repeat.
+        let mut refused = None;
+        self.resident.compute_h_ahead_of(
+            &self.stages,
+            witness,
+            self.work,
+            t,
+            &mut |queue, h, wait_h| {
+                // Joined here and not before, so the transforms are not held for it.
+                if let Some(upload) = upload.take() {
+                    match upload
+                        .join()
+                        .unwrap_or_else(|e| std::panic::resume_unwind(e))
+                    {
+                        Ok(buf) => w = Some(buf),
+                        Err(e) => refused = Some(e),
+                    }
+                }
+                let Some(w) = &w else {
+                    return Ok(());
+                };
+                let batch = (|| {
+                    let h_scalars = self.h_scalars(h)?;
+                    let mut jobs = self.witness_jobs(w);
+                    jobs.push(self.h_job(&h_scalars));
+                    self.msm.msm_batch_behind(&jobs, queue, wait_h)
+                })();
+                match batch {
+                    Ok(results) => out = Some(results),
+                    Err(e) if e.is_device_fault() => return Err(e),
+                    Err(e) => refused = Some(e),
+                }
+                Ok(())
+            },
+        )?;
+        if let Some(e) = refused {
+            return Err(e);
+        }
+        let mut out = out.ok_or_else(|| bad("the batch behind compute_h did not run"))?;
+        let h_g1 = out
+            .pop()
+            .ok_or_else(|| bad("msm_batch returned no results"))?
+            .g1()?;
+        let (a_g1, b_g2, b_g1, l_g1) = self.witness_results(out, cpu_b_g2)?;
+        // As in `h_and_msms`' split: `msm_us` is what the MSMs add beyond `compute_h`.
+        let h_us = t.gather_us + t.ntt_us - h_us;
+        t.msm_us += (start.elapsed().as_micros() as u64).saturating_sub(h_us);
+
+        Ok(MsmOutputs {
+            a_g1,
+            b_g2,
+            b_g1,
+            l_g1,
+            h_g1,
+        })
+    }
+
     /// Stage 9's scalars. The normal path is the device buffer stage 4 wrote, which
     /// never touches the host. `HPoly::require_handle` refuses a handle from some other
     /// backend and returns `None` for a host vector, so a CPU `compute_h` can still be
@@ -873,9 +951,12 @@ impl PreparedCircuit for MetalCircuit {
             return std::thread::scope(|s| {
                 let cpu_b_g2 = self.b_g2_on_cpu(s, witness);
                 let w = s.spawn(|| self.msm.upload_scalars_with(witness, self.work));
-                let h = self.compute_h(witness, t)?;
-                let w = w.join().unwrap_or_else(|e| std::panic::resume_unwind(e))?;
-                self.msms_with(witness, &h, t, Some((w, cpu_b_g2)))
+                if self.work == Work::Constant {
+                    let h = self.compute_h(witness, t)?;
+                    let w = w.join().unwrap_or_else(|e| std::panic::resume_unwind(e))?;
+                    return self.msms_with(witness, &h, t, Some((w, cpu_b_g2)));
+                }
+                self.msms_behind_h(witness, t, w, cpu_b_g2)
             });
         }
         let start = Instant::now();

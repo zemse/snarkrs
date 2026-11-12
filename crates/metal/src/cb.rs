@@ -424,6 +424,26 @@ impl Seal {
         enc.dispatchThreads_threadsPerThreadgroup(crate::mtl::size(1), crate::mtl::size(1));
     }
 
+    /// [`stored`] for an output the device reads on before the host has waited on it:
+    /// `buf` is written by the dispatch just encoded, in a submission of `waits` command
+    /// buffers, and work committed behind it reads `buf` first. A flip on the host
+    /// after the wait would land behind that read, so an armed
+    /// [`inject::Fault::WrongStore`] is encoded here instead, as a dispatch that
+    /// overwrites the first word of `buf`. Outside tests and the `fault-inject` feature
+    /// it is nothing.
+    pub(crate) fn stored_ahead(&self, enc: &ComputeCommandEncoderRef, buf: &Buffer, waits: u32) {
+        #[cfg(any(test, feature = "fault-inject"))]
+        if inject::wrong_store_ahead_fires(waits) {
+            enc.setComputePipelineState(&self.pipeline);
+            crate::mtl::set_buffer(enc, 0, buf, 0);
+            let words = [0u32, 0x9e37_79b9];
+            crate::enc::set_params(enc, 1, &words);
+            enc.dispatchThreads_threadsPerThreadgroup(crate::mtl::size(1), crate::mtl::size(1));
+        }
+        #[cfg(not(any(test, feature = "fault-inject")))]
+        let _ = (enc, buf, waits);
+    }
+
     /// [`Self::next`] and [`Self::encode_token`] in one.
     pub(crate) fn encode(&self, enc: &ComputeCommandEncoderRef) -> Token {
         let token = self.next();
@@ -736,6 +756,21 @@ pub mod inject {
     pub(super) fn wrong_store_fires() -> bool {
         let hit = match FAIL.get() {
             Some((at, Fault::WrongStore)) => CALLS.get() > at && (STICKY.get() || !FIRED.get()),
+            _ => false,
+        };
+        if hit {
+            FIRED.set(true);
+        }
+        hit
+    }
+
+    /// [`wrong_store_fires`] asked at encode time, for the output of a submission whose
+    /// `waits` waits are all still to come: whether the readback after them would fire.
+    pub(super) fn wrong_store_ahead_fires(waits: u32) -> bool {
+        let hit = match FAIL.get() {
+            Some((at, Fault::WrongStore)) => {
+                CALLS.get() + waits > at && (STICKY.get() || !FIRED.get())
+            }
             _ => false,
         };
         if hit {

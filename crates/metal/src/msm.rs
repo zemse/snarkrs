@@ -73,7 +73,9 @@ use snarkrs_groth16::ProveError;
 use crate::enc::{dispatch_1d, packed_buffer, set_params};
 use crate::kernels::{FR_MSL, MSM_MSL, SEAL_MSL};
 use crate::layout::{PackedG1Affine, PackedG2Affine, PackedScalar};
-use crate::mtl::{self, Buffer, ComputeCommandEncoderRef, ComputePipelineState, Device};
+use crate::mtl::{
+    self, Buffer, CommandQueueRef, ComputeCommandEncoderRef, ComputePipelineState, Device,
+};
 
 mod inputs;
 mod jobs;
@@ -160,6 +162,9 @@ pub struct MetalMsm {
     seal: crate::cb::Seal,
     pool: Pool,
 }
+
+/// The wait on work committed ahead of a batch, see [`MetalMsm::msm_batch_behind`].
+pub(crate) type Ahead<'a> = dyn FnMut() -> Result<(), ProveError> + 'a;
 
 impl MetalMsm {
     /// Picks the system default device and compiles every MSM kernel from source.
@@ -516,6 +521,31 @@ impl MetalMsm {
     /// scatters' memory traffic. A bucket array past `SCATTER_SPLIT_ROWS` splits the scatter in two,
     /// which scales both counts.
     pub fn msm_batch<'a>(&self, jobs: &[Job<'a>]) -> Result<Vec<MsmResult>, ProveError> {
+        self.batch(jobs, None)
+    }
+
+    /// [`Self::msm_batch`] as one attempt on `queue`, behind work the caller has
+    /// committed there and not yet waited on, which is what lets a job read a buffer
+    /// that work is still writing. `ahead` is the wait on it: called once the batch is
+    /// committed and before anything is read back, and its failure is the batch's.
+    ///
+    /// Nothing is retried here. The caller's attempt is the earlier work and this batch
+    /// together, and every command buffer of the batch has been waited on when this
+    /// returns, whatever it returns.
+    pub(crate) fn msm_batch_behind<'a>(
+        &self,
+        jobs: &[Job<'a>],
+        queue: &CommandQueueRef,
+        ahead: &mut Ahead<'_>,
+    ) -> Result<Vec<MsmResult>, ProveError> {
+        self.batch(jobs, Some((queue, ahead)))
+    }
+
+    fn batch<'a>(
+        &self,
+        jobs: &[Job<'a>],
+        mut behind: Option<(&CommandQueueRef, &mut Ahead<'_>)>,
+    ) -> Result<Vec<MsmResult>, ProveError> {
         if jobs.is_empty() {
             return Ok(Vec::new());
         }
@@ -604,6 +634,11 @@ impl MetalMsm {
         // stderr. Strictly a measurement aid: it adds one ~0.15 ms submission floor per
         // piece, so the sum reads slightly worse than the production path it explains.
         let results = if std::env::var_os("G16_METAL_MSM_PHASES").is_some() {
+            // The pieces go out on this module's own queue, so the earlier work is
+            // finished first.
+            if let Some((_, ahead)) = &mut behind {
+                ahead()?;
+            }
             let detail = std::env::var("G16_METAL_MSM_PHASES")
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
@@ -712,7 +747,9 @@ impl MetalMsm {
             // A constant-work batch goes out split (see `Submission`): the same
             // phases, one command buffer each, and the accumulation in pieces.
             let split = plans.iter().any(|p| p.dummy_rows > 0);
-            let encode = |sub: &mut Submission<'_>| -> Result<(), ProveError> {
+            let encode = |sub: &mut Submission<'_>,
+                          ahead: &mut dyn FnMut() -> Result<(), ProveError>|
+             -> Result<(), ProveError> {
                 for p in &plans {
                     p.encode_zero(self, sub.enc());
                 }
@@ -789,23 +826,34 @@ impl MetalMsm {
                 for (i, (job, out)) in jobs.iter().zip(&outs).enumerate() {
                     out.encode_reduce(self, sub.enc(), job, &plans[job_plan[i]]);
                 }
-                sub.wait("MSM batch")
+                // Committed before the earlier work is waited on, and waited on
+                // whether or not that work came through.
+                sub.close()?;
+                let ahead = ahead();
+                let own = sub.wait("MSM batch");
+                ahead?;
+                own
             };
             // Before this check the combine reinterpreted pooled buffers regardless of
             // whether the GPU had actually written them, so a fault returned the
             // previous proof's window sums with an Ok. Split or not, the whole batch is
             // re-encoded from its zeroing dispatches, so a retry reads nothing
             // half-written.
-            crate::cb::with_retry(&self.queue, |queue| {
-                encode(&mut Submission::new(self, queue, split))?;
-                // The first buffer the combine reads from the first job.
-                crate::cb::stored(if plans[job_plan[0]].host_tail {
-                    &outs[0].buckets
-                } else {
-                    &outs[0].window_sums
-                });
-                combine()
-            })?
+            let attempt =
+                |queue: &CommandQueueRef, ahead: &mut dyn FnMut() -> Result<(), ProveError>| {
+                    encode(&mut Submission::new(self, queue, split), ahead)?;
+                    // The first buffer the combine reads from the first job.
+                    crate::cb::stored(if plans[job_plan[0]].host_tail {
+                        &outs[0].buckets
+                    } else {
+                        &outs[0].window_sums
+                    });
+                    combine()
+                };
+            match behind {
+                Some((queue, ahead)) => attempt(queue, ahead)?,
+                None => crate::cb::with_retry(&self.queue, |queue| attempt(queue, &mut || Ok(())))?,
+            }
         };
 
         // Buffers go home. Anything the plan and the outputs still reference is dead
