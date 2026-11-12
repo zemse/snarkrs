@@ -4,8 +4,8 @@ The corrected experimental path passed the complete device protocol. In this one
 controlled microbenchmark, its batch-device and batch-wall medians are lower than
 each of four separate references for all eight tuples. This is descriptive median
 ordering, not a significance finding or an end-to-end proof speedup. The production
-default is unchanged; coordinated public-gate integration and a fresh final-source
-gate remain required before landing the candidate.
+default is unchanged. Coordinated public-gate integration subsequently passed a
+fresh final-source correctness gate, reported separately below.
 
 ## Source and protocol
 
@@ -117,6 +117,55 @@ The private raw archive is retained with the token results. A convenience copy i
 The [first incomplete attempt](cuda-clear-incomplete-2026-11-12.md),
 [second incomplete attempt](cuda-clear-retry-incomplete-2026-11-12.md), and rejected
 intermediate provenance packet remain negative history. This successful run does
-not retroactively promote them. Next: coordinate the public gate's explicit
-opt-in tests and require fresh final-source validation, without changing the
-default or claiming final benchmark readiness from this microbenchmark alone.
+not retroactively promote them.
+
+## Fresh public-gate integration
+
+Code source `e91632f897d3313c71abb0f6e216293fa126b1be` integrates the two opt-in
+poison-required tests into the public gate. The generic ignored sweep excludes
+them; separate fresh processes require each exact named test to pass once, with
+full-clear1, poison1, legacy0 and required-tests1. Missing, zero-test, ignored or
+skipped receipts fail. Other stages and CLI proofs retain outer full-clear0.
+The default remains OFF.
+
+Independent source review and parent reruns passed 11 host-gate tests, the native
+library's 67 tests with 29 ignored, and seven fresh locked offline GNU 2.31 ADX/BMI2
+Linux builds matching the preserved executables. Fresh device validation of this
+actual source then completed **7/7 commands and 131 successful test executions**:
+separate preparation1 plus public130. The public count is warm1, library67,
+selected ignored24, explicit clear2, legacy1, adversarial15, pipeline11, field5
+and fresh independent gnark4. Ignored tests in the ordinary library invocation
+are not counted as executions.
+
+All five new proofs passed own and Linux independent verification, then fresh
+native macOS rapidsnark verification against original pinned vkeys and
+witness-derived statements. An independent audit repeated all five native checks:
+5/5 valid again. These are five unique proofs, four explicit CUDA no-fallback
+outputs and one deliberate CPU VRAM-refusal output, not ten unique proofs.
+Historical CF proofs were not substituted for this source's receipts.
+
+The seven resource logs retained 3552 samples. Minimum available host RAM was
+13396616 KiB (12.776 GiB); maximum device use was 6507/15360 MiB (42.36%). The same
+4 GiB host floor, 90% device ceiling and 300-second retrieval reserve applied.
+Admission recorded 4562.452 seconds remaining against the 4500-second heuristic;
+it was not a whole-queue worst-case guarantee. These remain sampled global
+observations, not exact transient peaks or process attribution.
+
+The fresh consumer launched a new validator subprocess, required zero exit and
+exclusively read its current committed report. Independent audit rechecked the
+source/payload associations, ordered stages, receipts, original inputs and all
+resource samples, plus 60 archived-file/extracted pairs. The archive claim is
+narrow correspondence, not extraction-safety certification. The separately
+retained raw archive SHA256 is:
+
+`b0914a28c4ca7fa4a0702c233544e88e85b32116657c3ad1773878a8581e2460`
+
+Results were retrieved before shutdown. Native and separate EC2 readbacks
+confirmed stopped; only the newly owned SSH rule was revoked and all AWS stop
+deadlines were retained. A pre-token controller refusal for missing forced-stop
+options was preserved, then corrected without changing the deadline. It was not
+a failed GPU attempt or an accepted result.
+
+This four-vCPU calibration gate adds source-correctness evidence only. It adds no
+comparative performance result, default adoption or final eight-vCPU benchmark
+readiness. The CF measurements above retain their original source and scope.
