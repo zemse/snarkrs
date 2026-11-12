@@ -46,9 +46,11 @@
 //! uninitialised memory, a fresh block or a reused one. The count histogram is cleared by
 //! `zero_u32` before `msm_count` accumulates onto it, and every bucket array is run through
 //! `msm_clear_g1`/`msm_clear_g2` before an accumulation writes into it (all of a
-//! constant-work plan's packed projective identity, `zz` alone otherwise). Every other
-//! buffer is written before it is read: `msm_scan` writes every cursor row, the scatter
-//! fills each window's entries up to where the accumulation stops reading, and every spill,
+//! constant-work plan's packed projective identity, `zz` alone otherwise). The opt-in
+//! `G16_CUDA_MSM_FULL_CLEAR=1` uses `zero_u32` for all active variable-work bucket words
+//! instead. Every other buffer is written before it is read: `msm_scan` writes every cursor
+//! row, the scatter fills each window's entries up to where the accumulation stops reading,
+//! and every spill,
 //! fold, window-sum and ones slot a later kernel reads is stored first, or carries a
 //! `MSM_NO_ROW` tag that keeps its point from being used. `G16_CUDA_MSM_POISON=1` fills
 //! every scratch buffer with `0xa5` bytes instead of leaving it, which is how the device
@@ -1715,6 +1717,22 @@ const WIDE_BLOCK: u32 = 256;
 /// spread, e.g. G2 at 2^20 dense 284.6 / 284.6 / 285.7 ms. Not a lever.
 const POINT_BLOCK: u32 = 128;
 
+fn full_clear_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+/// The existing zero kernel indexes u32 words; larger typed-point buffers keep the
+/// original clear. Arena capacity is deliberately not part of the launch length.
+fn full_clear_words(enabled: bool, geometry: &Geometry, group: Group) -> Option<u32> {
+    if !enabled || geometry.dummy_rows != 0 {
+        return None;
+    }
+    geometry
+        .rows()
+        .checked_mul(group.words())
+        .and_then(|words| u32::try_from(words).ok())
+}
+
 // ---------------------------------------------------------------------------
 // The backend object
 // ---------------------------------------------------------------------------
@@ -1737,6 +1755,8 @@ pub struct CudaMsm {
     window: Option<u32>,
     /// The launch shapes every plan of this object takes; see [`Shapes`].
     shapes: Shapes,
+    /// Experimental contiguous clear of variable-work buckets only.
+    full_bucket_clear: bool,
     ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
     /// Kept alive explicitly. `CudaFunction` holds an `Arc<CudaModule>` internally, so this
@@ -1912,6 +1932,16 @@ impl CudaMsm {
         self
     }
 
+    /// Opt in to clearing every active variable-work bucket word with `zero_u32`.
+    ///
+    /// The per-object form of `G16_CUDA_MSM_FULL_CLEAR=1`. Off by default and unmeasured:
+    /// the extra stores may hurt later phases. Constant-work projective identities and
+    /// the legacy accumulation path are unchanged.
+    pub fn with_full_bucket_clear(mut self, enabled: bool) -> Self {
+        self.full_bucket_clear = enabled;
+        self
+    }
+
     /// Compiles `kernels::unit_msm()` and uploads all five repacked base vectors.
     pub fn new(cuda: &Cuda, pk: &ProvingKey) -> Result<Self, ProveError> {
         Self::without_key(cuda)?.with_key(pk)
@@ -2006,6 +2036,9 @@ impl CudaMsm {
             work: Work::Variable,
             window: None,
             shapes: Shapes::from_env(l2_bytes(&ctx)),
+            full_bucket_clear: full_clear_enabled(
+                std::env::var_os("G16_CUDA_MSM_FULL_CLEAR").as_deref(),
+            ),
             a: G1Bases::from_device(upload_words(&stream, &[])?, 0)?,
             b_g2: G2Bases::from_device(upload_words(&stream, &[])?, 0)?,
             b_g1: G1Bases::from_device(upload_words(&stream, &[])?, 0)?,
@@ -3050,6 +3083,19 @@ impl CudaMsm {
         p: &Plan<'_>,
         params: &MsmParams,
     ) -> Result<(), ProveError> {
+        if let Some(len) = full_clear_words(self.full_bucket_clear, p, job.group()) {
+            if len == 0 {
+                return Ok(());
+            }
+            let zero = &self.k.zero_u32;
+            let cfg = zero.cfg_1d(len as usize, WIDE_BLOCK);
+            let mut lb = self.stream.launch_builder(&zero.f);
+            lb.arg(&out.buckets).arg(&len);
+            // SAFETY: two parameters in order; buckets holds at least the active words,
+            // len fits u32, and zero_u32 guards gid < len. Same stream as every phase.
+            unsafe { lb.launch(cfg) }.map_err(|e| drv("launch bucket zero_u32", e))?;
+            return Ok(());
+        }
         let clear = &self.k.group(job.group()).clear;
         let cfg = clear.cfg_1d(p.rows(), WIDE_BLOCK);
         let mut lb = self.stream.launch_builder(&clear.f);
@@ -4632,6 +4678,56 @@ mod tests {
     }
 
     #[test]
+    fn full_clear_opt_in_is_exact() {
+        use std::ffi::OsStr;
+        assert!(!full_clear_enabled(None));
+        for value in ["", "0", "true", "01", "1 ", "2"] {
+            assert!(!full_clear_enabled(Some(OsStr::new(value))));
+        }
+        assert!(full_clear_enabled(Some(OsStr::new("1"))));
+    }
+
+    #[test]
+    fn full_clear_active_words_all_widths_and_work_modes() {
+        for c in 2..=MAX_WINDOW {
+            for n in [0, 1, 2, 65, 65536] {
+                for work in [Work::Variable, Work::Constant] {
+                    let g = Geometry::new(n, 0, n, c, 64, work).unwrap();
+                    for group in [Group::G1, Group::G2] {
+                        assert_eq!(full_clear_words(false, &g, group), None);
+                        let words = full_clear_words(true, &g, group);
+                        if work == Work::Constant {
+                            assert_eq!(words, None);
+                        } else {
+                            let active = g.n_windows * g.n_buckets * group.words();
+                            assert_eq!(words, Some(u32::try_from(active).unwrap()));
+                            if c == 13 {
+                                assert_eq!(g.rows(), 81920);
+                                assert_eq!(
+                                    active,
+                                    if group == Group::G1 { 2621440 } else { 5242880 }
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn full_clear_word_index_limit_keeps_typed_point_path() {
+        let mut g = Geometry::new(2, 0, 2, 16, 64, Work::Variable).unwrap();
+        // Synthetic larger geometry: the old clear indexes points, not words.
+        g.n_windows = (u32::MAX as usize / g.n_buckets / G2_WORDS) + 1;
+        assert!(g.rows() < u32::MAX as usize);
+        assert!(full_clear_words(true, &g, Group::G1).is_some());
+        assert_eq!(full_clear_words(true, &g, Group::G2), None);
+        g.n_windows *= 2;
+        assert_eq!(full_clear_words(true, &g, Group::G1), None);
+    }
+
+    #[test]
     fn gate_recoding_oracle_reconstructs_carry_boundaries() {
         use snarkrs_field::Field;
         for c in [2, 3, 8, 13, 16] {
@@ -4929,6 +5025,136 @@ mod tests {
                 [1, 1, 1, 0, 1, 0, 0]
             };
             assert_eq!(delta, expected, "allocation/launch/readback accounting");
+        }
+    }
+
+    #[test]
+    #[ignore = "opt-in NVIDIA full-clear scope gate; fails without device"]
+    fn full_clear_device_poisoned_scope() {
+        use snarkrs_field::{Fq, Fq2};
+        assert!(full_clear_enabled(
+            std::env::var_os("G16_CUDA_MSM_FULL_CLEAR").as_deref()
+        ));
+        let cuda = Cuda::new(0).expect("NVIDIA full-clear gate requires CUDA");
+        let module = CudaMsm::compile_with(&cuda, Work::Constant).unwrap();
+        let mut m = CudaMsm::from_module(&cuda, module).unwrap();
+        assert!(m.full_bucket_clear, "constructor must receive the opt-in");
+        let scalars = m.upload_scalars(&[Fr::from(7u64); 2]).unwrap();
+        let b1 = m.upload_g1_bases(&[G1Affine::identity(); 2]).unwrap();
+        let b2 = m.upload_g2_bases(&[G2Affine::identity(); 2]).unwrap();
+        for c in 2..=MAX_WINDOW {
+            for work in [Work::Variable, Work::Constant] {
+                m.work = work;
+                let p = gate_plan(&m, scalars.as_scalars(), 0, 2, c, 64);
+                for job in [
+                    Job::G1(JobG1 {
+                        bases: &b1,
+                        base_off: 0,
+                        scalars: scalars.as_scalars(),
+                        scalar_off: 0,
+                        n: 2,
+                    }),
+                    Job::G2(JobG2 {
+                        bases: &b2,
+                        base_off: 0,
+                        scalars: scalars.as_scalars(),
+                        scalar_off: 0,
+                        n: 2,
+                    }),
+                ] {
+                    let mut out = Outputs::new(&m, &job, &p).unwrap();
+                    let pw = job.group().words();
+                    let active = p.rows() * pw;
+                    // Oversized reused storage, including a non-point-aligned tail.
+                    out.buckets = m.alloc_words(active + 3 * pw + 17).unwrap();
+                    let identity = match job.group() {
+                        Group::G1 => as_words(&[PackedXyzzG1 {
+                            y: PackedFq::from_fq(&Fq::one()),
+                            ..Default::default()
+                        }])
+                        .to_vec(),
+                        Group::G2 => as_words(&[PackedXyzzG2 {
+                            y: PackedFq2::from_fq2(&Fq2::one()),
+                            ..Default::default()
+                        }])
+                        .to_vec(),
+                    };
+                    for enabled in [false, true] {
+                        m = m.with_full_bucket_clear(enabled);
+                        for byte in [0xa5u8, 0x3c] {
+                            let bytes = out.buckets.len() * 4;
+                            {
+                                let (ptr, _record) = out.buckets.device_ptr_mut(&m.stream);
+                                // SAFETY: the allocation owns bytes bytes, and poison and clear
+                                // are ordered on the same stream, including on buffer reuse.
+                                unsafe {
+                                    cudarc::driver::result::memset_d8_async(
+                                        ptr,
+                                        byte,
+                                        bytes,
+                                        m.stream.cu_stream(),
+                                    )
+                                }
+                                .unwrap();
+                            }
+                            let params = m.point_params(&out, &p);
+                            m.launch_clear(&job, &out, &p, &params).unwrap();
+                            let words = download(&m.stream, &out.buckets, "full clear").unwrap();
+                            let poison = u32::from_ne_bytes([byte; 4]);
+                            assert!(words[active..].iter().all(|w| *w == poison));
+                            let mut want = vec![poison; pw];
+                            if work == Work::Constant {
+                                want.copy_from_slice(&identity);
+                            } else if enabled {
+                                want.fill(0);
+                            } else {
+                                want[pw / 2..3 * pw / 4].fill(0);
+                            }
+                            for row in words[..active].chunks_exact(pw) {
+                                assert_eq!(row, want, "c={c}, work={work:?}, enabled={enabled}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "opt-in NVIDIA full-clear MSM gate; requires poisoned scratch"]
+    fn full_clear_device_msms() {
+        assert!(full_clear_enabled(
+            std::env::var_os("G16_CUDA_MSM_FULL_CLEAR").as_deref()
+        ));
+        assert!(poison(), "run with G16_CUDA_MSM_POISON=1");
+        assert!(!legacy_accumulate(), "run with G16_CUDA_MSM_LEGACY_ACC=0");
+        let cuda = Cuda::new(0).expect("NVIDIA full-clear gate requires CUDA");
+        let module = CudaMsm::compile_with(&cuda, Work::Constant).unwrap();
+        let mut m = CudaMsm::from_module(&cuda, module).unwrap();
+        assert!(m.full_bucket_clear, "constructor must receive the opt-in");
+        for work in [Work::Variable, Work::Constant] {
+            m.work = work;
+            for c in 2..=MAX_WINDOW {
+                for values in [
+                    vec![],
+                    vec![Fr::from(7u64)],
+                    vec![Fr::from(7u64), -Fr::from(7u64)],
+                ] {
+                    gate_device_case(&m, &values, c, 64, false);
+                }
+            }
+            for c in [2, 3, 8, 13, 16] {
+                let carry: Vec<_> = gate_carry_scalars(c).into_iter().cycle().take(65).collect();
+                for values in [
+                    vec![Fr::zero(); 65],
+                    vec![Fr::one(); 65],
+                    carry,
+                    review_scalars(65, "uniform"),
+                    review_scalars(65, "mixed"),
+                ] {
+                    gate_device_case(&m, &values, c, 64, false);
+                }
+            }
         }
     }
 
