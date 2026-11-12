@@ -565,6 +565,60 @@ impl MetalCircuit {
         Ok((a_g1, b_g2, b_g1, l_g1))
     }
 
+    /// Stages 5-9 as one batch. `ahead` is the witness upload and stage 6's thread from
+    /// a caller that started both before `h` existed; without it both start here.
+    fn msms_with(
+        &self,
+        witness: &[Fr],
+        h: &HPoly,
+        t: &mut StageTimings,
+        ahead: Option<WitnessAhead<'_>>,
+    ) -> Result<MsmOutputs, ProveError> {
+        self.check_witness(witness)?;
+        if h.len() != self.pk.domain_size {
+            return Err(bad(format!(
+                "h has {} entries, domain size is {}",
+                h.len(),
+                self.pk.domain_size
+            )));
+        }
+
+        let start = Instant::now();
+
+        let (a_g1, b_g2, b_g1, l_g1, h_g1) = std::thread::scope(|s| {
+            let (w, cpu_b_g2) = match ahead {
+                Some(ahead) => ahead,
+                None => {
+                    let cpu_b_g2 = self.b_g2_on_cpu(s, witness);
+                    (self.msm.upload_scalars_with(witness, self.work)?, cpu_b_g2)
+                }
+            };
+            let h_scalars = self.h_scalars(h)?;
+
+            // One command buffer for all of them. Order matches the stage numbering,
+            // and `msm_batch` returns results in job order.
+            let mut jobs = self.witness_jobs(&w);
+            jobs.push(self.h_job(&h_scalars));
+            let mut out = self.msm.msm_batch(&jobs)?;
+            let h_g1 = out
+                .pop()
+                .ok_or_else(|| bad("msm_batch returned no results"))?
+                .g1()?;
+            let (a_g1, b_g2, b_g1, l_g1) = self.witness_results(out, cpu_b_g2)?;
+            Ok::<_, ProveError>((a_g1, b_g2, b_g1, l_g1, h_g1))
+        })?;
+        // One command buffer for the GPU's share, so `msm_split` stays `None`.
+        t.msm_us += start.elapsed().as_micros() as u64;
+
+        Ok(MsmOutputs {
+            a_g1,
+            b_g2,
+            b_g1,
+            l_g1,
+            h_g1,
+        })
+    }
+
     /// Stage 9's scalars. The normal path is the device buffer stage 4 wrote, which
     /// never touches the host. `HPoly::require_handle` refuses a handle from some other
     /// backend and returns `None` for a host vector, so a CPU `compute_h` can still be
@@ -616,6 +670,13 @@ impl MetalCircuit {
         })
     }
 }
+
+/// The witness upload and stage 6's thread, when [`MetalCircuit::h_and_msms`] started
+/// them before `compute_h`.
+type WitnessAhead<'s> = (
+    ScalarBuf,
+    Option<std::thread::ScopedJoinHandle<'s, G2Projective>>,
+);
 
 /// The smallest domain where [`MetalCircuit::h_and_msms`] splits the five-job batch to
 /// overlap the witness MSMs with the transforms. See [`overlap_pays`].
@@ -670,7 +731,7 @@ impl BG2 {
     ) -> Result<Self, ProveError> {
         if g2_on_cpu(&v, domain_size, work) {
             let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(rayon::current_num_threads())
+                .num_threads(g2_pool_threads(domain_size))
                 .thread_name(|i| format!("metal-g2-{i}"))
                 .build()
                 .map_err(|e| bad(format!("stage 6 thread pool: {e}")))?;
@@ -680,6 +741,25 @@ impl BG2 {
             snarkrs_groth16::malloc::release(v);
             Ok(BG2::Gpu(bases?))
         }
+    }
+}
+
+/// Threads in stage 6's pool: every core where the batch is split (see
+/// [`overlap_pays`]), one fewer below that.
+///
+/// Below the split the proof thread is the critical path from the first submission to
+/// the last readback, and a pool on every core competes with it once stage 6 starts
+/// before `compute_h`: on twelve threads js_2x2_d32's host work between the transforms
+/// and the MSM batch took 4 to 6 ms instead of 1.3, and the proof read 14.3 to 15.3 ms
+/// against 14.1 to 14.3 with stage 6 started late. On eleven it reads 12.6. Stage 6
+/// does not notice the missing thread there (11.7 ms on either), and at 2^17 and up,
+/// where it is the critical path, the pool keeps every core.
+fn g2_pool_threads(domain_size: usize) -> usize {
+    let n = rayon::current_num_threads();
+    if overlap_pays(domain_size) {
+        n
+    } else {
+        n.saturating_sub(1).max(1)
     }
 }
 
@@ -755,44 +835,7 @@ impl PreparedCircuit for MetalCircuit {
         h: &HPoly,
         t: &mut StageTimings,
     ) -> Result<MsmOutputs, ProveError> {
-        self.check_witness(witness)?;
-        if h.len() != self.pk.domain_size {
-            return Err(bad(format!(
-                "h has {} entries, domain size is {}",
-                h.len(),
-                self.pk.domain_size
-            )));
-        }
-
-        let start = Instant::now();
-
-        let (a_g1, b_g2, b_g1, l_g1, h_g1) = std::thread::scope(|s| {
-            let cpu_b_g2 = self.b_g2_on_cpu(s, witness);
-            let w = self.msm.upload_scalars_with(witness, self.work)?;
-            let h_scalars = self.h_scalars(h)?;
-
-            // One command buffer for all of them. Order matches the stage numbering,
-            // and `msm_batch` returns results in job order.
-            let mut jobs = self.witness_jobs(&w);
-            jobs.push(self.h_job(&h_scalars));
-            let mut out = self.msm.msm_batch(&jobs)?;
-            let h_g1 = out
-                .pop()
-                .ok_or_else(|| bad("msm_batch returned no results"))?
-                .g1()?;
-            let (a_g1, b_g2, b_g1, l_g1) = self.witness_results(out, cpu_b_g2)?;
-            Ok::<_, ProveError>((a_g1, b_g2, b_g1, l_g1, h_g1))
-        })?;
-        // One command buffer for the GPU's share, so `msm_split` stays `None`.
-        t.msm_us += start.elapsed().as_micros() as u64;
-
-        Ok(MsmOutputs {
-            a_g1,
-            b_g2,
-            b_g1,
-            l_g1,
-            h_g1,
-        })
+        self.msms_with(witness, h, t, None)
     }
 
     /// Without this the trait default reports "no H" for every device handle, so
@@ -818,16 +861,23 @@ impl PreparedCircuit for MetalCircuit {
     /// witness jobs lose their seat in the concurrent encoder beside H's accumulation,
     /// a second submission is paid, and the device arbitrates the two queues however it
     /// likes. See [`overlap_pays`] for the measured consequences and for why the split
-    /// only happens at [`OVERLAP_MIN_DOMAIN`] and above; below it this method takes the
-    /// trait's own sequence, bit for bit. The CPU backend keeps the sequential default
+    /// only happens at [`OVERLAP_MIN_DOMAIN`] and above. Below it the GPU runs the trait's
+    /// own sequence, one five-job batch after `compute_h`, and only the host moves: the
+    /// witness upload and stage 6 on the CPU pool start before `compute_h` instead of
+    /// after it, since neither reads `h`. The CPU backend keeps the sequential default
     /// everywhere: there the same overlap measured even, since work stealing already
     /// absorbs the witness MSMs either way.
     fn h_and_msms(&self, witness: &[Fr], t: &mut StageTimings) -> Result<MsmOutputs, ProveError> {
-        if !overlap_pays(self.pk.domain_size) {
-            let h = self.compute_h(witness, t)?;
-            return self.msms(witness, &h, t);
-        }
         self.check_witness(witness)?;
+        if !overlap_pays(self.pk.domain_size) {
+            return std::thread::scope(|s| {
+                let cpu_b_g2 = self.b_g2_on_cpu(s, witness);
+                let w = s.spawn(|| self.msm.upload_scalars_with(witness, self.work));
+                let h = self.compute_h(witness, t)?;
+                let w = w.join().unwrap_or_else(|e| std::panic::resume_unwind(e))?;
+                self.msms_with(witness, &h, t, Some((w, cpu_b_g2)))
+            });
+        }
         let start = Instant::now();
 
         let mut compute_h_us = 0u64;
