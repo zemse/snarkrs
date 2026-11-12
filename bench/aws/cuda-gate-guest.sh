@@ -66,14 +66,32 @@ step warm 30 env G16_CUDA_TIME=1 "$BIN/lib" --ignored --exact --test-threads=1 -
   kernels::tests::every_unit_compiles_on_the_device
 grep -E "^unit |^every unit" "$OUT/warm.txt" | sed 's/^/  /'
 
-# The lib's device tests, without the two that need their own process or an hour: the
-# legacy accumulator gate reads G16_CUDA_MSM_LEGACY_ACC once per process, and the FFT
+# The lib's device tests, without those needing their own process or an hour: the
+# legacy and full-clear gates read their environment once per process, and the FFT
 # variant sweep is about 60 minutes cold.
 step lib 10 env G16_REQUIRE_TESTS=1 "$BIN/lib" --test-threads=1
 step lib-ignored 20 env G16_REQUIRE_TESTS=1 G16_CUDA_MSM_LEGACY_ACC=0 "$BIN/lib" --ignored \
   --test-threads=1 --nocapture \
   --skip constant_work_legacy_override_gate --skip every_variant_gives_the_same_points \
-  --skip every_unit_compiles_on_the_device
+  --skip every_unit_compiles_on_the_device \
+  --skip full_clear_device_poisoned_scope --skip full_clear_device_msms
+
+# These gates need fresh processes with full clear and poison on, legacy off.
+# Require the named test and its one-test result, not just a successful process.
+for gate in scope msms; do
+  case "$gate" in
+    scope) test=msm::tests::full_clear_device_poisoned_scope ;;
+    msms) test=msm::tests::full_clear_device_msms ;;
+  esac
+  step "clear-$gate" 10 env G16_REQUIRE_TESTS=1 G16_CUDA_MSM_FULL_CLEAR=1 \
+    G16_CUDA_MSM_POISON=1 G16_CUDA_MSM_LEGACY_ACC=0 "$BIN/lib" --ignored --exact \
+    --test-threads=1 --nocapture "$test"
+  grep -Fq "test $test ... " "$OUT/clear-$gate.txt" || FAILED+=("clear-$gate-not-run")
+  grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$OUT/clear-$gate.txt" \
+    || FAILED+=("clear-$gate-count")
+  grep -q "SKIPPED" "$OUT/clear-$gate.txt" && FAILED+=("clear-$gate-skip")
+done
+
 step lib-legacy 5 env G16_CUDA_MSM_LEGACY_ACC=1 "$BIN/lib" --ignored --exact \
   --test-threads=1 --nocapture msm::tests::constant_work_legacy_override_gate
 if (( EVERY_VARIANT )); then
