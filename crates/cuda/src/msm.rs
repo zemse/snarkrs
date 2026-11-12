@@ -5120,6 +5120,75 @@ mod tests {
         }
     }
 
+    fn full_clear_gate_scalars(kind: &str, work: Work) -> Vec<Fr> {
+        let mut values = review_scalars(65, kind);
+        if work == Work::Constant {
+            // Indices 0 and 64 share dummy row 0 and both have base weight +1.
+            values[64] = Fr::zero();
+        }
+        values
+    }
+
+    #[test]
+    fn full_clear_gate_fixtures_exercise_dummy_arithmetic() {
+        for kind in ["uniform", "mixed"] {
+            let original = review_scalars(65, kind);
+            for work in [Work::Variable, Work::Constant] {
+                let values = full_clear_gate_scalars(kind, work);
+                assert_eq!(values.len(), 65);
+                if work == Work::Variable {
+                    assert_eq!(values, original);
+                } else {
+                    assert_eq!(values[..64], original[..64]);
+                }
+                for c in 2..=MAX_WINDOW {
+                    let general = values
+                        .iter()
+                        .filter(|s| !s.is_zero() && !s.is_one())
+                        .count();
+                    let g = Geometry::new(65, 2, general, c, 64, work).unwrap();
+                    let digits: Vec<_> = values.iter().map(|s| gate_digits(*s, c)).collect();
+                    let mut dummy_sums = vec![0i64; g.n_windows * g.dummy_rows];
+                    let mut emitted = 0;
+                    let mut nonzero_general = 0;
+                    for w in 0..g.n_windows {
+                        for (i, scalar) in values.iter().enumerate() {
+                            let digit = digits[i][w];
+                            if !scalar.is_zero() && !scalar.is_one() && digit != 0 {
+                                nonzero_general += 1;
+                            }
+                            if work == Work::Variable
+                                && (scalar.is_zero() || scalar.is_one() || digit == 0)
+                            {
+                                continue;
+                            }
+                            emitted += 1;
+                            if digit == 0 {
+                                dummy_sums[w * g.dummy_rows + (i & (g.dummy_rows - 1))] +=
+                                    gate_base_weight(3 + i);
+                            }
+                        }
+                        if work == Work::Constant {
+                            assert_eq!(g.dummy_rows, 64);
+                            assert!(
+                                (1..=2).contains(&dummy_sums[w * g.dummy_rows]),
+                                "kind={kind}, work={work:?}, c={c}, window={w}"
+                            );
+                        }
+                    }
+                    if work == Work::Constant {
+                        assert_eq!(emitted, 65 * g.n_windows);
+                        assert!(values[64].is_zero());
+                    } else {
+                        assert_eq!(g.dummy_rows, 0);
+                        assert!(dummy_sums.is_empty());
+                        assert_eq!(emitted, nonzero_general);
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     #[ignore = "opt-in NVIDIA full-clear MSM gate; requires poisoned scratch"]
     fn full_clear_device_msms() {
@@ -5149,8 +5218,8 @@ mod tests {
                     vec![Fr::zero(); 65],
                     vec![Fr::one(); 65],
                     carry,
-                    review_scalars(65, "uniform"),
-                    review_scalars(65, "mixed"),
+                    full_clear_gate_scalars("uniform", work),
+                    full_clear_gate_scalars("mixed", work),
                 ] {
                     gate_device_case(&m, &values, c, 64, false);
                 }
