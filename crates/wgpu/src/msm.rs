@@ -13,7 +13,8 @@
 //! all run over the whole witness, so the counting sort runs once for the three of them; L
 //! has its own range (`scalar_off = n_public + 1`) and H has its own buffer. That is
 //! 3 pipelines and 12 dispatches per proof instead of 5 and 20, and more to the point it is
-//! two thirds less scatter traffic.
+//! two thirds less scatter traffic. A key with enough bases at infinity gives A and B a
+//! sort each instead, over the positions that are not ([`LiveRun`]).
 //!
 //! # The window width is chosen from `m`, not from `n`
 //!
@@ -216,9 +217,9 @@ pub fn window_size_for(m: usize, jobs: Jobs) -> u32 {
 
 /// Mirrors `struct MsmParams` in [`crate::gen::msm`]. 80 bytes, a multiple of the 16 WGSL
 /// rounds every uniform struct up to, so there is no invisible tail padding for the two
-/// declarations to disagree about; the last three words are the padding, spelled out.
+/// declarations to disagree about.
 ///
-/// The nine fields before the padding are the point stages', and nothing in this file
+/// The nine fields before the last three are the point stages', and nothing in this file
 /// reads them but `dummy_rows`. They live here rather than in a second struct because
 /// `snarkrs-metal` has one `MsmParams` covering both halves of an MSM, because design §3 puts
 /// every parameter block for a proof in one uniform ring, and because a second struct is a
@@ -268,9 +269,13 @@ pub struct MsmParams {
     /// Workgroups `msm_reduce_*` runs per window, each over a contiguous chunk of its
     /// buckets, writing one partial per group. Zero for every other kernel.
     pub reduce_groups: u32,
-    pub pad0: u32,
-    pub pad1: u32,
-    pub pad2: u32,
+    /// 1 when the sort reads its scalars through a live index, 0 otherwise. Read by
+    /// `msm_count` and `msm_scatter` only, like the two below; see [`LiveRun`].
+    pub live: u32,
+    /// The first word of this sort's run in the index.
+    pub live_off: u32,
+    /// The position this sort's range starts at, which the index counts from the group's.
+    pub live_lo: u32,
 }
 
 const _: () = assert!(core::mem::size_of::<MsmParams>() == 80);
@@ -297,6 +302,21 @@ impl MsmParams {
 /// Derived once and then read by every dispatch and every allocation, so the shader's view
 /// and the host's cannot disagree about `cap` in particular, which is the one number whose
 /// being too small corrupts silently.
+/// The run of a live index one counting sort reads its scalars through, in place of every
+/// position of its range: thread `i` of `msm_count` and `msm_scatter` takes the scalar at
+/// the position word `off + i` of the index names. See `crate::batch::Live`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LiveRun {
+    /// The run's first word in the index.
+    pub off: u32,
+    /// The position the sort's range starts at, counted like the index's own positions from
+    /// the group's first scalar.
+    pub lo: u32,
+    /// Positions the range holds, live or not, which the ones pass and every bounds check
+    /// still walk.
+    pub span: u32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DigitPlan {
     n: u32,
@@ -309,6 +329,8 @@ pub struct DigitPlan {
     /// bucket rows in the counters, the cursors and the bucket array, and only the digit
     /// kernels and the accumulation ever address them.
     dummy_rows: u32,
+    /// The live index run the sort reads through, and then `n` is its length.
+    live: Option<LiveRun>,
 }
 
 impl DigitPlan {
@@ -424,11 +446,27 @@ impl DigitPlan {
                 Work::Constant => DUMMY_ROWS,
                 Work::Variable => 0,
             },
+            live: None,
         })
+    }
+
+    /// The same sort over `run` of a live index: `n` is the run's length, `scalar_off` the
+    /// first position of the range it lies in.
+    pub fn over(mut self, run: LiveRun) -> Self {
+        self.live = Some(run);
+        self
     }
 
     pub fn n(&self) -> u32 {
         self.n
+    }
+    pub fn live(&self) -> Option<LiveRun> {
+        self.live
+    }
+    /// Positions of the scalar and base vectors the sort's range holds: `n`, or the live
+    /// run's span.
+    pub fn span(&self) -> u32 {
+        self.live.map_or(self.n, |run| run.span)
     }
     pub fn scalar_off(&self) -> u32 {
         self.scalar_off
@@ -496,9 +534,9 @@ impl DigitPlan {
             fold_groups: 0,
             fold_len: 0,
             reduce_groups: 0,
-            pad0: 0,
-            pad1: 0,
-            pad2: 0,
+            live: u32::from(self.live.is_some()),
+            live_off: self.live.map_or(0, |run| run.off),
+            live_lo: self.live.map_or(0, |run| run.lo),
         }
     }
 }
@@ -641,6 +679,9 @@ pub struct MsmDigits {
     wg: wgsl::Workgroups,
     workgroups_per_dispatch: u32,
     source_len: usize,
+    /// One word bound as the live index of a sort that reads none, because a binding the
+    /// kernel names has to be bound.
+    no_live: wgpu::Buffer,
 }
 
 impl MsmDigits {
@@ -811,6 +852,7 @@ impl MsmDigits {
             wg,
             workgroups_per_dispatch,
             source_len,
+            no_live: storage_buffer(backend, "g16 msm no live index", 4)?,
         })
     }
 
@@ -834,11 +876,12 @@ impl MsmDigits {
             storage_entry(wgsl::BIND_ZERO_BUF, false),
         ]
     }
-    pub fn count_entries() -> [wgpu::BindGroupLayoutEntry; 3] {
+    pub fn count_entries() -> [wgpu::BindGroupLayoutEntry; 4] {
         [
             ParamRing::layout_entry(wgsl::BIND_PARAMS),
             storage_entry(wgsl::BIND_SCALARS, true),
             storage_entry(wgsl::BIND_COUNTS_ATOMIC, false),
+            storage_entry(wgsl::BIND_LIVE, true),
         ]
     }
     pub fn scan_entries() -> [wgpu::BindGroupLayoutEntry; 3] {
@@ -848,12 +891,13 @@ impl MsmDigits {
             storage_entry(wgsl::BIND_CURSOR_WRITE, false),
         ]
     }
-    pub fn scatter_entries() -> [wgpu::BindGroupLayoutEntry; 4] {
+    pub fn scatter_entries() -> [wgpu::BindGroupLayoutEntry; 5] {
         [
             ParamRing::layout_entry(wgsl::BIND_PARAMS),
             storage_entry(wgsl::BIND_SCALARS, true),
             storage_entry(wgsl::BIND_CURSOR_ATOMIC, false),
             storage_entry(wgsl::BIND_ENTRIES, false),
+            storage_entry(wgsl::BIND_LIVE, true),
         ]
     }
     pub fn mont_entries() -> [wgpu::BindGroupLayoutEntry; 3] {
@@ -975,15 +1019,59 @@ impl MsmDigits {
         scalars: &wgpu::Buffer,
         bufs: &DigitBuffers,
     ) -> Result<SortBinds, ProveError> {
-        let want_scalars = u64::from(plan.scalar_off + plan.n) * FR_BYTES;
+        self.bind_sort_over(backend, ring, plan, scalars, None, bufs)
+    }
+
+    /// [`Self::bind_sort`] with the live index a plan [`DigitPlan::over`] a run reads
+    /// through, which it must then be given.
+    pub fn bind_sort_over(
+        &self,
+        backend: &WgpuBackend,
+        ring: &ParamRing,
+        plan: &DigitPlan,
+        scalars: &wgpu::Buffer,
+        live: Option<&wgpu::Buffer>,
+        bufs: &DigitBuffers,
+    ) -> Result<SortBinds, ProveError> {
+        let want_scalars = u64::from(plan.scalar_off + plan.span()) * FR_BYTES;
         if scalars.size() < want_scalars {
             return Err(bad(format!(
                 "the scalar buffer is {} bytes, {}..{} needs {want_scalars}",
                 scalars.size(),
                 plan.scalar_off,
-                plan.scalar_off + plan.n
+                plan.scalar_off + plan.span()
             )));
         }
+        let live = match (plan.live, live) {
+            (None, None) => &self.no_live,
+            (Some(run), Some(buf)) => {
+                let want = u64::from(run.off + plan.n) * 4;
+                if buf.size() < want {
+                    return Err(bad(format!(
+                        "the live index is {} bytes, words {}..{} need {want}",
+                        buf.size(),
+                        run.off,
+                        run.off + plan.n
+                    )));
+                }
+                buf
+            }
+            (plan_has, _) => {
+                return Err(bad(format!(
+                    "a sort planned {} a live index was bound {} one",
+                    if plan_has.is_some() {
+                        "over"
+                    } else {
+                        "without"
+                    },
+                    if plan_has.is_some() {
+                        "without"
+                    } else {
+                        "with"
+                    },
+                )))
+            }
+        };
         let want_rows = u64::from(plan.rows()) * 4;
         for (name, buf) in [("counts", &bufs.counts), ("cursor", &bufs.cursor)] {
             if buf.size() < want_rows {
@@ -1016,6 +1104,7 @@ impl MsmDigits {
                 &[
                     (wgsl::BIND_SCALARS, scalars),
                     (wgsl::BIND_COUNTS_ATOMIC, &bufs.counts),
+                    (wgsl::BIND_LIVE, live),
                 ],
             ),
             scan: self.bind(
@@ -1037,6 +1126,7 @@ impl MsmDigits {
                     (wgsl::BIND_SCALARS, scalars),
                     (wgsl::BIND_CURSOR_ATOMIC, &bufs.cursor),
                     (wgsl::BIND_ENTRIES, &bufs.entries),
+                    (wgsl::BIND_LIVE, live),
                 ],
             ),
         })

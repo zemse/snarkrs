@@ -52,11 +52,11 @@ use std::sync::Arc;
 // `std::time` on native, so no number on this machine changes.
 use web_time::Instant;
 
-use snarkrs_field::{Fr, One, Zero};
+use snarkrs_field::{AffineRepr, Fr, One, Zero};
 use snarkrs_formats::{Coefficients, ProvingKey};
 use snarkrs_groth16::{malloc::release, HPoly, MsmOutputs, ProveError, StageTimings};
 
-use crate::batch::{G1Bases, G2Bases, Group, Job, MontConvert, MsmBatch, Source};
+use crate::batch::{G1Bases, G2Bases, Group, Job, Live, MontConvert, MsmBatch, Source};
 use crate::device::{bad, WgpuBackend};
 use crate::msm::Work;
 use crate::readback::Seal;
@@ -268,6 +268,13 @@ pub struct WgpuCircuit {
     b_g2_bases: G2Bases,
     l_bases: G1Bases,
     h_bases: G1Bases,
+    /// The positions of the A query, and of the B query in either group, that are not at
+    /// infinity, when [`live_index`] found enough that are to sort A and B apart.
+    a_live: Option<Live>,
+    b_live: Option<Live>,
+    /// Per position, 1 if A's live index holds it and 2 if B's does, a query without an
+    /// index holding every position. Empty when neither has one.
+    live_in: Vec<u8>,
     cost: CircuitCost,
     /// What [`PreparedCircuit::msms`] proves under; the browser chooses per call instead.
     work: Work,
@@ -332,7 +339,7 @@ impl WgpuCircuit {
             )));
         }
 
-        let (stages, bases, cost) = Self::upload(&device, &pk)?;
+        let (stages, bases, live, cost) = Self::upload(&device, &pk)?;
         Ok(Self {
             pk,
             device,
@@ -343,6 +350,9 @@ impl WgpuCircuit {
             b_g2_bases: bases.2,
             l_bases: bases.3,
             h_bases: bases.4,
+            live_in: live_in(n_vars, &live),
+            a_live: live.0,
+            b_live: live.1,
             cost,
             work,
             host_released: false,
@@ -350,8 +360,8 @@ impl WgpuCircuit {
     }
 
     /// The device-resident half of a circuit: stages 0 to 4's modules and tables, then the
-    /// five base vectors. The uploads are queued here and land with the next submission;
-    /// [`Self::key_landed`] is that submission.
+    /// five base vectors and the live indices of A and B. The uploads are queued here and
+    /// land with the next submission; [`Self::key_landed`] is that submission.
     #[allow(clippy::type_complexity)]
     fn upload(
         device: &WgpuBackend,
@@ -360,6 +370,7 @@ impl WgpuCircuit {
         (
             HStages,
             (G1Bases, G1Bases, G2Bases, G1Bases, G1Bases),
+            (Option<Live>, Option<Live>),
             CircuitCost,
         ),
         ProveError,
@@ -379,6 +390,10 @@ impl WgpuCircuit {
         let b_g2_bases = G2Bases::upload(device, &pk.b_g2_query)?;
         let l_bases = G1Bases::upload(device, &pk.l_query)?;
         let h_bases = G1Bases::upload(device, &pk.h_query)?;
+        let a_live = live_index(device, pk.n_vars, |i| !pk.a_query[i].is_zero())?;
+        let b_live = live_index(device, pk.n_vars, |i| {
+            !(pk.b_g1_query[i].is_zero() && pk.b_g2_query[i].is_zero())
+        })?;
         let bases_us = t1.elapsed().as_micros() as u64;
 
         let cost = CircuitCost {
@@ -406,6 +421,7 @@ impl WgpuCircuit {
         Ok((
             stages,
             (a_bases, b_g1_bases, b_g2_bases, l_bases, h_bases),
+            (a_live, b_live),
             cost,
         ))
     }
@@ -455,13 +471,16 @@ impl WgpuCircuit {
         if self.host_released {
             return Err(bad("the key's host copy was released after it landed"));
         }
-        let (stages, bases, cost) = Self::upload(&self.device, &self.pk)?;
+        let (stages, bases, live, cost) = Self::upload(&self.device, &self.pk)?;
         self.stages = stages;
         self.a_bases = bases.0;
         self.b_g1_bases = bases.1;
         self.b_g2_bases = bases.2;
         self.l_bases = bases.3;
         self.h_bases = bases.4;
+        self.live_in = live_in(self.pk.n_vars, &live);
+        self.a_live = live.0;
+        self.b_live = live.1;
         self.cost = cost;
         Ok(())
     }
@@ -505,13 +524,15 @@ impl WgpuCircuit {
         self.cost
     }
 
-    /// Device bytes this key holds resident: the five base vectors.
+    /// Device bytes this key holds resident: the five base vectors and the live indices.
     pub fn base_bytes(&self) -> u64 {
         self.a_bases.bytes()
             + self.b_g1_bases.bytes()
             + self.b_g2_bases.bytes()
             + self.l_bases.bytes()
             + self.h_bases.bytes()
+            + self.a_live.as_ref().map_or(0, Live::bytes)
+            + self.b_live.as_ref().map_or(0, Live::bytes)
     }
 
     pub fn stages(&self) -> &HStages {
@@ -595,18 +616,74 @@ impl WgpuCircuit {
 /// in silence when it goes out of range, so **an undercount loses entries with no error
 /// anywhere**. Counting rather than estimating is not optional. At 140,824 variables this is
 /// about 0.2 ms.
-fn general_counts(witness: &[Fr], private_from: usize) -> (u32, u32) {
+///
+/// The last two are the count among the positions A's live index holds and among those
+/// B's does, which is what a sort over either sizes itself from: `live_in[i]` is 1 for a
+/// position in A's, 2 for one in B's, and the whole witness's count where it is empty.
+fn general_counts(witness: &[Fr], private_from: usize, live_in: &[u8]) -> (u32, u32, u32, u32) {
     let mut all = 0u32;
     let mut private = 0u32;
+    let (mut a, mut b) = (0u32, 0u32);
     for (i, x) in witness.iter().enumerate() {
         if !(x.is_zero() || x.is_one()) {
             all += 1;
             if i >= private_from {
                 private += 1;
             }
+            if let Some(&live) = live_in.get(i) {
+                a += u32::from(live & 1);
+                b += u32::from(live >> 1);
+            }
         }
     }
-    (all, private)
+    if live_in.is_empty() {
+        (a, b) = (all, all);
+    }
+    (all, private, a, b)
+}
+
+/// One base in this many at infinity is where a query gets a [`Live`] index, and A and B a
+/// counting sort each.
+///
+/// Low, because the second sort costs nothing that shows and the positions at infinity can
+/// hold most of the general scalars: 3.0% of `rsa2048`'s A query and 2.6% of its B query
+/// are at infinity, under 85% and 79% of the witness's 5,254 general scalars, and the two
+/// indices take its proof from 159.9 ms to 140.0 in native wgpu. An index is 4 bytes a
+/// live position on the device and again on the host.
+const LIVE_ONE_IN: usize = 64;
+
+/// The index of the `n` positions `live_at` holds for, or `None` when fewer than one in
+/// [`LIVE_ONE_IN`] of them is at infinity.
+fn live_index(
+    device: &WgpuBackend,
+    n: usize,
+    live_at: impl Fn(usize) -> bool,
+) -> Result<Option<Live>, ProveError> {
+    let dead = (0..n).filter(|&i| !live_at(i)).count();
+    if dead * LIVE_ONE_IN < n.max(1) {
+        return Ok(None);
+    }
+    let pos = (0..n).filter(|&i| live_at(i)).map(|i| i as u32).collect();
+    Live::upload(device, pos).map(Some)
+}
+
+/// [`WgpuCircuit`]'s `live_in`, from the two indices.
+fn live_in(n: usize, live: &(Option<Live>, Option<Live>)) -> Vec<u8> {
+    if live.0.is_none() && live.1.is_none() {
+        return Vec::new();
+    }
+    let mut out = vec![0u8; n];
+    for (bit, live) in [(1u8, &live.0), (2u8, &live.1)] {
+        match live {
+            Some(live) => {
+                for &i in live.positions() {
+                    out[i as usize] |= bit;
+                }
+            }
+            None => out.iter_mut().for_each(|x| *x |= bit),
+        }
+    }
+    out
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -757,12 +834,12 @@ impl WgpuCircuit {
         let private_from = self.pk.n_public + 1;
         // Under constant work nothing on the host looks at a scalar's value either: the
         // plans take `n`, and `None` is what says so.
-        let (g_all, g_private) = match work {
+        let (g_a, g_b, g_private) = match work {
             Work::Variable => {
-                let (all, private) = general_counts(witness, private_from);
-                (Some(all), Some(private))
+                let (_, private, a, b) = general_counts(witness, private_from, &self.live_in);
+                (Some(a), Some(b), Some(private))
             }
-            Work::Constant => (None, None),
+            Work::Constant => (None, None, None),
         };
         let n_vars = self.pk.n_vars as u32;
         let l_len = self.l_bases.len() as u32;
@@ -792,6 +869,21 @@ impl WgpuCircuit {
             bases: &self.h_bases,
             base_off: 0,
         }];
+        // The sorts over the witness, as (jobs, general scalars, live index). One for all
+        // three jobs when neither query has an index; otherwise A's and B's apart, each
+        // over its own live positions, because the two queries are at infinity in
+        // different places. `g_a` and `g_b` are both the whole witness's count in the
+        // first case.
+        let (a_live, b_live) = (self.a_live.as_ref(), self.b_live.as_ref());
+        let witness_sorts: Vec<(&[Job<'_>], Option<u32>, Option<&Live>)> =
+            if a_live.is_none() && b_live.is_none() {
+                vec![(&witness_jobs, g_a, None)]
+            } else {
+                vec![
+                    (&witness_jobs[..1], g_a, a_live),
+                    (&witness_jobs[1..], g_b, b_live),
+                ]
+            };
 
         // The normal path: `H` is the buffer stage 4 wrote and the witness is the one stage 0
         // uploaded, so nothing crosses the host boundary and stage 9's scalars never exist in
@@ -815,45 +907,48 @@ impl WgpuCircuit {
                         dst: w,
                         n: n_vars,
                     }),
-                    vec![
-                        Group {
-                            scalars: Source::Device {
-                                buf: w,
-                                general: g_all,
-                            },
+                    witness_sorts
+                        .iter()
+                        .map(|&(jobs, general, live)| Group {
+                            scalars: Source::Device { buf: w, general },
                             scalar_off: 0,
                             n: n_vars,
-                            jobs: &witness_jobs,
+                            jobs,
                             work,
-                        },
-                        Group {
-                            scalars: Source::Device {
-                                buf: w,
-                                general: g_private,
+                            live,
+                        })
+                        .chain([
+                            Group {
+                                scalars: Source::Device {
+                                    buf: w,
+                                    general: g_private,
+                                },
+                                // Section 8 covers the private wires only: witness[0] is the
+                                // constant 1 and witness[1..=n_public] are the public inputs,
+                                // which the verifier folds in through IC instead.
+                                scalar_off: private_from as u32,
+                                n: l_len,
+                                jobs: &l_jobs,
+                                work,
+                                live: None,
                             },
-                            // Section 8 covers the private wires only: witness[0] is the
-                            // constant 1 and witness[1..=n_public] are the public inputs,
-                            // which the verifier folds in through IC instead.
-                            scalar_off: private_from as u32,
-                            n: l_len,
-                            jobs: &l_jobs,
-                            work,
-                        },
-                        Group {
-                            scalars: Source::Device {
-                                buf: handle.h_std(),
-                                // Nobody on the host has seen these values, so the only safe
-                                // answer is "all of them are general". Overestimating costs a
-                                // wider window and a larger entry array; underestimating
-                                // loses entries in silence. See `crate::batch::Source`.
-                                general: None,
+                            Group {
+                                scalars: Source::Device {
+                                    buf: handle.h_std(),
+                                    // Nobody on the host has seen these values, so the only safe
+                                    // answer is "all of them are general". Overestimating costs a
+                                    // wider window and a larger entry array; underestimating
+                                    // loses entries in silence. See `crate::batch::Source`.
+                                    general: None,
+                                },
+                                scalar_off: 0,
+                                n: domain,
+                                jobs: &h_jobs,
+                                work,
+                                live: None,
                             },
-                            scalar_off: 0,
-                            n: domain,
-                            jobs: &h_jobs,
-                            work,
-                        },
-                    ],
+                        ])
+                        .collect::<Vec<_>>(),
                 )
             }
             None => {
@@ -863,29 +958,35 @@ impl WgpuCircuit {
                 let host_h = host_h.expect("require_handle returns None only for a host vector");
                 (
                     None,
-                    vec![
-                        Group {
+                    witness_sorts
+                        .iter()
+                        .map(|&(jobs, _, live)| Group {
                             scalars: Source::Host(witness),
                             scalar_off: 0,
                             n: n_vars,
-                            jobs: &witness_jobs,
+                            jobs,
                             work,
-                        },
-                        Group {
-                            scalars: Source::Host(witness),
-                            scalar_off: private_from as u32,
-                            n: l_len,
-                            jobs: &l_jobs,
-                            work,
-                        },
-                        Group {
-                            scalars: Source::Host(host_h),
-                            scalar_off: 0,
-                            n: domain,
-                            jobs: &h_jobs,
-                            work,
-                        },
-                    ],
+                            live,
+                        })
+                        .chain([
+                            Group {
+                                scalars: Source::Host(witness),
+                                scalar_off: private_from as u32,
+                                n: l_len,
+                                jobs: &l_jobs,
+                                work,
+                                live: None,
+                            },
+                            Group {
+                                scalars: Source::Host(host_h),
+                                scalar_off: 0,
+                                n: domain,
+                                jobs: &h_jobs,
+                                work,
+                                live: None,
+                            },
+                        ])
+                        .collect::<Vec<_>>(),
                 )
             }
         };
@@ -947,7 +1048,13 @@ impl WgpuCircuit {
             .ok_or_else(|| bad("msm_probe needs an H that is still on the device"))?;
 
         let private_from = self.pk.n_public + 1;
-        let (g_all, g_private) = general_counts(witness, private_from);
+        let (g_all, g_private, g_a, g_b) = general_counts(witness, private_from, &self.live_in);
+        let (live, g_live) = match which {
+            "a-g1" => (self.a_live.as_ref(), g_a),
+            "b-g2" | "b-g1" => (self.b_live.as_ref(), g_b),
+            _ => (None, g_all),
+        };
+        let g_live = if live.is_some() { g_live } else { g_all };
         let n_vars = self.pk.n_vars as u32;
         let w = handle.witness_std();
         let mont = Some(MontConvert {
@@ -997,6 +1104,7 @@ impl WgpuCircuit {
                 n: self.l_bases.len() as u32,
                 jobs: &jobs,
                 work,
+                live: None,
             },
             "h-g1" => Group {
                 scalars: Source::Device {
@@ -1007,16 +1115,18 @@ impl WgpuCircuit {
                 n: self.pk.domain_size as u32,
                 jobs: &jobs,
                 work,
+                live: None,
             },
             _ => Group {
                 scalars: Source::Device {
                     buf: w,
-                    general: Some(g_all),
+                    general: Some(g_live),
                 },
                 scalar_off: 0,
                 n: n_vars,
                 jobs: &jobs,
                 work,
+                live,
             },
         };
 

@@ -85,6 +85,17 @@
 //! error: it is one extra sort, or worse, one MSM reading another's entry array. Making the
 //! caller say it costs one line in `crate::backend` and makes the mistake unrepresentable.
 //!
+//! # A and B sort apart where the key has bases at infinity
+//!
+//! The one sort for the three witness MSMs gives every job an entry per general scalar and
+//! window, and the accumulation a lane iteration per entry whether or not the base under it
+//! is the point at infinity. A snarkjs key has many: a third of the B query of the
+//! `js_*` circuits, half of `railgun-13x01`'s A query and two thirds of its B query. So a
+//! [`Group`] may name a [`Live`] index, and `crate::backend` then gives A one group and B
+//! in both curves another, each over its own index. That is a second sort, which costs
+//! nothing that shows, for entry arrays, slices and merges as long as the bases that are
+//! there. The index is the key's, so constant work reads through it as well.
+//!
 //! # The witness reaches the device once, in Montgomery form
 //!
 //! Stage 0 already uploaded the witness as `PackedFr` ([`crate::stages`]), and every digit
@@ -127,7 +138,9 @@ use snarkrs_groth16::ProveError;
 
 use crate::device::{bad, WgpuBackend};
 use crate::gen::points as wgsl;
-use crate::msm::{pack_scalars, storage_buffer, DigitBuffers, DigitPlan, Jobs, MsmDigits, Work};
+use crate::msm::{
+    pack_scalars, storage_buffer, DigitBuffers, DigitPlan, Jobs, LiveRun, MsmDigits, Work,
+};
 use crate::params::ParamRing;
 use crate::points::{MsmPointsG1, MsmPointsG2, PointBuffers, PointPlan};
 use crate::readback::{is_aborted, Readback};
@@ -438,6 +451,59 @@ impl G2Bases {
 }
 
 // ---------------------------------------------------------------------------
+// The positions whose bases are not at infinity
+// ---------------------------------------------------------------------------
+
+/// The positions of a group's range whose base is not the point at infinity in at least one
+/// of its jobs, ascending and counted from the group's first scalar, on the device and on
+/// the host.
+///
+/// A snarkjs key holds many such bases: a wire that is in no constraint's A side has the
+/// point at infinity in the A query, and the same for B. The accumulation gives a base at
+/// infinity a lane iteration like any other, so a [`Group`] that names an index sorts only
+/// the positions in it: the sort's dispatch, the entry array, the slices and the merge are
+/// all as long as the index, and the entries still carry positions, so the point stages
+/// read the base vector as it is. Which positions are in it follows the key and never the
+/// witness, which is what lets constant work read through it too.
+pub struct Live {
+    buf: wgpu::Buffer,
+    pos: Vec<u32>,
+}
+
+impl Live {
+    /// Uploads `pos`, which must be strictly ascending.
+    pub fn upload(backend: &WgpuBackend, pos: Vec<u32>) -> Result<Self, ProveError> {
+        if let Some(w) = pos.windows(2).find(|w| w[0] >= w[1]) {
+            return Err(bad(format!(
+                "a live index must ascend strictly, and {} is followed by {}",
+                w[0], w[1]
+            )));
+        }
+        // At least one word, because a zero-length WebGPU buffer is not a thing.
+        let buf = storage_buffer(backend, "g16 msm live index", (pos.len().max(1) as u64) * 4)?;
+        backend
+            .queue()
+            .write_buffer(&buf, 0, bytemuck::cast_slice(&pos));
+        Ok(Self { buf, pos })
+    }
+
+    pub fn len(&self) -> usize {
+        self.pos.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.pos.is_empty()
+    }
+    /// The positions, on the host.
+    pub fn positions(&self) -> &[u32] {
+        &self.pos
+    }
+    /// Device bytes held.
+    pub fn bytes(&self) -> u64 {
+        self.buf.size()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // What a caller asks for
 // ---------------------------------------------------------------------------
 
@@ -552,6 +618,10 @@ pub struct Group<'a> {
     /// Whether the sort and every job over it may size themselves from the scalar values.
     /// Under [`Work::Constant`] the `general` count of a [`Source::Device`] is ignored.
     pub work: Work,
+    /// The positions every job's sort is confined to, or `None` for all `n`. Every base
+    /// outside it must be the point at infinity in every job, and the `general` count of a
+    /// [`Source::Device`] is then the count among these positions.
+    pub live: Option<&'a Live>,
 }
 
 /// One `fr_mont_to_std` dispatch, run before anything else in the encoder.
@@ -852,7 +922,7 @@ impl MsmBatch {
                 }
                 if k + 1 == pj.slabs.len() && pj.pplan.ones_groups() > 0 {
                     // The ones pass walks every scalar once.
-                    us += SORT_NS * f64::from(p.dplan.n()) / 1000.0;
+                    us += SORT_NS * f64::from(p.dplan.span()) / 1000.0;
                 }
                 units.push(Unit {
                     pj: i,
@@ -1032,11 +1102,12 @@ impl MsmBatch {
         };
         let mut sort_binds = Vec::with_capacity(pieces.len());
         for (pi, p) in pieces.iter().enumerate() {
-            sort_binds.push(self.digits.bind_sort(
+            sort_binds.push(self.digits.bind_sort_over(
                 backend,
                 ring,
                 &p.dplan,
                 scalar_buf(p.gi),
+                groups[p.gi].live.map(|live| &live.buf),
                 &sc.digits[pi].bufs,
             )?);
         }
@@ -1309,26 +1380,64 @@ impl MsmBatch {
             g1: g.jobs.len() as u32 - g2,
             g2,
         };
+        let live = g.live.map(Live::positions);
+        if let Some(&last) = live.and_then(|pos| pos.last()) {
+            if last >= g.n {
+                return Err(bad(format!(
+                    "group {gi}: its live index names position {last} of {} scalars",
+                    g.n
+                )));
+            }
+        }
         let mut cap = g.n;
         loop {
             let mut pieces = Vec::new();
             let mut lo = 0u32;
             let mut fits = true;
             while lo < g.n {
-                let mut hi = lo.saturating_add(cap).min(g.n);
+                let mut hi = g.n;
                 for job in g.jobs {
                     hi = hi.min(job.next_boundary(lo));
                 }
-                let n = hi - lo;
+                // Over a live index a piece is a run of it, at most `cap` long, and ends at
+                // the position the next run starts at.
+                let (n, run) = match live {
+                    None => {
+                        hi = hi.min(lo.saturating_add(cap));
+                        (hi - lo, None)
+                    }
+                    Some(pos) => {
+                        let first = pos.partition_point(|&p| p < lo);
+                        let mut end = pos.partition_point(|&p| p < hi);
+                        if end - first > cap as usize {
+                            end = first + cap as usize;
+                            hi = pos[end];
+                        }
+                        let run = LiveRun {
+                            off: first as u32,
+                            lo,
+                            span: hi - lo,
+                        };
+                        ((end - first) as u32, Some(run))
+                    }
+                };
+                if n == 0 {
+                    // Every base in `lo..hi` is at infinity, so nothing there adds anything.
+                    lo = hi;
+                    continue;
+                }
                 // A piece never has more general scalars than the whole range, and never
                 // more than its own length.
-                let dplan = DigitPlan::for_jobs(
+                let mut dplan = DigitPlan::for_jobs(
                     n,
                     g.scalar_off + lo,
                     general.map(|x| x.min(n)),
                     g.work,
                     jobs,
                 )?;
+                if let Some(run) = run {
+                    dplan = dplan.over(run);
+                }
                 if !self.fits(&dplan, g.jobs, limit)? {
                     fits = false;
                     break;

@@ -97,12 +97,12 @@ pub mod stages;
 pub mod wasm;
 
 pub use backend::{CircuitCost, WgpuCircuit, WgpuProver};
-pub use batch::{G1Bases, G2Bases, Group, Job, MontConvert, MsmBatch, MsmResult, Source};
+pub use batch::{G1Bases, G2Bases, Group, Job, Live, MontConvert, MsmBatch, MsmResult, Source};
 pub use device::{LimitsProfile, WgpuBackend};
 pub use gather::{CsrHost, CsrTables, GatherAbc, GatherParams};
 pub use msm::{
-    window_size, window_size_for, DigitBuffers, DigitPlan, Jobs, MsmDigits, MsmParams, SortBinds,
-    SortOffsets, Work, DUMMY_ROWS,
+    window_size, window_size_for, DigitBuffers, DigitPlan, Jobs, LiveRun, MsmDigits, MsmParams,
+    SortBinds, SortOffsets, Work, DUMMY_ROWS,
 };
 pub use ntt::{
     split_passes, Batch, Direction, Epilogue, Ntt, NttParams, NttTables, Planned, Scale, Transform,

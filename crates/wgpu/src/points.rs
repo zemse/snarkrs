@@ -363,7 +363,7 @@ impl PointPlan {
             base_off,
             slice_len,
             slices,
-            ones_groups: ones_groups_for(digits.n(), tg, digits.work()),
+            ones_groups: ones_groups_for(digits.span(), tg, digits.work()),
             tg,
             fold_len: match digits.work() {
                 Work::Constant => fold_len(),
@@ -484,6 +484,15 @@ impl PointPlan {
             slices: self.slices,
             reduce_groups: self.reduce_groups,
             ..digits.params(digits.n(), lo)
+        }
+    }
+
+    /// The block `msm_ones_*` reads, whose `n` is every position of the range: over a live
+    /// index the sort's `n` is the run's length, and a scalar of 1 is added wherever it is.
+    pub fn params_ones(&self, digits: &DigitPlan) -> MsmParams {
+        MsmParams {
+            n: digits.span(),
+            ..self.params(digits, 0)
         }
     }
 
@@ -1172,12 +1181,12 @@ impl<C: PointCurve> MsmPoints<C> {
         // The base range this MSM reads. `msm_ones_g2` walks base_off .. base_off + n and the
         // segmented pass reads base_off + (entry >> 1), whose largest value is base_off + n - 1
         // because msm_scatter stores the index within this MSM.
-        let base_end = u64::from(points.base_off) + u64::from(digits.n());
+        let base_end = u64::from(points.base_off) + u64::from(digits.span());
         need("the base vector", bases, base_end * self.curve.base_bytes)?;
         need(
             "the scalar buffer",
             scalars,
-            u64::from(digits.scalar_off() + digits.n()) * (LIMBS as u64) * 4,
+            u64::from(digits.scalar_off() + digits.span()) * (LIMBS as u64) * 4,
         )?;
 
         fn whole(b: &wgpu::Buffer) -> wgpu::BindingResource<'_> {
@@ -1415,7 +1424,7 @@ impl<C: PointCurve> MsmPoints<C> {
             // `sum_points` is a few hundred at most and ones_groups at most 64, against a
             // 65535 limit.
             reduce: ring.push(&points.params(digits, 0))?,
-            ones: ring.push(&points.params(digits, 0))?,
+            ones: ring.push(&points.params_ones(digits))?,
         })
     }
 

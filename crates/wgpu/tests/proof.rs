@@ -774,6 +774,7 @@ fn an_empty_group_dispatches_nothing_and_keeps_its_result_slots() {
                 n: n_vars,
                 jobs: &first,
                 work: Work::Variable,
+                live: None,
             };
             let g_last = || Group {
                 scalars: Source::Host(&witness),
@@ -781,6 +782,7 @@ fn an_empty_group_dispatches_nothing_and_keeps_its_result_slots() {
                 n: n_vars,
                 jobs: &last,
                 work: Work::Variable,
+                live: None,
             };
 
             let want = pollster::block_on(batch.run(b, None, &[g_first(), g_last()])).expect("two");
@@ -797,6 +799,7 @@ fn an_empty_group_dispatches_nothing_and_keeps_its_result_slots() {
                         n: 0,
                         jobs: &empty,
                         work: Work::Variable,
+                        live: None,
                     },
                     g_last(),
                 ],
@@ -1143,6 +1146,7 @@ fn a_group_cut_into_sub_msms_matches_the_cpu() {
                 n: n_vars,
                 jobs: &w_jobs,
                 work: Work::Variable,
+                live: None,
             },
             Group {
                 scalars: Source::Host(&witness),
@@ -1150,6 +1154,7 @@ fn a_group_cut_into_sub_msms_matches_the_cpu() {
                 n: l_len,
                 jobs: &l_jobs,
                 work: Work::Variable,
+                live: None,
             },
             Group {
                 scalars: Source::Host(&witness),
@@ -1157,6 +1162,7 @@ fn a_group_cut_into_sub_msms_matches_the_cpu() {
                 n: tail,
                 jobs: &off_jobs,
                 work: Work::Variable,
+                live: None,
             },
         ];
         let got =
@@ -1262,6 +1268,7 @@ fn a_point_stage_cut_into_one_window_per_submission_matches_the_cpu() {
                     n: n_vars,
                     jobs: &w_jobs,
                     work: Work::Variable,
+                    live: None,
                 },
                 Group {
                     scalars: Source::Host(&witness),
@@ -1269,6 +1276,7 @@ fn a_point_stage_cut_into_one_window_per_submission_matches_the_cpu() {
                     n: l_len,
                     jobs: &l_jobs,
                     work: Work::Variable,
+                    live: None,
                 },
             ];
             let before = b.submits();
@@ -1449,6 +1457,7 @@ fn where_the_msm_time_goes() {
             n: n_vars,
             jobs: &w_jobs,
             work: Work::Variable,
+            live: None,
         };
         let l_group = || Group {
             scalars: Source::Device {
@@ -1459,6 +1468,7 @@ fn where_the_msm_time_goes() {
             n: l_len,
             jobs: &l_jobs,
             work: Work::Variable,
+            live: None,
         };
         let h_group = || Group {
             scalars: Source::Device {
@@ -1469,6 +1479,7 @@ fn where_the_msm_time_goes() {
             n: domain,
             jobs: &h_jobs,
             work: Work::Variable,
+            live: None,
         };
 
         // Warm the pools and the pipelines before anything is timed.

@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use snarkrs_field::{
-    CurveGroup, Fr, G1Affine, G1Projective, G2Affine, G2Projective, One, PrimeField, PrimeGroup,
-    Zero,
+    AffineRepr, CurveGroup, Fr, G1Affine, G1Projective, G2Affine, G2Projective, One, PrimeField,
+    PrimeGroup, Zero,
 };
 use snarkrs_formats::{wtns::Witness, ProvingKey, VerifyingKey};
 use snarkrs_groth16::prove::prove_with_blinders;
@@ -25,9 +25,9 @@ use snarkrs_msm::{CpuMsm, MsmBackend};
 use snarkrs_wgpu::backend::WgpuProver;
 use snarkrs_wgpu::msm::pack_scalars;
 use snarkrs_wgpu::{
-    DigitBuffers, DigitPlan, G1Bases, G2Bases, Group, Job, LimitsProfile, MsmResult, ParamRing,
-    PointBinds, PointBuffers, PointOffsets, PointPlan, SortBinds, SortOffsets, Source, WgpuBackend,
-    Work, DUMMY_ROWS,
+    DigitBuffers, DigitPlan, G1Bases, G2Bases, Group, Job, LimitsProfile, Live, MsmResult,
+    ParamRing, PointBinds, PointBuffers, PointOffsets, PointPlan, SortBinds, SortOffsets, Source,
+    WgpuBackend, Work, DUMMY_ROWS,
 };
 
 #[path = "msmcommon/mod.rs"]
@@ -270,6 +270,7 @@ fn constant_work_msms_match_the_cpu_on_every_sparsity() {
                 n,
                 jobs: &whole,
                 work: Work::Constant,
+                live: None,
             },
             Group {
                 scalars: Source::Host(&scalars),
@@ -277,6 +278,7 @@ fn constant_work_msms_match_the_cpu_on_every_sparsity() {
                 n: n - off as u32,
                 jobs: &off_job,
                 work: Work::Constant,
+                live: None,
             },
         ];
         let got = pollster::block_on(batch.run(b, None, &gs)).expect("run");
@@ -305,6 +307,7 @@ fn constant_work_msms_match_the_cpu_on_every_sparsity() {
                 n,
                 jobs: &cut,
                 work: Work::Constant,
+                live: None,
             },
             Group {
                 scalars: Source::Host(&scalars),
@@ -312,6 +315,7 @@ fn constant_work_msms_match_the_cpu_on_every_sparsity() {
                 n: n - off as u32,
                 jobs: &cut_off,
                 work: Work::Constant,
+                live: None,
             },
         ];
         let got =
@@ -332,6 +336,7 @@ fn constant_work_msms_match_the_cpu_on_every_sparsity() {
                 n,
                 jobs: &whole,
                 work: Work::Constant,
+                live: None,
             },
             Group {
                 scalars: Source::Host(&scalars),
@@ -339,6 +344,7 @@ fn constant_work_msms_match_the_cpu_on_every_sparsity() {
                 n: n - off as u32,
                 jobs: &off_job,
                 work: Work::Constant,
+                live: None,
             },
         ];
         let got = pollster::block_on(batch.run_with_limits(b, None, &gs, limit, 1.0)).expect("run");
@@ -352,6 +358,163 @@ fn constant_work_msms_match_the_cpu_on_every_sparsity() {
         eprintln!(
             "  {label:<24} whole, {s1}+{s2} sub-MSMs and {} submissions all match the CPU",
             batch.last_submits()
+        );
+    }
+}
+
+/// A group over a [`Live`] index against the CPU MSM, under both work modes and on every
+/// sparsity: whole, over an offset range the way the L MSM reads one, and cut into
+/// sub-MSMs at a tiny binding limit over chunked bases, where a piece is a run of the
+/// index. Two thirds of the positions are at infinity in both groups and some in one only,
+/// which the index keeps.
+///
+/// Then that the sort is confined to the index and not merely handed one: an index that
+/// leaves out a finite base loses exactly that base's term, unless its scalar is 1, which
+/// the ones pass adds wherever it is.
+#[test]
+fn a_live_index_sorts_only_the_bases_not_at_infinity() {
+    let _one_at_a_time = exclusive();
+    const N: usize = 3 * 4096 + 7;
+    const LIMIT: u64 = 1 << 20;
+    let b = device();
+    let batch = prover().msm();
+    let (mut g1, mut g2) = bases_with_infinity(N);
+    for i in 0..N {
+        if i % 3 != 1 {
+            g1[i] = G1Affine::identity();
+            g2[i] = G2Affine::identity();
+        } else if i % 10 == 4 {
+            g1[i] = G1Affine::identity();
+        } else if i % 10 == 7 {
+            g2[i] = G2Affine::identity();
+        }
+    }
+    let off = 5usize;
+    let live_from = |from: usize| -> Vec<u32> {
+        (from..N)
+            .filter(|&i| !(g1[i].is_zero() && g2[i].is_zero()))
+            .map(|i| (i - from) as u32)
+            .collect()
+    };
+    let positions = live_from(0);
+    assert!(
+        positions.len() * 3 < N,
+        "the index is not a third of the range"
+    );
+    let live = Live::upload(b, positions.clone()).expect("live");
+    let live_off = Live::upload(b, live_from(off)).expect("live");
+    let b1 = G1Bases::upload(b, &g1).expect("g1 bases");
+    let b2 = G2Bases::upload(b, &g2).expect("g2 bases");
+    let chunk = ((N as u32) / 7).max(3) | 1;
+    let c1 = G1Bases::upload_chunked(b, &g1, chunk).expect("g1 chunks");
+    let c2 = G2Bases::upload_chunked(b, &g2, chunk).expect("g2 chunks");
+    let cpu = CpuMsm::new();
+    let n = N as u32;
+
+    for work in [Work::Variable, Work::Constant] {
+        for (label, scalars) in scalars_of_every_sparsity(N) {
+            let want1 = cpu.msm_g1(&g1, &scalars);
+            let want2 = cpu.msm_g2(&g2, &scalars);
+            let want_off = cpu.msm_g1(&g1[off..], &scalars[off..]);
+            for (what, j1, j2, limit) in [
+                ("whole", &b1, &b2, u64::MAX),
+                ("cut into sub-MSMs", &c1, &c2, LIMIT),
+            ] {
+                let jobs = [
+                    Job::G1 {
+                        bases: j1,
+                        base_off: 0,
+                    },
+                    Job::G2 {
+                        bases: j2,
+                        base_off: 0,
+                    },
+                ];
+                let off_job = [Job::G1 {
+                    bases: j1,
+                    base_off: off as u32,
+                }];
+                let gs = [
+                    Group {
+                        scalars: Source::Host(&scalars),
+                        scalar_off: 0,
+                        n,
+                        jobs: &jobs,
+                        work,
+                        live: Some(&live),
+                    },
+                    Group {
+                        scalars: Source::Host(&scalars),
+                        scalar_off: off as u32,
+                        n: n - off as u32,
+                        jobs: &off_job,
+                        work,
+                        live: Some(&live_off),
+                    },
+                ];
+                let limit = limit.min(b.granted_limits().max_storage_buffer_binding_size);
+                let got = pollster::block_on(batch.run_with_binding_limit(b, None, &gs, limit))
+                    .expect("run");
+                assert_eq!(got.len(), 3, "{work:?}, {label}, {what}");
+                assert_eq!(g1_of(&got[0]), want1, "{work:?}, {label}, {what}: G1");
+                assert_eq!(g2_of(&got[1]), want2, "{work:?}, {label}, {what}: G2");
+                assert_eq!(
+                    g1_of(&got[2]),
+                    want_off,
+                    "{work:?}, {label}, {what}: G1 over an offset range"
+                );
+                let (s1, s2) = batch.last_sub_msms();
+                if limit == LIMIT {
+                    assert!(
+                        s1 >= 4 && s2 >= 2,
+                        "{work:?}, {label}: {s1} G1 and {s2} G2 sub-MSMs, nothing was cut"
+                    );
+                } else {
+                    assert_eq!((s1, s2), (2, 1), "{work:?}, {label}: cut for nothing");
+                }
+            }
+        }
+        eprintln!("  {work:?}: whole and cut, over a live index, all match the CPU");
+    }
+
+    // Leave one finite base out of the index.
+    let gone = positions[positions.len() / 2] as usize;
+    assert!(!g1[gone].is_zero());
+    let mut short = positions.clone();
+    short.retain(|&i| i as usize != gone);
+    let short = Live::upload(b, short).expect("live");
+    let jobs = [Job::G1 {
+        bases: &b1,
+        base_off: 0,
+    }];
+    for (work, at_gone, counted) in [
+        (Work::Variable, Fr::from(12_345u64), false),
+        (Work::Variable, Fr::one(), true),
+        (Work::Constant, Fr::from(12_345u64), false),
+        (Work::Constant, Fr::one(), false),
+    ] {
+        let mut seed = 0x1234_5678_9abc_def1u64;
+        let mut scalars = random_scalars(N, &mut seed);
+        scalars[gone] = at_gone;
+        let all = cpu.msm_g1(&g1, &scalars);
+        let want = if counted {
+            all
+        } else {
+            all - g1[gone] * at_gone
+        };
+        let gs = [Group {
+            scalars: Source::Host(&scalars),
+            scalar_off: 0,
+            n,
+            jobs: &jobs,
+            work,
+            live: Some(&short),
+        }];
+        let got = pollster::block_on(batch.run(b, None, &gs)).expect("run");
+        assert_eq!(
+            g1_of(&got[0]),
+            want,
+            "{work:?}, scalar {at_gone} at the position the index leaves out"
         );
     }
 }
@@ -453,6 +616,7 @@ fn constant_work_matches_the_cpu_on_bucket_collisions() {
                 n: n as u32,
                 jobs: &whole,
                 work: Work::Constant,
+                live: None,
             }];
             if off < n {
                 gs.push(Group {
@@ -461,6 +625,7 @@ fn constant_work_matches_the_cpu_on_bucket_collisions() {
                     n: (n - off) as u32,
                     jobs: &off_job,
                     work: Work::Constant,
+                    live: None,
                 });
             }
             let got = pollster::block_on(batch.run(b, None, &gs)).expect("run");
@@ -613,6 +778,7 @@ fn constant_work_geometry_ignores_the_witness() {
             n,
             jobs: &jobs,
             work: Work::Constant,
+            live: None,
         }];
         // Once to allocate the pools, so the counted run is a proof's own.
         pollster::block_on(batch.run(b, None, &gs)).expect("warm");

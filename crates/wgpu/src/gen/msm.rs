@@ -121,7 +121,7 @@ pub const ENTRY_SCATTER: &str = "msm_scatter";
 /// strictest reading of WGSL's "two resource variables in one entry point's resource
 /// interface must not share a group and binding". Each entry point gets its own pipeline
 /// layout declaring only what it reads, which is what keeps the storage-buffer counts at
-/// 1, 2, 2 and 3 against the browser floor's 8. A pipeline layout is allowed to declare
+/// 1, 3, 2 and 4 against the browser floor's 8. A pipeline layout is allowed to declare
 /// bindings the shader ignores, so this costs nothing.
 pub const BIND_PARAMS: u32 = 0;
 /// `zero_u32`: the range to clear.
@@ -144,6 +144,9 @@ pub const BIND_ENTRIES: u32 = 7;
 pub const BIND_MONT_SRC: u32 = 8;
 /// `fr_mont_to_std`: the standard-form destination.
 pub const BIND_MONT_DST: u32 = 9;
+/// `msm_count` and `msm_scatter`: the positions whose bases are not at infinity, which a
+/// sort over a live index reads its scalars through. See `crate::batch::Live`.
+pub const BIND_LIVE: u32 = 10;
 
 /// Storage buffers each entry point's pipeline layout declares. The floor allows 8.
 ///
@@ -151,9 +154,9 @@ pub const BIND_MONT_DST: u32 = 9;
 /// these cannot drift away from the thing the device enforces.
 pub const STORAGE_ZERO: u32 = 1;
 pub const STORAGE_MONT: u32 = 2;
-pub const STORAGE_COUNT: u32 = 2;
+pub const STORAGE_COUNT: u32 = 3;
 pub const STORAGE_SCAN: u32 = 2;
-pub const STORAGE_SCATTER: u32 = 3;
+pub const STORAGE_SCATTER: u32 = 4;
 
 // ---------------------------------------------------------------------------
 // Workgroup sizes
@@ -482,9 +485,12 @@ const PARAM_FIELDS: &str = "\
     // Workgroups msm_reduce_* runs per window, each over a contiguous chunk of the\n\
     // window's buckets, writing partial w * reduce_groups + g. Zero for every other kernel.\n\
     reduce_groups: u32,\n\
-    pad0: u32,\n\
-    pad1: u32,\n\
-    pad2: u32,\n";
+    // A sort over a live index: 1 when thread i takes the scalar LIVE[live_off + i] names\n\
+    // rather than scalar i, the first word of this sort's run in LIVE, and the position\n\
+    // this sort's range starts at, which LIVE counts from the group's. Zero otherwise.\n\
+    live: u32,\n\
+    live_off: u32,\n\
+    live_lo: u32,\n";
 
 /// The parameter struct and its uniform binding. One copy per module, whichever module.
 ///
@@ -504,8 +510,8 @@ struct MsmParams {{
     s
 }
 
-/// The `Scalar` alias and the seven storage declarations the four digit kernels use between
-/// them. No entry point touches more than three.
+/// The `Scalar` alias and the eight storage declarations the four digit kernels use between
+/// them. No entry point touches more than four.
 fn digit_bindings() -> String {
     let mut s = String::new();
     let _ = write!(
@@ -524,6 +530,7 @@ alias Scalar = array<u32, {LIMBS}>;
 @group(0) @binding({BIND_CURSOR_WRITE}) var<storage, read_write> CURSOR_W: array<u32>;
 @group(0) @binding({BIND_CURSOR_ATOMIC}) var<storage, read_write> CURSOR_A: array<atomic<u32>>;
 @group(0) @binding({BIND_ENTRIES}) var<storage, read_write> ENTRIES: array<vec2<u32>>;
+@group(0) @binding({BIND_LIVE}) var<storage, read> LIVE: array<u32>;
 "
     );
     s
@@ -665,6 +672,18 @@ fn sc_digit({decl}, w: u32, c: u32) -> vec2<u32> {{
     s
 }
 
+/// Which scalar a thread of count or scatter takes, as the `i` everything after it reads.
+///
+/// Over a live index it is the position the index names, counted from this sort's own first
+/// position, so the dispatch is as long as the index run and a base at infinity never has
+/// an entry. Which positions those are is the key's and never the witness's.
+fn thread_scalar() -> &'static str {
+    "    var i = P.lo + gid.x;
+    if (i >= P.n) { return; }
+    if (P.live != 0u) { i = LIVE[P.live_off + i] - P.live_lo; }
+"
+}
+
 /// The eight-limb load plus the zero and one tests, shared by count and scatter.
 fn classify(pick: LimbPick) -> String {
     let mut s = String::new();
@@ -753,9 +772,7 @@ fn entry_count(workgroup: u32, pick: LimbPick) -> String {
         "
 @compute @workgroup_size({workgroup})
 fn {ENTRY_COUNT}(@builtin(global_invocation_id) gid: vec3<u32>) {{
-    let i = P.lo + gid.x;
-    if (i >= P.n) {{ return; }}
-{}\
+{}{}\
 \x20   for (var w = 0u; w < P.n_windows; w = w + 1u) {{
         let d = sc_digit({call}, w, P.c);
 {}\
@@ -763,6 +780,7 @@ fn {ENTRY_COUNT}(@builtin(global_invocation_id) gid: vec3<u32>) {{
     }}
 }}
 ",
+        thread_scalar(),
         classify(pick),
         digit_row()
     );
@@ -853,9 +871,7 @@ fn entry_scatter(workgroup: u32, pick: LimbPick) -> String {
 // derives cap from the classification the caller already did and never from a guess.
 @compute @workgroup_size({workgroup})
 fn {ENTRY_SCATTER}(@builtin(global_invocation_id) gid: vec3<u32>) {{
-    let i = P.lo + gid.x;
-    if (i >= P.n) {{ return; }}
-{}\
+{}{}\
 \x20   for (var w = 0u; w < P.n_windows; w = w + 1u) {{
         let d = sc_digit({call}, w, P.c);
 {}\
@@ -866,6 +882,7 @@ fn {ENTRY_SCATTER}(@builtin(global_invocation_id) gid: vec3<u32>) {{
     }}
 }}
 ",
+        thread_scalar(),
         classify(pick),
         digit_row()
     );
