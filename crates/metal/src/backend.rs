@@ -879,8 +879,8 @@ enum BG2 {
 /// there read 60.5 ms against 54.3, and 33.4 against 32.1 on rsa2048. So no share is
 /// built in. Every proof starts the pool on what the last ones left it, and
 /// [`Self::steer`] moves the split by how far apart the two finished. keccak256,
-/// rsa2048 and railgun-13x01, where the GPU finishes last, stay at none and prove as
-/// they did.
+/// rsa2048 and railgun-13x01, where the GPU finishes last, stay at none (every one of
+/// 100 proofs each at load 4 to 8) and prove as they did.
 ///
 /// The price is memory, and it sets the tail's size. An eighth of the query is held
 /// twice, 128 bytes a base, and a proof with a share has the G2 job's scratch beside
@@ -899,7 +899,7 @@ struct G2Tail {
     share: AtomicUsize,
     /// The share [`Self::steer`] is at, before rounding; `None` when
     /// `G16_METAL_G2_SHARE` pins the share.
-    aim: Option<Mutex<f64>>,
+    aim: Option<Mutex<G2Aim>>,
 }
 
 impl G2Tail {
@@ -915,7 +915,7 @@ impl G2Tail {
         Ok(Some(Self {
             bases: msm.upload_g2_bases(&v[v.len() - len..])?,
             share: AtomicUsize::new(pinned.unwrap_or(0)),
-            aim: pinned.is_none().then(|| Mutex::new(0.0)),
+            aim: pinned.is_none().then(|| Mutex::new(G2Aim::default())),
         }))
     }
 
@@ -931,8 +931,8 @@ impl G2Tail {
     /// way at an unchanged share, and a share set from each proof alone, or from the
     /// median of four, swung between 2% and 15% of js_16x16_d32's query. So a proof
     /// moves the aim by [`G2_STEER_GAIN`] of its lateness and by no more than
-    /// [`G2_STEER_CLAMP`] of it, and the share is the aim on a grid so that a proof's
-    /// plan is one of a few sizes.
+    /// [`G2_STEER_CLAMP`] of it, and only when the proof before agrees with it (see
+    /// [`G2Aim::after`]).
     fn steer(&self, n_vars: usize, start: Instant, done: Instant, gpu_done: Instant) {
         let Some(aim) = &self.aim else {
             return;
@@ -947,20 +947,51 @@ impl G2Tail {
             -gpu_done.duration_since(done).as_secs_f64()
         };
         let mut aim = aim.lock().unwrap_or_else(|e| e.into_inner());
-        *aim = g2_aim(*aim, self.bases.len(), n_vars, late / cpu);
+        *aim = aim.after(self.bases.len(), n_vars, late / cpu);
         let grid = (self.bases.len() / G2_SHARE_GRID).max(1);
-        let share = (*aim / grid as f64).round() as usize * grid;
-        self.share
-            .store(share.min(self.bases.len()), Ordering::Relaxed);
+        let share = (aim.at / grid as f64).round() as usize * grid;
+        let share = share.min(self.bases.len());
+        // With the command buffers' own times, see `cb::wait_ok`: the share this proof
+        // ran at is the previous line's.
+        if std::env::var_os("G16_METAL_CB_TIMES").is_some() {
+            eprintln!(
+                "[g2] pool {:.2} ms, done {:+.2} ms after the GPU: share {share} of {n_vars}",
+                cpu * 1e3,
+                late * 1e3,
+            );
+        }
+        self.share.store(share, Ordering::Relaxed);
     }
 }
 
-/// Where [`G2Tail::steer`] aims after a proof at `aim` of a tail of `len`, in bases:
-/// `late` is how long after the GPU's last result the pool finished, over how long the
-/// pool ran.
-fn g2_aim(aim: f64, len: usize, n_vars: usize, late: f64) -> f64 {
-    let late = late.clamp(-G2_STEER_CLAMP, G2_STEER_CLAMP);
-    (aim + G2_STEER_GAIN * n_vars as f64 * late).clamp(0.0, len as f64)
+/// Where [`G2Tail::steer`] is: the share it aims at, in bases and before the grid,
+/// and how late the pool was in the proof before, as [`Self::after`] takes it.
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+struct G2Aim {
+    at: f64,
+    late: f64,
+}
+
+impl G2Aim {
+    /// The aim after one more proof, for a tail of `len` of the `n_vars`: `late` is how
+    /// long after the GPU's last result the pool finished, over how long the pool ran.
+    ///
+    /// It moves only when this proof and the one before agree on which of the two
+    /// finished last. One proof that another process held up says the pool was late
+    /// on a circuit whose GPU finishes 14 ms after it: railgun-13x01, 80 proofs at
+    /// load 7 to 12, left a share of none three times without this, each time for one
+    /// proof. The clamp is near what a proof at the wrong share reads (5 ms of 65 on
+    /// js_16x16_d32), so that a proof the GPU lost 20 ms on moves the aim no further
+    /// than an ordinary one: at 0.15 the share fell twice as fast as it rose.
+    fn after(self, len: usize, n_vars: usize, late: f64) -> Self {
+        let at = if late * self.late > 0.0 {
+            let step = late.clamp(-G2_STEER_CLAMP, G2_STEER_CLAMP);
+            (self.at + G2_STEER_GAIN * n_vars as f64 * step).clamp(0.0, len as f64)
+        } else {
+            self.at
+        };
+        Self { at, late }
+    }
 }
 
 /// The part of the B query a [`G2Tail`] holds, and so the most the GPU can take.
@@ -969,10 +1000,10 @@ const G2_TAIL_DIV: usize = 8;
 const G2_TAIL_MAX_DOMAIN: usize = 1 << 20;
 /// Steps of the share across a [`G2Tail`].
 const G2_SHARE_GRID: usize = 32;
-/// How much of the query one proof moves the aim by, per unit of [`g2_aim`]'s `late`.
+/// How much of the query one proof moves the aim by, per unit of [`G2Aim::after`]'s `late`.
 const G2_STEER_GAIN: f64 = 0.2;
 /// The most `late` one proof is taken at, either way.
-const G2_STEER_CLAMP: f64 = 0.15;
+const G2_STEER_CLAMP: f64 = 0.08;
 
 impl BG2 {
     /// Where stage 6 runs for this key, see [`g2_on_cpu`], with the bases put there.
@@ -1530,15 +1561,21 @@ mod tests {
     #[test]
     fn the_g2_share_is_steered_towards_the_later_finisher() {
         let (len, n) = (250, 1000);
-        assert_eq!(g2_aim(0.0, len, n, 0.0), 0.0);
-        assert_eq!(g2_aim(0.0, len, n, 0.1), G2_STEER_GAIN * 100.0);
-        assert_eq!(g2_aim(50.0, len, n, -0.1), 50.0 - G2_STEER_GAIN * 100.0);
+        let aim = |at: f64, late: f64| G2Aim { at, late };
+        let step = G2_STEER_GAIN * 50.0;
+        assert_eq!(aim(0.0, 0.05).after(len, n, 0.05).at, step);
+        assert_eq!(aim(50.0, -0.05).after(len, n, -0.05).at, 50.0 - step);
+        // The first proof, and one that disagrees with the proof before, move nothing
+        // and are remembered.
+        assert_eq!(G2Aim::default().after(len, n, 0.05), aim(0.0, 0.05));
+        assert_eq!(aim(50.0, -0.05).after(len, n, 0.05), aim(50.0, 0.05));
+        assert_eq!(aim(50.0, 0.05).after(len, n, -0.05), aim(50.0, -0.05));
         // One proof that another process held up moves it no further than this.
         let most = G2_STEER_GAIN * 1000.0 * G2_STEER_CLAMP;
-        assert_eq!(g2_aim(0.0, len, n, 5.0), most);
-        assert_eq!(g2_aim(100.0, len, n, -5.0), 100.0 - most);
-        assert_eq!(g2_aim(1.0, len, n, -0.1), 0.0);
-        assert_eq!(g2_aim(249.0, len, n, 0.1), 250.0);
+        assert_eq!(aim(0.0, 0.05).after(len, n, 5.0).at, most);
+        assert_eq!(aim(100.0, -0.05).after(len, n, -5.0).at, 100.0 - most);
+        assert_eq!(aim(1.0, -0.05).after(len, n, -0.05).at, 0.0);
+        assert_eq!(aim(249.0, 0.05).after(len, n, 0.05).at, 250.0);
     }
 
     /// Zero blinders remove the masking, so the H evaluations are the only thing between
