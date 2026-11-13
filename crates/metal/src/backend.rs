@@ -879,8 +879,13 @@ enum BG2 {
 /// rsa2048, railgun-13x01 and anon-aadhaar, where the GPU finishes last, stay at none
 /// and prove as they did.
 ///
-/// The price is a quarter of the query held twice, 128 bytes a base: 4.5 MB on
-/// js_16x16_d32. Variable work only, since the share follows the witness.
+/// The price is memory. A quarter of the query is held twice, 128 bytes a base (4.5 MB
+/// on js_16x16_d32, 35 on anon-aadhaar), and a proof with a share has the G2 job's
+/// scratch beside the other four's. Peak footprint over 30 warm proofs: js_16x16_d32
+/// 322 to 326 MB without the tail, 334 with a tenth pinned and 356 to 368 steered,
+/// where what the batch asks the scratch pool for changes with the share; js_8x8_d32
+/// 193 to 216, keccak256 254 to 262, anon-aadhaar 1,473 to 1,507. Variable work only,
+/// since the share follows the witness.
 /// `G16_METAL_G2_SHARE` pins it, in thousandths of the query, for re-measuring.
 struct G2Tail {
     bases: G2Bases,
