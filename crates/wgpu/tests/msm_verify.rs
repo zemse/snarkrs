@@ -100,6 +100,14 @@ fn exclusive() -> std::sync::MutexGuard<'static, ()> {
 // The oracle: no Pippenger, no windows, no recoding
 // ---------------------------------------------------------------------------
 
+/// The slice length the plans in this file run at. Every one is a few hundred scalars, far
+/// too few to fill the device, so `slice_len_for` halves each to its floor; asked of the
+/// rule rather than retyped, and `widest_run_slices` holds the tests to it.
+fn slice_len(curve: wgsl::Curve) -> u32 {
+    let d = DigitPlan::new(1000, 0, Some(1000)).expect("plan");
+    snarkrs_wgpu::points::slice_len_for(curve, d.n_windows(), d.cap())
+}
+
 /// `sum_i s_i * P_i`, one double-and-add ladder per term.
 ///
 /// Deliberately the slowest possible implementation. It shares nothing with either MSM
@@ -422,7 +430,7 @@ fn the_g1_msm_equals_a_naive_sum_of_scalar_multiples() {
 fn one_bucket_holding_a_run_longer_than_several_slices_is_merged_whole() {
     let _one = exclusive();
     let mut rng = test_rng();
-    let sl = wgsl::G1.slice_len;
+    let sl = slice_len(wgsl::G1);
     let mut cases = 0usize;
     for m in [
         sl - 1,
@@ -481,7 +489,7 @@ fn one_bucket_holding_a_run_longer_than_several_slices_is_merged_whole() {
 fn a_fat_bucket_beside_sparse_ones_merges_both_kinds() {
     let _one = exclusive();
     let mut rng = test_rng();
-    let sl = wgsl::G1.slice_len as usize;
+    let sl = slice_len(wgsl::G1) as usize;
     for (fat, sparse) in [(3 * sl + 5, 200usize), (2 * sl + 1, 900), (7 * sl, 64)] {
         let n = fat + sparse;
         let bases = rand_g1(n, &mut rng);
@@ -537,7 +545,7 @@ fn a_fat_bucket_beside_sparse_ones_merges_both_kinds() {
 fn a_multi_slice_bucket_run_over_g2_is_merged_whole() {
     let _one = exclusive();
     let mut rng = test_rng();
-    let sl = wgsl::G2.slice_len;
+    let sl = slice_len(wgsl::G2);
     let m = 3 * sl + 5;
     let n = m as usize;
     let bases = rand_g2(n, &mut rng);
@@ -573,7 +581,7 @@ fn a_multi_slice_bucket_run_over_g2_is_merged_whole() {
 fn the_equal_and_opposite_arms_survive_a_run_that_spans_slices() {
     let _one = exclusive();
     let mut rng = test_rng();
-    let sl = wgsl::G1.slice_len as usize;
+    let sl = slice_len(wgsl::G1) as usize;
     let p = G1Affine::rand(&mut rng);
     let k = general_scalars(1, &mut rng)[0];
 
@@ -655,7 +663,7 @@ fn the_equal_and_opposite_arms_survive_a_run_that_spans_slices() {
 fn infinity_bases_inside_a_fat_bucket_are_skipped() {
     let _one = exclusive();
     let mut rng = test_rng();
-    let sl = wgsl::G1.slice_len as usize;
+    let sl = slice_len(wgsl::G1) as usize;
     let n = 3 * sl + 11;
     let mut bases = rand_g1(n, &mut rng);
     // Every fifth, which lands infinities at both ends of every slice and in the middle.
@@ -945,7 +953,7 @@ fn the_msm_is_the_same_point_when_every_kernel_is_split_across_dispatches() {
 fn a_pooled_spill_array_holding_the_previous_tags_changes_nothing() {
     let _one = exclusive();
     let mut rng = test_rng();
-    let sl = wgsl::G1.slice_len as usize;
+    let sl = slice_len(wgsl::G1) as usize;
     // A fat bucket, so most slices are a single run and most tail slots go untouched.
     let n = 4 * sl + 17;
     let bases = rand_g1(n, &mut rng);
@@ -1029,10 +1037,10 @@ fn walk_g1(n: usize, rng: &mut impl Rng) -> Vec<G1Affine> {
 ///
 /// # Why these three sizes and not a grid
 ///
-/// They straddle the one crossover that matters at prover sizes: c = 8 wins through m = 65536
-/// and c = 13 from m = 140824, and the old Metal-derived constants put that switch too early,
-/// picking c = 13 at 65536 where it is 22% slower (REV-12). The full sweep the constants were
-/// fitted to is in the comment on `snarkrs_wgpu::window_size`.
+/// They straddle the one crossover that matters at prover sizes: c = 8 wins through m = 32768
+/// and c = 13 from m = 65536, where this harness reads the two within 6% of each other. The
+/// old Metal-derived constants put a c = 13 at slice 128 there, 22% slower (REV-12); the
+/// model now prices the slice it will run at, see `snarkrs_wgpu::window_size_for`.
 ///
 /// The assertion is 10% and not "is the best", because neighbouring widths can sit within a
 /// few percent of each other, inside the noise of a three-sample median.

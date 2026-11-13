@@ -101,8 +101,8 @@ pub use batch::{G1Bases, G2Bases, Group, Job, MontConvert, MsmBatch, MsmResult, 
 pub use device::{LimitsProfile, WgpuBackend};
 pub use gather::{CsrHost, CsrTables, GatherAbc, GatherParams};
 pub use msm::{
-    window_size, DigitBuffers, DigitPlan, MsmDigits, MsmParams, SortBinds, SortOffsets, Work,
-    DUMMY_ROWS,
+    window_size, window_size_for, DigitBuffers, DigitPlan, Jobs, MsmDigits, MsmParams, SortBinds,
+    SortOffsets, Work, DUMMY_ROWS,
 };
 pub use ntt::{
     split_passes, Batch, Direction, Epilogue, Ntt, NttParams, NttTables, Planned, Scale, Transform,

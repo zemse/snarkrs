@@ -42,7 +42,7 @@ use snarkrs_gpu_layout::{PackedG2Affine, LIMBS};
 use snarkrs_msm::{CpuMsm, MsmBackend};
 use snarkrs_wgpu::gen::points as wgsl;
 use snarkrs_wgpu::msm::{pack_scalars, DigitBuffers, DigitPlan, MsmDigits};
-use snarkrs_wgpu::points::{MsmPointsG2, PointBuffers, PointPlan};
+use snarkrs_wgpu::points::{slice_len_for, MsmPointsG2, PointBuffers, PointPlan};
 use snarkrs_wgpu::{LimitsProfile, ParamRing, WgpuBackend};
 
 #[path = "msmcommon/mod.rs"]
@@ -495,7 +495,8 @@ fn the_g2_msm_matches_cpu_pippenger_at_2_16() {
 
 /// The wide accumulation is a second module, so it gets its own oracle. 100,001 general
 /// scalars at c = 8 is 32 windows of 782 slices, 25,024 threads: inside the wide band, and
-/// not a multiple of 256, so the last workgroup runs the guard.
+/// not a multiple of 256, so the last workgroup runs the guard. The width is forced, because
+/// the cost model's own pick for this many scalars is 13 and 15,640 threads, under the band.
 #[test]
 fn the_wide_g2_accumulation_matches_cpu_pippenger() {
     let _gpu = exclusive();
@@ -503,7 +504,7 @@ fn the_wide_g2_accumulation_matches_cpu_pippenger() {
     let n = 100_001usize;
     let bases = walk_bases(n, &mut rng);
     let scalars = general_scalars(n, &mut rng);
-    let dplan = DigitPlan::new(n as u32, 0, Some(general_count(&scalars))).expect("plan");
+    let dplan = DigitPlan::with_c(n as u32, 0, Some(general_count(&scalars)), 8).expect("plan");
     let threads = points()
         .plan_points(&dplan, 0)
         .expect("point plan")
@@ -513,7 +514,7 @@ fn the_wide_g2_accumulation_matches_cpu_pippenger() {
         wide.covers(threads) && !threads.is_multiple_of(wide.segmented),
         "{threads} threads no longer reach the wide module's guard; move n"
     );
-    let run = run_msm(&bases, &scalars, 0, 0, n as u32, None, 1);
+    let run = run_msm(&bases, &scalars, 0, 0, n as u32, Some(8), 1);
     assert!(!run.result.is_zero());
     assert_matches_cpu(&run, &bases, &scalars, "the wide band");
     run.assert_no_overrun(1, "the wide band");
@@ -1066,8 +1067,22 @@ fn the_slice_length_is_measured() {
 fn the_point_plan_derives_its_shape_once() {
     let d = DigitPlan::with_c(1000, 0, Some(1000), 12).expect("plan");
     let p = PointPlan::new(&d, 0, 32, wgsl::G2).expect("point plan");
-    assert_eq!(p.slice_len(), wgsl::G2.slice_len);
-    assert_eq!(p.slices(), 1000u32.div_ceil(wgsl::G2.slice_len));
+    let sl = slice_len_for(wgsl::G2, d.n_windows(), d.cap());
+    assert_eq!(p.slice_len(), sl);
+    assert_eq!(p.slices(), 1000u32.div_ceil(sl));
+    // 22 windows of 1,000 entries do not fill the device at any slice length, so this plan
+    // is at the floor; one that fills it at the curve's own length keeps that length, and
+    // one in between stops at the first halving that fills it.
+    assert!(sl < wgsl::G2.slice_len && d.n_windows() * p.slices() < wgsl::G2.fill);
+    let full = wgsl::G2.fill.div_ceil(d.n_windows()) * wgsl::G2.slice_len;
+    assert_eq!(
+        slice_len_for(wgsl::G2, d.n_windows(), full),
+        wgsl::G2.slice_len
+    );
+    assert_eq!(
+        slice_len_for(wgsl::G2, d.n_windows(), full / 2),
+        wgsl::G2.slice_len / 2
+    );
     assert_eq!(p.seg_threads(&d), d.n_windows() * p.slices());
     assert_eq!(p.spill_slots(&d), 2 * p.seg_threads(&d));
     // ceil(1000 / (32 * SLICE_LEN)) = 1, and it is never zero: a dispatch of zero workgroups writes

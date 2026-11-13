@@ -119,9 +119,11 @@ pub struct Curve {
     pub base_bytes: u64,
     /// Device bytes per XYZZ accumulator, four coordinates.
     pub point_bytes: u64,
-    /// Entries one thread of `msm_segmented_*` owns. Not baked into the WGSL (it is a
-    /// uniform field), but measured per curve, so it lives with the other shape constants
-    /// rather than as a bare `const` a plan could take from the wrong curve.
+    /// Entries one thread of `msm_segmented_*` owns on a pass large enough to fill the
+    /// device, and the most on any pass: [`crate::points::slice_len_for`] halves it for a
+    /// smaller one. Not baked into the WGSL (it is a uniform field), but measured per
+    /// curve, so it lives with the other shape constants rather than as a bare `const` a
+    /// plan could take from the wrong curve.
     ///
     /// Accumulation costs `slice_len` mixed additions per thread and the merge costs
     /// `max_bucket_count / slice_len` full additions for the fattest bucket, so the balance
@@ -148,8 +150,25 @@ pub struct Curve {
     /// to provide goes away.
     ///
     /// The curves agree, and the G1 column is 3.1x faster, which is the `Fq2` multiply ratio
-    /// again.
+    /// again. That sweep is at c = 12, whose top window is four buckets, so its left arm is
+    /// the merge walking a quarter of the scalars in one lane; at the widths the cost model
+    /// picks the left arm starts where the pass stops filling the device, see
+    /// [`Self::fill`].
     pub slice_len: u32,
+    /// Microseconds one step of a serial chain of this curve's point additions takes on a
+    /// device with threads to spare: what a thread of `msm_segmented_*` owes per entry of
+    /// its slice. Chrome 154 on an M2 Max, the kernel in a timed pass of its own, five
+    /// circuits from 2^12 to 2^17 at four widths and four slice lengths: a pass of fewer
+    /// than [`Self::fill`] threads costs this times its slice length whatever its size,
+    /// 11.2 ms over G1 and 37 over G2 at 128. The G2 over G1 ratio, 3.5, is the weight a
+    /// G2 job carries in [`crate::msm::window_size_for`].
+    pub step_us: u32,
+    /// Threads of `msm_segmented_*` at which the device is full: below it a pass costs its
+    /// longest chain, above it its entries. The same sweep fits
+    /// `step_us * slice_len * hypot(1, threads / fill)` to the accumulation with an RMS
+    /// error of 7% over 219 G1 passes and 10% over 61 G2 ones, at 14,000 threads over G1
+    /// (5.9 ns an entry once full) and 8,250 over G2 (34.5 ns).
+    pub fill: u32,
     /// The measured workgroup sizes for this curve's five entry points.
     pub wg: Workgroups,
     /// A wider `msm_segmented_*` for the pass sizes that want one, or `None` to run every
@@ -173,6 +192,8 @@ pub const G1: Curve = Curve {
     base_bytes: 64,
     point_bytes: 128,
     slice_len: 128,
+    step_us: 82,
+    fill: 14_000,
     wg: Workgroups {
         clear: 256,
         segmented: 64,
@@ -197,6 +218,8 @@ pub const G2: Curve = Curve {
     base_bytes: 128,
     point_bytes: 256,
     slice_len: 128,
+    step_us: 285,
+    fill: 8_250,
     wg: Workgroups {
         clear: 256,
         segmented: 64,

@@ -127,7 +127,7 @@ use snarkrs_groth16::ProveError;
 
 use crate::device::{bad, WgpuBackend};
 use crate::gen::points as wgsl;
-use crate::msm::{pack_scalars, storage_buffer, DigitBuffers, DigitPlan, MsmDigits, Work};
+use crate::msm::{pack_scalars, storage_buffer, DigitBuffers, DigitPlan, Jobs, MsmDigits, Work};
 use crate::params::ParamRing;
 use crate::points::{MsmPointsG1, MsmPointsG2, PointBuffers, PointPlan};
 use crate::readback::{is_aborted, Readback};
@@ -1299,6 +1299,16 @@ impl MsmBatch {
             // `Source::Device`'s `general` documents as the safe direction.
             (Source::Host(_), Work::Variable) => None,
         };
+        // The window width is the jobs' to share, and a G2 job weighs 3.5 G1 ones.
+        let g2 = g
+            .jobs
+            .iter()
+            .filter(|j| matches!(j, Job::G2 { .. }))
+            .count() as u32;
+        let jobs = Jobs {
+            g1: g.jobs.len() as u32 - g2,
+            g2,
+        };
         let mut cap = g.n;
         loop {
             let mut pieces = Vec::new();
@@ -1312,8 +1322,13 @@ impl MsmBatch {
                 let n = hi - lo;
                 // A piece never has more general scalars than the whole range, and never
                 // more than its own length.
-                let dplan =
-                    DigitPlan::with_work(n, g.scalar_off + lo, general.map(|x| x.min(n)), g.work)?;
+                let dplan = DigitPlan::for_jobs(
+                    n,
+                    g.scalar_off + lo,
+                    general.map(|x| x.min(n)),
+                    g.work,
+                    jobs,
+                )?;
                 if !self.fits(&dplan, g.jobs, limit)? {
                     fits = false;
                     break;

@@ -112,38 +112,65 @@ const _: () = assert!(DUMMY_ROWS.is_power_of_two());
 /// Forces the window width, or 0 to compute it. The browser's counterpart to
 /// `G16_WGPU_MSM_C`, which cannot work there: `std::env::var` on wasm always fails, so a
 /// page has no way to reach the environment variable at all. Set through `set_msm_c` in the
-/// wasm bindings, and read by [`window_size`] below.
+/// wasm bindings, and read by [`window_size_for`] below.
 pub static WINDOW_OVERRIDE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// Window width for `m` scalars that actually reach the buckets.
+/// The MSMs one counting sort feeds, by group: its window width is theirs to share.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Jobs {
+    pub g1: u32,
+    pub g2: u32,
+}
+
+impl Jobs {
+    /// One MSM over G1: `L`, `H`, and what a caller who does not say gets.
+    pub const G1: Self = Self { g1: 1, g2: 0 };
+}
+
+/// [`window_size_for`] for one MSM over G1.
+pub fn window_size(m: usize) -> u32 {
+    window_size_for(m, Jobs::G1)
+}
+
+/// Window width for `m` scalars that actually reach the buckets of `jobs`.
 ///
-/// # This model is a fit, and the backend has to say so
-///
-/// The constants below are least-squares fits (weighted by 1/t) to a whole-G1-MSM sweep of
-/// every width from 3 to 15 at nine sizes from 256 to 262,144 scalars, medians of five,
-/// native wgpu on this M2 Max. They replace `snarkrs-metal`'s constants, which were fitted to
-/// MSL kernels and scaled by a field-speed ratio, and which picked c = 13 at m = 65536 where
-/// c = 8 is 22% faster (REV-12). The refit picks the measured winner at every size from 8,192
-/// up and is within 5% below it:
+/// The width that minimises [`crate::points::stage_us`] summed over the jobs, which prices
+/// each job's accumulation at the slice length it will run at, its merge and its reduce in
+/// serial chain steps of its own curve. A G2 step is 3.5 G1 steps, so a witness plan, whose
+/// one sort feeds A and B in G1 and B in G2, is chosen mostly by its G2 job.
 ///
 /// ```text
-/// m         pick  best  over
-/// 256         5     3   3.3%
-/// 2048        5     3   0.0%
-/// 4096        8     5   4.7%
-/// 8192        8     8
-/// 18002       8     8
-/// 32768       8     8
-/// 65536       8     8
-/// 140824     13    13
-/// 262144     13    13
+/// general scalars     one G1 job    A, B in G2 and B in G1
+/// 256 to 1,024             5                 5
+/// 2,048 to 32,768          8                 8
+/// 49,152                   8                13
+/// 65,536 to 262,144       13                13
+/// 393,216                 13                16
+/// 524,288 and up          16                16
 /// ```
 ///
-/// Below 8,192 every width costs 15 to 18 ms, almost all of it fixed overhead, so the pick
-/// barely matters there. It is still a fit and not a derivation, and it was fitted on one
-/// device: `tests/msm_verify.rs::the_window_width_the_cost_model_picks_is_within_ten_percent_
-/// of_the_measured_best` holds it to a sweep across the crossover, and `G16_WGPU_MSM_C`
-/// forces a width.
+/// The whole stage in Chrome 154 on an M2 Max with every plan forced to one width, each
+/// kernel in a timed pass of its own, milliseconds, the best of slices 16 to 128 at each
+/// width and this function's pick for the witness plan starred:
+///
+/// ```text
+/// circuit (witness, H)                c = 5      8     13     16
+/// js_1x1_d8    (3,234, 4,096)          38.3   34.4*  65.0  162.5
+/// js_2x2_d16   (9,906, 16,384)         68.8   49.2*  74.7  180.9
+/// js_2x2_d32   (17,682, 32,768)               69.4*  87.1
+/// js_8x8_d32   (69,372, 131,072)      303.9  189.5  163.5* 253.1
+/// js_16x16_d32 (138,292, 262,144)            335.7  249.8* 322.5
+/// ```
+///
+/// # What it replaced
+///
+/// A least-squares fit to a whole-G1-MSM sweep in native wgpu: 6.61 ns a mixed addition,
+/// 0.16 us a bucket row, 164 us a merge iteration on the busiest bucket at slice 128. It
+/// priced the accumulation by its entries alone and every bucket row alike, where the
+/// reduce is 6.5 ms over the 81,920 rows of c = 13 and 18.9 over the 524,288 of c = 16, so
+/// it moved from c = 8 to 13 at 139,700 general scalars: `js_8x8_d32` ran at 8, and
+/// `js_16x16_d32`'s witness (138,292) sat just under the line with a G2 accumulation of
+/// 129 ms at 8. It also weighed every plan as one G1 job.
 ///
 /// # Why this is not the CPU's cost model
 ///
@@ -158,7 +185,9 @@ pub static WINDOW_OVERRIDE: std::sync::atomic::AtomicU32 = std::sync::atomic::At
 /// `2^(top_bits - 1)` buckets instead of `2^(c-1)`. At c=11 that is two buckets holding half
 /// the scalars each. On the CPU a serial bucket loop only cares about the total; on the GPU
 /// those runs span thousands of slices and the merge walks one in a single lane.
-pub fn window_size(m: usize) -> u32 {
+///
+/// It is still a fit to one device, and `G16_WGPU_MSM_C` forces a width.
+pub fn window_size_for(m: usize, jobs: Jobs) -> u32 {
     let forced = WINDOW_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
     if forced > 0 {
         return forced.clamp(2, MAX_WINDOW);
@@ -168,25 +197,11 @@ pub fn window_size(m: usize) -> u32 {
             return c.clamp(2, MAX_WINDOW);
         }
     }
-    /// One mixed addition in the segmented accumulation, microseconds.
-    const MADD_US: f64 = 0.00661;
-    /// One bucket's share of the clear, merge and reduction kernels, microseconds.
-    const ROW_US: f64 = 0.1605;
-    /// One iteration of the merge loop on the busiest bucket, microseconds. Serial.
-    const MERGE_US: f64 = 164.4;
-    /// Entries one thread of the segmented accumulation owns: the kernel's own value
-    /// (`gen::points::Curve::slice_len`). The Metal-derived model had to keep 64 here to
-    /// pick the right widths; the refit does not.
-    const SLICE_LEN: f64 = 128.0;
     let mut best = 3;
     let mut best_cost = f64::MAX;
     for c in 3..=MAX_WINDOW {
-        let w = RECODE_BITS.div_ceil(c) as usize;
-        let top_bits = RECODE_BITS as usize - (w - 1) * c as usize;
-        let top_buckets = (1u64 << (top_bits.min(c as usize) - 1)) as f64;
-        let cost = MADD_US * (w * m) as f64
-            + ROW_US * (w << (c - 1)) as f64
-            + MERGE_US * (m as f64 / top_buckets / SLICE_LEN);
+        let cost = f64::from(jobs.g1) * crate::points::stage_us(crate::gen::points::G1, m, c)
+            + f64::from(jobs.g2) * crate::points::stage_us(crate::gen::points::G2, m, c);
         if cost < best_cost {
             best_cost = cost;
             best = c;
@@ -330,8 +345,21 @@ impl DigitPlan {
         general: Option<u32>,
         work: Work,
     ) -> Result<Self, ProveError> {
+        Self::for_jobs(n, scalar_off, general, work, Jobs::G1)
+    }
+
+    /// [`Self::with_work`] for a sort that feeds `jobs`, which is what the window width is
+    /// chosen for; see [`window_size_for`].
+    pub fn for_jobs(
+        n: u32,
+        scalar_off: u32,
+        general: Option<u32>,
+        work: Work,
+        jobs: Jobs,
+    ) -> Result<Self, ProveError> {
         let general = Self::classified(n, general, work)?;
-        Self::at(n, scalar_off, general, window_size(general as usize), work)
+        let c = window_size_for(general as usize, jobs);
+        Self::at(n, scalar_off, general, c, work)
     }
 
     /// [`Self::with_c`] with the work mode chosen.

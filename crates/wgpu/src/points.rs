@@ -62,7 +62,7 @@ use crate::gather::storage_entry;
 use crate::gen::field::Variant;
 use crate::gen::msm::BIND_PARAMS;
 use crate::gen::points as wgsl;
-use crate::msm::{storage_buffer, DigitPlan, MsmParams, Work};
+use crate::msm::{storage_buffer, DigitPlan, MsmParams, Work, RECODE_BITS};
 use crate::params::ParamRing;
 use crate::pipelines::Kernels;
 
@@ -79,9 +79,111 @@ const BINDING_ALIGN: u64 = 256;
 // Slice length and ones groups
 // ---------------------------------------------------------------------------
 
-// The slice length lives on `gen::points::Curve`, because it is measured per curve and a
-// plan that took one curve's constant against another curve's module would be a silently
+// The slice length's constants live on `gen::points::Curve`, because they are measured per
+// curve and a plan that took one curve's against another curve's module would be a silently
 // wrong point rather than an error. `Curve::slice_len` carries both sweeps.
+
+/// The shortest slice [`slice_len_for`] halves to. Each halving doubles the spill slots and
+/// the merge's walk over a bucket's slices, and at 16 a chain is already 1.3 ms over G1 and
+/// 4.6 over G2, less than the reduce behind it. A floor of 32 measured `js_1x1_d8` at 53.6
+/// ms against 45.8 and `rsa2048` at 160.6 against 168.3: `rsa2048`'s witness has 474 of
+/// its 5,254 general scalars within 2^128 of the modulus, which share one bucket in every
+/// window but the lowest, and the merge walks that bucket's slices in one lane. The floor
+/// stays at 16 for the witnesses that have no such run; a witness loses to the fixed 128
+/// only where more than about 15% of its general scalars share a bucket.
+const SLICE_MIN: u32 = 16;
+
+/// Entries one thread of `msm_segmented_*` owns on a plan of `n_windows` windows of `cap`
+/// entries: [`wgsl::Curve::slice_len`], halved while the pass has fewer threads than fill
+/// the device ([`wgsl::Curve::fill`]), down to `SLICE_MIN`.
+///
+/// A thread is one serial chain of `slice_len` mixed additions, so a pass that does not
+/// fill the device costs its chain and not its entries: `js_2x2_d32`'s witness plan is
+/// 4,448 threads at 128 and each of its four G1 accumulations cost 11.2 ms, the same as
+/// `js_1x1_d8`'s 832 threads, and the G2 one 37. Halving the slice halves that until the
+/// threads are there, and past that point it only adds spill slots for the merge to walk.
+/// The accumulation and merge of one job, Chrome 154 on an M2 Max, each kernel in a timed
+/// pass of its own, milliseconds, the rule's pick starred:
+///
+/// ```text
+/// pass (general scalars, c)       threads at 128     16      32      64     128
+/// G1 js_1x1_d8    (3,234, 8)             832        2.0*    3.1     5.8    11.3
+/// G1 js_2x2_d16   (9,906, 8)           2,496        4.0*    3.9     6.1    11.4
+/// G1 js_2x2_d32  (17,682, 8)           4,448        7.2     5.4*    6.8    11.8
+/// G1 js_2x2_d32 H (32,768, 8)          8,192       11.5    10.4     9.0*   12.3
+/// G1 js_8x8_d32  (69,372, 13)         10,840       16.5    13.1    11.8*   13.7
+/// G1 js_8x8_d32 H (131,072, 13)       20,480       26.6    22.4    20.8    19.5*
+/// G2 js_1x1_d8    (3,234, 8)             832        8.0*   10.3    18.9    36.7
+/// G2 js_2x2_d16   (9,906, 8)           2,496       17.8    15.8*   20.1    36.8
+/// G2 js_2x2_d32  (17,682, 8)           4,448       28.3    27.4    28.0*   38.6
+/// G2 js_8x8_d32  (69,372, 13)         10,840       77.2    65.8    72.9    67.7*
+/// ```
+///
+/// A plan that fills the device at 128 keeps 128, so its spill buffers are the size they
+/// were. A function of the plan alone, so under [`Work::Constant`] it follows the key.
+pub fn slice_len_for(curve: wgsl::Curve, n_windows: u32, cap: u32) -> u32 {
+    let threads = |l: u32| u64::from(n_windows) * u64::from(cap.div_ceil(l).max(1));
+    let mut l = curve.slice_len;
+    while l > SLICE_MIN && threads(l) < u64::from(curve.fill) {
+        l /= 2;
+    }
+    l
+}
+
+/// Spill slots the merge clears per chain step once it fills the device: 43 to 46 ns a slot
+/// over G1 and 134 to 136 over G2 on plans of 139,000 to 277,000 slots.
+const MERGE_FILL: f64 = 2000.0;
+
+/// Chain steps a reduce thread owes per bucket of its segment, beside the `12 + c` of its
+/// `pt_mul_small` and tree at window width `c`. The reduce does not depend on the scalar
+/// count: 2.30 ms over G1 at c = 8 (two buckets a thread), 2.86 at 9, 3.86 at 10, 6.52 at
+/// 13 (16, four groups a window) and 18.9 at 16 (64, eight groups), 3.3 times each over G2.
+const REDUCE_STEPS_PER_BUCKET: f64 = 3.1;
+
+/// Chain steps of the `ones` pass: 0.6 to 0.8 ms over G1 and 1.9 to 2.7 over G2.
+const ONES_STEPS: f64 = 8.0;
+
+/// Estimated microseconds of one job's point stage over `m` general scalars at window
+/// width `c`: the accumulation at [`slice_len_for`]'s length, the merge, the reduce and the
+/// ones pass. What [`crate::msm::window_size_for`] minimises over `c`.
+///
+/// Every term is a count of chain steps of [`wgsl::Curve::step_us`], because every one of
+/// the four kernels is latency bound until its pass fills the device:
+///
+/// * accumulation: `slice_len * hypot(1, threads / fill)`, see [`wgsl::Curve::fill`].
+/// * merge: the longer of the walk over the fattest bucket's slices, two additions each,
+///   and its slots over `MERGE_FILL`. The fattest bucket of uniform digits is one of the
+///   top window's, which has only `RECODE_BITS - (W - 1) * c` bits: two buckets holding
+///   half the scalars each at c = 11, the cliff the model exists to stay off.
+/// * reduce: `REDUCE_STEPS_PER_BUCKET` and [`reduce_groups_for`]'s segment.
+///
+/// Against the timed passes it was fitted to, five circuits from 2^12 to 2^17 at widths 5,
+/// 8, 13 and 16 and slices 16 to 128: the accumulation within 7% RMS over 219 G1 passes
+/// and 10% over 61 G2 ones, the reduce within 5% and 8%, the merge within 35% and 42%
+/// (it is the one term that follows the witness). Summed over the five jobs it reads the
+/// whole stage 10% high in the median, the timed passes overlapping on the device, and
+/// between 17% low and 24% high over 81 (circuit, width, slice) points.
+///
+/// Fitted to variable work and used for both. A constant-work reduce is dearer than this
+/// says, 7.6, 18.7 and 52 ms over G1 at c = 8, 13 and 16 on `js_8x8_d32` (27, 27 and 76
+/// over G2), which puts a lone G1 job's move from 13 to 16 nearer 825,000 scalars than
+/// the 524,288 it gets; no artifact here has a plan between the two.
+pub fn stage_us(curve: wgsl::Curve, m: usize, c: u32) -> f64 {
+    let w = RECODE_BITS.div_ceil(c);
+    let top_bits = RECODE_BITS - (w - 1) * c;
+    let top_buckets = (1u64 << (top_bits.min(c) - 1)) as f64;
+    let n_buckets = 1u32 << (c - 1);
+    let cap = u32::try_from(m).unwrap_or(u32::MAX).max(1);
+    let l = slice_len_for(curve, w, cap);
+    let threads = f64::from(w) * f64::from(cap.div_ceil(l));
+    let accumulate = f64::from(l) * 1f64.hypot(threads / f64::from(curve.fill));
+    let merge =
+        (2.0 * (m as f64 / top_buckets / f64::from(l) + 1.0)).max(2.0 * threads / MERGE_FILL);
+    let tg = curve.wg.tg;
+    let segment = f64::from(n_buckets) / f64::from(tg * reduce_groups_for(w, n_buckets, tg));
+    let reduce = 12.0 + f64::from(c) + REDUCE_STEPS_PER_BUCKET * segment;
+    f64::from(curve.step_us) * (accumulate + merge + reduce + ONES_STEPS)
+}
 
 /// Workgroups in `msm_ones_*`: enough that a 2^18-long witness gives each thread about sixty
 /// scalars to scan, few enough that the host adds a few dozen points.
@@ -211,8 +313,8 @@ pub struct PointPlan {
 }
 
 impl PointPlan {
-    /// Plans the point stages for `digits`, reading bases from `base_off`, at `curve`'s
-    /// measured slice length.
+    /// Plans the point stages for `digits`, reading bases from `base_off`, at
+    /// [`slice_len_for`]'s slice length.
     ///
     /// `tg` is the reduction workgroup size, which sets `ones_groups`. It must be the `tg` the
     /// module was generated at; [`MsmPoints::plan_points`] passes its own and its own curve,
@@ -223,7 +325,8 @@ impl PointPlan {
         tg: u32,
         curve: wgsl::Curve,
     ) -> Result<Self, ProveError> {
-        Self::with_slice_len(digits, base_off, tg, curve.slice_len)
+        let slice_len = slice_len_for(curve, digits.n_windows(), digits.cap());
+        Self::with_slice_len(digits, base_off, tg, slice_len)
     }
 
     /// Same, at a forced slice length. For the sweeps in `tests/msm_g1.rs`.
@@ -1187,9 +1290,9 @@ impl<C: PointCurve> MsmPoints<C> {
 
     // ---- parameter blocks ----
 
-    /// The point plan for this module: this curve's measured slice length and this module's
-    /// reduction width, so the two things [`PointPlan`] cannot check for itself come from the
-    /// module that will run it.
+    /// The point plan for this module: this curve's slice length for the plan's size and
+    /// this module's reduction width, so the two things [`PointPlan`] cannot check for itself
+    /// come from the module that will run it.
     pub fn plan_points(&self, digits: &DigitPlan, base_off: u32) -> Result<PointPlan, ProveError> {
         PointPlan::new(digits, base_off, self.wg.tg, self.curve)
     }

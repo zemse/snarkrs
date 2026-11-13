@@ -58,8 +58,8 @@ use snarkrs_gpu_layout::{PackedG1Affine, LIMBS};
 use snarkrs_msm::{CpuMsm, MsmBackend};
 use snarkrs_wgpu::gen::points as wgsl;
 use snarkrs_wgpu::msm::{pack_scalars, DigitBuffers, DigitPlan, MsmDigits};
-use snarkrs_wgpu::points::{MsmPointsG1, PointBuffers, PointPlan};
-use snarkrs_wgpu::{LimitsProfile, ParamRing, WgpuBackend};
+use snarkrs_wgpu::points::{slice_len_for, MsmPointsG1, PointBuffers, PointPlan};
+use snarkrs_wgpu::{window_size, window_size_for, Jobs, LimitsProfile, ParamRing, WgpuBackend};
 
 #[path = "msmcommon/mod.rs"]
 mod common;
@@ -1329,14 +1329,66 @@ fn the_g1_slice_length_is_measured() {
 // 9. The plan arithmetic, on the host, with no device
 // ---------------------------------------------------------------------------
 
+/// The widths the cost model picks at the sizes it was measured at, for a lone G1 job and
+/// for a witness plan, whose sort feeds two G1 jobs and one G2. Both the picks and the
+/// measurements are in the comment on `snarkrs_wgpu::window_size_for`; this holds the
+/// model to them, and to never picking a width whose top window is a handful of buckets.
+#[test]
+fn the_window_width_follows_the_jobs_and_the_pass_size() {
+    let witness = Jobs { g1: 2, g2: 1 };
+    for (m, alone, shared) in [
+        (3_234usize, 8, 8),
+        (9_906, 8, 8),
+        (17_682, 8, 8),
+        (32_768, 8, 8),
+        (49_152, 8, 13),
+        (69_372, 13, 13),
+        (138_292, 13, 13),
+        (262_144, 13, 13),
+        (393_216, 13, 16),
+        (1 << 20, 16, 16),
+        (1 << 22, 16, 16),
+    ] {
+        assert_eq!(window_size(m), alone, "one G1 job over {m} scalars");
+        assert_eq!(window_size_for(m, Jobs::G1), alone, "{m}: Jobs::G1");
+        assert_eq!(window_size_for(m, witness), shared, "a witness plan of {m}");
+    }
+    for lg in 0..=24 {
+        for m in [1usize << lg, 3 << lg >> 1] {
+            for jobs in [Jobs::G1, witness, Jobs { g1: 0, g2: 1 }] {
+                let c = window_size_for(m, jobs);
+                let top_bits = 255 - (255u32.div_ceil(c) - 1) * c;
+                assert!(
+                    top_bits >= c.min(5),
+                    "{m} scalars, {jobs:?}: c = {c} leaves its top window {top_bits} bits"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn the_point_plan_derives_its_shape_once() {
     let d = DigitPlan::with_c(1000, 0, Some(1000), 12).expect("plan");
     let p = PointPlan::new(&d, 0, 32, wgsl::G1).expect("point plan");
     // Derived from the constant, never retyped: the G2 suite shipped two stale expectations
     // written as literals and both had to be fixed when a constant moved under them.
-    assert_eq!(p.slice_len(), wgsl::G1.slice_len);
-    assert_eq!(p.slices(), 1000u32.div_ceil(wgsl::G1.slice_len));
+    let sl = slice_len_for(wgsl::G1, d.n_windows(), d.cap());
+    assert_eq!(p.slice_len(), sl);
+    assert_eq!(p.slices(), 1000u32.div_ceil(sl));
+    // 22 windows of 1,000 entries do not fill the device at any slice length, so this plan
+    // is at the floor; one that fills it at the curve's own length keeps that length, and
+    // one in between stops at the first halving that fills it.
+    assert!(sl < wgsl::G1.slice_len && d.n_windows() * p.slices() < wgsl::G1.fill);
+    let full = wgsl::G1.fill.div_ceil(d.n_windows()) * wgsl::G1.slice_len;
+    assert_eq!(
+        slice_len_for(wgsl::G1, d.n_windows(), full),
+        wgsl::G1.slice_len
+    );
+    assert_eq!(
+        slice_len_for(wgsl::G1, d.n_windows(), full / 2),
+        wgsl::G1.slice_len / 2
+    );
     assert_eq!(p.seg_threads(&d), d.n_windows() * p.slices());
     assert_eq!(p.spill_slots(&d), 2 * p.seg_threads(&d));
     // ceil(1000 / (32 * 64)) = 1, and it is never zero: a dispatch of zero workgroups writes
