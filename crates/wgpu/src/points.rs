@@ -83,7 +83,7 @@ const BINDING_ALIGN: u64 = 256;
 // curve and a plan that took one curve's against another curve's module would be a silently
 // wrong point rather than an error. `Curve::slice_len` carries both sweeps.
 
-/// The shortest slice [`slice_len_for`] halves to. Each halving doubles the spill slots and
+/// The shortest slice [`slice_len_for`] gives. Each halving doubles the spill slots and
 /// the merge's walk over a bucket's slices, and at 16 a chain is already 1.3 ms over G1 and
 /// 4.6 over G2, less than the reduce behind it. A floor of 32 measured `js_1x1_d8` at 53.6
 /// ms against 45.8 and `rsa2048` at 160.6 against 168.3: `rsa2048`'s witness has 474 of
@@ -94,40 +94,44 @@ const BINDING_ALIGN: u64 = 256;
 const SLICE_MIN: u32 = 16;
 
 /// Entries one thread of `msm_segmented_*` owns on a plan of `n_windows` windows of `cap`
-/// entries: [`wgsl::Curve::slice_len`], halved while the pass has fewer threads than fill
-/// the device ([`wgsl::Curve::fill`]), down to `SLICE_MIN`.
+/// entries: the shortest slice that keeps the pass at the first of
+/// [`wgsl::Curve::chains`] it can without passing [`wgsl::Curve::slice_max`], no shorter
+/// than `SLICE_MIN`, and [`wgsl::Curve::slice_len`] where none can.
 ///
-/// A thread is one serial chain of `slice_len` mixed additions, so a pass that does not
-/// fill the device costs its chain and not its entries: `js_2x2_d32`'s witness plan is
-/// 4,448 threads at 128 and each of its four G1 accumulations cost 11.2 ms, the same as
-/// `js_1x1_d8`'s 832 threads, and the G2 one 37. Halving the slice halves that until the
-/// threads are there, and past that point it only adds spill slots for the merge to walk.
-/// The accumulation and merge of one job, Chrome 154 on an M2 Max, each kernel in a timed
-/// pass of its own, milliseconds, the rule's pick starred:
+/// A thread is one serial chain of `slice_len` mixed additions, so a pass the device runs
+/// side by side costs its chain and not its entries, and the shortest chain is the one
+/// that just fits. A few hundred threads over and the device runs a second chain behind
+/// the first: the rule this replaced halved the slice from 128 while the pass had fewer
+/// threads than `fill`, which left a G2 pass anywhere from 8,250 to 16,500 threads against
+/// a step near 11,600, and a G1 one from 14,000 to 28,000 against a step near 23,200. B's
+/// G2 accumulation under both rules, and the whole proof, whose G1 jobs move with it,
+/// Chrome 157 on an M2 Max, both builds interleaved in both orders, milliseconds:
 ///
 /// ```text
-/// pass (general scalars, c)       threads at 128     16      32      64     128
-/// G1 js_1x1_d8    (3,234, 8)             832        2.0*    3.1     5.8    11.3
-/// G1 js_2x2_d16   (9,906, 8)           2,496        4.0*    3.9     6.1    11.4
-/// G1 js_2x2_d32  (17,682, 8)           4,448        7.2     5.4*    6.8    11.8
-/// G1 js_2x2_d32 H (32,768, 8)          8,192       11.5    10.4     9.0*   12.3
-/// G1 js_8x8_d32  (69,372, 13)         10,840       16.5    13.1    11.8*   13.7
-/// G1 js_8x8_d32 H (131,072, 13)       20,480       26.6    22.4    20.8    19.5*
-/// G2 js_1x1_d8    (3,234, 8)             832        8.0*   10.3    18.9    36.7
-/// G2 js_2x2_d16   (9,906, 8)           2,496       17.8    15.8*   20.1    36.8
-/// G2 js_2x2_d32  (17,682, 8)           4,448       28.3    27.4    28.0*   38.6
-/// G2 js_8x8_d32  (69,372, 13)         10,840       77.2    65.8    72.9    67.7*
+///                   entries       halving              this rule
+/// circuit          a window   slice  threads  proof   slice  threads  proof
+/// js_2x2_d16          6,483      16   12,992   61.4      20   10,400   57.5
+/// js_2x2_d32         11,571      32   11,584  72|79      36   10,304   71.7
+/// tornado            18,172      64    9,088   92.2      56   10,400   87.0
+/// railgun-13x01      42,846      64   13,400  205.0      83   10,340  190.4
+/// js_8x8_d32         45,393      64   14,200  171.7      88   10,320  159.9
+/// js_16x16_d32       90,489     128   14,140  265.5     101   17,920  249.1
 /// ```
 ///
-/// A plan that fills the device at 128 keeps 128, so its spill buffers are the size they
-/// were. A function of the plan alone, so under [`Work::Constant`] it follows the key.
+/// `js_16x16_d32`'s is the one here too long for one chain, and runs in two; its row is
+/// the lower quartile, the sessions at load 8 to 13.
+///
+/// A function of the plan alone, so under [`Work::Constant`] it follows the key.
 pub fn slice_len_for(curve: wgsl::Curve, n_windows: u32, cap: u32) -> u32 {
-    let threads = |l: u32| u64::from(n_windows) * u64::from(cap.div_ceil(l).max(1));
-    let mut l = curve.slice_len;
-    while l > SLICE_MIN && threads(l) < u64::from(curve.fill) {
-        l /= 2;
+    for &chain in curve.chains {
+        // Slices a window may have for the pass to stay at `chain` threads.
+        let slices = (chain / n_windows.max(1)).max(1);
+        let l = cap.div_ceil(slices);
+        if l <= curve.slice_max {
+            return l.max(SLICE_MIN);
+        }
     }
-    l
+    curve.slice_len
 }
 
 /// Spill slots the merge clears per chain step once it fills the device: 43 to 46 ns a slot
@@ -150,7 +154,9 @@ const ONES_STEPS: f64 = 8.0;
 /// Every term is a count of chain steps of [`wgsl::Curve::step_us`], because every one of
 /// the four kernels is latency bound until its pass fills the device:
 ///
-/// * accumulation: `slice_len * hypot(1, threads / fill)`, see [`wgsl::Curve::fill`].
+/// * accumulation: `slice_len * hypot(1, threads / fill)`, see [`wgsl::Curve::fill`], and
+///   no more than [`wgsl::Curve::chain_us`] a step on a pass [`slice_len_for`] kept at
+///   the first of [`wgsl::Curve::chains`], which the fit read through the step.
 /// * merge: the longer of the walk over the fattest bucket's slices, two additions each,
 ///   and its slots over `MERGE_FILL`. The fattest bucket of uniform digits is one of the
 ///   top window's, which has only `RECODE_BITS - (W - 1) * c` bits: two buckets holding
@@ -176,7 +182,11 @@ pub fn stage_us(curve: wgsl::Curve, m: usize, c: u32) -> f64 {
     let cap = u32::try_from(m).unwrap_or(u32::MAX).max(1);
     let l = slice_len_for(curve, w, cap);
     let threads = f64::from(w) * f64::from(cap.div_ceil(l));
-    let accumulate = f64::from(l) * 1f64.hypot(threads / f64::from(curve.fill));
+    let mut per_step = 1f64.hypot(threads / f64::from(curve.fill));
+    if threads <= f64::from(curve.chains[0]) {
+        per_step = per_step.min(f64::from(curve.chain_us) / f64::from(curve.step_us));
+    }
+    let accumulate = f64::from(l) * per_step;
     let merge =
         (2.0 * (m as f64 / top_buckets / f64::from(l) + 1.0)).max(2.0 * threads / MERGE_FILL);
     let tg = curve.wg.tg;

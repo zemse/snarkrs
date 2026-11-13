@@ -120,8 +120,8 @@ pub struct Curve {
     /// Device bytes per XYZZ accumulator, four coordinates.
     pub point_bytes: u64,
     /// Entries one thread of `msm_segmented_*` owns on a pass large enough to fill the
-    /// device, and the most on any pass: [`crate::points::slice_len_for`] halves it for a
-    /// smaller one. Not baked into the WGSL (it is a uniform field), but measured per
+    /// device many times over: [`crate::points::slice_len_for`] sizes the slice of a
+    /// smaller one to its thread count. Not baked into the WGSL (it is a uniform field), but measured per
     /// curve, so it lives with the other shape constants rather than as a bare `const` a
     /// plan could take from the wrong curve.
     ///
@@ -163,12 +163,69 @@ pub struct Curve {
     /// 11.2 ms over G1 and 37 over G2 at 128. The G2 over G1 ratio, 3.5, is the weight a
     /// G2 job carries in [`crate::msm::window_size_for`].
     pub step_us: u32,
-    /// Threads of `msm_segmented_*` at which the device is full: below it a pass costs its
-    /// longest chain, above it its entries. The same sweep fits
+    /// Threads of `msm_segmented_*` at which the device is full in the cost model: below
+    /// it a pass costs its longest chain, above it its entries. A smooth fit through the
+    /// step [`Self::chains`] describes, and what prices a pass past it. The same sweep fits
     /// `step_us * slice_len * hypot(1, threads / fill)` to the accumulation with an RMS
     /// error of 7% over 219 G1 passes and 10% over 61 G2 ones, at 14,000 threads over G1
     /// (5.9 ns an entry once full) and 8,250 over G2 (34.5 ns).
     pub fill: u32,
+    /// Threads [`crate::points::slice_len_for`] aims a pass of `msm_segmented_*` at: what
+    /// the device runs side by side with room to spare, and after it what it runs in two
+    /// turns. Past a count that follows the bytes of the accumulator, not the entries, the
+    /// device runs the threads in turn and the pass costs a second chain at once. B's G2
+    /// accumulation on `js_2x2_d32`, 11,571 entries a window in 32 windows, and `H`'s G1
+    /// one, 32,768 a window, each in a timed pass of its own in Chrome 157 on an M2 Max as
+    /// the slice is forced from 128 down to 16, microseconds a chain step against threads:
+    ///
+    /// ```text
+    /// G2 threads   2,912   5,792   8,416  10,304  10,912  11,584  11,968  13,248  18,528  23,168
+    /// us a step      281     300     283     307     294  291|525    523     541     557     578
+    /// G1 threads   8,192  10,944  14,592  16,384  18,752  21,856  23,840  26,240  32,768  65,536
+    /// us a step       92      93     103     120     122     148     208     211     240     392
+    /// ```
+    ///
+    /// G2 holds one chain to 11,232 threads and runs two from 11,968 to 23,168. At 11,584,
+    /// where halving the slice by powers of two had put this pass, it was one or the other
+    /// for rounds at a time: 9.1 or 16.7 ms, a proof of 72 or 80. G1, at half the bytes a
+    /// thread, rises slowly to twice that count and steps there.
+    ///
+    /// The targets are under the steps by what whole proofs needed, the dispatches in one
+    /// pass as they ship. Over G2 11,200 ran the second chain in 3 of 5 rounds on `tornado`
+    /// (96.9 ms against 85.3) and 3 of 5 in one session on `railgun-13x01` (207 to 213
+    /// against 190); 10,800 and under in none, and 10,400 is 7% under the first that
+    /// failed. The second target is for a pass too long for the first at
+    /// [`Self::slice_max`]: `js_16x16_d32`'s, 90,489 entries a window in 20, proofs of 248.4
+    /// ms at 18,100 threads and 248.3 at 18,860, 248 or 262 at 19,260, and 266 at the
+    /// 14,140 the curve's 128 gives it. Over G1, with G2 at 10,400, milliseconds:
+    ///
+    /// ```text
+    /// G1 threads      16,000  18,000  20,000  22,000  24,000   halving
+    /// js_2x2_d32        72.7    71.6    72.6    73.1    77.7     72.4
+    /// tornado           88.2    86.4    87.4    88.3    95.3     90.3
+    /// js_8x8_d32       163.3   160.2   160.7   161.3   174.9    160.7
+    /// railgun-13x01    193.6   190.7   191.4   192.7   214.6    192.9
+    /// ```
+    ///
+    /// One GPU's numbers. A device with fewer cores steps sooner, and a target over its
+    /// step costs it a second chain on every pass this one runs in one.
+    pub chains: &'static [u32],
+    /// Microseconds a chain step costs at most on a pass of the first of [`Self::chains`]
+    /// or fewer threads: [`Self::step_us`] over G2, which is flat to its step, and what the
+    /// table above reads at 18,000 threads over G1.
+    pub chain_us: u32,
+    /// The longest slice [`crate::points::slice_len_for`] gives a pass to keep it at one
+    /// of [`Self::chains`]. A pass that would need a longer one fills the device many
+    /// times over at any length and runs at [`Self::slice_len`].
+    ///
+    /// A thread runs its slice without a break, and a long enough one loses the device
+    /// when another process wants the GPU. `js_16x16_d32`'s G2 pass in one chain is a slice
+    /// of 175, 51 ms a thread, and a proof of 238.7 ms where two chains of 101 give 248;
+    /// with a native prover looping beside the browser, fresh sessions that lost their
+    /// device on the first proofs: 16 of 16 at 175, 1 of 6 at 160, none of 6 at 150 or
+    /// 140, 1 of 34 at 128. So G2 stops at the 128 it has always run, 37 ms, and G1 at
+    /// 256, 31 ms.
+    pub slice_max: u32,
     /// The measured workgroup sizes for this curve's five entry points.
     pub wg: Workgroups,
     /// A wider `msm_segmented_*` for the pass sizes that want one, or `None` to run every
@@ -194,6 +251,9 @@ pub const G1: Curve = Curve {
     slice_len: 128,
     step_us: 82,
     fill: 14_000,
+    chains: &[18_000],
+    chain_us: 120,
+    slice_max: 256,
     wg: Workgroups {
         clear: 256,
         segmented: 64,
@@ -220,6 +280,9 @@ pub const G2: Curve = Curve {
     slice_len: 128,
     step_us: 285,
     fill: 8_250,
+    chains: &[10_400, 18_000],
+    chain_us: 285,
+    slice_max: 128,
     wg: Workgroups {
         clear: 256,
         segmented: 64,

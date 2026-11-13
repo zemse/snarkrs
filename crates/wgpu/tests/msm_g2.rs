@@ -1070,19 +1070,26 @@ fn the_point_plan_derives_its_shape_once() {
     let sl = slice_len_for(wgsl::G2, d.n_windows(), d.cap());
     assert_eq!(p.slice_len(), sl);
     assert_eq!(p.slices(), 1000u32.div_ceil(sl));
-    // 22 windows of 1,000 entries do not fill the device at any slice length, so this plan
-    // is at the floor; one that fills it at the curve's own length keeps that length, and
-    // one in between stops at the first halving that fills it.
-    assert!(sl < wgsl::G2.slice_len && d.n_windows() * p.slices() < wgsl::G2.fill);
-    let full = wgsl::G2.fill.div_ceil(d.n_windows()) * wgsl::G2.slice_len;
-    assert_eq!(
-        slice_len_for(wgsl::G2, d.n_windows(), full),
-        wgsl::G2.slice_len
-    );
-    assert_eq!(
-        slice_len_for(wgsl::G2, d.n_windows(), full / 2),
-        wgsl::G2.slice_len / 2
-    );
+    // 22 windows of 1,000 entries are fewer threads than the rule aims a pass at whatever
+    // the slice, so this plan is at the floor. A larger one runs at the shortest slice
+    // that keeps it at the first target it can reach within the longest slice the rule
+    // gives, and past the last target at the curve's own length.
+    let w = d.n_windows();
+    let chains = wgsl::G2.chains;
+    assert!(sl < wgsl::G2.slice_len && w * p.slices() < chains[0]);
+    let fits = chains[chains.len() - 1] / w * wgsl::G2.slice_max;
+    assert_eq!(slice_len_for(wgsl::G2, w, fits), wgsl::G2.slice_max);
+    assert_eq!(slice_len_for(wgsl::G2, w, fits + 1), wgsl::G2.slice_len);
+    for cap in [fits * 3 / 4, fits / 2, fits / 3, fits / 7] {
+        let l = slice_len_for(wgsl::G2, w, cap);
+        let threads = w * cap.div_ceil(l);
+        let target = *chains.iter().find(|&&t| threads <= t).expect("a target");
+        assert!(l > sl && l <= wgsl::G2.slice_max);
+        assert!(
+            w * cap.div_ceil(l - 1) > target,
+            "{cap}: {l} is not the shortest"
+        );
+    }
     assert_eq!(p.seg_threads(&d), d.n_windows() * p.slices());
     assert_eq!(p.spill_slots(&d), 2 * p.seg_threads(&d));
     // ceil(1000 / (32 * SLICE_LEN)) = 1, and it is never zero: a dispatch of zero workgroups writes

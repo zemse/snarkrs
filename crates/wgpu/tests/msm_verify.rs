@@ -101,7 +101,7 @@ fn exclusive() -> std::sync::MutexGuard<'static, ()> {
 // ---------------------------------------------------------------------------
 
 /// The slice length the plans in this file run at. Every one is a few hundred scalars, far
-/// too few to fill the device, so `slice_len_for` halves each to its floor; asked of the
+/// too few to fill the device, so `slice_len_for` puts each at its floor; asked of the
 /// rule rather than retyped, and `widest_run_slices` holds the tests to it.
 fn slice_len(curve: wgsl::Curve) -> u32 {
     let d = DigitPlan::new(1000, 0, Some(1000)).expect("plan");

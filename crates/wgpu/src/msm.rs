@@ -144,8 +144,7 @@ pub fn window_size(m: usize) -> u32 {
 /// general scalars     one G1 job    A, B in G2 and B in G1
 /// 256 to 1,024             5                 5
 /// 2,048 to 32,768          8                 8
-/// 49,152                   8                13
-/// 65,536 to 262,144       13                13
+/// 49,152 to 262,144       13                13
 /// 393,216                 13                16
 /// 524,288 and up          16                16
 /// ```
