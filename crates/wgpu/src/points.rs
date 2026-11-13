@@ -226,6 +226,20 @@ const ONES_SCAN: u32 = 8;
 /// quarters of it and at one and a half times: 93.9, 94.3 and 98.8 ms on `keccak256`
 /// against 103.7 at 64 groups, 129.1, 130.3 and 135.4 on `rsa2048` against 148.8.
 ///
+/// What a thread runs without a break is its scan, and that has a ceiling which is not
+/// about speed, as the accumulation's slice has ([`wgsl::Curve::slice_max`]): macOS cuts
+/// short a submission that holds the GPU too long and loses the device to a thread that
+/// does. The scan is `n` over the pass's threads, and this rule never gives fewer threads
+/// than the 64 groups of 64 scalars a thread it replaced, at any `n` (`tests/msm_g1.rs`
+/// holds it to that), so no thread scans more than it did: 79 scalars over G1 and 134
+/// over G2 on `anon-aadhaar`'s 1,101,048 wires where both scanned 269. Every submission
+/// of every artifact is as long as it was or shorter, native wgpu, median of nine, old
+/// rule and new in one binary: `anon-aadhaar` 220, 124 and 124 ms to 160, 124 and 124,
+/// `rsa2048` 118 to 97, `keccak256` 75 to 65, `sha256` 48 to 29, `railgun-13x01` 160 to
+/// 154, `js_16x16_d32` 164 and 44 to 158 and 44. It is not `slice_max`'s bound: past
+/// 1,048,576 positions over G2 (3,571,712 over G1) a thread scans more than the 128 (256)
+/// an accumulation slice may hold, and on a range of nothing but ones adds that many.
+///
 /// Floored at 1 because a dispatch of zero workgroups writes nothing and the host would
 /// then read a stale slot. Zero where the plan has no ones pass
 /// ([`DigitPlan::ones_pass`]): the pass is not dispatched, has no window in the results

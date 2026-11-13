@@ -1102,6 +1102,16 @@ fn the_point_plan_derives_its_shape_once() {
         ones_groups_for(1 << 22, wgsl::G2, wgsl::G2.wg.tg, true),
         wgsl::G2.fill / wgsl::G2.wg.tg
     );
+    // Never fewer groups than the rule this replaced gave, so no thread scans more scalars
+    // without a break than it did, at any length.
+    for n in (0..=25).flat_map(|k| [1u32 << k, (1 << k) + 1, (3 << k) - 1]) {
+        let tg = wgsl::G2.wg.tg;
+        let groups = ones_groups_for(n, wgsl::G2, tg, true);
+        assert!(
+            groups >= n.div_ceil(tg * 64).clamp(1, 64),
+            "{n} scalars in {groups} groups"
+        );
+    }
     for sorted in [
         d.ones_in_buckets(),
         DigitPlan::with_work_c(1000, 0, None, 12, Work::Constant).expect("plan"),

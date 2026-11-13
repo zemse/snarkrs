@@ -475,7 +475,10 @@ impl DigitPlan {
     /// `2^(top_bits - 1)` buckets, and the merge walks it in one lane
     /// (`crate::points::stage_us`); `cap` here counts the ones.
     ///
-    /// Under it the ones lengthen no chain. The half over is two merge steps a slice
+    /// Under it the ones lengthen no chain, and over it the one lane of the merge that
+    /// walks their bucket is at most half as long again as the plan's longest was: 13
+    /// additions against 10 on `railgun-13x01`'s B sort, 4 ms over G2, in a submission
+    /// that is 154 ms where it was 160. The half over is two merge steps a slice
     /// against the eight of the pass they replace, four to nine steps at the slice
     /// lengths `crate::points::slice_len_for` gives, so about even at the line.
     /// `railgun-13x01`'s B sort (335 a bucket and 439 ones) is the one artifact
