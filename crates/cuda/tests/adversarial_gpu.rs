@@ -927,10 +927,10 @@ fn offsets_select_the_right_sub_msm() {
 /// Every window width the kernels can address, in both groups and under both schedules,
 /// against a naive sum.
 ///
-/// `window_size` picks 3..=8 and nothing else in this workspace ever ran another width, so
-/// 2 and 9..=16 existed only as `G16_CUDA_MSM_C` values no test had validated. The widths
-/// are not interchangeable in the kernels. `top_bits(12)` and `top_bits(14)` are 3, so at
-/// those widths the top window has four live buckets, each holding a quarter of the
+/// `window_size` picked 3..=8 when this was written and nothing else in this workspace
+/// had run another width, so 2 and 9..=16 existed only as `G16_CUDA_MSM_C` values no
+/// test had validated. The widths are not interchangeable in the kernels. At 12 and 14
+/// the top window keeps 3 bits, so it has four live buckets, each holding a quarter of the
 /// scalars, and such a bucket's run spans thousands of slices: that is the one-thread
 /// `msm_merge_*` walk and, under constant work, the deepest fold. The signed digit's
 /// `(1 << c) - b - carry` and its `mag <= 2^(c-1)` bound move with `c`, and at 16 a window

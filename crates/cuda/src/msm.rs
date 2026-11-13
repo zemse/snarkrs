@@ -475,138 +475,240 @@ fn legacy_accumulate() -> bool {
     std::env::var("G16_CUDA_MSM_LEGACY_ACC").as_deref() == Ok("1")
 }
 
-/// The widest window the T4 sweep found worth using below [`WIDE_WINDOW_MIN_GENERAL`]
-/// general scalars. Distinct from `MAX_WINDOW`, which is what the kernels can physically
-/// address: this is what is fast, and it is smaller.
-const MEASURED_MAX_WINDOW: u32 = 8;
-
-/// The width [`window_size`] picks from [`WIDE_WINDOW_MIN_GENERAL`] general scalars up,
-/// and the general count it starts at; see the "re-measured" section there.
-const WIDE_WINDOW: u32 = 13;
-const WIDE_WINDOW_MIN_GENERAL: usize = 1 << 17;
-
-/// Meaningful bits of the top window at width `c`.
+/// How many of a plan's jobs run in each group.
 ///
-/// The digits are laid out over [`RECODE_BITS`] bits in `W = ceil(255 / c)` windows, and
-/// `W * c` overshoots 255 by up to `c - 1`, so the top window has only
-/// `255 - (W - 1) * c` meaningful bits and its digits crowd into `2^(top_bits - 1)` buckets
-/// instead of `2^(c-1)`.
-fn top_bits(c: u32) -> u32 {
-    let w = RECODE_BITS.div_ceil(c as usize);
-    (RECODE_BITS - (w - 1) * c as usize).min(c as usize) as u32
+/// Every job of a plan pays its own accumulation, merge and reduce at the plan's width,
+/// and a G2 job pays four to five times a G1 job's, so the width that suits a plan
+/// follows from which jobs share it as well as from how many scalars it sorts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Mix {
+    pub(crate) g1: usize,
+    pub(crate) g2: usize,
 }
 
-/// Window width for `m` scalars that actually reach the buckets.
+impl Mix {
+    /// One G1 job: A under a live index, L and H.
+    pub(crate) const G1: Self = Self { g1: 1, g2: 0 };
+
+    pub(crate) fn of(groups: &[Group]) -> Self {
+        let mut mix = Self::default();
+        for group in groups {
+            mix.add(*group);
+        }
+        mix
+    }
+
+    pub(crate) fn add(&mut self, group: Group) {
+        match group {
+            Group::G1 => self.g1 += 1,
+            Group::G2 => self.g2 += 1,
+        }
+    }
+}
+
+/// What one job costs a plan, in microseconds on a Tesla T4; see [`window_size_for`].
+struct JobCost {
+    /// One point operation of a dependent chain, a thread waiting on its own last one.
+    chain_us: f64,
+    /// One entry of the segmented accumulation at full occupancy.
+    entry_us: f64,
+    /// One bucket row's share of the clear and the merge.
+    row_us: f64,
+    /// One operation of one reduce thread, as throughput.
+    reduce_us: f64,
+    /// One reduce partial read back and added on the host.
+    partial_us: f64,
+}
+
+const G1_COST: JobCost = JobCost {
+    chain_us: 14.5,
+    entry_us: 0.00217,
+    row_us: 0.0063,
+    reduce_us: 0.00466,
+    partial_us: 0.7,
+};
+
+const G2_COST: JobCost = JobCost {
+    chain_us: 44.4,
+    entry_us: 0.0111,
+    row_us: 0.0278,
+    reduce_us: 0.0182,
+    partial_us: 2.4,
+};
+
+/// One entry through count and scatter, microseconds, and what a scatter store adds per
+/// square root of the window's buckets as the rows spread past the caches.
+const DIGIT_US: f64 = 0.000195;
+const SCATTER_US: f64 = 0.00000225;
+
+/// Reduce threads a T4 keeps resident at once; a grid past it runs its chain again.
+const RESIDENT_THREADS: usize = 10240;
+
+/// The widest window [`window_size_for`] picks. `MAX_WINDOW` is what the kernels can
+/// address; no plan measured faster at 16 than at 15, and it doubles the buckets.
+const MODEL_MAX_WINDOW: u32 = 15;
+
+/// Bits 192..=255 of the scalar field's modulus, which bound the top window's digits.
+const MODULUS_TOP: u64 = 0x30644e72e131a029;
+
+/// Modelled cost in microseconds of one plan over `m` general scalars at width `c`,
+/// shared by `mix` jobs; see [`window_size_for`] for the terms.
+fn plan_cost_us(c: u32, m: usize, mix: Mix) -> f64 {
+    let windows = RECODE_BITS.div_ceil(c as usize);
+    let buckets = 1usize << (c - 1);
+    let entries = (windows * m) as f64;
+
+    // The reduce as the launch shapes it: `chain` operations a thread, on `threads`.
+    let groups = reduce_groups_for(windows, buckets);
+    let block = buckets
+        .div_ceil(groups)
+        .next_power_of_two()
+        .min(REDUCE_TG as usize);
+    let chain = 2 * (buckets / (groups * block)).max(1) + block.trailing_zeros() as usize + 14;
+    let threads = windows * groups * block;
+    let reduce_chain = (chain * threads.div_ceil(RESIDENT_THREADS)) as f64;
+
+    // The merge's chain is its fattest bucket's. A scalar is below the modulus, so the
+    // top window's digits stop at `top`: its buckets hold `m / top` entries each, and
+    // the last two the carry reaches hold less.
+    let top = MODULUS_TOP as f64 / (1u64 << ((windows - 1) * c as usize - 192)) as f64;
+    let (m_f, last) = (m as f64, top.fract());
+    let wide_min = (MERGE_WIDE_MIN_SPAN * SLICE_LEN) as f64;
+    let (mut narrow, mut wide) = (0.0f64, 0.0f64);
+    for count in [
+        m_f / buckets as f64,
+        m_f / top,
+        m_f * (1.0 + last) / (2.0 * top),
+        m_f * last / (2.0 * top),
+    ] {
+        if count < wide_min {
+            narrow = narrow.max(count);
+        } else {
+            wide = wide.max(count);
+        }
+    }
+    let slice = SLICE_LEN as f64;
+    let mut merge_chain = 2.0 * (narrow / slice).ceil() + 3.0;
+    if wide > 0.0 {
+        merge_chain += 2.0 * wide / slice / MERGE_TG as f64 + 11.0;
+    }
+
+    let rows = (windows * buckets.min(m)) as f64;
+    let partials = (windows * groups) as f64;
+    let mut us = (DIGIT_US + SCATTER_US * (buckets as f64).sqrt()) * entries;
+    for (jobs, k) in [(mix.g1, &G1_COST), (mix.g2, &G2_COST)] {
+        // A slice is a chain of `SLICE_LEN` additions however few threads there are.
+        let accumulate = (k.chain_us * SLICE_LEN.min(m) as f64).max(k.entry_us * entries);
+        us += jobs as f64
+            * (accumulate
+                + k.chain_us * (merge_chain + reduce_chain)
+                + k.row_us * rows
+                + k.reduce_us * (threads * chain) as f64
+                + k.partial_us * partials);
+    }
+    us
+}
+
+/// Window width for a plan of `m` general scalars shared by one G1 job; see
+/// [`window_size_for`].
+pub fn window_size(m: usize) -> u32 {
+    window_size_for(m, Mix::G1)
+}
+
+/// Window width for a plan of `m` scalars that actually reach the buckets, shared by
+/// `mix` jobs.
 ///
 /// `m` is the general-scalar count, not the input length. That distinction matters
 /// enormously: a 140k-long witness with 2k general scalars is a 2k problem, and sizing the
 /// window for 140k would allocate 16384 buckets per window and spend half a million point
 /// additions reducing buckets that 34k additions filled.
 ///
-/// # Measured on a Tesla T4
+/// # The model
 ///
-/// The sweep this comment used to ask for has been run: `G16_CUDA_MSM_C` over 6..=16, warm,
-/// median of 6, on the two circuits that dominate the cost curve. `c = 8` won both, and the
-/// landscape is as violent as predicted, a 2.9x spread across the range:
+/// The width is the cheapest of 3..=[`MODEL_MAX_WINDOW`] under [`plan_cost_us`], which
+/// prices a plan as its digit pipeline plus, for each job, with `W = ceil(255 / c)`
+/// windows of `B = 2^(c-1)` buckets:
 ///
-/// ```text
-///   c        6      7      8      9     10     11     12     13     14     15     16
-///   70,357  155.5  145.8   73.1  134.3   80.5  212.0  145.0   88.7  182.5  164.9  271.9
-///  140,261  307.8  291.0  138.3  262.8  154.4  403.4  261.9  140.0  302.3  211.5  322.1
-/// ```
+/// * the accumulation, `entry_us * W * m`, floored at one slice's chain of
+///   [`SLICE_LEN`] additions, which is all a small plan costs at any width;
+/// * the merge's chain, the walk of its fattest bucket: two operations a slice below
+///   [`MERGE_WIDE_MIN_SPAN`] slices and one block's strided pass above it. The fattest
+///   buckets are the top window's, whose digits the modulus stops at 3 for c = 9 and 12
+///   for c = 10, and the bucket the carry half fills is the one that falls below the
+///   wide threshold: at c = 10 it walks 30 slices serially at 42,846 general scalars
+///   (3.1 ms in G2, measured) and merges wide at 45,393 (0.8 ms);
+/// * the reduce, a chain of `2 * buckets a thread + log2(block) + 14` operations that
+///   runs once per [`RESIDENT_THREADS`] of its grid (c = 11 launches 12,288 threads and
+///   reads 1.35 ms a G1 job where c = 10's 6,656 read 0.75 on the same chain), plus
+///   `reduce_us` per thread operation;
+/// * `row_us * W * B` for the clear and the merge's pass over the rows, and
+///   `partial_us` per reduce partial the host adds.
 ///
-/// Against the heuristic's own pick that is 88.7 -> 73.1 ms at 70,357 (1.21x) and
-/// 150.5 -> 138.3 ms at 140,261 (1.09x). So the pick is capped at 8 below.
-///
-/// **What that cap is NOT.** It is two circuit sizes on one card of one architecture,
-/// measured through whole-proof time with every MSM forced to the same width, not per-MSM.
-/// It changes the pick for every `m` above ~10k, and of those only 70,357 and 140,261 were
-/// measured; 10,153 and 17,929 move from 10 to 8 on inference, not evidence. The mechanism
-/// below argues the shape is architectural rather than Turing-specific, but that is an
-/// argument and the table is a measurement. See TASKS.local.md.
-///
-/// # Re-measured per MSM, after the wide merge, the reduce groups and the scatter split
-///
-/// That sweep was taken with every bucket merged in one thread, one reduce block a
-/// window and one scatter launch, and the cliffs at 9, 11, 12 and 14 were those three
-/// shapes failing, not the width: the wide merge (`msm_merge_wide_*`) takes the fat top
-/// window, `reduce_groups` the dependent reduce chain and the scatter split the L2
-/// thrash. With all three in, `variable_work_phase_timings` on the same T4, MSM time in
-/// ms per width (G1 / G2), dense random scalars:
+/// The Metal twin's model has the same shape with an M2 Max's constants. These are a
+/// T4's: a least-squares fit of the per-phase device times of the plans of eleven
+/// circuits, every plan of a proof forced to each width in 4..=16, 5 to 7 warm proofs a
+/// width, every proof verified. The chain constants land at 14.5 and 44.4 us an
+/// operation (a 64-addition slice alone reads 1.25 and 3.8 ms) and the entry constants
+/// at 2.17 and 11.1 ns, against the probe's 1.98 ns G1 and 6.01 ns G2 mixed addition.
+/// Plan time in ms at each width, the pick starred:
 ///
 /// ```text
-///   general      c=8          c=10         c=12         c=13
-///   65,536       6.0 / 25.7   6.6 / 26.3   6.7 / 26.6   5.8 / 23.1
-///   262,144     23.6 / 82.0  21.2 / 73.0  18.5 / 72.3  19.3 / 70.8
-///   1,048,576   97.0 / 329   77.0 / 266   69.7 / 244   63.9 / 230
+///   plan (general, jobs)        c=5     c=8     c=9    c=10    c=13    c=15
+///   js_1x1_d8 B (2,118, G2+G1)  8.26*   8.74   10.14   10.30   16.89   35.55
+///   js_2x2_d32 B (11,571)      11.71   11.04*  11.71   11.72   18.54   35.81
+///   js_2x2_d32 H (32,768, G1)   6.23    3.54*   3.26    3.93    4.19    7.71
+///   railgun-13x01 B (42,846)   44.76   27.82   23.74*  26.93   28.60   46.24
+///   js_8x8_d32 B (45,393)      42.89   27.03   23.08   23.86*  28.06   44.70
+///   sha256 H (65,536, G1)      10.05    6.69    6.20    6.27*   6.54   10.25
+///   js_8x8_d32 A (68,777, G1)  12.32    7.27    7.18    6.78*   8.50   10.42
+///   js_16x16_d32 B (90,489)    72.28   47.79   41.03   41.43*  42.33   58.84
+///   js_8x8_d32 H (131,072)     21.32   13.97   12.76   11.40*  10.94   13.81
+///   js_16x16_d32 A (137,105)   20.12   14.66   14.93   12.52*  13.08   14.79
+///   js_16x16_d32 H (262,144)   34.19   29.04   25.30   23.45   19.54*  20.98
+///   anon-aadhaar H (2^21)     280.86  191.66  196.79  179.40  145.25  130.64*
 /// ```
 ///
-/// and with a fifth each of 0, 1 and -1 (157k and 629k general of 2^18 and 2^20):
-/// 15.1 / 55.8 -> 12.6 / 47.1 and 57.3 / 197 -> 42.5 / 155 at c = 13; at 2^16 (39k
-/// general) c = 8 keeps 4.7 / 18.2 against 5.7 / 22.9. The width buys accumulation
-/// (fewer windows, 20 at 13 against 32) and pays per bucket in the clear, the merge of
-/// the top window and the reduce, about 2.5 ms in G1 and 8 in G2 at 13; the trade turns
-/// near 10^5 general scalars, so `WIDE_WINDOW` is taken from `WIDE_WINDOW_MIN_GENERAL`
-/// up and the capped heuristic below it. 13 over 12 because the three largest shapes
-/// read faster at 13 and the fourth within a sample; 14 lost every shape. A plan is
-/// shared by every job of a batch (A, B in both groups, over one witness), so the pick
-/// cannot favour a group.
+/// The pick is the measured best or within 0.5 ms of it on every plan above 5,000
+/// general scalars but js_8x8_d32's B (0.8) and anon-aadhaar's witness plans, whose
+/// ones pass over 489k to 1.1M positions moves more between runs than between widths.
+/// What the model does not see: the G2
+/// accumulation steps with the thread count (a plan of 18,172 reads 6.3 ms to 9,088
+/// threads and 9.2 from 10,508), so a neighbouring width can win by a step, as 9 does
+/// over 10 at 45,393 and 90,489; and a witness plan's scalars are not all full width,
+/// so its top window holds fewer entries than `m` says. Below about a thousand general
+/// scalars every width reads the same to within the run's noise.
 ///
-/// The Metal twin picks `c` from a three-term cost model whose coefficients (`MADD_US`,
-/// `ROW_US`, `MERGE_US`) were fitted to an M2 Max by forcing five window widths on two
-/// artifacts. Those are Apple silicon microseconds, they are meaningless on a T4, and none
-/// of them are copied here. What is used instead is the textbook Pippenger heuristic,
-/// `c ~ log2(m) - 3`, clamped, with one structural correction described below.
+/// # What it replaced
 ///
-/// # The one correction, which is structural rather than fitted
-///
-/// The cliffs in that table are not noise. At c=12 and c=14 the top window has three
-/// meaningful bits, so its digits crowd into four live buckets instead of 2048 or 8192 and
-/// each of the four holds a quarter of the scalars. On the CPU that costs nothing, because
-/// a serial bucket loop only cares about the total. On either GPU it is the critical path:
-/// such a bucket's run spans thousands of slices, and `msm_merge_*` walks a bucket's slice
-/// range in ONE thread while the rest of the machine waits.
-///
-/// So the heuristic's pick is stepped *down* (never up, which would only inflate the bucket
-/// array) by at most three, until the top window keeps at least half its bits. Under the
-/// `MEASURED_MAX_WINDOW` cap that fires at one width and one only: `base == 7`, which is `m`
-/// in 1024..=2047, where `top_bits(7) = 3` fails the guard and 6 is taken instead. Every
-/// other width in 3..=8 passes on the first iteration. The 12/13/14 widths are history of
-/// the uncapped heuristic, and they are why the guard is here at all.
+/// A cap at 8 below 2^17 general scalars and 13 from there, set by sweeps that forced
+/// one width on every plan of a proof before A and B were sorted apart over the key's
+/// live index. js_16x16_d32's B plan, 90,489 general scalars under that threshold, ran
+/// its G2 job at 32 windows of 128 buckets where 26 of 512 is 6.4 ms faster, and
+/// anon-aadhaar's H ran at 13 where 15 is 14.6 ms faster.
 ///
 /// Override with `G16_CUDA_MSM_C` to sweep it.
-pub fn window_size(m: usize) -> u32 {
+pub(crate) fn window_size_for(m: usize, mix: Mix) -> u32 {
     if let Ok(v) = std::env::var("G16_CUDA_MSM_C") {
         if let Ok(c) = v.parse::<u32>() {
             return c.clamp(2, MAX_WINDOW);
         }
     }
-    if m >= WIDE_WINDOW_MIN_GENERAL {
-        return WIDE_WINDOW;
-    }
-    // floor(log2(m)) + 1 for m >= 1, so `bits - 4` is the usual `log2(m) - 3`.
-    let bits = usize::BITS - m.max(1).leading_zeros();
-    // Capped at the measured optimum. The textbook heuristic keeps growing `c` with `m`
-    // and the T4 sweep says that is simply wrong here: it picked 13 at 140k where 8 is
-    // 1.09x faster, and 13 at 70k where 8 is 1.21x faster. Below ~10k general scalars the
-    // heuristic already returns 8 or less, so this only ever steps large problems down.
-    let base = bits.saturating_sub(4).clamp(3, MEASURED_MAX_WINDOW);
-    // `2 * top_bits >= c` reads as "the top window keeps at least half its bits", so its
-    // fattest bucket is at most about sqrt(2^c) times fatter than a uniform one rather than
-    // 2^(c-3) times.
-    for c in (base.saturating_sub(3).max(3)..=base).rev() {
-        if 2 * top_bits(c) >= c {
-            return c;
+    let mut best = (3, plan_cost_us(3, m, mix));
+    for c in 4..=MODEL_MAX_WINDOW {
+        let us = plan_cost_us(c, m, mix);
+        if us < best.1 {
+            best = (c, us);
         }
     }
-    base
+    best.0
 }
 
 /// The width a plan actually runs at: [`CudaMsm::with_window`] when set, else the
-/// heuristic (and its `G16_CUDA_MSM_C` override) for `general` scalars.
-fn pick_window(forced: Option<u32>, general: usize, work: Work) -> u32 {
+/// model's (and its `G16_CUDA_MSM_C` override) for `general` scalars shared by `mix`
+/// jobs. A constant-work plan's width follows from its length alone.
+fn pick_window(forced: Option<u32>, general: usize, mix: Mix, work: Work) -> u32 {
     forced.unwrap_or_else(|| match work {
-        Work::Variable => window_size(general),
+        Work::Variable => window_size_for(general, mix),
         Work::Constant => constant_window_size(general),
     })
 }
@@ -619,12 +721,12 @@ const CONSTANT_WINDOW_OFFSET: u32 = 4;
 ///
 /// A constant-work entry costs a complete addition and a store in every window whatever
 /// its digit, and its fold follows the slices, not the buckets, so neither the fat top
-/// buckets that [`window_size`]'s guard avoids nor its cap at 8 below 2^17 apply: fewer
+/// buckets nor the accumulation floor that [`window_size_for`] prices apply: fewer
 /// windows is fewer entries, paid for in clear and reduce per bucket. `G16_CUDA_MSM_C`
 /// forces a width as for variable work; `G16_CUDA_MSM_CW` moves the offset.
 ///
 /// Swept on a Tesla T4, warm `snarkrs bench --constant-work`, 2 rounds, prove ms at
-/// offsets 4 / 5 / 6, against [`window_size`]'s pick in the same session: sha256
+/// offsets 4 / 5 / 6, against the variable-work pick of the day in the same session: sha256
 /// 61.6-61.8 / 61.7-61.8 / 69.3-69.5 (74.6), keccak256 208.5-209.0 / 215.0-215.3 /
 /// 214.0-215.5 (232), rsa2048 241.8-242.0 / 259.2-260.2 / 260.7-261.1 (240),
 /// anon-aadhaar 839.6-839.7 / 842.9-847.0 / 875.8-877.7 (871). Forcing one width on
@@ -749,7 +851,7 @@ pub(crate) fn batch_words(
     window: Option<u32>,
     work: Work,
 ) -> Result<Vec<usize>, ProveError> {
-    let c = pick_window(window, n, work);
+    let c = pick_window(window, n, Mix::of(groups), work);
     let g = Geometry::new(n, 0, n, c, slice_len_for(n, c, work), work)?;
     let mut words = plan_words(&g)?.to_vec();
     for group in groups {
@@ -920,8 +1022,8 @@ pub(crate) fn resident_scratch(
 /// dozens of slices holds the whole merge launch open in a single lane while the rest of
 /// the machine waits. The Metal twin meets that only in its top window, at widths up to
 /// 15 bits, and points its wide kernel at a row range picked from the expected span;
-/// here [`window_size`] runs at 8 below 2^17 general scalars and at 13 above, so at
-/// 2^16 every bucket of a uniformly filled window spans 8 slices and the merge is a
+/// here [`window_size`] ran at 8 below 2^17 general scalars and at 13 above, so at
+/// 2^16 every bucket of a uniformly filled window spanned 8 slices and the merge was a
 /// large stage of the MSM, and at 13 the top window's 128 live buckets are the fat ones.
 /// The wide kernel strides the range across [`MERGE_TG`] threads and folds a tree.
 ///
@@ -948,7 +1050,7 @@ pub(crate) fn resident_scratch(
 /// same reason.
 ///
 /// That sweep ran every plan at c = 8, where a uniformly filled 2^18 row spans exactly
-/// 32 slices and span 32 sent every H row wide. Those plans now run at c = 13
+/// 32 slices and span 32 sent every H row wide. Those plans then moved to c = 13
 /// ([`window_size`]), where a uniform row is one slice and the fat rows are the top
 /// window's 128 live buckets, 32 slices at 2^18, which span 64 left to the narrow
 /// kernel: `variable_work_phase_timings` at c = 13, 2^18 dense, read the merge at
@@ -956,8 +1058,9 @@ pub(crate) fn resident_scratch(
 /// flat. Warm `snarkrs bench`, 2 rounds x 6, span 64 -> 32, prove ms: keccak256 42.9 /
 /// 42.6 -> 41.5 / 41.5, rsa2048 53.7 / 53.6 -> 52.4 / 52.8, anon-aadhaar 313.2 / 313.8
 /// -> 312.9 / 313.7, the four smaller circuits and every constant-work circuit within
-/// 0.3. Below 2^17 general scalars the plans stay at c = 8 with rows of at most 8
-/// slices at 2^16, which neither span reaches. Override with `G16_CUDA_MSM_WIDE`; 0
+/// 0.3. Below 2^17 general scalars the plans stayed at c = 8 with rows of at most 8
+/// slices at 2^16, which neither span reaches; [`window_size_for`] prices the span it
+/// leaves at each width since. Override with `G16_CUDA_MSM_WIDE`; 0
 /// disables the wide path.
 const MERGE_WIDE_MIN_SPAN: usize = 32;
 
@@ -1562,6 +1665,19 @@ fn plan_identity(
     index_off: usize,
 ) -> (usize, usize, usize, usize, usize) {
     (buf, soff, n, index, index_off)
+}
+
+/// The jobs sharing each digit plan of a batch, by [`plan_key`].
+fn plan_mixes(jobs: &[Job<'_>]) -> HashMap<(usize, usize, usize, usize, usize), Mix> {
+    let mut mixes: HashMap<_, Mix> = HashMap::new();
+    for job in jobs {
+        let (scalars, soff, n) = job.scalars();
+        mixes
+            .entry(plan_key(&scalars, soff, n))
+            .or_default()
+            .add(job.group());
+    }
+    mixes
 }
 
 /// Positions a job reaches past its offsets: its length, or under an index the last
@@ -2264,6 +2380,7 @@ impl CudaMsm {
     /// What `jobs` allocate as one batch, in bytes, from the same geometry `Plan::new` and
     /// `Outputs::new` size their buffers from.
     fn batch_bytes(&self, jobs: &[Job<'_>]) -> Result<u64, ProveError> {
+        let mixes = plan_mixes(jobs);
         let mut plans: HashMap<(usize, usize, usize, usize, usize), Geometry> = HashMap::new();
         let mut words = Vec::new();
         for job in jobs {
@@ -2272,7 +2389,7 @@ impl CudaMsm {
             let g = match plans.get(&key) {
                 Some(g) => *g,
                 None => {
-                    let g = Plan::geometry(self, scalars, soff, n)?;
+                    let g = Plan::geometry(self, scalars, soff, n, mixes[&key])?;
                     words.extend(plan_words(&g)?);
                     plans.insert(key, g);
                     g
@@ -2552,6 +2669,7 @@ impl CudaMsm {
             .map_err(|e| drv("record MSM start event", e))?;
 
         // ---- plan ----
+        let mixes = plan_mixes(jobs);
         let mut by_key: HashMap<(usize, usize, usize, usize, usize), usize> = HashMap::new();
         let mut job_plan = Vec::with_capacity(jobs.len());
 
@@ -2567,7 +2685,7 @@ impl CudaMsm {
                 Some(&i) => i,
                 None => {
                     let i = plans.len();
-                    plans.push(Plan::new(self, scalars, soff, n)?);
+                    plans.push(Plan::new(self, scalars, soff, n, mixes[&key])?);
                     by_key.insert(key, i);
                     i
                 }
@@ -3334,11 +3452,10 @@ fn geometry_for_metadata(
     scalar_off: usize,
     general: usize,
     index_span: Option<usize>,
-    window: Option<u32>,
+    c: u32,
     work: Work,
     shapes: Shapes,
 ) -> Result<Geometry, ProveError> {
-    let c = pick_window(window, general, work);
     let mut g = Geometry::with_shapes(
         n,
         scalar_off,
@@ -3360,13 +3477,14 @@ fn geometry_for_metadata(
 pub(crate) mod count_probe;
 
 impl<'a> Plan<'a> {
-    /// The shape a plan over `n` scalars from `scalar_off` takes, before anything is
-    /// allocated for it.
+    /// The shape a plan over `n` scalars from `scalar_off` takes when `mix` jobs share
+    /// it, before anything is allocated for it.
     fn geometry(
         msm: &CudaMsm,
         scalars: Scalars<'_>,
         scalar_off: usize,
         n: usize,
+        mix: Mix,
     ) -> Result<Geometry, ProveError> {
         kernel_range(scalar_off, n, SCALAR_WORDS)?;
         let general = if msm.work == Work::Constant {
@@ -3379,7 +3497,7 @@ impl<'a> Plan<'a> {
             scalar_off,
             general,
             scalars.index.map(|i| i.span),
-            msm.window,
+            pick_window(msm.window, general, mix, msm.work),
             msm.work,
             msm.shapes,
         )
@@ -3390,8 +3508,9 @@ impl<'a> Plan<'a> {
         scalars: Scalars<'a>,
         scalar_off: usize,
         n: usize,
+        mix: Mix,
     ) -> Result<Self, ProveError> {
-        let geometry = Self::geometry(msm, scalars, scalar_off, n)?;
+        let geometry = Self::geometry(msm, scalars, scalar_off, n, mix)?;
         Ok(Self {
             counts: msm.scratch(geometry.rows())?,
             cursor: msm.scratch(geometry.rows())?,
@@ -3739,17 +3858,21 @@ mod tests {
         let one = batch_words(n, &[Group::G1], None, Work::Variable).unwrap();
         let three =
             batch_words(n, &[Group::G1, Group::G2, Group::G1], None, Work::Variable).unwrap();
-        let c = pick_window(None, n, Work::Variable);
-        let g = Geometry::new(
-            n,
-            0,
-            n,
-            c,
-            slice_len_for(n, c, Work::Variable),
-            Work::Variable,
-        )
-        .unwrap();
+        let geometry = |groups: &[Group]| {
+            let c = pick_window(None, n, Mix::of(groups), Work::Variable);
+            Geometry::new(
+                n,
+                0,
+                n,
+                c,
+                slice_len_for(n, c, Work::Variable),
+                Work::Variable,
+            )
+            .unwrap()
+        };
+        let g = geometry(&[Group::G1]);
         assert_eq!(one.len(), 3 + output_words(&g, G1_WORDS).unwrap().len());
+        let g = geometry(&[Group::G1, Group::G2, Group::G1]);
         assert_eq!(
             vram_bytes(&three),
             vram_bytes(&plan_words(&g).unwrap())
@@ -4481,48 +4604,59 @@ mod tests {
                 "c = {c} wastes a window"
             );
             assert!(w * c as usize >= RECODE_BITS, "c = {c} loses the top bits");
-            assert!(top_bits(c) >= 1 && top_bits(c) <= c, "c = {c}");
         }
     }
 
-    /// The window sizes this ships with, written down so a change to [`window_size`] shows
-    /// up as a diff here rather than as a silent 2x in a benchmark nobody reran.
+    /// The window sizes this ships with, written down so a change to [`window_size_for`]
+    /// shows up as a diff here rather than as a silent 2x in a benchmark nobody reran.
     ///
-    /// The values themselves are the T4-measured cap over the heuristic described on
-    /// [`window_size`], so this test pins behaviour, not optimality.
+    /// The plans are the ones the T4 sweep measured, so this test pins behaviour, not
+    /// optimality.
     #[test]
     fn the_default_window_sizes_are_what_we_think_they_are() {
-        // These pin `top_bits` itself, not a live branch of `window_size`: the cap keeps
-        // the pick at 8 or below, so 12 and 14 are unreachable widths now.
-        assert_eq!(top_bits(12), 3);
-        assert_eq!(top_bits(14), 3);
-        assert_eq!(top_bits(13), 8);
-        assert_eq!(top_bits(15), 15);
-
-        // The one width the correction still fires at: base 7 fails `2 * top_bits >= c`
-        // and steps down to 6. Reachable only between 1024 and 2047 general scalars.
-        assert_eq!(window_size(1500), 6);
-
-        // A 2^16 H vector, dense by construction: the heuristic says 13 and
-        // [`MEASURED_MAX_WINDOW`] caps it at the swept 8.
-        assert_eq!(window_size(1 << 16), 8);
-        assert_eq!(window_size(WIDE_WINDOW_MIN_GENERAL - 1), 8);
-        // From 2^17 general scalars the wide width wins: a 140k witness with about 140k
-        // general scalars, a 2^18 H vector, and anon-aadhaar's 2^21 one.
-        assert_eq!(window_size(WIDE_WINDOW_MIN_GENERAL), 13);
-        assert_eq!(window_size(140_261), 13);
-        assert_eq!(window_size(1 << 18), 13);
-        assert_eq!(window_size(1 << 21), 13);
-        // The wide width keeps more than half its top bits, as the correction demands.
-        assert!(2 * top_bits(WIDE_WINDOW) >= WIDE_WINDOW);
+        let b = Mix { g1: 1, g2: 1 };
+        // (general scalars, the pick of a G1 plan, the pick of B's plan)
+        for (m, g1, g2) in [
+            // js_1x1_d8: the accumulation is one slice's chain at any width, and 5 is
+            // the width whose merge and reduce chains are shortest.
+            (2_118, 5, 5),
+            (4_096, 5, 5),
+            // js_2x2_d32, tornado and railgun-01x01 keep 8.
+            (11_571, 8, 8),
+            (17_531, 8, 8),
+            (32_768, 8, 9),
+            // railgun-13x01's B plan: at 10 the top window's last bucket walks 30
+            // slices serially, which js_8x8_d32's 45,393 clears.
+            (42_846, 9, 9),
+            (45_393, 9, 10),
+            // sha256's H, js_8x8_d32's A and H, js_16x16_d32's B and A.
+            (65_536, 10, 10),
+            (68_777, 10, 10),
+            (90_489, 10, 10),
+            (131_072, 10, 13),
+            (137_105, 10, 13),
+            // A 2^18 H, and anon-aadhaar's 2^21 one.
+            (262_144, 13, 13),
+            (2_097_152, 15, 15),
+        ] {
+            assert_eq!(window_size(m), g1, "G1 plan of {m}");
+            assert_eq!(window_size_for(m, b), g2, "B plan of {m}");
+        }
+        // A plan A shares with both B jobs, as on a key with no live index, is priced
+        // with all three.
+        let shared = Mix::of(&[Group::G1, Group::G2, Group::G1]);
+        assert_eq!(shared, Mix { g1: 2, g2: 1 });
+        assert_eq!(window_size_for(90_489, shared), 10);
         // Small inputs clamp rather than underflow.
         assert_eq!(window_size(0), 3);
         assert_eq!(window_size(1), 3);
         assert_eq!(window_size(64), 3);
-        // And nothing ever exceeds the bucket-array cap.
-        for m in [1usize, 7, 1000, 1 << 20, 1 << 30] {
-            let c = window_size(m);
-            assert!((3..=MAX_WINDOW).contains(&c), "m = {m} gave c = {c}");
+        // And nothing leaves the widths the sweep covered.
+        for m in [0usize, 1, 7, 1000, 1 << 20, 1 << 26, 1 << 30] {
+            for mix in [Mix::G1, b, shared, Mix { g1: 0, g2: 1 }] {
+                let c = window_size_for(m, mix);
+                assert!((3..=MODEL_MAX_WINDOW).contains(&c), "m = {m} gave c = {c}");
+            }
         }
     }
 
@@ -4530,15 +4664,30 @@ mod tests {
     /// plan's own range check is what rejects a bad one.
     #[test]
     fn a_forced_window_overrides_the_heuristic() {
-        assert_eq!(pick_window(None, 1500, Work::Variable), window_size(1500));
+        let b = Mix { g1: 1, g2: 1 };
         assert_eq!(
-            pick_window(None, 1500, Work::Constant),
-            constant_window_size(1500)
+            pick_window(None, 1500, Mix::G1, Work::Variable),
+            window_size(1500)
         );
+        assert_eq!(
+            pick_window(None, 45_393, b, Work::Variable),
+            window_size_for(45_393, b)
+        );
+        // A constant-work width is its length's, whatever shares the plan.
+        for mix in [Mix::G1, b] {
+            assert_eq!(
+                pick_window(None, 1500, mix, Work::Constant),
+                constant_window_size(1500)
+            );
+            assert_eq!(
+                pick_window(None, 45_393, mix, Work::Constant),
+                constant_window_size(45_393)
+            );
+        }
         for c in [1u32, 2, 3, 12, 14, MAX_WINDOW, MAX_WINDOW + 1] {
             for work in [Work::Variable, Work::Constant] {
-                assert_eq!(pick_window(Some(c), 1500, work), c);
-                assert_eq!(pick_window(Some(c), 1 << 18, work), c);
+                assert_eq!(pick_window(Some(c), 1500, b, work), c);
+                assert_eq!(pick_window(Some(c), 1 << 18, Mix::G1, work), c);
             }
         }
         assert!(Geometry::new(65, 0, 65, 1, 64, Work::Variable).is_err());
@@ -5794,7 +5943,7 @@ mod tests {
                     .collect();
                 let plans: Vec<Plan<'_>> = scalars
                     .iter()
-                    .map(|s| Plan::new(&m, s.as_scalars(), 0, n).unwrap())
+                    .map(|s| Plan::new(&m, s.as_scalars(), 0, n, Mix::G1).unwrap())
                     .collect();
                 let outs: Vec<Outputs> = jobs
                     .iter()
@@ -6383,7 +6532,7 @@ mod tests {
                         );
                     }
                 };
-                let plan = Plan::new(m, ds.as_scalars(), 0, n).unwrap();
+                let plan = Plan::new(m, ds.as_scalars(), 0, n, Mix::G1).unwrap();
                 let geometry = plan.geometry;
                 let out = Outputs::new(m, &job, &plan).unwrap();
                 let params = m.point_params(&out, &plan);

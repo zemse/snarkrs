@@ -73,13 +73,13 @@ fn view(
     }
 }
 
-fn shape(view: View, shapes: Shapes) -> Result<Geometry, ProveError> {
+fn shape(view: View, mix: Mix, shapes: Shapes) -> Result<Geometry, ProveError> {
     geometry_for_metadata(
         view.identity.2,
         view.identity.1,
         view.general,
         view.index_span,
-        None,
+        pick_window(None, view.general, mix, Work::Variable),
         Work::Variable,
         shapes,
     )
@@ -137,12 +137,16 @@ pub(crate) fn canonical_json(
     let mut job_plan = Vec::new();
     let mut allocation_words = Vec::new();
     let mut digit_launches = 0;
+    let mut mixes: HashMap<_, Mix> = HashMap::new();
+    for (_, group, view) in jobs {
+        mixes.entry(view.identity).or_default().add(group);
+    }
     for (_, _, view) in jobs {
         let next = plans.len();
         let index = match by_key.get(&view.identity) {
             Some(&index) => index,
             None => {
-                let geometry = shape(view, shapes)?;
+                let geometry = shape(view, mixes[&view.identity], shapes)?;
                 let scatter = geometry.n_windows.div_ceil(scatter_windows(
                     shapes.scatter_rows,
                     geometry.n_buckets + geometry.dummy_rows,
@@ -441,45 +445,23 @@ fn metadata_geometry_matches_prior_plan_expression_including_index_span() {
                         previous.ones_groups = ones_groups_for(span);
                     }
                     assert_eq!(
-                        geometry_for_metadata(
-                            n,
-                            7,
-                            general,
-                            span,
-                            Some(c),
-                            work,
-                            Shapes::default()
-                        )
-                        .unwrap(),
+                        geometry_for_metadata(n, 7, general, span, c, work, Shapes::default())
+                            .unwrap(),
                         previous
                     );
                 }
             }
         }
     }
-    assert!(geometry_for_metadata(
-        usize::MAX,
-        0,
-        0,
-        None,
-        Some(3),
-        Work::Variable,
-        Shapes::default()
-    )
-    .is_err());
-    assert!(geometry_for_metadata(
-        1,
-        usize::MAX,
-        0,
-        None,
-        Some(3),
-        Work::Variable,
-        Shapes::default()
-    )
-    .is_err());
     assert!(
-        geometry_for_metadata(1, 0, 2, None, Some(3), Work::Variable, Shapes::default()).is_err()
+        geometry_for_metadata(usize::MAX, 0, 0, None, 3, Work::Variable, Shapes::default())
+            .is_err()
     );
+    assert!(
+        geometry_for_metadata(1, usize::MAX, 0, None, 3, Work::Variable, Shapes::default())
+            .is_err()
+    );
+    assert!(geometry_for_metadata(1, 0, 2, None, 3, Work::Variable, Shapes::default()).is_err());
 }
 
 #[test]
