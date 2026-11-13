@@ -29,10 +29,12 @@
 //! on the rayon pool at the same time as the GPU runs the other four, because the pool
 //! is otherwise idle for the whole proof and G2 is the MSM this GPU is worst at. The
 //! GPU still runs every other stage, so the proof's time is still the GPU's. See
-//! [`g2_on_cpu`].
+//! [`g2_on_cpu`]. Where the pool is then what the proof waits on, the GPU takes the end
+//! of stage 6 back, see [`G2Tail`].
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use snarkrs_field::{Fr, G1Projective, G2Affine, G2Projective};
@@ -225,7 +227,8 @@ impl Backend for MetalBackend {
 ///
 /// # Concurrency
 ///
-/// Nothing here is mutated by a proof. Per-proof scratch is **pooled behind a mutex**,
+/// Nothing here is mutated by a proof but the share of stage 6 the next one gives the
+/// GPU ([`G2Tail`]), which is an atomic. Per-proof scratch is **pooled behind a mutex**,
 /// in two separate pools that each kernel module owns: `crate::stages`' pool hands out
 /// the witness, A, B, C, transform temporary and the two H buffers, and takes them back
 /// when the [`HHandle`] inside the [`HPoly`] is dropped; `crate::msm`'s pool hands out
@@ -481,7 +484,8 @@ impl MetalCircuit {
     /// short suffix of it, is what makes all four share a single counting sort inside
     /// `msm_batch`; a second upload would silently cost more digit pipelines as well as
     /// the copy.
-    fn witness_jobs<'a>(&'a self, w: &'a ScalarBuf) -> Vec<Job<'a>> {
+    /// `g2_share` is [`CpuG2::gpu_share`], the end of the B query the GPU takes.
+    fn witness_jobs<'a>(&'a self, w: &'a ScalarBuf, g2_share: usize) -> Vec<Job<'a>> {
         let mut jobs = vec![Job::G1(JobG1 {
             bases: &self.a_bases,
             base_off: 0,
@@ -489,14 +493,24 @@ impl MetalCircuit {
             scalar_off: 0,
             n: self.pk.n_vars,
         })];
-        if let BG2::Gpu(bases) = &self.b_g2 {
-            jobs.push(Job::G2(JobG2 {
+        match &self.b_g2 {
+            BG2::Gpu(bases) => jobs.push(Job::G2(JobG2 {
                 bases,
                 base_off: 0,
                 scalars: w,
                 scalar_off: 0,
                 n: self.pk.n_vars,
-            }));
+            })),
+            BG2::Cpu {
+                tail: Some(tail), ..
+            } if g2_share > 0 => jobs.push(Job::G2(JobG2 {
+                bases: &tail.bases,
+                base_off: tail.bases.len() - g2_share,
+                scalars: w,
+                scalar_off: self.pk.n_vars - g2_share,
+                n: g2_share,
+            })),
+            BG2::Cpu { .. } => {}
         }
         jobs.push(Job::G1(JobG1 {
             bases: &self.b_g1_bases,
@@ -519,34 +533,44 @@ impl MetalCircuit {
     }
 
     /// Stage 6 on the CPU pool, started from `s` so it runs while the GPU has the other
-    /// four; `None` when B in G2 is one of the [`Self::witness_jobs`].
+    /// four; `None` when B in G2 is one of the [`Self::witness_jobs`]. With a
+    /// [`G2Tail`] the pool takes the query up to the share the GPU has this proof.
     fn b_g2_on_cpu<'s>(
         &'s self,
         s: &'s std::thread::Scope<'s, '_>,
         witness: &'s [Fr],
-    ) -> Option<std::thread::ScopedJoinHandle<'s, G2Projective>> {
-        let BG2::Cpu { bases, pool } = &self.b_g2 else {
+    ) -> Option<CpuG2<'s>> {
+        let BG2::Cpu { bases, pool, tail } = &self.b_g2 else {
             return None;
         };
-        Some(s.spawn(move || {
-            pool.install(|| {
+        let gpu_share = tail.as_ref().map_or(0, G2Tail::share);
+        let n = bases.len() - gpu_share;
+        let thread = s.spawn(move || {
+            let start = Instant::now();
+            let sum = pool.install(|| {
                 let cpu = match self.work {
                     Work::Constant => CpuMsm::constant_work(),
                     Work::Variable => CpuMsm::new(),
                 };
-                cpu.msm_g2(bases, witness)
-            })
-        }))
+                cpu.msm_g2(&bases[..n], &witness[..n])
+            });
+            (sum, start, Instant::now())
+        });
+        Some(CpuG2 { thread, gpu_share })
     }
 
     /// A, B in G2, B in G1 and L, from the [`Self::witness_jobs`] results in job order
-    /// and stage 6's CPU result when it ran there.
+    /// and stage 6's CPU result when it ran there, the two summed when they shared it.
+    /// Called with every GPU result of the proof in hand, which is what the next
+    /// proof's share is steered by.
     fn witness_results(
         &self,
         out: Vec<crate::msm::MsmResult>,
-        cpu_b_g2: Option<std::thread::ScopedJoinHandle<'_, G2Projective>>,
+        cpu_b_g2: Option<CpuG2<'_>>,
     ) -> Result<(G1Projective, G2Projective, G1Projective, G1Projective), ProveError> {
-        let want = 3 + usize::from(cpu_b_g2.is_none());
+        let gpu_done = Instant::now();
+        let on_gpu = cpu_b_g2.as_ref().is_none_or(|cpu| cpu.gpu_share > 0);
+        let want = 3 + usize::from(on_gpu);
         if out.len() != want {
             return Err(bad(format!(
                 "msm_batch returned {} witness results, want {want}",
@@ -556,10 +580,24 @@ impl MetalCircuit {
         let mut out = out.into_iter();
         let mut next = || out.next().expect("length checked above");
         let a_g1 = next().g1()?;
-        let b_g2 = match cpu_b_g2 {
-            Some(h) => h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)),
-            None => next().g2()?,
+        let mut b_g2 = if on_gpu {
+            next().g2()?
+        } else {
+            G2Projective::default()
         };
+        if let Some(cpu) = cpu_b_g2 {
+            let (sum, start, done) = cpu
+                .thread
+                .join()
+                .unwrap_or_else(|e| std::panic::resume_unwind(e));
+            b_g2 += sum;
+            if let BG2::Cpu {
+                tail: Some(tail), ..
+            } = &self.b_g2
+            {
+                tail.steer(self.pk.n_vars, start, done, gpu_done);
+            }
+        }
         let b_g1 = next().g1()?;
         let l_g1 = next().g1()?;
         Ok((a_g1, b_g2, b_g1, l_g1))
@@ -597,7 +635,7 @@ impl MetalCircuit {
 
             // One command buffer for all of them. Order matches the stage numbering,
             // and `msm_batch` returns results in job order.
-            let mut jobs = self.witness_jobs(&w);
+            let mut jobs = self.witness_jobs(&w, gpu_share(&cpu_b_g2));
             jobs.push(self.h_job(&h_scalars));
             let mut out = self.msm.msm_batch(&jobs)?;
             let h_g1 = out
@@ -632,10 +670,11 @@ impl MetalCircuit {
         witness: &[Fr],
         t: &mut StageTimings,
         w: std::thread::ScopedJoinHandle<'s, Result<ScalarBuf, ProveError>>,
-        cpu_b_g2: Option<std::thread::ScopedJoinHandle<'s, G2Projective>>,
+        cpu_b_g2: Option<CpuG2<'s>>,
     ) -> Result<MsmOutputs, ProveError> {
         let start = Instant::now();
         let h_us = t.gather_us + t.ntt_us;
+        let g2_share = gpu_share(&cpu_b_g2);
 
         let mut upload = Some(w);
         let mut w = None;
@@ -663,7 +702,7 @@ impl MetalCircuit {
                 };
                 let batch = (|| {
                     let h_scalars = self.h_scalars(h)?;
-                    let mut jobs = self.witness_jobs(w);
+                    let mut jobs = self.witness_jobs(w, g2_share);
                     jobs.push(self.h_job(&h_scalars));
                     self.msm.msm_batch_behind(&jobs, queue, wait_h)
                 })();
@@ -751,10 +790,18 @@ impl MetalCircuit {
 
 /// The witness upload and stage 6's thread, when [`MetalCircuit::h_and_msms`] started
 /// them before `compute_h`.
-type WitnessAhead<'s> = (
-    ScalarBuf,
-    Option<std::thread::ScopedJoinHandle<'s, G2Projective>>,
-);
+type WitnessAhead<'s> = (ScalarBuf, Option<CpuG2<'s>>);
+
+/// Stage 6's thread on the CPU pool: its sum with when it started and finished, and
+/// how much of the end of the query it left to the GPU, see [`G2Tail`].
+struct CpuG2<'s> {
+    thread: std::thread::ScopedJoinHandle<'s, (G2Projective, Instant, Instant)>,
+    gpu_share: usize,
+}
+
+fn gpu_share(cpu_b_g2: &Option<CpuG2<'_>>) -> usize {
+    cpu_b_g2.as_ref().map_or(0, |cpu| cpu.gpu_share)
+}
 
 /// The smallest domain where [`MetalCircuit::h_and_msms`] splits the five-job batch to
 /// overlap the witness MSMs with the transforms. See [`overlap_pays`].
@@ -792,12 +839,111 @@ fn overlap_pays(domain_size: usize) -> bool {
 /// Where stage 6, B in G2, runs for one key.
 enum BG2 {
     Gpu(G2Bases),
-    /// The key's host bases, for [`CpuMsm`] on a pool of its own.
+    /// The key's host bases, for [`CpuMsm`] on a pool of its own, and the end of them
+    /// on the device where the two share the stage.
     Cpu {
         bases: Vec<G2Affine>,
         pool: rayon::ThreadPool,
+        tail: Option<G2Tail>,
     },
 }
+
+/// The end of the B query on the device as well as on the host, so that the GPU can
+/// take a share of stage 6 off the pool.
+///
+/// Where the batch is split (see [`overlap_pays`]) a dense witness leaves the proof
+/// waiting on the pool with the GPU done: js_16x16_d32's pool finished at 68.0 ms and
+/// the GPU's last buffer at 60.3. A G2 job over the last tenth of the query cost the
+/// GPU 6.4 ms and took 5.4 off the pool, and over the last fifth 10.9 and 9.4, so the
+/// two meet near a tenth. That is the witness's number and the machine's, not the
+/// key's: railgun-13x01's pool is done 14 ms before its GPU, and the same tenth pinned
+/// there read 60.5 ms against 54.3, and 33.4 against 32.1 on rsa2048. So no share is
+/// built in. Every proof starts the pool on what the last ones left it, and
+/// [`Self::steer`] moves the split by how far apart the two finished. keccak256,
+/// rsa2048, railgun-13x01 and anon-aadhaar, where the GPU finishes last, stay at none
+/// and prove as they did.
+///
+/// The price is a quarter of the query held twice, 128 bytes a base: 4.5 MB on
+/// js_16x16_d32. Variable work only, since the share follows the witness.
+/// `G16_METAL_G2_SHARE` pins it, in thousandths of the query, for re-measuring.
+struct G2Tail {
+    bases: G2Bases,
+    /// How many of them the next proof gives the GPU.
+    share: AtomicUsize,
+    /// The share [`Self::steer`] is at, before rounding; `None` when
+    /// `G16_METAL_G2_SHARE` pins the share.
+    aim: Option<Mutex<f64>>,
+}
+
+impl G2Tail {
+    fn new(msm: &MetalMsm, v: &[G2Affine]) -> Result<Option<Self>, ProveError> {
+        let pinned = std::env::var("G16_METAL_G2_SHARE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|permille| v.len() * permille.min(1000) / 1000);
+        let len = pinned.unwrap_or(v.len() / G2_TAIL_DIV);
+        if len == 0 {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            bases: msm.upload_g2_bases(&v[v.len() - len..])?,
+            share: AtomicUsize::new(pinned.unwrap_or(0)),
+            aim: pinned.is_none().then(|| Mutex::new(0.0)),
+        }))
+    }
+
+    fn share(&self) -> usize {
+        self.share.load(Ordering::Relaxed)
+    }
+
+    /// Moves the share towards the one where the pool and the GPU finish together,
+    /// from one proof: the pool had its part of the `n_vars` from `start` to `done`,
+    /// and the GPU's last result was in hand at `gpu_done`.
+    ///
+    /// One proof says little. On a shared machine the two finished 8 ms apart either
+    /// way at an unchanged share, and a share set from each proof alone, or from the
+    /// median of four, swung between 2% and 15% of js_16x16_d32's query. So a proof
+    /// moves the aim by [`G2_STEER_GAIN`] of its lateness and by no more than
+    /// [`G2_STEER_CLAMP`] of it, and the share is the aim on a grid so that a proof's
+    /// plan is one of a few sizes.
+    fn steer(&self, n_vars: usize, start: Instant, done: Instant, gpu_done: Instant) {
+        let Some(aim) = &self.aim else {
+            return;
+        };
+        let cpu = done.duration_since(start).as_secs_f64();
+        if cpu <= 0.0 {
+            return;
+        }
+        let late = if done >= gpu_done {
+            done.duration_since(gpu_done).as_secs_f64()
+        } else {
+            -gpu_done.duration_since(done).as_secs_f64()
+        };
+        let mut aim = aim.lock().unwrap_or_else(|e| e.into_inner());
+        *aim = g2_aim(*aim, self.bases.len(), n_vars, late / cpu);
+        let grid = (self.bases.len() / G2_SHARE_GRID).max(1);
+        let share = (*aim / grid as f64).round() as usize * grid;
+        self.share
+            .store(share.min(self.bases.len()), Ordering::Relaxed);
+    }
+}
+
+/// Where [`G2Tail::steer`] aims after a proof at `aim` of a tail of `len`, in bases:
+/// `late` is how long after the GPU's last result the pool finished, over how long the
+/// pool ran.
+fn g2_aim(aim: f64, len: usize, n_vars: usize, late: f64) -> f64 {
+    let late = late.clamp(-G2_STEER_CLAMP, G2_STEER_CLAMP);
+    (aim + G2_STEER_GAIN * n_vars as f64 * late).clamp(0.0, len as f64)
+}
+
+/// The part of the B query a [`G2Tail`] holds, and so the most the GPU can take.
+const G2_TAIL_DIV: usize = 4;
+/// Steps of the share across a [`G2Tail`].
+const G2_SHARE_GRID: usize = 32;
+/// How much of the query one proof moves the aim by, per unit of [`g2_aim`]'s `late`.
+const G2_STEER_GAIN: f64 = 0.2;
+/// The most `late` one proof is taken at, either way.
+const G2_STEER_CLAMP: f64 = 0.15;
 
 impl BG2 {
     /// Where stage 6 runs for this key, see [`g2_on_cpu`], with the bases put there.
@@ -813,7 +959,16 @@ impl BG2 {
                 .thread_name(|i| format!("metal-g2-{i}"))
                 .build()
                 .map_err(|e| bad(format!("stage 6 thread pool: {e}")))?;
-            Ok(BG2::Cpu { bases: v, pool })
+            let tail = if work == Work::Variable && overlap_pays(domain_size) {
+                G2Tail::new(msm, &v)?
+            } else {
+                None
+            };
+            Ok(BG2::Cpu {
+                bases: v,
+                pool,
+                tail,
+            })
         } else {
             let bases = msm.upload_g2_bases(&v);
             snarkrs_groth16::malloc::release(v);
@@ -964,9 +1119,10 @@ impl PreparedCircuit for MetalCircuit {
         let mut compute_h_us = 0u64;
         let (h_out, wit_out) = std::thread::scope(|s| {
             let cpu_b_g2 = self.b_g2_on_cpu(s, witness);
-            let wit = s.spawn(|| {
+            let g2_share = gpu_share(&cpu_b_g2);
+            let wit = s.spawn(move || {
                 let w = self.msm.upload_scalars_with(witness, self.work)?;
-                self.msm.msm_batch(&self.witness_jobs(&w))
+                self.msm.msm_batch(&self.witness_jobs(&w, g2_share))
             });
             let h_out = (|| {
                 let t0 = Instant::now();
@@ -1270,6 +1426,70 @@ mod tests {
                 assert!(handle.lend_entries().is_some(), "{name}: never given back");
             },
         );
+    }
+
+    /// Stage 6 is the same point whatever share of the query the GPU took: none of it,
+    /// one base, all but one, all of it. The tail here is the whole query, pinned, on
+    /// every artifact, so the three submission shapes all carry the job: the split
+    /// batches, the batch behind the transforms and the trait's own `msms`.
+    #[test]
+    fn a_g2_share_gives_the_same_point() {
+        let backend = MetalBackend::new().unwrap();
+        for_each("a_g2_share_gives_the_same_point", |name, dir| {
+            let pk = ProvingKey::load(&dir.join("circuit.zkey")).unwrap();
+            let witness = Witness::load(&dir.join("circuit.wtns")).unwrap().0;
+            let mut circuit = MetalCircuit::new(
+                backend.stages.clone(),
+                backend.msm.clone(),
+                pk,
+                Work::Variable,
+            )
+            .unwrap();
+            let BG2::Cpu { bases, tail, .. } = &mut circuit.b_g2 else {
+                panic!("{name}: stage 6 is not on the pool");
+            };
+            let n = bases.len();
+            let want = CpuMsm::new().msm_g2(bases, &witness);
+            *tail = Some(G2Tail {
+                bases: backend.msm.upload_g2_bases(bases).unwrap(),
+                share: AtomicUsize::new(0),
+                aim: None,
+            });
+            let mut shares = vec![0, 1, 2, n / 7, n / 2, n - 1, n];
+            shares.retain(|&share| share <= n);
+            shares.dedup();
+            for share in shares {
+                let BG2::Cpu {
+                    tail: Some(tail), ..
+                } = &circuit.b_g2
+                else {
+                    unreachable!("set above");
+                };
+                tail.share.store(share, Ordering::Relaxed);
+                let mut t = StageTimings::default();
+                let out = circuit.h_and_msms(&witness, &mut t).unwrap();
+                assert_eq!(out.b_g2, want, "{name}: share {share} of {n}, h_and_msms");
+                let h = circuit.compute_h(&witness, &mut t).unwrap();
+                let out = circuit.msms(&witness, &h, &mut t).unwrap();
+                assert_eq!(out.b_g2, want, "{name}: share {share} of {n}, msms");
+            }
+        });
+    }
+
+    /// The steering moves towards whichever of the two finished last, by a bounded
+    /// step, and stays inside the tail.
+    #[test]
+    fn the_g2_share_is_steered_towards_the_later_finisher() {
+        let (len, n) = (250, 1000);
+        assert_eq!(g2_aim(0.0, len, n, 0.0), 0.0);
+        assert_eq!(g2_aim(0.0, len, n, 0.1), G2_STEER_GAIN * 100.0);
+        assert_eq!(g2_aim(50.0, len, n, -0.1), 50.0 - G2_STEER_GAIN * 100.0);
+        // One proof that another process held up moves it no further than this.
+        let most = G2_STEER_GAIN * 1000.0 * G2_STEER_CLAMP;
+        assert_eq!(g2_aim(0.0, len, n, 5.0), most);
+        assert_eq!(g2_aim(100.0, len, n, -5.0), 100.0 - most);
+        assert_eq!(g2_aim(1.0, len, n, -0.1), 0.0);
+        assert_eq!(g2_aim(249.0, len, n, 0.1), 250.0);
     }
 
     /// Zero blinders remove the masking, so the H evaluations are the only thing between
