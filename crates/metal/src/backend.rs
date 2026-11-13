@@ -677,47 +677,18 @@ impl MetalCircuit {
         let g2_share = gpu_share(&cpu_b_g2);
 
         let mut upload = Some(w);
-        let mut w = None;
-        let mut out = None;
-        // A refusal that is not the device's is not `with_retry`'s to repeat.
-        let mut refused = None;
-        self.resident.compute_h_ahead_of(
-            &self.stages,
-            witness,
-            self.work,
-            t,
-            &mut |queue, h, wait_h| {
-                // Joined here and not before, so the transforms are not held for it.
-                if let Some(upload) = upload.take() {
-                    match upload
-                        .join()
-                        .unwrap_or_else(|e| std::panic::resume_unwind(e))
-                    {
-                        Ok(buf) => w = Some(buf),
-                        Err(e) => refused = Some(e),
-                    }
-                }
-                let Some(w) = &w else {
-                    return Ok(());
-                };
-                let batch = (|| {
-                    let h_scalars = self.h_scalars(h)?;
-                    let mut jobs = self.witness_jobs(w, g2_share);
-                    jobs.push(self.h_job(&h_scalars));
-                    self.msm.msm_batch_behind(&jobs, queue, wait_h)
-                })();
-                match batch {
-                    Ok(results) => out = Some(results),
-                    Err(e) if e.is_device_fault() => return Err(e),
-                    Err(e) => refused = Some(e),
-                }
-                Ok(())
-            },
-        )?;
-        if let Some(e) = refused {
-            return Err(e);
-        }
-        let mut out = out.ok_or_else(|| bad("the batch behind compute_h did not run"))?;
+        let w = std::cell::OnceCell::new();
+        let mut out = self.batch_behind_h(witness, t, &mut || {
+            // Joined here and not before, so the transforms are not held for it.
+            if let Some(upload) = upload.take() {
+                let buf = upload
+                    .join()
+                    .unwrap_or_else(|e| std::panic::resume_unwind(e))?;
+                let _ = w.set(buf);
+            }
+            let w = w.get().ok_or_else(|| bad("the witness upload failed"))?;
+            Ok(self.witness_jobs(w, g2_share))
+        })?;
         let h_g1 = out
             .pop()
             .ok_or_else(|| bad("msm_batch returned no results"))?
@@ -734,6 +705,51 @@ impl MetalCircuit {
             l_g1,
             h_g1,
         })
+    }
+
+    /// Stages 0 to 4 with one batch committed behind them, on their queue, before they
+    /// are waited on: `ahead`'s jobs and then stage 9's. Results in job order. `ahead`
+    /// runs on every attempt, and its error is the proof's, not retried.
+    fn batch_behind_h<'a>(
+        &'a self,
+        witness: &[Fr],
+        t: &mut StageTimings,
+        ahead: &mut dyn FnMut() -> Result<Vec<Job<'a>>, ProveError>,
+    ) -> Result<Vec<crate::msm::MsmResult>, ProveError> {
+        let mut out = None;
+        // A refusal that is not the device's is not `with_retry`'s to repeat.
+        let mut refused = None;
+        self.resident.compute_h_ahead_of(
+            &self.stages,
+            witness,
+            self.work,
+            t,
+            &mut |queue, h, wait_h| {
+                let jobs = match ahead() {
+                    Ok(jobs) => jobs,
+                    Err(e) => {
+                        refused.get_or_insert(e);
+                        return Ok(());
+                    }
+                };
+                let batch = (|| {
+                    let h_scalars = self.h_scalars(h)?;
+                    let mut jobs = jobs;
+                    jobs.push(self.h_job(&h_scalars));
+                    self.msm.msm_batch_behind(&jobs, queue, wait_h)
+                })();
+                match batch {
+                    Ok(results) => out = Some(results),
+                    Err(e) if e.is_device_fault() => return Err(e),
+                    Err(e) => refused = Some(e),
+                }
+                Ok(())
+            },
+        )?;
+        if let Some(e) = refused {
+            return Err(e);
+        }
+        out.ok_or_else(|| bad("the batch behind compute_h did not run"))
     }
 
     /// Stage 9's scalars. The normal path is the device buffer stage 4 wrote, which
@@ -1090,6 +1106,16 @@ impl PreparedCircuit for MetalCircuit {
     /// thread while the compute_h command buffers run, and the device interleaves the
     /// two. The H MSM then goes out as its own batch once `compute_h` has returned.
     ///
+    /// When the GPU has a share of stage 6 (see [`G2Tail`]) the H MSM goes out behind
+    /// the transforms instead, on their queue and before they are waited on, as
+    /// [`Self::msms_behind_h`]'s batch does. The pool holds every core by then, and
+    /// what the host does between stage 4 and the batch waited for one: on js_8x8_d32
+    /// the witness batch ended at 20.9 ms, H's started at 28.5, and the GPU was idle
+    /// between them. Without a share the first order stands. Behind the transforms the
+    /// device ran the witness batch last, and railgun-13x01, which waits on the GPU
+    /// and not the pool, read 53.1 ms against 52.7 with that batch's combine at its
+    /// end in place of H's.
+    ///
     /// Splitting the five-job batch is not free, and worse, its price is not fixed: the
     /// witness jobs lose their seat in the concurrent encoder beside H's accumulation,
     /// a second submission is paid, and the device arbitrates the two queues however it
@@ -1125,6 +1151,13 @@ impl PreparedCircuit for MetalCircuit {
                 self.msm.msm_batch(&self.witness_jobs(&w, g2_share))
             });
             let h_out = (|| {
+                if self.work == Work::Variable && g2_share > 0 {
+                    // Stage 9 goes out behind the transforms, as in `msms_behind_h`.
+                    let h_us = t.gather_us + t.ntt_us;
+                    let out = self.batch_behind_h(witness, t, &mut || Ok(Vec::new()))?;
+                    compute_h_us = t.gather_us + t.ntt_us - h_us;
+                    return Ok(out);
+                }
                 let t0 = Instant::now();
                 let h = self.compute_h(witness, t)?;
                 compute_h_us = t0.elapsed().as_micros() as u64;
