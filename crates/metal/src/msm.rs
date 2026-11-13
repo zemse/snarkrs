@@ -505,6 +505,7 @@ impl MetalMsm {
             scalars,
             scalar_off: 0,
             n,
+            plan_off: None,
         })])?;
         out[0].g2()
     }
@@ -570,7 +571,21 @@ impl MetalMsm {
             .iter()
             .map(|&(_, id, soff, n)| (id, soff, n))
             .collect();
-        for (&(sbuf, id, soff, n), start) in ranges.iter().zip(plan_starts(&keys)) {
+        for ((&(sbuf, id, soff, n), start), job) in ranges.iter().zip(plan_starts(&keys)).zip(jobs)
+        {
+            let start = match job {
+                Job::G2(JobG2 {
+                    plan_off: Some(lo), ..
+                }) => {
+                    if *lo > soff {
+                        return Err(err(format!(
+                            "digit pipeline offset {lo} is past the job's scalar offset {soff}"
+                        )));
+                    }
+                    *lo
+                }
+                _ => start,
+            };
             let key = (id, start, soff + n - start);
             let idx = match by_key.get(&key) {
                 Some(&i) => i,

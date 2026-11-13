@@ -777,6 +777,7 @@ fn a_suffix_sharing_the_wider_plan_matches_the_cpu() {
                         scalars: &s,
                         scalar_off: off,
                         n: n - off,
+                        plan_off: None,
                     }),
                 ])
                 .unwrap();
@@ -795,6 +796,45 @@ fn a_suffix_sharing_the_wider_plan_matches_the_cpu() {
                 want2,
                 "{label} {work:?}: G2"
             );
+        }
+    }
+}
+
+/// A G2 job over a suffix on a digit pipeline that starts before it, with no wider job
+/// in the batch to ride: the pipeline at the buffer's start, part of the way, and at
+/// the job itself, down to a job of one scalar, on every sparsity. A pipeline that
+/// starts past the job is refused.
+#[test]
+fn a_suffix_on_a_pipeline_of_its_own_matches_the_cpu() {
+    use snarkrs_msm::MsmBackend;
+    let m = MetalMsm::new().expect("Metal device");
+    let cpu = snarkrs_msm::CpuMsm::new();
+    let n = 3 * CLASSIFY_CHUNK + 7;
+    let (_, g2) = bases_with_infinity(n);
+    let b2 = m.upload_g2_bases(&g2).expect("upload bases");
+    for (label, scalars) in scalars_of_every_sparsity(n) {
+        let s = m.upload_scalars(&scalars).expect("upload scalars");
+        for off in [5, n / 2, n - 1] {
+            let job = |plan_off| {
+                m.msm_batch(&[Job::G2(JobG2 {
+                    bases: &b2,
+                    base_off: off,
+                    scalars: &s,
+                    scalar_off: off,
+                    n: n - off,
+                    plan_off,
+                })])
+            };
+            let want = cpu.msm_g2(&g2[off..], &scalars[off..]).into_affine();
+            for plan_off in [0, off / 2, off] {
+                let got = job(Some(plan_off)).unwrap();
+                assert_eq!(
+                    got[0].g2().unwrap().into_affine(),
+                    want,
+                    "{label}: {off}.. on a pipeline from {plan_off}"
+                );
+            }
+            assert!(job(Some(off + 1)).is_err(), "{label}: pipeline past {off}");
         }
     }
 }
@@ -987,6 +1027,7 @@ fn five_msms_against_cpu(name: &str) {
             scalars: &w_scalars,
             scalar_off: 0,
             n,
+            plan_off: None,
         }),
         Job::G1(JobG1 {
             bases: &b1_bases,
@@ -1139,6 +1180,7 @@ fn measure_against_cpu() {
                     scalars: &w_scalars,
                     scalar_off: 0,
                     n,
+                    plan_off: None,
                 }),
                 Job::G1(JobG1 {
                     bases: &b1_bases,
@@ -1246,6 +1288,7 @@ fn measure_per_msm() {
                     scalars: sbuf,
                     scalar_off: soff,
                     n: nn,
+                    plan_off: None,
                 })],
                 2 => vec![Job::G1(JobG1 {
                     bases: &l_bases,

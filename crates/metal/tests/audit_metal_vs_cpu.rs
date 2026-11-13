@@ -330,6 +330,7 @@ fn where_the_msm_time_actually_goes() {
                     scalars: &w,
                     scalar_off: 0,
                     n,
+                    plan_off: None,
                 }),
                 Job::G1(JobG1 {
                     bases: &b1,

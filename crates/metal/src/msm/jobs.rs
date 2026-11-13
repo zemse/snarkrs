@@ -23,6 +23,12 @@ pub struct JobG2<'a> {
     pub scalars: &'a ScalarBuf,
     pub scalar_off: usize,
     pub n: usize,
+    /// Where the digit pipeline this job rides starts, when that is before
+    /// `scalar_off`. The job skips the scalars between the two, as one sharing a wider
+    /// job's pipeline does (see `plan::SHARE_MAX_SKIP`), and its scratch is sized by
+    /// the pipeline's range and not its own, so a job whose length changes from one
+    /// batch to the next asks the pool for the same buffers every time.
+    pub plan_off: Option<usize>,
 }
 
 pub enum Job<'a> {

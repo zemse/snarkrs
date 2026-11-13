@@ -30,10 +30,15 @@ impl Pool {
         let bytes = crate::alloc::bytes(factors)?.max(4);
         let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
         // Smallest buffer that fits, so a single huge allocation cannot be handed out
-        // for every small request and then be unavailable for the one that needs it.
+        // for every small request and then be unavailable for the one that needs it,
+        // and none that would be more than a fifth unused, for the same reason one
+        // size down: the first batch with a G2 job beside G1 ones the pool already had
+        // buffers for put its 3.4 MB buckets in a 5.5 MB spill buffer, the spill in a
+        // 10.5 MB bucket buffer, and so on up, and the pool grew by 32 MB where the
+        // job's own scratch is 7 (js_16x16_d32), 240 MB at 2^22.
         let mut best: Option<usize> = None;
         for (i, b) in free.iter().enumerate() {
-            if b.length() >= bytes {
+            if b.length() >= bytes && b.length() - bytes <= bytes / 4 {
                 match best {
                     Some(j) if free[j].length() <= b.length() => {}
                     _ => best = Some(i),

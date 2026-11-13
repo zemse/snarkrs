@@ -637,6 +637,7 @@ fn constant_work_phase_occupancy() {
                     scalars: &s,
                     scalar_off: 0,
                     n,
+                    plan_off: None,
                 })
             };
             let mut plan = Plan::new(&s, 0, n);
@@ -768,6 +769,7 @@ fn constant_work_phase_flatness() {
                         scalars: s,
                         scalar_off: 0,
                         n,
+                        plan_off: None,
                     })
                 }
             })

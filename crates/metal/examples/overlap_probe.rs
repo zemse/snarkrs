@@ -56,6 +56,7 @@ mod probe {
                 scalars: w,
                 scalar_off: 0,
                 n: pk.n_vars,
+                plan_off: None,
             }),
             Job::G1(JobG1 {
                 bases: &bases.b_g1,

@@ -500,6 +500,7 @@ impl MetalCircuit {
                 scalars: w,
                 scalar_off: 0,
                 n: self.pk.n_vars,
+                plan_off: None,
             })),
             BG2::Cpu {
                 tail: Some(tail), ..
@@ -509,6 +510,8 @@ impl MetalCircuit {
                 scalars: w,
                 scalar_off: self.pk.n_vars - g2_share,
                 n: g2_share,
+                // The whole tail's, whatever the share: see `JobG2::plan_off`.
+                plan_off: Some(self.pk.n_vars - tail.bases.len()),
             })),
             BG2::Cpu { .. } => {}
         }
@@ -876,16 +879,19 @@ enum BG2 {
 /// there read 60.5 ms against 54.3, and 33.4 against 32.1 on rsa2048. So no share is
 /// built in. Every proof starts the pool on what the last ones left it, and
 /// [`Self::steer`] moves the split by how far apart the two finished. keccak256,
-/// rsa2048, railgun-13x01 and anon-aadhaar, where the GPU finishes last, stay at none
-/// and prove as they did.
+/// rsa2048 and railgun-13x01, where the GPU finishes last, stay at none and prove as
+/// they did.
 ///
-/// The price is memory. A quarter of the query is held twice, 128 bytes a base (4.5 MB
-/// on js_16x16_d32, 35 on anon-aadhaar), and a proof with a share has the G2 job's
-/// scratch beside the other four's. Peak footprint over 30 warm proofs: js_16x16_d32
-/// 322 to 326 MB without the tail, 334 with a tenth pinned and 356 to 368 steered,
-/// where what the batch asks the scratch pool for changes with the share; js_8x8_d32
-/// 193 to 216, keccak256 254 to 262, anon-aadhaar 1,473 to 1,507. Variable work only,
-/// since the share follows the witness.
+/// The price is memory, and it sets the tail's size. An eighth of the query is held
+/// twice, 128 bytes a base, and a proof with a share has the G2 job's scratch beside
+/// the other four's, sized by the tail whatever the share (see `JobG2::plan_off`):
+/// peak footprint over 30 warm proofs 322 to 327 MB to 336 to 340 on js_16x16_d32 and
+/// 189 to 196 to 202 to 203 on js_8x8_d32. A quarter of the query, with scratch that
+/// followed the share, read 356 to 368 and 216, and 5.55 GB against 4.67 on
+/// js_384x384_d32. There the pool is later still and the share wants over a fifth of
+/// the query, but a twentieth already cost 141 to 148 MB for 2 to 6% of the proof, so
+/// from [`G2_TAIL_MAX_DOMAIN`] up there is no tail. Variable work only, since the
+/// share follows the witness.
 /// `G16_METAL_G2_SHARE` pins it, in thousandths of the query, for re-measuring.
 struct G2Tail {
     bases: G2Bases,
@@ -958,7 +964,9 @@ fn g2_aim(aim: f64, len: usize, n_vars: usize, late: f64) -> f64 {
 }
 
 /// The part of the B query a [`G2Tail`] holds, and so the most the GPU can take.
-const G2_TAIL_DIV: usize = 4;
+const G2_TAIL_DIV: usize = 8;
+/// The domain from which a key gets no [`G2Tail`].
+const G2_TAIL_MAX_DOMAIN: usize = 1 << 20;
 /// Steps of the share across a [`G2Tail`].
 const G2_SHARE_GRID: usize = 32;
 /// How much of the query one proof moves the aim by, per unit of [`g2_aim`]'s `late`.
@@ -980,7 +988,10 @@ impl BG2 {
                 .thread_name(|i| format!("metal-g2-{i}"))
                 .build()
                 .map_err(|e| bad(format!("stage 6 thread pool: {e}")))?;
-            let tail = if work == Work::Variable && overlap_pays(domain_size) {
+            let tail = if work == Work::Variable
+                && overlap_pays(domain_size)
+                && domain_size < G2_TAIL_MAX_DOMAIN
+            {
                 G2Tail::new(msm, &v)?
             } else {
                 None

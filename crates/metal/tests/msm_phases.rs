@@ -101,6 +101,7 @@ fn msm_stage_intercept() {
                         scalars: &s,
                         scalar_off: 0,
                         n,
+                        plan_off: None,
                     }),
                     Job::G1(JobG1 {
                         bases: &b1,
