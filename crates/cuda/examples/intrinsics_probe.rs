@@ -307,7 +307,7 @@ fn verify_g2(words: &[u32], expected: G2Affine, n: usize) -> Result<()> {
     if coords.len() != n * 4 {
         return Err("G2 output length".into());
     }
-    for (i, p) in coords.chunks_exact(4).enumerate() {
+    for (i, p) in coords.as_chunks::<4>().0.iter().enumerate() {
         if p.iter().any(|v| !v.reduced()) {
             return Err(format!("noncanonical G2 coordinate at {i}").into());
         }
@@ -425,7 +425,13 @@ fn fq(cuda: &Cuda, c: &Config) -> Result<()> {
                 })?
             };
             let got = cuda.stream().clone_dtoh(&output)?;
-            if got.len() != n * 8 || got.chunks_exact(8).any(|w| w != as_words(&[expected])) {
+            if got.len() != n * 8
+                || got
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .any(|w| w != as_words(&[expected]))
+            {
                 return Err("Fq oracle mismatch".into());
             }
             Ok(sample)
