@@ -27,8 +27,11 @@
 //!   so the first-touch page faults had to be paid once rather than per proof. `cudarc`'s
 //!   `CudaStream::alloc` calls `cuMemAllocAsync` where the driver supports it, which is the
 //!   driver's own stream-ordered memory pool: the second proof's allocation is served out
-//!   of the first proof's freed blocks with no trip to the OS. Reimplementing that in Rust
-//!   would be slower and would add a way to hand a live buffer to a second proof.
+//!   of the first proof's freed blocks with no trip to the OS. That holds only because
+//!   `context::keep_pool` raises the pool's release threshold. At the driver's default of
+//!   zero the pool unmaps every free block at the next synchronize, which is the next
+//!   proof's wait for H, and the MSM then maps its scratch again. Reimplementing the pool
+//!   in Rust would be slower and would add a way to hand a live buffer to a second proof.
 //! * `MsmParams` reaches the kernel by value through the parameter space, so there is no
 //!   buffer index to keep in sync with the kernel's `[[buffer(n)]]` attributes and none of
 //!   that class of mistake is expressible.
@@ -91,7 +94,7 @@ use snarkrs_gpu_layout::{
 use snarkrs_groth16::{HPoly, MsmOutputs, ProveError, StageTimings};
 
 use crate::context::{
-    bad, drv, elapsed_us, memory_trace_enabled, plan_lock, trace_memory, upload_words,
+    bad, drv, elapsed_us, memory_trace_enabled, plan_lock, pool_bytes, trace_memory, upload_words,
 };
 use crate::stages::{HHandle, Staging, TAG};
 use crate::{as_words, from_words, kernels, Cuda};
@@ -807,26 +810,32 @@ fn budget_bytes(free: u64, limit: Option<u64>, reserve: u64) -> u64 {
     limit.map_or(budget, |l| l.min(budget))
 }
 
-/// Bytes an allocation may take now: the free device memory less [`VRAM_HEADROOM`] and
-/// `G16_CUDA_VRAM_RESERVE`, capped by `limit`. Preparation, stage scratch and MSMs ask here.
+/// Bytes an allocation may take now: the free device memory and what the pool holds idle,
+/// less [`VRAM_HEADROOM`] and `G16_CUDA_VRAM_RESERVE`, capped by `limit`. Preparation,
+/// stage scratch and MSMs ask here.
 pub(crate) fn device_budget(
     ctx: &CudaContext,
     stream: &CudaStream,
     limit: Option<u64>,
 ) -> Result<u64, ProveError> {
     let reserve = env_vram_reserve()?;
-    // A dropped buffer is a `cuMemFreeAsync`, and the pool gives its pages back only at
-    // a synchronize; without one the last batch's scratch still reads as in use.
+    // A dropped buffer is a `cuMemFreeAsync`, which the pool counts idle only once the
+    // stream reaches it; without a synchronize the last batch's scratch still reads as in
+    // use.
     stream
         .synchronize()
         .map_err(|e| drv("synchronize before the memory query", e))?;
     let (free, total) = ctx
         .mem_get_info()
         .map_err(|e| drv("query device memory", e))?;
-    let budget = budget_bytes(free as u64, limit, reserve);
+    // What the pool holds idle is not free to the driver's count, and is to an allocation
+    // here: the last proof's scratch, which the next one is about to take again.
+    let (reserved, used) = pool_bytes(ctx).map_err(|e| drv("query the memory pool", e))?;
+    let idle = reserved.saturating_sub(used);
+    let budget = budget_bytes((free as u64).saturating_add(idle), limit, reserve);
     if memory_trace_enabled() {
         eprintln!(
-            "cuda memory budget: free {free}, total {total}, reserve {reserve}, limit {limit:?}, available {budget} bytes"
+            "cuda memory budget: free {free}, pool idle {idle}, total {total}, reserve {reserve}, limit {limit:?}, available {budget} bytes"
         );
     }
     Ok(budget)

@@ -61,7 +61,7 @@ use snarkrs_field::{Field, Fr};
 use snarkrs_formats::{Coefficients, HBasis, ProvingKey};
 use snarkrs_groth16::{Backend, HPoly, MsmOutputs, PreparedCircuit, ProveError, StageTimings};
 
-use crate::context::{bad, drv, memory_trace_enabled, plan_lock, trace_memory, Cuda};
+use crate::context::{bad, drv, memory_trace_enabled, plan_lock, trace_memory, Cuda, PoolTrim};
 use crate::msm::{device_budget, too_big, CudaMsm, Work};
 use crate::stages::{CudaStages, HHandle, TAG};
 
@@ -312,6 +312,9 @@ pub struct CudaCircuit {
     /// Points an MSM run of [`PreparedCircuit::h_and_msms_from_rows`] covers at most, see
     /// [`CudaMsm`]'s `msms_resident`.
     msm_chunk: usize,
+    /// Last, so it drops after the buffers above. `None` from [`Self::from_parts`], whose
+    /// context never set the pool to keep anything.
+    _trim: Option<PoolTrim>,
 }
 
 /// [`CudaCircuit`]'s MSM run on the rows path: 2^22 points, so the largest batch's scratch
@@ -440,12 +443,14 @@ impl CudaCircuit {
             );
         }
 
+        let trim = PoolTrim(msm.stream().clone());
         Ok(Self {
             pk,
             stages,
             msm,
             cost,
             msm_chunk: MSM_CHUNK,
+            _trim: Some(trim),
         })
     }
 
@@ -465,6 +470,7 @@ impl CudaCircuit {
             msm,
             cost,
             msm_chunk,
+            _trim: None,
         }
     }
 
@@ -689,6 +695,7 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::pool_bytes;
     use snarkrs_formats::Matrix;
 
     /// `G16_ARTIFACTS` first: CARGO_MANIFEST_DIR is baked in at compile time and does not
@@ -761,6 +768,41 @@ mod tests {
             Ok(_) => panic!("allocated {scratch} bytes of scratch under a limit one less"),
         }
         assert_eq!(free_now(backend.cuda()), before, "the refusal allocated");
+    }
+
+    /// The pool and the budget are where a proof found them once it is done, and the pool
+    /// is back to what it held once the circuit is dropped, with no synchronize after.
+    #[test]
+    #[ignore = "requires a CUDA device and tiny_mul/circuit.zkey under G16_ARTIFACTS or bench/artifacts"]
+    fn a_dropped_circuit_leaves_nothing_in_the_pool() {
+        let backend = CudaBackend::new().expect("CUDA device");
+        let (ctx, stream) = (backend.cuda().context(), backend.cuda().stream());
+        let budget = || device_budget(ctx, stream, None).unwrap();
+        drop(PoolTrim(stream.clone()));
+        let pool_before = pool_bytes(ctx).unwrap();
+
+        let pk = ProvingKey::load(&tiny_mul_zkey()).expect("tiny_mul key");
+        let witness: Vec<Fr> = (0..pk.n_vars as u64).map(Fr::from).collect();
+        let circuit = backend.prepare_circuit(pk).unwrap();
+        let prove = || {
+            let mut t = StageTimings::default();
+            let h = circuit.compute_h(&witness, &mut t).unwrap();
+            circuit.msms(&witness, &h, &mut t).unwrap();
+        };
+        // The first proof also takes what the driver sets up outside the pool on a
+        // kernel's first launch.
+        prove();
+        let idle = (budget(), free_now(backend.cuda()));
+        prove();
+        assert_eq!(free_now(backend.cuda()), idle.1, "a proof moved the pool");
+        assert_eq!(budget(), idle.0, "idle scratch left the budget");
+
+        drop(circuit);
+        assert_eq!(
+            pool_bytes(ctx).unwrap(),
+            pool_before,
+            "the drop left blocks"
+        );
     }
 
     #[test]

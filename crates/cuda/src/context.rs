@@ -9,7 +9,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
-use cudarc::driver::sys::{CUctx_flags, CUresult};
+use cudarc::driver::sys::{self, CUctx_flags, CUresult};
 use cudarc::driver::{
     CudaContext, CudaEvent, CudaFunction, CudaModule, CudaSlice, CudaStream, DriverError,
 };
@@ -264,6 +264,10 @@ impl Cuda {
             unsafe { ctx.disable_event_tracking() };
             ctx.new_stream()?
         } else {
+            // Not on a private stream: the pool is the device's, one a process, and there
+            // it is the other tenant's too. A hint, so a driver that refuses it is not an
+            // error.
+            let _ = keep_pool(&ctx);
             ctx.default_stream()
         };
         let cc = ctx.compute_capability()?;
@@ -562,9 +566,90 @@ pub(crate) fn trace_memory(
     if memory_trace_enabled() {
         stream.synchronize()?;
         let (free, total) = ctx.mem_get_info()?;
-        eprintln!("cuda memory {phase}: free {free}, total {total} bytes");
+        let (reserved, used) = pool_bytes(ctx)?;
+        eprintln!(
+            "cuda memory {phase}: free {free}, total {total} bytes, pool reserved {reserved}, \
+             used {used}"
+        );
     }
     Ok(())
+}
+
+/// The pool `cuMemAllocAsync` serves this device's buffers from, which is where every
+/// `CudaStream::alloc` here goes. `None` on a driver without one, where `cudarc` falls
+/// back to `cuMemAlloc` and nothing is retained.
+fn pool(ctx: &CudaContext) -> Result<Option<sys::CUmemoryPool>, DriverError> {
+    if !ctx.has_async_alloc() {
+        return Ok(None);
+    }
+    ctx.bind_to_thread()?;
+    let mut pool = std::mem::MaybeUninit::uninit();
+    // SAFETY: the device is this context's own and `pool` is written before it is read.
+    unsafe {
+        sys::cuDeviceGetMemPool(pool.as_mut_ptr(), ctx.cu_device()).result()?;
+        Ok(Some(pool.assume_init()))
+    }
+}
+
+/// Keeps freed buffers in the pool across a synchronize. The default release threshold is
+/// zero, under which the pool unmaps every free block at the next synchronize: a proof's
+/// MSM scratch, freed at its end, was unmapped inside the next proof's wait for H and
+/// mapped again for its MSMs, 5.3 ms a proof at 2^18 on a T4. The threshold counts what
+/// the pool holds in use as well, the resident keys included, so no finite one keeps the
+/// scratch of a key larger than itself; `u64::MAX` is the driver's own spelling of "never
+/// shrink at a synchronize". What bounds the pool instead is [`PoolTrim`] and the driver,
+/// which releases idle blocks itself before it fails an allocation.
+fn keep_pool(ctx: &CudaContext) -> Result<(), DriverError> {
+    let Some(pool) = pool(ctx)? else {
+        return Ok(());
+    };
+    let mut keep = u64::MAX;
+    // SAFETY: the attribute is a `cuuint64_t`, which `keep` is.
+    unsafe {
+        sys::cuMemPoolSetAttribute(
+            pool,
+            sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+            (&raw mut keep).cast(),
+        )
+        .result()
+    }
+}
+
+/// Bytes the pool holds from the device, and bytes of those in live buffers. Both zero
+/// without a pool.
+pub(crate) fn pool_bytes(ctx: &CudaContext) -> Result<(u64, u64), DriverError> {
+    let Some(pool) = pool(ctx)? else {
+        return Ok((0, 0));
+    };
+    let read = |attr| {
+        let mut bytes = 0u64;
+        // SAFETY: both attributes read here are a `cuuint64_t`, which `bytes` is.
+        unsafe { sys::cuMemPoolGetAttribute(pool, attr, (&raw mut bytes).cast()).result()? };
+        Ok(bytes)
+    };
+    Ok((
+        read(sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT)?,
+        read(sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_CURRENT)?,
+    ))
+}
+
+/// Gives the pool's idle blocks back to the device when dropped. Declared last in what
+/// owns a key's device buffers, so their frees are queued by then: under [`keep_pool`] no
+/// synchronize returns them, and a dropped key would otherwise stay mapped until the
+/// process ends.
+pub(crate) struct PoolTrim(pub(crate) Arc<CudaStream>);
+
+impl Drop for PoolTrim {
+    /// A free is stream ordered, so the pool counts a buffer idle only once the stream has
+    /// drained. A failure here leaves memory mapped and nothing wrong.
+    fn drop(&mut self) {
+        let _ = self.0.synchronize();
+        if let Ok(Some(pool)) = pool(self.0.context()) {
+            // SAFETY: the pool is the device's current one. Blocks backing a live buffer
+            // are not released, whoever owns it.
+            let _ = unsafe { sys::cuMemPoolTrimTo(pool, 0) };
+        }
+    }
 }
 
 /// `G16_CUDA_SYNC=spin|yield|blocking`: how a host thread waits in a synchronize, as the
