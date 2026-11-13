@@ -17,18 +17,18 @@
 //!
 //! On the device: bucket accumulation over fixed-length slices, the spill merge, the
 //! per-window reduction and the sum of the bases whose scalar is 1. On the host: the Horner
-//! combination of `n_windows` points and the sum of at most 64 `ones` partials, so
-//! `n_windows - 1 + ones_groups` additions, at most 148 against tens of millions on the
-//! device. It is where ZPrize, heliax and `snarkrs-metal` all independently left the window tail,
-//! for the same reason: compiling a shader containing `add_points` at the tail costs more
-//! than the readback plus the additions.
+//! combination of `n_windows` points and the sum of at most 218 `ones` partials
+//! ([`ones_groups_for`]), so `n_windows - 1 + ones_groups` additions, at most 302 against
+//! tens of millions on the device. It is where ZPrize, heliax and `snarkrs-metal` all
+//! independently left the window tail, for the same reason: compiling a shader containing
+//! `add_points` at the tail costs more than the readback plus the additions.
 //!
 //! # One readback, and G2's 256-byte point makes it free
 //!
 //! `msm_reduce_*` writes `n_windows` points and `msm_ones_*` writes `ones_groups` points, and
 //! both go into **one** buffer, so the whole result of an MSM is one `copy_buffer_to_buffer`
 //! and one `mapAsync`. One MSM is therefore `n_windows * reduce_groups + ones_groups` points,
-//! and at most [`SUB_MSM_READBACK_G1`] or [`SUB_MSM_READBACK_G2`] bytes: 144 KiB for a proof
+//! and at most [`SUB_MSM_READBACK_G1`] or [`SUB_MSM_READBACK_G2`] bytes: 237 KiB for a proof
 //! whose five MSMs are one sub-MSM each. Design §3's 64 KiB per-proof budget does not hold
 //! and is not the bound;
 //! `tests/proof.rs::a_whole_proof_submits_once_for_h_then_per_msm_slab_and_the_readback_is_bounded`
@@ -144,7 +144,8 @@ const MERGE_FILL: f64 = 2000.0;
 /// 13 (16, four groups a window) and 18.9 at 16 (64, eight groups), 3.3 times each over G2.
 const REDUCE_STEPS_PER_BUCKET: f64 = 3.1;
 
-/// Chain steps of the `ones` pass: 0.6 to 0.8 ms over G1 and 1.9 to 2.7 over G2.
+/// Chain steps of the `ones` pass: 0.6 to 0.8 ms over G1 and 1.9 to 2.7 over G2 on a
+/// witness with few ones. The same at every width, so it moves no choice of one.
 const ONES_STEPS: f64 = 8.0;
 
 /// Estimated microseconds of one job's point stage over `m` general scalars at window
@@ -195,19 +196,47 @@ pub fn stage_us(curve: wgsl::Curve, m: usize, c: u32) -> f64 {
     f64::from(curve.step_us) * (accumulate + merge + reduce + ONES_STEPS)
 }
 
-/// Workgroups in `msm_ones_*`: enough that a 2^18-long witness gives each thread about sixty
-/// scalars to scan, few enough that the host adds a few dozen points.
+/// Scalars a thread of `msm_ones_*` scans on a range short enough to leave the device
+/// threads to spare. Its chain is the ones among them and then the six additions of the
+/// workgroup's tree, so fewer shorten nothing that shows and every group is a point the
+/// host adds: `sha256` (59,170 wires, 42% ones) proves in 63.1 ms at 64, 47.7 at 16, 45.2
+/// at 8 and 44.8 at 4, Chrome 157 on an M2 Max.
+const ONES_SCAN: u32 = 8;
+
+/// Workgroups in `msm_ones_*`: [`ONES_SCAN`] scalars a thread until the pass has
+/// [`wgsl::Curve::fill`] threads, and then as many as the range leaves each.
 ///
-/// Capped at 64 because every group is a point in the readback and a point the host adds
-/// serially, and floored at 1 because a dispatch of zero workgroups writes nothing and the
-/// host would then read a stale slot. Zero under [`Work::Constant`], whose digit kernels
-/// recode a 1 like any other scalar: the pass is not dispatched, has no window in the
-/// results buffer and is never read.
-fn ones_groups_for(n: u32, tg: u32, work: Work) -> u32 {
-    match work {
-        Work::Constant => 0,
-        Work::Variable => n.div_ceil(tg * 64).clamp(1, 64),
+/// The pass is latency bound like the other four, and its chain is the ones a thread
+/// meets: at 64 scalars a thread and 64 groups a bit-heavy witness had every thread add
+/// about thirty bases in series on a device a quarter full. `keccak256`'s four passes
+/// (240,257 wires, 45% ones) with every job at one count, each in a timed pass of its
+/// own, milliseconds, and what the host then spends adding the partials:
+///
+/// ```text
+/// groups a job        59     118     235     470     939
+/// A, G1             5.09    3.34    2.52    3.49    4.50
+/// B, G2            12.33    8.91   10.03   13.72   19.22
+/// B, G1             4.04    2.85    1.94    2.71    3.87
+/// L, G1             6.09    3.47    2.48    4.62    4.69
+/// host combine      0.72    1.17    2.03    3.79    7.23
+/// ```
+///
+/// Each curve is best where its threads are about its `fill`, 218 groups over G1 and 128
+/// over G2, and past it the pass costs its entries. The whole proof at that cap, at three
+/// quarters of it and at one and a half times: 93.9, 94.3 and 98.8 ms on `keccak256`
+/// against 103.7 at 64 groups, 129.1, 130.3 and 135.4 on `rsa2048` against 148.8.
+///
+/// Floored at 1 because a dispatch of zero workgroups writes nothing and the host would
+/// then read a stale slot. Zero where the plan has no ones pass
+/// ([`DigitPlan::ones_pass`]): the pass is not dispatched, has no window in the results
+/// buffer and is never read. Public so the readback ceiling in `tests/proof.rs` can be
+/// derived from it rather than retyped.
+pub fn ones_groups_for(n: u32, curve: wgsl::Curve, tg: u32, ones_pass: bool) -> u32 {
+    if !ones_pass {
+        return 0;
     }
+    n.div_ceil(tg * ONES_SCAN)
+        .clamp(1, (curve.fill / tg).max(1))
 }
 
 /// Spill slots one thread of `msm_fold_*` takes per level: the constant-work merge, whose
@@ -266,12 +295,12 @@ const REDUCE_MIN_SEGMENT: u32 = 8;
 
 /// Bytes one G1 sub-MSM reads back at most: the most window partials any `c` in
 /// [`crate::msm::window_size`]'s range gives (16 windows of 8 groups at c = 16), rounded up
-/// to the binding alignment, plus `ones_groups_for`'s clamp of 64 partials, at 128 bytes a
+/// to the binding alignment, plus [`ones_groups_for`]'s most, 218 partials, at 128 bytes a
 /// point. A small key's c = 3 gives 85 partials and stays under it.
-pub const SUB_MSM_READBACK_G1: u64 = 24 * 1024;
+pub const SUB_MSM_READBACK_G1: u64 = 16 * 1024 + 218 * 128;
 
-/// The G2 twin of [`SUB_MSM_READBACK_G1`], at 256 bytes a point.
-pub const SUB_MSM_READBACK_G2: u64 = 48 * 1024;
+/// The G2 twin of [`SUB_MSM_READBACK_G1`], at 256 bytes a point and 128 ones partials.
+pub const SUB_MSM_READBACK_G2: u64 = 64 * 1024;
 
 /// Workgroups per window in `msm_reduce_*` for a plan of `n_windows` by `n_buckets` at
 /// `tg` threads a workgroup. Public so the readback ceiling in `tests/proof.rs` can be
@@ -326,9 +355,10 @@ impl PointPlan {
     /// Plans the point stages for `digits`, reading bases from `base_off`, at
     /// [`slice_len_for`]'s slice length.
     ///
-    /// `tg` is the reduction workgroup size, which sets `ones_groups`. It must be the `tg` the
-    /// module was generated at; [`MsmPoints::plan_points`] passes its own and its own curve,
-    /// so a caller who goes through the module cannot get either pair wrong.
+    /// `tg` is the reduction workgroup size, which sets `ones_groups` with the curve's
+    /// `fill`. It must be the `tg` the module was generated at; [`MsmPoints::plan_points`]
+    /// passes its own and its own curve, so a caller who goes through the module cannot get
+    /// either pair wrong.
     pub fn new(
         digits: &DigitPlan,
         base_off: u32,
@@ -336,7 +366,7 @@ impl PointPlan {
         curve: wgsl::Curve,
     ) -> Result<Self, ProveError> {
         let slice_len = slice_len_for(curve, digits.n_windows(), digits.cap());
-        Self::with_slice_len(digits, base_off, tg, slice_len)
+        Self::with_slice_len(digits, base_off, tg, curve, slice_len)
     }
 
     /// Same, at a forced slice length. For the sweeps in `tests/msm_g1.rs`.
@@ -344,6 +374,7 @@ impl PointPlan {
         digits: &DigitPlan,
         base_off: u32,
         tg: u32,
+        curve: wgsl::Curve,
         slice_len: u32,
     ) -> Result<Self, ProveError> {
         if slice_len == 0 {
@@ -373,7 +404,7 @@ impl PointPlan {
             base_off,
             slice_len,
             slices,
-            ones_groups: ones_groups_for(digits.span(), tg, digits.work()),
+            ones_groups: ones_groups_for(digits.span(), curve, tg, digits.ones_pass()),
             tg,
             fold_len: match digits.work() {
                 Work::Constant => fold_len(),
@@ -1431,8 +1462,8 @@ impl<C: PointCurve> MsmPoints<C> {
         Ok(PointOffsets {
             slabs: out,
             // One workgroup per window and group, and per ones group, always one dispatch:
-            // `sum_points` is a few hundred at most and ones_groups at most 64, against a
-            // 65535 limit.
+            // `sum_points` and ones_groups are a few hundred at most, against a 65535
+            // limit.
             reduce: ring.push(&points.params(digits, 0))?,
             ones: ring.push(&points.params_ones(digits))?,
         })

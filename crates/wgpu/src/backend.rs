@@ -608,38 +608,52 @@ impl WgpuCircuit {
     }
 }
 
-/// Scalars that are neither 0 nor 1, over the whole witness and over the private tail.
+/// Scalars that are neither 0 nor 1, and scalars that are 1, over the positions each of the
+/// three witness sorts holds.
 ///
 /// One pass rather than two, and it is the only host work `msms` does on the witness: the
 /// limbs are already on the device from stage 0. `crate::msm::DigitPlan` sizes both the
-/// window width and `cap` from this count, and `cap` bounds a storage write that WebGPU drops
-/// in silence when it goes out of range, so **an undercount loses entries with no error
-/// anywhere**. Counting rather than estimating is not optional. At 140,824 variables this is
-/// about 0.2 ms.
+/// window width and `cap` from the first count, and `cap` bounds a storage write that WebGPU
+/// drops in silence when it goes out of range, so **an undercount loses entries with no
+/// error anywhere**. Counting rather than estimating is not optional. At 140,824 variables
+/// this is about 0.2 ms. The ones are what says whether a sort keeps them; see
+/// [`crate::batch::Source::Device`].
 ///
-/// The last two are the count among the positions A's live index holds and among those
-/// B's does, which is what a sort over either sizes itself from: `live_in[i]` is 1 for a
-/// position in A's, 2 for one in B's, and the whole witness's count where it is empty.
-fn general_counts(witness: &[Fr], private_from: usize, live_in: &[u8]) -> (u32, u32, u32, u32) {
-    let mut all = 0u32;
-    let mut private = 0u32;
-    let (mut a, mut b) = (0u32, 0u32);
+/// `a` and `b` count among the positions A's live index holds and among those B's does,
+/// which is what a sort over either sizes itself from: `live_in[i]` is 1 for a position in
+/// A's, 2 for one in B's, and both are the whole witness's count where it is empty.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Counts {
+    general: u32,
+    ones: u32,
+}
+
+struct WitnessCounts {
+    a: Counts,
+    b: Counts,
+    private: Counts,
+}
+
+fn witness_counts(witness: &[Fr], private_from: usize, live_in: &[u8]) -> WitnessCounts {
+    let (mut a, mut b, mut private) = (Counts::default(), Counts::default(), Counts::default());
     for (i, x) in witness.iter().enumerate() {
-        if !(x.is_zero() || x.is_one()) {
-            all += 1;
-            if i >= private_from {
-                private += 1;
-            }
-            if let Some(&live) = live_in.get(i) {
-                a += u32::from(live & 1);
-                b += u32::from(live >> 1);
+        if x.is_zero() {
+            continue;
+        }
+        let one = u32::from(x.is_one());
+        let live = live_in.get(i).copied().unwrap_or(3);
+        for (c, here) in [
+            (&mut a, live & 1 != 0),
+            (&mut b, live & 2 != 0),
+            (&mut private, i >= private_from),
+        ] {
+            if here {
+                c.ones += one;
+                c.general += 1 - one;
             }
         }
     }
-    if live_in.is_empty() {
-        (a, b) = (all, all);
-    }
-    (all, private, a, b)
+    WitnessCounts { a, b, private }
 }
 
 /// One base in this many at infinity is where a query gets a [`Live`] index, and A and B a
@@ -836,8 +850,8 @@ impl WgpuCircuit {
         // plans take `n`, and `None` is what says so.
         let (g_a, g_b, g_private) = match work {
             Work::Variable => {
-                let (_, private, a, b) = general_counts(witness, private_from, &self.live_in);
-                (Some(a), Some(b), Some(private))
+                let n = witness_counts(witness, private_from, &self.live_in);
+                (Some(n.a), Some(n.b), Some(n.private))
             }
             Work::Constant => (None, None, None),
         };
@@ -869,13 +883,13 @@ impl WgpuCircuit {
             bases: &self.h_bases,
             base_off: 0,
         }];
-        // The sorts over the witness, as (jobs, general scalars, live index). One for all
-        // three jobs when neither query has an index; otherwise A's and B's apart, each
-        // over its own live positions, because the two queries are at infinity in
+        // The sorts over the witness, as (jobs, general scalars and ones, live index). One
+        // for all three jobs when neither query has an index; otherwise A's and B's apart,
+        // each over its own live positions, because the two queries are at infinity in
         // different places. `g_a` and `g_b` are both the whole witness's count in the
         // first case.
         let (a_live, b_live) = (self.a_live.as_ref(), self.b_live.as_ref());
-        let witness_sorts: Vec<(&[Job<'_>], Option<u32>, Option<&Live>)> =
+        let witness_sorts: Vec<(&[Job<'_>], Option<Counts>, Option<&Live>)> =
             if a_live.is_none() && b_live.is_none() {
                 vec![(&witness_jobs, g_a, None)]
             } else {
@@ -909,8 +923,12 @@ impl WgpuCircuit {
                     }),
                     witness_sorts
                         .iter()
-                        .map(|&(jobs, general, live)| Group {
-                            scalars: Source::Device { buf: w, general },
+                        .map(|&(jobs, counts, live)| Group {
+                            scalars: Source::Device {
+                                buf: w,
+                                general: counts.map(|c| c.general),
+                                ones: counts.map(|c| c.ones),
+                            },
                             scalar_off: 0,
                             n: n_vars,
                             jobs,
@@ -921,7 +939,8 @@ impl WgpuCircuit {
                             Group {
                                 scalars: Source::Device {
                                     buf: w,
-                                    general: g_private,
+                                    general: g_private.map(|c| c.general),
+                                    ones: g_private.map(|c| c.ones),
                                 },
                                 // Section 8 covers the private wires only: witness[0] is the
                                 // constant 1 and witness[1..=n_public] are the public inputs,
@@ -940,6 +959,7 @@ impl WgpuCircuit {
                                     // wider window and a larger entry array; underestimating
                                     // loses entries in silence. See `crate::batch::Source`.
                                     general: None,
+                                    ones: None,
                                 },
                                 scalar_off: 0,
                                 n: domain,
@@ -1048,13 +1068,12 @@ impl WgpuCircuit {
             .ok_or_else(|| bad("msm_probe needs an H that is still on the device"))?;
 
         let private_from = self.pk.n_public + 1;
-        let (g_all, g_private, g_a, g_b) = general_counts(witness, private_from, &self.live_in);
+        let counts = witness_counts(witness, private_from, &self.live_in);
         let (live, g_live) = match which {
-            "a-g1" => (self.a_live.as_ref(), g_a),
-            "b-g2" | "b-g1" => (self.b_live.as_ref(), g_b),
-            _ => (None, g_all),
+            "a-g1" => (self.a_live.as_ref(), counts.a),
+            _ => (self.b_live.as_ref(), counts.b),
         };
-        let g_live = if live.is_some() { g_live } else { g_all };
+        let g_private = counts.private;
         let n_vars = self.pk.n_vars as u32;
         let w = handle.witness_std();
         let mont = Some(MontConvert {
@@ -1098,7 +1117,8 @@ impl WgpuCircuit {
             "l-g1" => Group {
                 scalars: Source::Device {
                     buf: w,
-                    general: Some(g_private),
+                    general: Some(g_private.general),
+                    ones: Some(g_private.ones),
                 },
                 scalar_off: private_from as u32,
                 n: self.l_bases.len() as u32,
@@ -1110,6 +1130,7 @@ impl WgpuCircuit {
                 scalars: Source::Device {
                     buf: handle.h_std(),
                     general: None,
+                    ones: None,
                 },
                 scalar_off: 0,
                 n: self.pk.domain_size as u32,
@@ -1120,7 +1141,8 @@ impl WgpuCircuit {
             _ => Group {
                 scalars: Source::Device {
                     buf: w,
-                    general: Some(g_live),
+                    general: Some(g_live.general),
+                    ones: Some(g_live.ones),
                 },
                 scalar_off: 0,
                 n: n_vars,

@@ -22,11 +22,13 @@
 //!
 //! [`ENTRY_COUNT`] and [`ENTRY_SCATTER`] test for both before touching a window. A zero
 //! costs one 8-word read; a one is routed to `msm_ones_*` at U9 and costs one mixed addition
-//! for the whole scalar. This is not a micro-optimisation: the signed recoding sends every
-//! scalar equal to 1 to digit +1 of window 0, so bucket `(0, 0)` would collect *every*
-//! one-scalar, and since one thread owns one bucket that single thread would serially
-//! accumulate 100k points while the rest of the machine idled. Four of the five MSMs take the
-//! witness as scalars and a bit-heavy circuit is over 99% zeros and ones.
+//! for the whole scalar, unless the plan has no ones pass (`ones_groups` is 0, which is a
+//! range whose ones the host counted and found few) and it is recoded with the rest. This
+//! is not a micro-optimisation: the signed recoding sends every scalar equal to 1 to digit
+//! +1 of window 0, so bucket `(0, 0)` would collect *every* one-scalar, and since one thread
+//! owns one bucket that single thread would serially accumulate 100k points while the rest
+//! of the machine idled. Four of the five MSMs take the witness as scalars and a bit-heavy
+//! circuit is over 99% zeros and ones.
 //!
 //! It also means the prover is not constant time with respect to the witness. `security/`
 //! and `snarkrs-msm`'s `prescan` docs carry that analysis; it is a deliberate trade, not an
@@ -428,11 +430,11 @@ fn fr_prelude(v: Variant) -> String {
 /// so the declarations cannot drift.
 ///
 /// **Twenty `u32`, 80 bytes, and the last twelve are the point stages'.** The digit kernels
-/// here ignore `base_off`, `ones_groups`, `slice_len`, `slices`, the four `fold_*` and
-/// `reduce_groups` entirely; they are in this struct rather than in a second one because
-/// `snarkrs-metal` has exactly one `MsmParams` covering both halves, because design §3 puts
-/// every parameter block for a proof in one uniform ring, and because two structs would be
-/// two host mirrors for
+/// here ignore `base_off`, `slice_len`, `slices`, the four `fold_*` and `reduce_groups`
+/// entirely, and read of `ones_groups` only whether it is zero; they are in this struct
+/// rather than in a second one because `snarkrs-metal` has exactly one `MsmParams` covering
+/// both halves, because design §3 puts every parameter block for a proof in one uniform
+/// ring, and because two structs would be two host mirrors for
 /// `tests/wgsl_static.rs::every_uniform_parameter_struct_matches_its_host_mirror` to check
 /// and one more place for a field to be added on one side only.
 ///
@@ -465,6 +467,7 @@ const PARAM_FIELDS: &str = "\
     // scalars from n_public + 1 and bases from 0.\n\
     base_off: u32,\n\
     // Workgroups in msm_ones_*, which is also the stride its grid walks the scalars with.\n\
+    // Count and scatter drop a scalar of 1 only where it is not zero.\n\
     ones_groups: u32,\n\
     // Entries one thread of msm_segmented_* owns.\n\
     slice_len: u32,\n\
@@ -720,11 +723,12 @@ fn classify(pick: LimbPick) -> String {
     // thread, from serially accumulating 100k points while the rest of the machine idles.
     //
     // Constant work skips neither: the ones pass is off, so a 1 recodes into bucket (0, 0)
-    // like any other scalar, and a 0 takes its window's dummy rows.
+    // like any other scalar, and a 0 takes its window's dummy rows. A variable plan whose
+    // ones are few has no ones pass either (ones_groups is 0) and recodes them the same.
     let hi = {hi};
     if (P.dummy_rows == 0u) {{
         if ((hi | {zero}) == 0u) {{ return; }}
-        if (hi == 0u && {zero} == 1u) {{ return; }}
+        if (hi == 0u && {zero} == 1u && P.ones_groups != 0u) {{ return; }}
     }}
 "
     );

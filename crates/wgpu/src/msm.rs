@@ -97,7 +97,8 @@ pub enum Work {
     /// What it costs is what the zeros and ones were saving, so it is priced per circuit
     /// on `crate::backend::WgpuProver::constant_work`.
     Constant,
-    /// Zero scalars are dropped, one scalars go to the ones pass, the window is sized for
+    /// Zero scalars are dropped, one scalars go to the ones pass or, where the host counted
+    /// few of them, to the buckets ([`DigitPlan::ones_in_buckets`]), the window is sized for
     /// the rest. Running time, buffer sizes and the dispatch geometry then follow how many
     /// witness entries are zero or one.
     #[default]
@@ -245,7 +246,9 @@ pub struct MsmParams {
     pub lo: u32,
     /// Element offset into the base vector. Zero for every digit kernel.
     pub base_off: u32,
-    /// Workgroups in `msm_ones_*`. Zero for every digit kernel.
+    /// Workgroups in `msm_ones_*`. `msm_count` and `msm_scatter` read only whether it is
+    /// zero, which is where a scalar of 1 stays in the sort: a [`DigitPlan`] writes 1 for a
+    /// plan with a ones pass.
     pub ones_groups: u32,
     /// Entries one thread of `msm_segmented_*` owns. Zero for every digit kernel.
     pub slice_len: u32,
@@ -330,6 +333,9 @@ pub struct DigitPlan {
     dummy_rows: u32,
     /// The live index run the sort reads through, and then `n` is its length.
     live: Option<LiveRun>,
+    /// Whether a scalar of 1 leaves the sort for `msm_ones_*`. Never under
+    /// [`Work::Constant`]; see [`Self::ones_in_buckets`].
+    ones_pass: bool,
 }
 
 impl DigitPlan {
@@ -446,7 +452,39 @@ impl DigitPlan {
                 Work::Variable => 0,
             },
             live: None,
+            ones_pass: work == Work::Variable,
         })
+    }
+
+    /// The same sort with a scalar of 1 recoded like any other, into bucket (0, 0), and no
+    /// ones pass over any job of it. The caller's `general` count must then have held the
+    /// ones as well, because each takes an entry of window 0.
+    ///
+    /// For a range whose ones are few: the pass costs a job its workgroup tree whatever it
+    /// finds, 0.7 ms over G1 and 1.9 over G2 on `js_2x2_d32`'s 30 ones, and the bucket
+    /// they share costs the merge little until it is well past the plan's fattest; see
+    /// [`Self::ones_fit`].
+    pub fn ones_in_buckets(mut self) -> Self {
+        self.ones_pass = false;
+        self
+    }
+
+    /// Whether `ones` scalars of 1 are few enough to share bucket (0, 0): no more than one
+    /// and a half times what the plan's fattest bucket holds. That is a bucket of the top
+    /// window, whose `RECODE_BITS - (W - 1) * c` bits spread the plan's entries over
+    /// `2^(top_bits - 1)` buckets, and the merge walks it in one lane
+    /// (`crate::points::stage_us`); `cap` here counts the ones.
+    ///
+    /// Under it the ones lengthen no chain. The half over is two merge steps a slice
+    /// against the eight of the pass they replace, four to nine steps at the slice
+    /// lengths `crate::points::slice_len_for` gives, so about even at the line.
+    /// `railgun-13x01`'s B sort (335 a bucket and 439 ones) is the one artifact
+    /// between the two: 188.4 and 189.5 ms with its ones sorted against 192.0 and 196.3
+    /// with the pass, lower quartiles 186.5 and 187.3 against 189.7 and 189.5.
+    pub fn ones_fit(&self, ones: u32) -> bool {
+        let top_bits = RECODE_BITS - (self.n_windows - 1) * self.c;
+        let top_buckets = 1u64 << (top_bits.min(self.c) - 1);
+        2 * u64::from(ones) * top_buckets <= 3 * u64::from(self.cap)
     }
 
     /// The same sort over `run` of a live index: `n` is the run's length, `scalar_off` the
@@ -485,6 +523,10 @@ impl DigitPlan {
     pub fn dummy_rows(&self) -> u32 {
         self.dummy_rows
     }
+    /// Whether the jobs over this sort run `msm_ones_*`.
+    pub fn ones_pass(&self) -> bool {
+        self.ones_pass
+    }
     pub fn work(&self) -> Work {
         if self.dummy_rows == 0 {
             Work::Variable
@@ -513,7 +555,8 @@ impl DigitPlan {
     }
 
     /// The parameter block the digit kernels read, with the point-stage fields left at
-    /// zero. [`crate::points::PointPlan::params`] is the one that fills them.
+    /// zero but `ones_groups`, which is 1 where there is a ones pass.
+    /// [`crate::points::PointPlan::params`] is the one that fills them.
     pub fn params(&self, n: u32, lo: u32) -> MsmParams {
         MsmParams {
             n,
@@ -524,7 +567,7 @@ impl DigitPlan {
             scalar_off: self.scalar_off,
             lo,
             base_off: 0,
-            ones_groups: 0,
+            ones_groups: u32::from(self.ones_pass),
             slice_len: 0,
             slices: 0,
             dummy_rows: self.dummy_rows,

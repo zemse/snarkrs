@@ -43,7 +43,7 @@
 //! One `mapAsync` round trip is about 0.3 ms. Design §3 caps the whole per-proof readback at
 //! 64 KiB; the bound the code actually gives is
 //! [`crate::points::SUB_MSM_READBACK_G1`] and [`crate::points::SUB_MSM_READBACK_G2`] per
-//! sub-MSM, 144 KiB over four G1 jobs and one G2, and `keccak256` reads back 109 KiB. It is
+//! sub-MSM, 237 KiB over four G1 jobs and one G2, and `keccak256` reads back 205 KiB. It is
 //! paid once per proof and nothing is chunked through it.
 //!
 //! That ceiling is load-bearing on wasm. `get_mapped_range` there copies the entire mapped

@@ -58,8 +58,10 @@ use snarkrs_gpu_layout::{PackedG1Affine, LIMBS};
 use snarkrs_msm::{CpuMsm, MsmBackend};
 use snarkrs_wgpu::gen::points as wgsl;
 use snarkrs_wgpu::msm::{pack_scalars, DigitBuffers, DigitPlan, MsmDigits};
-use snarkrs_wgpu::points::{slice_len_for, MsmPointsG1, PointBuffers, PointPlan};
-use snarkrs_wgpu::{window_size, window_size_for, Jobs, LimitsProfile, ParamRing, WgpuBackend};
+use snarkrs_wgpu::points::{ones_groups_for, slice_len_for, MsmPointsG1, PointBuffers, PointPlan};
+use snarkrs_wgpu::{
+    window_size, window_size_for, Jobs, LimitsProfile, ParamRing, WgpuBackend, Work,
+};
 
 #[path = "msmcommon/mod.rs"]
 mod common;
@@ -1002,7 +1004,8 @@ impl Bench {
     fn time(&self, p: &MsmPointsG1, slice_len: u32, reps: u32, what: Stage) -> f64 {
         let b = floor();
         let pplan =
-            PointPlan::with_slice_len(&self.dplan, 0, p.workgroups().tg, slice_len).expect("plan");
+            PointPlan::with_slice_len(&self.dplan, 0, p.workgroups().tg, p.curve(), slice_len)
+                .expect("plan");
         let pts = PointBuffers::new(b, &self.dplan, &pplan, 0, p.curve()).expect("buffers");
         let mut ring =
             ParamRing::new(b, "u9 bench ring", p.slots(&self.dplan, &pplan) + 4).expect("ring");
@@ -1398,9 +1401,30 @@ fn the_point_plan_derives_its_shape_once() {
     }
     assert_eq!(p.seg_threads(&d), d.n_windows() * p.slices());
     assert_eq!(p.spill_slots(&d), 2 * p.seg_threads(&d));
-    // ceil(1000 / (32 * 64)) = 1, and it is never zero: a dispatch of zero workgroups writes
-    // nothing and the host would then add a stale slot.
-    assert_eq!(p.ones_groups(), 1000u32.div_ceil(32 * 64).clamp(1, 64));
+    // Eight scalars a thread, ceil(1000 / (32 * 8)) = 4, until the pass has the curve's
+    // `fill` threads, and never zero: a dispatch of zero workgroups writes nothing and the
+    // host would then add a stale slot. None on a plan with no ones pass.
+    assert_eq!(p.ones_groups(), 4);
+    assert_eq!(ones_groups_for(1, wgsl::G1, 32, true), 1);
+    assert_eq!(
+        ones_groups_for(1 << 22, wgsl::G1, wgsl::G1.wg.tg, true),
+        wgsl::G1.fill / wgsl::G1.wg.tg
+    );
+    for sorted in [
+        d.ones_in_buckets(),
+        DigitPlan::with_work_c(1000, 0, None, 12, Work::Constant).expect("plan"),
+    ] {
+        assert!(!sorted.ones_pass());
+        assert_eq!(sorted.params(1000, 0).ones_groups, 0);
+        let p = PointPlan::new(&sorted, 0, 32, wgsl::G1).expect("point plan");
+        assert_eq!(p.ones_groups(), 0);
+        assert_eq!(
+            p.results_bytes(&sorted, wgsl::G1),
+            p.ones_offset(&sorted, wgsl::G1)
+        );
+    }
+    assert!(d.ones_pass());
+    assert_eq!(d.params(1000, 0).ones_groups, 1);
 
     // An empty window still gets one slice, because the segmented pass tags its spill slots
     // before it tests for an empty window.
@@ -1419,7 +1443,7 @@ fn the_point_plan_derives_its_shape_once() {
     assert_eq!(params.ones_groups, p.ones_groups());
     assert_eq!(std::mem::size_of_val(&params), 80);
 
-    assert!(PointPlan::with_slice_len(&d, 0, 32, 0).is_err());
+    assert!(PointPlan::with_slice_len(&d, 0, 32, wgsl::G1, 0).is_err());
     assert!(PointPlan::new(&d, 0, 0, wgsl::G1).is_err());
     println!("the point plan's five derived numbers agree with their definitions");
 }

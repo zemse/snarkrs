@@ -23,7 +23,7 @@ use snarkrs_groth16::verify::verify;
 use snarkrs_groth16::{Backend, StageTimings};
 use snarkrs_msm::{CpuMsm, MsmBackend};
 use snarkrs_wgpu::backend::WgpuProver;
-use snarkrs_wgpu::msm::pack_scalars;
+use snarkrs_wgpu::msm::{pack_scalars, Jobs};
 use snarkrs_wgpu::{
     DigitBuffers, DigitPlan, G1Bases, G2Bases, Group, Job, LimitsProfile, Live, MsmResult,
     ParamRing, PointBinds, PointBuffers, PointOffsets, PointPlan, SortBinds, SortOffsets, Source,
@@ -516,6 +516,148 @@ fn a_live_index_sorts_only_the_bases_not_at_infinity() {
             want,
             "{work:?}, scalar {at_gone} at the position the index leaves out"
         );
+    }
+}
+
+/// Scalars of 1 the host counted, against the CPU MSM under both work modes, whole and
+/// over a [`Live`] index. A few of them are sorted with the rest and no job runs a ones
+/// pass, which the readback shows as the ones partials it no longer holds; one more than
+/// the plan takes ([`DigitPlan::ones_fit`]), or a witness of bits, and the pass runs as it
+/// does over a buffer nobody counted. Constant work reads neither count.
+#[test]
+fn counted_ones_are_sorted_with_the_rest_where_they_fit() {
+    let _one_at_a_time = exclusive();
+    const N: usize = 3 * 4096 + 7;
+    const FEW: usize = 40;
+    let b = device();
+    let batch = prover().msm();
+    let (g1, g2) = bases_with_infinity(N);
+    let positions: Vec<u32> = (0..N)
+        .filter(|&i| !g1[i].is_zero())
+        .map(|i| i as u32)
+        .collect();
+    assert!(positions.len() < N);
+    let live = Live::upload(b, positions.clone()).expect("live");
+    let b1 = G1Bases::upload(b, &g1).expect("g1 bases");
+    let b2 = G2Bases::upload(b, &g2).expect("g2 bases");
+    let cpu = CpuMsm::new();
+    let jobs = [
+        Job::G1 {
+            bases: &b1,
+            base_off: 0,
+        },
+        Job::G2 {
+            bases: &b2,
+            base_off: 0,
+        },
+    ];
+
+    // (general, ones) among `at`, and whether the plan the batch would build sorts them.
+    let counts = |scalars: &[Fr], at: &mut dyn Iterator<Item = usize>| -> (u32, u32) {
+        at.fold((0, 0), |(g, o), i| {
+            let x = &scalars[i];
+            (
+                g + u32::from(!(x.is_zero() || x.is_one())),
+                o + u32::from(x.is_one()),
+            )
+        })
+    };
+    let sorts = |n: u32, (general, ones): (u32, u32)| -> bool {
+        DigitPlan::for_jobs(
+            n,
+            0,
+            Some(general + ones),
+            Work::Variable,
+            Jobs { g1: 1, g2: 1 },
+        )
+        .expect("plan")
+        .ones_fit(ones)
+    };
+
+    let mut seed = 0x0123_4567_89ab_cdefu64;
+    let dense = random_scalars(N, &mut seed);
+    // 37 does not divide N, so these are `k` positions.
+    let with_ones = |k: usize| -> Vec<Fr> {
+        let mut s = dense.clone();
+        for i in 0..k {
+            s[(i * 37 + 11) % N] = Fr::one();
+        }
+        s
+    };
+    let whole = |s: &[Fr]| counts(s, &mut (0..N));
+    assert!(sorts(N as u32, whole(&with_ones(FEW))));
+    let over = (FEW..N)
+        .find(|&k| !sorts(N as u32, whole(&with_ones(k))))
+        .expect("no count of ones is too many for the plan");
+    assert!(sorts(N as u32, whole(&with_ones(over - 1))));
+
+    let mut cases = vec![
+        ("a few ones", with_ones(FEW)),
+        ("the most ones that fit", with_ones(over - 1)),
+        ("one too many", with_ones(over)),
+    ];
+    cases.extend(scalars_of_every_sparsity(N));
+    for (label, scalars) in &cases {
+        let want1 = cpu.msm_g1(&g1, scalars);
+        let want2 = cpu.msm_g2(&g2, scalars);
+        let (words, _) = pack_scalars(scalars);
+        let sbuf = storage_words(b, "counted scalars", &words);
+        for (over_live, live) in [(false, None), (true, Some(&live))] {
+            let (n_sort, (general, ones)) = if over_live {
+                (
+                    positions.len() as u32,
+                    counts(scalars, &mut positions.iter().map(|&i| i as usize)),
+                )
+            } else {
+                (N as u32, whole(scalars))
+            };
+            let sorted = sorts(n_sort, (general, ones));
+            let mut bytes = Vec::new();
+            for (work, ones) in [
+                (Work::Variable, Some(ones)),
+                (Work::Variable, None),
+                (Work::Constant, Some(ones)),
+                (Work::Constant, None),
+            ] {
+                let gs = [Group {
+                    scalars: Source::Device {
+                        buf: &sbuf,
+                        general: Some(general),
+                        ones,
+                    },
+                    scalar_off: 0,
+                    n: N as u32,
+                    jobs: &jobs,
+                    work,
+                    live,
+                }];
+                let got = pollster::block_on(batch.run(b, None, &gs)).expect("run");
+                let what = format!("{label}, live {over_live}, {work:?}, ones {ones:?}");
+                assert_eq!(g1_of(&got[0]), want1, "{what}: G1");
+                assert_eq!(g2_of(&got[1]), want2, "{what}: G2");
+                bytes.push(batch.last_readback_bytes());
+            }
+            // Counted and sorted, the two jobs read back no ones partials.
+            assert_eq!(
+                bytes[0] < bytes[1],
+                sorted,
+                "{label}, live {over_live}: {} bytes counted, {} not",
+                bytes[0],
+                bytes[1]
+            );
+            assert!(bytes[0] <= bytes[1], "{label}, live {over_live}");
+            assert_eq!(bytes[2], bytes[3], "{label}: constant work read a count");
+        }
+        eprintln!("  {label:<24} counted and not, whole and over a live index, match the CPU");
+    }
+    for (label, sorted) in [
+        ("a few ones", true),
+        ("one too many", false),
+        ("bits and a few generals", false),
+        ("ones", false),
+    ] {
+        let s = &cases.iter().find(|c| c.0 == label).expect("a case").1;
+        assert_eq!(sorts(N as u32, whole(s)), sorted, "{label}");
     }
 }
 

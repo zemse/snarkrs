@@ -881,8 +881,10 @@ fn an_empty_group_dispatches_nothing_and_keeps_its_result_slots() {
 /// circuit whose witness is mostly bits gets a **small** `c` however many constraints it has:
 /// the bucket clear and reduction dominate its cost model, so `msm::window_size` picks 3 and
 /// each of A, B and L reads back 85 window sums. The reduce also splits a wide window into up
-/// to 8 groups (`reduce_groups_for`), and `ones_groups` grows with `n` to 64. Measured over
-/// the artifacts on an M2 Max, 2026-11-10:
+/// to 8 groups (`reduce_groups_for`), and `ones_groups` grew with `n` to 64 when this was
+/// measured, over the artifacts on an M2 Max, 2026-11-10 (it is 218 over G1 and 128 over G2
+/// since, and none on a witness whose few ones are sorted with the rest, so `keccak256`
+/// reads back 209,408 B):
 ///
 /// ```text
 /// artifact       constraints  sub-MSMs   readback B
@@ -911,9 +913,10 @@ fn an_empty_group_dispatches_nothing_and_keeps_its_result_slots() {
 /// byte) is 56 us for `keccak256`'s 111,360 B against 33 us at 64 KiB.
 ///
 /// So the bound is the code's, per sub-MSM: the largest `windows * groups` over every `c`
-/// `msm::window_size` searches (16 windows by 8 groups at c = 16), aligned, plus 64 ones
-/// partials, which is `SUB_MSM_READBACK_G1` (24 KiB) and `SUB_MSM_READBACK_G2` (48 KiB), 144
-/// KiB for a key that fits the binding limit as four G1 sub-MSMs and one G2. This derives
+/// `msm::window_size` searches (16 windows by 8 groups at c = 16), aligned, plus the most
+/// ones partials `ones_groups_for` gives, which is `SUB_MSM_READBACK_G1` (44,288 B) and
+/// `SUB_MSM_READBACK_G2` (64 KiB), 237 KiB for a key that fits the binding limit as four G1
+/// sub-MSMs and one G2. This derives
 /// both from the planners and fails if either constant disagrees, then holds every artifact's
 /// readback to them over the sub-MSMs the batch reports it ran.
 #[test]
@@ -921,8 +924,6 @@ fn a_whole_proof_submits_once_for_h_then_per_msm_slab_and_the_readback_is_bounde
     let _one_at_a_time = exclusive();
     /// The narrowest window `msm::window_size` will return.
     const C_MIN: u32 = 3;
-    /// `ones_groups_for` clamps to this.
-    const MAX_ONES_GROUPS: u64 = 64;
     /// The widest window `msm::window_size` will return, so the fewest windows a sub-MSM
     /// can have and the most submissions one can take: one per window and one more for a
     /// submission holding only the conversion.
@@ -948,7 +949,8 @@ fn a_whole_proof_submits_once_for_h_then_per_msm_slab_and_the_readback_is_bounde
     };
     let per_job = |curve: snarkrs_wgpu::gen::points::Curve| {
         let pt = curve.point_bytes;
-        (sum_points(curve) * pt).div_ceil(256) * 256 + MAX_ONES_GROUPS * pt
+        let ones = snarkrs_wgpu::points::ones_groups_for(u32::MAX, curve, curve.wg.tg, true);
+        (sum_points(curve) * pt).div_ceil(256) * 256 + u64::from(ones) * pt
     };
     let ceiling = |g1: u32, g2: u32| {
         u64::from(g1) * per_job(snarkrs_wgpu::gen::points::G1)
@@ -1032,8 +1034,8 @@ fn a_whole_proof_submits_once_for_h_then_per_msm_slab_and_the_readback_is_bounde
         assert!(
             read > 0 && read <= ceiling,
             "{}: the MSM readback is {read} bytes, over the {ceiling} byte ceiling that \
-             {windows} windows at c = {C_MIN}, the reduce's groups and {MAX_ONES_GROUPS} \
-             ones groups allow over {g1} G1 and {g2} G2 sub-MSMs",
+             {windows} windows at c = {C_MIN}, the reduce's groups and the ones groups \
+             allow over {g1} G1 and {g2} G2 sub-MSMs",
             a.name
         );
         verify(&a.vkey(), &public_of(&witness, circuit.n_public()), &proof).expect("verify");
@@ -1452,6 +1454,7 @@ fn where_the_msm_time_goes() {
             scalars: Source::Device {
                 buf: ws,
                 general: Some(g_all),
+                ones: None,
             },
             scalar_off: 0,
             n: n_vars,
@@ -1463,6 +1466,7 @@ fn where_the_msm_time_goes() {
             scalars: Source::Device {
                 buf: ws,
                 general: Some(g_priv),
+                ones: None,
             },
             scalar_off: private_from,
             n: l_len,
@@ -1474,6 +1478,7 @@ fn where_the_msm_time_goes() {
             scalars: Source::Device {
                 buf: handle.h_std(),
                 general: None,
+                ones: None,
             },
             scalar_off: 0,
             n: domain,

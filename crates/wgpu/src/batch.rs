@@ -592,9 +592,14 @@ pub enum Source<'a> {
     /// loses entries with no error anywhere. `None` therefore means `n`, not a guess, and is
     /// the only honest answer for a buffer the host has never seen. That is the case for `H`,
     /// whose values exist only on the device.
+    ///
+    /// `ones` is how many of them are 1, among the positions `general` counts over. A
+    /// plan they fit ([`DigitPlan::ones_fit`]) sorts them with the rest and runs no ones
+    /// pass. `None` is a buffer nobody counted, and the pass runs.
     Device {
         buf: &'a wgpu::Buffer,
         general: Option<u32>,
+        ones: Option<u32>,
     },
     /// Host scalars, packed and uploaded here.
     ///
@@ -1360,15 +1365,15 @@ impl MsmBatch {
         if g.n == 0 {
             return Ok(Vec::new());
         }
-        let general = match (&g.scalars, g.work) {
+        let (general, ones) = match (&g.scalars, g.work) {
             // Constant work plans for the range's length whatever the buffer knows about
             // its contents: every scalar reaches the buckets, in every window.
-            (_, Work::Constant) => None,
-            (Source::Device { general, .. }, Work::Variable) => *general,
+            (_, Work::Constant) => (None, None),
+            (Source::Device { general, ones, .. }, Work::Variable) => (*general, *ones),
             // Not available at plan time: this runs before the upload, so `pack_scalars`
             // has not walked these scalars yet. `None` means `n`, which is the overestimate
             // `Source::Device`'s `general` documents as the safe direction.
-            (Source::Host(_), Work::Variable) => None,
+            (Source::Host(_), Work::Variable) => (None, None),
         };
         // The window width is the jobs' to share, and a G2 job weighs 3.5 G1 ones.
         let g2 = g
@@ -1435,6 +1440,20 @@ impl MsmBatch {
                     g.work,
                     jobs,
                 )?;
+                // Nor more ones. Where they are counted, the plan that sorts them with the
+                // rest is the one to run if they fit it.
+                if let (Some(general), Some(ones)) = (general, ones) {
+                    let with_ones = DigitPlan::for_jobs(
+                        n,
+                        g.scalar_off + lo,
+                        Some(general.saturating_add(ones).min(n)),
+                        g.work,
+                        jobs,
+                    )?;
+                    if with_ones.ones_fit(ones.min(n)) {
+                        dplan = with_ones.ones_in_buckets();
+                    }
+                }
                 if let Some(run) = run {
                     dplan = dplan.over(run);
                 }
