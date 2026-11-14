@@ -63,6 +63,103 @@ __device__ __forceinline__ bool fq_eq(Fq a, Fq b) {
     return acc == 0u;
 }
 
+// Addition, subtraction and the conditional subtraction as carry chains. PTX has an
+// addressable carry flag and C does not: the portable forms in the `#else` widen every
+// limb to 64 bits and shift the carry back out, where `add.cc` / `addc.cc` (`sub.cc` /
+// `subc.cc`) is one instruction a limb. The modulus is written into the chains as
+// immediates, and a Rust test holds them to FQ_N. Same values, bit for bit; the portable
+// forms stay for a host build of this file (`G16_FF_PORTABLE`), which has no PTX.
+#ifndef G16_FF_PORTABLE
+__device__ __forceinline__ Fq fq_cond_sub_n(Fq a, u32 hi) {
+    Fq red;
+    u32 borrow;
+    asm("{\n\t"
+        ".reg .u32 z;\n\t"
+        "mov.u32 z, 0;\n\t"
+        "sub.cc.u32 %0, %9, 0xd87cfd47;\n\t"
+        "subc.cc.u32 %1, %10, 0x3c208c16;\n\t"
+        "subc.cc.u32 %2, %11, 0x6871ca8d;\n\t"
+        "subc.cc.u32 %3, %12, 0x97816a91;\n\t"
+        "subc.cc.u32 %4, %13, 0x8181585d;\n\t"
+        "subc.cc.u32 %5, %14, 0xb85045b6;\n\t"
+        "subc.cc.u32 %6, %15, 0xe131a029;\n\t"
+        "subc.cc.u32 %7, %16, 0x30644e72;\n\t"
+        "subc.u32 %8, z, z;\n\t"
+        "}\n\t"
+        : "=r"(red.v[0]), "=r"(red.v[1]), "=r"(red.v[2]), "=r"(red.v[3]), "=r"(red.v[4]),
+          "=r"(red.v[5]), "=r"(red.v[6]), "=r"(red.v[7]), "=r"(borrow)
+        : "r"(a.v[0]), "r"(a.v[1]), "r"(a.v[2]), "r"(a.v[3]), "r"(a.v[4]), "r"(a.v[5]),
+          "r"(a.v[6]), "r"(a.v[7]));
+    bool take = (hi != 0u) || (borrow == 0u);
+    Fq out;
+#pragma unroll
+    for (u32 i = 0; i < FQ_LIMBS; i++) {
+        out.v[i] = take ? red.v[i] : a.v[i];
+    }
+    return out;
+}
+
+__device__ __forceinline__ Fq fq_add(Fq a, Fq b) {
+    Fq s;
+    asm("{\n\t"
+        "add.cc.u32 %0, %8, %16;\n\t"
+        "addc.cc.u32 %1, %9, %17;\n\t"
+        "addc.cc.u32 %2, %10, %18;\n\t"
+        "addc.cc.u32 %3, %11, %19;\n\t"
+        "addc.cc.u32 %4, %12, %20;\n\t"
+        "addc.cc.u32 %5, %13, %21;\n\t"
+        "addc.cc.u32 %6, %14, %22;\n\t"
+        "addc.u32 %7, %15, %23;\n\t"
+        "}\n\t"
+        : "=r"(s.v[0]), "=r"(s.v[1]), "=r"(s.v[2]), "=r"(s.v[3]), "=r"(s.v[4]), "=r"(s.v[5]),
+          "=r"(s.v[6]), "=r"(s.v[7])
+        : "r"(a.v[0]), "r"(a.v[1]), "r"(a.v[2]), "r"(a.v[3]), "r"(a.v[4]), "r"(a.v[5]),
+          "r"(a.v[6]), "r"(a.v[7]), "r"(b.v[0]), "r"(b.v[1]), "r"(b.v[2]), "r"(b.v[3]),
+          "r"(b.v[4]), "r"(b.v[5]), "r"(b.v[6]), "r"(b.v[7]));
+    return fq_cond_sub_n(s, 0u);
+}
+
+__device__ __forceinline__ Fq fq_sub(Fq a, Fq b) {
+    Fq d;
+    asm("{\n\t"
+        ".reg .u32 z;\n\t"
+        ".reg .u32 k;\n\t"
+        ".reg .u32 t;\n\t"
+        "mov.u32 z, 0;\n\t"
+        "sub.cc.u32 %0, %8, %16;\n\t"
+        "subc.cc.u32 %1, %9, %17;\n\t"
+        "subc.cc.u32 %2, %10, %18;\n\t"
+        "subc.cc.u32 %3, %11, %19;\n\t"
+        "subc.cc.u32 %4, %12, %20;\n\t"
+        "subc.cc.u32 %5, %13, %21;\n\t"
+        "subc.cc.u32 %6, %14, %22;\n\t"
+        "subc.cc.u32 %7, %15, %23;\n\t"
+        "subc.u32 k, z, z;\n\t"
+        "and.b32 t, k, 0xd87cfd47;\n\t"
+        "add.cc.u32 %0, %0, t;\n\t"
+        "and.b32 t, k, 0x3c208c16;\n\t"
+        "addc.cc.u32 %1, %1, t;\n\t"
+        "and.b32 t, k, 0x6871ca8d;\n\t"
+        "addc.cc.u32 %2, %2, t;\n\t"
+        "and.b32 t, k, 0x97816a91;\n\t"
+        "addc.cc.u32 %3, %3, t;\n\t"
+        "and.b32 t, k, 0x8181585d;\n\t"
+        "addc.cc.u32 %4, %4, t;\n\t"
+        "and.b32 t, k, 0xb85045b6;\n\t"
+        "addc.cc.u32 %5, %5, t;\n\t"
+        "and.b32 t, k, 0xe131a029;\n\t"
+        "addc.cc.u32 %6, %6, t;\n\t"
+        "and.b32 t, k, 0x30644e72;\n\t"
+        "addc.u32 %7, %7, t;\n\t"
+        "}\n\t"
+        : "=r"(d.v[0]), "=r"(d.v[1]), "=r"(d.v[2]), "=r"(d.v[3]), "=r"(d.v[4]), "=r"(d.v[5]),
+          "=r"(d.v[6]), "=r"(d.v[7])
+        : "r"(a.v[0]), "r"(a.v[1]), "r"(a.v[2]), "r"(a.v[3]), "r"(a.v[4]), "r"(a.v[5]),
+          "r"(a.v[6]), "r"(a.v[7]), "r"(b.v[0]), "r"(b.v[1]), "r"(b.v[2]), "r"(b.v[3]),
+          "r"(b.v[4]), "r"(b.v[5]), "r"(b.v[6]), "r"(b.v[7]));
+    return d;
+}
+#else
 // See fr_cond_sub_n in the prelude for why the borrow test is bit 63 of a wrapped u64 and
 // why this is a ternary rather than an `if`.
 __device__ __forceinline__ Fq fq_cond_sub_n(Fq a, u32 hi) {
@@ -115,6 +212,8 @@ __device__ __forceinline__ Fq fq_sub(Fq a, Fq b) {
     }
     return out;
 }
+
+#endif // G16_FF_PORTABLE
 
 __device__ __forceinline__ Fq fq_zero() {
     Fq z;

@@ -4932,6 +4932,7 @@ mod tests {
             kernels::CURVE_CUH.contains(&want_n0),
             "kernels/bn254_curve.cuh does not contain the line:\n{want_n0}"
         );
+        kernels::assert_carry_chains(kernels::CURVE_CUH, &FQ_MODULUS);
     }
 
     /// Every entry point this host loads must be present in the source, and `extern "C"`.

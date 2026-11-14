@@ -142,6 +142,7 @@ mod tests {
             src.contains("struct Fr {\n    u32 v[8];\n};"),
             "the CUDA Fr struct no longer mirrors PackedFr"
         );
+        crate::kernels::assert_carry_chains(src, &FR_MODULUS);
     }
 
     /// A `--use_fast_math` here would be meaningless at best. Assert it never appears.

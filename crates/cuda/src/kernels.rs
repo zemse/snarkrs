@@ -136,6 +136,22 @@ pub fn unit_field_probe() -> String {
     )
 }
 
+/// The carry chains of a field's addition and subtraction carry its modulus as
+/// immediates, a second copy of the limbs the drift guards hold: every limb must sit in
+/// the conditional subtraction's chain and in the masked add-back.
+#[cfg(test)]
+pub(crate) fn assert_carry_chains(src: &str, modulus: &[u32; 8]) {
+    for (i, limb) in modulus.iter().enumerate() {
+        let sub = if i == 0 { "sub.cc" } else { "subc.cc" };
+        for want in [
+            format!("\"{sub}.u32 %{i}, %{}, 0x{limb:08x};\\n\\t\"", 9 + i),
+            format!("\"and.b32 t, k, 0x{limb:08x};\\n\\t\""),
+        ] {
+            assert!(src.contains(&want), "no carry-chain line:\n{want}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
