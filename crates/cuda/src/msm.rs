@@ -62,8 +62,8 @@
 //! # Timings
 //!
 //! [`StageTimings::msm_us`] is filled from a CUDA event pair spanning every launch, plus
-//! the host-side scalar pack and upload and the readback and Horner tail, both on a wall
-//! clock. Host time spent *issuing* launches is deliberately not added: the launches are
+//! the host-side scalar pack and upload and what of the readback and Horner pass runs
+//! past the device's span, both on a wall clock. Host time spent *issuing* launches is deliberately not added: the launches are
 //! asynchronous, so that time overlaps the device work the event pair already counted.
 //! [`CudaMsm::last_device_us`] exposes the device half on its own, which is a number the
 //! Metal backend cannot produce at all.
@@ -82,8 +82,8 @@ use std::time::Instant;
 
 use ark_ff::{AdditiveGroup, One, Zero};
 use cudarc::driver::{
-    sys, CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, CudaView, DevicePtrMut,
-    DeviceRepr, LaunchConfig, PushKernelArg,
+    sys, CudaContext, CudaEvent, CudaFunction, CudaModule, CudaSlice, CudaStream, CudaView,
+    DevicePtr, DevicePtrMut, DeviceRepr, HostSlice, LaunchConfig, PinnedHostSlice, PushKernelArg,
 };
 
 use snarkrs_field::{Fr, G1Affine, G1Projective, G2Affine, G2Projective};
@@ -2077,6 +2077,10 @@ pub struct CudaMsm {
     /// Scratch reserved once by [`Self::with_arena`], which every batch then draws from and
     /// hands back instead of allocating. `None`, the default, allocates per batch.
     arena: Option<Mutex<Vec<CudaSlice<u32>>>>,
+    /// Page-locked host buffers the reduce partials are read back into, kept between
+    /// batches: page-locking one is milliseconds, and a copy into pageable memory would
+    /// hold the host until the stream drains.
+    pinned: Mutex<Vec<Pinned>>,
     /// [`Cuda::plan_memory`]: held without an arena from an MSM call's first memory query
     /// until its last batch's scratch is freed, so concurrent proofs run their MSMs one at a
     /// time, each against the memory the last one gave back.
@@ -2345,6 +2349,7 @@ impl CudaMsm {
             last_runs: AtomicU64::new(0),
             vram_limit: None,
             arena: None,
+            pinned: Mutex::new(Vec::new()),
         })
     }
 
@@ -2499,7 +2504,8 @@ impl CudaMsm {
         self.last_device_us.load(Ordering::Relaxed)
     }
 
-    /// Wall clock of the last batch's readback plus its Horner tail.
+    /// Wall clock of what the last batch's readback and Horner pass ran past its device
+    /// span: each job's partials are read and summed while the device is on the next job.
     pub fn last_combine_us(&self) -> u64 {
         self.last_combine_us.load(Ordering::Relaxed)
     }
@@ -2681,6 +2687,68 @@ impl CudaMsm {
             .map_err(|e| drv("allocate MSM scratch", e))
     }
 
+    /// Queue a copy of the first `words` of `buf` into a page-locked buffer of
+    /// [`Self::pinned`], the smallest that holds them or a new one. The copy is
+    /// asynchronous because its destination is page-locked, and the event recorded
+    /// behind it says when it has run.
+    fn read_back(&self, buf: &CudaSlice<u32>, words: usize) -> Result<PinnedWords, ProveError> {
+        if words > buf.len() {
+            return Err(bad(format!(
+                "readback of {words} words from a buffer of {}",
+                buf.len()
+            )));
+        }
+        let fit = {
+            let mut pool = self.pinned.lock().unwrap_or_else(|e| e.into_inner());
+            pool.iter()
+                .enumerate()
+                .filter(|(_, p)| p.buf.len() >= words)
+                .min_by_key(|(_, p)| p.buf.len())
+                .map(|(i, _)| i)
+                .map(|i| pool.swap_remove(i))
+        };
+        let mut pinned = match fit {
+            Some(p) => p,
+            None => Pinned {
+                // SAFETY: the memory is uninitialised and any byte pattern is a valid
+                // `u32`; nothing reads past the words a copy wrote.
+                buf: unsafe {
+                    self.ctx
+                        .alloc_pinned::<u32>(words.next_power_of_two().max(PINNED_MIN_WORDS))
+                }
+                .map_err(|e| drv("allocate pinned MSM readback", e))?,
+                copied: self
+                    .ctx
+                    .new_event(None)
+                    .map_err(|e| drv("create MSM readback event", e))?,
+            },
+        };
+        if words != 0 {
+            let view = buf.slice(..words);
+            let (src, _record_src) = view.device_ptr(&self.stream);
+            // SAFETY: the buffer is used with this stream alone.
+            let (dst, _record_dst) = unsafe { pinned.buf.stream_synced_mut_slice(&self.stream) };
+            // `CudaStream::memcpy_dtoh` copies the destination's length, not the source's,
+            // and a pooled buffer is longer than the prefix asked for.
+            // SAFETY: `src` is `words` words of `buf`'s live allocation and `dst` holds at
+            // least as many, page-locked until the pool drops it.
+            unsafe {
+                cudarc::driver::result::memcpy_dtoh_async(
+                    &mut dst[..words],
+                    src,
+                    self.stream.cu_stream(),
+                )
+            }
+            .map_err(|e| drv("download MSM points", e))?;
+            // The buffer's own event is recorded only on a context with several streams.
+            pinned
+                .copied
+                .record(&self.stream)
+                .map_err(|e| drv("record MSM readback event", e))?;
+        }
+        Ok(PinnedWords { pinned, words })
+    }
+
     /// A finished batch's buffers back into the arena, or freed without one.
     fn recycle(&self, plans: Vec<Plan<'_>>, outs: Vec<Outputs>) {
         let Some(arena) = &self.arena else {
@@ -2722,7 +2790,7 @@ impl CudaMsm {
         })
     }
 
-    /// Every MSM in one stream, one synchronize, one readback.
+    /// Every MSM in one stream, one synchronize, a readback a job behind its launches.
     ///
     /// Jobs that share a scalar buffer, offset and length share their digit pipeline: the A,
     /// B-in-G2 and B-in-G1 MSMs all run over the whole witness, so the counting sort runs
@@ -2737,10 +2805,20 @@ impl CudaMsm {
 
     /// [`Self::msm_batch`] under a [`Self::plan_guard`] the caller holds.
     fn batch(&self, jobs: &[Job<'_>]) -> Result<Vec<MsmResult>, ProveError> {
+        self.batch_then(jobs, &mut || ())
+    }
+
+    /// [`Self::batch`], with `queued` run on the host once every launch is queued and
+    /// before the wait, so beside the device's work rather than ahead of it.
+    fn batch_then(
+        &self,
+        jobs: &[Job<'_>],
+        queued: &mut dyn FnMut(),
+    ) -> Result<Vec<MsmResult>, ProveError> {
         // Owned out here so the scratch goes back to an arena on every return, an error
         // included.
         let (mut plans, mut outs) = (Vec::new(), Vec::new());
-        let result = self.run_batch(jobs, &mut plans, &mut outs);
+        let result = self.run_batch(jobs, &mut plans, &mut outs, queued);
         self.recycle(plans, outs);
         let out = result?;
         trace_memory(&self.ctx, &self.stream, "after MSM scratch recycle")
@@ -2753,6 +2831,7 @@ impl CudaMsm {
         jobs: &[Job<'a>],
         plans: &mut Vec<Plan<'a>>,
         outs: &mut Vec<Outputs>,
+        queued: &mut dyn FnMut(),
     ) -> Result<Vec<MsmResult>, ProveError> {
         if jobs.is_empty() {
             return Ok(Vec::new());
@@ -2814,6 +2893,7 @@ impl CudaMsm {
         start
             .record(&self.stream)
             .map_err(|e| drv("record MSM start event", e))?;
+        let t_start = Instant::now();
 
         // ---- plan ----
         let mixes = plan_mixes(jobs);
@@ -2881,27 +2961,44 @@ impl CudaMsm {
         for p in plans.iter() {
             self.launch_digits(p)?;
         }
+        // Each job's partials are copied out behind its own launches, so the host has
+        // them while the device is still on the jobs after it.
+        let mut readbacks = Readbacks {
+            msm: self,
+            bufs: Vec::with_capacity(jobs.len()),
+        };
         for (i, (job, out)) in jobs.iter().zip(outs.iter()).enumerate() {
-            self.launch_points(job, out, &plans[job_plan[i]])?;
+            let plan = &plans[job_plan[i]];
+            self.launch_points(job, out, plan)?;
+            readbacks.bufs.push(out.queue_readback(self, plan)?);
         }
         end.record(&self.stream)
             .map_err(|e| drv("record MSM end event", e))?;
+        queued();
 
-        // The one wait. Everything above was queued without the host blocking.
+        // ---- combine ----
+        // A job's partials are waited for one job at a time, and its Horner pass runs
+        // beside the device's work on the next job.
+        let combined: Result<Vec<MsmResult>, ProveError> = outs
+            .iter()
+            .zip(&readbacks.bufs)
+            .enumerate()
+            .map(|(i, (out, readback))| out.combine(&plans[job_plan[i]], readback))
+            .collect();
+
+        // The one wait on the stream, which the last job's partials already were. It stays
+        // ahead of every return from here, so no scratch is handed back under a kernel.
         self.stream
             .synchronize()
             .map_err(|e| drv("synchronize stages 5-9", e))?;
-        self.last_device_us
-            .store(elapsed_us(&start, &end)?, Ordering::Relaxed);
-
-        // ---- combine ----
-        let t0 = Instant::now();
-        let mut results = Vec::with_capacity(jobs.len());
-        for (i, out) in outs.iter().enumerate() {
-            results.push(out.combine(self, &plans[job_plan[i]])?);
-        }
-        self.last_combine_us
-            .store(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let results = combined?;
+        let device_us = elapsed_us(&start, &end)?;
+        self.last_device_us.store(device_us, Ordering::Relaxed);
+        // What the host spent past the device's span, the last job's Horner pass above all.
+        self.last_combine_us.store(
+            (t_start.elapsed().as_micros() as u64).saturating_sub(device_us),
+            Ordering::Relaxed,
+        );
 
         Ok(results)
     }
@@ -2936,28 +3033,6 @@ impl CudaMsm {
         let _plan = self.plan_guard();
 
         let t0 = Instant::now();
-        // The witness the gather already uploaded is reused when `h` is our own device
-        // handle and can vouch (length + limb fold) that it was computed from this very
-        // witness; then the standard-form copy `compute_h` converted on device serves
-        // stages 5-8 with no second PCIe transfer and no host-side re-pack. Any doubt
-        // falls back to the plain upload. `G16_CUDA_WITNESS_REUSE=0` forces the fallback.
-        // `w_owned` exists only to give the fallback upload an owner that outlives the
-        // batch; the reuse arm borrows straight from the handle inside `h`.
-        let reused = h
-            .device_handle::<HHandle>(TAG)
-            .and_then(|hd| hd.witness_std_for(witness));
-        let w_owned: Option<ScalarBuf> = if reused.is_none() {
-            Some(self.upload_scalars(witness)?)
-        } else {
-            None
-        };
-        let w = match reused {
-            Some((buf, _)) if self.work == Work::Constant => {
-                Scalars::device_std(buf, witness.len())?
-            }
-            Some((buf, prefix)) => Scalars::device_std_with_prefix(buf, witness.len(), prefix)?,
-            None => w_owned.as_ref().expect("uploaded above").as_scalars(),
-        };
         // Held only so the borrow in `h_scalars` outlives the batch.
         let h_owned: Option<ScalarBuf>;
         let h_scalars = match h.require_handle::<HHandle>(TAG)? {
@@ -2975,7 +3050,7 @@ impl CudaMsm {
                 Scalars::device_std(handle.h_std(), h.len())?
             }
         };
-        let upload_us = t0.elapsed().as_micros() as u64;
+        let h_upload_us = t0.elapsed().as_micros() as u64;
 
         let n = witness.len();
         let l_off = self.n_public + 1;
@@ -2985,71 +3060,112 @@ impl CudaMsm {
         // truncating would drop the tail of `H` and produce a proof that only fails at
         // verification.
         let h_n = h_scalars.len();
-        let (wa, a_n, _) = w.select(self.a_live.as_ref(), 0..n);
-        let (wb, b_n, _) = w.select(self.b_live.as_ref(), 0..n);
-        let jobs = vec![
-            Job::G1(JobG1 {
-                bases: &self.a,
-                base_off: 0,
-                scalars: wa,
-                scalar_off: 0,
-                n: a_n,
-            }),
-            Job::G2(JobG2 {
-                bases: &self.b_g2,
-                base_off: 0,
-                scalars: wb,
-                scalar_off: 0,
-                n: b_n,
-            }),
-            Job::G1(JobG1 {
-                bases: &self.b_g1,
-                base_off: 0,
-                scalars: wb,
-                scalar_off: 0,
-                n: b_n,
-            }),
-            Job::G1(JobG1 {
-                bases: &self.l,
-                base_off: 0,
-                scalars: w,
-                scalar_off: l_off,
-                n: l_n,
-            }),
-            Job::G1(JobG1 {
-                bases: &self.h,
-                base_off: 0,
-                scalars: h_scalars,
-                scalar_off: 0,
-                n: h_n,
-            }),
-        ];
-        // One batch when the five fit the device memory, which is every key the benchmarks
-        // run; otherwise the batches `resident_schedule` lists, in the longest runs that fit.
-        let budget = self.vram_budget()?;
-        let out = match budget {
-            Some(b) if self.batch_bytes(&jobs)? > b => {
-                let run = self.fit_runs(w, h_scalars, h_n, n.max(h_n), b)?;
-                self.run_schedule(w, h_scalars, h_n, run)?
-            }
-            _ => {
-                let out = self.batch(&jobs)?;
-                self.last_runs.store(1, Ordering::Relaxed);
-                MsmOutputs {
-                    a_g1: out[0].g1()?,
-                    b_g2: out[1].g2()?,
-                    b_g1: out[2].g1()?,
-                    l_g1: out[3].g1()?,
-                    h_g1: out[4].g1()?,
+        // The five MSMs over the witness scalars `w`, `queued` as in `batch_then`.
+        let run = |w: Scalars<'_>, queued: &mut dyn FnMut()| -> Result<MsmOutputs, ProveError> {
+            let (wa, a_n, _) = w.select(self.a_live.as_ref(), 0..n);
+            let (wb, b_n, _) = w.select(self.b_live.as_ref(), 0..n);
+            let jobs = vec![
+                Job::G1(JobG1 {
+                    bases: &self.a,
+                    base_off: 0,
+                    scalars: wa,
+                    scalar_off: 0,
+                    n: a_n,
+                }),
+                Job::G2(JobG2 {
+                    bases: &self.b_g2,
+                    base_off: 0,
+                    scalars: wb,
+                    scalar_off: 0,
+                    n: b_n,
+                }),
+                Job::G1(JobG1 {
+                    bases: &self.b_g1,
+                    base_off: 0,
+                    scalars: wb,
+                    scalar_off: 0,
+                    n: b_n,
+                }),
+                Job::G1(JobG1 {
+                    bases: &self.l,
+                    base_off: 0,
+                    scalars: w,
+                    scalar_off: l_off,
+                    n: l_n,
+                }),
+                Job::G1(JobG1 {
+                    bases: &self.h,
+                    base_off: 0,
+                    scalars: h_scalars,
+                    scalar_off: 0,
+                    n: h_n,
+                }),
+            ];
+            // One batch when the five fit the device memory, which is every key the
+            // benchmarks run; otherwise the batches `resident_schedule` lists, in the
+            // longest runs that fit.
+            let budget = self.vram_budget()?;
+            match budget {
+                Some(b) if self.batch_bytes(&jobs)? > b => {
+                    let len = self.fit_runs(w, h_scalars, h_n, n.max(h_n), b)?;
+                    self.run_schedule(w, h_scalars, h_n, len)
+                }
+                _ => {
+                    let out = self.batch_then(&jobs, queued)?;
+                    self.last_runs.store(1, Ordering::Relaxed);
+                    Ok(MsmOutputs {
+                        a_g1: out[0].g1()?,
+                        b_g2: out[1].g2()?,
+                        b_g1: out[2].g1()?,
+                        l_g1: out[3].g1()?,
+                        h_g1: out[4].g1()?,
+                    })
                 }
             }
+        };
+        // The fallback: the witness packed and uploaded again, when the handle cannot
+        // vouch for the copy it holds.
+        let upload = || -> Result<(MsmOutputs, u64), ProveError> {
+            let t0 = Instant::now();
+            let owned = self.upload_scalars(witness)?;
+            let upload_us = t0.elapsed().as_micros() as u64;
+            Ok((run(owned.as_scalars(), &mut || ())?, upload_us))
+        };
+
+        // The witness the gather already uploaded is reused when `h` is our own device
+        // handle and can vouch (length + limb fold) that it was computed from this very
+        // witness; then the standard-form copy `compute_h` converted on device serves
+        // stages 5-8 with no second PCIe transfer and no host-side re-pack. The fold is a
+        // pass over the whole witness, so it is taken once the batch is queued, beside the
+        // device's work, and a batch over a copy it then refuses is thrown away and run
+        // again from the plain upload, as any other doubt is.
+        // `G16_CUDA_WITNESS_REUSE=0` forces the fallback.
+        let claim = h
+            .device_handle::<HHandle>(TAG)
+            .and_then(|hd| Some((hd, hd.witness_std_claim(witness.len())?)));
+        let (out, upload_us) = match claim {
+            Some((hd, (buf, prefix))) => {
+                let w = if self.work == Work::Constant {
+                    Scalars::device_std(buf, witness.len())?
+                } else {
+                    Scalars::device_std_with_prefix(buf, witness.len(), prefix)?
+                };
+                let mut held = None;
+                let out = run(w, &mut || held = Some(hd.holds(witness)))?;
+                if held.unwrap_or_else(|| hd.holds(witness)) {
+                    (out, 0)
+                } else {
+                    upload()?
+                }
+            }
+            None => upload()?,
         };
 
         // Host launch time is not added: the launches are asynchronous, so it overlaps the
         // device work the event pair already counted. What is added is the two things that
         // genuinely happen with the device idle. One event pair over each batch, so
         // `msm_split` stays `None`.
-        t.msm_us += upload_us + self.last_device_us() + self.last_combine_us();
+        t.msm_us += h_upload_us + upload_us + self.last_device_us() + self.last_combine_us();
 
         Ok(out)
     }
@@ -3767,24 +3883,92 @@ impl Outputs {
     /// against tens of millions on the device: moving this to the GPU would cost more in
     /// launches than it saves, which is the same place the Metal twin and zkonduit's
     /// Metal MSM both stop.
-    fn combine(&self, msm: &CudaMsm, plan: &Plan<'_>) -> Result<MsmResult, ProveError> {
-        // Only the words the plan wrote: a buffer from an arena may be longer.
+    /// Queue the copy of this job's reduce partials, and of its ones partials, into
+    /// page-locked host memory. Only the words the plan wrote: a buffer from an arena may
+    /// be longer.
+    fn queue_readback(&self, msm: &CudaMsm, plan: &Plan<'_>) -> Result<Readback, ProveError> {
         let pw = self.group.words();
-        let w_words = download_prefix(&msm.stream, &self.window_sums, plan.window_sums() * pw)?;
-        let o_words = match &self.ones {
+        let sums = msm.read_back(&self.window_sums, plan.window_sums() * pw)?;
+        let ones = match &self.ones {
             Some(ones) => {
-                let words = download_prefix(&msm.stream, ones, self.ones_groups * pw)?;
+                let words = msm.read_back(ones, self.ones_groups * pw)?;
                 #[cfg(test)]
                 msm.activity.ones_readbacks.fetch_add(1, Ordering::Relaxed);
-                words
+                Some(words)
             }
-            None => Vec::new(),
+            None => None,
         };
-        let (w, o) = (&w_words, &o_words);
+        Ok(Readback { sums, ones })
+    }
+
+    /// Wait for this job's partials and add them up on the host.
+    fn combine(&self, plan: &Plan<'_>, readback: &Readback) -> Result<MsmResult, ProveError> {
+        let w = readback.sums.words()?;
+        let o = match &readback.ones {
+            Some(ones) => ones.words()?,
+            None => &[],
+        };
         Ok(match self.group {
             Group::G1 => MsmResult::G1(horner(w, o, plan, "G1", PackedXyzzG1::to_projective)?),
             Group::G2 => MsmResult::G2(horner(w, o, plan, "G2", PackedXyzzG2::to_projective)?),
         })
+    }
+}
+
+/// The smallest page-locked readback buffer, in words: 16 KiB, a G2 job's partials at
+/// most widths.
+const PINNED_MIN_WORDS: usize = 4096;
+
+/// One device buffer's prefix on its way to the host.
+struct PinnedWords {
+    pinned: Pinned,
+    words: usize,
+}
+
+/// A page-locked host buffer and the event behind the last copy into it.
+struct Pinned {
+    buf: PinnedHostSlice<u32>,
+    copied: CudaEvent,
+}
+
+impl PinnedWords {
+    /// The words, once the copy that fills them has run.
+    fn words(&self) -> Result<&[u32], ProveError> {
+        if self.words == 0 {
+            return Ok(&[]);
+        }
+        self.pinned
+            .copied
+            .synchronize()
+            .map_err(|e| drv("wait for MSM points", e))?;
+        let all = self
+            .pinned
+            .buf
+            .as_slice()
+            .map_err(|e| drv("read MSM points", e))?;
+        Ok(&all[..self.words])
+    }
+}
+
+/// What one job reads back: its reduce partials and, with a ones pass, that pass's.
+struct Readback {
+    sums: PinnedWords,
+    ones: Option<PinnedWords>,
+}
+
+/// A batch's readbacks, whose buffers go back to [`CudaMsm::pinned`] on every return.
+struct Readbacks<'a> {
+    msm: &'a CudaMsm,
+    bufs: Vec<Readback>,
+}
+
+impl Drop for Readbacks<'_> {
+    fn drop(&mut self) {
+        let mut pool = self.msm.pinned.lock().unwrap_or_else(|e| e.into_inner());
+        for r in self.bufs.drain(..) {
+            pool.push(r.sums.pinned);
+            pool.extend(r.ones.map(|o| o.pinned));
+        }
     }
 }
 
@@ -3865,27 +4049,6 @@ fn upload_g2(
         buf: staging.upload_packed(stream, bases, PackedG2Affine::pack_into)?,
         len: bases.len(),
     })
-}
-
-/// [`download`] of the first `words` of `buf`, all of it when that is its length.
-fn download_prefix(
-    stream: &Arc<CudaStream>,
-    buf: &CudaSlice<u32>,
-    words: usize,
-) -> Result<Vec<u32>, ProveError> {
-    if words > buf.len() {
-        return Err(bad(format!(
-            "readback of {words} words from a buffer of {}",
-            buf.len()
-        )));
-    }
-    let v = stream
-        .clone_dtoh(&buf.slice(..words))
-        .map_err(|e| drv("download MSM points", e))?;
-    stream
-        .synchronize()
-        .map_err(|e| drv("synchronize MSM readback", e))?;
-    Ok(v)
 }
 
 // ---------------------------------------------------------------------------
@@ -5583,7 +5746,9 @@ mod tests {
             );
             m.launch_points(&job, &out, &p).unwrap();
             m.stream.synchronize().unwrap();
-            let result = out.combine(m, &p).unwrap();
+            let result = out
+                .combine(&p, &out.queue_readback(m, &p).unwrap())
+                .unwrap();
             if out.group == Group::G2 {
                 assert_eq!(result.g2().unwrap(), g2 * want);
             } else {
@@ -7015,7 +7180,9 @@ mod tests {
                     let r = time(&|| m.launch_reduce(&job, &out, &plan, &params));
                     let o = time(&|| m.launch_ones(&job, &out, &plan, &params));
                     let t0 = Instant::now();
-                    let got = out.combine(m, &plan).unwrap();
+                    let got = out
+                        .combine(&plan, &out.queue_readback(m, &plan).unwrap())
+                        .unwrap();
                     let h = t0.elapsed().as_secs_f64() * 1e3;
                     check(got, rep, "isolated");
                     if rep >= warm {

@@ -960,10 +960,6 @@ impl CudaStages {
             };
             PackedFr::pack_into(witness, dst);
         }
-        // Fingerprint, and classify only in variable work. The prefix is what
-        // lets the MSM stage size its windows for the general scalars only; the fold is
-        // what lets it prove the witness it was handed is the one this scratch holds.
-        let (witness_prefix, witness_fold) = witness_metadata(witness, self.work);
         let pack_us = start.elapsed().as_micros() as u64;
 
         let fused = std::env::var_os("G16_CUDA_UNFUSED").is_none();
@@ -1008,6 +1004,13 @@ impl CudaStages {
                 .record(&self.stream)
                 .map_err(|e| drv("record join event", e))?;
         }
+
+        // Fingerprint, and classify only in variable work. The prefix is what
+        // lets the MSM stage size its windows for the general scalars only; the fold is
+        // what lets it prove the witness it was handed is the one this scratch holds.
+        // Neither is read before the MSM stage, so both are computed here, while the
+        // device runs what was queued above.
+        let (witness_prefix, witness_fold) = witness_metadata(witness, self.work);
 
         // The one wait. Everything above was queued without the host blocking.
         self.stream
@@ -1652,17 +1655,26 @@ impl HHandle {
         &self,
         witness: &[snarkrs_field::Fr],
     ) -> Option<(&CudaSlice<u32>, &[u32])> {
+        self.witness_std_claim(witness.len())
+            .filter(|_| self.holds(witness))
+    }
+
+    /// [`Self::witness_std_for`] without the fold, for the caller that takes it while
+    /// the device works: the buffer and prefix of a witness of `len` scalars, to be held
+    /// to [`Self::holds`] before anything computed from them is used.
+    pub(crate) fn witness_std_claim(&self, len: usize) -> Option<(&CudaSlice<u32>, &[u32])> {
         if std::env::var("G16_CUDA_WITNESS_REUSE").as_deref() == Ok("0") {
             return None;
         }
-        if !self.reuse || witness.len() != self.n_vars {
-            return None;
-        }
-        let fold = witness_fingerprint(witness);
-        if fold != self.witness_fold {
+        if !self.reuse || len != self.n_vars {
             return None;
         }
         Some((&self.sc().witness_std, &self.witness_prefix))
+    }
+
+    /// Whether `witness` folds to what this handle's `compute_h` was given.
+    pub(crate) fn holds(&self, witness: &[snarkrs_field::Fr]) -> bool {
+        witness_fingerprint(witness) == self.witness_fold
     }
 
     /// The standard-form witness this handle's stages left on the device, `n_vars * 8`

@@ -412,6 +412,17 @@ fn constant_work_proof_and_resident_h_match_cpu_and_variable() {
             assert_eq!(got.l_g1, d.l_g1);
             assert_eq!(got.h_g1, d.h_g1);
         }
+        // A witness the handle refuses is uploaded again, and the batch queued over the
+        // handle's copy thrown away.
+        let want = cpu.msms(&changed, &want_h, &mut t).unwrap();
+        for backend in [circuit.as_ref(), variable.as_ref()] {
+            let got = backend.msms(&changed, &h, &mut t).unwrap();
+            assert_eq!(got.a_g1, want.a_g1, "{name}");
+            assert_eq!(got.b_g2, want.b_g2, "{name}");
+            assert_eq!(got.b_g1, want.b_g1, "{name}");
+            assert_eq!(got.l_g1, want.l_g1, "{name}");
+            assert_eq!(got.h_g1, want.h_g1, "{name}");
+        }
         for (r, s) in [(0u64, 0u64), (31337, 4242)] {
             let prove = |backend: &dyn PreparedCircuit| {
                 prove_with_blinders(
