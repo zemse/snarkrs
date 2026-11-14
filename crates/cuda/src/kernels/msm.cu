@@ -772,15 +772,135 @@ extern "C" __global__ void msm_segmented_g1(const MsmEntry* entries,
     msm_segmented_impl<Fq>(entries, bases, cursor, buckets, spill_pts, spill_rows, p, gid);
 }
 
-extern "C" __global__ void msm_segmented_g2(const MsmEntry* entries,
-                                            const AffG2* bases,
-                                            const u32* cursor,
-                                            PtG2* buckets,
-                                            PtG2* spill_pts,
-                                            u32* spill_rows,
-                                            MsmParams p) {
+// The G2 accumulation is `msm_segmented_impl<Fq2>` with half of its accumulator out of the
+// registers. As the template instantiates it the kernel holds 255 of them, so an SM takes
+// two blocks of it and a third waits its turn. Here y and zzz live in the block's shared
+// memory, 16 KB a block, and `__launch_bounds__` holds ptxas to the 168 registers that let
+// an SM take three: it spills 66 bytes where the template bounded the same way spills 980.
+// SEG_TG is the shared arrays' length and so the block the host launches (`POINT_BLOCK`).
+// MEASURED on a T4, microseconds a step of a pass against its blocks an SM, the G2 pass
+// of six circuits with every slice length forced in turn, every proof verified:
+//
+//   blocks an SM    1    2        3         4         5         6
+//   the template   50   78-86   142-165   154-169   215-240   229-250
+//   this           51   75-92    92-121   146-178   182-207   193-243
+//
+// Four blocks an SM is not the next step. Bounded to 128 registers the same body spills
+// 942 bytes and reads 135 at two blocks and 150 to 170 at four, and js_16x16_d32's proof
+// 82.0 ms against 81.5: the card runs this pass at its 70 W cap with the SM clock pulled
+// down under it, so warps past the ones the cap feeds buy nothing and the spills cost.
+#define SEG_TG 128
+#define SEG_SM_BLOCKS 3
+
+// `pt_madd` on an accumulator whose y and zzz sit behind pointers: the same guards, the
+// same products in the same order, so the same bits.
+__device__ __forceinline__ void pt_madd_split(Fq2& x, Fq2* y, Fq2& zz, Fq2* zzz, AffG2 p) {
+    if (aff_is_inf(p)) {
+        return;
+    }
+    if (f_is_zero(zz)) {
+        x = p.x;
+        *y = p.y;
+        f_set_one(zz);
+        *zzz = zz;
+        return;
+    }
+    Fq2 u2 = f_mul(p.x, zz);
+    Fq2 s2 = f_mul(p.y, *zzz);
+    Fq2 pp_ = f_sub(u2, x);
+    Fq2 rr = f_sub(s2, *y);
+    if (f_is_zero(pp_)) {
+        PtG2 r = pt_zero<Fq2>();
+        if (f_is_zero(rr)) {
+            r = pt_dbl_affine(p);
+        }
+        x = r.x;
+        *y = r.y;
+        zz = r.zz;
+        *zzz = r.zzz;
+        return;
+    }
+    Fq2 pp = f_sqr(pp_);
+    Fq2 ppp = f_mul(pp_, pp);
+    Fq2 q = f_mul(x, pp);
+    x = f_sub(f_sub(f_sqr(rr), ppp), f_add(q, q));
+    *y = f_sub(f_mul(rr, f_sub(q, x)), f_mul(*y, ppp));
+    zz = f_mul(zz, pp);
+    *zzz = f_mul(*zzz, ppp);
+}
+
+extern "C" __global__ void __launch_bounds__(SEG_TG, SEG_SM_BLOCKS)
+msm_segmented_g2(const MsmEntry* entries,
+                 const AffG2* bases,
+                 const u32* cursor,
+                 PtG2* buckets,
+                 PtG2* spill_pts,
+                 u32* spill_rows,
+                 MsmParams p) {
+    __shared__ Fq2 shared_y[SEG_TG];
+    __shared__ Fq2 shared_zzz[SEG_TG];
     u32 gid = blockIdx.x * blockDim.x + threadIdx.x;
-    msm_segmented_impl<Fq2>(entries, bases, cursor, buckets, spill_pts, spill_rows, p, gid);
+    u32 w = gid / p.slices;
+    u32 k = gid - w * p.slices;
+    if (w >= p.n_windows) {
+        return;
+    }
+    u32 base = w * p.cap;
+    u32 last = w * p.n_buckets + p.n_buckets - 1u;
+    u32 used = cursor[last] - base;
+
+    u32 head_slot = 2u * gid;
+    u32 tail_slot = head_slot + 1u;
+    spill_rows[head_slot] = MSM_NO_ROW;
+    spill_rows[tail_slot] = MSM_NO_ROW;
+
+    u32 lo = k * p.slice_len;
+    if (lo >= used) {
+        return;
+    }
+    u32 hi = msm_min(lo + p.slice_len, used);
+
+    u32 cur_row = entries[base + lo].x;
+    PtG2 acc = pt_zero<Fq2>();
+    Fq2* y = &shared_y[threadIdx.x];
+    Fq2* zzz = &shared_zzz[threadIdx.x];
+    *y = acc.y;
+    *zzz = acc.zzz;
+    bool is_first_run = true;
+
+    for (u32 i = lo; i < hi; i++) {
+        MsmEntry e = entries[base + i];
+        if (e.x != cur_row) {
+            acc.y = *y;
+            acc.zzz = *zzz;
+            if (is_first_run) {
+                spill_rows[head_slot] = cur_row;
+                spill_pts[head_slot] = acc;
+                is_first_run = false;
+            } else {
+                buckets[cur_row] = acc;
+            }
+            acc = pt_zero<Fq2>();
+            *y = acc.y;
+            *zzz = acc.zzz;
+            cur_row = e.x;
+        }
+        AffG2 b = bases[p.base_off + (e.y >> 1)];
+        if ((e.y & 1u) != 0u) {
+            b.y = f_neg(b.y);
+        }
+        pt_madd_split(acc.x, y, acc.zz, zzz, b);
+    }
+
+    acc.y = *y;
+    acc.zzz = *zzz;
+    if (is_first_run) {
+        spill_rows[head_slot] = cur_row;
+        spill_pts[head_slot] = acc;
+    } else {
+        spill_rows[tail_slot] = cur_row;
+        spill_pts[tail_slot] = acc;
+    }
 }
 
 // The constant-work accumulation below, the fold and the reduce's constant branch are
