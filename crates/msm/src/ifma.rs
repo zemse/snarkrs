@@ -643,7 +643,7 @@ fn window_chunk<P: IfmaCurve>(
 ) -> Projective<P> {
     let n_buckets = 1usize << (c - 1);
     let mut fill = Fill::<P>::new(bases, &scan.idx, &prep.rows, n_buckets);
-    // See `window_chunk_batch`.
+    // See `window_fill`.
     let mut dummy = Xyzz::<P::RF>::ZERO;
     for k in range {
         let d = signed_digit(scan.bigints[k].as_ref(), window, c);

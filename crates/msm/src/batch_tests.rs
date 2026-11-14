@@ -401,6 +401,9 @@ fn check_reduce<P: RawCurve<ScalarField = Fr>>(
     while seg <= 2 * n.max(1) {
         let got = segmented_running_sum_at::<P>(&xy, &occupied, seg);
         assert_eq!(to_projective::<P>(&got), want, "n = {n}, seg = {seg}");
+        // The same lengths as chunks, each a task with its own segments.
+        let got = chunked_running_sum_at::<P>(&xy, &occupied, seg);
+        assert_eq!(to_projective::<P>(&got), want, "n = {n}, chunk = {seg}");
         seg *= 2;
     }
 }
@@ -536,6 +539,199 @@ fn reduce_segment_is_a_power_of_two_below_the_range() {
         assert!(seg.is_power_of_two() && seg >= 2 && seg < n, "n = {n}");
     }
     assert_eq!(reduce_segment(4096), 32);
+}
+
+/// Two fills of one window, each with its own points per bucket, merged while both still
+/// hold unsettled rounds, against ark's sum per bucket.
+fn check_merge<P: RawCurve<ScalarField = Fr>>(a: &[Vec<Affine<P>>], b: &[Vec<Affine<P>>]) {
+    let n = a.len();
+    assert_eq!(b.len(), n);
+    for batch in [MIN_BATCH, BATCH] {
+        let mut fills = [BatchFill::<P>::new(n, batch), BatchFill::<P>::new(n, batch)];
+        let mut want = vec![Projective::<P>::zero(); n];
+        for (fill, points) in fills.iter_mut().zip([a, b]) {
+            for (j, bucket) in points.iter().enumerate() {
+                for &point in bucket {
+                    insert(fill, j, point);
+                    want[j] += point;
+                }
+            }
+        }
+        merge_fills(&mut fills);
+        check_buckets(&fills[0], &want);
+        let weighted = want
+            .iter()
+            .enumerate()
+            .fold(Projective::<P>::zero(), |acc, (b, p)| {
+                acc + *p * Fr::from((b + 1) as u64)
+            });
+        let got = chunked_running_sum::<P>(&fills[0].xy, &fills[0].occupied);
+        assert_eq!(to_projective::<P>(&got), weighted);
+        let [merged, _] = fills;
+        check_finish(merged, &want);
+    }
+}
+
+fn merge_shapes<P: RawCurve<ScalarField = Fr>>() {
+    use ark_std::rand::Rng;
+    let small = small_multiples::<P>(9);
+    let m = |i: i64| small[(i + 9) as usize].into_affine();
+    let none = || vec![Vec::new(); 9];
+    // Nothing on either side, nothing on one, and a single point on one.
+    check_merge::<P>(&none(), &none());
+    let mut one = none();
+    one[8] = vec![m(4)];
+    check_merge::<P>(&one, &none());
+    check_merge::<P>(&none(), &one);
+
+    let mut a = none();
+    let mut b = none();
+    // The two fills' buckets meet as equal points and as opposite ones.
+    (a[0], b[0]) = (vec![m(1)], vec![m(1)]);
+    (a[1], b[1]) = (vec![m(1)], vec![m(-1)]);
+    // Opposite only once a pending addition lands.
+    (a[2], b[2]) = (vec![m(1), m(2)], vec![m(-3)]);
+    // One fill arrives with retries, which settle into its side bucket, and the bucket
+    // then differs from, equals and negates the other's.
+    (a[3], b[3]) = (vec![m(2)], vec![m(1); 6]);
+    (a[4], b[4]) = (vec![m(6)], vec![m(1); 6]);
+    (a[5], b[5]) = (vec![m(-6)], vec![m(1); 6]);
+    // Retries on both sides that sum to nothing.
+    (a[6], b[6]) = (vec![m(1); 6], vec![m(-2); 3]);
+    // A bucket that emptied inside one fill, over a live one and an empty one.
+    (a[7], b[7]) = (vec![m(5)], vec![m(1), m(-1)]);
+    b[8] = vec![m(2), m(1), m(-3)];
+    check_merge::<P>(&a, &b);
+    check_merge::<P>(&b, &a);
+
+    // A hot bucket past the retry trigger, cancelled by the other fill's one point.
+    let hot = MIN_BATCH + 2;
+    let total = (Projective::<P>::from(m(1)) * Fr::from(hot as u64)).into_affine();
+    let mut a = none();
+    let mut b = none();
+    (a[3], b[3]) = (vec![-total], vec![m(1); hot]);
+    (a[4], b[4]) = (vec![total], vec![m(1); hot]);
+    check_merge::<P>(&a, &b);
+    check_merge::<P>(&b, &a);
+
+    // More buckets than one task of the merge takes.
+    let mut rng = ark_std::test_rng();
+    let n = 2 * REDUCE_CHUNK + 37;
+    let mut side = || -> Vec<Vec<Affine<P>>> {
+        (0..n)
+            .map(|_| {
+                (0..rng.gen_range(0..3))
+                    .map(|_| rng.gen_range(-9i64..=9))
+                    .filter(|&i| i != 0)
+                    .map(m)
+                    .collect()
+            })
+            .collect()
+    };
+    let (a, b) = (side(), side());
+    check_merge::<P>(&a, &b);
+}
+
+#[test]
+fn merge_shapes_g1() {
+    merge_shapes::<snarkrs_field::g1::Config>();
+}
+
+#[test]
+fn merge_shapes_g2() {
+    merge_shapes::<snarkrs_field::g2::Config>();
+}
+
+/// Every window of a small MSM through [`ganged_windows`], in pieces from one point up to
+/// the whole range and on one thread and twelve, against the digits times the bases in
+/// ark arithmetic. Repeated and negated bases under one scalar meet across the pieces,
+/// in whichever fills the pool happened to give them.
+fn ganged_pieces<P: RawCurve<ScalarField = Fr>>()
+where
+    P::BaseField: Send + Sync,
+{
+    let small = small_multiples::<P>(9);
+    let n = 700;
+    let mut bases: Vec<Affine<P>> = (0..n).map(|i| small[10 + i % 9].into_affine()).collect();
+    let mut scalars: Vec<Fr> = (0..n).map(|i| -Fr::from(i as u64 * 7919 + 3)).collect();
+    for i in 0..n / 2 {
+        // One scalar over a base and its negative, alternating: every bucket they
+        // touch sees doublings and cancellations, most of them across pieces.
+        bases[i] = if i % 3 == 0 { -bases[0] } else { bases[0] };
+        scalars[i] = scalars[0];
+    }
+    scalars[n - 1] = Fr::zero();
+    for len in [0, 1, n] {
+        let scan = Prescan::<P> {
+            idx: (0..len as u32).collect(),
+            bigints: scalars[..len].iter().map(|s| s.into_bigint()).collect(),
+            ones_sum: Projective::zero(),
+        };
+        for c in [5u32, 9] {
+            let want: Vec<_> = (0..RECODE_BITS.div_ceil(c as usize))
+                .map(|w| {
+                    (0..len).fold(Projective::<P>::zero(), |acc, k| {
+                        let d = signed_digit(scan.bigints[k].as_ref(), w, c);
+                        let term = Projective::<P>::from(bases[k]) * Fr::from(d.unsigned_abs());
+                        if d < 0 {
+                            acc - term
+                        } else {
+                            acc + term
+                        }
+                    })
+                })
+                .collect();
+            for grain in [1, 2, 7, 64, n / 2, n] {
+                for threads in [1, 12] {
+                    for work in [Work::Variable, Work::Constant] {
+                        assert_eq!(
+                            ganged_windows(&bases, &scan, c, work, threads, grain),
+                            want,
+                            "{len} points at c = {c}, pieces of {grain}, {threads} threads"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn ganged_pieces_g1() {
+    ganged_pieces::<snarkrs_field::g1::Config>();
+}
+
+#[test]
+fn ganged_pieces_g2() {
+    ganged_pieces::<snarkrs_field::g2::Config>();
+}
+
+/// A window closes once, after its last piece, however the threads come and go: every
+/// thread that claimed a piece hands in one fill, and one that came too late hands in
+/// none.
+#[test]
+fn a_gang_closes_with_every_fill() {
+    type P = snarkrs_field::g1::Config;
+    let fill = || Some(BatchFill::<P>::new(16, 8));
+    let gang = Gang::<P>::new();
+    let pieces = 3;
+    assert!(gang.enter() && gang.enter() && gang.enter());
+    gang.next.store(2, Ordering::Relaxed);
+    // A piece is still unclaimed, then two threads are still inside.
+    assert!(gang.leave(fill(), pieces).is_none());
+    gang.next.store(4, Ordering::Relaxed);
+    assert!(gang.leave(None, pieces).is_none());
+    assert!(gang.enter());
+    assert!(gang.leave(fill(), pieces).is_none());
+    assert_eq!(gang.leave(fill(), pieces).map(|fills| fills.len()), Some(3));
+    assert!(!gang.enter());
+    assert_eq!(gang.inside.load(Ordering::Relaxed), 0);
+
+    for c in 3..=MAX_WINDOW {
+        let n_buckets = 1usize << (c - 1);
+        let grain = split_grain(n_buckets);
+        assert!(grain >= MIN_GRAIN && grain >= n_buckets / GRAIN_BUCKET_RATIO);
+    }
 }
 
 /// The XYZZ running sum against the segmented one at every segment length, per bucket,

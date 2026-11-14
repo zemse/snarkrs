@@ -24,6 +24,8 @@ use ark_ec::short_weierstrass::{Affine, Projective, SWCurveConfig};
 use ark_ff::{AdditiveGroup, One, PrimeField, Zero};
 use rayon::prelude::*;
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use snarkrs_field::{Fr, G1Affine, G1Projective, G2Affine, G2Projective};
 
@@ -118,6 +120,12 @@ const BATCH: usize = 1024;
 /// under one Fq product per point; narrower windows mean a small `m`, where the fill is
 /// not the cost that matters, and they keep the XYZZ fill.
 const MIN_BATCH: usize = 128;
+
+/// Buckets per point of a piece, see [`split_grain`].
+const GRAIN_BUCKET_RATIO: usize = 4;
+
+/// Fewest points in a piece, about 0.1 ms of G1 on a performance core.
+const MIN_GRAIN: usize = 1024;
 
 /// Batch size for a window of `n_buckets`: half the buckets, capped at [`BATCH`]. Below
 /// the cap this holds the conflict share `batch / n_buckets` where the 2048-bucket window
@@ -867,13 +875,18 @@ impl<P: RawCurve> BatchFill<P> {
         self.busy[b] = false;
     }
 
-    /// Flush the stragglers, then reduce. Two flushes settle everything: after the
-    /// first, a retry either schedules cleanly or drops to the side buckets in
-    /// [`Self::reschedule`].
-    fn finish(mut self) -> Projective<P> {
+    /// Flush the stragglers. Two flushes settle everything: after the first, a retry
+    /// either schedules cleanly or drops to the side buckets in [`Self::reschedule`].
+    fn settle(&mut self) {
         self.flush();
         self.reschedule();
         self.flush();
+    }
+
+    /// Settle, then reduce, on this thread.
+    #[cfg(test)]
+    fn finish(mut self) -> Projective<P> {
+        self.settle();
         to_projective(&affine_running_sum::<P>(
             &mut self.xy,
             &mut self.occupied,
@@ -884,6 +897,7 @@ impl<P: RawCurve> BatchFill<P> {
 
 /// The running sum `sum_j (j + 1) * B_j` over the settled buckets, the side buckets folded
 /// in first when the chunk was degenerate enough to have any.
+#[cfg(any(test, target_arch = "x86_64"))]
 fn affine_running_sum<P: RawCurve>(
     xy: &mut [[P::RF; 2]],
     occupied: &mut [bool],
@@ -910,6 +924,16 @@ fn reduce_segment(n: usize) -> usize {
 /// The same running sum as [`window_chunk`], in XYZZ with the occupied buckets entering as
 /// mixed additions: one dependent chain, a madd and an add (20M + 4S) a bucket.
 fn xyzz_running_sum<F: RawField>(xy: &[[F; 2]], occupied: &[bool]) -> Xyzz<F> {
+    let mut plain = Xyzz::ZERO;
+    xyzz_running_sums(xy, occupied, &mut plain)
+}
+
+/// [`xyzz_running_sum`], the plain sum of the buckets left in `plain`.
+fn xyzz_running_sums<F: RawField>(
+    xy: &[[F; 2]],
+    occupied: &[bool],
+    plain: &mut Xyzz<F>,
+) -> Xyzz<F> {
     let mut running = Xyzz::<F>::ZERO;
     let mut total = Xyzz::<F>::ZERO;
     for j in (0..xy.len()).rev() {
@@ -918,6 +942,7 @@ fn xyzz_running_sum<F: RawField>(xy: &[[F; 2]], occupied: &[bool]) -> Xyzz<F> {
         }
         total.add_assign(&running);
     }
+    *plain = running;
     total
 }
 
@@ -927,6 +952,65 @@ fn segmented_running_sum<P: RawCurve>(xy: &[[P::RF; 2]], occupied: &[bool]) -> X
         return xyzz_running_sum(xy, occupied);
     }
     segmented_running_sum_at::<P>(xy, occupied, reduce_segment(xy.len()))
+}
+
+/// Buckets per task of [`chunked_running_sum`]. A chunk is its own
+/// [`segmented_running_sum`], so a shorter one shares each inversion between fewer
+/// segments: 221 ns a bucket of G1 at 2048 against 189 over 2^15 at once.
+const REDUCE_CHUNK: usize = 2048;
+
+/// [`segmented_running_sum`] with the bucket range cut into chunks of [`REDUCE_CHUNK`],
+/// one task each, so the reduction of a wide window is not one thread's to finish while
+/// the rest of the pool has run out of points.
+fn chunked_running_sum<P: RawCurve>(xy: &[[P::RF; 2]], occupied: &[bool]) -> Xyzz<P::RF> {
+    chunked_running_sum_at::<P>(xy, occupied, REDUCE_CHUNK)
+}
+
+/// [`chunked_running_sum`] at a given chunk, a power of two. A chunk's sum counts its
+/// buckets from 1, so chunk `r` still owes `r * chunk` times the plain sum of its
+/// buckets, which is settled as the segments are in [`segmented_running_sum_at`].
+fn chunked_running_sum_at<P: RawCurve>(
+    xy: &[[P::RF; 2]],
+    occupied: &[bool],
+    chunk: usize,
+) -> Xyzz<P::RF> {
+    debug_assert!(chunk.is_power_of_two());
+    if xy.len() <= chunk {
+        return segmented_running_sum::<P>(xy, occupied);
+    }
+    let parts: Vec<_> = xy
+        .par_chunks(chunk)
+        .zip(occupied.par_chunks(chunk))
+        .map(|(xy, occupied)| {
+            let mut plain = Xyzz::ZERO;
+            let sum = if xy.len() <= REDUCE_XYZZ {
+                xyzz_running_sums(xy, occupied, &mut plain)
+            } else {
+                segmented_running_sums_at::<P>(
+                    xy,
+                    occupied,
+                    reduce_segment(xy.len()),
+                    Some(&mut plain),
+                )
+            };
+            (sum, plain)
+        })
+        .collect();
+    let mut sum = Xyzz::<P::RF>::ZERO;
+    let mut running = Xyzz::<P::RF>::ZERO;
+    let mut owed = Xyzz::<P::RF>::ZERO;
+    for (r, (part, plain)) in parts.iter().enumerate().rev() {
+        sum.add_assign(part);
+        if r > 0 {
+            running.add_assign(plain);
+            owed.add_assign(&running);
+        }
+    }
+    for _ in 0..chunk.trailing_zeros() {
+        owed = owed.dbl();
+    }
+    sum.add_assign(&owed);
+    sum
 }
 
 /// What one side of a segment's step needs from the shared inversion. A first point and a
@@ -956,9 +1040,23 @@ fn segmented_running_sum_at<P: RawCurve>(
     occupied: &[bool],
     seg: usize,
 ) -> Xyzz<P::RF> {
+    segmented_running_sums_at::<P>(xy, occupied, seg, None)
+}
+
+/// [`segmented_running_sum_at`], the plain sum of the buckets left in `plain` for a
+/// caller that asks for it.
+fn segmented_running_sums_at<P: RawCurve>(
+    xy: &[[P::RF; 2]],
+    occupied: &[bool],
+    seg: usize,
+    plain: Option<&mut Xyzz<P::RF>>,
+) -> Xyzz<P::RF> {
     debug_assert!(seg.is_power_of_two());
     let n = xy.len();
     if n == 0 {
+        if let Some(plain) = plain {
+            *plain = Xyzz::ZERO;
+        }
         return Xyzz::ZERO;
     }
     let k = n.div_ceil(seg);
@@ -1071,6 +1169,14 @@ fn segmented_running_sum_at<P: RawCurve>(
             sum.madd(tot[s][0], tot[s][1]);
         }
     }
+    if let Some(plain) = plain {
+        *plain = Xyzz::ZERO;
+        for s in 0..k {
+            if run_occ[s] {
+                plain.madd(run[s][0], run[s][1]);
+            }
+        }
+    }
     // Segment s weighs s, so segment 0 drops out and segment 1 is bucket 0 of the
     // recursion.
     let mut owed = segmented_running_sum::<P>(&run[1..], &run_occ[1..]);
@@ -1126,11 +1232,22 @@ fn fold_side<P: RawCurve>(xy: &mut [[P::RF; 2]], occupied: &mut [bool], side: &S
         .collect();
     let mut inv: Vec<P::RF> = live.iter().map(|&j| side[j].zzz).collect();
     batch_invert::<P>(&mut inv);
-    let mut adds: Vec<(usize, [P::RF; 2], Step)> = Vec::with_capacity(live.len());
-    let mut dens: Vec<P::RF> = Vec::with_capacity(live.len());
-    for (&j, &izzz) in live.iter().zip(&inv) {
+    let points = live.iter().zip(&inv).map(|(&j, &izzz)| {
         let p = &side[j];
-        let p = [p.x.mul(p.zz.mul(izzz).sqr()), p.y.mul(izzz)];
+        (j, [p.x.mul(p.zz.mul(izzz).sqr()), p.y.mul(izzz)])
+    });
+    add_points::<P>(xy, occupied, points);
+}
+
+/// `bucket j += p` for each `(j, p)`, no bucket twice, behind one inversion.
+fn add_points<P: RawCurve>(
+    xy: &mut [[P::RF; 2]],
+    occupied: &mut [bool],
+    points: impl Iterator<Item = (usize, [P::RF; 2])>,
+) {
+    let mut adds: Vec<(usize, [P::RF; 2], Step)> = Vec::with_capacity(points.size_hint().0);
+    let mut dens: Vec<P::RF> = Vec::with_capacity(points.size_hint().0);
+    for (j, p) in points {
         let dx = p[0].sub(xy[j][0]);
         if !occupied[j] {
             xy[j] = p;
@@ -1154,21 +1271,52 @@ fn fold_side<P: RawCurve>(xy: &mut [[P::RF; 2]], occupied: &mut [bool], side: &S
     }
 }
 
-/// [`window_chunk`] with the fill batched: affine buckets, additions applied in rounds
-/// that share one field inversion. See [`BatchFill`] for the machinery and the conflict
-/// story. Only worth it with buckets to spare; [`pippenger`] switches on
+/// Settle every fill of one window and add the rest into the first, bucket by bucket,
+/// which then holds the window in affine buckets alone. A bucket that is empty on either
+/// side costs nothing, so the fills together make as many additions as one fill over
+/// all their points would have. The bucket range is cut as in [`chunked_running_sum`].
+fn merge_fills<P: RawCurve>(fills: &mut [BatchFill<P>]) {
+    fills.par_iter_mut().for_each(|fill| {
+        fill.settle();
+        if let Some(side) = fill.side.take() {
+            fold_side::<P>(&mut fill.xy, &mut fill.occupied, &side);
+        }
+    });
+    let Some((first, rest)) = fills.split_first_mut() else {
+        return;
+    };
+    if rest.is_empty() {
+        return;
+    }
+    let rest = &*rest;
+    first
+        .xy
+        .par_chunks_mut(REDUCE_CHUNK)
+        .zip(first.occupied.par_chunks_mut(REDUCE_CHUNK))
+        .enumerate()
+        .for_each(|(r, (xy, occupied))| {
+            let lo = r * REDUCE_CHUNK;
+            for other in rest {
+                let theirs = other.xy[lo..][..xy.len()].iter().copied().enumerate();
+                let live = theirs.filter(|&(j, _)| other.occupied[lo + j]);
+                add_points::<P>(xy, occupied, live);
+            }
+        });
+}
+
+/// [`window_chunk`]'s bucket visits with the fill batched: affine buckets, additions
+/// applied in rounds that share one field inversion. See [`BatchFill`] for the machinery
+/// and the conflict story. Only worth it with buckets to spare; [`pippenger`] switches on
 /// [`MIN_BATCH`].
-fn window_chunk_batch<P: RawCurve>(
+fn window_fill<P: RawCurve>(
+    fill: &mut BatchFill<P>,
     bases: &[Affine<P>],
     scan: &Prescan<P>,
     range: core::ops::Range<usize>,
     window: usize,
     c: u32,
     work: Work,
-) -> Projective<P> {
-    // `d` is in [-2^(c-1), 2^(c-1)], so `2^(c-1)` buckets is tight.
-    let n_buckets = 1usize << (c - 1);
-    let mut fill = BatchFill::<P>::new(n_buckets, batch_size(n_buckets));
+) {
     // See `window_chunk`. XYZZ rather than a batched slot: a zero scalar sends every one
     // of its digits here, and one batched bucket that contended would push them all through
     // the retry and side-bucket machinery instead.
@@ -1190,10 +1338,163 @@ fn window_chunk_batch<P: RawCurve>(
         }
     }
     core::hint::black_box(&dummy);
+}
+
+/// One range of one window through [`window_fill`] and reduced on its own, which is what
+/// the tests hold the other fills to.
+#[cfg(test)]
+fn window_chunk_batch<P: RawCurve>(
+    bases: &[Affine<P>],
+    scan: &Prescan<P>,
+    range: core::ops::Range<usize>,
+    window: usize,
+    c: u32,
+    work: Work,
+) -> Projective<P> {
+    // `d` is in [-2^(c-1), 2^(c-1)], so `2^(c-1)` buckets is tight.
+    let n_buckets = 1usize << (c - 1);
+    let mut fill = BatchFill::<P>::new(n_buckets, batch_size(n_buckets));
+    window_fill(&mut fill, bases, scan, range, window, c, work);
     fill.finish()
 }
 
-/// A per-group replacement for [`window_chunk_batch`], prepared once per MSM. Only an
+/// Points per piece of [`ganged_windows`] for a window of `n_buckets`. A piece is what a
+/// thread commits to at a time, so the last one out of a slow core is what the pool waits
+/// for at the end of the MSMs; a thread that joins a window for one piece pays for
+/// clearing and later scanning a bucket array of its own, which bounds it from below.
+fn split_grain(n_buckets: usize) -> usize {
+    (n_buckets / GRAIN_BUCKET_RATIO).max(MIN_GRAIN)
+}
+
+/// One window of [`ganged_windows`]: its point range as numbered pieces that threads
+/// claim, and the fills of the threads that claimed any.
+struct Gang<P: RawCurve> {
+    /// The next unclaimed piece. Runs past the piece count once the window is claimed out.
+    next: AtomicUsize,
+    /// Threads between [`Self::enter`] and [`Self::leave`], for the next thread's choice.
+    inside: AtomicUsize,
+    /// The fills of the threads that have left, and whether the window has been closed.
+    left: Mutex<(Vec<BatchFill<P>>, bool)>,
+    sum: OnceLock<Projective<P>>,
+}
+
+impl<P: RawCurve> Gang<P> {
+    fn new() -> Self {
+        Gang {
+            next: AtomicUsize::new(0),
+            inside: AtomicUsize::new(0),
+            left: Mutex::new((Vec::new(), false)),
+            sum: OnceLock::new(),
+        }
+    }
+
+    /// Whether the window still takes threads. Counted in before the first claim, so the
+    /// window cannot close under a thread that holds a piece.
+    fn enter(&self) -> bool {
+        let left = self.left.lock().unwrap();
+        if !left.1 {
+            self.inside.fetch_add(1, Ordering::Relaxed);
+        }
+        !left.1
+    }
+
+    /// Hand in the fill, if any piece was claimed. The last thread out of a window with
+    /// no piece left gets every fill back and closes it.
+    fn leave(&self, fill: Option<BatchFill<P>>, pieces: usize) -> Option<Vec<BatchFill<P>>> {
+        let mut left = self.left.lock().unwrap();
+        left.0.extend(fill);
+        let inside = self.inside.fetch_sub(1, Ordering::Relaxed) - 1;
+        if inside > 0 || self.next.load(Ordering::Relaxed) < pieces {
+            return None;
+        }
+        left.1 = true;
+        Some(core::mem::take(&mut left.0))
+    }
+}
+
+/// Every window of an MSM through the batch-affine fill, on `threads` threads of the pool.
+///
+/// The tasks are not the windows. A window is a list of pieces of `grain` points, and a
+/// thread takes a whole window that nobody has started while there is one, then joins
+/// the started window with the most unclaimed pieces a thread, with a fill of its own.
+/// So a window one thread works alone is one fill, the windows left at the end are
+/// shared out piece by piece, and no thread waits on another's window: with equal tasks
+/// a window each, 17 of them on eight fast and four slow cores had the fast ones idle
+/// while the slow ones finished their first. The last thread out of a window adds its
+/// fills together ([`merge_fills`]) and reduces once ([`chunked_running_sum`]), both cut
+/// into tasks for whoever is free.
+fn ganged_windows<P: RawCurve>(
+    bases: &[Affine<P>],
+    scan: &Prescan<P>,
+    c: u32,
+    work: Work,
+    threads: usize,
+    grain: usize,
+) -> Vec<Projective<P>>
+where
+    P::BaseField: Send + Sync,
+{
+    let m = scan.idx.len();
+    // `d` is in [-2^(c-1), 2^(c-1)], so `2^(c-1)` buckets is tight.
+    let n_buckets = 1usize << (c - 1);
+    let pieces = m.div_ceil(grain);
+    let gangs: Vec<Gang<P>> = (0..RECODE_BITS.div_ceil(c as usize))
+        .map(|_| Gang::new())
+        .collect();
+    let fresh = AtomicUsize::new(0);
+    let pick = || {
+        let w = fresh.fetch_add(1, Ordering::Relaxed);
+        if w < gangs.len() {
+            return Some(w);
+        }
+        let share = |g: &Gang<P>| {
+            let unclaimed = pieces.saturating_sub(g.next.load(Ordering::Relaxed));
+            (unclaimed << 8) / (g.inside.load(Ordering::Relaxed) + 1)
+        };
+        let (w, most) = gangs.iter().map(share).enumerate().max_by_key(|s| s.1)?;
+        (most > 0).then_some(w)
+    };
+    let run = || {
+        while let Some(w) = pick() {
+            let gang = &gangs[w];
+            if !gang.enter() {
+                continue;
+            }
+            let mut fill = None;
+            loop {
+                let piece = gang.next.fetch_add(1, Ordering::Relaxed);
+                if piece >= pieces {
+                    break;
+                }
+                let fill =
+                    fill.get_or_insert_with(|| BatchFill::new(n_buckets, batch_size(n_buckets)));
+                let range = piece * grain..((piece + 1) * grain).min(m);
+                window_fill(fill, bases, scan, range, w, c, work);
+            }
+            if let Some(mut fills) = gang.leave(fill, pieces) {
+                merge_fills(&mut fills);
+                // No fill at all is an MSM of no points.
+                let sum = fills.first().map_or(Xyzz::ZERO, |fill| {
+                    chunked_running_sum::<P>(&fill.xy, &fill.occupied)
+                });
+                // Closed once, by this thread.
+                let _ = gang.sum.set(to_projective(&sum));
+            }
+        }
+    };
+    rayon::scope(|s| {
+        for _ in 1..threads {
+            s.spawn(|_| run());
+        }
+        run();
+    });
+    gangs
+        .into_iter()
+        .map(|g| g.sum.into_inner().expect("every window was closed"))
+        .collect()
+}
+
+/// A per-group replacement for [`window_fill`], prepared once per MSM. Only an
 /// x86_64 with AVX-512 IFMA has one (see `ifma`); everything else keeps the portable fill.
 trait FastFill: RawCurve {
     /// Whatever the replacement needs per MSM, built from the prescan.
@@ -1305,17 +1606,19 @@ where
     let n_windows = RECODE_BITS.div_ceil(c as usize);
 
     // Windows are independent, so they are the first axis of parallelism, and at BN254
-    // sizes there are usually more of them (17 to 20) than there are cores. When there are
-    // not, split the point range too and give each chunk its own bucket array. Summing the
-    // per-chunk reduced sums is exact because the running-sum reduction is linear in the
-    // buckets, and it is far cheaper than merging bucket arrays. The tasks are sized for
-    // twice the pool rather than once: 16 windows on 12 threads are two waves of equal
-    // tasks, the second a third full, and with four of the twelve being efficiency cores at
-    // under half a performance core's pace the last task out sets the wall. On
-    // anon-aadhaar's H (2^21 points, c = 16, M2 Max) one chunk a window measured 588 ms,
-    // two 535, three 531, four 537: past that each chunk is another bucket reduction.
-    // Under this rule the forced-window sweep at [`window_size`] still has its pick best
-    // or tied.
+    // sizes there are usually more of them (17 to 20) than there are cores. The wide
+    // windows, the batch-affine ones, go to [`ganged_windows`], which shares the point
+    // range of the last windows out between the threads. The XYZZ fill and the x86 one
+    // keep the older rule: when there are fewer windows than twice the pool, split the
+    // point range too and give each chunk its own bucket array, reduced on its own.
+    // Summing the per-chunk reduced sums is exact because the running-sum reduction is
+    // linear in the buckets. Twice the pool rather than once: 16 windows on 12 threads are
+    // two waves of equal tasks, the second a third full, and with four of the twelve being
+    // efficiency cores at under half a performance core's pace the last task out sets the
+    // wall. On anon-aadhaar's H (2^21 points, c = 16, M2 Max) one chunk a window measured
+    // 588 ms, two 535, three 531, four 537: past that each chunk is another bucket
+    // reduction. Under this rule the forced-window sweep at [`window_size`] still has its
+    // pick best or tied.
     // Signed digits land in [-2^(c-1), 2^(c-1)] and index as `d - 1` when positive and
     // `-d - 1` when negative, so the highest reachable index is 2^(c-1) - 1 and 2^(c-1)
     // buckets cover every digit.
@@ -1331,31 +1634,39 @@ where
         None
     };
 
-    let window_sums: Vec<Projective<P>> = (0..n_windows)
-        .into_par_iter()
-        .map(|w| {
-            (0..point_chunks)
-                .into_par_iter()
-                .map(|ci| {
-                    let lo = ci * chunk_len;
-                    let hi = ((ci + 1) * chunk_len).min(m);
-                    if lo >= hi {
-                        return Projective::zero();
-                    }
-                    // The wide windows batch their fill behind a shared inversion; the
-                    // narrow ones stay on the XYZZ fill, which has no round overhead
-                    // to amortise.
-                    if let Some(prep) = &fast {
-                        P::window_chunk(prep, bases, &scan, lo..hi, w, c, work)
-                    } else if batched {
-                        window_chunk_batch(bases, &scan, lo..hi, w, c, work)
-                    } else {
-                        window_chunk(bases, &scan, lo..hi, w, c, work)
-                    }
-                })
-                .reduce(Projective::zero, |a, b| a + b)
-        })
-        .collect();
+    let window_sums: Vec<Projective<P>> = if batched && fast.is_none() {
+        ganged_windows(
+            bases,
+            &scan,
+            c,
+            work,
+            threads.max(1),
+            split_grain(n_buckets),
+        )
+    } else {
+        (0..n_windows)
+            .into_par_iter()
+            .map(|w| {
+                (0..point_chunks)
+                    .into_par_iter()
+                    .map(|ci| {
+                        let lo = ci * chunk_len;
+                        let hi = ((ci + 1) * chunk_len).min(m);
+                        if lo >= hi {
+                            return Projective::zero();
+                        }
+                        // The narrow windows stay on the XYZZ fill, which has no round
+                        // overhead to amortise.
+                        if let Some(prep) = &fast {
+                            P::window_chunk(prep, bases, &scan, lo..hi, w, c, work)
+                        } else {
+                            window_chunk(bases, &scan, lo..hi, w, c, work)
+                        }
+                    })
+                    .reduce(Projective::zero, |a, b| a + b)
+            })
+            .collect()
+    };
 
     // Horner over the windows, high to low: c doublings between each.
     let mut acc = window_sums[n_windows - 1];
