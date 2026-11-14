@@ -7,7 +7,7 @@
 //! Two properties matter beyond raw speed, both because the witness is the scalar vector
 //! for four of the five MSMs:
 //!   * a scalar of 0 must cost nothing beyond the digit scan,
-//!   * a scalar of 1 must cost exactly one mixed addition, not a full bucket round trip.
+//!   * a scalar of 1 must cost exactly one addition, not a full bucket round trip.
 //!
 //! How much those paths matter is circuit-shaped, and an earlier version of this comment
 //! overclaimed it: "in bit-decomposition-heavy circuits over 99% of witness scalars are
@@ -331,7 +331,7 @@ fn signed_digit(limbs: &[u64], i: usize, c: u32) -> i64 {
 }
 
 /// Scalars split into the three classes that matter, with the two cheap classes already
-/// paid for: `ones_sum` holds one mixed addition per scalar equal to 1, zeros are gone,
+/// paid for: `ones_sum` holds one addition per scalar equal to 1, zeros are gone,
 /// and only `idx`/`bigints` reach the bucket loop. `idx[k]` is the base that `bigints[k]`
 /// multiplies, so the bucket loop walks both vectors in order and hits the bases through
 /// one indirection.
@@ -369,6 +369,89 @@ fn scrub(v: &mut [BigInt]) {
 }
 
 type BigInt = <Fr as PrimeField>::BigInt;
+
+/// Points a [`OnesFold`] holds before it adds them in pairs.
+const ONES_BATCH: usize = 1024;
+
+/// Fewest points left at the end of a [`OnesFold`] that are worth an inversion.
+const ONES_MIN: usize = 64;
+
+/// The plain sum of the bases whose scalar is one. The points wait in a buffer, and a
+/// full buffer is halved: its upper half is added to its lower half point by point
+/// behind one inversion, as in [`BatchFill::flush`], 5M + 1S an addition against the
+/// 8M + 2S of a mixed one. What is left at the end is halved down to [`ONES_MIN`] points,
+/// and those go into `rest` one by one. On one thread of the M2 Max (`bench_ones_fold`)
+/// a point costs 112 ns against 135 for a chain of mixed additions on G1 and 234 against
+/// 331 on G2, and at the 1000 points of a bit-heavy scan chunk 119 and 245.
+struct OnesFold<P: RawCurve> {
+    xy: Vec<[P::RF; 2]>,
+    /// The product of the denominators before each pair, see [`batch_invert`].
+    prefix: Vec<P::RF>,
+    rest: Xyzz<P::RF>,
+}
+
+impl<P: RawCurve> OnesFold<P> {
+    fn new() -> Self {
+        OnesFold {
+            xy: Vec::new(),
+            prefix: Vec::new(),
+            rest: Xyzz::ZERO,
+        }
+    }
+
+    /// The caller guarantees `(x, y)` is not the point at infinity.
+    #[inline(always)]
+    fn add(&mut self, x: P::RF, y: P::RF) {
+        if self.xy.len() == ONES_BATCH {
+            self.halve();
+        }
+        self.xy.push([x, y]);
+    }
+
+    /// `xy[k] += xy[k + half]` for every `k` below `half`, an odd point out kept as it is.
+    fn halve(&mut self) {
+        let n = self.xy.len();
+        let half = n / 2;
+        self.prefix.clear();
+        let mut acc = P::RF::ONE;
+        for k in 0..half {
+            let upper = self.xy[k + half];
+            let dx = upper[0].sub(self.xy[k][0]);
+            self.prefix.push(acc);
+            if dx.is_zero() {
+                // The same point twice or a point and its negative: a zkey does not
+                // guarantee distinct bases. `madd` knows both cases, so the upper point
+                // goes there and the lower one stays.
+                self.rest.madd(upper[0], upper[1]);
+            } else {
+                acc = acc.mul(dx);
+            }
+        }
+        let mut inv = P::raw_inv(acc);
+        for k in (0..half).rev() {
+            let (lower, upper) = (self.xy[k], self.xy[k + half]);
+            let dx = upper[0].sub(lower[0]);
+            if !dx.is_zero() {
+                self.xy[k] = affine_add(lower, upper, inv.mul(self.prefix[k]));
+                inv = inv.mul(dx);
+            }
+        }
+        if n % 2 == 1 {
+            self.xy[half] = self.xy[n - 1];
+        }
+        self.xy.truncate(n - half);
+    }
+
+    fn finish(mut self) -> Projective<P> {
+        while self.xy.len() >= ONES_MIN {
+            self.halve();
+        }
+        for p in &self.xy {
+            self.rest.madd(p[0], p[1]);
+        }
+        to_projective(&self.rest)
+    }
+}
 
 /// Splits the scalars into zero / one / general, once, before any window runs.
 ///
@@ -413,7 +496,7 @@ where
     let run = |lo: usize, hi: usize| {
         let mut idx = Vec::new();
         let mut bigints = Vec::new();
-        let mut ones_sum = Xyzz::<P::RF>::ZERO;
+        let mut ones = OnesFold::<P>::new();
         for i in lo..hi {
             let s = &scalars[i];
             if work == Work::Variable && s.is_zero() {
@@ -431,12 +514,10 @@ where
                 continue;
             }
             if work == Work::Variable && s.is_one() {
-                // One mixed addition, total, for the whole scalar. Through the raw
-                // XYZZ madd, not ark's Jacobian one: on a bit-heavy witness this loop
-                // runs tens of thousands of times per MSM, and the branchy ark madd
-                // was profiled at 247 ns against the raw path's multiply floor.
+                // One addition, total, for the whole scalar. On a bit-heavy witness
+                // this loop runs tens of thousands of times per MSM, see [`OnesFold`].
                 let (x, y) = P::raw_xy(&bases[i]);
-                ones_sum.madd(x, y);
+                ones.add(x, y);
                 continue;
             }
             if bigints.len() == bigints.capacity() {
@@ -452,7 +533,7 @@ where
         Prescan {
             idx,
             bigints: Cow::Owned(bigints),
-            ones_sum: to_projective(&ones_sum),
+            ones_sum: ones.finish(),
         }
     };
 
@@ -510,7 +591,7 @@ where
     debug_assert!(n <= u32::MAX as usize);
     let run = |lo: usize, chunk: &mut [Fr]| {
         let mut idx = Vec::new();
-        let mut ones_sum = Xyzz::<P::RF>::ZERO;
+        let mut ones = OnesFold::<P>::new();
         for j in 0..chunk.len() {
             let s = chunk[j];
             let i = lo + j;
@@ -523,13 +604,13 @@ where
             }
             if work == Work::Variable && s.is_one() {
                 let (x, y) = P::raw_xy(&bases[i]);
-                ones_sum.madd(x, y);
+                ones.add(x, y);
                 continue;
             }
             chunk[idx.len()].0 = s.into_bigint();
             idx.push(i as u32);
         }
-        (idx, to_projective(&ones_sum))
+        (idx, ones.finish())
     };
     let parts: Vec<(Vec<u32>, Projective<P>)> = scalars
         .par_chunks_mut(SCAN_CHUNK)
@@ -1957,6 +2038,77 @@ mod tests {
         assert_eq!(msm.msm_g2(&g2, &ones), want2);
     }
 
+    fn ones_fold_case<P: RawCurve>(points: &[Affine<P>]) {
+        let mut fold = OnesFold::<P>::new();
+        for p in points {
+            let (x, y) = P::raw_xy(p);
+            fold.add(x, y);
+        }
+        let want = points.iter().fold(Projective::<P>::zero(), |a, p| a + p);
+        assert_eq!(fold.finish(), want, "n = {}", points.len());
+    }
+
+    /// Every size at which the fold changes path: nothing to add, too few points for an
+    /// inversion, an odd one out, a full buffer and several of them.
+    #[test]
+    fn ones_fold_matches_the_plain_sum() {
+        let mut rng = test_rng();
+        let small = [0, 1, 2, 3, ONES_MIN - 1, ONES_MIN, ONES_MIN + 1];
+        let full = [ONES_BATCH, ONES_BATCH + 1, 3 * ONES_BATCH + 5];
+        for n in small.into_iter().chain(full) {
+            ones_fold_case(&walk_points::<snarkrs_field::g1::Config>(n, &mut rng));
+            ones_fold_case(&walk_points::<snarkrs_field::g2::Config>(n, &mut rng));
+        }
+    }
+
+    /// Pairs the shared inversion cannot take: the same point twice, a point and its
+    /// negative, and a buffer of nothing else.
+    #[test]
+    fn ones_fold_survives_equal_and_opposite_points() {
+        fn case<P: RawCurve>(rng: &mut impl Rng)
+        where
+            Projective<P>: UniformRand,
+        {
+            // A full buffer pairs `k` with `k + ONES_BATCH / 2`.
+            let half = ONES_BATCH / 2;
+            let mut points: Vec<Affine<P>> = walk_points(3 * ONES_BATCH, rng);
+            for k in (0..half - 3).step_by(6) {
+                points[k + half] = points[k];
+                points[k + 3 + half] = -points[k + 3];
+            }
+            ones_fold_case(&points);
+            ones_fold_case(&[points[0]; 2 * ONES_BATCH + 3]);
+            let opposite: Vec<Affine<P>> = (0..ONES_BATCH + 2)
+                .map(|k| if k < half { points[0] } else { -points[0] })
+                .collect();
+            ones_fold_case(&opposite);
+        }
+        let mut rng = test_rng();
+        case::<snarkrs_field::g1::Config>(&mut rng);
+        case::<snarkrs_field::g2::Config>(&mut rng);
+    }
+
+    /// No scalar equal to one, one, two, half of them and all of them, across the
+    /// parallel scan's chunks.
+    #[test]
+    fn one_scalars_at_every_count() {
+        let mut rng = test_rng();
+        let n = 4 * SCAN_CHUNK + 77;
+        let g1: Vec<G1Affine> = walk_points(n, &mut rng);
+        let g2: Vec<G2Affine> = walk_points(n, &mut rng);
+        let msm = CpuMsm::new();
+        for ones in [0, 1, 2, n / 2, n] {
+            let mut s = rand_scalars(n, &mut rng);
+            for k in 0..ones {
+                s[(k * 7919) % n] = Fr::one();
+            }
+            let want1 = G1Projective::msm(&g1, &s).unwrap();
+            assert_eq!(msm.msm_g1(&g1, &s), want1, "{ones} ones");
+            assert_eq!(msm.msm_g2(&g2, &s), G2Projective::msm(&g2, &s).unwrap());
+            assert_eq!(msm.msm_g1_in_place(&g1, &mut s), want1, "{ones} ones");
+        }
+    }
+
     #[test]
     fn single_point() {
         let mut rng = test_rng();
@@ -2272,6 +2424,61 @@ mod tests {
                 ark_ms / ours_1t_ms,
             );
         }
+    }
+
+    /// `cargo test -p snarkrs-msm --release -- --ignored --nocapture bench_ones_fold`
+    ///
+    /// One thread, [`OnesFold`] against the chain of mixed additions it replaced, at the
+    /// point counts a scan chunk of a bit-heavy witness holds and well past them. Best of
+    /// seven, the two taking turns.
+    #[test]
+    #[ignore = "benchmark, meaningless in a debug build"]
+    fn bench_ones_fold() {
+        use std::time::Instant;
+        fn case<P: RawCurve>(name: &str, rng: &mut impl Rng)
+        where
+            Projective<P>: UniformRand,
+        {
+            for n in [200usize, 1000, 4096, 65536] {
+                let points: Vec<Affine<P>> = walk_points(n, rng);
+                let reps = (1 << 20) / n;
+                let ns = |t: Instant| t.elapsed().as_secs_f64() * 1e9 / (reps * n) as f64;
+                let mut best = [f64::MAX; 2];
+                let mut out = [Projective::<P>::zero(); 2];
+                for _ in 0..7 {
+                    let t = Instant::now();
+                    for _ in 0..reps {
+                        let mut chain = Xyzz::<P::RF>::ZERO;
+                        for p in &points {
+                            let (x, y) = P::raw_xy(p);
+                            chain.madd(x, y);
+                        }
+                        out[0] = to_projective(&chain);
+                    }
+                    best[0] = best[0].min(ns(t));
+                    let t = Instant::now();
+                    for _ in 0..reps {
+                        let mut fold = OnesFold::<P>::new();
+                        for p in &points {
+                            let (x, y) = P::raw_xy(p);
+                            fold.add(x, y);
+                        }
+                        out[1] = fold.finish();
+                    }
+                    best[1] = best[1].min(ns(t));
+                }
+                assert_eq!(out[0], out[1]);
+                println!(
+                    "{name} n={n:6}  madd chain {:6.1} ns  fold {:6.1} ns a point  ratio {:.2}",
+                    best[0],
+                    best[1],
+                    best[1] / best[0]
+                );
+            }
+        }
+        let mut rng = test_rng();
+        case::<snarkrs_field::g1::Config>("G1", &mut rng);
+        case::<snarkrs_field::g2::Config>("G2", &mut rng);
     }
 
     /// `cargo test -p snarkrs-msm --release -- --ignored --nocapture sweep_forced_window`
