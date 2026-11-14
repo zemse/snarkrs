@@ -102,7 +102,7 @@ const MAX_WINDOW: u32 = 16;
 const SCAN_CHUNK: usize = 1 << 12;
 
 /// A point chunk must be at least this many times the bucket count to be worth splitting
-/// off: every extra chunk pays another full bucket reduction, `2 * 2^(c-1)` Jacobian adds,
+/// off: every extra chunk pays another full bucket reduction, `2 * 2^(c-1)` additions,
 /// so at 16x the reduction overhead of the split stays under a fifth of the chunk's work.
 const CHUNK_BUCKET_RATIO: usize = 16;
 
@@ -138,11 +138,10 @@ fn batch_size(n_buckets: usize) -> usize {
 /// `2^c`, which is worth roughly one extra bit of window. The weight of 3 on the bucket
 /// term is the XYZZ fill's ratio: a visit is madd-2008-s (8M + 2S), a bucket two add-2008-s
 /// (12M + 2S each). Windows from c = 9 up take the batch-affine fill instead, a 5M + 1S
-/// visit and a madd plus an add per bucket, so their ratio is nearer 4. Weighting 4 would
-/// take one window off 2^15 and 2^16 and move 2^18 from c = 15 to 13 (an exact tie in that
-/// model); the sweep below measures 13 and 15 as tied at 2^18 and 3 best or tied at every
-/// size it covers, so the model is kept on 3. The one extra bucket `signed_digit` needs is
-/// left out of the model, it moves nothing.
+/// visit and two affine additions per bucket behind a shared inversion (12M + 2S, see
+/// [`segmented_running_sum_at`]), so their ratio is nearer 2.3. Weighting 2.3 picks the
+/// same window as 3 at every power of two from 2^15 up, so the model is kept on 3. The
+/// one extra bucket `signed_digit` needs is left out of the model, it moves nothing.
 ///
 /// A forced-window sweep (`sweep_forced_window`, plus the same over js_16x16_d32's real
 /// key and witness; M2 Max, 12 threads, medians of 7 to 9 interleaved reps, two runs) has
@@ -875,46 +874,284 @@ impl<P: RawCurve> BatchFill<P> {
         self.flush();
         self.reschedule();
         self.flush();
-        to_projective(&affine_running_sum(
-            &self.xy,
-            &self.occupied,
+        to_projective(&affine_running_sum::<P>(
+            &mut self.xy,
+            &mut self.occupied,
             self.side.as_ref(),
         ))
     }
 }
 
-/// The same running sum as [`window_chunk`], with the occupied buckets entering as mixed
-/// additions (8M + 2S against the XYZZ-bucket add's 12M + 2S) and the side buckets, when
-/// the chunk was degenerate enough to have any, folded in.
-fn affine_running_sum<F: RawField>(
-    xy: &[[F; 2]],
-    occupied: &[bool],
-    side: Option<&SideBuckets<F>>,
-) -> Xyzz<F> {
+/// The running sum `sum_j (j + 1) * B_j` over the settled buckets, the side buckets folded
+/// in first when the chunk was degenerate enough to have any.
+fn affine_running_sum<P: RawCurve>(
+    xy: &mut [[P::RF; 2]],
+    occupied: &mut [bool],
+    side: Option<&SideBuckets<P::RF>>,
+) -> Xyzz<P::RF> {
+    if let Some(side) = side {
+        fold_side::<P>(xy, occupied, side);
+    }
+    segmented_running_sum::<P>(xy, occupied)
+}
+
+/// A bucket range this short keeps the XYZZ running sum: the segmented one below would
+/// pay an inversion a step for a handful of segments. At 128 buckets of G1 the XYZZ sum
+/// measures 315 ns a bucket against 328 segmented, at 256 it is 292 to 317 against 285.
+const REDUCE_XYZZ: usize = 128;
+
+/// Segment length of [`segmented_running_sum`] over `n` buckets, a power of two near
+/// `sqrt(n) / 2`. A step costs one inversion whatever the segment count and every segment
+/// costs a fix-up at the end, so the two balance near `2 * sqrt(n)` segments.
+fn reduce_segment(n: usize) -> usize {
+    1 << (n.next_power_of_two().trailing_zeros() / 2).saturating_sub(1)
+}
+
+/// The same running sum as [`window_chunk`], in XYZZ with the occupied buckets entering as
+/// mixed additions: one dependent chain, a madd and an add (20M + 4S) a bucket.
+fn xyzz_running_sum<F: RawField>(xy: &[[F; 2]], occupied: &[bool]) -> Xyzz<F> {
     let mut running = Xyzz::<F>::ZERO;
     let mut total = Xyzz::<F>::ZERO;
-    match side {
-        Some(side) => {
-            for j in (0..xy.len()).rev() {
-                if occupied[j] {
-                    running.madd(xy[j][0], xy[j][1]);
+    for j in (0..xy.len()).rev() {
+        if occupied[j] {
+            running.madd(xy[j][0], xy[j][1]);
+        }
+        total.add_assign(&running);
+    }
+    total
+}
+
+/// [`xyzz_running_sum`] past [`REDUCE_XYZZ`] buckets, at [`reduce_segment`].
+fn segmented_running_sum<P: RawCurve>(xy: &[[P::RF; 2]], occupied: &[bool]) -> Xyzz<P::RF> {
+    if xy.len() <= REDUCE_XYZZ {
+        return xyzz_running_sum(xy, occupied);
+    }
+    segmented_running_sum_at::<P>(xy, occupied, reduce_segment(xy.len()))
+}
+
+/// What one side of a segment's step needs from the shared inversion. A first point and a
+/// cancellation need nothing and are settled before it.
+#[derive(Clone, Copy, PartialEq)]
+enum Step {
+    Skip,
+    Add,
+    Dbl,
+}
+
+/// The running sum in affine coordinates. The bucket range is cut into segments of
+/// `seg` (a power of two), each with its own running sum and total, and all segments
+/// step together: per bucket two affine additions, `running += B_j` and
+/// `total += running`, with one inversion shared by the whole step as in
+/// [`BatchFill::flush`]. That is 12M + 2S a bucket with every multiply independent of
+/// its neighbours, against 20M + 4S in one dependent chain. The total lags the running sum
+/// by a step, so both additions of a step read the same settled values and need no
+/// inversion of their own; one last step catches it up.
+///
+/// A segment's total counts its buckets from 1, so segment `s` still owes
+/// `s * seg * R_s`, with `R_s` its final running sum. `sum_s s * R_s` is this same sum
+/// over the segments, `seg` is a power of two, and the fix-up is one recursion and
+/// `log2(seg)` doublings.
+fn segmented_running_sum_at<P: RawCurve>(
+    xy: &[[P::RF; 2]],
+    occupied: &[bool],
+    seg: usize,
+) -> Xyzz<P::RF> {
+    debug_assert!(seg.is_power_of_two());
+    let n = xy.len();
+    if n == 0 {
+        return Xyzz::ZERO;
+    }
+    let k = n.div_ceil(seg);
+    let mut run = vec![[P::RF::ZERO; 2]; k];
+    let mut tot = vec![[P::RF::ZERO; 2]; k];
+    let mut run_occ = vec![false; k];
+    let mut tot_occ = vec![false; k];
+    // The segments with an addition in the current step: segment, total side, running
+    // side. The two sides' denominators go to one product chain each.
+    let mut steps: Vec<(u32, Step, Step)> = Vec::with_capacity(k);
+    let mut dens: Vec<[P::RF; 2]> = Vec::with_capacity(k);
+    let mut prefix: Vec<[P::RF; 2]> = Vec::with_capacity(k);
+
+    for t in 0..=seg {
+        steps.clear();
+        dens.clear();
+        for s in 0..k {
+            let [rx, ry] = run[s];
+            let (mut step_t, mut den_t) = (Step::Skip, P::RF::ONE);
+            if run_occ[s] {
+                let [tx, ty] = tot[s];
+                let dx = rx.sub(tx);
+                if !tot_occ[s] {
+                    tot[s] = run[s];
+                    tot_occ[s] = true;
+                } else if !dx.is_zero() {
+                    (step_t, den_t) = (Step::Add, dx);
+                } else if ry == ty {
+                    (step_t, den_t) = (Step::Dbl, ty.double());
+                } else {
+                    tot_occ[s] = false;
                 }
-                if side.slot[j] != 0 {
-                    running.add_assign(&side[j]);
+            }
+            let (mut step_r, mut den_r) = (Step::Skip, P::RF::ONE);
+            // High bucket first; the last step has no bucket, it only settles the totals.
+            let j = s * seg + (seg - 1).wrapping_sub(t);
+            if t < seg && j < n && occupied[j] {
+                let [bx, by] = xy[j];
+                let dx = bx.sub(rx);
+                if !run_occ[s] {
+                    run[s] = xy[j];
+                    run_occ[s] = true;
+                } else if !dx.is_zero() {
+                    (step_r, den_r) = (Step::Add, dx);
+                } else if by == ry {
+                    (step_r, den_r) = (Step::Dbl, ry.double());
+                } else {
+                    // The xy stays: a pending total still reads it below.
+                    run_occ[s] = false;
                 }
-                total.add_assign(&running);
+            }
+            if step_t != Step::Skip || step_r != Step::Skip {
+                steps.push((s as u32, step_t, step_r));
+                dens.push([den_t, den_r]);
             }
         }
-        None => {
-            for j in (0..xy.len()).rev() {
-                if occupied[j] {
-                    running.madd(xy[j][0], xy[j][1]);
-                }
-                total.add_assign(&running);
+        if steps.is_empty() {
+            continue;
+        }
+
+        // Two product chains sharing the inversion, as in `BatchFill::flush`, so the
+        // backward walk holds a segment's two additions at once.
+        prefix.clear();
+        let (mut a, mut c) = (P::RF::ONE, P::RF::ONE);
+        for d in &dens {
+            prefix.push([a, c]);
+            a = a.mul(d[0]);
+            c = c.mul(d[1]);
+        }
+        let ac = P::raw_inv(a.mul(c));
+        let (mut ia, mut ic) = (ac.mul(c), ac.mul(a));
+        for i in (0..steps.len()).rev() {
+            let (s, step_t, step_r) = steps[i];
+            let s = s as usize;
+            let (dt, dr) = (ia.mul(prefix[i][0]), ic.mul(prefix[i][1]));
+            ia = ia.mul(dens[i][0]);
+            ic = ic.mul(dens[i][1]);
+            let (r, tt) = (run[s], tot[s]);
+            if step_t == Step::Add && step_r == Step::Add {
+                // Both formulas interleaved, see `BatchFill::add2`.
+                let [bx, by] = xy[s * seg + seg - 1 - t];
+                let lt = r[1].sub(tt[1]).mul(dt);
+                let lr = by.sub(r[1]).mul(dr);
+                let st = lt.sqr();
+                let sr = lr.sqr();
+                let x3t = st.sub(tt[0]).sub(r[0]);
+                let x3r = sr.sub(r[0]).sub(bx);
+                let y3t = lt.mul(tt[0].sub(x3t)).sub(tt[1]);
+                let y3r = lr.mul(r[0].sub(x3r)).sub(r[1]);
+                tot[s] = [x3t, y3t];
+                run[s] = [x3r, y3r];
+                continue;
+            }
+            match step_t {
+                Step::Add => tot[s] = affine_add(tt, r, dt),
+                Step::Dbl => tot[s] = affine_dbl(tt, dt),
+                Step::Skip => {}
+            }
+            match step_r {
+                Step::Add => run[s] = affine_add(r, xy[s * seg + seg - 1 - t], dr),
+                Step::Dbl => run[s] = affine_dbl(r, dr),
+                Step::Skip => {}
             }
         }
     }
-    total
+
+    let mut sum = Xyzz::<P::RF>::ZERO;
+    for s in 0..k {
+        if tot_occ[s] {
+            sum.madd(tot[s][0], tot[s][1]);
+        }
+    }
+    // Segment s weighs s, so segment 0 drops out and segment 1 is bucket 0 of the
+    // recursion.
+    let mut owed = segmented_running_sum::<P>(&run[1..], &run_occ[1..]);
+    for _ in 0..seg.trailing_zeros() {
+        owed = owed.dbl();
+    }
+    sum.add_assign(&owed);
+    sum
+}
+
+/// `a + p` for two affine points of different x, `1 / (p.x - a.x)` in hand.
+#[inline(always)]
+fn affine_add<F: RawField>(a: [F; 2], p: [F; 2], d_inv: F) -> [F; 2] {
+    let lambda = p[1].sub(a[1]).mul(d_inv);
+    let x3 = lambda.sqr().sub(a[0]).sub(p[0]);
+    [x3, lambda.mul(a[0].sub(x3)).sub(a[1])]
+}
+
+/// `2a` for an affine point, `1 / (2 a.y)` in hand.
+#[inline(always)]
+fn affine_dbl<F: RawField>(a: [F; 2], d_inv: F) -> [F; 2] {
+    let xx = a[0].sqr();
+    let lambda = xx.double().add(xx).mul(d_inv);
+    let x3 = lambda.sqr().sub(a[0].double());
+    [x3, lambda.mul(a[0].sub(x3)).sub(a[1])]
+}
+
+/// Montgomery's trick over nonzero elements, in place.
+fn batch_invert<P: RawCurve>(v: &mut [P::RF]) {
+    if v.is_empty() {
+        return;
+    }
+    let mut prefix = Vec::with_capacity(v.len());
+    let mut acc = P::RF::ONE;
+    for d in v.iter() {
+        prefix.push(acc);
+        acc = acc.mul(*d);
+    }
+    let mut inv = P::raw_inv(acc);
+    for (d, p) in v.iter_mut().zip(prefix).rev() {
+        let next = inv.mul(*d);
+        *d = inv.mul(p);
+        inv = next;
+    }
+}
+
+/// Add every live side bucket into its affine bucket, so the running sum only sees affine
+/// points. Two inversions for the lot: one takes the side points to affine, with
+/// `1 / ZZ = (ZZ / ZZZ)^2` by the XYZZ invariant, the other is the additions'.
+fn fold_side<P: RawCurve>(xy: &mut [[P::RF; 2]], occupied: &mut [bool], side: &SideBuckets<P::RF>) {
+    let live: Vec<usize> = (0..xy.len())
+        .filter(|&j| side.slot[j] != 0 && !side[j].is_zero())
+        .collect();
+    let mut inv: Vec<P::RF> = live.iter().map(|&j| side[j].zzz).collect();
+    batch_invert::<P>(&mut inv);
+    let mut adds: Vec<(usize, [P::RF; 2], Step)> = Vec::with_capacity(live.len());
+    let mut dens: Vec<P::RF> = Vec::with_capacity(live.len());
+    for (&j, &izzz) in live.iter().zip(&inv) {
+        let p = &side[j];
+        let p = [p.x.mul(p.zz.mul(izzz).sqr()), p.y.mul(izzz)];
+        let dx = p[0].sub(xy[j][0]);
+        if !occupied[j] {
+            xy[j] = p;
+            occupied[j] = true;
+        } else if !dx.is_zero() {
+            adds.push((j, p, Step::Add));
+            dens.push(dx);
+        } else if p[1] == xy[j][1] {
+            adds.push((j, p, Step::Dbl));
+            dens.push(p[1].double());
+        } else {
+            occupied[j] = false;
+        }
+    }
+    batch_invert::<P>(&mut dens);
+    for (&(j, p, step), &d_inv) in adds.iter().zip(&dens) {
+        xy[j] = match step {
+            Step::Add => affine_add(xy[j], p, d_inv),
+            _ => affine_dbl(xy[j], d_inv),
+        };
+    }
 }
 
 /// [`window_chunk`] with the fill batched: affine buckets, additions applied in rounds

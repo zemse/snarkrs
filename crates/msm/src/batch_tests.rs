@@ -356,3 +356,257 @@ fn batch_threshold_and_infinity_g1() {
 fn batch_threshold_and_infinity_g2() {
     threshold_and_infinity::<snarkrs_field::g2::Config>();
 }
+
+/// Every reduce over the same buckets, against an independently weighted sum. A side
+/// entry is the points its XYZZ bucket takes, in order.
+fn check_reduce<P: RawCurve<ScalarField = Fr>>(
+    buckets: &[Projective<P>],
+    side: &[(usize, Vec<Projective<P>>)],
+) {
+    let n = buckets.len();
+    let mut xy = vec![[P::RF::ZERO; 2]; n];
+    let mut occupied = vec![false; n];
+    let mut want = Projective::<P>::zero();
+    for (j, b) in buckets.iter().enumerate() {
+        want += *b * Fr::from((j + 1) as u64);
+        let a = b.into_affine();
+        if !a.infinity {
+            let (x, y) = P::raw_xy(&a);
+            xy[j] = [x, y];
+            occupied[j] = true;
+        }
+    }
+    let mut side_buckets = SideBuckets::new(n);
+    for (j, points) in side {
+        for p in points {
+            let (x, y) = P::raw_xy(&p.into_affine());
+            side_buckets.entry(*j).madd(x, y);
+            want += *p * Fr::from((j + 1) as u64);
+        }
+    }
+    let side = (!side.is_empty()).then_some(&side_buckets);
+    let got = affine_running_sum::<P>(&mut xy.clone(), &mut occupied.clone(), side);
+    assert_eq!(to_projective::<P>(&got), want, "n = {n}");
+
+    if let Some(side) = side {
+        fold_side::<P>(&mut xy, &mut occupied, side);
+    }
+    assert_eq!(
+        to_projective::<P>(&xyzz_running_sum(&xy, &occupied)),
+        want,
+        "n = {n}, xyzz"
+    );
+    // From one bucket a segment to one segment longer than the range.
+    let mut seg = 1;
+    while seg <= 2 * n.max(1) {
+        let got = segmented_running_sum_at::<P>(&xy, &occupied, seg);
+        assert_eq!(to_projective::<P>(&got), want, "n = {n}, seg = {seg}");
+        seg *= 2;
+    }
+}
+
+/// `i * G` for `i` in `-m..=m`, index `i + m`.
+fn small_multiples<P: RawCurve<ScalarField = Fr>>(m: i64) -> Vec<Projective<P>> {
+    let g = Projective::<P>::from(P::GENERATOR);
+    (-m..=m)
+        .map(|i| {
+            let p = g * Fr::from(i.unsigned_abs());
+            if i < 0 {
+                -p
+            } else {
+                p
+            }
+        })
+        .collect()
+}
+
+fn reduce_shapes<P: RawCurve<ScalarField = Fr>>() {
+    use ark_std::rand::Rng;
+    let g = Projective::<P>::from(P::GENERATOR);
+    let zero = Projective::<P>::zero();
+    // Nothing at all, on both sides of the XYZZ threshold.
+    for n in [0, 1, 100, REDUCE_XYZZ, REDUCE_XYZZ + 1] {
+        check_reduce::<P>(&vec![zero; n], &[]);
+    }
+    // One bucket, at every position of a range that is not a whole number of segments.
+    for j in 0..77 {
+        let mut buckets = vec![zero; 77];
+        buckets[j] = g;
+        check_reduce::<P>(&buckets, &[]);
+    }
+    // Every bucket the same point: each segment's second step doubles its running sum
+    // and its total, and the segments' running sums are all equal in the recursion.
+    for n in [1, 2, 64, REDUCE_XYZZ + 1, 257] {
+        check_reduce::<P>(&vec![g; n], &[]);
+    }
+    // A point and its negative in turn: every running sum cancels every other step, and
+    // whole segments sum to nothing.
+    for n in [64, REDUCE_XYZZ + 1, 257] {
+        let buckets: Vec<_> = (0..n).map(|j| if j % 2 == 0 { g } else { -g }).collect();
+        check_reduce::<P>(&buckets, &[]);
+    }
+    // Small multiples of one point, so running sums and totals keep meeting as equal
+    // points and as negatives, within a segment and across them. `gaps` thins the range.
+    let small = small_multiples::<P>(3);
+    let mut rng = ark_std::test_rng();
+    for n in [33, 64, 100, REDUCE_XYZZ + 1, 256, 1000] {
+        for gaps in [1, 2, 8] {
+            for _ in 0..6 {
+                let buckets: Vec<_> = (0..n)
+                    .map(|_| {
+                        if rng.gen_range(0..gaps) == 0 {
+                            small[rng.gen_range(0..small.len())]
+                        } else {
+                            zero
+                        }
+                    })
+                    .collect();
+                check_reduce::<P>(&buckets, &[]);
+            }
+        }
+    }
+    // Unrelated points at a production bucket count.
+    let mut cur = g * Fr::from(0x9e37_79b9_7f4a_7c15u64);
+    let step = g * Fr::from(0xd1b5_4a32_d192_ed03u64);
+    let buckets: Vec<_> = (0..4096)
+        .map(|_| {
+            cur += step;
+            cur
+        })
+        .collect();
+    check_reduce::<P>(&buckets, &[]);
+}
+
+#[test]
+fn reduce_shapes_g1() {
+    reduce_shapes::<snarkrs_field::g1::Config>();
+}
+
+#[test]
+fn reduce_shapes_g2() {
+    reduce_shapes::<snarkrs_field::g2::Config>();
+}
+
+fn reduce_folds_side<P: RawCurve<ScalarField = Fr>>() {
+    use ark_std::rand::Rng;
+    let small = small_multiples::<P>(9);
+    let m = |i: i64| small[(i + 9) as usize];
+    let mut rng = ark_std::test_rng();
+    for n in [8, 80, 300] {
+        let mut buckets: Vec<_> = (0..n).map(|_| m(rng.gen_range(-9..=9))).collect();
+        // A side bucket of 3G, with ZZ != 1, over an affine bucket that differs, equals
+        // it, negates it and is empty; one that cancelled to the identity but kept its
+        // slot; and one whose own two points doubled.
+        buckets[0] = m(5);
+        buckets[1] = m(3);
+        buckets[2] = m(-3);
+        buckets[n / 2] = m(0);
+        buckets[n - 2] = m(4);
+        buckets[n - 1] = m(7);
+        let side = vec![
+            (0, vec![m(1), m(2)]),
+            (1, vec![m(1), m(2)]),
+            (2, vec![m(1), m(2)]),
+            (n / 2, vec![m(1), m(2)]),
+            (n - 2, vec![m(1), m(-1)]),
+            (n - 1, vec![m(1), m(1)]),
+        ];
+        check_reduce::<P>(&buckets, &side);
+        // The same side buckets over an otherwise empty range.
+        let mut sparse = vec![Projective::<P>::zero(); n];
+        sparse[2] = m(-3);
+        check_reduce::<P>(&sparse, &side);
+    }
+}
+
+#[test]
+fn reduce_folds_side_g1() {
+    reduce_folds_side::<snarkrs_field::g1::Config>();
+}
+
+#[test]
+fn reduce_folds_side_g2() {
+    reduce_folds_side::<snarkrs_field::g2::Config>();
+}
+
+#[test]
+fn reduce_segment_is_a_power_of_two_below_the_range() {
+    for n in REDUCE_XYZZ + 1..=1 << MAX_WINDOW {
+        let seg = reduce_segment(n);
+        assert!(seg.is_power_of_two() && seg >= 2 && seg < n, "n = {n}");
+    }
+    assert_eq!(reduce_segment(4096), 32);
+}
+
+/// The XYZZ running sum against the segmented one at every segment length, per bucket,
+/// on one thread and then on every thread of the pool at once, which is how the window
+/// tasks run it.
+fn time_reduce<P: RawCurve<ScalarField = Fr>>(name: &str) {
+    use std::time::Instant;
+    let g = Projective::<P>::from(P::GENERATOR);
+    let step = g * Fr::from(0xd1b5_4a32_d192_ed03u64);
+    let threads = rayon::current_num_threads();
+    for log in [6u32, 7, 8, 9, 10, 11, 12, 13, 14, 15] {
+        let n = 1usize << log;
+        let mut cur = g * Fr::from(0x9e37_79b9_7f4a_7c15u64);
+        let proj: Vec<_> = (0..n)
+            .map(|_| {
+                cur += step;
+                cur
+            })
+            .collect();
+        let xy: Vec<[P::RF; 2]> = Projective::normalize_batch(&proj)
+            .iter()
+            .map(|a| {
+                let (x, y) = P::raw_xy(a);
+                [x, y]
+            })
+            .collect();
+        let occupied = vec![true; n];
+        let want = to_projective::<P>(&xyzz_running_sum(&xy, &occupied));
+        let reps = (1 << 18) / n + 3;
+        let time = |f: &(dyn Fn() -> Xyzz<P::RF> + Sync)| {
+            let one = || {
+                let mut best = f64::MAX;
+                for _ in 0..reps {
+                    let t = Instant::now();
+                    let got = f();
+                    best = best.min(t.elapsed().as_secs_f64() * 1e9 / n as f64);
+                    assert_eq!(to_projective::<P>(&got), want);
+                }
+                best
+            };
+            let single = one();
+            let mut all = vec![0.0; threads];
+            std::thread::scope(|s| {
+                for slot in all.iter_mut() {
+                    s.spawn(|| *slot = one());
+                }
+            });
+            (single, all.iter().sum::<f64>() / threads as f64)
+        };
+        let (s, a) = time(&|| xyzz_running_sum(&xy, &occupied));
+        println!("{name} 2^{log:2} xyzz           {s:7.1} ns a bucket alone, {a:7.1} on {threads} threads");
+        let mut seg = 2;
+        while seg <= n / 4 {
+            let (s, a) = time(&|| segmented_running_sum_at::<P>(&xy, &occupied, seg));
+            println!(
+                "{name} 2^{log:2} seg {seg:5}{}     {s:7.1} ns a bucket alone, {a:7.1} on {threads} threads",
+                if seg == reduce_segment(n) { "*" } else { " " },
+            );
+            seg *= 2;
+        }
+    }
+}
+
+#[test]
+#[ignore = "benchmark, meaningless in a debug build"]
+fn time_reduce_g1() {
+    time_reduce::<snarkrs_field::g1::Config>("G1");
+}
+
+#[test]
+#[ignore = "benchmark, meaningless in a debug build"]
+fn time_reduce_g2() {
+    time_reduce::<snarkrs_field::g2::Config>("G2");
+}
