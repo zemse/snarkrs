@@ -1033,11 +1033,10 @@ extern "C" __global__ void msm_merge_g2(PtG2* buckets,
 //
 // On the Metal side only the top window's live buckets are ever this fat, because its
 // window widths run to 15 bits, so the twin points the kernel at a row range the host
-// picks from the expected span. This port's host runs at 8 below 2^17 general scalars
-// (`window_size`), where a uniformly filled bucket holds `n / 128` entries, but a
-// witness MSM is anything but uniform: its small values crowd the low windows, so one
-// plan holds rows spanning dozens of slices beside thousands spanning one, and a block
-// pays the whole tree on either. So the split is by the row's own count: a row at or
+// picks from the expected span. This port's host picks a width per plan
+// (`window_size_for`), and a witness MSM is anything but uniform at any of them: its
+// small values crowd the low windows, so one plan holds rows spanning dozens of slices
+// beside thousands spanning one, and a block pays the whole tree on either. So the split is by the row's own count: a row at or
 // above `merge_wide_min` entries merges here and `msm_merge_*` skips it, a row below
 // exits here before the barriers and merges there. Both kernels run over every row;
 // the host launches this one only when some row can reach the count. MEASURED on a T4
@@ -1236,9 +1235,23 @@ extern "C" __global__ void msm_fold_g2(const PtG2* in_pts,
 // dependent chain of 128 full additions: latency, not work. Each window is therefore
 // split across `reduce_groups` blocks, each owning a contiguous chunk of its buckets and
 // writing one partial to `window_sums[w * reduce_groups + g]`; the host adds the
-// partials per window before its Horner combination. At the shipped c = 8 the host's
-// rule keeps one block a window, where the T4 measured two groups flat (TASKS.local.md,
-// OPT-07): a lane then owes its fixed `pt_mul_small` for one bucket less.
+// partials per window before its Horner combination.
+//
+// `lo * Q` is not a multiply on every thread's chain, which is where this kernel leaves
+// the twin's G2 reduce. `pt_mul_small(run, lo)` is `c - 1` doublings and, across a warp
+// whose lanes each hold a different `lo`, as many additions, ahead of a six-level tree:
+// 25 dependent operations at c = 8, of which the segment is 4. Thread `t` starts at
+// `lo = tg_lo + t * seg_len`, so
+//
+//   sum_t (P_t + lo_t Q_t) = P + seg_len * sum_k 2^k T_k + tg_lo * Q
+//
+// with P and Q the block's sums and T_k the sum of the Q_t whose `t` has bit k set. The
+// tree carries all of them: a node of 2^l threads holds P, Q and T_0..T_(l-1), joining
+// two nodes is one addition per value, each on a thread of its own, and the new T_l is
+// the right node's Q, a copy. Then one thread per T_k and one for Q double their term
+// while threads 0 and 1, in the other warp, add each term as its weight comes up: 17
+// operations at c = 8, 20 at c = 10 and 35 at c = 13, against 25, 29 and 47. The launch
+// must be a power of two of at least 8 threads, which is `reduce_threads` on the host.
 //
 // REDUCE_TG is the shared array size and therefore the largest block the host may launch
 // at these kernels. 64 rather than 128 is an occupancy choice: at 64 the G2 array is
@@ -1261,34 +1274,123 @@ __device__ __forceinline__ void msm_reduce_impl(const Xyzz<F>* buckets,
     u32 chunk = (p.n_buckets + p.reduce_groups - 1u) / p.reduce_groups;
     u32 tg_lo = g * chunk;
     u32 tg_hi = msm_min(tg_lo + chunk, p.n_buckets);
-    u32 seg_len = (chunk + tcount - 1u) / tcount;
+    // A power of two, so the segment scaling is `sh` doublings; a thread it leaves past
+    // `tg_hi` holds the identity.
+    u32 per = (chunk + tcount - 1u) / tcount;
+    u32 sh = (per > 1u) ? msm_hibit(per - 1u) + 1u : 0u;
+    u32 seg_len = 1u << sh;
     u32 lo = tg_lo + tid * seg_len;
     u32 hi = msm_min(lo + seg_len, tg_hi);
 
-    P mine = PtOps<P>::zero();
-    if (lo < hi) {
-        P run = PtOps<P>::zero();
-        P tot = PtOps<P>::zero();
-        for (u32 j = hi; j > lo; j--) {
-            run = pt_add(run, PtOps<P>::load(buckets[w * p.n_buckets + (j - 1u)]));
-            tot = pt_add(tot, run);
-        }
-        mine = pt_add(tot, pt_mul_small(run, lo));
+    // `x` is this thread's P and `z` its Q.
+    P x = PtOps<P>::zero();
+    P z = PtOps<P>::zero();
+    for (u32 j = hi; j > lo; j--) {
+        z = pt_add(z, PtOps<P>::load(buckets[w * p.n_buckets + (j - 1u)]));
+        x = pt_add(x, z);
     }
-    shared[tid] = mine;
 
-    // Every thread of the block runs this loop the same number of times, so no
-    // __syncthreads() is reached by only part of the block. A thread whose segment was
-    // empty still contributes its identity and still has to arrive at the barriers.
-    for (u32 s = 1; s < tcount; s <<= 1) {
-        __syncthreads();
-        if ((tid & ((s << 1) - 1u)) == 0u && tid + s < tcount) {
-            shared[tid] = pt_add(shared[tid], shared[tid + s]);
+    // The tree. Every thread of the block reaches every barrier, and no slot is read and
+    // written by two threads between two of them. A pair has three values and two slots,
+    // so the first two levels keep a value in `x` and `z` and a slot carries only what
+    // crosses threads; from the quads on a node's values sit in its first slots, in the
+    // order P, Q, T_0, T_1, ...
+    u32 levels = msm_hibit(tcount);
+    for (u32 ph = 0u; ph < levels; ph++) {
+        u32 m = 2u << ph;
+        u32 i = tid & (m - 1u);
+        bool add;
+        u32 src;
+        if (ph == 0u) {
+            // An even thread ends with the pair's P in `x`, an odd one with its Q in `x`
+            // and its T_0, the Q it came with, in `z`.
+            shared[tid] = (i == 1u) ? x : z;
+            add = true;
+            src = tid ^ 1u;
+        } else if (ph == 1u) {
+            if (i != 0u) {
+                shared[tid] = (i == 1u) ? z : x;
+            }
+            add = i != 2u;
+            src = (i == 3u) ? tid - 2u : (i == 2u) ? tid : tid + 2u;
+        } else {
+            add = i <= ph + 1u;
+            src = (i <= ph + 2u) ? tid - i + (m >> 1) + ((i == ph + 2u) ? 1u : i) : tid;
         }
+        if (ph < 2u) {
+            __syncthreads();
+        }
+        P v = shared[src];
+        if (add) {
+            bool aux = (ph == 0u && i == 1u) || (ph == 1u && i == 3u);
+            P own = (ph >= 2u) ? shared[tid] : aux ? z : x;
+            v = pt_add(own, v);
+        }
+        __syncthreads();
+        if (ph == 0u) {
+            x = v;
+        } else if (ph == 1u) {
+            if (i != 2u) {
+                shared[(i == 3u) ? tid - 1u : tid] = v;
+            }
+        } else if (i <= ph + 2u) {
+            shared[tid] = v;
+        }
+        if (ph != 0u) {
+            __syncthreads();
+        }
+    }
+
+    // The block's P is in slot 0, its Q in slot 1 and T_k in slot 2 + k. Thread
+    // `tcount / 2 + k` doubles T_k up to its weight `seg_len << k` and the one after
+    // them doubles Q through the bits of `tg_lo`; thread 0 adds each T_k to P the
+    // interval after it lands, thread 1 sums the Q terms, and thread 0 takes that sum
+    // last.
+    u32 bits = (tg_lo != 0u) ? msm_hibit(tg_lo) + 1u : 0u;
+    u32 rounds = (levels + sh > bits) ? levels + sh : bits;
+    u32 last = rounds + ((tg_lo != 0u) ? 1u : 0u);
+    u32 k = tid - (tcount >> 1);
+    P acc = PtOps<P>::zero();
+    if (tid == 0u) {
+        acc = shared[0];
+    } else if (k < levels) {
+        acc = shared[2u + k];
+    } else if (k == levels) {
+        acc = shared[1];
     }
     __syncthreads();
+    for (u32 it = 0u; it <= last; it++) {
+        bool dbl = false;
+        bool add = false;
+        u32 get = 0u;
+        u32 put = tcount;
+        if (k < levels) {
+            dbl = it != 0u && it <= k + sh;
+            put = (it == k + sh) ? 2u + k : tcount;
+        } else if (k == levels) {
+            dbl = it != 0u && it < bits;
+            put = (it < bits && ((tg_lo >> it) & 1u) != 0u) ? (it & 1u) : tcount;
+        } else if (tid == 0u) {
+            add = it == rounds + 1u || (it > sh && it - 1u - sh < levels);
+            get = (it == rounds + 1u) ? levels + 2u : 1u + it - sh;
+        } else if (tid == 1u) {
+            add = it != 0u && it <= rounds && ((tg_lo >> (it - 1u)) & 1u) != 0u;
+            get = (it - 1u) & 1u;
+            put = (it == rounds) ? levels + 2u : tcount;
+        }
+        if (dbl) {
+            acc = pt_dbl(acc);
+        }
+        if (add) {
+            acc = pt_add(acc, shared[get]);
+        }
+        if (put != tcount) {
+            shared[put] = acc;
+        }
+        __syncthreads();
+    }
     if (tid == 0u) {
-        window_sums[tg] = PtOps<P>::store(shared[0]);
+        window_sums[tg] = PtOps<P>::store(acc);
     }
 }
 

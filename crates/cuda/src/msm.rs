@@ -777,9 +777,13 @@ const ONES_SPT: usize = 32;
 ///
 /// At c = 8 a window is 128 buckets, which the floor leaves at one group: a thread then
 /// owns two buckets, and halving that into one a lane saves two additions while every
-/// lane still owes its fixed `pt_mul_small`; the T4 measured that split flat (TASKS.local.md,
-/// OPT-07). The rule bites from c = 9 up, where one block a window leaves most of the
-/// card idle on a dependent chain. Override with `G16_CUDA_MSM_RG` to sweep it.
+/// block still owes its tree and ladder; the T4 measured that split flat under the
+/// reduce that multiplied on every lane (TASKS.local.md, OPT-07). The rule bites from
+/// c = 9 up, where one block a window leaves most of the card idle on a dependent
+/// chain. More groups, 16 and 32 a window where the rule gives 4 at c = 10 and 8 at
+/// c = 13, read slower under the ladder as under the multiply: a 2^18 proof's five
+/// reduces 4.8 ms at the rule's, 11.5 at 16 and 23.5 at 32, the host adding the
+/// partials in 1.4, 2.9 and 5.0. Override with `G16_CUDA_MSM_RG` to sweep it.
 const REDUCE_TARGET_THREADS: usize = 8192;
 
 fn reduce_groups_for(n_windows: usize, n_buckets: usize) -> usize {
@@ -793,16 +797,20 @@ fn reduce_groups_for(n_windows: usize, n_buckets: usize) -> usize {
 }
 
 /// Threads a reduce block runs: one per bucket of its chunk, rounded up to a power of two,
-/// at most [`REDUCE_TG`].
+/// at least [`REDUCE_MIN_THREADS`] and at most [`REDUCE_TG`].
 ///
 /// Every thread of the block takes part in the closing tree, `log2(threads)` levels of
 /// serial additions, whether or not its segment held a bucket. At c = 3 a window is four
-/// buckets, and 64 threads paid six levels for them where four pay two. A function of
+/// buckets, and 64 threads paid six levels for them where eight pay three. A function of
 /// `c` and the reduce groups alone, so the same for every witness.
 fn reduce_threads(g: &Geometry) -> u32 {
     let chunk = g.n_buckets.div_ceil(g.reduce_groups.max(1));
-    (chunk.next_power_of_two() as u32).clamp(1, REDUCE_TG)
+    (chunk.next_power_of_two() as u32).clamp(REDUCE_MIN_THREADS, REDUCE_TG)
 }
+
+/// The smallest block `msm_reduce_*` runs: its closing ladder seats two adding threads
+/// and `log2(threads) + 1` doubling ones, which four threads cannot.
+const REDUCE_MIN_THREADS: u32 = 8;
 
 /// Which MSMs a batch of [`CudaMsm::msms_resident`] runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3976,13 +3984,207 @@ mod tests {
                 let chunk = g.n_buckets.div_ceil(g.reduce_groups);
                 assert!(t.is_power_of_two() && t <= REDUCE_TG as usize);
                 assert!(t >= chunk.min(REDUCE_TG as usize));
-                assert!(t < 2 * chunk || t == 1);
+                assert!(t < 2 * chunk || t == REDUCE_MIN_THREADS as usize);
+                // The kernel's ladder: threads 0 and 1 add, `t / 2..=t / 2 + log2(t)`
+                // double.
+                assert!(t >= 8 && t / 2 + (t.trailing_zeros() as usize) < t);
             }
         }
         let g = Geometry::new(8, 0, 8, 3, 8, Work::Constant).unwrap();
-        assert_eq!(reduce_threads(&g), 4);
+        assert_eq!(reduce_threads(&g), REDUCE_MIN_THREADS);
         let g = Geometry::new(8, 0, 8, 8, 8, Work::Constant).unwrap();
         assert_eq!(reduce_threads(&g), REDUCE_TG);
+    }
+
+    /// `msm_reduce_*` on integers: the kernel's segments, tree and ladder, one loop over
+    /// the block's threads per interval between two barriers, at every width and under
+    /// forced reduce groups. A slot a thread writes in an interval is touched by no other
+    /// thread in it, which is what lets the kernel go without a barrier there.
+    #[test]
+    fn the_reduce_tree_and_ladder_sum_a_window() {
+        struct Slots {
+            v: Vec<u64>,
+            read: Vec<Vec<usize>>,
+            wrote: Vec<Option<usize>>,
+        }
+        impl Slots {
+            fn rd(&mut self, tid: usize, i: usize) -> u64 {
+                assert!(
+                    self.wrote[i].is_none_or(|t| t == tid),
+                    "slot {i} read after a write"
+                );
+                self.read[i].push(tid);
+                self.v[i]
+            }
+            fn wr(&mut self, tid: usize, i: usize, v: u64) {
+                assert!(self.wrote[i].is_none(), "slot {i} written twice");
+                assert!(
+                    self.read[i].iter().all(|t| *t == tid),
+                    "slot {i} written after a read"
+                );
+                self.wrote[i] = Some(tid);
+                self.v[i] = v;
+            }
+            fn sync(&mut self) {
+                self.read.iter_mut().for_each(Vec::clear);
+                self.wrote.fill(None);
+            }
+        }
+        let hibit = |k: usize| k.ilog2() as usize;
+        let block = |buckets: &[u64], groups: usize, g: usize, t: usize| -> u64 {
+            let chunk = buckets.len().div_ceil(groups);
+            let tg_lo = g * chunk;
+            let tg_hi = (tg_lo + chunk).min(buckets.len());
+            let per = chunk.div_ceil(t);
+            let sh = if per > 1 { hibit(per - 1) + 1 } else { 0 };
+            let (mut x, mut z) = (vec![0u64; t], vec![0u64; t]);
+            for tid in 0..t {
+                let lo = tg_lo + (tid << sh);
+                for j in (lo..(lo + (1 << sh)).min(tg_hi)).rev() {
+                    z[tid] = z[tid].wrapping_add(buckets[j]);
+                    x[tid] = x[tid].wrapping_add(z[tid]);
+                }
+            }
+            let mut s = Slots {
+                v: vec![0; t],
+                read: vec![Vec::new(); t],
+                wrote: vec![None; t],
+            };
+            let levels = hibit(t);
+            let mut v = vec![0u64; t];
+            for ph in 0..levels {
+                let m = 2usize << ph;
+                for tid in 0..t {
+                    let i = tid & (m - 1);
+                    if ph == 0 {
+                        s.wr(tid, tid, if i == 1 { x[tid] } else { z[tid] });
+                    } else if ph == 1 && i != 0 {
+                        s.wr(tid, tid, if i == 1 { z[tid] } else { x[tid] });
+                    }
+                }
+                if ph < 2 {
+                    s.sync();
+                }
+                for tid in 0..t {
+                    let i = tid & (m - 1);
+                    let (add, src) = match ph {
+                        0 => (true, tid ^ 1),
+                        1 if i == 3 => (true, tid - 2),
+                        1 => (i != 2, if i == 2 { tid } else { tid + 2 }),
+                        _ if i <= ph + 1 => (true, tid - i + m / 2 + i),
+                        _ if i == ph + 2 => (false, tid - i + m / 2 + 1),
+                        _ => (false, tid),
+                    };
+                    v[tid] = s.rd(tid, src);
+                    if add {
+                        let aux = (ph == 0 && i == 1) || (ph == 1 && i == 3);
+                        let own = match ph {
+                            0 | 1 if aux => z[tid],
+                            0 | 1 => x[tid],
+                            _ => s.rd(tid, tid),
+                        };
+                        v[tid] = own.wrapping_add(v[tid]);
+                    }
+                }
+                s.sync();
+                for tid in 0..t {
+                    let i = tid & (m - 1);
+                    match ph {
+                        0 => x[tid] = v[tid],
+                        1 if i != 2 => s.wr(tid, if i == 3 { tid - 1 } else { tid }, v[tid]),
+                        1 => {}
+                        _ if i <= ph + 2 => s.wr(tid, tid, v[tid]),
+                        _ => {}
+                    }
+                }
+                if ph != 0 {
+                    s.sync();
+                }
+            }
+            let bits = if tg_lo != 0 { hibit(tg_lo) + 1 } else { 0 };
+            let rounds = (levels + sh).max(bits);
+            let last = rounds + usize::from(tg_lo != 0);
+            let mut acc = vec![0u64; t];
+            for (tid, acc) in acc.iter_mut().enumerate() {
+                let k = tid.wrapping_sub(t / 2);
+                if tid == 0 {
+                    *acc = s.rd(tid, 0);
+                } else if k < levels {
+                    *acc = s.rd(tid, 2 + k);
+                } else if k == levels {
+                    *acc = s.rd(tid, 1);
+                }
+            }
+            s.sync();
+            for it in 0..=last {
+                for (tid, acc) in acc.iter_mut().enumerate() {
+                    let k = tid.wrapping_sub(t / 2);
+                    let (mut dbl, mut add, mut get, mut put) = (false, false, 0, None);
+                    if k < levels {
+                        dbl = it != 0 && it <= k + sh;
+                        put = (it == k + sh).then_some(2 + k);
+                    } else if k == levels {
+                        dbl = it != 0 && it < bits;
+                        put = (it < bits && (tg_lo >> it) & 1 != 0).then_some(it & 1);
+                    } else if tid == 0 {
+                        add = it == rounds + 1 || (it > sh && it - 1 - sh < levels);
+                        get = if it == rounds + 1 {
+                            levels + 2
+                        } else {
+                            (1 + it).wrapping_sub(sh)
+                        };
+                    } else if tid == 1 {
+                        add = it != 0 && it <= rounds && (tg_lo >> (it - 1)) & 1 != 0;
+                        get = it.wrapping_sub(1) & 1;
+                        put = (it == rounds).then_some(levels + 2);
+                    }
+                    if dbl {
+                        *acc = acc.wrapping_mul(2);
+                    }
+                    if add {
+                        *acc = acc.wrapping_add(s.rd(tid, get));
+                    }
+                    if let Some(put) = put {
+                        s.wr(tid, put, *acc);
+                    }
+                }
+                s.sync();
+            }
+            acc[0]
+        };
+        for c in 2..=MAX_WINDOW {
+            let n_buckets = 1usize << (c - 1);
+            let buckets: Vec<u64> = (0..n_buckets as u64)
+                .map(|j| (j + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1)
+                .collect();
+            let want = buckets
+                .iter()
+                .zip(1u64..)
+                .fold(0u64, |s, (b, j)| s.wrapping_add(b.wrapping_mul(j)));
+            let shipped = reduce_groups_for(RECODE_BITS.div_ceil(c as usize), n_buckets);
+            for groups in [shipped, 1, 2, 3, 5, 8, n_buckets] {
+                if groups > n_buckets {
+                    continue;
+                }
+                let g = Geometry::with_shapes(
+                    1000,
+                    0,
+                    1000,
+                    c,
+                    64,
+                    Work::Variable,
+                    Shapes {
+                        reduce_groups: Some(groups),
+                        ..Shapes::default()
+                    },
+                )
+                .unwrap();
+                let t = reduce_threads(&g) as usize;
+                let got =
+                    (0..groups).fold(0u64, |s, k| s.wrapping_add(block(&buckets, groups, k, t)));
+                assert_eq!(got, want, "c = {c}, {groups} groups of {t} threads");
+            }
+        }
     }
 
     #[test]
@@ -6157,8 +6359,9 @@ mod tests {
     }
 
     /// CPU-only structural counts for the c13 timing inputs, no device or timings.
-    /// Entry capacity is an upper bound, not the emitted digit count. Add call sites
-    /// exclude the offset ladders; identities and equal points change their arithmetic.
+    /// Entry capacity is an upper bound, not the emitted digit count. Add calls are the
+    /// segments', the trees' and the ladders'; identities and equal points change their
+    /// arithmetic.
     #[test]
     #[ignore = "prints structural counts; no CUDA device required"]
     fn variable_work_operation_counts() {
@@ -6173,9 +6376,24 @@ mod tests {
                 let g = Geometry::new(n, 0, general, 13, SLICE_LEN, Work::Variable).unwrap();
                 let threads = reduce_threads(&g) as usize;
                 let blocks = g.window_sums();
-                let ladders = blocks * threads;
+                let ladders = blocks;
                 assert_eq!(g.n_buckets % (g.reduce_groups * threads), 0);
-                let reduce_add_calls = 2 * g.rows() + ladders + blocks * (threads - 1);
+                // A ladder adds a T_k a tree level, and a block past the first its Q once
+                // a set bit of its first bucket and their sum.
+                let chunk = g.n_buckets / g.reduce_groups;
+                let ladder_adds: usize = (0..g.reduce_groups)
+                    .map(|k| match k * chunk {
+                        0 => threads.ilog2() as usize,
+                        lo => (threads.ilog2() + lo.count_ones() + 1) as usize,
+                    })
+                    .sum();
+                let reduce_add_calls =
+                    2 * g.rows() + blocks * reduce_tree_adds(threads) + g.n_windows * ladder_adds;
+                // The window's last block, whose ladder is the longest.
+                let (levels, top) = (threads.ilog2(), (g.reduce_groups - 1) * chunk);
+                let rounds = (levels + (chunk / threads).ilog2())
+                    .max(top.checked_ilog2().map_or(0, |b| b + 1));
+                let barriers = 2 * levels + 3 + rounds + u32::from(top != 0);
                 let scatter = g.n_windows.div_ceil(scatter_windows(
                     shapes.scatter_rows,
                     g.n_buckets,
@@ -6185,14 +6403,14 @@ mod tests {
                 let clear_bytes = g.rows() * std::mem::size_of::<PackedFq2>();
                 let span_bytes = g.rows() * std::mem::size_of::<PackedXyzzG2>();
                 let download_bytes = (blocks + g.ones_groups) * std::mem::size_of::<PackedXyzzG2>();
-                assert_eq!(reduce_add_calls, 184160);
+                assert_eq!(reduce_add_calls, 194460);
                 assert_eq!(clear_bytes, 5 << 20);
                 assert_eq!(span_bytes, 20 << 20);
                 assert_eq!(launches, 14);
                 println!(
                     "counts {set},{n},{zero},{one},{general},{},{},{},{},{},{},{launches},{blocks},{threads},{reduce_add_calls},{ladders},{},{clear_bytes},{span_bytes},{download_bytes}",
                     g.n_windows, g.n_buckets, g.slices, g.spill_slots(),
-                    g.n_windows * g.cap, L2_BYTES_ASSUMED, threads.ilog2() + 1,
+                    g.n_windows * g.cap, L2_BYTES_ASSUMED, barriers,
                 );
             }
         }
@@ -6225,18 +6443,34 @@ mod tests {
             a.checked_add(b).unwrap()
         }
 
-        fn mul(&mut self, p: i64, k: usize) -> i64 {
+        fn dbl(&mut self, p: i64) -> i64 {
+            self.ladder_doubles[usize::from(p != 0)] += 1;
+            p.checked_mul(2).unwrap()
+        }
+
+        /// A block's closing ladder: `p + sum_k (t[k] << (k + sh)) + lo * q`, each
+        /// term doubled on a thread of its own and added as it lands.
+        fn ladder(&mut self, p: i64, q: i64, t: &[i64], sh: usize, lo: usize) -> i64 {
             self.ladders += 1;
-            let mut acc = 0i64;
-            if k != 0 && p != 0 {
-                for bit in (0..=k.ilog2()).rev() {
-                    self.ladder_doubles[usize::from(acc != 0)] += 1;
-                    acc = acc.checked_mul(2).unwrap();
-                    if (k >> bit) & 1 != 0 {
+            let mut acc = p;
+            for (k, &term) in t.iter().enumerate() {
+                let term = (0..k + sh).fold(term, |d, _| self.dbl(d));
+                self.ladder_adds += 1;
+                acc = self.add(acc, term);
+            }
+            if lo != 0 {
+                let (mut d, mut sum) = (q, 0i64);
+                for bit in 0..=lo.ilog2() {
+                    if bit != 0 {
+                        d = self.dbl(d);
+                    }
+                    if (lo >> bit) & 1 != 0 {
                         self.ladder_adds += 1;
-                        acc = self.add(acc, p);
+                        sum = self.add(sum, d);
                     }
                 }
+                self.ladder_adds += 1;
+                acc = self.add(acc, sum);
             }
             acc
         }
@@ -6249,6 +6483,14 @@ mod tests {
                 2 * generic + 3 * dbl,
             )
         }
+    }
+
+    /// Additions of one block's tree: a join of two nodes of `2^(l-1)` threads adds
+    /// their P, their Q and their `l - 1` T_k.
+    fn reduce_tree_adds(threads: usize) -> usize {
+        (1..=threads.ilog2() as usize)
+            .map(|l| (threads >> l) * (l + 1))
+            .sum()
     }
 
     fn reduce_geometry(n: usize, general: usize, c: u32, rg: usize) -> Geometry {
@@ -6308,7 +6550,7 @@ mod tests {
         assert!(threads.is_power_of_two());
         assert_eq!(buckets.len(), g.n_windows);
         let chunk = g.n_buckets.div_ceil(g.reduce_groups);
-        let seg = chunk.div_ceil(threads);
+        let sh = chunk.div_ceil(threads).next_power_of_two().ilog2() as usize;
         let mut windows = Vec::new();
         for row in buckets {
             assert_eq!(row.len(), g.n_buckets);
@@ -6316,31 +6558,47 @@ mod tests {
             for group in 0..g.reduce_groups {
                 let start = group * chunk;
                 let end = (start + chunk).min(g.n_buckets);
-                let mut shared = vec![0; threads];
-                for (tid, mine) in shared.iter_mut().enumerate() {
-                    let lo = start + tid * seg;
-                    let hi = (lo + seg).min(end);
-                    if lo < hi {
-                        let (mut run, mut tot) = (0, 0);
-                        for j in (lo..hi).rev() {
-                            run = counts.add(run, row[j]);
-                            tot = counts.add(tot, run);
-                        }
-                        let offset = counts.mul(run, lo);
-                        *mine = counts.add(tot, offset);
+                // A node is its P, its Q and its T_k, a thread's segment to begin with.
+                let mut nodes = Vec::with_capacity(threads);
+                for tid in 0..threads {
+                    let lo = start + (tid << sh);
+                    let (mut run, mut tot) = (0, 0);
+                    for j in (lo..(lo + (1 << sh)).min(end)).rev() {
+                        run = counts.add(run, row[j]);
+                        tot = counts.add(tot, run);
                     }
+                    nodes.push((tot, run, Vec::new()));
                 }
-                let mut stride = 1;
-                while stride < threads {
-                    for tid in (0..threads).step_by(2 * stride) {
-                        if tid + stride < threads {
-                            shared[tid] = counts.add(shared[tid], shared[tid + stride]);
-                        }
-                    }
-                    stride *= 2;
+                // The kernel's pairs add their Q, and its quads their T_0, right operand
+                // first; every other join is left first.
+                let mut level = 0;
+                while nodes.len() > 1 {
+                    level += 1;
+                    nodes = nodes
+                        .chunks(2)
+                        .map(|pair| {
+                            let (l, r) = (&pair[0], &pair[1]);
+                            let p = counts.add(l.0, r.0);
+                            let q = match level {
+                                1 => counts.add(r.1, l.1),
+                                _ => counts.add(l.1, r.1),
+                            };
+                            let mut t: Vec<i64> = std::iter::zip(&l.2, &r.2)
+                                .map(|(&a, &b)| match level {
+                                    2 => counts.add(b, a),
+                                    _ => counts.add(a, b),
+                                })
+                                .collect();
+                            t.push(r.1);
+                            (p, q, t)
+                        })
+                        .collect();
                 }
+                let (p, q, t) = &nodes[0];
                 // Host group folding is not a CUDA reduce call.
-                window = window.checked_add(shared[0]).unwrap();
+                window = window
+                    .checked_add(counts.ladder(*p, *q, t, sh, start))
+                    .unwrap();
             }
             let direct = row.iter().enumerate().fold(0i64, |sum, (j, b)| {
                 sum.checked_add(b.checked_mul((j + 1) as i64).unwrap())
@@ -6349,7 +6607,8 @@ mod tests {
             assert_eq!(window, direct);
             windows.push(window);
         }
-        let fixed = 2 * g.rows() + counts.ladders as usize + g.window_sums() * (threads - 1);
+        let fixed = 2 * g.rows() + g.window_sums() * reduce_tree_adds(threads);
+        assert_eq!(counts.ladders as usize, g.window_sums());
         assert_eq!(
             counts.adds.iter().sum::<u64>(),
             fixed as u64 + counts.ladder_adds
@@ -6372,14 +6631,16 @@ mod tests {
         }
         assert_eq!(c.adds, [2, 1, 1, 1, 1]);
         assert_eq!(c.fq2(), (26, 5));
+        // 5 + (3 << 1) + (0 << 2) + 13 * 7, the last through the bits of 13.
         let mut c = ReduceCounts::default();
-        assert_eq!(c.mul(7, 0), 0);
-        assert_eq!(c.mul(0, 13), 0);
-        assert_eq!(c.mul(-7, 1), -7);
-        assert_eq!(c.mul(7, 13), 91);
-        assert_eq!(c.ladder_doubles, [2, 3]);
-        assert_eq!(c.ladder_adds, 4);
-        assert_eq!(c.adds, [2, 0, 0, 0, 2]);
+        assert_eq!(c.ladder(5, 7, &[3, 0], 1, 13), 102);
+        assert_eq!(c.ladder_doubles, [2, 4]);
+        assert_eq!(c.ladder_adds, 6);
+        assert_eq!(c.adds, [1, 1, 0, 0, 4]);
+        assert_eq!(c.ladder(5, 7, &[], 0, 0), 5);
+        assert_eq!((c.ladders, c.ladder_adds), (2, 6));
+        assert_eq!(reduce_tree_adds(8), 18);
+        assert_eq!(reduce_tree_adds(64), 183);
     }
 
     #[test]
