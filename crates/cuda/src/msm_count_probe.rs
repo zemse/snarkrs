@@ -80,6 +80,7 @@ fn shape(view: View, mix: Mix, shapes: Shapes) -> Result<Geometry, ProveError> {
         view.general,
         view.index_span,
         pick_window(None, view.general, mix, Work::Variable),
+        mix,
         Work::Variable,
         shapes,
     )
@@ -436,7 +437,12 @@ fn metadata_geometry_matches_prior_plan_expression_including_index_span() {
                         7,
                         general,
                         c,
-                        slice_len_for(n, c, work),
+                        slice_len_for(
+                            if work == Work::Constant { n } else { general },
+                            c,
+                            Mix::G1,
+                            work,
+                        ),
                         work,
                         Shapes::default(),
                     )
@@ -445,23 +451,49 @@ fn metadata_geometry_matches_prior_plan_expression_including_index_span() {
                         previous.ones_groups = ones_groups_for(span);
                     }
                     assert_eq!(
-                        geometry_for_metadata(n, 7, general, span, c, work, Shapes::default())
-                            .unwrap(),
+                        geometry_for_metadata(
+                            n,
+                            7,
+                            general,
+                            span,
+                            c,
+                            Mix::G1,
+                            work,
+                            Shapes::default()
+                        )
+                        .unwrap(),
                         previous
                     );
                 }
             }
         }
     }
+    assert!(geometry_for_metadata(
+        usize::MAX,
+        0,
+        0,
+        None,
+        3,
+        Mix::G1,
+        Work::Variable,
+        Shapes::default()
+    )
+    .is_err());
+    assert!(geometry_for_metadata(
+        1,
+        usize::MAX,
+        0,
+        None,
+        3,
+        Mix::G1,
+        Work::Variable,
+        Shapes::default()
+    )
+    .is_err());
     assert!(
-        geometry_for_metadata(usize::MAX, 0, 0, None, 3, Work::Variable, Shapes::default())
+        geometry_for_metadata(1, 0, 2, None, 3, Mix::G1, Work::Variable, Shapes::default())
             .is_err()
     );
-    assert!(
-        geometry_for_metadata(1, usize::MAX, 0, None, 3, Work::Variable, Shapes::default())
-            .is_err()
-    );
-    assert!(geometry_for_metadata(1, 0, 2, None, 3, Work::Variable, Shapes::default()).is_err());
 }
 
 #[test]

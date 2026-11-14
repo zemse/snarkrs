@@ -135,7 +135,9 @@ const MERGE_TG: u32 = 64;
 /// artifacts. 64 sits under that on purpose: it also keeps the thread count high enough to
 /// fill the machine at the smaller domains, where there are only a few thousand slices to
 /// begin with. That argument is about the algorithm rather than about Apple silicon, which
-/// is why the constant carries over unchanged. Sweep it with `G16_CUDA_MSM_L`.
+/// is why the constant carries over unchanged. Sweep it with `G16_CUDA_MSM_L`. A
+/// variable-work plan takes it as the longest slice of a G1 pass and cuts the pass to
+/// the card from there; see [`variable_slice_len`].
 const SLICE_LEN: usize = 64;
 
 /// Whether scalar values may change the MSM schedule.
@@ -199,18 +201,18 @@ const SEG_TARGET_THREADS: usize = 4096;
 /// The shortest slice [`slice_len_for`] halves to. Override with `G16_CUDA_MSM_SEG_MIN`.
 const SEG_MIN_LEN: usize = 8;
 
-/// Slice length a plan of `n` scalars at width `c` runs at.
+/// Slice length a plan of `n` scalars at width `c` runs at, `n` being the general
+/// scalars under variable work, shared by `mix` jobs.
 ///
-/// Variable work keeps [`SLICE_LEN`]. A constant-work accumulation runs every one of a
-/// slice's iterations as a dependent chain of complete additions, so at a small `n` a
-/// window of a few slices is a few threads each owing [`SLICE_LEN`] additions while the
-/// card idles: the slice halves while the halved grid stays within
-/// [`SEG_TARGET_THREADS`], down to [`SEG_MIN_LEN`], the Metal twin's `slice_len_for`
-/// without its overshoot. Each slice owns two spill slots, so overshooting doubles the
-/// spill: a 2048-point witness batch at slice 16 needs 9.7 MB against H's 7.8 MB, and
-/// `fit_run` could then never cut it under a budget, where at 32 it needs 6.4. A
-/// function of `n` and `c` alone, which the key fixes. `G16_CUDA_MSM_L` forces one
-/// length for both.
+/// A constant-work accumulation runs every one of a slice's iterations as a dependent
+/// chain of complete additions, so at a small `n` a window of a few slices is a few
+/// threads each owing [`SLICE_LEN`] additions while the card idles: the slice halves
+/// while the halved grid stays within [`SEG_TARGET_THREADS`], down to [`SEG_MIN_LEN`],
+/// the Metal twin's `slice_len_for` without its overshoot. Each slice owns two spill
+/// slots, so overshooting doubles the spill: a 2048-point witness batch at slice 16
+/// needs 9.7 MB against H's 7.8 MB, and `fit_run` could then never cut it under a
+/// budget, where at 32 it needs 6.4. A function of `n` and `c` alone, which the key
+/// fixes. `G16_CUDA_MSM_L` forces one length for both.
 ///
 /// Measured on a Tesla T4 by `constant_work_phase_flatness`, accumulation plus fold in
 /// ms, G1 / G2: at n = 8 (c = 3) slice 64 reads 1.77 / 6.14 and the halving to 8 reads
@@ -218,12 +220,14 @@ const SEG_MIN_LEN: usize = 8;
 /// 3.89 / 13.0 against 2.05 / 6.57. A target of 16384 threads halves 4096 to slice 8
 /// and moves the cost into the fold (1.85 / 7.12); a floor of 2 does the same at n = 8
 /// (0.32 / 1.18). From 2^16 up the plan keeps slice 64.
-fn slice_len_for(n: usize, c: u32, work: Work) -> usize {
+///
+/// Variable work is [`variable_slice_len`].
+fn slice_len_for(n: usize, c: u32, mix: Mix, work: Work) -> usize {
     if let Some(l) = forced_slice_len() {
         return l;
     }
     if work == Work::Variable {
-        return SLICE_LEN;
+        return variable_slice_len(n, c, mix);
     }
     let num = |name: &str, default: usize| {
         std::env::var(name)
@@ -242,6 +246,92 @@ fn slice_len_for(n: usize, c: u32, work: Work) -> usize {
         l /= 2;
     }
     l
+}
+
+/// Threads of `msm_segmented_*` a T4 runs side by side before a pass costs more a
+/// step: two blocks of [`POINT_BLOCK`] on each of its 40 SMs. Half of it is the grain,
+/// one block an SM.
+const FILL_THREADS: usize = 2 * FILL_GRAIN;
+const FILL_GRAIN: usize = 40 * POINT_BLOCK as usize;
+
+/// The shortest slice of a variable-work plan, and the longest of one with a G2 job.
+const FILL_MIN_LEN: usize = 8;
+const FILL_MAX_LEN: usize = 2 * SLICE_LEN;
+
+/// The shortest slice that keeps a variable-work pass of `general` scalars at width `c`
+/// within a whole number of [`FILL_THREADS`], taking the fewest fills a slice of at most
+/// `max` reaches.
+fn fill_slice_len(general: usize, c: u32, max: usize) -> usize {
+    let windows = RECODE_BITS.div_ceil(c as usize);
+    let general = general.max(1);
+    let mut fills = 1;
+    loop {
+        let l = general.div_ceil((fills * FILL_THREADS / windows).max(1));
+        if l <= max {
+            return l.max(FILL_MIN_LEN);
+        }
+        fills += 1;
+    }
+}
+
+/// Slice length of a variable-work plan of `general` scalars at width `c`:
+/// [`fill_slice_len`] within [`SLICE_LEN`], or, for a plan with a G2 job, within
+/// [`FILL_MAX_LEN`] where [`plan_cost_at`] prices that no higher.
+///
+/// A thread is one dependent chain of `slice_len` mixed additions, and a T4 runs the
+/// chains of a pass side by side up to a count its registers set, so a pass costs its
+/// steps times what a step costs at that count, and the count moves in whole blocks an
+/// SM. `msm_segmented_g2` holds 255 registers, two blocks of 128 threads an SM, 10,240
+/// threads on 40 SMs; one more block and that SM runs it behind the others. Microseconds
+/// a step of a pass against its blocks an SM, every slice length forced in turn on
+/// seven circuits (`G16_CUDA_MSM_L`), every proof verified:
+///
+/// ```text
+///   blocks an SM    to 1   to 2   to 3   to 4
+///   G2 us a step      60    105    190    207
+///   G1 us a step      20     21     29     37
+/// ```
+///
+/// (To two is at two: 80 blocks read 105, 81 and 82 read 147, and a G2 pass reads 307
+/// at six an SM and 413 at eight.) At a whole number of fills a G2 entry costs 10.0 to
+/// 10.4 ns whatever the slice; the fixed slice of 64 left js_2x2_d32's B pass, 11,571
+/// entries a window in 32 windows, at 5,792 threads, 46 blocks, paying two blocks' step
+/// for little more than one block's work: 5.4 ms, against 4.1 at a slice of 40 and 73
+/// blocks. A plan below a fill is where it shows most. js_1x1_d8's four plans, 2,118 to
+/// 4,096 scalars, ran 1,734 to 3,264 threads through 64 steps, 3.8 ms a G2 pass and
+/// 1.24 a G1 one, and read 1.07 and 0.25 to 0.44 at slices of 11 to 21.
+///
+/// G1 holds fewer registers: its step is flat to two blocks an SM, where G2's nearly
+/// doubles, and past a few fills a G1 pass is bound by its entries (2.5 to 2.7 ns each
+/// at any slice), so a G1 plan only needs keeping off the counts just past a step:
+/// sha256's H pass at 64 is 208 blocks, 5.2 an SM, and the slice of 56 that makes it
+/// 238 reads 0.5 ms less.
+///
+/// The longer slice is a G2 plan's. A slice of 116 puts js_8x8_d32's B pass in one
+/// fill where 58 takes two, the same accumulation to within 0.2 ms, and halves the
+/// spill slots the merge walks: js_16x16_d32's B merges read 2.25 ms at 58 and 1.66 at
+/// 115. But [`MERGE_WIDE_MIN_SPAN`] counts slices, so a longer slice raises the count
+/// a row needs to merge wide, and js_8x8_d32's half-filled top bucket, wide at 58,
+/// walks some 18 slices of 116 in one thread: 2.9 ms against 0.8. [`plan_cost_at`]
+/// prices exactly that row, so the pick is its.
+///
+/// Each slice owns two spill slots, and a pass is at most its fills of threads, so a
+/// plan's spill is bounded by the card and not by a short slice.
+fn variable_slice_len(general: usize, c: u32, mix: Mix) -> usize {
+    // A width no plan can take is the geometry's to refuse.
+    if !(2..=MAX_WINDOW).contains(&c) {
+        return SLICE_LEN;
+    }
+    let short = fill_slice_len(general, c, SLICE_LEN);
+    if mix.g2 == 0 {
+        return short;
+    }
+    let long = fill_slice_len(general, c, FILL_MAX_LEN);
+    if plan_cost_at(c, general, mix, long) <= plan_cost_at(c, general, mix, short) {
+        long
+    } else {
+        short
+    }
 }
 
 /// Checked without allocating, before any kernel can index a scalar or point range.
@@ -512,6 +602,10 @@ struct JobCost {
     chain_us: f64,
     /// One entry of the segmented accumulation at full occupancy.
     entry_us: f64,
+    /// One step of the segmented accumulation with one block on an SM and with two,
+    /// what each block past two adds, and what an odd count adds from three; see
+    /// [`variable_slice_len`].
+    step_us: [f64; 4],
     /// One bucket row's share of the clear and the merge.
     row_us: f64,
     /// One operation of one reduce thread, as throughput.
@@ -523,6 +617,7 @@ struct JobCost {
 const G1_COST: JobCost = JobCost {
     chain_us: 14.5,
     entry_us: 0.00217,
+    step_us: [20.0, 20.5, 8.4, 0.0],
     row_us: 0.0063,
     reduce_us: 0.00466,
     partial_us: 0.7,
@@ -531,6 +626,7 @@ const G1_COST: JobCost = JobCost {
 const G2_COST: JobCost = JobCost {
     chain_us: 44.4,
     entry_us: 0.0111,
+    step_us: [60.0, 105.0, 52.5, 32.0],
     row_us: 0.0278,
     reduce_us: 0.0182,
     partial_us: 2.4,
@@ -552,19 +648,28 @@ const MODEL_MAX_WINDOW: u32 = 15;
 const MODULUS_TOP: u64 = 0x30644e72e131a029;
 
 /// Modelled cost in microseconds of one plan over `m` general scalars at width `c`,
-/// shared by `mix` jobs; see [`window_size_for`] for the terms.
+/// shared by `mix` jobs, at the slice length it runs at; see [`window_size_for`] for
+/// the terms.
 fn plan_cost_us(c: u32, m: usize, mix: Mix) -> f64 {
+    plan_cost_at(c, m, mix, slice_len_for(m, c, mix, Work::Variable))
+}
+
+/// [`plan_cost_us`] at a given slice length.
+fn plan_cost_at(c: u32, m: usize, mix: Mix, slice_len: usize) -> f64 {
     let windows = RECODE_BITS.div_ceil(c as usize);
     let buckets = 1usize << (c - 1);
     let entries = (windows * m) as f64;
 
     // The reduce as the launch shapes it: `chain` operations a thread, on `threads`.
+    // The ladder's doublings run beside its additions, which takes half of the `c - 1`
+    // bits off the 14 a thread owed past its segment and the tree.
     let groups = reduce_groups_for(windows, buckets);
     let block = buckets
         .div_ceil(groups)
         .next_power_of_two()
-        .min(REDUCE_TG as usize);
-    let chain = 2 * (buckets / (groups * block)).max(1) + block.trailing_zeros() as usize + 14;
+        .clamp(REDUCE_MIN_THREADS as usize, REDUCE_TG as usize);
+    let chain = 2 * (buckets / (groups * block)).max(1) + block.trailing_zeros() as usize + 14
+        - (c as usize - 1) / 2;
     let threads = windows * groups * block;
     let reduce_chain = (chain * threads.div_ceil(RESIDENT_THREADS)) as f64;
 
@@ -573,7 +678,7 @@ fn plan_cost_us(c: u32, m: usize, mix: Mix) -> f64 {
     // the last two the carry reaches hold less.
     let top = MODULUS_TOP as f64 / (1u64 << ((windows - 1) * c as usize - 192)) as f64;
     let (m_f, last) = (m as f64, top.fract());
-    let wide_min = (MERGE_WIDE_MIN_SPAN * SLICE_LEN) as f64;
+    let wide_min = (MERGE_WIDE_MIN_SPAN * slice_len) as f64;
     let (mut narrow, mut wide) = (0.0f64, 0.0f64);
     for count in [
         m_f / buckets as f64,
@@ -587,18 +692,28 @@ fn plan_cost_us(c: u32, m: usize, mix: Mix) -> f64 {
             wide = wide.max(count);
         }
     }
-    let slice = SLICE_LEN as f64;
+    let slice = slice_len as f64;
     let mut merge_chain = 2.0 * (narrow / slice).ceil() + 3.0;
     if wide > 0.0 {
         merge_chain += 2.0 * wide / slice / MERGE_TG as f64 + 11.0;
     }
 
+    // The accumulation: `slice_len` steps at what a step costs with this many blocks an
+    // SM, and a G1 pass no less than its entries.
+    let grains = (windows * m.max(1).div_ceil(slice_len)).div_ceil(FILL_GRAIN);
     let rows = (windows * buckets.min(m)) as f64;
     let partials = (windows * groups) as f64;
     let mut us = (DIGIT_US + SCATTER_US * (buckets as f64).sqrt()) * entries;
-    for (jobs, k) in [(mix.g1, &G1_COST), (mix.g2, &G2_COST)] {
-        // A slice is a chain of `SLICE_LEN` additions however few threads there are.
-        let accumulate = (k.chain_us * SLICE_LEN.min(m) as f64).max(k.entry_us * entries);
+    for (jobs, k, floor) in [(mix.g1, &G1_COST, true), (mix.g2, &G2_COST, false)] {
+        let [one, two, more, odd] = k.step_us;
+        let step = match grains {
+            0 | 1 => one,
+            _ => two + more * (grains - 2) as f64 + odd * (grains % 2) as f64,
+        };
+        let mut accumulate = slice * step;
+        if floor {
+            accumulate = accumulate.max(k.entry_us * entries);
+        }
         us += jobs as f64
             * (accumulate
                 + k.chain_us * (merge_chain + reduce_chain)
@@ -629,18 +744,20 @@ pub fn window_size(m: usize) -> u32 {
 /// prices a plan as its digit pipeline plus, for each job, with `W = ceil(255 / c)`
 /// windows of `B = 2^(c-1)` buckets:
 ///
-/// * the accumulation, `entry_us * W * m`, floored at one slice's chain of
-///   [`SLICE_LEN`] additions, which is all a small plan costs at any width;
+/// * the accumulation, its slice's steps at what a step costs with the pass's blocks
+///   an SM ([`variable_slice_len`], which picks the slice by this same price), and for
+///   a G1 job no less than `entry_us * W * m`;
 /// * the merge's chain, the walk of its fattest bucket: two operations a slice below
 ///   [`MERGE_WIDE_MIN_SPAN`] slices and one block's strided pass above it. The fattest
 ///   buckets are the top window's, whose digits the modulus stops at 3 for c = 9 and 12
 ///   for c = 10, and the bucket the carry half fills is the one that falls below the
 ///   wide threshold: at c = 10 it walks 30 slices serially at 42,846 general scalars
 ///   (3.1 ms in G2, measured) and merges wide at 45,393 (0.8 ms);
-/// * the reduce, a chain of `2 * buckets a thread + log2(block) + 14` operations that
-///   runs once per [`RESIDENT_THREADS`] of its grid (c = 11 launches 12,288 threads and
-///   reads 1.35 ms a G1 job where c = 10's 6,656 read 0.75 on the same chain), plus
-///   `reduce_us` per thread operation;
+/// * the reduce, a chain of `2 * buckets a thread + log2(block) + 14 - (c - 1) / 2`
+///   operations that runs once per [`RESIDENT_THREADS`] of its grid (c = 11 launches
+///   12,288 threads and read 1.35 ms a G1 job where c = 10's 6,656 read 0.75 on the
+///   same chain, under the reduce that owed the whole 14), plus `reduce_us` per thread
+///   operation;
 /// * `row_us * W * B` for the clear and the merge's pass over the rows, and
 ///   `partial_us` per reduce partial the host adds.
 ///
@@ -668,14 +785,20 @@ pub fn window_size(m: usize) -> u32 {
 ///   anon-aadhaar H (2^21)     280.86  191.66  196.79  179.40  145.25  130.64*
 /// ```
 ///
-/// The pick is the measured best or within 0.5 ms of it on every plan above 5,000
+/// The pick was the measured best or within 0.5 ms of it on every plan above 5,000
 /// general scalars but js_8x8_d32's B (0.8) and anon-aadhaar's witness plans, whose
 /// ones pass over 489k to 1.1M positions moves more between runs than between widths.
-/// What the model does not see: the G2
-/// accumulation steps with the thread count (a plan of 18,172 reads 6.3 ms to 9,088
-/// threads and 9.2 from 10,508), so a neighbouring width can win by a step, as 9 does
-/// over 10 at 45,393 and 90,489; and a witness plan's scalars are not all full width,
-/// so its top window holds fewer entries than `m` says. Below about a thousand general
+///
+/// That table is the sweep's, every slice at 64 and the reduce a ladder longer, so a
+/// small plan reads its slice's chain at every width (a 64-addition slice alone read
+/// 1.25 and 3.8 ms) and a G2 pass reads whichever side of a thread step its width put
+/// it (a plan of 18,172 read 6.3 ms to 9,088 threads and 9.2 from 10,508). The slice
+/// now follows the plan, the accumulation term prices it, and the picks moved where
+/// the widths re-measured under it did: js_1x1_d8's four plans take 8, 8.1 ms of MSM
+/// against 10.8 at 5 with the same slices and 13.5 before them, and a G1 plan of
+/// 131,072 to 140,000 takes 13 (js_16x16_d32's A reads 11.8 ms at 13 and 12.2 at 10).
+/// What the model does not see: a witness plan's scalars are not all full width, so
+/// its top window holds fewer entries than `m` says. Below about a thousand general
 /// scalars every width reads the same to within the run's noise.
 ///
 /// # What it replaced
@@ -859,8 +982,9 @@ pub(crate) fn batch_words(
     window: Option<u32>,
     work: Work,
 ) -> Result<Vec<usize>, ProveError> {
-    let c = pick_window(window, n, Mix::of(groups), work);
-    let g = Geometry::new(n, 0, n, c, slice_len_for(n, c, work), work)?;
+    let mix = Mix::of(groups);
+    let c = pick_window(window, n, mix, work);
+    let g = Geometry::new(n, 0, n, c, slice_len_for(n, c, mix, work), work)?;
     let mut words = plan_words(&g)?.to_vec();
     for group in groups {
         words.extend(output_words(&g, group.words())?);
@@ -3455,21 +3579,24 @@ impl std::ops::Deref for Plan<'_> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn geometry_for_metadata(
     n: usize,
     scalar_off: usize,
     general: usize,
     index_span: Option<usize>,
     c: u32,
+    mix: Mix,
     work: Work,
     shapes: Shapes,
 ) -> Result<Geometry, ProveError> {
+    let sliced = if work == Work::Constant { n } else { general };
     let mut g = Geometry::with_shapes(
         n,
         scalar_off,
         general,
         c,
-        slice_len_for(n, c, work),
+        slice_len_for(sliced, c, mix, work),
         work,
         shapes,
     )?;
@@ -3506,6 +3633,7 @@ impl<'a> Plan<'a> {
             general,
             scalars.index.map(|i| i.span),
             pick_window(msm.window, general, mix, msm.work),
+            mix,
             msm.work,
             msm.shapes,
         )
@@ -3873,7 +4001,7 @@ mod tests {
                 0,
                 n,
                 c,
-                slice_len_for(n, c, Work::Variable),
+                slice_len_for(n, c, Mix::of(groups), Work::Variable),
                 Work::Variable,
             )
             .unwrap()
@@ -3958,8 +4086,7 @@ mod tests {
     fn constant_slices_shorten_within_the_thread_target() {
         for n in [0, 1, 8, 512, 1024, 2048, 4096, 1 << 15, 1 << 20] {
             for c in 2..=MAX_WINDOW {
-                assert_eq!(slice_len_for(n, c, Work::Variable), SLICE_LEN);
-                let l = slice_len_for(n, c, Work::Constant);
+                let l = slice_len_for(n, c, Mix::G1, Work::Constant);
                 let w = RECODE_BITS.div_ceil(c as usize);
                 assert!(l.is_power_of_two() && (SEG_MIN_LEN..=SLICE_LEN).contains(&l));
                 let grid = w * n.max(1).div_ceil(l);
@@ -3970,9 +4097,60 @@ mod tests {
                 );
             }
         }
-        assert_eq!(slice_len_for(8, 3, Work::Constant), SEG_MIN_LEN);
-        assert_eq!(slice_len_for(2048, 7, Work::Constant), 32);
-        assert_eq!(slice_len_for(1 << 15, 11, Work::Constant), SLICE_LEN);
+        assert_eq!(slice_len_for(8, 3, Mix::G1, Work::Constant), SEG_MIN_LEN);
+        assert_eq!(slice_len_for(2048, 7, Mix::G1, Work::Constant), 32);
+        assert_eq!(
+            slice_len_for(1 << 15, 11, Mix::G1, Work::Constant),
+            SLICE_LEN
+        );
+    }
+
+    /// A variable-work pass is a whole number of fills, the fewest its longest slice
+    /// reaches, and one entry shorter is over them.
+    #[test]
+    fn variable_slices_cut_a_pass_to_whole_fills() {
+        let b = Mix { g1: 1, g2: 1 };
+        for general in [
+            0usize,
+            1,
+            7,
+            100,
+            2_118,
+            11_571,
+            45_393,
+            90_489,
+            1 << 18,
+            1 << 21,
+        ] {
+            for c in 3..=MAX_WINDOW {
+                let w = RECODE_BITS.div_ceil(c as usize);
+                let fills = |l: usize| (w * general.max(1).div_ceil(l)).div_ceil(FILL_THREADS);
+                for max in [SLICE_LEN, FILL_MAX_LEN] {
+                    let l = fill_slice_len(general, c, max);
+                    assert!((FILL_MIN_LEN..=max).contains(&l));
+                    assert_eq!(fills(l), fills(max), "general = {general}, c = {c}");
+                    assert!(l == FILL_MIN_LEN || fills(l - 1) > fills(l));
+                }
+                let (short, long) = (
+                    fill_slice_len(general, c, SLICE_LEN),
+                    fill_slice_len(general, c, FILL_MAX_LEN),
+                );
+                assert_eq!(variable_slice_len(general, c, Mix::G1), short);
+                assert!([short, long].contains(&variable_slice_len(general, c, b)));
+            }
+        }
+        // js_2x2_d32's B plan, 46 blocks at 64, runs 79; js_1x1_d8's 2,118 run 67.
+        assert_eq!(variable_slice_len(11_571, 8, b), 37);
+        assert_eq!(32 * 11_571usize.div_ceil(37), 10_016);
+        assert_eq!(variable_slice_len(2_118, 8, b), 8);
+        // js_8x8_d32's B plan takes two fills at 58, where 116 leaves its half-filled
+        // top bucket to one thread; js_16x16_d32's clears it and takes one slice of 115
+        // through two fills.
+        assert_eq!(variable_slice_len(45_393, 10, b), 58);
+        assert_eq!(variable_slice_len(90_489, 10, b), 115);
+        // sha256's H, 208 blocks at 64, runs 238, and a 2^18 H keeps 64.
+        assert_eq!(variable_slice_len(65_536, 10, Mix::G1), 56);
+        assert_eq!(variable_slice_len(1 << 18, 13, Mix::G1), SLICE_LEN);
     }
 
     #[test]
@@ -4819,24 +4997,24 @@ mod tests {
         let b = Mix { g1: 1, g2: 1 };
         // (general scalars, the pick of a G1 plan, the pick of B's plan)
         for (m, g1, g2) in [
-            // js_1x1_d8: the accumulation is one slice's chain at any width, and 5 is
-            // the width whose merge and reduce chains are shortest.
-            (2_118, 5, 5),
-            (4_096, 5, 5),
-            // js_2x2_d32, tornado and railgun-01x01 keep 8.
+            // js_1x1_d8: its slices cut to the card, the accumulation is its entries',
+            // and 8 has fewer of them than 5.
+            (2_118, 8, 8),
+            (4_096, 8, 8),
+            // js_2x2_d32, tornado and railgun-01x01 keep 8, and a 2^15 H takes 9.
             (11_571, 8, 8),
             (17_531, 8, 8),
-            (32_768, 8, 9),
-            // railgun-13x01's B plan: at 10 the top window's last bucket walks 30
+            (32_768, 9, 9),
+            // railgun-13x01's B plan: at 10 the top window's last bucket walks its
             // slices serially, which js_8x8_d32's 45,393 clears.
             (42_846, 9, 9),
-            (45_393, 9, 10),
+            (45_393, 10, 10),
             // sha256's H, js_8x8_d32's A and H, js_16x16_d32's B and A.
             (65_536, 10, 10),
             (68_777, 10, 10),
             (90_489, 10, 10),
-            (131_072, 10, 13),
-            (137_105, 10, 13),
+            (131_072, 13, 13),
+            (137_105, 13, 13),
             // A 2^18 H, and anon-aadhaar's 2^21 one.
             (262_144, 13, 13),
             (2_097_152, 15, 15),
@@ -4850,9 +5028,9 @@ mod tests {
         assert_eq!(shared, Mix { g1: 2, g2: 1 });
         assert_eq!(window_size_for(90_489, shared), 10);
         // Small inputs clamp rather than underflow.
-        assert_eq!(window_size(0), 3);
-        assert_eq!(window_size(1), 3);
-        assert_eq!(window_size(64), 3);
+        assert_eq!(window_size(0), 4);
+        assert_eq!(window_size(1), 4);
+        assert_eq!(window_size(64), 5);
         // And nothing leaves the widths the sweep covered.
         for m in [0usize, 1, 7, 1000, 1 << 20, 1 << 26, 1 << 30] {
             for mix in [Mix::G1, b, shared, Mix { g1: 0, g2: 1 }] {
