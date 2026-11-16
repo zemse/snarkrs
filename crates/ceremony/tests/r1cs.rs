@@ -334,6 +334,10 @@ fn coefficients_are_plain_little_endian() {
         Fr::new_unchecked(bigint(r1cs.coef_bytes(c.a[0].coef_ptr).unwrap())),
         Fr::from(2u64)
     );
+    // A pointer 4 GiB further on is a different byte, not the same one truncated to u32.
+    let far = c.a[0].coef_ptr + (1u64 << 32);
+    assert!(r1cs.coef_bytes(far).is_err());
+    assert!(r1cs.coef_bytes(u64::MAX).is_err());
 
     // One constraint, one output and no public inputs, so nPublic is 1 and the domain is
     // floor(log2(1 + 1)) + 1 = 2.

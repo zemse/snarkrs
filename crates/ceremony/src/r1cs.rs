@@ -114,7 +114,7 @@ impl Matrix {
 #[derive(Clone, Copy, Debug)]
 pub struct Term {
     pub signal: u32,
-    pub coef_ptr: u32,
+    pub coef_ptr: u64,
 }
 
 /// One constraint, as three linear combinations in file order.
@@ -182,19 +182,10 @@ impl R1cs {
                 format!("{} bytes left after the header", cur.remaining()),
             ));
         }
-        // Every coefficient is addressed by a u32 offset into section 2, both here and in
-        // snarkjs' accumulator lists, so a section past 4 GiB would silently alias rather
-        // than fail. JS numbers do not have that ceiling, which is why the check is ours.
-        let body = file.unique_section(S_CONSTRAINTS)?;
-        if body.len() > u32::MAX as usize {
-            return Err(CeremonyError::malformed(
-                S_CONSTRAINTS,
-                format!(
-                    "{} bytes does not fit a u32 coefficient pointer",
-                    body.len()
-                ),
-            ));
-        }
+        // Section 2 is walked lazily, but a file without exactly one fails here. Coefficient
+        // pointers are u64, so its size has no ceiling of its own: a 2^25 circuit's runs
+        // past 4 GiB.
+        file.unique_section(S_CONSTRAINTS)?;
         Ok(Self { file, header })
     }
 
@@ -253,7 +244,7 @@ impl R1cs {
                     }
                     // The pointer is to the value, not to the term: snarkjs takes it after
                     // reading the signal index (`zkey_new.js:222-225`).
-                    let coef_ptr = (pos + 4) as u32;
+                    let coef_ptr = (pos + 4) as u64;
                     pos += TERM_BYTES;
                     f(matrix, c, Term { signal, coef_ptr });
                 }
@@ -301,15 +292,17 @@ impl R1cs {
     }
 
     /// The 32 raw plain-little-endian bytes at `coef_ptr`, for a caller feeding the MSM.
-    pub fn coef_bytes(&self, coef_ptr: u32) -> Result<&[u8], CeremonyError> {
+    pub fn coef_bytes(&self, coef_ptr: u64) -> Result<&[u8], CeremonyError> {
         let body = self.constraint_bytes()?;
-        let start = coef_ptr as usize;
-        body.get(start..start + crate::N8).ok_or_else(|| {
-            CeremonyError::malformed(
-                S_CONSTRAINTS,
-                format!("coefficient pointer {coef_ptr} is past the end of the section"),
-            )
-        })
+        usize::try_from(coef_ptr)
+            .ok()
+            .and_then(|start| body.get(start..start.checked_add(crate::N8)?))
+            .ok_or_else(|| {
+                CeremonyError::malformed(
+                    S_CONSTRAINTS,
+                    format!("coefficient pointer {coef_ptr} is past the end of the section"),
+                )
+            })
     }
 
     /// The coefficient at `coef_ptr` as a field element.
@@ -322,7 +315,7 @@ impl R1cs {
     /// (`wasm_field1.js:238-241`) and puts it back. Decoding these bytes as single
     /// Montgomery parses cleanly and produces a zkey that fails verification with no other
     /// symptom.
-    pub fn coef(&self, coef_ptr: u32) -> Result<Fr, CeremonyError> {
+    pub fn coef(&self, coef_ptr: u64) -> Result<Fr, CeremonyError> {
         Ok(fr_normal(self.coef_bytes(coef_ptr)?, S_CONSTRAINTS)?)
     }
 
@@ -346,7 +339,7 @@ impl R1cs {
 pub struct SignalTerm {
     pub matrix: Matrix,
     pub constraint: u32,
-    pub coef_ptr: u32,
+    pub coef_ptr: u64,
 }
 
 /// Section 2 inverted: for each signal, every term that mentions it, in file order.
@@ -357,9 +350,9 @@ pub struct SignalTerm {
 /// passes with one allocation, which is exactly why [`snarkrs_formats::Coefficients`] sorts zkey
 /// section 4 at load rather than scattering per proof.
 ///
-/// Offsets are `u32` for the same reason the coefficient pointers are: one term occupies
-/// [`TERM_BYTES`] of a section that [`R1cs::parse`] has already capped at 4 GiB, so there
-/// can be no more than about 119 million of them.
+/// Offsets are `u32` because they count terms, not bytes: one term occupies [`TERM_BYTES`],
+/// so a u32 holds every term of a section up to about 144 GiB, and [`SignalIndex::build`]
+/// refuses a larger one before counting.
 pub struct SignalIndex {
     /// `row_ptr[s] .. row_ptr[s + 1]` indexes `terms`. Length `n_vars + 1`.
     row_ptr: Vec<u32>,
@@ -369,6 +362,13 @@ pub struct SignalIndex {
 impl SignalIndex {
     pub fn build(r1cs: &R1cs) -> Result<Self, CeremonyError> {
         let n_vars = r1cs.header.n_vars as usize;
+        let section = r1cs.constraint_bytes()?.len();
+        if section / TERM_BYTES > u32::MAX as usize {
+            return Err(CeremonyError::malformed(
+                S_CONSTRAINTS,
+                format!("{section} bytes can hold more terms than a u32 offset counts"),
+            ));
+        }
         let mut row_ptr = vec![0u32; n_vars + 1];
         r1cs.walk(|_, _, term| row_ptr[term.signal as usize + 1] += 1)?;
         // Prefix sum in place turns the histogram into the row offsets.

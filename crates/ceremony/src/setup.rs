@@ -300,7 +300,7 @@ pub struct PointTerm {
     pub tag: BaseTag,
     /// Element index into the tagged Lagrange block, which is the constraint index.
     pub index: u32,
-    pub coef_ptr: Option<u32>,
+    pub coef_ptr: Option<u64>,
 }
 
 /// The five accumulator lists `processConstraints` builds, before any point is computed.
@@ -330,7 +330,7 @@ pub struct CoefRecord {
     pub constraint: u32,
     pub signal: u32,
     /// `None` is the scalar 1, as in [`PointTerm`].
-    pub coef_ptr: Option<u32>,
+    pub coef_ptr: Option<u64>,
 }
 
 /// Walk the r1cs once and build every accumulator, in the three-pass order
@@ -485,8 +485,15 @@ fn write_coefficients(
     r1cs: &R1cs,
     coefs: &[CoefRecord],
 ) -> Result<(), CeremonyError> {
+    // The count is a u32 field, which a section 2 under about 144 GiB cannot overflow.
+    let n = u32::try_from(coefs.len()).map_err(|_| {
+        CeremonyError::BadParams(format!(
+            "{} coefficients do not fit a u32 count",
+            coefs.len()
+        ))
+    })?;
     w.start_section(S_COEFFS)?;
-    w.write_u32(coefs.len() as u32)?;
+    w.write_u32(n)?;
     for batch in coefs.chunks(COEF_BATCH) {
         let encoded: Vec<[u8; COEF_RECORD_BYTES]> = batch
             .par_iter()
@@ -508,7 +515,7 @@ fn write_coefficients(
 }
 
 /// The scalar a term contributes: the raw r1cs coefficient, or 1 for the `-1` sentinel.
-fn coefficient(r1cs: &R1cs, coef_ptr: Option<u32>) -> Result<Fr, CeremonyError> {
+fn coefficient(r1cs: &R1cs, coef_ptr: Option<u64>) -> Result<Fr, CeremonyError> {
     match coef_ptr {
         Some(ptr) => r1cs.coef(ptr),
         None => Ok(Fr::one()),
