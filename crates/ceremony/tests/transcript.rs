@@ -604,6 +604,35 @@ fn beacon_rng_matches_snarkjs() {
     );
 }
 
+/// Longer chains than snarkjs' 1024, so a hardware SHA-256 path is held to the same
+/// answer over enough rounds to matter. The digests are from Python's hashlib:
+/// `c = seed; for _ in range(1 << n): c = hashlib.sha256(c).digest()`.
+#[test]
+fn beacon_rng_matches_hashlib_chain() {
+    let cases: [(&[u8], u8, &str); 2] = [
+        (
+            &[0x0a, 0x0b, 0x0c, 0x0d],
+            16,
+            "61b1cf88a35244db9b26ed8d29a54b5e62760792b1630d74b58319e111fa4e80",
+        ),
+        (
+            &[
+                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+                23, 24, 25, 26, 27, 28, 29, 30, 31,
+            ],
+            13,
+            "bc95728653f42cc8cbf71ca2634868244ceb66c16df7d64d9a5eb87997e97d78",
+        ),
+    ];
+    for (seed, exp, digest) in cases {
+        let mut rng = rng_from_beacon_params(seed, BeaconIterations::new(exp).unwrap());
+        let mut reference = CeremonyRng::from_digest(&unhex(digest));
+        for _ in 0..8 {
+            assert_eq!(rng.next_u32(), reference.next_u32(), "exp {exp}");
+        }
+    }
+}
+
 /// `getRandomRng` is not reproducible in production, but its shape is: BLAKE2b-512 over
 /// the 64 OS bytes **then** the UTF-8 entropy, no NUL and no length prefix
 /// (`misc.js:187-191`). The entropy here is non-ASCII so the encoding is pinned too.

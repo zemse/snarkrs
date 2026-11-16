@@ -38,6 +38,13 @@ rand_chacha.workspace = true
 # there is no wasm target to keep a filesystem API out of.
 memmap2.workspace = true
 
+# The ARMv8 SHA-256 instructions for the beacon's 2^numIterationsExp chain, which sha2
+# 0.10 only uses through its `asm` feature on aarch64 (x86 gets SHA-NI without it). The
+# PPoT beacon's 2^31 rounds take about 100 ns each this way against 540 in software.
+# sha2-asm's aarch64 source is GNU assembler, so MSVC targets keep the software path.
+[target.'cfg(all(target_arch = "aarch64", not(target_env = "msvc")))'.dependencies]
+sha2 = { workspace = true, features = ["asm"] }
+
 [dev-dependencies]
 # The Metal ceremony seams, which the `*_metal.rs` tests hold the CPU ones against.
 # snarkrs-metal dev-depends on this crate for the same reason; a dev-dependency in both
