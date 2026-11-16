@@ -403,6 +403,62 @@ fn challenge_and_response_match_snarkjs() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// `ptt` writes snarkjs' files under snarkjs' names, and `--power` writes the same bytes
+/// for only the powers it names. A power the file does not have below its own, or an
+/// unprepared file, is exit 1 with nothing written.
+#[test]
+fn truncate_matches_snarkjs() {
+    let Some(js) = snarkjs_bin() else {
+        return;
+    };
+    let dir = scratch("truncate");
+    let run = |line: &str| {
+        let o = snarkrs(&dir, line);
+        expect(&o, 0, line);
+        stdout(&o)
+    };
+    run("ptn bn128 5 pot_0000.ptau");
+    run("ptc pot_0000.ptau pot_0001.ptau -e=one -n=First");
+    run("pt2 pot_0001.ptau pot.ptau");
+    std::fs::copy(dir.join("pot.ptau"), dir.join("js.ptau")).unwrap();
+
+    let ours = run("powersoftau truncate pot.ptau");
+    let (code, theirs) = snarkjs(&js, &dir, "ptt js.ptau");
+    assert_eq!(code, 0, "snarkjs ptt: {theirs}");
+    assert_eq!(ours, theirs);
+    for p in 1..5 {
+        same_bytes(
+            &dir,
+            &format!("pot_{p:02}.ptau"),
+            &format!("js_{p:02}.ptau"),
+        );
+        std::fs::remove_file(dir.join(format!("pot_{p:02}.ptau"))).unwrap();
+    }
+
+    run("ptt pot.ptau --power 3 -power=2,3");
+    for p in 1..5 {
+        let name = format!("pot_{p:02}.ptau");
+        match p {
+            2 | 3 => same_bytes(&dir, &name, &format!("js_{p:02}.ptau")),
+            _ => assert!(!dir.join(&name).exists(), "{name}"),
+        }
+    }
+
+    for line in [
+        "ptt pot.ptau --power 5",
+        "ptt pot.ptau --power 0",
+        "ptt pot_0001.ptau",
+    ] {
+        let o = snarkrs(&dir, line);
+        expect(&o, 1, line);
+        assert!(stderr(&o).starts_with("error: "), "{}", said(&o));
+    }
+    assert!(!dir.join("pot_05.ptau").exists());
+    assert!(!dir.join("pot_0001_01.ptau").exists());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// A zkey contribution made in bellman's format, and the Solidity verifier. Export and
 /// import are deterministic and held to snarkjs' bytes and log; the contribution is random,
 /// so snarkjs' `zkvi` has to accept the key it ends in. The verifier is our own contract,

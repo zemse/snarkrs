@@ -740,6 +740,51 @@ fn truncate_late_error_publishes_no_power() {
     }
 }
 
+/// A chosen power is the same file the full run writes for it, a power outside
+/// `1 .. power` or an unprepared source is refused, and neither refusal writes anything.
+#[test]
+fn truncate_to_chosen_powers_writes_the_full_runs_files() {
+    use snarkrs_ceremony::ptau_export::{ptau_truncate, ptau_truncate_powers};
+    let fixture = Fixture::new("truncate-powers");
+    let (all, some) = (fixture.dir.join("all"), fixture.dir.join("some"));
+    std::fs::create_dir_all(&all).unwrap();
+    std::fs::create_dir_all(&some).unwrap();
+    let ptau = snarkrs_ceremony::ptau::Ptau::open(&fixture.ptau).unwrap();
+    let template = |dir: &Path| dir.join("t_").to_str().unwrap().to_owned();
+    ptau_truncate(&ptau, &template(&all), &mut Vec::new()).unwrap();
+    let written =
+        ptau_truncate_powers(&ptau, &template(&some), &[5, 2, 5], &mut Vec::new()).unwrap();
+    assert_eq!(written, [some.join("t_02.ptau"), some.join("t_05.ptau")]);
+    assert_eq!(entries(&some).len(), 2);
+    for name in ["t_02.ptau", "t_05.ptau"] {
+        assert_eq!(
+            std::fs::read(some.join(name)).unwrap(),
+            std::fs::read(all.join(name)).unwrap(),
+            "{name}"
+        );
+    }
+    let fresh = fixture.dir.join("fresh");
+    std::fs::create_dir_all(&fresh).unwrap();
+    for bad in [0, 9, 30] {
+        let error =
+            ptau_truncate_powers(&ptau, &template(&fresh), &[3, bad], &mut Vec::new()).unwrap_err();
+        assert!(
+            matches!(error, CeremonyError::BadParams(_)),
+            "{bad}: {error}"
+        );
+    }
+    let unprepared =
+        snarkrs_ceremony::ptau::Ptau::open(&fixture.dir.join("contributed.ptau")).unwrap();
+    let error =
+        ptau_truncate_powers(&unprepared, &template(&fresh), &[3], &mut Vec::new()).unwrap_err();
+    assert!(matches!(error, CeremonyError::NotPrepared), "{error}");
+    assert!(
+        entries(&fresh).is_empty(),
+        "a refusal wrote {:?}",
+        entries(&fresh)
+    );
+}
+
 /// `zkey verify r1cs` keeps its init key under a reserved name, so a user file named
 /// like the old `<key>.verify-init.zkey` scratch file survives it.
 #[test]

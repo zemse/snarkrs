@@ -5,6 +5,7 @@
 //!   snarkrs powersoftau beacon <in.ptau> <out.ptau> <hashHex> <iterExp>    (ptb)
 //!   snarkrs powersoftau prepare phase2 <in.ptau> <out.ptau>                (pt2)
 //!   snarkrs powersoftau verify <in.ptau>                                   (ptv)
+//!   snarkrs powersoftau truncate <in.ptau> [--power P]...                  (ptt)
 //!   snarkrs powersoftau export challenge <in.ptau> [challenge]            (ptec)
 //!   snarkrs powersoftau challenge contribute bn128 <challenge> [response] [-e=TEXT]
 //!                                                                          (ptcc)
@@ -68,9 +69,10 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use snarkrs_ceremony::snarkjs_log::{self, SnarkjsLog};
 use snarkrs_ceremony::{
-    bellman, challenge, contribute as zkey_mpc, phase1, prepare, ptau as ptau_file, setup,
-    solidity, vkey, CeremonyError,
+    bellman, challenge, contribute as zkey_mpc, phase1, prepare, ptau as ptau_file, ptau_export,
+    setup, solidity, vkey, CeremonyError,
 };
 use snarkrs_cli::{
     bench,
@@ -233,6 +235,16 @@ enum PtauCmd {
     },
     /// Check the contribution chain and recompute the challenge hashes.
     Verify { ptau: PathBuf },
+    /// Write the file at every smaller power: `pot.ptau` gives `pot_01.ptau` up to one
+    /// below its own power, beside it. Needs a prepared file.
+    Truncate {
+        /// Kept as given: the output names are cut from this text, as snarkjs cuts them.
+        ptau: String,
+        /// Write only these powers, not all of them. Repeatable or comma-separated. Every
+        /// power of a power-28 file is about 300 GB. Ours, not snarkjs'.
+        #[arg(long = "power", value_name = "P", value_delimiter = ',')]
+        powers: Vec<u32>,
+    },
     Export {
         #[command(subcommand)]
         cmd: PtauExportCmd,
@@ -709,6 +721,21 @@ fn entropy_or_prompt(given: Option<String>) -> Result<String> {
     }
 }
 
+/// The lines a `snarkrs_ceremony` command hands snarkjs' logger, printed as ours.
+struct CliLog;
+
+impl SnarkjsLog for CliLog {
+    fn log(&mut self, level: snarkjs_log::Level, msg: &str) -> std::io::Result<()> {
+        match level {
+            snarkjs_log::Level::Debug => log::debug(msg),
+            snarkjs_log::Level::Info => log::info(msg),
+            snarkjs_log::Level::Warn => log::warn(msg),
+            snarkjs_log::Level::Error => log::error(msg),
+        }
+        Ok(())
+    }
+}
+
 fn run_ptau(cmd: PtauCmd) -> Result<u8> {
     match cmd {
         PtauCmd::New { curve, power, out } => {
@@ -808,6 +835,19 @@ fn run_ptau(cmd: PtauCmd) -> Result<u8> {
                 );
             }
             log::info("Powers of Tau Ok!");
+        }
+        PtauCmd::Truncate { ptau, powers } => {
+            let src = ptau_file::Ptau::open(Path::new(&ptau))
+                .with_context(|| format!("opening {ptau}"))?;
+            let template = ptau_export::truncate_template(&ptau);
+            let written = match powers.is_empty() {
+                true => ptau_export::ptau_truncate(&src, &template, &mut CliLog),
+                false => ptau_export::ptau_truncate_powers(&src, &template, &powers, &mut CliLog),
+            }
+            .with_context(|| format!("truncating {ptau}"))?;
+            for path in written {
+                log::debug(format!("wrote {}", path.display()));
+            }
         }
         PtauCmd::Export {
             cmd: PtauExportCmd::Challenge { ptau, out },

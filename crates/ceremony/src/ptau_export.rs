@@ -282,13 +282,43 @@ pub fn ptau_truncate<L: SnarkjsLog + ?Sized>(
     template: &str,
     log: &mut L,
 ) -> Result<Vec<PathBuf>, CeremonyError> {
+    let all: Vec<u32> = (1..ptau.power()).collect();
+    ptau_truncate_powers(ptau, template, &all, log)
+}
+
+/// [`ptau_truncate`] for the listed powers only, each file the same bytes the full run
+/// writes for it. Every power of a power-28 file is about 300 GB, which is why this exists.
+///
+/// The powers are sorted and deduplicated, and each must be in `1 .. power`. An
+/// unprepared file is refused before anything is written, where snarkjs' `copySection`
+/// throws on the missing section 12 after leaving a partial `_01.ptau` behind.
+pub fn ptau_truncate_powers<L: SnarkjsLog + ?Sized>(
+    ptau: &Ptau,
+    template: &str,
+    powers: &[u32],
+    log: &mut L,
+) -> Result<Vec<PathBuf>, CeremonyError> {
     let h = *ptau.header();
-    let paths: Vec<PathBuf> = (1..h.power)
+    if let Some(p) = powers.iter().find(|p| !(1..h.power).contains(*p)) {
+        return Err(CeremonyError::BadParams(format!(
+            "cannot truncate a power-{} file to power {p}: it must be between 1 and {}",
+            h.power,
+            h.power - 1
+        )));
+    }
+    if !powers.is_empty() && !ptau.is_prepared() {
+        return Err(CeremonyError::NotPrepared);
+    }
+    let mut powers = powers.to_vec();
+    powers.sort_unstable();
+    powers.dedup();
+    let paths: Vec<PathBuf> = powers
+        .iter()
         .map(|p| PathBuf::from(format!("{template}{p:02}.ptau")))
         .collect();
     let destinations: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
     crate::write::staged_all(&destinations, |stages| {
-        for (p, stage) in (1..h.power).zip(stages) {
+        for (&p, stage) in powers.iter().zip(stages) {
             log.debug(&format!("Writing Power: {p:02}"))?;
             truncate_one(ptau, p, stage)?;
         }

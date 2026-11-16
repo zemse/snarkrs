@@ -121,6 +121,7 @@ fails with exit 1 and says so.
 snarkrs powersoftau new bn128 12                              # powersOfTau12_0000.ptau
 snarkrs powersoftau contribute powersOfTau12_0000.ptau pot_0001.ptau -e=... -n=me
 snarkrs powersoftau prepare phase2 pot_0001.ptau powersoftau.ptau
+snarkrs powersoftau truncate powersoftau.ptau [--power 8,10]  # powersoftau_01.ptau ... _11.ptau
 snarkrs groth16 setup circuit.r1cs powersoftau.ptau circuit_0000.zkey
 snarkrs zkey contribute circuit_0000.zkey circuit_final.zkey -e=...
 snarkrs zkey export verificationkey circuit_final.zkey verification_key.json

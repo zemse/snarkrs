@@ -141,7 +141,7 @@ pub const COMMANDS: &[Command] = &[
         cmd: "powersoftau truncate <powersoftau.ptau>",
         alias: &["ptt"],
         description: "Generate different powers of tau with smaller sizes ",
-        support: Later,
+        support: Yes,
     },
     Command {
         cmd: "powersoftau verify <powersoftau.ptau>",
@@ -368,7 +368,14 @@ pub const EXTRAS: &[(&str, &str)] = &[
 
 /// Our options that take their value as the next token. Everything else is a flag or
 /// `key=value`, as in snarkjs.
-pub const VALUE_OPTIONS: &[&str] = &["backend", "self-verify", "fallback", "vkey", "threads"];
+pub const VALUE_OPTIONS: &[&str] = &[
+    "backend",
+    "self-verify",
+    "fallback",
+    "vkey",
+    "threads",
+    "power",
+];
 
 /// snarkjs' short option names (`-verbose|v`, `-entropy|e`, `-name|n`, and `wtns debug`'s
 /// `-get|g`, `-set|s`, `-trigger|t`) and `-h`.
@@ -599,6 +606,7 @@ mod tests {
             ("ptec a", "powersoftau export challenge a"),
             ("ptcc bn128 c", "powersoftau challenge contribute bn128 c"),
             ("ptir a r b", "powersoftau import response a r b"),
+            ("ptt a.ptau", "powersoftau truncate a.ptau"),
             ("zkeb a", "zkey export bellman a"),
             ("zkbc bn128 a b", "zkey bellman contribute bn128 a b"),
             ("zkib a m b", "zkey import bellman a m b"),
@@ -649,6 +657,10 @@ mod tests {
         assert_eq!(
             clap("g16p -backend=cpu").join(" "),
             "groth16 prove --backend=cpu"
+        );
+        assert_eq!(
+            clap("ptt p.ptau --power 17 -power=22").join(" "),
+            "powersoftau truncate p.ptau --power=17 --power=22"
         );
     }
 
