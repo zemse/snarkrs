@@ -25,6 +25,7 @@
 //! The one shipped bug that has to be reproduced rather than fixed lives in
 //! [`hash_h_points`].
 
+use std::ops::Range;
 use std::path::Path;
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::thread::JoinHandle;
@@ -42,10 +43,10 @@ use snarkrs_msm::xyzz::{to_projective, RawCurve, Xyzz};
 use snarkrs_msm::{AccelError, MsmBackend};
 
 use crate::ptau::{self, Ptau};
-use crate::r1cs::{Matrix, R1cs};
+use crate::r1cs::{Matrix, R1cs, S_CONSTRAINTS, TERM_BYTES};
 use crate::transcript::{self, Digest, Transcript};
 use crate::write::BinFileWriter;
-use crate::{CeremonyError, Groth16Header, N8, SG1};
+use crate::{CeremonyError, Groth16Header, N8, SG1, SG2};
 
 /// zkey section ids, in id order rather than write order.
 pub const S_PROTOCOL: u32 = 1;
@@ -74,8 +75,8 @@ pub const ZKEY_MAX_VERSION: u32 = 2;
 pub const COEF_RECORD_BYTES: usize = 12 + crate::N8;
 
 /// Section 4 records encoded per `write_bytes` call. Only a buffering choice: the bytes
-/// are identical whatever the split, and 8192 records is 352 KB.
-const COEF_BATCH: usize = 8192;
+/// are identical whatever the split, and 65536 records is 2.9 MB.
+const COEF_BATCH: usize = 1 << 16;
 
 /// Points per `normalize_batch` call in [`to_affine`]: one field inversion each, so the
 /// split only trades inversions against scratch, and the affine output is the same.
@@ -240,13 +241,27 @@ fn setup_inner(
     header_hash.update_g2(&header.delta_g2);
     let cs = CsHash::spawn(header_hash)?;
 
-    let acc = process_constraints(&r1cs, domain_size)?;
-    let n_coefs = acc.coefs.len();
-    write_coefficients(&mut w, &r1cs, &acc.coefs)?;
+    // The r1cs walks are serial and the Lagrange check is not, so they run side by side;
+    // an r1cs error still wins, as it would have run first.
+    let (acc, bases) = rayon::join(
+        || -> Result<Accumulators, CeremonyError> {
+            let counts = TermCounts::walk(&r1cs, domain_size)?;
+            let n = coef_count(counts.n_coefs)?;
+            w.start_section(S_COEFFS)?;
+            w.write_u32(n)?;
+            let acc = counts.fill(&r1cs, |batch| {
+                w.write_bytes(&encode_coefficients(&r1cs, batch)?)
+            })?;
+            w.end_section()?;
+            Ok(acc)
+        },
+        || LagrangeBlocks::read(&ptau, domain_size),
+    );
+    let acc = acc?;
+    let bases = bases?;
+    let n_coefs = acc.n_coefs;
 
-    let bases = LagrangeBlocks::read(&ptau, domain_size)?;
-
-    write_points_g1(&mut w, &cs, S_IC, &acc.ic, &bases, &r1cs, msm)?;
+    write_points_g1(&mut w, &cs, S_IC, acc.ic(), &bases, &r1cs, msm)?;
 
     w.start_section(S_H)?;
     w.write_g1_slice(&write_hs(&ptau, domain_size)?)?;
@@ -254,10 +269,10 @@ fn setup_inner(
 
     hash_h_points_into(&ptau, domain_size, |b| cs.send(Absorb::Bytes(b)))?;
 
-    write_points_g1(&mut w, &cs, S_C, &acc.c, &bases, &r1cs, msm)?;
-    write_points_g1(&mut w, &cs, S_A, &acc.a, &bases, &r1cs, msm)?;
-    write_points_g1(&mut w, &cs, S_B1, &acc.b1, &bases, &r1cs, msm)?;
-    write_points_g2(&mut w, &cs, S_B2, &acc.b2, &bases, &r1cs, msm)?;
+    write_points_g1(&mut w, &cs, S_C, acc.c(), &bases, &r1cs, msm)?;
+    write_points_g1(&mut w, &cs, S_A, acc.a.all(), &bases, &r1cs, msm)?;
+    write_points_g1(&mut w, &cs, S_B1, acc.b.all(), &bases, &r1cs, msm)?;
+    write_points_g2(&mut w, &cs, S_B2, acc.b.all(), &bases, &r1cs, msm)?;
 
     let cs_hash = cs.finish().finalize();
     w.start_section(S_MPC_PARAMS)?;
@@ -298,31 +313,198 @@ pub enum BaseTag {
 /// (`zkey_new.js:436-446`). It appears only in the public-signal tail, which appends a
 /// synthetic constraint row per public signal with `a = 1, b = 0, c = 0` so that `A_s(x)`
 /// is nonzero for every public signal.
-#[derive(Clone, Copy, Debug)]
+///
+/// Packed into 12 bytes, because a 2^25 circuit holds a quarter of a billion of these at
+/// once: the tag rides in the top two bits of the element index, which
+/// [`process_constraints`] keeps below `2^30`, and `None` is `u64::MAX`, which no offset
+/// into a section can be.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct PointTerm {
-    pub tag: BaseTag,
-    /// Element index into the tagged Lagrange block, which is the constraint index.
-    pub index: u32,
-    pub coef_ptr: Option<u64>,
+    word: u32,
+    coef: [u32; 2],
 }
 
-/// The five accumulator lists `processConstraints` builds, before any point is computed.
+/// Bits of [`PointTerm`]'s element index; the tag takes the rest of the word.
+const INDEX_BITS: u32 = 30;
+const NO_COEF: u64 = u64::MAX;
+
+impl PointTerm {
+    const EMPTY: Self = Self {
+        word: 0,
+        coef: [0; 2],
+    };
+
+    pub fn new(tag: BaseTag, index: u32, coef_ptr: Option<u64>) -> Self {
+        debug_assert!(index < 1 << INDEX_BITS, "element {index} does not pack");
+        let tag = match tag {
+            BaseTag::TauG1 => 0,
+            BaseTag::TauG2 => 1,
+            BaseTag::AlphaTauG1 => 2,
+            BaseTag::BetaTauG1 => 3,
+        };
+        let ptr = coef_ptr.unwrap_or(NO_COEF);
+        Self {
+            word: tag << INDEX_BITS | index,
+            coef: [ptr as u32, (ptr >> 32) as u32],
+        }
+    }
+
+    pub fn tag(&self) -> BaseTag {
+        match self.word >> INDEX_BITS {
+            0 => BaseTag::TauG1,
+            1 => BaseTag::TauG2,
+            2 => BaseTag::AlphaTauG1,
+            _ => BaseTag::BetaTauG1,
+        }
+    }
+
+    /// Element index into the tagged Lagrange block, which is the constraint index.
+    pub fn index(&self) -> u32 {
+        self.word & ((1 << INDEX_BITS) - 1)
+    }
+
+    pub fn coef_ptr(&self) -> Option<u64> {
+        let ptr = u64::from(self.coef[0]) | u64::from(self.coef[1]) << 32;
+        (ptr != NO_COEF).then_some(ptr)
+    }
+}
+
+impl std::fmt::Debug for PointTerm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PointTerm")
+            .field("tag", &self.tag())
+            .field("index", &self.index())
+            .field("coef_ptr", &self.coef_ptr())
+            .finish()
+    }
+}
+
+/// One list of terms per output point, flattened: slot `i` is
+/// `terms[offsets[i] .. offsets[i + 1]]`.
 ///
-/// Lengths are fixed at construction and never grow: `A`, `B1` and `B2` are `nVars` long,
-/// `C` is `nVars - nPublic - 1`, and `IC` is `nPublic + 1`. That matters beyond bookkeeping
-/// because each length is hashed into `csHash` as a big-endian u32 before its points. A
-/// signal that appears in no constraint leaves an empty slot, and an empty slot writes the
-/// group identity, which serialises as all-zero bytes.
+/// Built by a counting walk and a filling walk over the r1cs rather than by pushing into a
+/// vector per slot, which on a 2^25 circuit was 74 million vector headers and their
+/// doubling slack. Offsets count terms, so a u32 holds every term of an r1cs up to about
+/// 144 GiB, and [`process_constraints`] refuses a larger one before counting.
+pub struct Slots {
+    offsets: Vec<u32>,
+    terms: Vec<PointTerm>,
+}
+
+impl Slots {
+    /// One slot per list, in order.
+    pub fn from_lists(lists: &[Vec<PointTerm>]) -> Self {
+        let mut offsets = Vec::with_capacity(lists.len() + 1);
+        offsets.push(0u32);
+        let mut terms = Vec::new();
+        for list in lists {
+            terms.extend_from_slice(list);
+            offsets.push(u32::try_from(terms.len()).expect("terms fit a u32 offset"));
+        }
+        Self { offsets, terms }
+    }
+
+    pub fn len(&self) -> usize {
+        self.offsets.len() - 1
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn slot(&self, i: usize) -> &[PointTerm] {
+        &self.terms[self.offsets[i] as usize..self.offsets[i + 1] as usize]
+    }
+
+    pub fn all(&self) -> SlotRange<'_> {
+        self.range(0..self.len())
+    }
+
+    /// # Panics
+    ///
+    /// Panics unless `range` lies within `0..len()`.
+    pub fn range(&self, range: Range<usize>) -> SlotRange<'_> {
+        assert!(range.start <= range.end && range.end <= self.len());
+        SlotRange {
+            slots: self,
+            start: range.start,
+            end: range.end,
+        }
+    }
+}
+
+/// A run of consecutive slots of one [`Slots`], numbered from zero.
+#[derive(Clone, Copy)]
+pub struct SlotRange<'a> {
+    slots: &'a Slots,
+    start: usize,
+    end: usize,
+}
+
+impl<'a> SlotRange<'a> {
+    pub fn len(&self) -> usize {
+        self.end - self.start
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn slot(&self, k: usize) -> &'a [PointTerm] {
+        assert!(k < self.len());
+        self.slots.slot(self.start + k)
+    }
+
+    /// The slots `range` of this run, numbered from zero again.
+    pub fn sub(&self, range: Range<usize>) -> SlotRange<'a> {
+        assert!(range.start <= range.end && range.end <= self.len());
+        SlotRange {
+            slots: self.slots,
+            start: self.start + range.start,
+            end: self.start + range.end,
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &'a [PointTerm]> + 'a {
+        let (slots, range) = (self.slots, self.start..self.end);
+        range.map(move |i| slots.slot(i))
+    }
+}
+
+/// The accumulator lists `processConstraints` builds, before any point is computed.
+///
+/// Lengths are fixed: `A`, `B1` and `B2` are `nVars` long, `C` is `nVars - nPublic - 1`,
+/// and `IC` is `nPublic + 1`. That matters beyond bookkeeping because each length is
+/// hashed into `csHash` as a big-endian u32 before its points. A signal that appears in no
+/// constraint leaves an empty slot, and an empty slot writes the group identity, which
+/// serialises as all-zero bytes.
+///
+/// Section 4's records are not kept: they are handed out in push order while the lists
+/// fill (see [`TermCounts::fill`]), and only their count stays.
 pub struct Accumulators {
-    pub ic: Vec<Vec<PointTerm>>,
-    pub a: Vec<Vec<PointTerm>>,
-    pub b1: Vec<Vec<PointTerm>>,
-    pub b2: Vec<Vec<PointTerm>>,
-    pub c: Vec<Vec<PointTerm>>,
-    /// Section 4 in push order: `(matrix, constraint, signal, coef_ptr)`, matrix 0 for A
-    /// and 1 for B. C terms are never recorded. Do not sort this: the order is execution
-    /// order and the file stores it as such.
-    pub coefs: Vec<CoefRecord>,
+    /// Section 5, one slot per signal.
+    pub a: Slots,
+    /// Sections 6 and 7, one slot per signal. They differ only in the group each term's
+    /// base comes from, `L_j(tau)` in G1 for B1 and in G2 for B2, so the list is held once
+    /// and tagged for B1.
+    pub b: Slots,
+    /// Sections 3 and 8, one slot per signal: [`Accumulators::ic`] is signals
+    /// `0 ..= nPublic` and [`Accumulators::c`] the rest. They partition the signals, which
+    /// is why one list covers both.
+    pub ic_c: Slots,
+    /// Section 4's record count, `nnz(A) + nnz(B) + nPublic + 1`.
+    pub n_coefs: usize,
+    n_public: usize,
+}
+
+impl Accumulators {
+    pub fn ic(&self) -> SlotRange<'_> {
+        self.ic_c.range(0..self.n_public + 1)
+    }
+
+    pub fn c(&self) -> SlotRange<'_> {
+        self.ic_c.range(self.n_public + 1..self.ic_c.len())
+    }
 }
 
 /// One section-4 record.
@@ -336,185 +518,268 @@ pub struct CoefRecord {
     pub coef_ptr: Option<u64>,
 }
 
-/// Walk the r1cs once and build every accumulator, in the three-pass order
+/// Walk the r1cs and build every accumulator, in the three-pass order
 /// `zkey_new.js:222-300` uses: A terms, then B terms, then C terms per constraint, then
 /// the public-signal tail.
 pub fn process_constraints(r1cs: &R1cs, domain_size: usize) -> Result<Accumulators, CeremonyError> {
-    let n_vars = r1cs.header().n_vars as usize;
-    let n_public = r1cs.header().n_public();
-    let n_constraints = r1cs.header().n_constraints as usize;
-
-    // Signal 0 is the constant ONE and signals `1 ..= nPublic` are the public ones, so a
-    // circuit with no private signal at all still needs `nVars > nPublic`. snarkjs would
-    // instead build a `BigArray` of negative length and only fail later, in the C write.
-    if n_vars <= n_public {
-        return Err(CeremonyError::BadParams(format!(
-            "{n_vars} signals cannot hold the ONE signal plus {n_public} public ones"
-        )));
-    }
-    // The tail rows sit at Lagrange element `nConstraints + s`, and the largest of them
-    // has to stay inside the `domainSize`-element block. `circuit_power` guarantees it;
-    // this catches a caller that computed `domain_size` some other way, before the bound
-    // turns into an out-of-range base index a few million points later.
-    if n_constraints + n_public >= domain_size {
-        return Err(CeremonyError::BadParams(format!(
-            "domain size {domain_size} does not cover {n_constraints} constraints plus \
-             {n_public} public signals"
-        )));
-    }
-
-    let mut ic = vec![Vec::new(); n_public + 1];
-    let mut a = vec![Vec::new(); n_vars];
-    let mut b1 = vec![Vec::new(); n_vars];
-    let mut b2 = vec![Vec::new(); n_vars];
-    let mut c = vec![Vec::new(); n_vars - n_public - 1];
-    let nnz = r1cs.nonzeros()?;
-    let mut coefs = Vec::with_capacity(nnz.a + nnz.b + n_public + 1);
-
-    // `IC` and `C` partition the signals, so one closure covers both destinations. The
-    // tag differs per pass, which is the only thing that distinguishes the three.
-    macro_rules! push_ic_or_c {
-        ($signal:expr, $term:expr) => {{
-            let s = $signal as usize;
-            if s <= n_public {
-                ic[s].push($term);
-            } else {
-                c[s - n_public - 1].push($term);
-            }
-        }};
-    }
-
-    for (constraint, cons) in r1cs.constraints()?.iter().enumerate() {
-        let constraint = constraint as u32;
-        for term in &cons.a {
-            let coef_ptr = Some(term.coef_ptr);
-            a[term.signal as usize].push(PointTerm {
-                tag: BaseTag::TauG1,
-                index: constraint,
-                coef_ptr,
-            });
-            push_ic_or_c!(
-                term.signal,
-                PointTerm {
-                    tag: BaseTag::BetaTauG1,
-                    index: constraint,
-                    coef_ptr,
-                }
-            );
-            coefs.push(CoefRecord {
-                matrix: Matrix::A.as_u32(),
-                constraint,
-                signal: term.signal,
-                coef_ptr,
-            });
-        }
-        for term in &cons.b {
-            let coef_ptr = Some(term.coef_ptr);
-            b1[term.signal as usize].push(PointTerm {
-                tag: BaseTag::TauG1,
-                index: constraint,
-                coef_ptr,
-            });
-            b2[term.signal as usize].push(PointTerm {
-                tag: BaseTag::TauG2,
-                index: constraint,
-                coef_ptr,
-            });
-            push_ic_or_c!(
-                term.signal,
-                PointTerm {
-                    tag: BaseTag::AlphaTauG1,
-                    index: constraint,
-                    coef_ptr,
-                }
-            );
-            coefs.push(CoefRecord {
-                matrix: Matrix::B.as_u32(),
-                constraint,
-                signal: term.signal,
-                coef_ptr,
-            });
-        }
-        // The C pass touches no coefficient record and no A/B accumulator: the C matrix
-        // reaches the key only through `IC` and `C` (`zkey_new.js:272-287`).
-        for term in &cons.c {
-            push_ic_or_c!(
-                term.signal,
-                PointTerm {
-                    tag: BaseTag::TauG1,
-                    index: constraint,
-                    coef_ptr: Some(term.coef_ptr),
-                }
-            );
-        }
-    }
-
-    // One synthetic row per public signal, `a = 1` and nothing else, so `A_s(x)` is
-    // nonzero for every public signal (`zkey_new.js:290-300`).
-    for s in 0..=n_public {
-        let index = (n_constraints + s) as u32;
-        a[s].push(PointTerm {
-            tag: BaseTag::TauG1,
-            index,
-            coef_ptr: None,
-        });
-        ic[s].push(PointTerm {
-            tag: BaseTag::BetaTauG1,
-            index,
-            coef_ptr: None,
-        });
-        coefs.push(CoefRecord {
-            matrix: Matrix::A.as_u32(),
-            constraint: index,
-            signal: s as u32,
-            coef_ptr: None,
-        });
-    }
-
-    Ok(Accumulators {
-        ic,
-        a,
-        b1,
-        b2,
-        c,
-        coefs,
-    })
+    TermCounts::walk(r1cs, domain_size)?.fill(r1cs, |_| Ok(()))
 }
 
-/// Section 4: a `u32` count then one 44-byte record each, the coefficient re-encoded from
-/// the r1cs' plain little-endian into double Montgomery (`zkey_new.js:303-334`).
-fn write_coefficients(
-    w: &mut BinFileWriter,
-    r1cs: &R1cs,
-    coefs: &[CoefRecord],
-) -> Result<(), CeremonyError> {
-    // The count is a u32 field, which a section 2 under about 144 GiB cannot overflow.
-    let n = u32::try_from(coefs.len()).map_err(|_| {
-        CeremonyError::BadParams(format!(
-            "{} coefficients do not fit a u32 count",
-            coefs.len()
-        ))
-    })?;
-    w.start_section(S_COEFFS)?;
-    w.write_u32(n)?;
-    for batch in coefs.chunks(COEF_BATCH) {
-        let encoded: Vec<[u8; COEF_RECORD_BYTES]> = batch
-            .par_iter()
-            .map(|rec| {
-                let value = coefficient(r1cs, rec.coef_ptr)?;
-                let mut out = [0u8; COEF_RECORD_BYTES];
-                out[..4].copy_from_slice(&rec.matrix.to_le_bytes());
-                out[4..8].copy_from_slice(&rec.constraint.to_le_bytes());
-                out[8..12].copy_from_slice(&rec.signal.to_le_bytes());
-                out[12..].copy_from_slice(&crate::write::fr_double_montgomery(&value));
-                Ok(out)
-            })
-            .collect::<Result<_, CeremonyError>>()?;
-        for record in &encoded {
-            w.write_bytes(record)?;
+/// The first of [`process_constraints`]' two walks: how many terms each slot will hold.
+///
+/// Every structural error in the r1cs surfaces here, so the second walk, which reads the
+/// same bytes, cannot fail.
+struct TermCounts {
+    a: Vec<u32>,
+    b: Vec<u32>,
+    ic_c: Vec<u32>,
+    n_coefs: usize,
+    n_public: usize,
+    n_constraints: usize,
+}
+
+impl TermCounts {
+    fn walk(r1cs: &R1cs, domain_size: usize) -> Result<Self, CeremonyError> {
+        let n_vars = r1cs.header().n_vars as usize;
+        let n_public = r1cs.header().n_public();
+        let n_constraints = r1cs.header().n_constraints as usize;
+
+        // Signal 0 is the constant ONE and signals `1 ..= nPublic` are the public ones, so
+        // a circuit with no private signal at all still needs `nVars > nPublic`. snarkjs
+        // would instead build a `BigArray` of negative length and only fail later, in the
+        // C write.
+        if n_vars <= n_public {
+            return Err(CeremonyError::BadParams(format!(
+                "{n_vars} signals cannot hold the ONE signal plus {n_public} public ones"
+            )));
         }
+        // The tail rows sit at Lagrange element `nConstraints + s`, and the largest of them
+        // has to stay inside the `domainSize`-element block. `circuit_power` guarantees it;
+        // this catches a caller that computed `domain_size` some other way, before the bound
+        // turns into an out-of-range base index a few million points later.
+        if n_constraints + n_public >= domain_size {
+            return Err(CeremonyError::BadParams(format!(
+                "domain size {domain_size} does not cover {n_constraints} constraints plus \
+                 {n_public} public signals"
+            )));
+        }
+        // Every element index is below `domain_size`, and no ptau goes past 2^28.
+        if domain_size > 1 << INDEX_BITS {
+            return Err(CeremonyError::CircuitTooBig(crate::floor_log2(
+                domain_size as u64,
+            )));
+        }
+        // The IC and C list holds every term plus the tail, the most any list does.
+        let section = r1cs.constraint_bytes()?.len();
+        if section / TERM_BYTES + n_public + 1 > u32::MAX as usize {
+            return Err(CeremonyError::malformed(
+                S_CONSTRAINTS,
+                format!("{section} bytes can hold more terms than a u32 offset counts"),
+            ));
+        }
+
+        let mut a = vec![0u32; n_vars + 1];
+        let mut b = vec![0u32; n_vars + 1];
+        let mut ic_c = vec![0u32; n_vars + 1];
+        let (mut n_a, mut n_b) = (0usize, 0usize);
+        r1cs.walk(|matrix, _, term| {
+            let s = term.signal as usize;
+            ic_c[s] += 1;
+            match matrix {
+                Matrix::A => {
+                    a[s] += 1;
+                    n_a += 1;
+                }
+                Matrix::B => {
+                    b[s] += 1;
+                    n_b += 1;
+                }
+                Matrix::C => {}
+            }
+        })?;
+        for s in 0..=n_public {
+            a[s] += 1;
+            ic_c[s] += 1;
+        }
+        Ok(Self {
+            a,
+            b,
+            ic_c,
+            n_coefs: n_a + n_b + n_public + 1,
+            n_public,
+            n_constraints,
+        })
     }
-    w.end_section()
+
+    /// The second walk: place every term, and hand section 4's records to `records` in push
+    /// order, at most [`COEF_BATCH`] at a time. The first error `records` returns is the
+    /// one this returns, once the walk is done.
+    fn fill(
+        self,
+        r1cs: &R1cs,
+        mut records: impl FnMut(&[CoefRecord]) -> Result<(), CeremonyError>,
+    ) -> Result<Accumulators, CeremonyError> {
+        let Self {
+            a: mut a_at,
+            b: mut b_at,
+            ic_c: mut ic_c_at,
+            n_coefs,
+            n_public,
+            n_constraints,
+        } = self;
+        let mut a = vec![PointTerm::EMPTY; counts_to_starts(&mut a_at)];
+        let mut b = vec![PointTerm::EMPTY; counts_to_starts(&mut b_at)];
+        let mut ic_c = vec![PointTerm::EMPTY; counts_to_starts(&mut ic_c_at)];
+
+        let mut batch = Vec::with_capacity(COEF_BATCH);
+        let mut failed = None;
+        let mut emit = |batch: &mut Vec<CoefRecord>| {
+            if failed.is_none() {
+                if let Err(e) = records(batch) {
+                    failed = Some(e);
+                }
+            }
+            batch.clear();
+        };
+        // `IC` and `C` share a list, so one placement covers both destinations. The tag
+        // differs per pass, which is the only thing that distinguishes the three.
+        r1cs.walk(|matrix, constraint, term| {
+            let s = term.signal as usize;
+            let coef_ptr = Some(term.coef_ptr);
+            match matrix {
+                Matrix::A => {
+                    put(&mut a, &mut a_at, s, BaseTag::TauG1, constraint, coef_ptr);
+                    put(
+                        &mut ic_c,
+                        &mut ic_c_at,
+                        s,
+                        BaseTag::BetaTauG1,
+                        constraint,
+                        coef_ptr,
+                    );
+                }
+                Matrix::B => {
+                    put(&mut b, &mut b_at, s, BaseTag::TauG1, constraint, coef_ptr);
+                    put(
+                        &mut ic_c,
+                        &mut ic_c_at,
+                        s,
+                        BaseTag::AlphaTauG1,
+                        constraint,
+                        coef_ptr,
+                    );
+                }
+                // The C pass touches no coefficient record and no A/B accumulator: the C
+                // matrix reaches the key only through `IC` and `C` (`zkey_new.js:272-287`).
+                Matrix::C => {
+                    put(
+                        &mut ic_c,
+                        &mut ic_c_at,
+                        s,
+                        BaseTag::TauG1,
+                        constraint,
+                        coef_ptr,
+                    );
+                    return;
+                }
+            }
+            batch.push(CoefRecord {
+                matrix: matrix.as_u32(),
+                constraint,
+                signal: term.signal,
+                coef_ptr,
+            });
+            if batch.len() == COEF_BATCH {
+                emit(&mut batch);
+            }
+        })?;
+
+        // One synthetic row per public signal, `a = 1` and nothing else, so `A_s(x)` is
+        // nonzero for every public signal (`zkey_new.js:290-300`).
+        for s in 0..=n_public {
+            let index = (n_constraints + s) as u32;
+            put(&mut a, &mut a_at, s, BaseTag::TauG1, index, None);
+            put(&mut ic_c, &mut ic_c_at, s, BaseTag::BetaTauG1, index, None);
+            batch.push(CoefRecord {
+                matrix: Matrix::A.as_u32(),
+                constraint: index,
+                signal: s as u32,
+                coef_ptr: None,
+            });
+        }
+        emit(&mut batch);
+        if let Some(e) = failed {
+            return Err(e);
+        }
+
+        Ok(Accumulators {
+            a: slots(a_at, a),
+            b: slots(b_at, b),
+            ic_c: slots(ic_c_at, ic_c),
+            n_coefs,
+            n_public,
+        })
+    }
+}
+
+/// Per-slot counts to start offsets, in place, returning the total. The last entry, a
+/// count of zero, becomes the total.
+fn counts_to_starts(counts: &mut [u32]) -> usize {
+    let mut at = 0u32;
+    for c in counts.iter_mut() {
+        (*c, at) = (at, at + *c);
+    }
+    at as usize
+}
+
+/// Place one term at its slot's cursor and advance the cursor.
+fn put(
+    terms: &mut [PointTerm],
+    cursor: &mut [u32],
+    slot: usize,
+    tag: BaseTag,
+    index: u32,
+    coef_ptr: Option<u64>,
+) {
+    let at = &mut cursor[slot];
+    terms[*at as usize] = PointTerm::new(tag, index, coef_ptr);
+    *at += 1;
+}
+
+/// After a fill each cursor sits at its slot's end, which is the next slot's start, so
+/// shifting them up one gives the offsets.
+fn slots(mut cursor: Vec<u32>, terms: Vec<PointTerm>) -> Slots {
+    let n = cursor.len() - 1;
+    cursor.copy_within(0..n, 1);
+    cursor[0] = 0;
+    Slots {
+        offsets: cursor,
+        terms,
+    }
+}
+
+/// Section 4's count is a u32 field, which a section 2 under about 144 GiB cannot
+/// overflow.
+fn coef_count(n: usize) -> Result<u32, CeremonyError> {
+    u32::try_from(n)
+        .map_err(|_| CeremonyError::BadParams(format!("{n} coefficients do not fit a u32 count")))
+}
+
+/// Section 4's records, 44 bytes each, the coefficient re-encoded from the r1cs' plain
+/// little-endian into double Montgomery (`zkey_new.js:303-334`).
+fn encode_coefficients(r1cs: &R1cs, batch: &[CoefRecord]) -> Result<Vec<u8>, CeremonyError> {
+    let mut out = vec![0u8; batch.len() * COEF_RECORD_BYTES];
+    out.par_chunks_mut(COEF_RECORD_BYTES)
+        .zip(batch.par_iter())
+        .try_for_each(|(out, rec)| {
+            let value = coefficient(r1cs, rec.coef_ptr)?;
+            out[..4].copy_from_slice(&rec.matrix.to_le_bytes());
+            out[4..8].copy_from_slice(&rec.constraint.to_le_bytes());
+            out[8..12].copy_from_slice(&rec.signal.to_le_bytes());
+            out[12..].copy_from_slice(&crate::write::fr_double_montgomery(&value));
+            Ok::<_, CeremonyError>(())
+        })?;
+    Ok(out)
 }
 
 /// The scalar a term contributes: the raw r1cs coefficient, or 1 for the `-1` sentinel.
@@ -533,7 +798,7 @@ fn write_points_g1(
     w: &mut BinFileWriter,
     cs: &CsHash,
     id: u32,
-    slots: &[Vec<PointTerm>],
+    slots: SlotRange<'_>,
     bases: &LagrangeBlocks,
     r1cs: &R1cs,
     msm: &dyn MsmBackend,
@@ -552,7 +817,7 @@ fn write_points_g2(
     w: &mut BinFileWriter,
     cs: &CsHash,
     id: u32,
-    slots: &[Vec<PointTerm>],
+    slots: SlotRange<'_>,
     bases: &LagrangeBlocks,
     r1cs: &R1cs,
     msm: &dyn MsmBackend,
@@ -640,7 +905,7 @@ impl Drop for CsHash {
 /// slot's terms summed, through a multiexp only once the slot reaches
 /// `MULTIEXP_MIN_TERMS`.
 pub fn compose_points_g1(
-    slots: &[Vec<PointTerm>],
+    slots: SlotRange<'_>,
     bases: &LagrangeBlocks,
     r1cs: &R1cs,
     msm: &dyn MsmBackend,
@@ -648,22 +913,24 @@ pub fn compose_points_g1(
     compose(
         slots,
         |term| bases.g1(term),
-        |term| coefficient(r1cs, term.coef_ptr),
+        |term| coefficient(r1cs, term.coef_ptr()),
         |b, s| msm.try_msm_g1(b, s),
     )
 }
 
-/// [`compose_points_g1`] for section 7, the only G2 output.
+/// [`compose_points_g1`] for section 7, the only G2 output. Each term's base is its
+/// element of `L_j(tau) * G2` whatever its tag, because B2 shares B1's list
+/// ([`Accumulators::b`]).
 pub fn compose_points_g2(
-    slots: &[Vec<PointTerm>],
+    slots: SlotRange<'_>,
     bases: &LagrangeBlocks,
     r1cs: &R1cs,
     msm: &dyn MsmBackend,
 ) -> Result<Vec<G2Affine>, CeremonyError> {
     compose(
         slots,
-        |term| bases.g2(term),
-        |term| coefficient(r1cs, term.coef_ptr),
+        |term| bases.tau_g2(term.index()),
+        |term| coefficient(r1cs, term.coef_ptr()),
         |b, s| msm.try_msm_g2(b, s),
     )
 }
@@ -689,7 +956,7 @@ const TERMS_PER_SUM: usize = 16;
 /// ladder. An error is the one of the lowest failing slot, as a serial walk would report
 /// it.
 fn compose<P, B, S, M>(
-    slots: &[Vec<PointTerm>],
+    slots: SlotRange<'_>,
     base: B,
     scalar: S,
     msm: M,
@@ -740,7 +1007,7 @@ where
             let mut sum = vec![Xyzz::<P::RF>::ZERO; range.len()];
             let mut ladder = vec![false; range.len()];
             let minus_one = -Fr::one();
-            for (k, slot) in slots[range.clone()].iter().enumerate() {
+            for (k, slot) in slots.sub(range.clone()).iter().enumerate() {
                 let i = range.start + k;
                 let (p, s) = match gather(slot, &base, &scalar) {
                     Ok(t) => t,
@@ -881,36 +1148,34 @@ mod tests {
         // Slots of 0, 1 and 31 terms, an empty one between, and one term a base the
         // lookup refuses, which must surface as the error of its slot and no other's.
         let len = [0, 1, MULTIEXP_MIN_TERMS - 1, 0, 3];
-        let slots: Vec<Vec<PointTerm>> = len
+        let lists: Vec<Vec<PointTerm>> = len
             .iter()
             .map(|&n| {
                 (0..n)
-                    .map(|i| PointTerm {
-                        tag: BaseTag::TauG1,
-                        index: i as u32,
-                        coef_ptr: None,
-                    })
+                    .map(|i| PointTerm::new(BaseTag::TauG1, i as u32, None))
                     .collect()
             })
             .collect();
+        let slots = Slots::from_lists(&lists);
+        let slots = slots.all();
         let g = G1Affine::generator();
         let three = |_: &PointTerm| Ok(Fr::from(3u64));
         let msm = |_: &[G1Affine], _: &[Fr]| -> Result<G1Projective, AccelError> {
             panic!("small slot must stay on CPU")
         };
-        let got = compose(&slots, |_| Ok(g), three, msm).unwrap();
+        let got = compose(slots, |_| Ok(g), three, msm).unwrap();
         for (p, &n) in got.iter().zip(&len) {
             assert_eq!(*p, (g * Fr::from(3 * n as u64)).into_affine());
         }
         let bad = |t: &PointTerm| {
-            if t.index == 2 {
+            if t.index() == 2 {
                 Err(CeremonyError::BadParams("no such base".into()))
             } else {
                 Ok(g)
             }
         };
         assert!(matches!(
-            compose(&slots, bad, three, msm),
+            compose(slots, bad, three, msm),
             Err(CeremonyError::BadParams(_))
         ));
     }
@@ -918,58 +1183,66 @@ mod tests {
 
 /// The four `domainSize`-point Lagrange blocks setup reads out of the ptau, one per
 /// [`BaseTag`], each from element `domainSize - 1` of its section.
-pub struct LagrangeBlocks {
-    pub tau_g1: Vec<G1Affine>,
-    pub tau_g2: Vec<G2Affine>,
-    pub alpha_tau_g1: Vec<G1Affine>,
-    pub beta_tau_g1: Vec<G1Affine>,
+///
+/// Held as the ptau's own bytes and decoded per term, not decoded up front: on a 2^25
+/// circuit the decoded blocks were 11.7 GB of anonymous memory, where the mapped file's
+/// pages are ones the kernel can drop and read back. A decode is two range checks and a
+/// copy, because a ptau stores coordinates in the Montgomery form arkworks keeps.
+pub struct LagrangeBlocks<'a> {
+    tau_g1: &'a [u8],
+    tau_g2: &'a [u8],
+    alpha_tau_g1: &'a [u8],
+    beta_tau_g1: &'a [u8],
 }
 
-impl LagrangeBlocks {
-    pub fn read(ptau: &Ptau, domain_size: usize) -> Result<Self, CeremonyError> {
+impl<'a> LagrangeBlocks<'a> {
+    /// Locate the four blocks and check every coordinate in them is below `q`, which is
+    /// all the decode they replace ever checked, so a block a term never reads still fails
+    /// the same way it did.
+    pub fn read(ptau: &'a Ptau, domain_size: usize) -> Result<Self, CeremonyError> {
+        let block = |id: u32, stride: usize| -> Result<&'a [u8], CeremonyError> {
+            let bytes = ptau.lagrange_block_bytes(id, stride, domain_size)?;
+            bytes
+                .par_chunks(N8)
+                .with_min_len(1 << 14)
+                .try_for_each(|f| binfile::fq(f).map(drop))?;
+            Ok(bytes)
+        };
         Ok(Self {
-            tau_g1: ptau.lagrange_block_g1(ptau::S_LAGRANGE_TAU_G1, domain_size)?,
-            tau_g2: ptau.lagrange_block_g2(domain_size)?,
-            alpha_tau_g1: ptau.lagrange_block_g1(ptau::S_LAGRANGE_ALPHA_TAU_G1, domain_size)?,
-            beta_tau_g1: ptau.lagrange_block_g1(ptau::S_LAGRANGE_BETA_TAU_G1, domain_size)?,
+            tau_g1: block(ptau::S_LAGRANGE_TAU_G1, SG1)?,
+            tau_g2: block(ptau::S_LAGRANGE_TAU_G2, SG2)?,
+            alpha_tau_g1: block(ptau::S_LAGRANGE_ALPHA_TAU_G1, SG1)?,
+            beta_tau_g1: block(ptau::S_LAGRANGE_BETA_TAU_G1, SG1)?,
         })
     }
 
     fn g1(&self, term: &PointTerm) -> Result<G1Affine, CeremonyError> {
-        let block = match term.tag {
-            BaseTag::TauG1 => &self.tau_g1,
-            BaseTag::AlphaTauG1 => &self.alpha_tau_g1,
-            BaseTag::BetaTauG1 => &self.beta_tau_g1,
+        let block = match term.tag() {
+            BaseTag::TauG1 => self.tau_g1,
+            BaseTag::AlphaTauG1 => self.alpha_tau_g1,
+            BaseTag::BetaTauG1 => self.beta_tau_g1,
             BaseTag::TauG2 => return Err(wrong_group(term)),
         };
-        block.get(term.index as usize).copied().ok_or_else(|| {
-            CeremonyError::BadParams(format!(
-                "Lagrange element {} is past the {}-point block",
-                term.index,
-                block.len()
-            ))
-        })
+        Ok(binfile::g1(element(block, SG1, term.index())?)?)
     }
 
-    fn g2(&self, term: &PointTerm) -> Result<G2Affine, CeremonyError> {
-        if term.tag != BaseTag::TauG2 {
-            return Err(wrong_group(term));
-        }
-        self.tau_g2
-            .get(term.index as usize)
-            .copied()
-            .ok_or_else(|| {
-                CeremonyError::BadParams(format!(
-                    "Lagrange element {} is past the {}-point block",
-                    term.index,
-                    self.tau_g2.len()
-                ))
-            })
+    fn tau_g2(&self, index: u32) -> Result<G2Affine, CeremonyError> {
+        Ok(binfile::g2(element(self.tau_g2, SG2, index)?)?)
     }
 }
 
+fn element(block: &[u8], stride: usize, index: u32) -> Result<&[u8], CeremonyError> {
+    let at = index as usize * stride;
+    block.get(at..at + stride).ok_or_else(|| {
+        CeremonyError::BadParams(format!(
+            "Lagrange element {index} is past the {}-point block",
+            block.len() / stride
+        ))
+    })
+}
+
 fn wrong_group(term: &PointTerm) -> CeremonyError {
-    CeremonyError::BadParams(format!("{:?} is not a base of this group", term.tag))
+    CeremonyError::BadParams(format!("{:?} is not a base of this group", term.tag()))
 }
 
 /// Section 9: every odd element of the `2*domainSize` Lagrange block of ptau section 12.

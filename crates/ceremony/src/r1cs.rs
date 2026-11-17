@@ -208,7 +208,7 @@ impl R1cs {
     /// the order the bytes are laid out: A, B then C within each constraint, constraints
     /// ascending. Every view below is built on this, so there is one bounds check to get
     /// right rather than four.
-    fn walk<F>(&self, mut f: F) -> Result<(), CeremonyError>
+    pub(crate) fn walk<F>(&self, mut f: F) -> Result<(), CeremonyError>
     where
         F: FnMut(Matrix, u32, Term),
     {

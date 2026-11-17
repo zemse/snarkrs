@@ -507,6 +507,19 @@ impl Ptau {
         self.g2_points(S_LAGRANGE_TAU_G2, domain_size - 1, domain_size)
     }
 
+    /// The same block as [`Ptau::lagrange_block_g1`] or [`Ptau::lagrange_block_g2`],
+    /// undecoded: `stride` is [`SG1`] or [`SG2`]. The checks are theirs, and so are the
+    /// errors.
+    pub fn lagrange_block_bytes(
+        &self,
+        id: u32,
+        stride: usize,
+        domain_size: usize,
+    ) -> Result<&[u8], CeremonyError> {
+        self.check_lagrange(id, domain_size)?;
+        self.section_elements(id, stride, domain_size - 1, domain_size)
+    }
+
     /// The two things that go wrong before the bounds check does: asking a raw file for a
     /// block it never had, and a `domain_size` that is not a power of two, which would
     /// silently read across a block boundary and return points from two different

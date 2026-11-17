@@ -116,11 +116,11 @@ fn setup(path: &Path) {
     );
     let mut bits_hist = [0u64; 5];
     for (label, slots) in [
-        ("IC (G1)", &acc.ic),
-        ("C (G1)", &acc.c),
-        ("A (G1)", &acc.a),
-        ("B1 (G1)", &acc.b1),
-        ("B2 (G2)", &acc.b2),
+        ("IC (G1)", acc.ic()),
+        ("C (G1)", acc.c()),
+        ("A (G1)", acc.a.all()),
+        ("B1 (G1)", acc.b.all()),
+        ("B2 (G2)", acc.b.all()),
     ] {
         let (mut ark, mut glv) = (Cost::default(), Cost::default());
         let (mut msm_slots, mut msm_terms, mut terms) = (0u64, 0u64, 0u64);
@@ -160,7 +160,7 @@ fn setup(path: &Path) {
 }
 
 fn scalar(r1cs: &R1cs, t: &PointTerm) -> Fr {
-    match t.coef_ptr {
+    match t.coef_ptr() {
         Some(p) => r1cs.coef(p).expect("coef"),
         None => Fr::one(),
     }
