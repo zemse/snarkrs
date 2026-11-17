@@ -785,8 +785,8 @@ fn truncate_to_chosen_powers_writes_the_full_runs_files() {
     );
 }
 
-/// `zkey verify r1cs` keeps its init key under a reserved name, so a user file named
-/// like the old `<key>.verify-init.zkey` scratch file survives it.
+/// `zkey verify r1cs` writes nothing beside the key, so a user file named like the old
+/// `<key>.verify-init.zkey` scratch file survives it, on success and on failure.
 #[test]
 fn verify_from_r1cs_leaves_neighbouring_files_alone() {
     let fixture = Fixture::new("verify-r1cs-scratch");
@@ -806,11 +806,19 @@ fn verify_from_r1cs_leaves_neighbouring_files_alone() {
     .unwrap();
     std::fs::write(&neighbour, b"user file").unwrap();
     let before = entries(&dir);
-    contribute::verify_from_r1cs(&fixture.r1cs, &fixture.ptau, &key, &CpuMsm::new()).unwrap();
+    contribute::verify_from_r1cs(
+        &fixture.r1cs,
+        &fixture.ptau,
+        &key,
+        &CpuMsm::new(),
+        &CpuMsm::new(),
+    )
+    .unwrap();
     assert_eq!(std::fs::read(&neighbour).unwrap(), b"user file");
     assert_eq!(entries(&dir), before, "scratch key left behind");
     let msm = FailMsm::new("msm_g1", 1);
-    let error = contribute::verify_from_r1cs(&fixture.r1cs, &fixture.ptau, &key, &msm).unwrap_err();
+    let error =
+        contribute::verify_from_r1cs(&fixture.r1cs, &fixture.ptau, &key, &msm, &msm).unwrap_err();
     assert!(fake_device(&error), "unexpected error: {error}");
     assert_eq!(std::fs::read(&neighbour).unwrap(), b"user file");
     assert_eq!(entries(&dir), before, "scratch key left behind on failure");

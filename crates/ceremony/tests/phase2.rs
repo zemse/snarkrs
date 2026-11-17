@@ -712,3 +712,256 @@ fn a_beacon_record_with_an_unbounded_exponent_is_refused_by_the_verifier() {
         "{err}"
     );
 }
+
+/// `(id, start, len)` of each section of a zkey, in file order.
+type Table = [(u32, usize, usize)];
+
+/// One edit of a contributed key, and the message both forms of `zkey verify` must then
+/// reject it with.
+struct Tamper {
+    what: &'static str,
+    edit: fn(&mut Vec<u8>, &Table),
+    expect: &'static str,
+}
+
+/// `(id, start, len)` of every section, in file order.
+fn section_table(path: &Path) -> Vec<(u32, usize, usize)> {
+    let file = snarkrs_formats::binfile::BinFile::open(path, b"zkey", 2).unwrap();
+    file.sections()
+        .iter()
+        .map(|s| (s.id, s.start, s.len))
+        .collect()
+}
+
+fn body(table: &Table, id: u32) -> (usize, usize) {
+    let &(_, start, len) = table.iter().find(|s| s.0 == id).unwrap();
+    (start, len)
+}
+
+/// Swap the last two points of section `id`, which in a section of more than 2^20 points
+/// is inside the last chunk setup produces.
+fn swap_last_two(bytes: &mut [u8], table: &Table, id: u32, stride: usize) {
+    let (start, len) = body(table, id);
+    let last = start + len - stride;
+    assert_ne!(
+        bytes[last - stride..last],
+        bytes[last..last + stride],
+        "section {id} ends in two equal points, so swapping them changes nothing"
+    );
+    for i in 0..stride {
+        bytes.swap(last - stride + i, last + i);
+    }
+}
+
+/// Rewrite the file with `id`'s body cut or zero-padded to `new_len`, every section
+/// header kept in order.
+fn resize(bytes: &mut Vec<u8>, table: &Table, id: u32, new_len: usize) {
+    let mut out = bytes[..12].to_vec();
+    for &(sid, start, len) in table {
+        let mut b = bytes[start..start + len].to_vec();
+        if sid == id {
+            b.resize(new_len, 0);
+        }
+        out.extend_from_slice(&sid.to_le_bytes());
+        out.extend_from_slice(&(b.len() as u64).to_le_bytes());
+        out.extend_from_slice(&b);
+    }
+    *bytes = out;
+}
+
+const TAMPERS: &[Tamper] = &[
+    Tamper {
+        what: "IC",
+        edit: |b, t| swap_last_two(b, t, 3, 64),
+        expect: "IC section is not identical",
+    },
+    Tamper {
+        what: "Coeffs, last record",
+        edit: |b, t| {
+            let (start, len) = body(t, 4);
+            b[start + len - 1] ^= 1;
+        },
+        expect: "Coeffs section is not identical",
+    },
+    Tamper {
+        what: "A, last chunk",
+        edit: |b, t| swap_last_two(b, t, 5, 64),
+        expect: "A section is not identical",
+    },
+    Tamper {
+        what: "B1, one bit of the last point",
+        edit: |b, t| {
+            let (start, len) = body(t, 6);
+            b[start + len - 1] ^= 1;
+        },
+        expect: "B1 section is not identical",
+    },
+    Tamper {
+        what: "B2, last chunk",
+        edit: |b, t| swap_last_two(b, t, 7, 128),
+        expect: "B2 section is not identical",
+    },
+    Tamper {
+        what: "L, last chunk",
+        edit: |b, t| swap_last_two(b, t, 8, 64),
+        expect: "L section does not match",
+    },
+    Tamper {
+        what: "H",
+        edit: |b, t| swap_last_two(b, t, 9, 64),
+        expect: "H section does not match",
+    },
+    Tamper {
+        what: "csHash",
+        edit: |b, t| b[body(t, 10).0] ^= 1,
+        expect: "inconsistent transcript",
+    },
+    Tamper {
+        // `alpha_1` and `beta_1` sit at 84 and 148 of section 2. Both are curve points,
+        // so the swap passes the header's own checks and only the comparison catches it.
+        what: "header alpha1",
+        edit: |b, t| {
+            let start = body(t, 2).0;
+            for i in 0..64 {
+                b.swap(start + 84 + i, start + 148 + i);
+            }
+        },
+        expect: "invalid alpha1",
+    },
+    Tamper {
+        what: "A, one point longer",
+        edit: |b, t| {
+            let len = body(t, 5).1;
+            resize(b, t, 5, len + 64);
+        },
+        expect: "A section is not identical",
+    },
+    Tamper {
+        what: "B2, one point shorter",
+        edit: |b, t| {
+            let len = body(t, 7).1;
+            resize(b, t, 7, len - 128);
+        },
+        expect: "B2 section is not identical",
+    },
+    Tamper {
+        what: "L, one point shorter",
+        edit: |b, t| {
+            let len = body(t, 8).1;
+            resize(b, t, 8, len - 64);
+        },
+        expect: "invalid L section size",
+    },
+    Tamper {
+        what: "H, one point longer",
+        edit: |b, t| {
+            let len = body(t, 9).1;
+            resize(b, t, 9, len + 64);
+        },
+        expect: "invalid H section size",
+    },
+];
+
+/// `zkey verify r1cs` compares setup's output as it is produced instead of through an init
+/// key on disk, so every rejection has to come out as `zkey verify init` against that init
+/// key words it, which also pins the order the checks run in. anon-aadhaar has 1.1 million
+/// signals, so its A, B1, B2 and C sections span two of setup's chunks and the edits
+/// marked "last chunk" land in the second.
+#[test]
+fn the_r1cs_form_rejects_what_the_init_form_rejects() {
+    let bench = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench");
+    let msm = CpuMsm::new();
+    for (circuit, power) in [("js_2x2_d32", 17), ("anon-aadhaar", 21)] {
+        let r1cs = bench.join(format!("artifacts/{circuit}/circuit.r1cs"));
+        let ptau = bench.join(format!("ptau/ppot_0080_{power}.ptau"));
+        if !r1cs.is_file() || !ptau.is_file() {
+            resources::skip(format_args!("the_r1cs_form_rejects_...: no {circuit}"));
+            continue;
+        }
+        let dir = tmp_dir(&format!("r1cs-form-{circuit}"));
+        let init = dir.join("init.zkey");
+        let good = dir.join("good.zkey");
+        snarkrs_ceremony::setup::setup(&r1cs, &ptau, &init, &msm).unwrap();
+        contribute::contribute(&init, &good, None, "r1cs form", &CpuKeyScale).unwrap();
+        let report = contribute::verify_from_r1cs(&r1cs, &ptau, &good, &msm, &msm)
+            .expect("the untouched key verifies");
+        assert_eq!(report.contribution_hashes.len(), 1);
+        assert_eq!(report.setup_backend, Some("cpu"));
+
+        let table = section_table(&good);
+        let pristine = std::fs::read(&good).unwrap();
+        let bad = dir.join("bad.zkey");
+        for t in TAMPERS {
+            let mut bytes = pristine.clone();
+            (t.edit)(&mut bytes, &table);
+            std::fs::write(&bad, &bytes).unwrap();
+            let from_init = contribute::verify_from_init(&init, &ptau, &bad, &msm)
+                .expect_err(&format!("{circuit}: the init form accepted {}", t.what));
+            let from_r1cs = contribute::verify_from_r1cs(&r1cs, &ptau, &bad, &msm, &msm)
+                .expect_err(&format!("{circuit}: the r1cs form accepted {}", t.what));
+            assert_eq!(
+                from_r1cs.to_string(),
+                from_init.to_string(),
+                "{circuit}: {}",
+                t.what
+            );
+            assert!(
+                from_r1cs.to_string().contains(t.expect),
+                "{circuit}: {}: {from_r1cs}",
+                t.what
+            );
+        }
+
+        // The same shape and one coefficient different. Section 4 differs too, and
+        // `csHash` is the one snarkjs checks first.
+        let parsed = snarkrs_ceremony::r1cs::R1cs::open(&r1cs).unwrap();
+        let term = parsed.constraints().unwrap()[0].a[0];
+        let constraints = parsed
+            .file()
+            .sections()
+            .iter()
+            .find(|s| s.id == 2)
+            .unwrap()
+            .start;
+        drop(parsed);
+        // Coefficients are plain little-endian and nonzero, so one less is still canonical.
+        let mut other = std::fs::read(&r1cs).unwrap();
+        let at = constraints + term.coef_ptr as usize;
+        for b in &mut other[at..at + 32] {
+            let (v, borrow) = b.overflowing_sub(1);
+            *b = v;
+            if !borrow {
+                break;
+            }
+        }
+        let other_r1cs = dir.join("other.r1cs");
+        std::fs::write(&other_r1cs, other).unwrap();
+        let err = contribute::verify_from_r1cs(&other_r1cs, &ptau, &good, &msm, &msm)
+            .expect_err("a key verified against a different circuit");
+        assert!(err.to_string().contains("circuit does not match"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A key of another shape fails on the header, before any section is recomputed.
+    let (small, big) = (
+        bench.join("artifacts/js_2x2_d32/circuit.r1cs"),
+        bench.join("artifacts/anon-aadhaar/circuit.r1cs"),
+    );
+    let ptau = bench.join("ptau/ppot_0080_21.ptau");
+    if !small.is_file() || !big.is_file() || !ptau.is_file() {
+        resources::skip("the_r1cs_form_rejects_...: no js_2x2_d32 or anon-aadhaar");
+        return;
+    }
+    let dir = tmp_dir("r1cs-form-shape");
+    let init = dir.join("init.zkey");
+    let key = dir.join("key.zkey");
+    snarkrs_ceremony::setup::setup(&small, &ptau, &init, &msm).unwrap();
+    contribute::contribute(&init, &key, None, "shape", &CpuKeyScale).unwrap();
+    let err = contribute::verify_from_r1cs(&big, &ptau, &key, &msm, &msm)
+        .expect_err("a key verified against a circuit of another shape");
+    assert!(
+        err.to_string().contains("different circuit parameters"),
+        "{err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

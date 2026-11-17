@@ -56,7 +56,6 @@ pub fn staged<T>(
     staged_all(&[destination], |stages| operation(&stages[0]))
 }
 
-pub(crate) use snarkrs_formats::stage::Stage;
 pub use snarkrs_formats::stage::{staged_all, staged_all_default_mode};
 
 /// A binfile under construction.

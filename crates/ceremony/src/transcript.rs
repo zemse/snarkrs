@@ -974,6 +974,11 @@ fn encode_all<T: Sync, const N: usize>(points: &[T], enc: fn(&T) -> [u8; N]) -> 
     buf
 }
 
+/// [`g2_uncompressed`] of every point, concatenated, encoded in parallel.
+pub fn g2_uncompressed_all(points: &[G2Affine]) -> Vec<u8> {
+    encode_all(points, g2_uncompressed)
+}
+
 /// Uncompressed G2: `x.c1, x.c0, y.c1, y.c0`, each 32 bytes big-endian. The swap is what
 /// the byte reversal over the whole 64-byte `F2` blob produces, and it is the same
 /// ordering Ethereum's pairing precompiles use.

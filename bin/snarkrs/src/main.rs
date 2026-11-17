@@ -1057,7 +1057,7 @@ fn run_zkey(cmd: ZkeyCmd) -> Result<u8> {
             let msm = msm_backend(BackendKind::Cpu)?;
             let (report, zkey) = match &cmd {
                 ZkeyVerifyCmd::R1cs { r1cs, ptau, zkey } => (
-                    zkey_mpc::verify_from_r1cs(r1cs, ptau, zkey, msm.as_ref()),
+                    zkey_mpc::verify_from_r1cs(r1cs, ptau, zkey, msm.as_ref(), msm.as_ref()),
                     zkey,
                 ),
                 ZkeyVerifyCmd::Init { init, ptau, zkey } => (
@@ -1077,6 +1077,12 @@ fn run_zkey(cmd: ZkeyCmd) -> Result<u8> {
                 "vars {}, public {}, domain size {}",
                 report.n_vars, report.n_public, report.domain_size
             ));
+            let phases: Vec<String> = report
+                .phases
+                .iter()
+                .map(|(name, t)| format!("{name} {:.1} s", t.as_secs_f64()))
+                .collect();
+            log::debug(format!("stages: {}", phases.join(", ")));
             // Newest first, as `zkey_verify_frominit.js` prints them.
             for (i, h) in report.contribution_hashes.iter().enumerate().rev() {
                 log::info("-------------------------");

@@ -20,6 +20,7 @@
 //! consistent rescaling of the given init key. It does not verify the circuit.
 
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
 use snarkrs_field::{
@@ -31,13 +32,13 @@ use snarkrs_ntt::{CpuNtt, Direction};
 use crate::phase1::check_beacon;
 use crate::ptau::Ptau;
 use crate::setup::{
-    S_A, S_B1, S_B2, S_C, S_COEFFS, S_H, S_HEADER, S_IC, S_MPC_PARAMS, S_PROTOCOL, ZKEY_MAGIC,
-    ZKEY_MAX_VERSION, ZKEY_SECTIONS, ZKEY_VERSION,
+    Prepared, SetupSink, S_A, S_B1, S_B2, S_C, S_COEFFS, S_H, S_HEADER, S_IC, S_MPC_PARAMS,
+    S_PROTOCOL, ZKEY_MAGIC, ZKEY_MAX_VERSION, ZKEY_SECTIONS, ZKEY_VERSION,
 };
 use crate::transcript::{
     self, create_delta_key, hash_to_g2, same_ratio, CeremonyRng, Digest, Transcript,
 };
-use crate::write::BinFileWriter;
+use crate::write::{g1_lem, g2_lem, BinFileWriter};
 use crate::{
     CeremonyError, ContainerError, ContributionKind, ContributionParams, Groth16Header, SG1, SG2,
 };
@@ -49,6 +50,11 @@ use snarkrs_formats::binfile::{self, BinFile, Cursor};
 /// same on the way out, and it is the unit a GPU kernel would take: one launch per chunk,
 /// with [`scale_g1`] as the body.
 const CHUNK_POINTS: usize = 1 << 16;
+
+/// Points per MSM in the L and H checks. Each check is a sum of products, so it is taken a
+/// chunk at a time and never holds a whole section decoded: 2^21 G1 points is 151 MB,
+/// where a 2^25 circuit's H section is 2.4 GB.
+const CHECK_CHUNK: usize = 1 << 21;
 
 /// One record of zkey section 10.
 ///
@@ -411,6 +417,10 @@ pub struct ZkeyVerifyReport {
     pub n_vars: usize,
     pub n_public: usize,
     pub domain_size: usize,
+    /// The backend that recomputed the initial key, for the r1cs form.
+    pub setup_backend: Option<&'static str>,
+    /// Wall time per stage, in run order.
+    pub phases: Vec<(&'static str, Duration)>,
 }
 
 /// `zkey verify init` (`zkey_verify_frominit.js:32-231`), in six parts: the contribution
@@ -437,7 +447,78 @@ pub fn verify_from_init(
     let init_header = Groth16Header::read(init.unique_section(S_HEADER)?)?;
     let init_mpc = MpcParams::read(init.unique_section(S_MPC_PARAMS)?)?;
 
-    let contribution_hashes = verify_chain(&mpc, &header)?;
+    let contribution_hashes = check_headers(&mpc, &header, &init_header)?;
+    if mpc.cs_hash != init_mpc.cs_hash {
+        return Err(fail("circuit does not match"));
+    }
+
+    let n_vars = header.n_vars as usize;
+    let n_public = header.n_public as usize;
+    let domain_size = header.domain_size as usize;
+    let l_bytes = file.unique_section(S_C)?;
+    if l_bytes.len() != SG1 * (n_vars - n_public - 1) {
+        return Err(fail("invalid L section size"));
+    }
+    let h_bytes = file.unique_section(S_H)?;
+    if h_bytes.len() != SG1 * domain_size {
+        return Err(fail("invalid H section size"));
+    }
+
+    for (id, what) in COMPARED {
+        if file.unique_section(id)? != init.unique_section(id)? {
+            return Err(fail(format!("{what} section is not identical")));
+        }
+    }
+
+    let mut rng = transcript::rng_from_entropy("g16 zkey verify")?;
+    let at = Instant::now();
+    check_l_section(
+        init.unique_section(S_C)?,
+        l_bytes,
+        &header.delta_g2,
+        &init_header.delta_g2,
+        &mut rng,
+        msm,
+    )?;
+    let l_time = at.elapsed();
+    check_h_section(
+        ptau,
+        h_bytes,
+        domain_size,
+        &header.delta_g2,
+        &init_header.delta_g2,
+        &mut rng,
+        msm,
+    )?;
+
+    Ok(ZkeyVerifyReport {
+        contribution_hashes,
+        n_vars,
+        n_public,
+        domain_size,
+        setup_backend: None,
+        phases: vec![("L check", l_time), ("H check", at.elapsed() - l_time)],
+    })
+}
+
+/// The sections `zkey verify` requires to be byte-identical between the init key and the
+/// final one, in the order it compares them (`zkey_verify_frominit.js:169-197`).
+const COMPARED: [(u32, &str); 5] = [
+    (S_IC, "IC"),
+    (S_COEFFS, "Coeffs"),
+    (S_A, "A"),
+    (S_B1, "B1"),
+    (S_B2, "B2"),
+];
+
+/// The checks both forms of `zkey verify` make before `csHash`: the contribution chain,
+/// then init-vs-final header agreement.
+fn check_headers(
+    mpc: &MpcParams,
+    header: &Groth16Header,
+    init_header: &Groth16Header,
+) -> Result<Vec<Digest>, CeremonyError> {
+    let contribution_hashes = verify_chain(mpc, header)?;
 
     if (
         init_header.n_vars,
@@ -473,43 +554,70 @@ pub fn verify_from_init(
     ) {
         return Err(fail("invalid delta2"));
     }
-    if mpc.cs_hash != init_mpc.cs_hash {
-        return Err(fail("circuit does not match"));
-    }
+    Ok(contribution_hashes)
+}
+
+/// `zkey verify r1cs`: [`verify_from_init`] against the initial key a setup of `r1cs` would
+/// write, recomputed and compared as it is produced. This is the only form that checks
+/// the key against a circuit, and it costs a full setup, every MSM included.
+///
+/// `setup_msm` computes that initial key and `check_msm` the L and H checks. They are two
+/// parameters because they fail differently: a wrong recomputed point fails a byte
+/// comparison, so a faulty `setup_msm` can only reject a good key, while a faulty
+/// `check_msm` that returns equal sums on both sides would accept a bad one.
+///
+/// snarkjs holds the whole initial key in memory (`zkey_verify_fromr1cs.js:26`, a `bigMem`
+/// handle). Here no copy of it exists, in memory or on disk: every check on it is either a
+/// byte comparison, made a chunk at a time against the final key's mapped bytes, or a sum
+/// the L check takes a chunk at a time. So the memory this takes is setup's own term lists
+/// plus a few chunks, whatever the size of the key.
+///
+/// The header checks run before the recompute rather than after it, because they need only
+/// the header a setup would write. A key that fails one fails in seconds instead of after
+/// a full setup, with the same message. Everything else is reported in
+/// [`verify_from_init`]'s order once the recompute is done.
+pub fn verify_from_r1cs(
+    r1cs: &Path,
+    ptau: &Path,
+    final_zkey: &Path,
+    setup_msm: &dyn MsmBackend,
+    check_msm: &dyn MsmBackend,
+) -> Result<ZkeyVerifyReport, CeremonyError> {
+    let setup = Prepared::open(r1cs, ptau)?;
+    let file = BinFile::open(final_zkey, ZKEY_MAGIC, ZKEY_MAX_VERSION)?;
+    check_protocol(&file)?;
+    let header = Groth16Header::read(file.unique_section(S_HEADER)?)?;
+    let mpc = MpcParams::read(file.unique_section(S_MPC_PARAMS)?)?;
+    let init_header = setup.header();
+    let contribution_hashes = check_headers(&mpc, &header, init_header)?;
 
     let n_vars = header.n_vars as usize;
     let n_public = header.n_public as usize;
     let domain_size = header.domain_size as usize;
-    let l_bytes = file.unique_section(S_C)?;
-    if l_bytes.len() != SG1 * (n_vars - n_public - 1) {
+    let l_len = SG1 * (n_vars - n_public - 1);
+    let mut rng = transcript::rng_from_entropy("g16 zkey verify")?;
+    let mut sink = Recompute::new(&file, l_len, &mut rng, check_msm);
+    let report = setup.run(&mut sink, setup_msm)?;
+    let Recompute { identical, l, .. } = sink;
+
+    if mpc.cs_hash != report.cs_hash {
+        return Err(fail("circuit does not match"));
+    }
+    if file.unique_section(S_C)?.len() != l_len {
         return Err(fail("invalid L section size"));
     }
     let h_bytes = file.unique_section(S_H)?;
     if h_bytes.len() != SG1 * domain_size {
         return Err(fail("invalid H section size"));
     }
-
-    for (id, what) in [
-        (S_IC, "IC"),
-        (S_COEFFS, "Coeffs"),
-        (S_A, "A"),
-        (S_B1, "B1"),
-        (S_B2, "B2"),
-    ] {
-        if file.unique_section(id)? != init.unique_section(id)? {
+    for (id, what) in COMPARED {
+        file.unique_section(id)?;
+        if !identical.contains(&(id, true)) {
             return Err(fail(format!("{what} section is not identical")));
         }
     }
-
-    let mut rng = transcript::rng_from_entropy("g16 zkey verify")?;
-    check_l_section(
-        init.unique_section(S_C)?,
-        l_bytes,
-        &header.delta_g2,
-        &init_header.delta_g2,
-        &mut rng,
-        msm,
-    )?;
+    l.finish()?.check(&header.delta_g2, &init_header.delta_g2)?;
+    let at = Instant::now();
     check_h_section(
         ptau,
         h_bytes,
@@ -517,32 +625,201 @@ pub fn verify_from_init(
         &header.delta_g2,
         &init_header.delta_g2,
         &mut rng,
-        msm,
+        check_msm,
     )?;
 
+    let mut phases = report.phases;
+    phases.push(("H check", at.elapsed()));
     Ok(ZkeyVerifyReport {
         contribution_hashes,
         n_vars,
         n_public,
         domain_size,
+        setup_backend: Some(setup_msm.name()),
+        phases,
     })
 }
 
-/// `zkey verify r1cs`: [`crate::setup::setup`] into a temporary init key, then
-/// [`verify_from_init`] against it. This is the only form that checks the key against a
-/// circuit, and it costs a full setup, every MSM included.
-pub fn verify_from_r1cs(
-    r1cs: &Path,
-    ptau: &Path,
-    final_zkey: &Path,
-    msm: &dyn MsmBackend,
-) -> Result<ZkeyVerifyReport, CeremonyError> {
-    // snarkjs keeps the init key in memory (`zkey_verify_fromr1cs.js:26`, a `bigMem`
-    // handle). At anon-aadhaar that is 631 MB, so this writes it beside the key instead,
-    // under a reserved name no user file can have, and removes it when it drops.
-    let init = crate::write::Stage::beside(final_zkey)?;
-    crate::setup::setup(r1cs, ptau, init.path(), msm)?;
-    verify_from_init(init.path(), ptau, final_zkey, msm)
+/// [`verify_from_init`]'s comparisons, made against setup's sections as they are produced
+/// instead of against an init key on disk.
+///
+/// Each compared section is matched a chunk at a time against the final key's mapped
+/// bytes, and section 8, which the contributions rescaled, goes straight into the L
+/// check's random combination. What stays is a verdict per section, for
+/// [`verify_from_r1cs`] to report in snarkjs' order once `csHash` is known.
+struct Recompute<'a> {
+    file: &'a BinFile,
+    /// The section being produced, and the comparison of it if it is one of [`COMPARED`].
+    open: Option<(u32, Option<Compare<'a>>)>,
+    /// `(id, byte-identical)` for every compared section produced.
+    identical: Vec<(u32, bool)>,
+    l: LStream<'a>,
+}
+
+impl<'a> Recompute<'a> {
+    /// `l_len` is the byte length the final key's section 8 must have; one of any other
+    /// length fails its size check, so the L sums skip it.
+    fn new(
+        file: &'a BinFile,
+        l_len: usize,
+        rng: &'a mut CeremonyRng,
+        msm: &'a dyn MsmBackend,
+    ) -> Self {
+        let body = file
+            .unique_section(S_C)
+            .ok()
+            .filter(|body| body.len() == l_len);
+        Self {
+            file,
+            open: None,
+            identical: Vec::new(),
+            l: LStream {
+                body,
+                at: 0,
+                sums: RatioSums::default(),
+                failed: None,
+                rng,
+                msm,
+            },
+        }
+    }
+
+    fn compare(&mut self) -> Option<&mut Compare<'a>> {
+        self.open.as_mut().and_then(|(_, c)| c.as_mut())
+    }
+}
+
+impl SetupSink for Recompute<'_> {
+    /// Section 9 is rescaled by every contribution, and the H check reads the final key's
+    /// copy against the ptau, so the recomputed one would be compared against nothing.
+    fn wants(&self, id: u32) -> bool {
+        id != S_H
+    }
+
+    fn header(&mut self, _: &Groth16Header) -> Result<(), CeremonyError> {
+        Ok(())
+    }
+
+    fn start(&mut self, id: u32) -> Result<(), CeremonyError> {
+        let compared = COMPARED.iter().any(|&(c, _)| c == id);
+        let compare = compared.then(|| {
+            let body = self.file.unique_section(id).ok();
+            Compare {
+                body,
+                at: 0,
+                same: body.is_some(),
+            }
+        });
+        self.open = Some((id, compare));
+        Ok(())
+    }
+
+    fn bytes(&mut self, bytes: &[u8]) -> Result<(), CeremonyError> {
+        if let Some(c) = self.compare() {
+            c.next(bytes.len(), |fin| fin == bytes);
+        }
+        Ok(())
+    }
+
+    fn g1(&mut self, points: &[G1Affine]) -> Result<(), CeremonyError> {
+        if matches!(self.open, Some((S_C, _))) {
+            self.l.add(points);
+        } else if let Some(c) = self.compare() {
+            c.next(points.len() * SG1, |fin| encodes_as(points, fin, g1_lem));
+        }
+        Ok(())
+    }
+
+    fn g2(&mut self, points: &[G2Affine]) -> Result<(), CeremonyError> {
+        if let Some(c) = self.compare() {
+            c.next(points.len() * SG2, |fin| encodes_as(points, fin, g2_lem));
+        }
+        Ok(())
+    }
+
+    fn end(&mut self) -> Result<(), CeremonyError> {
+        if let Some((id, Some(c))) = self.open.take() {
+            let whole = c.body.is_some_and(|body| c.at == body.len());
+            self.identical.push((id, c.same && whole));
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self, _: &Digest) -> Result<(), CeremonyError> {
+        Ok(())
+    }
+}
+
+/// One section of the final key being matched against its recomputation.
+struct Compare<'a> {
+    /// `None` when the final key has no such section; that error is raised in order later.
+    body: Option<&'a [u8]>,
+    /// Bytes of `body` matched so far.
+    at: usize,
+    same: bool,
+}
+
+impl Compare<'_> {
+    /// Match the next `len` bytes of the final key's section with `matches`. Once a
+    /// mismatch is found the rest is only counted.
+    fn next(&mut self, len: usize, matches: impl FnOnce(&[u8]) -> bool) {
+        let fin = self.body.and_then(|b| b.get(self.at..self.at + len));
+        self.at += len;
+        self.same = self.same && fin.is_some_and(matches);
+    }
+}
+
+/// True when `fin` is exactly `points`, each encoded by `enc`.
+fn encodes_as<T: Sync, const N: usize>(points: &[T], fin: &[u8], enc: fn(&T) -> [u8; N]) -> bool {
+    fin.len() == points.len() * N
+        && points
+            .par_iter()
+            .zip(fin.par_chunks_exact(N))
+            .with_min_len(4096)
+            .all(|(p, b)| enc(p) == *b)
+}
+
+/// The L check fed by setup's section 8 as it is produced: each chunk of the recomputed C
+/// and the same points of the final key go into [`RatioSums`] under the same scalars, so
+/// neither section is ever held whole.
+struct LStream<'a> {
+    /// The final key's section 8, when its length is the one the check needs.
+    body: Option<&'a [u8]>,
+    at: usize,
+    sums: RatioSums,
+    /// The first error, raised when the L check is reached, as `check_l_section` would.
+    failed: Option<CeremonyError>,
+    rng: &'a mut CeremonyRng,
+    msm: &'a dyn MsmBackend,
+}
+
+impl LStream<'_> {
+    fn add(&mut self, init: &[G1Affine]) {
+        let Some(body) = self.body else { return };
+        if self.failed.is_some() {
+            return;
+        }
+        let len = init.len() * SG1;
+        let Some(fin) = body.get(self.at..self.at + len) else {
+            self.failed = Some(fail("L section does not match"));
+            return;
+        };
+        self.at += len;
+        let scalars = l_scalars(self.rng, init.len());
+        let added = decode_g1(fin)
+            .map_err(CeremonyError::from)
+            .and_then(|fin| self.sums.add(init, &fin, &scalars, self.msm));
+        if let Err(e) = added {
+            self.failed = Some(e);
+        }
+    }
+
+    fn finish(self) -> Result<RatioSums, CeremonyError> {
+        match self.failed {
+            Some(e) => Err(e),
+            None => Ok(self.sums),
+        }
+    }
 }
 
 fn fail(what: impl Into<String>) -> CeremonyError {
@@ -636,25 +913,62 @@ fn check_l_section(
     if init_body.len() != final_body.len() {
         return Err(fail("L section does not match"));
     }
-    let n = final_body.len() / SG1;
-    if n == 0 {
-        return Ok(());
+    let mut sums = RatioSums::default();
+    for (init, fin) in init_body
+        .chunks(CHECK_CHUNK * SG1)
+        .zip(final_body.chunks(CHECK_CHUNK * SG1))
+    {
+        let scalars = l_scalars(rng, init.len() / SG1);
+        sums.add(&decode_g1(init)?, &decode_g1(fin)?, &scalars, msm)?;
     }
-    // 32-bit scalars, as snarkjs uses (`getRandomBytes(4*n)`). A forged section would have
-    // to survive a random combination, and 32 bits of soundness per check is snarkjs'
-    // choice, not something the port gets to tighten without diverging.
-    let scalars: Vec<Fr> = (0..n).map(|_| Fr::from(rng.next_u32())).collect();
-    let r1 = msm.try_msm_g1(&decode_g1(init_body)?, &scalars)?;
-    let r2 = msm.try_msm_g1(&decode_g1(final_body)?, &scalars)?;
-    if !same_ratio(
-        &r1.into_affine(),
-        &r2.into_affine(),
-        delta_g2,
-        init_delta_g2,
-    ) {
-        return Err(fail("L section does not match"));
+    sums.check(delta_g2, init_delta_g2)
+}
+
+/// `n` of the L check's scalars. 32 bits each, as snarkjs uses (`getRandomBytes(4*n)`):
+/// a forged section would have to survive a random combination, and 32 bits of soundness
+/// per check is snarkjs' choice, not something the port gets to tighten without
+/// diverging.
+fn l_scalars(rng: &mut CeremonyRng, n: usize) -> Vec<Fr> {
+    (0..n).map(|_| Fr::from(rng.next_u32())).collect()
+}
+
+/// The L check's two random combinations, one per file, summed a chunk at a time with
+/// the same scalars on both sides.
+#[derive(Default)]
+struct RatioSums {
+    init: G1Projective,
+    fin: G1Projective,
+    n: usize,
+}
+
+impl RatioSums {
+    fn add(
+        &mut self,
+        init: &[G1Affine],
+        fin: &[G1Affine],
+        scalars: &[Fr],
+        msm: &dyn MsmBackend,
+    ) -> Result<(), CeremonyError> {
+        self.init += msm.try_msm_g1(init, scalars)?;
+        self.fin += msm.try_msm_g1(fin, scalars)?;
+        self.n += scalars.len();
+        Ok(())
     }
-    Ok(())
+
+    /// An empty section has nothing to compare.
+    fn check(&self, delta_g2: &G2Affine, init_delta_g2: &G2Affine) -> Result<(), CeremonyError> {
+        if self.n > 0
+            && !same_ratio(
+                &self.init.into_affine(),
+                &self.fin.into_affine(),
+                delta_g2,
+                init_delta_g2,
+            )
+        {
+            return Err(fail("L section does not match"));
+        }
+        Ok(())
+    }
 }
 
 /// The H check, the one part of `zkey verify` that is not a byte comparison or a single
@@ -700,15 +1014,18 @@ fn check_h_section(
     coeffs[domain_size - 1] = Fr::zero();
 
     let n = domain_size - 1;
-    let hi = ptau.g1_points(crate::ptau::S_TAU_G1, domain_size, n)?;
-    let lo = ptau.g1_points(crate::ptau::S_TAU_G1, 0, n)?;
-    let diff: Vec<G1Affine> = G1Projective::normalize_batch(
-        &hi.par_iter()
-            .zip(&lo)
-            .map(|(a, b)| *a - *b)
-            .collect::<Vec<_>>(),
-    );
-    let r1 = msm.try_msm_g1(&diff, &coeffs[..n])?;
+    let hi = ptau.section_elements(crate::ptau::S_TAU_G1, SG1, domain_size, n)?;
+    let lo = ptau.section_elements(crate::ptau::S_TAU_G1, SG1, 0, n)?;
+    let mut r1 = G1Projective::zero();
+    for ((hi, lo), coeffs) in hi
+        .chunks(CHECK_CHUNK * SG1)
+        .zip(lo.chunks(CHECK_CHUNK * SG1))
+        .zip(coeffs[..n].chunks(CHECK_CHUNK))
+    {
+        let (hi, lo) = (decode_g1(hi)?, decode_g1(lo)?);
+        let diff: Vec<G1Projective> = hi.par_iter().zip(&lo).map(|(a, b)| *a - *b).collect();
+        r1 += msm.try_msm_g1(&crate::setup::to_affine(&diff), coeffs)?;
+    }
 
     // `Fr.w[power+1]`: a primitive `2n`-th root, so `inc^i` walks the odd coset the H
     // bases live on. The `power >= Fr.s` branch snarkjs also has is unreachable here,
@@ -727,7 +1044,16 @@ fn check_h_section(
     let ntt = CpuNtt::new();
     ntt.ntt(&domain, &mut shifted, Direction::Forward);
 
-    let r2 = msm.try_msm_g1(&decode_g1(h_body)?, &shifted)?;
+    if h_body.len() != SG1 * domain_size {
+        return Err(fail("invalid H section size"));
+    }
+    let mut r2 = G1Projective::zero();
+    for (h, s) in h_body
+        .chunks(CHECK_CHUNK * SG1)
+        .zip(shifted.chunks(CHECK_CHUNK))
+    {
+        r2 += msm.try_msm_g1(&decode_g1(h)?, s)?;
+    }
     if !same_ratio(
         &r1.into_affine(),
         &r2.into_affine(),

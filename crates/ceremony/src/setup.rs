@@ -29,6 +29,7 @@ use std::ops::Range;
 use std::path::Path;
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use ark_ec::short_weierstrass::{Affine, Projective};
 use rayon::prelude::*;
@@ -118,6 +119,8 @@ pub struct SetupReport {
     /// The circuit hash written into section 10, and the value every later contribution
     /// transcript is seeded with.
     pub cs_hash: Digest,
+    /// Wall time per stage, in run order.
+    pub phases: Vec<(&'static str, Duration)>,
 }
 
 /// `zkey_new.js:59` with the floor-log2 of `misc.js:53`:
@@ -170,126 +173,347 @@ pub fn setup(
     msm: &dyn MsmBackend,
 ) -> Result<SetupReport, CeremonyError> {
     crate::write::staged(out_path, |stage| {
-        setup_inner(r1cs_path, ptau_path, stage, msm)
+        let setup = Prepared::open(r1cs_path, ptau_path)?;
+        let mut file = FileSink::create(stage)?;
+        setup.run(&mut file, msm)
     })
 }
 
-fn setup_inner(
-    r1cs_path: &Path,
-    ptau_path: &Path,
-    out_path: &Path,
-    msm: &dyn MsmBackend,
-) -> Result<SetupReport, CeremonyError> {
-    let ptau = Ptau::open(ptau_path)?;
-    let r1cs = R1cs::open(r1cs_path)?;
+/// A setup whose inputs are open and checked, and whose header is known, before any
+/// section is produced.
+pub(crate) struct Prepared {
+    ptau: Ptau,
+    r1cs: R1cs,
+    header: Groth16Header,
+}
 
-    let n_vars = r1cs.header().n_vars as usize;
-    let n_public = r1cs.header().n_public();
-    let n_constraints = r1cs.header().n_constraints as usize;
-    let cir_power = r1cs.header().cir_power();
-    let domain_size = r1cs.header().domain_size();
+impl Prepared {
+    pub(crate) fn open(r1cs_path: &Path, ptau_path: &Path) -> Result<Self, CeremonyError> {
+        let ptau = Ptau::open(ptau_path)?;
+        let r1cs = R1cs::open(r1cs_path)?;
+        let cir_power = r1cs.header().cir_power();
 
-    // Order matters only for the message a caller sees: snarkjs tests the power first
-    // (`zkey_new.js:61`) and only then section 12 (`:66`).
-    if cir_power > ptau.power() {
-        return Err(CeremonyError::PtauTooSmall {
-            needed: cir_power,
-            have: ptau.power(),
-        });
+        // Order matters only for the message a caller sees: snarkjs tests the power first
+        // (`zkey_new.js:61`) and only then section 12 (`:66`).
+        if cir_power > ptau.power() {
+            return Err(CeremonyError::PtauTooSmall {
+                needed: cir_power,
+                have: ptau.power(),
+            });
+        }
+        if !ptau.is_prepared() {
+            return Err(CeremonyError::NotPrepared);
+        }
+
+        // `vk_alpha_1` and `vk_beta_1` are element 0 of the alpha and beta ptau sections,
+        // that is `alpha*tau^0*G1` and `beta*tau^0*G1` (`zkey_new.js:101,107,113`). Reading
+        // them from the Lagrange sections instead would give `alpha*L_0(tau)*G1`, which for
+        // a one-element domain is the same point and for every real domain is not.
+        let alpha_g1 = ptau.g1_points(ptau::S_ALPHA_TAU_G1, 0, 1)?[0];
+        let beta_g1 = ptau.g1_points(ptau::S_BETA_TAU_G1, 0, 1)?[0];
+        let beta_g2 = ptau.g2_points(ptau::S_BETA_G2, 0, 1)?[0];
+
+        let header = Groth16Header {
+            n_vars: r1cs.header().n_vars,
+            n_public: r1cs.header().n_public() as u32,
+            domain_size: r1cs.header().domain_size() as u32,
+            alpha_g1,
+            beta_g1,
+            beta_g2,
+            gamma_g2: G2Affine::generator(),
+            delta_g1: G1Affine::generator(),
+            delta_g2: G2Affine::generator(),
+        };
+        Ok(Self { ptau, r1cs, header })
     }
-    if !ptau.is_prepared() {
-        return Err(CeremonyError::NotPrepared);
+
+    /// Section 2 of the key [`Prepared::run`] produces.
+    pub(crate) fn header(&self) -> &Groth16Header {
+        &self.header
     }
 
-    // `vk_alpha_1` and `vk_beta_1` are element 0 of the alpha and beta ptau sections, that
-    // is `alpha*tau^0*G1` and `beta*tau^0*G1` (`zkey_new.js:101,107,113`). Reading them
-    // from the Lagrange sections instead would give `alpha*L_0(tau)*G1`, which for a
-    // one-element domain is the same point and for every real domain is not.
-    let alpha_g1 = ptau.g1_points(ptau::S_ALPHA_TAU_G1, 0, 1)?[0];
-    let beta_g1 = ptau.g1_points(ptau::S_BETA_TAU_G1, 0, 1)?[0];
-    let beta_g2 = ptau.g2_points(ptau::S_BETA_G2, 0, 1)?[0];
+    /// Produce every section into `sink`, in write order.
+    pub(crate) fn run<S: SetupSink>(
+        &self,
+        sink: &mut S,
+        msm: &dyn MsmBackend,
+    ) -> Result<SetupReport, CeremonyError> {
+        let Self { ptau, r1cs, header } = self;
+        let n_vars = r1cs.header().n_vars as usize;
+        let n_public = r1cs.header().n_public();
+        let n_constraints = r1cs.header().n_constraints as usize;
+        let cir_power = r1cs.header().cir_power();
+        let domain_size = r1cs.header().domain_size();
+        let mut phases = Phases::start();
 
-    let header = Groth16Header {
-        n_vars: n_vars as u32,
-        n_public: n_public as u32,
-        domain_size: domain_size as u32,
-        alpha_g1,
-        beta_g1,
-        beta_g2,
-        gamma_g2: G2Affine::generator(),
-        delta_g1: G1Affine::generator(),
-        delta_g2: G2Affine::generator(),
-    };
+        sink.header(header)?;
+        // The six header points, uncompressed, in write order (`zkey_new.js:104,110,116,
+        // :130-132`). The scalars beside them on disk are never hashed.
+        let mut header_hash = Transcript::new();
+        header_hash.update_g1(&header.alpha_g1);
+        header_hash.update_g1(&header.beta_g1);
+        header_hash.update_g2(&header.beta_g2);
+        header_hash.update_g2(&header.gamma_g2);
+        header_hash.update_g1(&header.delta_g1);
+        header_hash.update_g2(&header.delta_g2);
+        let cs = CsHash::spawn(header_hash)?;
 
-    let mut w = BinFileWriter::create(out_path, ZKEY_MAGIC, ZKEY_VERSION, ZKEY_SECTIONS)?;
+        // The r1cs walks are serial and the Lagrange check is not, so they run side by
+        // side; an r1cs error still wins, as it would have run first.
+        let (acc, bases) = rayon::join(
+            || -> Result<Accumulators, CeremonyError> {
+                let counts = TermCounts::walk(r1cs, domain_size)?;
+                let n = coef_count(counts.n_coefs)?;
+                sink.start(S_COEFFS)?;
+                sink.bytes(&n.to_le_bytes())?;
+                let acc =
+                    counts.fill(r1cs, |batch| sink.bytes(&encode_coefficients(r1cs, batch)?))?;
+                sink.end()?;
+                Ok(acc)
+            },
+            || LagrangeBlocks::read(ptau, domain_size),
+        );
+        let acc = acc?;
+        let bases = bases?;
+        phases.lap("constraints");
 
-    w.start_section(S_PROTOCOL)?;
-    w.write_u32(crate::PROTOCOL_GROTH16)?;
-    w.end_section()?;
+        let ic = acc.ic();
+        point_section(
+            sink,
+            &cs,
+            S_IC,
+            ic.len(),
+            |r| compose_points_g1(ic.sub(r), &bases, r1cs, msm),
+            emit_g1,
+        )?;
+        phases.lap("IC");
 
-    w.start_section(S_HEADER)?;
-    header.write(&mut w)?;
-    w.end_section()?;
-    // The six header points, uncompressed, in write order (`zkey_new.js:104,110,116,
-    // :130-132`). The scalars beside them on disk are never hashed.
-    let mut header_hash = Transcript::new();
-    header_hash.update_g1(&header.alpha_g1);
-    header_hash.update_g1(&header.beta_g1);
-    header_hash.update_g2(&header.beta_g2);
-    header_hash.update_g2(&header.gamma_g2);
-    header_hash.update_g1(&header.delta_g1);
-    header_hash.update_g2(&header.delta_g2);
-    let cs = CsHash::spawn(header_hash)?;
+        if sink.wants(S_H) {
+            sink.start(S_H)?;
+            h_points(ptau, domain_size, |points| sink.g1(points))?;
+            sink.end()?;
+            phases.lap("H");
+        }
+        hash_h_points_into(ptau, domain_size, |b| cs.send(b))?;
+        phases.lap("H hash");
 
-    // The r1cs walks are serial and the Lagrange check is not, so they run side by side;
-    // an r1cs error still wins, as it would have run first.
-    let (acc, bases) = rayon::join(
-        || -> Result<Accumulators, CeremonyError> {
-            let counts = TermCounts::walk(&r1cs, domain_size)?;
-            let n = coef_count(counts.n_coefs)?;
-            w.start_section(S_COEFFS)?;
-            w.write_u32(n)?;
-            let acc = counts.fill(&r1cs, |batch| {
-                w.write_bytes(&encode_coefficients(&r1cs, batch)?)
-            })?;
-            w.end_section()?;
-            Ok(acc)
-        },
-        || LagrangeBlocks::read(&ptau, domain_size),
-    );
-    let acc = acc?;
-    let bases = bases?;
-    let n_coefs = acc.n_coefs;
+        for (id, slots, name) in [
+            (S_C, acc.c(), "C"),
+            (S_A, acc.a.all(), "A"),
+            (S_B1, acc.b.all(), "B1"),
+        ] {
+            point_section(
+                sink,
+                &cs,
+                id,
+                slots.len(),
+                |r| compose_points_g1(slots.sub(r), &bases, r1cs, msm),
+                emit_g1,
+            )?;
+            phases.lap(name);
+        }
+        let b2 = acc.b.all();
+        point_section(
+            sink,
+            &cs,
+            S_B2,
+            b2.len(),
+            |r| compose_points_g2(b2.sub(r), &bases, r1cs, msm),
+            emit_g2,
+        )?;
+        phases.lap("B2");
 
-    write_points_g1(&mut w, &cs, S_IC, acc.ic(), &bases, &r1cs, msm)?;
+        let cs_hash = cs.finish().finalize();
+        phases.lap("csHash");
+        sink.finish(&cs_hash)?;
 
-    w.start_section(S_H)?;
-    w.write_g1_slice(&write_hs(&ptau, domain_size)?)?;
-    w.end_section()?;
+        Ok(SetupReport {
+            n_vars,
+            n_public,
+            n_constraints,
+            domain_size,
+            cir_power,
+            n_coefs: acc.n_coefs,
+            cs_hash,
+            phases: phases.laps,
+        })
+    }
+}
 
-    hash_h_points_into(&ptau, domain_size, |b| cs.send(Absorb::Bytes(b)))?;
+/// Wall time per stage of a run, for `-v`.
+struct Phases {
+    at: Instant,
+    laps: Vec<(&'static str, Duration)>,
+}
 
-    write_points_g1(&mut w, &cs, S_C, acc.c(), &bases, &r1cs, msm)?;
-    write_points_g1(&mut w, &cs, S_A, acc.a.all(), &bases, &r1cs, msm)?;
-    write_points_g1(&mut w, &cs, S_B1, acc.b.all(), &bases, &r1cs, msm)?;
-    write_points_g2(&mut w, &cs, S_B2, acc.b.all(), &bases, &r1cs, msm)?;
+impl Phases {
+    fn start() -> Self {
+        Self {
+            at: Instant::now(),
+            laps: Vec::new(),
+        }
+    }
 
-    let cs_hash = cs.finish().finalize();
-    w.start_section(S_MPC_PARAMS)?;
-    w.write_bytes(&cs_hash)?;
-    w.write_u32(0)?;
-    w.end_section()?;
-    w.finish()?;
+    fn lap(&mut self, name: &'static str) {
+        let now = Instant::now();
+        self.laps.push((name, now - self.at));
+        self.at = now;
+    }
+}
 
-    Ok(SetupReport {
-        n_vars,
-        n_public,
-        n_constraints,
-        domain_size,
-        cir_power,
-        n_coefs,
-        cs_hash,
-    })
+/// Where [`Prepared::run`]'s sections go: a file for `groth16 setup`, or a comparison
+/// against a contributed key for `zkey verify` (`crate::contribute`).
+///
+/// Sections arrive in write order, each as [`SetupSink::start`], its body in any number of
+/// pieces, then [`SetupSink::end`]. A point section arrives [`SECTION_CHUNK`] points at a
+/// time, so neither side ever holds a whole one.
+pub(crate) trait SetupSink: Send {
+    /// False for a section whose body the sink ignores, so it is never produced. Only
+    /// section 9 is optional, because it alone is not hashed.
+    fn wants(&self, _id: u32) -> bool {
+        true
+    }
+    /// Sections 1 and 2.
+    fn header(&mut self, header: &Groth16Header) -> Result<(), CeremonyError>;
+    fn start(&mut self, id: u32) -> Result<(), CeremonyError>;
+    fn bytes(&mut self, bytes: &[u8]) -> Result<(), CeremonyError>;
+    fn g1(&mut self, points: &[G1Affine]) -> Result<(), CeremonyError>;
+    fn g2(&mut self, points: &[G2Affine]) -> Result<(), CeremonyError>;
+    fn end(&mut self) -> Result<(), CeremonyError>;
+    /// Section 10, once the hash is known.
+    fn finish(&mut self, cs_hash: &Digest) -> Result<(), CeremonyError>;
+}
+
+/// The sink `groth16 setup` writes through.
+struct FileSink(Option<BinFileWriter>);
+
+impl FileSink {
+    fn create(path: &Path) -> Result<Self, CeremonyError> {
+        Ok(Self(Some(BinFileWriter::create(
+            path,
+            ZKEY_MAGIC,
+            ZKEY_VERSION,
+            ZKEY_SECTIONS,
+        )?)))
+    }
+
+    fn w(&mut self) -> Result<&mut BinFileWriter, CeremonyError> {
+        self.0
+            .as_mut()
+            .ok_or_else(|| CeremonyError::malformed(S_MPC_PARAMS, "written after section 10"))
+    }
+}
+
+impl SetupSink for FileSink {
+    fn header(&mut self, header: &Groth16Header) -> Result<(), CeremonyError> {
+        let w = self.w()?;
+        w.start_section(S_PROTOCOL)?;
+        w.write_u32(crate::PROTOCOL_GROTH16)?;
+        w.end_section()?;
+        w.start_section(S_HEADER)?;
+        header.write(w)?;
+        w.end_section()
+    }
+
+    fn start(&mut self, id: u32) -> Result<(), CeremonyError> {
+        self.w()?.start_section(id)
+    }
+
+    fn bytes(&mut self, bytes: &[u8]) -> Result<(), CeremonyError> {
+        self.w()?.write_bytes(bytes)
+    }
+
+    fn g1(&mut self, points: &[G1Affine]) -> Result<(), CeremonyError> {
+        self.w()?.write_g1_slice(points)
+    }
+
+    fn g2(&mut self, points: &[G2Affine]) -> Result<(), CeremonyError> {
+        self.w()?.write_g2_slice(points)
+    }
+
+    fn end(&mut self) -> Result<(), CeremonyError> {
+        self.w()?.end_section()
+    }
+
+    fn finish(&mut self, cs_hash: &Digest) -> Result<(), CeremonyError> {
+        let mut w = self
+            .0
+            .take()
+            .ok_or_else(|| CeremonyError::malformed(S_MPC_PARAMS, "section 10 written twice"))?;
+        w.start_section(S_MPC_PARAMS)?;
+        w.write_bytes(cs_hash)?;
+        w.write_u32(0)?;
+        w.end_section()?;
+        w.finish()
+    }
+}
+
+/// Output points per chunk of a point section.
+///
+/// Each chunk is composed while the one before it goes to the sink and the hasher, so a
+/// section is never whole in memory: the working set is a few chunks, about 170 MB each in
+/// G1 and 330 MB in G2, wherever the circuit's size. Only a buffering choice: the bytes and
+/// the hash are the same whatever the split.
+const SECTION_CHUNK: usize = 1 << 20;
+
+/// One point section: hash the slot count, then compose, emit and hash each chunk.
+///
+/// snarkjs interleaves the writing and the hashing chunk by chunk (`zkey_new.js:369-377`)
+/// but nothing else touches the hasher in between, so the byte stream is the same.
+fn point_section<T, S, F>(
+    sink: &mut S,
+    cs: &CsHash,
+    id: u32,
+    n: usize,
+    compose: F,
+    emit: fn(&mut S, &CsHash, Vec<T>) -> Result<(), CeremonyError>,
+) -> Result<(), CeremonyError>
+where
+    T: Send,
+    S: SetupSink,
+    F: Fn(Range<usize>) -> Result<Vec<T>, CeremonyError> + Sync,
+{
+    cs.send((n as u32).to_be_bytes().to_vec());
+    sink.start(id)?;
+    let mut done: Option<Vec<T>> = None;
+    let mut from = 0;
+    while from < n {
+        let to = (from + SECTION_CHUNK).min(n);
+        let (next, emitted) = rayon::join(
+            || compose(from..to),
+            || done.take().map_or(Ok(()), |points| emit(sink, cs, points)),
+        );
+        // A serial run would have emitted this chunk before composing the next one.
+        emitted?;
+        done = Some(next?);
+        from = to;
+    }
+    if let Some(points) = done {
+        emit(sink, cs, points)?;
+    }
+    sink.end()
+}
+
+/// A G1 chunk to the sink, then to the hasher.
+fn emit_g1<S: SetupSink>(
+    sink: &mut S,
+    cs: &CsHash,
+    points: Vec<G1Affine>,
+) -> Result<(), CeremonyError> {
+    sink.g1(&points)?;
+    cs.send(transcript::g1_uncompressed_all(&points));
+    Ok(())
+}
+
+/// [`emit_g1`] for section 7.
+fn emit_g2<S: SetupSink>(
+    sink: &mut S,
+    cs: &CsHash,
+    points: Vec<G2Affine>,
+) -> Result<(), CeremonyError> {
+    sink.g2(&points)?;
+    cs.send(transcript::g2_uncompressed_all(&points));
+    Ok(())
 }
 
 /// Which of the four ptau Lagrange sections a term's base comes from
@@ -790,80 +1014,32 @@ fn coefficient(r1cs: &R1cs, coef_ptr: Option<u64>) -> Result<Fr, CeremonyError> 
     }
 }
 
-/// Hash the slot count, compose the points, write the section, hash the points.
-///
-/// snarkjs interleaves the writing and the hashing chunk by chunk (`zkey_new.js:369-377`)
-/// but nothing else touches the hasher in between, so the byte stream is the same.
-fn write_points_g1(
-    w: &mut BinFileWriter,
-    cs: &CsHash,
-    id: u32,
-    slots: SlotRange<'_>,
-    bases: &LagrangeBlocks,
-    r1cs: &R1cs,
-    msm: &dyn MsmBackend,
-) -> Result<(), CeremonyError> {
-    cs.send(Absorb::Bytes((slots.len() as u32).to_be_bytes().to_vec()));
-    let points = compose_points_g1(slots, bases, r1cs, msm)?;
-    w.start_section(id)?;
-    w.write_g1_slice(&points)?;
-    w.end_section()?;
-    cs.send(Absorb::G1(points));
-    Ok(())
-}
-
-/// [`write_points_g1`] for section 7.
-fn write_points_g2(
-    w: &mut BinFileWriter,
-    cs: &CsHash,
-    id: u32,
-    slots: SlotRange<'_>,
-    bases: &LagrangeBlocks,
-    r1cs: &R1cs,
-    msm: &dyn MsmBackend,
-) -> Result<(), CeremonyError> {
-    cs.send(Absorb::Bytes((slots.len() as u32).to_be_bytes().to_vec()));
-    let points = compose_points_g2(slots, bases, r1cs, msm)?;
-    w.start_section(id)?;
-    w.write_g2_slice(&points)?;
-    w.end_section()?;
-    cs.send(Absorb::G2(points));
-    Ok(())
-}
-
-/// What [`CsHash`] absorbs: raw bytes, or points it encodes uncompressed first.
-enum Absorb {
-    Bytes(Vec<u8>),
-    G1(Vec<G1Affine>),
-    G2(Vec<G2Affine>),
-}
-
-/// Messages [`CsHash`] holds before a sender waits. Each is at most one section's points.
+/// Messages [`CsHash`] holds before a sender waits. Each is at most one chunk's encoding.
 const HASH_QUEUE: usize = 2;
 
-/// `csHash` on a thread of its own, fed in send order through one channel.
+/// `csHash` on a thread of its own, fed bytes in send order through one channel.
 ///
 /// BLAKE2b is serial, and on a 2^25 circuit each point section is 1.2 to 2.4 GB of it, so
-/// absorbing a section in line held the whole pool for 10 to 15 s. Here the next section
+/// absorbing a section in line held the whole pool for 10 to 15 s. Here the next chunk
 /// composes while the last one is hashed. The digest depends only on the byte stream, not
 /// on how it is split.
+///
+/// The worker never waits on the rayon pool, which is why senders encode the points and
+/// not it: a sender can be a pool thread blocked on a full queue, and a worker queued
+/// behind that thread's stack would never be served.
 struct CsHash {
-    tx: Option<SyncSender<Absorb>>,
+    tx: Option<SyncSender<Vec<u8>>>,
     worker: Option<JoinHandle<Transcript>>,
 }
 
 impl CsHash {
     fn spawn(mut transcript: Transcript) -> Result<Self, CeremonyError> {
-        let (tx, rx) = sync_channel::<Absorb>(HASH_QUEUE);
+        let (tx, rx) = sync_channel::<Vec<u8>>(HASH_QUEUE);
         let worker = std::thread::Builder::new()
             .name("cs-hash".into())
             .spawn(move || {
-                for message in rx {
-                    match message {
-                        Absorb::Bytes(b) => transcript.update(&b),
-                        Absorb::G1(p) => transcript.update_g1_all(&p),
-                        Absorb::G2(p) => transcript.update_g2_all(&p),
-                    }
+                for bytes in rx {
+                    transcript.update(&bytes);
                 }
                 transcript
             })?;
@@ -873,7 +1049,7 @@ impl CsHash {
         })
     }
 
-    fn send(&self, message: Absorb) {
+    fn send(&self, message: Vec<u8>) {
         // A send fails only once the worker has panicked, and `finish` re-raises that.
         if let Some(tx) = &self.tx {
             let _ = tx.send(message);
@@ -1075,7 +1251,7 @@ where
 /// Over the whole slice it would hold a second vector of every `z` and a third of their
 /// running products, one field element per signal each, while the projective input is
 /// still alive.
-fn to_affine<P: CurveGroup>(acc: &[P]) -> Vec<P::Affine> {
+pub(crate) fn to_affine<P: CurveGroup>(acc: &[P]) -> Vec<P::Affine> {
     let mut out = vec![P::Affine::zero(); acc.len()];
     out.par_chunks_mut(NORMALIZE_CHUNK)
         .zip(acc.par_chunks(NORMALIZE_CHUNK))
@@ -1249,6 +1425,20 @@ fn wrong_group(term: &PointTerm) -> CeremonyError {
 /// No arithmetic. Only section 12 carries the `power+1` block, which is why this read is
 /// possible at all when `cirPower == power`.
 pub fn write_hs(ptau: &Ptau, domain_size: usize) -> Result<Vec<G1Affine>, CeremonyError> {
+    let mut out = Vec::with_capacity(domain_size);
+    h_points(ptau, domain_size, |points| {
+        out.extend_from_slice(points);
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// [`write_hs`] handed to `emit` [`SECTION_CHUNK`] points at a time, in order.
+fn h_points(
+    ptau: &Ptau,
+    domain_size: usize,
+    mut emit: impl FnMut(&[G1Affine]) -> Result<(), CeremonyError>,
+) -> Result<(), CeremonyError> {
     if !domain_size.is_power_of_two() {
         return Err(CeremonyError::BadParams(format!(
             "domain size {domain_size} is not a power of two"
@@ -1260,22 +1450,35 @@ pub fn write_hs(ptau: &Ptau, domain_size: usize) -> Result<Vec<G1Affine>, Ceremo
     if cir_power < Fr::TWO_ADICITY {
         let data = ptau.section_elements(ptau::S_LAGRANGE_TAU_G1, SG1, block - 1, block)?;
         // Each record is an (even, odd) pair, so its second half is the odd element.
-        Ok(binfile::decode_records(
-            data,
-            2 * SG1,
-            G1Affine::identity(),
-            |_, b| binfile::g1(&b[SG1..]),
-        )?)
+        for chunk in data.chunks(SECTION_CHUNK * 2 * SG1) {
+            emit(&binfile::decode_records(
+                chunk,
+                2 * SG1,
+                G1Affine::identity(),
+                |_, b| binfile::g1(&b[SG1..]),
+            )?)?;
+        }
+        Ok(())
     } else if cir_power == Fr::TWO_ADICITY {
         // At the two-adicity there is no `2*domainSize`-th root of unity, so
         // `lagrangeEvaluations` took its coset branch and wrote the even and odd halves
         // contiguously instead of interleaved. Every odd element is then just the second
         // half (`zkey_new.js:192-194`).
-        ptau.g1_points(
+        let data = ptau.section_elements(
             ptau::S_LAGRANGE_TAU_G1,
+            SG1,
             block - 1 + domain_size,
             domain_size,
-        )
+        )?;
+        for chunk in data.chunks(SECTION_CHUNK * SG1) {
+            emit(&binfile::decode_records(
+                chunk,
+                SG1,
+                G1Affine::identity(),
+                |_, b| binfile::g1(b),
+            )?)?;
+        }
+        Ok(())
     } else {
         Err(CeremonyError::CircuitTooBig(cir_power))
     }
@@ -1314,7 +1517,7 @@ pub fn hash_h_points(
     transcript: &mut Transcript,
 ) -> Result<(), CeremonyError> {
     let cs = CsHash::spawn(transcript.clone())?;
-    let hashed = hash_h_points_into(ptau, domain_size, |b| cs.send(Absorb::Bytes(b)));
+    let hashed = hash_h_points_into(ptau, domain_size, |b| cs.send(b));
     *transcript = cs.finish();
     hashed
 }
