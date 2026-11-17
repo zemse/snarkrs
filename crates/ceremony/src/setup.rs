@@ -1247,6 +1247,13 @@ fn lagrange_scalars(
     let mut a = vec![Fr::zero(); rows];
     let mut b = vec![Fr::zero(); rows];
     let starts = r1cs.constraint_starts(SCALAR_BLOCK)?;
+    // The zip below would otherwise drop the constraints past the last start silently.
+    if starts.len() != n_constraints.div_ceil(SCALAR_BLOCK) {
+        return Err(CeremonyError::BadParams(format!(
+            "{} constraint starts for {n_constraints} constraints",
+            starts.len()
+        )));
+    }
     a[..n_constraints]
         .par_chunks_mut(SCALAR_BLOCK)
         .zip(b[..n_constraints].par_chunks_mut(SCALAR_BLOCK))

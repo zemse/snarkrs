@@ -688,6 +688,11 @@ pub fn verify_from_r1cs_with(
             return Err(fail(format!("{what} section is not identical")));
         }
     }
+    // Every verdict has to have been raised by the loop above, which is what makes
+    // skipping csHash on a failed one safe.
+    for (_, verdict) in verdicts {
+        verdict?;
+    }
     l.finish()?.check(&header.delta_g2, &init_header.delta_g2)?;
     let at = Instant::now();
     check_h_section(

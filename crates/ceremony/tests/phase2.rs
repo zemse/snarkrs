@@ -959,9 +959,30 @@ fn small_subgroup_b2(bytes: &mut [u8], table: &Table) {
     bytes[at..at + 128].copy_from_slice(&g2_lem(&moved));
 }
 
+/// Add G to the first finite point of section 5 and subtract it from the next, so the
+/// section's plain sum is unchanged and only unequal scalars on the two points catch it.
+fn cancel_pair_a(bytes: &mut [u8], table: &Table) {
+    use snarkrs_field::{AffineRepr, CurveGroup};
+    let first = first_finite(bytes, table, 5, 64);
+    let start = body(table, 5).0;
+    let g = snarkrs_field::G1Affine::generator();
+    for (i, sign) in [(first, true), (first + 1, false)] {
+        let at = start + i * 64;
+        let p = snarkrs_formats::binfile::g1(&bytes[at..at + 64]).unwrap();
+        let moved = if sign { p + g } else { p - g }.into_affine();
+        bytes[at..at + 64].copy_from_slice(&snarkrs_ceremony::write::g1_lem(&moved));
+    }
+}
+
 /// Edits only the random check has its own reason to reject, in a point that is otherwise
 /// the right one: the exact check sees different bytes.
 const RANDOM_TAMPERS: &[Tamper] = &[
+    Tamper {
+        what: "A, +G and -G on two points",
+        edit: |b, t| cancel_pair_a(b, t),
+        expect: "A section is not identical",
+        random: "A section does not match",
+    },
     Tamper {
         what: "A, x + q",
         edit: |b, t| non_canonical(b, t, 5, 64),
