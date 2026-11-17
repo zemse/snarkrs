@@ -22,18 +22,20 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use ark_ec::short_weierstrass::{Affine, Projective};
 use rayon::prelude::*;
 use snarkrs_field::{
-    AffineRepr, CurveGroup, Domain, Field, Fr, G1Affine, G1Projective, G2Affine, Zero,
+    g1, g2, AffineRepr, CurveGroup, Domain, Field, Fr, G1Affine, G1Projective, G2Affine, Zero,
 };
-use snarkrs_msm::{KeyScale, MsmBackend};
+use snarkrs_msm::xyzz::{to_projective, RawCurve, Xyzz};
+use snarkrs_msm::{AccelError, KeyScale, MsmBackend};
 use snarkrs_ntt::{CpuNtt, Direction};
 
 use crate::phase1::check_beacon;
 use crate::ptau::Ptau;
 use crate::setup::{
-    Prepared, SetupSink, S_A, S_B1, S_B2, S_C, S_COEFFS, S_H, S_HEADER, S_IC, S_MPC_PARAMS,
-    S_PROTOCOL, ZKEY_MAGIC, ZKEY_MAX_VERSION, ZKEY_SECTIONS, ZKEY_VERSION,
+    Combined, Prepared, SetupSink, S_A, S_B1, S_B2, S_C, S_COEFFS, S_H, S_HEADER, S_IC,
+    S_MPC_PARAMS, S_PROTOCOL, ZKEY_MAGIC, ZKEY_MAX_VERSION, ZKEY_SECTIONS, ZKEY_VERSION,
 };
 use crate::transcript::{
     self, create_delta_key, hash_to_g2, same_ratio, CeremonyRng, Digest, Transcript,
@@ -419,6 +421,8 @@ pub struct ZkeyVerifyReport {
     pub domain_size: usize,
     /// The backend that recomputed the initial key, for the r1cs form.
     pub setup_backend: Option<&'static str>,
+    /// How sections 5 to 7 were checked.
+    pub check: Check,
     /// Wall time per stage, in run order.
     pub phases: Vec<(&'static str, Duration)>,
 }
@@ -436,6 +440,19 @@ pub fn verify_from_init(
     ptau: &Path,
     final_zkey: &Path,
     msm: &dyn MsmBackend,
+) -> Result<ZkeyVerifyReport, CeremonyError> {
+    verify_from_init_with(init_zkey, ptau, final_zkey, msm, Check::Exact)
+}
+
+/// [`verify_from_init`] with sections 5 to 7 checked as `check` says. The byte comparison
+/// [`Check::Exact`] makes here is already cheaper than any combination, so
+/// [`Check::Random`] buys this form nothing but the same check the r1cs form makes.
+pub fn verify_from_init_with(
+    init_zkey: &Path,
+    ptau: &Path,
+    final_zkey: &Path,
+    msm: &dyn MsmBackend,
+    check: Check,
 ) -> Result<ZkeyVerifyReport, CeremonyError> {
     let file = BinFile::open(final_zkey, ZKEY_MAGIC, ZKEY_MAX_VERSION)?;
     check_protocol(&file)?;
@@ -464,13 +481,22 @@ pub fn verify_from_init(
         return Err(fail("invalid H section size"));
     }
 
+    // Drawn with both keys already open, so no scalar exists before the points it weighs.
+    let mut rng = transcript::rng_from_entropy("g16 zkey verify")?;
     for (id, what) in COMPARED {
-        if file.unique_section(id)? != init.unique_section(id)? {
-            return Err(fail(format!("{what} section is not identical")));
+        let (fin, ini) = (file.unique_section(id)?, init.unique_section(id)?);
+        match (check, id) {
+            (Check::Random, S_A | S_B1) => {
+                random_against_init::<g1::Config>(ini, fin, what, &mut rng, msm)?
+            }
+            (Check::Random, S_B2) => {
+                random_against_init::<g2::Config>(ini, fin, what, &mut rng, msm)?
+            }
+            _ if fin != ini => return Err(fail(format!("{what} section is not identical"))),
+            _ => {}
         }
     }
 
-    let mut rng = transcript::rng_from_entropy("g16 zkey verify")?;
     let at = Instant::now();
     check_l_section(
         init.unique_section(S_C)?,
@@ -497,6 +523,7 @@ pub fn verify_from_init(
         n_public,
         domain_size,
         setup_backend: None,
+        check,
         phases: vec![("L check", l_time), ("H check", at.elapsed() - l_time)],
     })
 }
@@ -583,6 +610,24 @@ pub fn verify_from_r1cs(
     setup_msm: &dyn MsmBackend,
     check_msm: &dyn MsmBackend,
 ) -> Result<ZkeyVerifyReport, CeremonyError> {
+    verify_from_r1cs_with(r1cs, ptau, final_zkey, setup_msm, check_msm, Check::Exact)
+}
+
+/// [`verify_from_r1cs`] with sections 5 to 7 checked as `check` says.
+///
+/// [`Check::Random`] composes none of their points. Setup instead sums the Lagrange bases
+/// under the scalars each section's combination comes to ([`Prepared::run`]), on
+/// `setup_msm`, and the final key's points are decoded, checked and combined on
+/// `check_msm`. As in the exact check, setup's output is only ever compared, so a faulty
+/// `setup_msm` can only reject.
+pub fn verify_from_r1cs_with(
+    r1cs: &Path,
+    ptau: &Path,
+    final_zkey: &Path,
+    setup_msm: &dyn MsmBackend,
+    check_msm: &dyn MsmBackend,
+    check: Check,
+) -> Result<ZkeyVerifyReport, CeremonyError> {
     let setup = Prepared::open(r1cs, ptau)?;
     let file = BinFile::open(final_zkey, ZKEY_MAGIC, ZKEY_MAX_VERSION)?;
     check_protocol(&file)?;
@@ -595,12 +640,37 @@ pub fn verify_from_r1cs(
     let n_public = header.n_public as usize;
     let domain_size = header.domain_size as usize;
     let l_len = SG1 * l_points(n_vars, n_public).ok_or_else(|| fail("invalid L section size"))?;
+    // Drawn with the final key already open, so no scalar exists before the points it
+    // weighs.
     let mut rng = transcript::rng_from_entropy("g16 zkey verify")?;
+    let combine = (check == Check::Random).then(|| {
+        let r = random_scalars(&mut rng, init_header.n_vars as usize);
+        (r, sweep_seed(&mut rng))
+    });
     let mut sink = Recompute::new(&file, l_len, &mut rng, check_msm);
-    let report = setup.run(&mut sink, setup_msm)?;
-    let Recompute { identical, l, .. } = sink;
+    sink.random = combine.as_ref().map(|(r, seed)| Random {
+        r,
+        seed: *seed,
+        msm: check_msm,
+        a: None,
+        b1: None,
+        b2: None,
+        combined: None,
+    });
+    let report = setup.run(&mut sink, setup_msm, combine.as_ref().map(|(r, _)| &r[..]))?;
+    let Recompute {
+        identical,
+        l,
+        random,
+        ..
+    } = sink;
+    let mut verdicts = random.map(Random::finish).unwrap_or_default();
 
-    if mpc.cs_hash != report.cs_hash {
+    // In the random check csHash is over the final key's own sections 5 to 7, since none
+    // of setup's were composed (`Random`). Those bytes are the true composition only if
+    // their check passes, so a failed one makes the comparison meaningless; it is skipped
+    // then, and the failure is raised below in its place in the order.
+    if verdicts.iter().all(|(_, v)| v.is_ok()) && mpc.cs_hash != report.cs_hash {
         return Err(fail("circuit does not match"));
     }
     if file.unique_section(S_C)?.len() != l_len {
@@ -612,7 +682,9 @@ pub fn verify_from_r1cs(
     }
     for (id, what) in COMPARED {
         file.unique_section(id)?;
-        if !identical.contains(&(id, true)) {
+        if let Some((_, verdict)) = verdicts.iter_mut().find(|(v, _)| *v == id) {
+            std::mem::replace(verdict, Ok(()))?;
+        } else if !identical.contains(&(id, true)) {
             return Err(fail(format!("{what} section is not identical")));
         }
     }
@@ -636,6 +708,7 @@ pub fn verify_from_r1cs(
         n_public,
         domain_size,
         setup_backend: Some(setup_msm.name()),
+        check,
         phases,
     })
 }
@@ -654,6 +727,8 @@ struct Recompute<'a> {
     /// `(id, byte-identical)` for every compared section produced.
     identical: Vec<(u32, bool)>,
     l: LStream<'a>,
+    /// Sections 5 to 7 under [`Check::Random`], which setup supplies rather than produces.
+    random: Option<Random<'a>>,
 }
 
 impl<'a> Recompute<'a> {
@@ -681,6 +756,7 @@ impl<'a> Recompute<'a> {
                 rng,
                 msm,
             },
+            random: None,
         }
     }
 
@@ -747,6 +823,38 @@ impl SetupSink for Recompute<'_> {
 
     fn finish(&mut self, _: &Digest) -> Result<(), CeremonyError> {
         Ok(())
+    }
+
+    fn supply(&mut self, id: u32, hash: &(dyn Fn(Vec<u8>) + Sync)) -> Result<(), CeremonyError> {
+        let random = self.random.as_mut().ok_or_else(|| {
+            CeremonyError::BadParams(format!("section {id} supplied to an exact check"))
+        })?;
+        // A missing section is raised in order later, as the exact check raises it.
+        let body = self.file.unique_section(id).unwrap_or(&[]);
+        let (r, seed, msm) = (random.r, random.seed, random.msm);
+        match id {
+            S_A => random.a = Some(reduce(body, r, seed, msm, hash)),
+            S_B1 => random.b1 = Some(reduce(body, r, seed, msm, hash)),
+            S_B2 => random.b2 = Some(reduce(body, r, seed, msm, hash)),
+            _ => {
+                return Err(CeremonyError::BadParams(format!(
+                    "section {id} is not one the random check combines"
+                )))
+            }
+        }
+        Ok(())
+    }
+
+    fn combined(&mut self, sums: Combined) -> Result<(), CeremonyError> {
+        match &mut self.random {
+            Some(random) => {
+                random.combined = Some(sums);
+                Ok(())
+            }
+            None => Err(CeremonyError::BadParams(
+                "combined sections handed to an exact check".into(),
+            )),
+        }
     }
 }
 
@@ -823,6 +931,348 @@ impl LStream<'_> {
             }
             None => Ok(self.sums),
         }
+    }
+}
+
+/// How `zkey verify` checks sections 5 to 7, the A, B1 and B2 points. IC, Coeffs and C are
+/// checked the same way under both: IC and Coeffs byte for byte, and C composed and fed to
+/// the L check.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Check {
+    /// Byte for byte, as snarkjs checks them. In the r1cs form that composes every point,
+    /// one multiexp per signal, which is most of the command's time.
+    #[default]
+    Exact,
+    /// One random linear combination per section, held against the same combination of
+    /// what the section has to hold, after every point of it is decoded and checked. See
+    /// [`reduce`] for what that proves and with what error.
+    Random,
+}
+
+impl Check {
+    pub fn name(self) -> &'static str {
+        match self {
+            Check::Exact => "exact",
+            Check::Random => "random",
+        }
+    }
+}
+
+/// Points per pass of [`reduce`], as in setup's own sections.
+const RANDOM_CHUNK: usize = 1 << 20;
+
+/// Combinations [`sweep`] takes of a G2 section, and the bits of each of their scalars.
+const SWEEPS: usize = 10;
+const SWEEP_BITS: u32 = 13;
+
+/// Points per bucket pass of [`sweep`]. Each pass ends in a running sum over its 2^13
+/// buckets, about a tenth of the pass at this size.
+const SWEEP_TASK: usize = 1 << 18;
+
+/// A group a section of the random check is in.
+trait Section: RawCurve {
+    /// Bytes per point on disk.
+    const STRIDE: usize;
+    /// [`sweep`] combinations a section of this group needs: none in G1, whose curve has
+    /// prime order, so a point on it is in the group.
+    const SWEEPS: usize;
+    fn decode(b: &[u8]) -> Result<Affine<Self>, ContainerError>;
+    fn uncompressed(points: &[Affine<Self>]) -> Vec<u8>;
+    fn combine(
+        msm: &dyn MsmBackend,
+        bases: &[Affine<Self>],
+        scalars: &[Fr],
+    ) -> Result<Projective<Self>, AccelError>;
+}
+
+impl Section for g1::Config {
+    const STRIDE: usize = SG1;
+    const SWEEPS: usize = 0;
+    fn decode(b: &[u8]) -> Result<G1Affine, ContainerError> {
+        binfile::g1(b)
+    }
+    fn uncompressed(points: &[G1Affine]) -> Vec<u8> {
+        transcript::g1_uncompressed_all(points)
+    }
+    fn combine(
+        msm: &dyn MsmBackend,
+        bases: &[G1Affine],
+        scalars: &[Fr],
+    ) -> Result<G1Projective, AccelError> {
+        msm.try_msm_g1(bases, scalars)
+    }
+}
+
+impl Section for g2::Config {
+    const STRIDE: usize = SG2;
+    const SWEEPS: usize = SWEEPS;
+    fn decode(b: &[u8]) -> Result<G2Affine, ContainerError> {
+        binfile::g2(b)
+    }
+    fn uncompressed(points: &[G2Affine]) -> Vec<u8> {
+        transcript::g2_uncompressed_all(points)
+    }
+    fn combine(
+        msm: &dyn MsmBackend,
+        bases: &[G2Affine],
+        scalars: &[Fr],
+    ) -> Result<Projective<g2::Config>, AccelError> {
+        msm.try_msm_g2(bases, scalars)
+    }
+}
+
+/// One section of a key reduced by [`reduce`].
+struct Reduced<P: Section> {
+    /// `sum_i r_i * P_i`.
+    sum: Projective<P>,
+    /// [`sweep`]'s combinations, [`Section::SWEEPS`] of them.
+    sweeps: Vec<Projective<P>>,
+}
+
+impl<P: Section> Reduced<P> {
+    /// Every sweep in the order-r subgroup, which with high probability means every point
+    /// is. Checked per point here, on a handful of points.
+    fn in_subgroup(&self) -> bool {
+        self.sweeps.iter().all(|s| {
+            let s = s.into_affine();
+            s.is_on_curve() && s.is_in_correct_subgroup_assuming_on_curve()
+        })
+    }
+}
+
+/// Why [`reduce`] gave up on a section.
+enum Failure {
+    /// Not `r.len()` points long.
+    Size,
+    /// Point `at` failed to decode or is off the curve.
+    Point { at: usize, why: &'static str },
+    /// Not a verdict on the key: the MSM failed.
+    Other(CeremonyError),
+}
+
+impl Failure {
+    /// `whose` names the key when it is not the final one.
+    fn into_error(self, what: &str, whose: &str) -> CeremonyError {
+        match self {
+            // The exact check's message, since its byte comparison fails on the same keys.
+            Failure::Size => fail(format!("{what} section is not identical")),
+            Failure::Point { at, why } => fail(format!(
+                "{what} section does not match: point {at}{whose} {why}"
+            )),
+            Failure::Other(e) => e,
+        }
+    }
+}
+
+/// The random check's view of one point section: decode and check every point, take
+/// `sum_i r_i * P_i` on `msm`, sweep a G2 section, and hand `hash` the uncompressed
+/// encoding of each chunk in order.
+///
+/// What a pass proves, with each `r_i` uniform below 2^128 and drawn after the key is
+/// fixed:
+///
+/// * Each point decodes canonically, every coordinate below `q` and the all-zero encoding
+///   alone read as infinity, as snarkjs writes it, and lies on its curve.
+/// * G1 has prime order `r`, so a G1 point on the curve is in the group. G2's twist does
+///   not: `E'(Fq2)` has order `r * h`, `h` having 10069 as its smallest prime factor. A
+///   point with a component of order `d | h` survives a random combination with
+///   probability about `1/d`, so [`sweep`] takes [`SWEEPS`] more combinations with 13-bit
+///   scalars and the caller checks each lands in the order-r subgroup. Each one misses a
+///   nonzero component with probability at most `2^-13` (a component of order above
+///   2^13 is hit by at most one scalar below 2^13), so all ten miss it with at most
+///   `2^-130`.
+/// * With every point in a group of prime order `r > 2^128`, two sections that differ at
+///   point `k` give equal sums with probability at most `2^-128`: fixing every other
+///   scalar, at most one `r_k` below 2^128 cancels the difference.
+///
+/// So a section the random check accepts differs from the one it should hold with
+/// probability at most `2^-128 + 2^-130`, and over A, B1 and B2 under `2^-126`.
+fn reduce<P: Section>(
+    body: &[u8],
+    r: &[Fr],
+    sweep_seed: [u32; 8],
+    msm: &dyn MsmBackend,
+    mut hash: impl FnMut(Vec<u8>),
+) -> Result<Reduced<P>, Failure> {
+    if Some(body.len()) != r.len().checked_mul(P::STRIDE) {
+        return Err(Failure::Size);
+    }
+    let mut rng = CeremonyRng::from_seed_words(sweep_seed);
+    let mut out = Reduced {
+        sum: Projective::zero(),
+        sweeps: vec![Projective::zero(); P::SWEEPS],
+    };
+    for (k, (bytes, r)) in body
+        .chunks(RANDOM_CHUNK * P::STRIDE)
+        .zip(r.chunks(RANDOM_CHUNK))
+        .enumerate()
+    {
+        let points = binfile::decode_records(bytes, P::STRIDE, Affine::identity(), |i, b| {
+            let p = P::decode(b).map_err(|_| (i, "has a coordinate at or above q"))?;
+            if !p.is_on_curve() {
+                return Err((i, "is not on the curve"));
+            }
+            Ok(p)
+        })
+        .map_err(|(i, why)| Failure::Point {
+            at: k * RANDOM_CHUNK + i,
+            why,
+        })?;
+        out.sum += P::combine(msm, &points, r).map_err(|e| Failure::Other(e.into()))?;
+        sweep(&points, &mut rng, &mut out.sweeps);
+        hash(P::uncompressed(&points));
+    }
+    Ok(out)
+}
+
+/// Add `sum_i c_i * P_i` over `points` to each of `sums`, every `c_i` fresh and uniform
+/// below 2^13, by bucket: each point is one addition into the bucket of its scalar, and a
+/// running sum over the buckets weighs each by its index.
+///
+/// The arithmetic is plain additions on the curve, with no endomorphism, so the sums are
+/// the true ones even for a point outside the subgroup, which is the point of taking them.
+fn sweep<P: RawCurve>(points: &[Affine<P>], rng: &mut CeremonyRng, sums: &mut [Projective<P>]) {
+    if sums.is_empty() {
+        return;
+    }
+    let n = points.len();
+    let mask = (1u32 << SWEEP_BITS) - 1;
+    let mut scalars = vec![0u16; sums.len() * n];
+    for pair in scalars.chunks_mut(2) {
+        let w = rng.next_u32();
+        pair[0] = (w & mask) as u16;
+        if let Some(c) = pair.get_mut(1) {
+            *c = (w >> 16 & mask) as u16;
+        }
+    }
+    let jobs: Vec<(usize, usize)> = (0..sums.len())
+        .flat_map(|k| (0..n).step_by(SWEEP_TASK).map(move |from| (k, from)))
+        .collect();
+    let parts: Vec<(usize, Projective<P>)> = jobs
+        .into_par_iter()
+        .map(|(k, from)| {
+            let to = (from + SWEEP_TASK).min(n);
+            // On the heap: 2^13 G2 buckets are 2 MB, a rayon thread's whole stack.
+            #[allow(clippy::useless_vec)]
+            let mut buckets = vec![Xyzz::<P::RF>::ZERO; 1 << SWEEP_BITS];
+            for (p, &c) in points[from..to]
+                .iter()
+                .zip(&scalars[k * n + from..k * n + to])
+            {
+                if c != 0 && !p.infinity {
+                    let (x, y) = P::raw_xy(p);
+                    buckets[c as usize].madd(x, y);
+                }
+            }
+            let (mut running, mut acc) = (Xyzz::ZERO, Xyzz::ZERO);
+            for b in buckets[1..].iter().rev() {
+                running.add_assign(b);
+                acc.add_assign(&running);
+            }
+            (k, to_projective::<P>(&acc))
+        })
+        .collect();
+    for (k, s) in parts {
+        sums[k] += s;
+    }
+}
+
+/// `n` scalars of the random check, each uniform below 2^128.
+fn random_scalars(rng: &mut CeremonyRng, n: usize) -> Vec<Fr> {
+    let raw: Vec<u128> = (0..n)
+        .map(|_| u128::from(rng.next_u64()) << 64 | u128::from(rng.next_u64()))
+        .collect();
+    raw.par_iter().map(|&v| Fr::from(v)).collect()
+}
+
+/// The seed of [`sweep`]'s scalars, drawn from the check's own RNG.
+fn sweep_seed(rng: &mut CeremonyRng) -> [u32; 8] {
+    std::array::from_fn(|_| rng.next_u32())
+}
+
+/// [`Recompute`]'s state under [`Check::Random`]: sections 5 to 7 of the final key reduced
+/// as setup reaches them, and what setup says they should combine to.
+///
+/// csHash is a hash over the composed points, and none are composed here, so setup hashes
+/// the final key's own points in their place, which [`reduce`] supplies. That stands for
+/// the hash of the composition only once the random check has shown those points are the
+/// composition, which is why [`verify_from_r1cs_with`] compares it only then.
+struct Random<'a> {
+    r: &'a [Fr],
+    seed: [u32; 8],
+    msm: &'a dyn MsmBackend,
+    a: Option<Result<Reduced<g1::Config>, Failure>>,
+    b1: Option<Result<Reduced<g1::Config>, Failure>>,
+    b2: Option<Result<Reduced<g2::Config>, Failure>>,
+    combined: Option<Combined>,
+}
+
+impl Random<'_> {
+    /// The verdict on each section, by id.
+    fn finish(self) -> Vec<(u32, Result<(), CeremonyError>)> {
+        let Some(want) = self.combined else {
+            let none = |id| {
+                (
+                    id,
+                    Err(CeremonyError::BadParams("setup combined nothing".into())),
+                )
+            };
+            return vec![none(S_A), none(S_B1), none(S_B2)];
+        };
+        vec![
+            (S_A, judge(self.a, "A", want.a)),
+            (S_B1, judge(self.b1, "B1", want.b1)),
+            (S_B2, judge(self.b2, "B2", want.b2)),
+        ]
+    }
+}
+
+/// The random check's verdict on one section of the final key, given what it should sum
+/// to. `None` is a section setup never supplied.
+fn judge<P: Section>(
+    found: Option<Result<Reduced<P>, Failure>>,
+    what: &str,
+    want: Projective<P>,
+) -> Result<(), CeremonyError> {
+    let found = found
+        .ok_or_else(|| CeremonyError::BadParams(format!("setup never supplied {what}")))?
+        .map_err(|f| f.into_error(what, ""))?;
+    if !found.in_subgroup() {
+        return Err(fail(format!(
+            "{what} section does not match: a point is outside the order-r subgroup"
+        )));
+    }
+    if found.sum != want {
+        return Err(fail(format!("{what} section does not match")));
+    }
+    Ok(())
+}
+
+/// [`verify_from_init_with`]'s random check of one section: the final key's against the
+/// initial key's, under the same scalars, both decoded and checked.
+///
+/// Holding every sweep equal on both sides as well makes this an equality check on the
+/// whole curve, not only the subgroup: the sweeps' 13-bit scalars catch a difference of
+/// any order with probability at least `1 - 2^-13` each.
+fn random_against_init<P: Section>(
+    init: &[u8],
+    fin: &[u8],
+    what: &str,
+    rng: &mut CeremonyRng,
+    msm: &dyn MsmBackend,
+) -> Result<(), CeremonyError> {
+    if init.len() != fin.len() || !fin.len().is_multiple_of(P::STRIDE) {
+        return Err(fail(format!("{what} section is not identical")));
+    }
+    let r = random_scalars(rng, fin.len() / P::STRIDE);
+    let seed = sweep_seed(rng);
+    let ini = reduce::<P>(init, &r, seed, msm, drop)
+        .map_err(|f| f.into_error(what, " of the initial key"))?;
+    match reduce::<P>(fin, &r, seed, msm, drop) {
+        Ok(f) if f.in_subgroup() && f.sweeps != ini.sweeps => {
+            Err(fail(format!("{what} section does not match")))
+        }
+        f => judge(Some(f), what, ini.sum),
     }
 }
 

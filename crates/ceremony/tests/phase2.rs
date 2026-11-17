@@ -31,7 +31,7 @@ use common::{beacon_bytes, BEACON_HEX};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use snarkrs_ceremony::contribute::{self, MpcParams};
+use snarkrs_ceremony::contribute::{self, Check, MpcParams};
 use snarkrs_ceremony::vkey;
 use snarkrs_ceremony::write::g2_lem;
 use snarkrs_ceremony::{CeremonyError, CpuKeyScale, Groth16Header};
@@ -717,11 +717,12 @@ fn a_beacon_record_with_an_unbounded_exponent_is_refused_by_the_verifier() {
 type Table = [(u32, usize, usize)];
 
 /// One edit of a contributed key, and the message both forms of `zkey verify` must then
-/// reject it with.
+/// reject it with, under the exact check and under the random one.
 struct Tamper {
     what: &'static str,
     edit: fn(&mut Vec<u8>, &Table),
     expect: &'static str,
+    random: &'static str,
 }
 
 /// `(id, start, len)` of every section, in file order.
@@ -787,6 +788,7 @@ const TAMPERS: &[Tamper] = &[
         what: "IC",
         edit: |b, t| swap_last_two(b, t, 3, 64),
         expect: "IC section is not identical",
+        random: "IC section is not identical",
     },
     Tamper {
         what: "Coeffs, last record",
@@ -795,11 +797,13 @@ const TAMPERS: &[Tamper] = &[
             b[start + len - 1] ^= 1;
         },
         expect: "Coeffs section is not identical",
+        random: "Coeffs section is not identical",
     },
     Tamper {
         what: "A, last chunk",
         edit: |b, t| swap_last_two(b, t, 5, 64),
         expect: "A section is not identical",
+        random: "A section does not match",
     },
     Tamper {
         what: "B1, one bit of the last point",
@@ -808,26 +812,31 @@ const TAMPERS: &[Tamper] = &[
             b[start + len - 1] ^= 1;
         },
         expect: "B1 section is not identical",
+        random: "B1 section does not match",
     },
     Tamper {
         what: "B2, last chunk",
         edit: |b, t| swap_last_two(b, t, 7, 128),
         expect: "B2 section is not identical",
+        random: "B2 section does not match",
     },
     Tamper {
         what: "L, last chunk",
         edit: |b, t| swap_last_two(b, t, 8, 64),
         expect: "L section does not match",
+        random: "L section does not match",
     },
     Tamper {
         what: "H",
         edit: |b, t| swap_last_two(b, t, 9, 64),
         expect: "H section does not match",
+        random: "H section does not match",
     },
     Tamper {
         what: "csHash",
         edit: |b, t| b[body(t, 10).0] ^= 1,
         expect: "inconsistent transcript",
+        random: "inconsistent transcript",
     },
     Tamper {
         // `alpha_1` and `beta_1` sit at 84 and 148 of section 2. Both are curve points,
@@ -840,6 +849,7 @@ const TAMPERS: &[Tamper] = &[
             }
         },
         expect: "invalid alpha1",
+        random: "invalid alpha1",
     },
     Tamper {
         what: "A, one point longer",
@@ -848,6 +858,7 @@ const TAMPERS: &[Tamper] = &[
             resize(b, t, 5, len + 64);
         },
         expect: "A section is not identical",
+        random: "A section is not identical",
     },
     Tamper {
         what: "B2, one point shorter",
@@ -856,6 +867,7 @@ const TAMPERS: &[Tamper] = &[
             resize(b, t, 7, len - 128);
         },
         expect: "B2 section is not identical",
+        random: "B2 section is not identical",
     },
     Tamper {
         what: "L, one point shorter",
@@ -864,6 +876,7 @@ const TAMPERS: &[Tamper] = &[
             resize(b, t, 8, len - 64);
         },
         expect: "invalid L section size",
+        random: "invalid L section size",
     },
     Tamper {
         what: "H, one point longer",
@@ -872,14 +885,170 @@ const TAMPERS: &[Tamper] = &[
             resize(b, t, 9, len + 64);
         },
         expect: "invalid H section size",
+        random: "invalid H section size",
     },
 ];
+
+/// The first point of section `id` that is not the point at infinity.
+fn first_finite(bytes: &[u8], table: &Table, id: u32, stride: usize) -> usize {
+    let (start, len) = body(table, id);
+    (0..len / stride)
+        .find(|i| bytes[start + i * stride..start + (i + 1) * stride] != vec![0u8; stride][..])
+        .unwrap_or_else(|| panic!("section {id} is all infinity"))
+}
+
+/// Add `q` to the first coordinate of the first finite point of section `id`: the same
+/// field element, encoded out of range, which the exact check sees only as other bytes.
+fn non_canonical(bytes: &mut [u8], table: &Table, id: u32, stride: usize) {
+    use snarkrs_field::PrimeField;
+    let at = body(table, id).0 + first_finite(bytes, table, id, stride) * stride;
+    let q = snarkrs_field::Fq::MODULUS.0;
+    let mut carry = 0u128;
+    for (i, limb) in q.iter().enumerate() {
+        let b = &mut bytes[at + i * 8..at + i * 8 + 8];
+        let sum = u128::from(u64::from_le_bytes(b.try_into().unwrap())) + u128::from(*limb) + carry;
+        b.copy_from_slice(&(sum as u64).to_le_bytes());
+        carry = sum >> 64;
+    }
+    assert_eq!(carry, 0, "x + q does not fit 256 bits");
+}
+
+/// Flip the low bit of the first finite point's `y` (`y.c0` in G2): still below `q`, and
+/// off the curve.
+fn off_curve(bytes: &mut [u8], table: &Table, id: u32, stride: usize) {
+    let at = body(table, id).0 + first_finite(bytes, table, id, stride) * stride;
+    bytes[at + stride / 2] ^= 1;
+}
+
+/// A point of order 10069 on the G2 twist, the smallest prime factor of its cofactor
+/// `h`: a twist point of no particular order, times `r * h / 10069`.
+fn order_10069_point() -> snarkrs_field::G2Projective {
+    use snarkrs_field::{AffineRepr, Fq, Fq2, PrimeField};
+    // h / 10069, little-endian.
+    const H_OVER: [u64; 4] = [
+        0x6c3cd334915f1659,
+        0x207142f7671af448,
+        0x9e28bcf65b5681da,
+        0x0001_3af7a58fce69,
+    ];
+    for x in 1u64.. {
+        let Some(p) =
+            G2Affine::get_point_from_x_unchecked(Fq2::new(Fq::from(x), Fq::from(1u64)), false)
+        else {
+            continue;
+        };
+        let t = p.mul_bigint(snarkrs_field::Fr::MODULUS.0);
+        let t = AffineRepr::mul_bigint(&snarkrs_field::CurveGroup::into_affine(t), H_OVER);
+        if !snarkrs_field::Zero::is_zero(&t) {
+            let t = snarkrs_field::CurveGroup::into_affine(t);
+            assert!(t.is_on_curve() && !t.is_in_correct_subgroup_assuming_on_curve());
+            assert!(snarkrs_field::Zero::is_zero(&t.mul_bigint([10069u64])));
+            return t.into_group();
+        }
+    }
+    unreachable!()
+}
+
+/// Add a point of order 10069 to the first finite B2 point. The result is on the curve,
+/// canonically encoded and outside the order-r subgroup, which only a subgroup check
+/// rejects for certain.
+fn small_subgroup_b2(bytes: &mut [u8], table: &Table) {
+    let at = body(table, 7).0 + first_finite(bytes, table, 7, 128) * 128;
+    let p = snarkrs_formats::binfile::g2(&bytes[at..at + 128]).unwrap();
+    let moved = snarkrs_field::CurveGroup::into_affine(p + order_10069_point());
+    bytes[at..at + 128].copy_from_slice(&g2_lem(&moved));
+}
+
+/// Edits only the random check has its own reason to reject, in a point that is otherwise
+/// the right one: the exact check sees different bytes.
+const RANDOM_TAMPERS: &[Tamper] = &[
+    Tamper {
+        what: "A, x + q",
+        edit: |b, t| non_canonical(b, t, 5, 64),
+        expect: "A section is not identical",
+        random: "has a coordinate at or above q",
+    },
+    Tamper {
+        what: "B1, x + q",
+        edit: |b, t| non_canonical(b, t, 6, 64),
+        expect: "B1 section is not identical",
+        random: "has a coordinate at or above q",
+    },
+    Tamper {
+        what: "B2, x.c0 + q",
+        edit: |b, t| non_canonical(b, t, 7, 128),
+        expect: "B2 section is not identical",
+        random: "has a coordinate at or above q",
+    },
+    Tamper {
+        what: "A, off the curve",
+        edit: |b, t| off_curve(b, t, 5, 64),
+        expect: "A section is not identical",
+        random: "A section does not match: point",
+    },
+    Tamper {
+        what: "B1, off the curve",
+        edit: |b, t| off_curve(b, t, 6, 64),
+        expect: "B1 section is not identical",
+        random: "B1 section does not match: point",
+    },
+    Tamper {
+        what: "B2, off the curve",
+        edit: |b, t| off_curve(b, t, 7, 128),
+        expect: "B2 section is not identical",
+        random: "B2 section does not match: point",
+    },
+    Tamper {
+        what: "B2, plus a point of order 10069",
+        edit: |b, t| small_subgroup_b2(b, t),
+        expect: "B2 section is not identical",
+        random: "B2 section does not match: a point is outside the order-r subgroup",
+    },
+];
+
+/// Every form and check of `zkey verify` on one key: `(init exact, r1cs exact, init random,
+/// r1cs random)`.
+type Verdicts = [Result<contribute::ZkeyVerifyReport, CeremonyError>; 4];
+
+fn verify_all(r1cs: &Path, ptau: &Path, init: &Path, key: &Path) -> Verdicts {
+    let msm = CpuMsm::new();
+    [
+        contribute::verify_from_init_with(init, ptau, key, &msm, Check::Exact),
+        contribute::verify_from_r1cs_with(r1cs, ptau, key, &msm, &msm, Check::Exact),
+        contribute::verify_from_init_with(init, ptau, key, &msm, Check::Random),
+        contribute::verify_from_r1cs_with(r1cs, ptau, key, &msm, &msm, Check::Random),
+    ]
+}
+
+/// Both forms reject `what` with the same message under each check, containing `expect`
+/// under the exact one and `random` under the random one.
+#[track_caller]
+fn assert_rejected(verdicts: Verdicts, what: &str, expect: &str, random: &str) {
+    let [init, r1cs, init_random, r1cs_random] = verdicts.map(|v| v.err().map(|e| e.to_string()));
+    for (form, err, want) in [
+        ("init", &init, expect),
+        ("r1cs", &r1cs, expect),
+        ("init --check random", &init_random, random),
+        ("r1cs --check random", &r1cs_random, random),
+    ] {
+        let err = err
+            .as_ref()
+            .unwrap_or_else(|| panic!("{what}: the {form} form accepted it"));
+        assert!(err.contains(want), "{what}: {form}: {err}");
+    }
+    assert_eq!(r1cs, init, "{what}");
+    assert_eq!(r1cs_random, init_random, "{what}");
+}
 
 /// `zkey verify r1cs` compares setup's output as it is produced instead of through an init
 /// key on disk, so every rejection has to come out as `zkey verify init` against that init
 /// key words it, which also pins the order the checks run in. anon-aadhaar has 1.1 million
 /// signals, so its A, B1, B2 and C sections span two of setup's chunks and the edits
 /// marked "last chunk" land in the second.
+///
+/// The random check has to reject every one of them too, and the edits only it has a
+/// reason of its own to reject: an out-of-range coordinate, a point off the curve, and a
+/// B2 point with a component of small order.
 #[test]
 fn the_r1cs_form_rejects_what_the_init_form_rejects() {
     let bench = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench");
@@ -896,59 +1065,61 @@ fn the_r1cs_form_rejects_what_the_init_form_rejects() {
         let good = dir.join("good.zkey");
         snarkrs_ceremony::setup::setup(&r1cs, &ptau, &init, &msm).unwrap();
         contribute::contribute(&init, &good, None, "r1cs form", &CpuKeyScale).unwrap();
-        let report = contribute::verify_from_r1cs(&r1cs, &ptau, &good, &msm, &msm)
-            .expect("the untouched key verifies");
-        assert_eq!(report.contribution_hashes.len(), 1);
+        for (verdict, check) in verify_all(&r1cs, &ptau, &init, &good).into_iter().zip([
+            Check::Exact,
+            Check::Exact,
+            Check::Random,
+            Check::Random,
+        ]) {
+            let report = verdict.expect("the untouched key verifies");
+            assert_eq!(report.contribution_hashes.len(), 1);
+            assert_eq!(report.check, check);
+        }
+        let report = contribute::verify_from_r1cs(&r1cs, &ptau, &good, &msm, &msm).unwrap();
         assert_eq!(report.setup_backend, Some("cpu"));
+        assert_eq!(report.check, Check::Exact);
 
         let table = section_table(&good);
         let pristine = std::fs::read(&good).unwrap();
         let bad = dir.join("bad.zkey");
-        for t in TAMPERS {
+        for t in TAMPERS.iter().chain(RANDOM_TAMPERS) {
             let mut bytes = pristine.clone();
             (t.edit)(&mut bytes, &table);
             std::fs::write(&bad, &bytes).unwrap();
-            let from_init = contribute::verify_from_init(&init, &ptau, &bad, &msm)
-                .expect_err(&format!("{circuit}: the init form accepted {}", t.what));
-            let from_r1cs = contribute::verify_from_r1cs(&r1cs, &ptau, &bad, &msm, &msm)
-                .expect_err(&format!("{circuit}: the r1cs form accepted {}", t.what));
-            assert_eq!(
-                from_r1cs.to_string(),
-                from_init.to_string(),
-                "{circuit}: {}",
-                t.what
-            );
-            assert!(
-                from_r1cs.to_string().contains(t.expect),
-                "{circuit}: {}: {from_r1cs}",
-                t.what
+            assert_rejected(
+                verify_all(&r1cs, &ptau, &init, &bad),
+                &format!("{circuit}: {}", t.what),
+                t.expect,
+                t.random,
             );
         }
 
         // The first chunk, and the last point of the first chunk, which only a section of
         // more than 2^20 points has.
-        for (id, stride, expect) in [
-            (5, 64, "A section is not identical"),
-            (8, 64, "L section does not match"),
+        for (id, stride, expect, random) in [
+            (
+                5,
+                64,
+                "A section is not identical",
+                "A section does not match",
+            ),
+            (
+                8,
+                64,
+                "L section does not match",
+                "L section does not match",
+            ),
         ] {
             let points = body(&table, id).1 / stride;
             for at in [0, (1 << 20) - 1].into_iter().filter(|&at| at + 1 < points) {
                 let mut bytes = pristine.clone();
                 swap_from(&mut bytes, &table, id, stride, at);
                 std::fs::write(&bad, &bytes).unwrap();
-                let what = format!("section {id}, point {at}");
-                let from_init = contribute::verify_from_init(&init, &ptau, &bad, &msm)
-                    .expect_err(&format!("{circuit}: the init form accepted {what}"));
-                let from_r1cs = contribute::verify_from_r1cs(&r1cs, &ptau, &bad, &msm, &msm)
-                    .expect_err(&format!("{circuit}: the r1cs form accepted {what}"));
-                assert_eq!(
-                    from_r1cs.to_string(),
-                    from_init.to_string(),
-                    "{circuit}: {what}"
-                );
-                assert!(
-                    from_r1cs.to_string().contains(expect),
-                    "{circuit}: {what}: {from_r1cs}"
+                assert_rejected(
+                    verify_all(&r1cs, &ptau, &init, &bad),
+                    &format!("{circuit}: section {id}, point {at}"),
+                    expect,
+                    random,
                 );
             }
         }

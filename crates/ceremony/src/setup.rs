@@ -35,8 +35,8 @@ use ark_ec::short_weierstrass::{Affine, Projective};
 use rayon::prelude::*;
 use snarkrs_field::raw::RawField;
 use snarkrs_field::{
-    AffineRepr, CurveGroup, FftField, Fq, Fr, G1Affine, G1Projective, G2Affine, One, PrimeField,
-    Zero,
+    AffineRepr, CurveGroup, FftField, Fq, Fr, G1Affine, G1Projective, G2Affine, G2Projective, One,
+    PrimeField, Zero,
 };
 use snarkrs_formats::binfile;
 use snarkrs_msm::glv::{self, GlvField};
@@ -175,7 +175,7 @@ pub fn setup(
     crate::write::staged(out_path, |stage| {
         let setup = Prepared::open(r1cs_path, ptau_path)?;
         let mut file = FileSink::create(stage)?;
-        setup.run(&mut file, msm)
+        setup.run(&mut file, msm, None)
     })
 }
 
@@ -233,10 +233,16 @@ impl Prepared {
     }
 
     /// Produce every section into `sink`, in write order.
+    ///
+    /// With `combine`, one scalar per signal, sections 5 to 7 are not composed at all:
+    /// [`SetupSink::combined`] gets what each would sum to under those scalars, from the
+    /// Lagrange bases ([`combine_sections`]), and [`SetupSink::supply`] the points csHash
+    /// hashes in their place.
     pub(crate) fn run<S: SetupSink>(
         &self,
         sink: &mut S,
         msm: &dyn MsmBackend,
+        combine: Option<&[Fr]>,
     ) -> Result<SetupReport, CeremonyError> {
         let Self { ptau, r1cs, header } = self;
         let n_vars = r1cs.header().n_vars as usize;
@@ -266,8 +272,9 @@ impl Prepared {
                 let n = coef_count(counts.n_coefs)?;
                 sink.start(S_COEFFS)?;
                 sink.bytes(&n.to_le_bytes())?;
-                let acc =
-                    counts.fill(r1cs, |batch| sink.bytes(&encode_coefficients(r1cs, batch)?))?;
+                let acc = counts.fill(r1cs, combine.is_none(), |batch| {
+                    sink.bytes(&encode_coefficients(r1cs, batch)?)
+                })?;
                 sink.end()?;
                 Ok(acc)
             },
@@ -297,31 +304,57 @@ impl Prepared {
         hash_h_points_into(ptau, domain_size, |b| cs.send(b))?;
         phases.lap("H hash");
 
-        for (id, slots, name) in [
-            (S_C, acc.c(), "C"),
-            (S_A, acc.a.all(), "A"),
-            (S_B1, acc.b.all(), "B1"),
-        ] {
-            point_section(
-                sink,
-                &cs,
-                id,
-                slots.len(),
-                |r| compose_points_g1(slots.sub(r), &bases, r1cs, msm),
-                emit_g1,
-            )?;
-            phases.lap(name);
-        }
-        let b2 = acc.b.all();
+        let c = acc.c();
         point_section(
             sink,
             &cs,
-            S_B2,
-            b2.len(),
-            |r| compose_points_g2(b2.sub(r), &bases, r1cs, msm),
-            emit_g2,
+            S_C,
+            c.len(),
+            |r| compose_points_g1(c.sub(r), &bases, r1cs, msm),
+            emit_g1,
         )?;
-        phases.lap("B2");
+        phases.lap("C");
+
+        if let Some(scalars) = combine {
+            // csHash still covers sections 5 to 7, hashed as the sink supplies them, each
+            // after its slot count as `point_section` would send it.
+            let (sums, supplied) = rayon::join(
+                || combine_sections(r1cs, &bases, scalars, n_public, msm),
+                || -> Result<(), CeremonyError> {
+                    // One slot per signal, as `Accumulators` would hold them.
+                    for id in [S_A, S_B1, S_B2] {
+                        cs.send((n_vars as u32).to_be_bytes().to_vec());
+                        sink.supply(id, &|bytes| cs.send(bytes))?;
+                    }
+                    Ok(())
+                },
+            );
+            supplied?;
+            sink.combined(sums?)?;
+            phases.lap("A, B1, B2 combined");
+        } else {
+            for (id, slots, name) in [(S_A, acc.a.all(), "A"), (S_B1, acc.b.all(), "B1")] {
+                point_section(
+                    sink,
+                    &cs,
+                    id,
+                    slots.len(),
+                    |r| compose_points_g1(slots.sub(r), &bases, r1cs, msm),
+                    emit_g1,
+                )?;
+                phases.lap(name);
+            }
+            let b2 = acc.b.all();
+            point_section(
+                sink,
+                &cs,
+                S_B2,
+                b2.len(),
+                |r| compose_points_g2(b2.sub(r), &bases, r1cs, msm),
+                emit_g2,
+            )?;
+            phases.lap("B2");
+        }
 
         let cs_hash = cs.finish().finalize();
         phases.lap("csHash");
@@ -382,6 +415,28 @@ pub(crate) trait SetupSink: Send {
     fn end(&mut self) -> Result<(), CeremonyError>;
     /// Section 10, once the hash is known.
     fn finish(&mut self, cs_hash: &Digest) -> Result<(), CeremonyError>;
+    /// Section `id`, one of 5 to 7, when [`Prepared::run`] combines them rather than
+    /// composing them: the sink checks the points it has for it, and sends their
+    /// uncompressed encoding to `hash`, in order, for csHash.
+    fn supply(&mut self, id: u32, _hash: &(dyn Fn(Vec<u8>) + Sync)) -> Result<(), CeremonyError> {
+        Err(CeremonyError::BadParams(format!(
+            "this sink has no points to supply for section {id}"
+        )))
+    }
+    /// What sections 5 to 7 combine to under the scalars [`Prepared::run`] was given.
+    fn combined(&mut self, _sums: Combined) -> Result<(), CeremonyError> {
+        Err(CeremonyError::BadParams(
+            "this sink takes no combined sections".into(),
+        ))
+    }
+}
+
+/// `sum_i r_i * P_i` over each of sections 5 to 7, for scalars `r`, one per signal.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Combined {
+    pub a: G1Projective,
+    pub b1: G1Projective,
+    pub b2: G2Projective,
 }
 
 /// The sink `groth16 setup` writes through.
@@ -746,7 +801,7 @@ pub struct CoefRecord {
 /// `zkey_new.js:222-300` uses: A terms, then B terms, then C terms per constraint, then
 /// the public-signal tail.
 pub fn process_constraints(r1cs: &R1cs, domain_size: usize) -> Result<Accumulators, CeremonyError> {
-    TermCounts::walk(r1cs, domain_size)?.fill(r1cs, |_| Ok(()))
+    TermCounts::walk(r1cs, domain_size)?.fill(r1cs, true, |_| Ok(()))
 }
 
 /// The first of [`process_constraints`]' two walks: how many terms each slot will hold.
@@ -838,9 +893,13 @@ impl TermCounts {
     /// The second walk: place every term, and hand section 4's records to `records` in push
     /// order, at most [`COEF_BATCH`] at a time. The first error `records` returns is the
     /// one this returns, once the walk is done.
+    ///
+    /// Without `ab` the A and B lists come back empty, for a run that combines sections 5
+    /// to 7 rather than composing them: on a 2^25 circuit they are a gigabyte.
     fn fill(
         self,
         r1cs: &R1cs,
+        ab: bool,
         mut records: impl FnMut(&[CoefRecord]) -> Result<(), CeremonyError>,
     ) -> Result<Accumulators, CeremonyError> {
         let Self {
@@ -851,6 +910,9 @@ impl TermCounts {
             n_public,
             n_constraints,
         } = self;
+        if !ab {
+            (a_at, b_at) = (vec![0], vec![0]);
+        }
         let mut a = vec![PointTerm::EMPTY; counts_to_starts(&mut a_at)];
         let mut b = vec![PointTerm::EMPTY; counts_to_starts(&mut b_at)];
         let mut ic_c = vec![PointTerm::EMPTY; counts_to_starts(&mut ic_c_at)];
@@ -872,7 +934,9 @@ impl TermCounts {
             let coef_ptr = Some(term.coef_ptr);
             match matrix {
                 Matrix::A => {
-                    put(&mut a, &mut a_at, s, BaseTag::TauG1, constraint, coef_ptr);
+                    if ab {
+                        put(&mut a, &mut a_at, s, BaseTag::TauG1, constraint, coef_ptr);
+                    }
                     put(
                         &mut ic_c,
                         &mut ic_c_at,
@@ -883,7 +947,9 @@ impl TermCounts {
                     );
                 }
                 Matrix::B => {
-                    put(&mut b, &mut b_at, s, BaseTag::TauG1, constraint, coef_ptr);
+                    if ab {
+                        put(&mut b, &mut b_at, s, BaseTag::TauG1, constraint, coef_ptr);
+                    }
                     put(
                         &mut ic_c,
                         &mut ic_c_at,
@@ -922,7 +988,9 @@ impl TermCounts {
         // nonzero for every public signal (`zkey_new.js:290-300`).
         for s in 0..=n_public {
             let index = (n_constraints + s) as u32;
-            put(&mut a, &mut a_at, s, BaseTag::TauG1, index, None);
+            if ab {
+                put(&mut a, &mut a_at, s, BaseTag::TauG1, index, None);
+            }
             put(&mut ic_c, &mut ic_c_at, s, BaseTag::BetaTauG1, index, None);
             batch.push(CoefRecord {
                 matrix: Matrix::A.as_u32(),
@@ -1109,6 +1177,120 @@ pub fn compose_points_g2(
         |term| coefficient(r1cs, term.coef_ptr()),
         |b, s| msm.try_msm_g2(b, s),
     )
+}
+
+/// Bases per MSM in [`combine_sections`]: 2^21 decoded G2 points is 285 MB.
+const COMBINE_CHUNK: usize = 1 << 21;
+
+/// Constraints per rayon task in [`lagrange_scalars`].
+const SCALAR_BLOCK: usize = 1 << 14;
+
+/// What sections 5 to 7 sum to under `r`, one scalar per signal, without composing a point
+/// of them.
+///
+/// Signal `i`'s A point is `sum_t coef_t * L_{j_t}(tau) * G1` over its A terms `t`, each in
+/// constraint `j_t`, plus `L_{nConstraints + i}(tau) * G1` for a public signal. Regrouped
+/// by constraint, `sum_i r_i * A_i` is `sum_j s_j * L_j(tau) * G1`, where `s_j` sums
+/// `r_i * coef` over the A terms of row `j` ([`lagrange_scalars`]). So one MSM over the
+/// Lagrange bases stands in for one composition per signal. B1 and B2 share B's terms and
+/// so one `s`, over the G1 and the G2 bases.
+fn combine_sections(
+    r1cs: &R1cs,
+    bases: &LagrangeBlocks,
+    r: &[Fr],
+    n_public: usize,
+    msm: &dyn MsmBackend,
+) -> Result<Combined, CeremonyError> {
+    let (a, b) = lagrange_scalars(r1cs, r, n_public)?;
+    let mut sums = Combined::default();
+    let mut from = 0;
+    while from < a.len() {
+        let to = (from + COMBINE_CHUNK).min(a.len());
+        let g1 = binfile::decode_records(
+            block_range(bases.tau_g1, SG1, from..to)?,
+            SG1,
+            G1Affine::identity(),
+            |_, b| binfile::g1(b),
+        )?;
+        sums.a += msm.try_msm_g1(&g1, &a[from..to])?;
+        sums.b1 += msm.try_msm_g1(&g1, &b[from..to])?;
+        drop(g1);
+        let g2 = binfile::decode_records(
+            block_range(bases.tau_g2, SG2, from..to)?,
+            SG2,
+            G2Affine::identity(),
+            |_, b| binfile::g2(b),
+        )?;
+        sums.b2 += msm.try_msm_g2(&g2, &b[from..to])?;
+        from = to;
+    }
+    Ok(sums)
+}
+
+/// `s_j` for A and for B, `j` up to the last public signal's synthetic row: each term
+/// adds `r_i * coef` to its row, and the row of public signal `s` gets `r_s` for its
+/// synthetic `a = 1`. The rows split across tasks, so no two tasks touch one `s_j`.
+fn lagrange_scalars(
+    r1cs: &R1cs,
+    r: &[Fr],
+    n_public: usize,
+) -> Result<(Vec<Fr>, Vec<Fr>), CeremonyError> {
+    let n_constraints = r1cs.header().n_constraints as usize;
+    if r.len() != r1cs.header().n_vars as usize {
+        return Err(CeremonyError::BadParams(format!(
+            "{} scalars for {} signals",
+            r.len(),
+            r1cs.header().n_vars
+        )));
+    }
+    let rows = n_constraints + n_public + 1;
+    let mut a = vec![Fr::zero(); rows];
+    let mut b = vec![Fr::zero(); rows];
+    let starts = r1cs.constraint_starts(SCALAR_BLOCK)?;
+    a[..n_constraints]
+        .par_chunks_mut(SCALAR_BLOCK)
+        .zip(b[..n_constraints].par_chunks_mut(SCALAR_BLOCK))
+        .zip(starts.par_iter())
+        .enumerate()
+        .try_for_each(|(k, ((a, b), &pos))| {
+            let first = k * SCALAR_BLOCK;
+            let mut failed = None;
+            r1cs.walk_range(
+                pos,
+                first as u32..(first + a.len()) as u32,
+                |matrix, c, term| {
+                    let row = c as usize - first;
+                    let s = match matrix {
+                        Matrix::A => &mut a[row],
+                        Matrix::B => &mut b[row],
+                        Matrix::C => return,
+                    };
+                    match coefficient(r1cs, Some(term.coef_ptr)) {
+                        Ok(v) => *s += r[term.signal as usize] * v,
+                        Err(e) => {
+                            failed.get_or_insert(e);
+                        }
+                    }
+                },
+            )?;
+            failed.map_or(Ok(()), Err)
+        })?;
+    for (s, r) in a[n_constraints..].iter_mut().zip(r) {
+        *s += r;
+    }
+    Ok((a, b))
+}
+
+/// Elements `range` of a Lagrange block.
+fn block_range(block: &[u8], stride: usize, range: Range<usize>) -> Result<&[u8], CeremonyError> {
+    block
+        .get(range.start * stride..range.end * stride)
+        .ok_or_else(|| {
+            CeremonyError::BadParams(format!(
+                "Lagrange elements {range:?} are past the {}-point block",
+                block.len() / stride
+            ))
+        })
 }
 
 /// Terms per rayon task in [`compose`], counting a slot that goes to the multiexp as

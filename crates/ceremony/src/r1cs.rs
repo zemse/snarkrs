@@ -208,32 +208,44 @@ impl R1cs {
     /// the order the bytes are laid out: A, B then C within each constraint, constraints
     /// ascending. Every view below is built on this, so there is one bounds check to get
     /// right rather than four.
-    pub(crate) fn walk<F>(&self, mut f: F) -> Result<(), CeremonyError>
+    pub(crate) fn walk<F>(&self, f: F) -> Result<(), CeremonyError>
+    where
+        F: FnMut(Matrix, u32, Term),
+    {
+        let body = self.constraint_bytes()?;
+        let pos = self.walk_range(0, 0..self.header.n_constraints, f)?;
+        if pos != body.len() {
+            return Err(CeremonyError::malformed(
+                S_CONSTRAINTS,
+                format!(
+                    "{} constraints end at byte {pos} of {}",
+                    self.header.n_constraints,
+                    body.len()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// [`R1cs::walk`] over the constraints `range` only, the first of which starts at byte
+    /// `pos` of section 2. Returns the byte after the last. With
+    /// [`R1cs::constraint_starts`] this splits one walk into many that run side by side.
+    pub(crate) fn walk_range<F>(
+        &self,
+        mut pos: usize,
+        range: std::ops::Range<u32>,
+        mut f: F,
+    ) -> Result<usize, CeremonyError>
     where
         F: FnMut(Matrix, u32, Term),
     {
         let body = self.constraint_bytes()?;
         let n_vars = self.header.n_vars;
-        let mut pos = 0usize;
-        for c in 0..self.header.n_constraints {
+        for c in range {
             for matrix in [Matrix::A, Matrix::B, Matrix::C] {
                 let n_terms = read_u32(body, pos, c)? as usize;
                 pos += 4;
-                // One check for the whole linear combination: `n_terms` is attacker
-                // controlled and `n_terms * TERM_BYTES` is what would wrap.
-                let end = n_terms
-                    .checked_mul(TERM_BYTES)
-                    .and_then(|span| pos.checked_add(span))
-                    .filter(|end| *end <= body.len())
-                    .ok_or_else(|| {
-                        CeremonyError::malformed(
-                            S_CONSTRAINTS,
-                            format!(
-                                "constraint {c} {matrix:?} declares {n_terms} terms, past the end \
-                                 of the section"
-                            ),
-                        )
-                    })?;
+                let end = lc_end(body, pos, n_terms, c, matrix)?;
                 while pos < end {
                     let signal = read_u32(body, pos, c)?;
                     if signal >= n_vars {
@@ -250,17 +262,26 @@ impl R1cs {
                 }
             }
         }
-        if pos != body.len() {
-            return Err(CeremonyError::malformed(
-                S_CONSTRAINTS,
-                format!(
-                    "{} constraints end at byte {pos} of {}",
-                    self.header.n_constraints,
-                    body.len()
-                ),
-            ));
+        Ok(pos)
+    }
+
+    /// The byte of section 2 at which constraint `k * every` starts, for every such
+    /// constraint. Reads only the term counts, so it costs a sliver of a [`R1cs::walk`].
+    pub(crate) fn constraint_starts(&self, every: usize) -> Result<Vec<usize>, CeremonyError> {
+        let body = self.constraint_bytes()?;
+        let n = self.header.n_constraints as usize;
+        let mut starts = Vec::with_capacity(n.div_ceil(every.max(1)));
+        let mut pos = 0usize;
+        for c in 0..self.header.n_constraints {
+            if (c as usize).is_multiple_of(every.max(1)) {
+                starts.push(pos);
+            }
+            for matrix in [Matrix::A, Matrix::B, Matrix::C] {
+                let n_terms = read_u32(body, pos, c)? as usize;
+                pos = lc_end(body, pos + 4, n_terms, c, matrix)?;
+            }
         }
-        Ok(())
+        Ok(starts)
     }
 
     /// Walk section 2 once. The result is `n_constraints` entries in file order; setup
@@ -419,6 +440,31 @@ impl SignalIndex {
     pub fn total_terms(&self) -> usize {
         self.terms.len()
     }
+}
+
+/// The byte after a linear combination of `n_terms` terms starting at `pos`. One check for
+/// the whole of it: `n_terms` is attacker controlled and `n_terms * TERM_BYTES` is what
+/// would wrap.
+fn lc_end(
+    body: &[u8],
+    pos: usize,
+    n_terms: usize,
+    c: u32,
+    matrix: Matrix,
+) -> Result<usize, CeremonyError> {
+    n_terms
+        .checked_mul(TERM_BYTES)
+        .and_then(|span| pos.checked_add(span))
+        .filter(|end| *end <= body.len())
+        .ok_or_else(|| {
+            CeremonyError::malformed(
+                S_CONSTRAINTS,
+                format!(
+                    "constraint {c} {matrix:?} declares {n_terms} terms, past the end of the \
+                     section"
+                ),
+            )
+        })
 }
 
 fn read_u32(body: &[u8], pos: usize, constraint: u32) -> Result<u32, CeremonyError> {
