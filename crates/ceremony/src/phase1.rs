@@ -238,9 +238,9 @@ impl PtauGroup for Affine<g2::Config> {
 /// detail with no framing implication, since BLAKE2b is a stream.
 ///
 /// Uses the `blake2` crate rather than [`Transcript`]: nothing here snapshots a partial
-/// hash, so the only thing that matters is the digest, and at power 28 this absorbs 34 GB
-/// of repeated generator that our hand-driven compression loop has no reason to be slow
-/// over.
+/// hash, so the only thing that matters is the digest, and at power 28 this absorbs
+/// `384 * 2^28` bytes, about 103 GB, of repeated generator that our hand-driven
+/// compression loop has no reason to be slow over.
 pub fn first_challenge_hash(power: u32) -> Digest {
     let mut h = Blake2b512::new();
     h.update(crate::transcript::blake2b512(b""));
@@ -753,17 +753,17 @@ struct Predecessor {
 }
 
 impl Predecessor {
-    /// `initialContribution`. Note it seeds from `ceremonyPower`, not `power`: a truncated
-    /// file's chain was built over the full ceremony
-    /// (`powersoftau_verify.js:146`).
-    fn initial(ceremony_power: u32) -> Self {
+    /// `initialContribution`. `first_challenge` is the first challenge hash of
+    /// `ceremonyPower`, not of `power`: a truncated file's chain was built over the full
+    /// ceremony (`powersoftau_verify.js:146`).
+    fn initial(first_challenge: Digest) -> Self {
         Self {
             tau_g1: G1Affine::generator(),
             tau_g2: G2Affine::generator(),
             alpha_g1: G1Affine::generator(),
             beta_g1: G1Affine::generator(),
             beta_g2: G2Affine::generator(),
-            next_challenge: first_challenge_hash(ceremony_power),
+            next_challenge: first_challenge,
         }
     }
 
@@ -1023,7 +1023,10 @@ fn verify_lagrange<C: PtauGroup>(
 pub fn verify(ptau: &Path) -> Result<PtauVerifyReport, CeremonyError> {
     let file = Ptau::open(ptau)?;
     let header = *file.header();
-    let contributions = file.contributions()?;
+    // Record 0's parse and its predecessor both need this, and at power 28 it is minutes
+    // of BLAKE2b, so it is taken once.
+    let first_challenge = first_challenge_hash(header.ceremony_power);
+    let contributions = file.contributions_from(&first_challenge)?;
     if contributions.is_empty() {
         return Err(failed(
             "this file has no contribution, it cannot be used in production",
@@ -1035,7 +1038,7 @@ pub fn verify(ptau: &Path) -> Result<PtauVerifyReport, CeremonyError> {
     let last = contributions.len() - 1;
 
     let predecessor = |i: usize| match i {
-        0 => Predecessor::initial(header.ceremony_power),
+        0 => Predecessor::initial(first_challenge),
         _ => Predecessor::of(&contributions[i - 1]),
     };
 

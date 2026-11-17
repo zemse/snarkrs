@@ -529,6 +529,26 @@ impl Ptau {
     /// on the `{p, size}` object, so the check never fires
     /// (`powersoftau_utils.js:228`).
     pub fn contributions(&self) -> Result<Vec<PtauContribution>, CeremonyError> {
+        // `ceremonyPower`, not `power`. This is the one first-challenge hash snarkjs takes
+        // at the ceremony's size (`powersoftau_verify.js:146`); its five other call sites
+        // pass `power` and are all on paths that reject a truncated file first. Record 0
+        // was made against the full-size accumulator, so seeding from `power` derives its
+        // `g2_sp` off the wrong challenge on any file where the two differ: on
+        // `ppot_0080_15.ptau` that breaks `e(g1_s, g2_spx) == e(g1_sx, g2_sp)` for record 0
+        // and no other, since every later record is seeded from the stored
+        // `next_challenge`.
+        self.contributions_from(&crate::phase1::first_challenge_hash(
+            self.header.ceremony_power,
+        ))
+    }
+
+    /// [`Ptau::contributions`] with record 0's predecessor challenge supplied, for a
+    /// caller that needs `first_challenge_hash(ceremony_power)` itself and should not
+    /// absorb its `384 * 2^ceremony_power` bytes twice.
+    pub fn contributions_from(
+        &self,
+        first_challenge: &Digest,
+    ) -> Result<Vec<PtauContribution>, CeremonyError> {
         let section = match self.section(S_CONTRIBUTIONS) {
             Ok(data) => data,
             Err(CeremonyError::MissingSection(_)) => return Ok(Vec::new()),
@@ -538,15 +558,7 @@ impl Ptau {
         let n = read_u32(&mut data)? as usize;
         // A lying count would otherwise reserve 2^32 records before the first read.
         let mut out = Vec::with_capacity(n.min(data.len() / CONTRIBUTION_PREFIX_BYTES));
-        // `ceremonyPower`, not `power`. This is the one first-challenge hash snarkjs takes
-        // at the ceremony's size (`powersoftau_verify.js:146`); its five other call sites
-        // pass `power` and are all on paths that reject a truncated file first. Record 0
-        // was made against the full-size accumulator, so seeding from `power` derives its
-        // `g2_sp` off the wrong challenge on any file where the two differ: on
-        // `ppot_0080_15.ptau` that breaks `e(g1_s, g2_spx) == e(g1_sx, g2_sp)` for record 0
-        // and no other, since every later record is seeded from the stored
-        // `next_challenge`.
-        let mut prev = crate::phase1::first_challenge_hash(self.header.ceremony_power);
+        let mut prev = *first_challenge;
         for _ in 0..n {
             let c = PtauContribution::read(&mut data, &prev)?;
             prev = c.next_challenge;
