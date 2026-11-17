@@ -456,7 +456,7 @@ pub fn verify_from_init(
     let n_public = header.n_public as usize;
     let domain_size = header.domain_size as usize;
     let l_bytes = file.unique_section(S_C)?;
-    if l_bytes.len() != SG1 * (n_vars - n_public - 1) {
+    if l_points(n_vars, n_public).map(|n| SG1 * n) != Some(l_bytes.len()) {
         return Err(fail("invalid L section size"));
     }
     let h_bytes = file.unique_section(S_H)?;
@@ -594,7 +594,7 @@ pub fn verify_from_r1cs(
     let n_vars = header.n_vars as usize;
     let n_public = header.n_public as usize;
     let domain_size = header.domain_size as usize;
-    let l_len = SG1 * (n_vars - n_public - 1);
+    let l_len = SG1 * l_points(n_vars, n_public).ok_or_else(|| fail("invalid L section size"))?;
     let mut rng = transcript::rng_from_entropy("g16 zkey verify")?;
     let mut sink = Recompute::new(&file, l_len, &mut rng, check_msm);
     let report = setup.run(&mut sink, setup_msm)?;
@@ -817,9 +817,18 @@ impl LStream<'_> {
     fn finish(self) -> Result<RatioSums, CeremonyError> {
         match self.failed {
             Some(e) => Err(e),
+            // Setup has to have produced every point of the final key's section 8.
+            None if self.body.is_some_and(|body| self.at != body.len()) => {
+                Err(fail("L section does not match"))
+            }
             None => Ok(self.sums),
         }
     }
+}
+
+/// The private signals past ONE, which is the length of section 8 in points.
+fn l_points(n_vars: usize, n_public: usize) -> Option<usize> {
+    n_vars.checked_sub(n_public)?.checked_sub(1)
 }
 
 fn fail(what: impl Into<String>) -> CeremonyError {

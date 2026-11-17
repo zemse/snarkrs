@@ -738,6 +738,19 @@ fn body(table: &Table, id: u32) -> (usize, usize) {
     (start, len)
 }
 
+/// Swap point `at` of section `id` with the first later point that differs from it.
+fn swap_from(bytes: &mut [u8], table: &Table, id: u32, stride: usize, at: usize) {
+    let (start, len) = body(table, id);
+    let a = start + at * stride;
+    let b = (a + stride..start + len)
+        .step_by(stride)
+        .find(|&b| bytes[a..a + stride] != bytes[b..b + stride])
+        .unwrap_or_else(|| panic!("section {id} has no point after {at} that differs from it"));
+    for i in 0..stride {
+        bytes.swap(a + i, b + i);
+    }
+}
+
 /// Swap the last two points of section `id`, which in a section of more than 2^20 points
 /// is inside the last chunk setup produces.
 fn swap_last_two(bytes: &mut [u8], table: &Table, id: u32, stride: usize) {
@@ -910,6 +923,34 @@ fn the_r1cs_form_rejects_what_the_init_form_rejects() {
                 "{circuit}: {}: {from_r1cs}",
                 t.what
             );
+        }
+
+        // The first chunk, and the last point of the first chunk, which only a section of
+        // more than 2^20 points has.
+        for (id, stride, expect) in [
+            (5, 64, "A section is not identical"),
+            (8, 64, "L section does not match"),
+        ] {
+            let points = body(&table, id).1 / stride;
+            for at in [0, (1 << 20) - 1].into_iter().filter(|&at| at + 1 < points) {
+                let mut bytes = pristine.clone();
+                swap_from(&mut bytes, &table, id, stride, at);
+                std::fs::write(&bad, &bytes).unwrap();
+                let what = format!("section {id}, point {at}");
+                let from_init = contribute::verify_from_init(&init, &ptau, &bad, &msm)
+                    .expect_err(&format!("{circuit}: the init form accepted {what}"));
+                let from_r1cs = contribute::verify_from_r1cs(&r1cs, &ptau, &bad, &msm, &msm)
+                    .expect_err(&format!("{circuit}: the r1cs form accepted {what}"));
+                assert_eq!(
+                    from_r1cs.to_string(),
+                    from_init.to_string(),
+                    "{circuit}: {what}"
+                );
+                assert!(
+                    from_r1cs.to_string().contains(expect),
+                    "{circuit}: {what}: {from_r1cs}"
+                );
+            }
         }
 
         // The same shape and one coefficient different. Section 4 differs too, and
