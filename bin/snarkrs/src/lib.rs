@@ -266,7 +266,10 @@ pub fn ceremony_backend_kind(kind: BackendKind, seam: CeremonySeam) -> Result<Ba
     match kind {
         BackendKind::Cpu => Ok(kind),
         BackendKind::Wgpu => Err(no_wgpu()),
-        BackendKind::Cuda if matches!(seam, CeremonySeam::GroupFft) && cfg!(feature = "cuda") => {
+        BackendKind::Cuda
+            if matches!(seam, CeremonySeam::Msm | CeremonySeam::GroupFft)
+                && cfg!(feature = "cuda") =>
+        {
             Ok(kind)
         }
         BackendKind::Cuda => Err(no_cuda()),
@@ -294,7 +297,7 @@ pub fn msm_backend(kind: BackendKind) -> Result<Box<dyn MsmBackend>> {
         BackendKind::Cpu => Ok(Box::new(CpuMsm::new())),
         BackendKind::Wgpu => Err(no_wgpu()),
         BackendKind::Metal => metal_msm(),
-        BackendKind::Cuda => Err(no_cuda()),
+        BackendKind::Cuda => cuda_msm(),
     }
 }
 
@@ -356,6 +359,13 @@ fn metal_key() -> Result<Box<dyn KeyScale>> {
 }
 
 #[cfg(feature = "cuda")]
+fn cuda_msm() -> Result<Box<dyn MsmBackend>> {
+    Ok(Box::new(
+        snarkrs_cuda::CudaMsmBackend::new().map_err(|e| unavailable(BackendKind::Cuda, e))?,
+    ))
+}
+
+#[cfg(feature = "cuda")]
 fn cuda_fft() -> Result<Box<dyn GroupFft>> {
     Ok(Box::new(
         snarkrs_cuda::CudaGroupFft::new().map_err(|e| unavailable(BackendKind::Cuda, e))?,
@@ -363,20 +373,26 @@ fn cuda_fft() -> Result<Box<dyn GroupFft>> {
 }
 
 #[cfg(not(feature = "cuda"))]
+fn cuda_msm() -> Result<Box<dyn MsmBackend>> {
+    Err(no_cuda())
+}
+
+#[cfg(not(feature = "cuda"))]
 fn cuda_fft() -> Result<Box<dyn GroupFft>> {
     Err(no_cuda())
 }
 
-/// CUDA has kernels for the prover and for `ptau prepare`'s group FFT, and none for the
-/// two ceremony seams this message now covers. Saying "not built in" when the feature
-/// *is* on would send someone to rebuild a binary that already has everything it is
-/// going to get.
+/// CUDA has kernels for the prover, `setup`'s MSM and `ptau prepare`'s group FFT, and none
+/// for the apply-key, the one ceremony seam this message now covers. Saying "not built in"
+/// when the feature *is* on would send someone to rebuild a binary that already has
+/// everything it is going to get.
 fn no_cuda() -> anyhow::Error {
     if cfg!(feature = "cuda") {
         AccelError::Unimplemented {
             backend: "cuda",
-            reason: "snarkrs-cuda implements the prover and the `ptau prepare` group FFT; \
-                     the ceremony MSM and apply-key have no CUDA kernels yet",
+            reason: "snarkrs-cuda implements the prover, the `setup` MSM and the \
+                     `ptau prepare` group FFT; the contribute and beacon apply-key has no \
+                     CUDA kernel yet",
         }
         .into()
     } else {
@@ -588,35 +604,37 @@ mod tests {
     }
 
     #[test]
-    fn cuda_rejects_ceremony_msm_and_key_scaling() {
-        for e in [
-            backend_error(msm_backend(BackendKind::Cuda)),
-            backend_error(key_backend(BackendKind::Cuda)),
-        ] {
-            assert!(e.contains("backend `cuda` is unavailable"), "{e}");
-            if cfg!(feature = "cuda") {
-                assert!(e.contains("MSM and apply-key"), "{e}");
-                assert!(e.contains("no CUDA kernels"), "{e}");
-                assert!(!e.contains("WITHOUT"), "{e}");
-            } else {
-                assert!(e.contains("WITHOUT the `cuda` feature"), "{e}");
-                assert!(e.contains("--features cuda"), "{e}");
-            }
+    fn cuda_rejects_ceremony_key_scaling() {
+        let e = backend_error(key_backend(BackendKind::Cuda));
+        assert!(e.contains("backend `cuda` is unavailable"), "{e}");
+        if cfg!(feature = "cuda") {
+            assert!(e.contains("apply-key has no CUDA kernel"), "{e}");
+            assert!(!e.contains("WITHOUT"), "{e}");
+        } else {
+            assert!(e.contains("WITHOUT the `cuda` feature"), "{e}");
+            assert!(e.contains("--features cuda"), "{e}");
         }
     }
 
     #[test]
-    fn cuda_group_fft_selection_respects_the_feature() {
+    fn cuda_msm_and_group_fft_selection_respects_the_feature() {
         if cfg!(feature = "cuda") {
             // Selection only: this test must not load a CUDA driver.
-            assert!(matches!(
-                ceremony_backend_kind(BackendKind::Cuda, CeremonySeam::GroupFft),
-                Ok(BackendKind::Cuda)
-            ));
+            for seam in [CeremonySeam::Msm, CeremonySeam::GroupFft] {
+                assert!(matches!(
+                    ceremony_backend_kind(BackendKind::Cuda, seam),
+                    Ok(BackendKind::Cuda)
+                ));
+            }
+            assert!(ceremony_backend_kind(BackendKind::Cuda, CeremonySeam::KeyScale).is_err());
         } else {
-            let e = backend_error(fft_backend(BackendKind::Cuda));
-            assert!(e.contains("WITHOUT the `cuda` feature"), "{e}");
-            assert!(e.contains("--features cuda"), "{e}");
+            for e in [
+                backend_error(msm_backend(BackendKind::Cuda)),
+                backend_error(fft_backend(BackendKind::Cuda)),
+            ] {
+                assert!(e.contains("WITHOUT the `cuda` feature"), "{e}");
+                assert!(e.contains("--features cuda"), "{e}");
+            }
         }
     }
 

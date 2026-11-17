@@ -149,9 +149,9 @@ warning when the CUDA device does not open. A backend named on the command line 
 the one that runs.
 
 The short aliases work too (`ptn`, `ptc`, `pt2`, `g16s`, `zkc`, `zkev`, `g16p`, `g16v`, ...),
-and the ceremony commands generally take `--backend cpu|metal`. CUDA supports only the
-`ptau prepare` group FFT, not ceremony MSM or key scaling; WGPU supports none of those
-three ceremony seams. The output is what snarkjs expects, so the two are interchangeable
+and the ceremony commands generally take `--backend cpu|metal`. CUDA supports the
+`ptau prepare` group FFT and the MSM behind `groth16 setup` and `zkey verify r1cs`, not key
+scaling; WGPU supports none of those three ceremony seams. The output is what snarkjs expects, so the two are interchangeable
 in either direction:
 
 ```sh

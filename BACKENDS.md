@@ -45,7 +45,7 @@ witness-dependent work constant-time. CUDA constant work is opt-in via
 
 | ceremony seam | CPU | Metal | CUDA | WGPU |
 | --- | --- | --- | --- | --- |
-| MSM (`setup`) | supported | supported | unsupported | unsupported |
+| MSM (`setup`, `zkey verify r1cs`) | supported | supported | supported | unsupported |
 | group FFT (`ptau prepare`) | supported | supported | supported | unsupported |
 | key scaling (contribute/beacon) | supported | supported | unsupported | unsupported |
 
@@ -105,6 +105,7 @@ documentation change. Commands and detailed F evidence live in
 | EXECUTED, main `d506763` | domain `2^22` same-instance large proof gate, variable work: CPU, Metal, WGPU Floor/Auto | 4/4 jobs passed, each `1/1` on `large/js_384x384_d32`, totaling 4 large cases; both verifiers and reference public signals accepted, no fallback. Large constant work and domains above `2^22` remain unexecuted. |
 | EXECUTED, CUDA `c50353c`, merged on `b759c4c` | Tesla T4, driver 595.91.07, NVRTC 12.8.93; variable and constant proving | 5 mandatory device tests passed; CPU H/all-five-MSM/pinned-proof comparisons for tiny_mul and sha256 passed. 4 no-fallback CLI proofs accepted by snarkjs with reference public signals. 20 serial warm reps verified. Other NVIDIA devices and large CUDA proofs untested. |
 | CURRENT, historical only | CUDA ceremony group FFT | source support and historical benchmarks, not a fresh ceremony run. |
+| COMPILE only | CUDA ceremony MSM (`groth16 setup`, `zkey verify r1cs`) | cross-built for Linux x86-64; its device tests and the setup and verify end to end in `cuda-gate-guest.sh` have not run on a T4. |
 | BLOCKED | phones, Safari and other browser/device combinations | not currently validated by the desktop smoke or shader compilation. |
 
 Each corrected F case covered `tiny_mul` (domain 8) or SHA-256 (domain 65536): CPU H and

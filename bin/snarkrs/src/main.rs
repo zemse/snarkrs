@@ -43,8 +43,9 @@
 //! `cli.rs` turns that line into one clap parses, and has the table. Our own options sit on
 //! top as `--` flags: `groth16 prove` and `fullprove` take `--backend auto|cpu|wgpu|metal|cuda`,
 //! `--stage-timings`, `--self-verify true|false`, `--vkey vkey.json`, `--fallback`,
-//! `--constant-work` and `--threads N`, the ceremony commands take `--backend cpu|metal`,
-//! and `zkey verify` takes `--check exact|random` (or `--check-exact`, `--check-random`).
+//! `--constant-work` and `--threads N`, the ceremony commands take `--backend cpu|metal`
+//! (and `cuda` for `groth16 setup`, `zkey verify r1cs` and `ptau prepare`), and
+//! `zkey verify` takes `--check exact|random` (or `--check-exact`, `--check-random`).
 //!
 //! Exit codes are snarkjs': 0 for success, 1 for a failure or a proof or file that does not
 //! verify, 99 for a line that names no command or gives it the wrong parameters. Results
@@ -63,8 +64,9 @@
 //! Their `--backend` is not `prove`'s. `prove` selects a whole `snarkrs_groth16::Backend`; a
 //! ceremony command selects one primitive, and the eight that have the flag are the eight
 //! with a primitive worth moving. The bar every one of them is held to is that
-//! `--backend cpu` and `--backend metal` write **byte-identical** files, which is what
-//! carries the snarkjs equivalence the CPU path already has.
+//! `--backend cpu`, `--backend metal` and, where it is accepted, `--backend cuda` write
+//! **byte-identical** files, which is what carries the snarkjs equivalence the CPU path
+//! already has.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -183,8 +185,8 @@ struct Entropy {
     entropy: Option<String>,
 }
 
-/// cpu or metal. Both must write byte-identical output; that equivalence is what carries
-/// the snarkjs one.
+/// cpu or metal, and cuda for `groth16 setup`, `zkey verify r1cs` and `ptau prepare`. Every
+/// one must write byte-identical output; that equivalence is what carries the snarkjs one.
 #[derive(clap::Args)]
 struct CeremonyBackend {
     #[arg(long, value_enum, default_value_t = BackendKind::Cpu)]
@@ -1883,7 +1885,7 @@ mod tests {
                 let unavailable = match kind {
                     BackendKind::Wgpu => true,
                     BackendKind::Cuda => {
-                        !cfg!(feature = "cuda") || !matches!(seam, CeremonySeam::GroupFft)
+                        !cfg!(feature = "cuda") || matches!(seam, CeremonySeam::KeyScale)
                     }
                     BackendKind::Metal => !cfg!(all(feature = "metal", target_os = "macos")),
                     BackendKind::Cpu => false,
