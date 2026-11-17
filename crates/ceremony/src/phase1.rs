@@ -783,6 +783,24 @@ fn failed(what: impl Into<String>) -> CeremonyError {
     CeremonyError::Verification(what.into())
 }
 
+/// The RNG a beacon record's own parameters seed (`powersoftau_verify.js:31`): its
+/// `2^numIterationsExp` rounds of SHA-256 are the whole cost of checking a beacon, and
+/// they need nothing from the rest of the chain.
+fn beacon_rng(index: usize, cur: &PtauContribution) -> Result<CeremonyRng, CeremonyError> {
+    let named = |what: &str| format!("{what} in contribution #{index}");
+    let exp = cur
+        .params
+        .num_iterations_exp
+        .ok_or_else(|| failed(named("beacon record has no numIterationsExp")))?;
+    let hash = cur
+        .params
+        .beacon_hash
+        .as_deref()
+        .ok_or_else(|| failed(named("beacon record has no beaconHash")))?;
+    let iterations = check_beacon(hash, exp)?;
+    Ok(rng_from_beacon_params(hash, iterations))
+}
+
 /// `verifyContribution` (`powersoftau_verify.js:29-127`): a beacon's key has to be the one
 /// its own parameters produce, every key has to satisfy its own same-ratio pair, and each
 /// of the five stored points has to be the predecessor's scaled by the committed exponent.
@@ -790,25 +808,19 @@ fn failed(what: impl Into<String>) -> CeremonyError {
 /// `g2_sp` is recomputed here rather than taken from the record, because it is not stored:
 /// it is `getG2sp(personalization, prevChallenge, g1_s, g1_sx)`, which is the only thing
 /// binding a contribution to its predecessor's challenge (`:73-75`).
+///
+/// `beacon` is [`beacon_rng`] of a beacon record when the caller already ran it, and is
+/// run here when it did not.
 fn verify_contribution(
     index: usize,
     cur: &PtauContribution,
     prev: &Predecessor,
+    beacon: Option<Result<CeremonyRng, CeremonyError>>,
 ) -> Result<(), CeremonyError> {
     let named = |what: &str| format!("{what} in contribution #{index}");
 
     if cur.kind == ContributionKind::Beacon {
-        let exp = cur
-            .params
-            .num_iterations_exp
-            .ok_or_else(|| failed(named("beacon record has no numIterationsExp")))?;
-        let hash = cur
-            .params
-            .beacon_hash
-            .as_deref()
-            .ok_or_else(|| failed(named("beacon record has no beaconHash")))?;
-        let iterations = check_beacon(hash, exp)?;
-        let mut rng = rng_from_beacon_params(hash, iterations);
+        let mut rng = beacon.unwrap_or_else(|| beacon_rng(index, cur))?;
         let expected = crate::transcript::create_ptau_key(&mut rng, &prev.next_challenge);
         for (name, got, want) in [
             ("tau", cur.pubkeys.tau, expected.tau.pubkey),
@@ -1017,46 +1029,106 @@ fn verify_lagrange<C: PtauGroup>(
 /// against the recomputed `g2_sp`, check the stored generators at the head of each
 /// section, and recompute the final next-challenge hash.
 ///
-/// The order is snarkjs': the last contribution first, because everything else in the file
-/// is checked against it, then the powers, then the earlier records
+/// Three long serial jobs run side by side: the first challenge hash, about 103 GB of
+/// BLAKE2b at `ceremonyPower` 28; each beacon's `2^numIterationsExp` rounds of SHA-256,
+/// 2^31 of them on the PPoT beacon; and the section checks on this thread. Every one is
+/// joined before any verdict, and a failure is reported in snarkjs' order: the last
+/// contribution first, because everything else in the file is checked against it, then
+/// the powers, then the earlier records, then the Lagrange sections
 /// (`powersoftau_verify.js:129-285`).
 pub fn verify(ptau: &Path) -> Result<PtauVerifyReport, CeremonyError> {
     let file = Ptau::open(ptau)?;
     let header = *file.header();
-    // Record 0's parse and its predecessor both need this, and at power 28 it is minutes
-    // of BLAKE2b, so it is taken once.
-    let first_challenge = first_challenge_hash(header.ceremony_power);
-    let contributions = file.contributions_from(&first_challenge)?;
+    // The first challenge reaches the parse only through record 0's `g2_sp`, which
+    // `verify_contribution` recomputes from the challenge it checks against and never
+    // reads off the record. Parsing against a placeholder lets the real one be hashed
+    // beside the checks rather than in front of them.
+    let contributions = file.contributions_from(&[0u8; 64])?;
     if contributions.is_empty() {
         return Err(failed(
             "this file has no contribution, it cannot be used in production",
         ));
     }
-    let n = 1usize << header.power;
-    let msm = CpuMsm::new();
-    let ntt = CpuNtt::new();
     let last = contributions.len() - 1;
+    let cur = &contributions[last];
+    let mut rng = rng_from_entropy("g16 ptau verify")?;
+
+    let (first_challenge, mut beacons, sections, lagrange) = std::thread::scope(|s| {
+        let first = s.spawn(|| first_challenge_hash(header.ceremony_power));
+        let beacons: Vec<_> = contributions
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                (c.kind == ContributionKind::Beacon).then(|| s.spawn(move || beacon_rng(i + 1, c)))
+            })
+            .collect();
+
+        let sections = verify_sections(&file, header, cur, &mut rng);
+        // Its seed comes off the same RNG after the section scalars, as in snarkjs. A
+        // section failure is reported ahead of it whatever it finds, so it is not run
+        // behind one.
+        let lagrange = sections
+            .is_ok()
+            .then(|| verify_prepared(&file, header.power, &mut rng));
+
+        let first = first.join().expect("first challenge worker panicked");
+        let beacons: Vec<_> = beacons
+            .into_iter()
+            .map(|h| h.map(|h| h.join().expect("beacon worker panicked")))
+            .collect();
+        (first, beacons, sections, lagrange)
+    });
 
     let predecessor = |i: usize| match i {
         0 => Predecessor::initial(first_challenge),
         _ => Predecessor::of(&contributions[i - 1]),
     };
 
-    verify_contribution(last + 1, &contributions[last], &predecessor(last))?;
+    verify_contribution(last + 1, cur, &predecessor(last), beacons[last].take())?;
+    let next_challenge_checked = sections?;
+    for i in (0..last).rev() {
+        verify_contribution(i + 1, &contributions[i], &predecessor(i), beacons[i].take())?;
+    }
+    let prepared = lagrange.expect("the Lagrange check runs whenever the sections pass")?;
+
+    let contribution_hashes = contributions
+        .iter()
+        .map(|c| c.response_hash())
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(PtauVerifyReport {
+        power: header.power,
+        ceremony_power: header.ceremony_power,
+        prepared,
+        contribution_hashes,
+        next_challenge_checked,
+    })
+}
+
+/// The point sections against the last contribution `cur`: each section's powers, the
+/// generators at its head, and the next-challenge hash over all of them
+/// (`powersoftau_verify.js:167-252`). Returns whether that hash was compared, which a
+/// truncated file skips.
+fn verify_sections(
+    file: &Ptau,
+    header: PtauHeader,
+    cur: &PtauContribution,
+    rng: &mut CeremonyRng,
+) -> Result<bool, CeremonyError> {
+    let n = 1usize << header.power;
+    let msm = CpuMsm::new();
 
     // The next-challenge hash is rebuilt from the file's own bytes, seeded with the last
     // contribution's reconstructed response hash.
-    let cur = &contributions[last];
     let mut hasher = Transcript::new();
     hasher.update(&cur.response_hash()?);
-    let mut rng = rng_from_entropy("g16 ptau verify")?;
 
     let tau1 = verify_powers::<G1Affine>(
-        &file,
+        file,
         ptau::S_TAU_G1,
         n * 2 - 1,
         &[0, 1],
-        &mut rng,
+        rng,
         &mut hasher,
         &msm,
     )?;
@@ -1079,15 +1151,7 @@ pub fn verify(ptau: &Path) -> Result<PtauVerifyReport, CeremonyError> {
         ));
     }
 
-    let tau2 = verify_powers::<G2Affine>(
-        &file,
-        ptau::S_TAU_G2,
-        n,
-        &[0, 1],
-        &mut rng,
-        &mut hasher,
-        &msm,
-    )?;
+    let tau2 = verify_powers::<G2Affine>(file, ptau::S_TAU_G2, n, &[0, 1], rng, &mut hasher, &msm)?;
     if !same_ratio(
         &G1Affine::generator(),
         &cur.tau_g1,
@@ -1111,7 +1175,7 @@ pub fn verify(ptau: &Path) -> Result<PtauVerifyReport, CeremonyError> {
         (ptau::S_ALPHA_TAU_G1, cur.alpha_g1, "alpha*tau*G1"),
         (ptau::S_BETA_TAU_G1, cur.beta_g1, "beta*tau*G1"),
     ] {
-        let r = verify_powers::<G1Affine>(&file, id, n, &[0], &mut rng, &mut hasher, &msm)?;
+        let r = verify_powers::<G1Affine>(file, id, n, &[0], rng, &mut hasher, &msm)?;
         if !same_ratio(
             &r.r1.into_affine(),
             &r.r2.into_affine(),
@@ -1144,13 +1208,16 @@ pub fn verify(ptau: &Path) -> Result<PtauVerifyReport, CeremonyError> {
             "hash of the values does not match the next challenge of the last contributor",
         ));
     }
+    Ok(next_challenge_checked)
+}
 
-    for i in (0..last).rev() {
-        verify_contribution(i + 1, &contributions[i], &predecessor(i))?;
-    }
-
+/// The Lagrange sections of a prepared file, or nothing on one that is not. Returns
+/// whether the file is prepared (`powersoftau_verify.js:268-283`).
+fn verify_prepared(file: &Ptau, power: u32, rng: &mut CeremonyRng) -> Result<bool, CeremonyError> {
     let prepared = file.is_prepared();
     if prepared {
+        let msm = CpuMsm::new();
+        let ntt = CpuNtt::new();
         // One seed for all four sections and every power, the way snarkjs draws it once
         // outside the loop (`powersoftau_verify.js:404-407`).
         let mut seed = [0u32; 8];
@@ -1158,55 +1225,43 @@ pub fn verify(ptau: &Path) -> Result<PtauVerifyReport, CeremonyError> {
             *w = rng.next_u32();
         }
         verify_lagrange::<G1Affine>(
-            &file,
+            file,
             ptau::S_TAU_G1,
             ptau::S_LAGRANGE_TAU_G1,
-            header.power,
+            power,
             seed,
             &msm,
             &ntt,
         )?;
         verify_lagrange::<G2Affine>(
-            &file,
+            file,
             ptau::S_TAU_G2,
             ptau::S_LAGRANGE_TAU_G2,
-            header.power,
+            power,
             seed,
             &msm,
             &ntt,
         )?;
         verify_lagrange::<G1Affine>(
-            &file,
+            file,
             ptau::S_ALPHA_TAU_G1,
             ptau::S_LAGRANGE_ALPHA_TAU_G1,
-            header.power,
+            power,
             seed,
             &msm,
             &ntt,
         )?;
         verify_lagrange::<G1Affine>(
-            &file,
+            file,
             ptau::S_BETA_TAU_G1,
             ptau::S_LAGRANGE_BETA_TAU_G1,
-            header.power,
+            power,
             seed,
             &msm,
             &ntt,
         )?;
     }
-
-    let contribution_hashes = contributions
-        .iter()
-        .map(|c| c.response_hash())
-        .collect::<Result<Vec<_>, _>>()?;
-
-    Ok(PtauVerifyReport {
-        power: header.power,
-        ceremony_power: header.ceremony_power,
-        prepared,
-        contribution_hashes,
-        next_challenge_checked,
-    })
+    Ok(prepared)
 }
 
 /// The two bounds snarkjs enforces on a beacon before it opens a file

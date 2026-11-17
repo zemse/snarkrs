@@ -619,6 +619,110 @@ fn verify_catches_a_rewritten_contribution_record() {
     );
 }
 
+/// Where an [`a_chain`] file's two records start. Everything before section 7 is fixed by
+/// power 8, and a record is a 1504-byte prefix ending in `paramLength`, then the params.
+fn records(data: &[u8]) -> [usize; 2] {
+    let n = 256usize;
+    let s7 = 12
+        + (12 + 44)
+        + (12 + (2 * n - 1) * 64)
+        + (12 + n * 128)
+        + 2 * (12 + n * 64)
+        + (12 + 128)
+        + 12;
+    assert_eq!(u32::from_le_bytes(data[s7..s7 + 4].try_into().unwrap()), 2);
+    let first = s7 + 4;
+    let params = u32::from_le_bytes(data[first + 1500..first + 1504].try_into().unwrap());
+    [first, first + 1504 + params as usize]
+}
+
+/// The pubkey follows the record's five points; its first two G1 are tau's `g1_s` and
+/// `g1_sx`, then alpha's.
+const PUBKEY_AT: usize = 3 * 64 + 2 * 128;
+
+/// One byte of the beacon hash changed: every point and every same-ratio pair in the file
+/// is still consistent, so only re-running the beacon's own SHA-256 chain notices.
+#[test]
+fn verify_catches_an_altered_beacon_parameter() {
+    let dir = tmp_dir("verify-beacon");
+    let chain = a_chain(&dir);
+    let data = std::fs::read(&chain).unwrap();
+    let [_, beacon] = records(&data);
+    let hash = beacon_bytes();
+    let at = beacon
+        + 1504
+        + data[beacon + 1504..]
+            .windows(hash.len())
+            .position(|w| w == hash)
+            .expect("beacon hash not in the record's params");
+    let broken = tampered(&chain, &dir.join("beacon.ptau"), at, &[hash[0] ^ 1]);
+    let err = phase1::verify(&broken).unwrap_err();
+    assert!(
+        matches!(&err, CeremonyError::Verification(m) if m.contains("BEACON key") && m.contains("#2")),
+        "expected a beacon key failure on record 2, got {err}"
+    );
+}
+
+/// The first record's tau `g1_s` swapped for its alpha `g1_s`, a valid point that breaks
+/// the key's own same-ratio pair. The record is not the last, so this is caught in the
+/// walk back over the earlier records.
+#[test]
+fn verify_catches_a_corrupted_contribution_key() {
+    let dir = tmp_dir("verify-key");
+    let chain = a_chain(&dir);
+    let data = std::fs::read(&chain).unwrap();
+    let [first, _] = records(&data);
+    let alpha_g1_s = &data[first + PUBKEY_AT + 128..first + PUBKEY_AT + 192];
+    let broken = tampered(&chain, &dir.join("key.ptau"), first + PUBKEY_AT, alpha_g1_s);
+    let err = phase1::verify(&broken).unwrap_err();
+    assert!(
+        matches!(&err, CeremonyError::Verification(m) if m == "INVALID key (tau) in contribution #1"),
+        "expected an invalid tau key on record 1, got {err}"
+    );
+}
+
+/// The checks run side by side, but a file that fails several of them reports the one
+/// snarkjs would reach first: the last record, then the powers, then the earlier records.
+#[test]
+fn verify_reports_the_failure_snarkjs_reaches_first() {
+    let dir = tmp_dir("verify-order");
+    let chain = a_chain(&dir);
+    let data = std::fs::read(&chain).unwrap();
+    let [first, beacon] = records(&data);
+
+    let key = tampered(
+        &chain,
+        &dir.join("key.ptau"),
+        first + PUBKEY_AT,
+        &data[first + PUBKEY_AT + 128..first + PUBKEY_AT + 192],
+    );
+    let point = tampered(
+        &key,
+        &dir.join("point.ptau"),
+        12 + 12 + 44 + 12 + 5 * 64,
+        &[0u8; 64],
+    );
+    let err = phase1::verify(&point).unwrap_err();
+    assert!(
+        matches!(&err, CeremonyError::Verification(m) if m.contains("tauG1")),
+        "expected the tauG1 powers failure ahead of record 1's key, got {err}"
+    );
+
+    let hash = beacon_bytes();
+    let at = beacon
+        + 1504
+        + data[beacon + 1504..]
+            .windows(hash.len())
+            .position(|w| w == hash)
+            .unwrap();
+    let all = tampered(&point, &dir.join("all.ptau"), at, &[hash[0] ^ 1]);
+    let err = phase1::verify(&all).unwrap_err();
+    assert!(
+        matches!(&err, CeremonyError::Verification(m) if m.contains("BEACON key")),
+        "expected the beacon failure ahead of the powers, got {err}"
+    );
+}
+
 /// A prepared file adds four Lagrange sections, and the check that they belong to this
 /// accumulator moves the transform onto the scalars: `<raw, r>` against
 /// `<lagrange, fft(r)>`. `bench/ptau/local_13.ptau` is snarkjs' own

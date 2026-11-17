@@ -227,6 +227,63 @@ fn a_ceremony_and_a_proof_run_on_snarkjs_lines() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// `ptv` on a contribute-then-beacon chain with one thing broken: a byte of the beacon
+/// hash, a point in the tau*G1 section, or the first record's tau key. Each is exit 1 and
+/// an error line, and the untouched chain is exit 0. snarkjs, when it is here, agrees.
+#[test]
+fn ptv_exits_1_on_a_tampered_chain() {
+    let dir = scratch("ptv-tampered");
+    let run = |line: &str| {
+        let o = snarkrs(&dir, line);
+        expect(&o, 0, line);
+    };
+    run("ptn bn128 8 pot_0000.ptau");
+    run("ptc pot_0000.ptau pot_0001.ptau -e=one -n=First");
+    let beacon = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
+    run(&format!("ptb pot_0001.ptau pot_beacon.ptau {beacon} 10"));
+    run("ptv pot_beacon.ptau");
+
+    // Power 8 fixes everything before section 7; a record is a 1504-byte prefix ending in
+    // `paramLength`, and its pubkey starts after its three G1 and two G2 points.
+    let data = std::fs::read(dir.join("pot_beacon.ptau")).unwrap();
+    let n = 256usize;
+    let s7 = 12 + (12 + 44) + (12 + (2 * n - 1) * 64) + (12 + n * 128) + 2 * (12 + n * 64);
+    let s7 = s7 + (12 + 128) + 12;
+    let first = s7 + 4;
+    let params = u32::from_le_bytes(data[first + 1500..first + 1504].try_into().unwrap());
+    let second = first + 1504 + params as usize;
+    let hash: Vec<u8> = (1..=32).collect();
+    let in_params = data[second + 1504..]
+        .windows(32)
+        .position(|w| w == hash.as_slice())
+        .expect("beacon hash not in the beacon record");
+    let pubkey = first + 3 * 64 + 2 * 128;
+    let cases: [(&str, usize, Vec<u8>); 3] = [
+        ("beacon.ptau", second + 1504 + in_params, vec![0xff]),
+        ("point.ptau", 12 + 12 + 44 + 12 + 5 * 64, vec![0u8; 64]),
+        (
+            "key.ptau",
+            pubkey,
+            data[pubkey + 128..pubkey + 192].to_vec(),
+        ),
+    ];
+    let js = snarkjs_bin();
+    for (name, at, bytes) in cases {
+        let mut broken = data.clone();
+        broken[at..at + bytes.len()].copy_from_slice(&bytes);
+        std::fs::write(dir.join(name), broken).unwrap();
+        let line = format!("ptv {name}");
+        let o = snarkrs(&dir, &line);
+        expect(&o, 1, &line);
+        assert!(stderr(&o).starts_with("error: "), "{}", said(&o));
+        if let Some(js) = &js {
+            let (code, out) = snarkjs(js, &dir, &line);
+            assert_eq!(code, 1, "snarkjs {line}: {out}");
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// snarkjs 0.7.6, named by `SNARKJS` because the one on PATH may be another version.
 fn snarkjs_bin() -> Option<String> {
     let bin = std::env::var("SNARKJS").unwrap_or_else(|_| "snarkjs".to_owned());
