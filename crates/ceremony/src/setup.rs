@@ -26,6 +26,8 @@
 //! [`hash_h_points`].
 
 use std::path::Path;
+use std::sync::mpsc::{sync_channel, SyncSender};
+use std::thread::JoinHandle;
 
 use ark_ec::short_weierstrass::{Affine, Projective};
 use rayon::prelude::*;
@@ -218,7 +220,6 @@ fn setup_inner(
         delta_g2: G2Affine::generator(),
     };
 
-    let mut cs = Transcript::new();
     let mut w = BinFileWriter::create(out_path, ZKEY_MAGIC, ZKEY_VERSION, ZKEY_SECTIONS)?;
 
     w.start_section(S_PROTOCOL)?;
@@ -230,12 +231,14 @@ fn setup_inner(
     w.end_section()?;
     // The six header points, uncompressed, in write order (`zkey_new.js:104,110,116,
     // :130-132`). The scalars beside them on disk are never hashed.
-    cs.update_g1(&header.alpha_g1);
-    cs.update_g1(&header.beta_g1);
-    cs.update_g2(&header.beta_g2);
-    cs.update_g2(&header.gamma_g2);
-    cs.update_g1(&header.delta_g1);
-    cs.update_g2(&header.delta_g2);
+    let mut header_hash = Transcript::new();
+    header_hash.update_g1(&header.alpha_g1);
+    header_hash.update_g1(&header.beta_g1);
+    header_hash.update_g2(&header.beta_g2);
+    header_hash.update_g2(&header.gamma_g2);
+    header_hash.update_g1(&header.delta_g1);
+    header_hash.update_g2(&header.delta_g2);
+    let cs = CsHash::spawn(header_hash)?;
 
     let acc = process_constraints(&r1cs, domain_size)?;
     let n_coefs = acc.coefs.len();
@@ -243,20 +246,20 @@ fn setup_inner(
 
     let bases = LagrangeBlocks::read(&ptau, domain_size)?;
 
-    write_points_g1(&mut w, &mut cs, S_IC, &acc.ic, &bases, &r1cs, msm)?;
+    write_points_g1(&mut w, &cs, S_IC, &acc.ic, &bases, &r1cs, msm)?;
 
     w.start_section(S_H)?;
     w.write_g1_slice(&write_hs(&ptau, domain_size)?)?;
     w.end_section()?;
 
-    hash_h_points(&ptau, domain_size, &mut cs)?;
+    hash_h_points_into(&ptau, domain_size, |b| cs.send(Absorb::Bytes(b)))?;
 
-    write_points_g1(&mut w, &mut cs, S_C, &acc.c, &bases, &r1cs, msm)?;
-    write_points_g1(&mut w, &mut cs, S_A, &acc.a, &bases, &r1cs, msm)?;
-    write_points_g1(&mut w, &mut cs, S_B1, &acc.b1, &bases, &r1cs, msm)?;
-    write_points_g2(&mut w, &mut cs, S_B2, &acc.b2, &bases, &r1cs, msm)?;
+    write_points_g1(&mut w, &cs, S_C, &acc.c, &bases, &r1cs, msm)?;
+    write_points_g1(&mut w, &cs, S_A, &acc.a, &bases, &r1cs, msm)?;
+    write_points_g1(&mut w, &cs, S_B1, &acc.b1, &bases, &r1cs, msm)?;
+    write_points_g2(&mut w, &cs, S_B2, &acc.b2, &bases, &r1cs, msm)?;
 
-    let cs_hash = cs.finalize();
+    let cs_hash = cs.finish().finalize();
     w.start_section(S_MPC_PARAMS)?;
     w.write_bytes(&cs_hash)?;
     w.write_u32(0)?;
@@ -528,39 +531,109 @@ fn coefficient(r1cs: &R1cs, coef_ptr: Option<u64>) -> Result<Fr, CeremonyError> 
 /// but nothing else touches the hasher in between, so the byte stream is the same.
 fn write_points_g1(
     w: &mut BinFileWriter,
-    cs: &mut Transcript,
+    cs: &CsHash,
     id: u32,
     slots: &[Vec<PointTerm>],
     bases: &LagrangeBlocks,
     r1cs: &R1cs,
     msm: &dyn MsmBackend,
 ) -> Result<(), CeremonyError> {
-    cs.update_u32_be(slots.len() as u32);
+    cs.send(Absorb::Bytes((slots.len() as u32).to_be_bytes().to_vec()));
     let points = compose_points_g1(slots, bases, r1cs, msm)?;
     w.start_section(id)?;
     w.write_g1_slice(&points)?;
     w.end_section()?;
-    cs.update_g1_all(&points);
+    cs.send(Absorb::G1(points));
     Ok(())
 }
 
 /// [`write_points_g1`] for section 7.
 fn write_points_g2(
     w: &mut BinFileWriter,
-    cs: &mut Transcript,
+    cs: &CsHash,
     id: u32,
     slots: &[Vec<PointTerm>],
     bases: &LagrangeBlocks,
     r1cs: &R1cs,
     msm: &dyn MsmBackend,
 ) -> Result<(), CeremonyError> {
-    cs.update_u32_be(slots.len() as u32);
+    cs.send(Absorb::Bytes((slots.len() as u32).to_be_bytes().to_vec()));
     let points = compose_points_g2(slots, bases, r1cs, msm)?;
     w.start_section(id)?;
     w.write_g2_slice(&points)?;
     w.end_section()?;
-    cs.update_g2_all(&points);
+    cs.send(Absorb::G2(points));
     Ok(())
+}
+
+/// What [`CsHash`] absorbs: raw bytes, or points it encodes uncompressed first.
+enum Absorb {
+    Bytes(Vec<u8>),
+    G1(Vec<G1Affine>),
+    G2(Vec<G2Affine>),
+}
+
+/// Messages [`CsHash`] holds before a sender waits. Each is at most one section's points.
+const HASH_QUEUE: usize = 2;
+
+/// `csHash` on a thread of its own, fed in send order through one channel.
+///
+/// BLAKE2b is serial, and on a 2^25 circuit each point section is 1.2 to 2.4 GB of it, so
+/// absorbing a section in line held the whole pool for 10 to 15 s. Here the next section
+/// composes while the last one is hashed. The digest depends only on the byte stream, not
+/// on how it is split.
+struct CsHash {
+    tx: Option<SyncSender<Absorb>>,
+    worker: Option<JoinHandle<Transcript>>,
+}
+
+impl CsHash {
+    fn spawn(mut transcript: Transcript) -> Result<Self, CeremonyError> {
+        let (tx, rx) = sync_channel::<Absorb>(HASH_QUEUE);
+        let worker = std::thread::Builder::new()
+            .name("cs-hash".into())
+            .spawn(move || {
+                for message in rx {
+                    match message {
+                        Absorb::Bytes(b) => transcript.update(&b),
+                        Absorb::G1(p) => transcript.update_g1_all(&p),
+                        Absorb::G2(p) => transcript.update_g2_all(&p),
+                    }
+                }
+                transcript
+            })?;
+        Ok(Self {
+            tx: Some(tx),
+            worker: Some(worker),
+        })
+    }
+
+    fn send(&self, message: Absorb) {
+        // A send fails only once the worker has panicked, and `finish` re-raises that.
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(message);
+        }
+    }
+
+    /// Wait for everything sent to be absorbed.
+    fn finish(mut self) -> Transcript {
+        drop(self.tx.take());
+        match self.worker.take().map(JoinHandle::join) {
+            Some(Ok(transcript)) => transcript,
+            Some(Err(panic)) => std::panic::resume_unwind(panic),
+            None => unreachable!("finish consumes the hasher"),
+        }
+    }
+}
+
+impl Drop for CsHash {
+    /// An early return still waits for the worker, so no thread outlives the setup.
+    fn drop(&mut self) {
+        drop(self.tx.take());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 /// One output point per accumulator slot: identity for an empty slot, and otherwise the
@@ -967,7 +1040,20 @@ pub fn hash_h_points(
     domain_size: usize,
     transcript: &mut Transcript,
 ) -> Result<(), CeremonyError> {
-    transcript.update_u32_be((domain_size - 1) as u32);
+    let cs = CsHash::spawn(transcript.clone())?;
+    let hashed = hash_h_points_into(ptau, domain_size, |b| cs.send(Absorb::Bytes(b)));
+    *transcript = cs.finish();
+    hashed
+}
+
+/// [`hash_h_points`] with each chunk's bytes handed to `absorb` in order, so the hash can
+/// run beside the next chunk's arithmetic.
+fn hash_h_points_into(
+    ptau: &Ptau,
+    domain_size: usize,
+    mut absorb: impl FnMut(Vec<u8>),
+) -> Result<(), CeremonyError> {
+    absorb(((domain_size - 1) as u32).to_be_bytes().to_vec());
 
     let file = ptau.file();
     let start = file
@@ -1001,25 +1087,10 @@ pub fn hash_h_points(
         // included (see above).
         Ok(transcript::g1_uncompressed_all(&to_affine(&diff)))
     };
-    // The hash is serial, so it runs beside the next chunk's arithmetic rather than
-    // between chunks.
-    let mut prev: Option<Vec<u8>> = None;
     let mut i = 0usize;
     while i < domain_size - 1 {
-        let hash = prev.take();
-        let (next, ()) = rayon::join(
-            || chunk(i),
-            || {
-                if let Some(b) = hash {
-                    transcript.update(&b);
-                }
-            },
-        );
-        prev = Some(next?);
+        absorb(chunk(i)?);
         i += H_CHUNK;
-    }
-    if let Some(b) = prev {
-        transcript.update(&b);
     }
     Ok(())
 }
