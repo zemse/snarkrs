@@ -105,6 +105,7 @@ AWS behavior: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/Stop_Start.htm
 ```sh
 G16_T4=/path/to/t4.sh T4_BOX=mine bash bench/aws/cuda-gate.sh
 G16_T4=/path/to/t4.sh bash bench/aws/cuda-gate.sh --every-variant   # adds the ~60 min FFT sweep
+G16_T4=/path/to/t4.sh bash bench/aws/cuda-gate.sh --ceremony-only   # the ceremony MSM alone
 ```
 
 Cross-builds the CUDA test binaries and the CLI, ships them with tiny_mul, sha256 and the
@@ -113,6 +114,13 @@ the instance and lives outside the repo; the gate never calls aws, and it releas
 on exit. The lib's legacy accumulator gate runs in its own process, and the CLI proves with
 --fallback false, so a proof the GPU did not make fails. Prints GATE PASSED or names the
 failed steps; full output is in out/ on the box.
+
+The ceremony MSM is cuda-ceremony-guest.sh, which the gate sources at its end and
+--ceremony-only runs alone: the adapter's device tests, then for tiny_mul and js_2x2_d32 on
+ppot_0080_15, `groth16 setup --backend cuda` byte-identical to cpu and `zkey verify r1cs
+--backend cuda` passing with `--check exact` and `--check random`, each at the shipped
+crossover and with every MSM on the device. --ceremony-large adds anon-aadhaar on
+ppot_0080_21, 2.6 GB more to ship and 3.7 GB resident.
 
 ## Nothing survives the sweep
 

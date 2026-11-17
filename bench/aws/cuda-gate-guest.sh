@@ -76,7 +76,7 @@ step lib-ignored 20 env G16_REQUIRE_TESTS=1 G16_CUDA_MSM_LEGACY_ACC=0 "$BIN/lib"
   --skip constant_work_legacy_override_gate --skip every_variant_gives_the_same_points \
   --skip every_unit_compiles_on_the_device \
   --skip full_clear_device_poisoned_scope --skip full_clear_device_msms \
-  --skip pair_inventory_count_only
+  --skip pair_inventory_count_only --skip ceremony::tests::
 
 # These gates need fresh processes with full clear and poison on, legacy off.
 # Require the named test and its one-test result, not just a successful process.
@@ -142,6 +142,9 @@ echo "  refused: prove rc=$p verify rc=$v $(tail -1 "$OUT/refused.verify.txt")"
 (( p == 0 && v == 0 )) || FAILED+=("cli-refused")
 [[ $(grep -c "warning" "$OUT/refused.prove.txt") == 1 ]] || FAILED+=("cli-refused-warnings")
 grep -q "suspect\|proving again" "$OUT/refused.prove.txt" && FAILED+=("cli-refused-retry")
+
+# The ceremony MSM: its device tests, then setup and zkey verify r1cs on cuda.
+source "$HERE/cuda-ceremony-guest.sh"
 
 log "result"
 if (( ${#FAILED[@]} )); then echo "GATE FAILED: ${FAILED[*]}"; exit 1; fi
