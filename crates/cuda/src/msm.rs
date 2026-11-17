@@ -1093,7 +1093,7 @@ pub(crate) fn device_budget(
 /// Shortest run [`CudaMsm::fit_runs`] cuts an MSM into before it refuses. A run of 2^10
 /// points needs a few megabytes of scratch, so a budget below it is a device with nothing
 /// free rather than a key too large.
-const MIN_RUN: usize = 1 << 10;
+pub(crate) const MIN_RUN: usize = 1 << 10;
 
 /// The bytes buffers of `words` take, each at least the one word `alloc_words` asks for.
 fn vram_bytes(words: &[usize]) -> u64 {
@@ -2532,7 +2532,7 @@ impl CudaMsm {
 
     /// What `jobs` allocate as one batch, in bytes, from the same geometry `Plan::new` and
     /// `Outputs::new` size their buffers from.
-    fn batch_bytes(&self, jobs: &[Job<'_>]) -> Result<u64, ProveError> {
+    pub(crate) fn batch_bytes(&self, jobs: &[Job<'_>]) -> Result<u64, ProveError> {
         let mixes = plan_mixes(jobs);
         let mut plans: HashMap<(usize, usize, usize, usize, usize), Geometry> = HashMap::new();
         let mut words = Vec::new();

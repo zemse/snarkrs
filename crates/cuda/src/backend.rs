@@ -232,7 +232,7 @@ impl CudaBackend {
 }
 
 /// Device 0, or the ordinal in `G16_CUDA_DEVICE`.
-fn env_ordinal() -> Result<usize, ProveError> {
+pub(crate) fn env_ordinal() -> Result<usize, ProveError> {
     match std::env::var("G16_CUDA_DEVICE") {
         Ok(v) => v.trim().parse::<usize>().map_err(|e| {
             bad(format!(
@@ -244,7 +244,7 @@ fn env_ordinal() -> Result<usize, ProveError> {
 }
 
 /// `G16_CUDA_VRAM_LIMIT`, in bytes, when it is set.
-fn env_vram_limit() -> Result<Option<u64>, ProveError> {
+pub(crate) fn env_vram_limit() -> Result<Option<u64>, ProveError> {
     match std::env::var("G16_CUDA_VRAM_LIMIT") {
         Ok(v) => v.trim().parse::<u64>().map(Some).map_err(|e| {
             bad(format!(

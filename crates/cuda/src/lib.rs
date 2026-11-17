@@ -27,10 +27,10 @@
 
 #[cfg(feature = "cuda")]
 mod backend;
-/// The ceremony seam that has CUDA kernels: `ptau prepare`'s group FFT.
+/// The ceremony seams that have CUDA kernels: `setup`'s MSM and `ptau prepare`'s group FFT.
 #[cfg(feature = "cuda")]
 mod ceremony;
-/// The host-side checks every readback of that seam is held to.
+/// The host-side checks every readback of those seams is held to.
 #[cfg(feature = "cuda")]
 mod check;
 #[cfg(feature = "cuda")]
@@ -53,7 +53,7 @@ pub mod stages;
 #[cfg(feature = "cuda")]
 pub use backend::{CudaBackend, CudaCircuit, PrepareCost, MSM_CHUNK};
 #[cfg(feature = "cuda")]
-pub use ceremony::CudaGroupFft;
+pub use ceremony::{CudaGroupFft, CudaMsmBackend};
 #[cfg(feature = "cuda")]
 pub use context::{Cuda, CudaError};
 /// The per-thread fault injector behind the group FFT's readbacks, for a test in another

@@ -14,9 +14,10 @@
 //! quiet machine, only an NVIDIA device, so it runs with the rest of the `cuda` feature's
 //! tests, and skips loudly without one.
 //!
-//! The group FFT is the one CUDA ceremony seam; the KeyScale and MSM operations the Metal
-//! soak (`recovery_metal.rs`) covers have no CUDA kernels. `G16_RECOVERY_POWER` sets the
-//! ptau power (default 10, at most 16).
+//! The group FFT is the CUDA ceremony seam with an injector; the KeyScale the Metal soak
+//! (`recovery_metal.rs`) covers has no CUDA kernel, and the CUDA MSM's check is a sum on
+//! the curve with no per-readback hook. `G16_RECOVERY_POWER` sets the ptau power (default
+//! 10, at most 16).
 
 #![cfg(feature = "cuda")]
 

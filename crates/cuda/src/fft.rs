@@ -216,9 +216,9 @@ const LOG_POINTS: usize = 8;
 /// carried over rather than re-derived. Nothing on a headless card is known to need the
 /// wait; a wrong store from a fault the driver did not report is given the same time to
 /// clear, 9.2 s over the eight attempts.
-const RETRIES: u32 = 8;
+pub(crate) const RETRIES: u32 = 8;
 
-fn backoff(attempt: u32) -> std::time::Duration {
+pub(crate) fn backoff(attempt: u32) -> std::time::Duration {
     std::time::Duration::from_millis(200 << attempt.min(3))
 }
 
