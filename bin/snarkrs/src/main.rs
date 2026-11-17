@@ -498,6 +498,8 @@ enum ZkeyImportCmd {
 enum ZkeyVerifyCmd {
     /// Re-run the whole setup to produce the initial key, then check the chain from it.
     /// The only form that checks the key against the circuit, and it costs a full setup.
+    ///
+    /// `--backend` runs that setup's MSMs; the checks themselves always run on the CPU.
     R1cs {
         #[arg(default_value = "circuit.r1cs")]
         r1cs: PathBuf,
@@ -505,6 +507,8 @@ enum ZkeyVerifyCmd {
         ptau: PathBuf,
         #[arg(default_value = "circuit_final.zkey")]
         zkey: PathBuf,
+        #[command(flatten)]
+        backend: CeremonyBackend,
     },
     /// Check the chain from a given initial key. Nothing ties that key to any circuit.
     Init {
@@ -1052,16 +1056,35 @@ fn run_zkey(cmd: ZkeyCmd) -> Result<u8> {
             ));
         }
         ZkeyCmd::Verify { cmd } => {
-            // No `--backend`: with the r1cs form this re-runs the whole setup, and a
-            // verifier that shares the accelerator with the thing it is checking checks less.
-            let msm = msm_backend(BackendKind::Cpu)?;
+            // The L and H checks run on the CPU whatever `--backend` says, because a device
+            // MSM that wrongly returned equal sums on both sides would pass a bad key.
+            // `--backend` moves only the r1cs form's recompute of the initial key, which
+            // fails closed: a wrong point fails the byte comparison. What it gives up is
+            // independence. A key set up on the same faulty backend carries the same wrong
+            // points, and those compare equal, so `--backend cpu`, the default, is the
+            // check that shares nothing with a GPU-built key.
+            let check = msm_backend(BackendKind::Cpu)?;
             let (report, zkey) = match &cmd {
-                ZkeyVerifyCmd::R1cs { r1cs, ptau, zkey } => (
-                    zkey_mpc::verify_from_r1cs(r1cs, ptau, zkey, msm.as_ref(), msm.as_ref()),
+                ZkeyVerifyCmd::R1cs {
+                    r1cs,
+                    ptau,
                     zkey,
-                ),
+                    backend,
+                } => {
+                    let setup = msm_backend(backend.backend)?;
+                    (
+                        zkey_mpc::verify_from_r1cs(
+                            r1cs,
+                            ptau,
+                            zkey,
+                            setup.as_ref(),
+                            check.as_ref(),
+                        ),
+                        zkey,
+                    )
+                }
                 ZkeyVerifyCmd::Init { init, ptau, zkey } => (
-                    zkey_mpc::verify_from_init(init, ptau, zkey, msm.as_ref()),
+                    zkey_mpc::verify_from_init(init, ptau, zkey, check.as_ref()),
                     zkey,
                 ),
             };
@@ -1082,6 +1105,11 @@ fn run_zkey(cmd: ZkeyCmd) -> Result<u8> {
                 .iter()
                 .map(|(name, t)| format!("{name} {:.1} s", t.as_secs_f64()))
                 .collect();
+            if let Some(backend) = report.setup_backend {
+                log::debug(format!(
+                    "initial key recomputed on {backend}, checked on cpu"
+                ));
+            }
             log::debug(format!("stages: {}", phases.join(", ")));
             // Newest first, as `zkey_verify_frominit.js` prints them.
             for (i, h) in report.contribution_hashes.iter().enumerate().rev() {
