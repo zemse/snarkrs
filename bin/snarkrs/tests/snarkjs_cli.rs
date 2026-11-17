@@ -189,6 +189,55 @@ fn a_ceremony_and_a_proof_run_on_snarkjs_lines() {
         let out = run(line);
         assert!(out.ends_with("ZKey Ok!\n"), "`{line}`: {out}");
     }
+    // `--check`, ours: every spelling of each method, `-v` naming the one that ran, and
+    // two different ones a usage error rather than the last one winning.
+    for (line, method) in [
+        ("zkv -v", "exact"),
+        ("zkv -v --check exact", "exact"),
+        ("zkv -v --check-exact", "exact"),
+        ("zkv -v --check random", "random"),
+        ("zkv -v --check=random", "random"),
+        ("zkv -v -check random", "random"),
+        ("zkv -v -check=random", "random"),
+        ("zkv -v --check-random", "random"),
+        ("zkv -v -check-random", "random"),
+        (
+            "zkv -v --check-random --check random --check-random",
+            "random",
+        ),
+        ("zkvi -v", "exact"),
+        ("zkvi -v --check random", "random"),
+        ("zkvi -v --check-random", "random"),
+        (
+            "zkey verify r1cs circuit.r1cs powersoftau.ptau circuit_final.zkey -v --check random",
+            "random",
+        ),
+    ] {
+        let o = snarkrs(&dir, line);
+        expect(&o, 0, line);
+        assert!(stdout(&o).ends_with("ZKey Ok!\n"), "`{line}`: {}", said(&o));
+        assert!(
+            said(&o).contains(&format!("debug: check {method}: ")),
+            "`{line}`: {}",
+            said(&o)
+        );
+    }
+    for line in [
+        "zkv --check-random --check exact",
+        "zkv --check random --check-exact",
+        "zkv --check-random --check-exact",
+        "zkv --check exact --check=random",
+        "zkvi --check-exact --check random",
+    ] {
+        let o = snarkrs(&dir, line);
+        expect(&o, 99, line);
+        assert!(stderr(&o).contains("contradict"), "`{line}`: {}", said(&o));
+    }
+    let line = "zkv --check fast";
+    let o = snarkrs(&dir, line);
+    expect(&o, 99, line);
+    assert!(stderr(&o).contains("fast"), "{}", said(&o));
+
     // A chain that does not start at the given initial key is a verdict: exit 1.
     let line = "zkvi circuit_0001.zkey powersoftau.ptau circuit_0001.zkey";
     let o = snarkrs(&dir, line);

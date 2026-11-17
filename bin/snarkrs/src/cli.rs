@@ -375,6 +375,7 @@ pub const VALUE_OPTIONS: &[&str] = &[
     "vkey",
     "threads",
     "power",
+    "check",
 ];
 
 /// snarkjs' short option names (`-verbose|v`, `-entropy|e`, `-name|n`, and `wtns debug`'s
@@ -661,6 +662,11 @@ mod tests {
         assert_eq!(
             clap("ptt p.ptau --power 17 -power=22").join(" "),
             "powersoftau truncate p.ptau --power=17 --power=22"
+        );
+        // `--check-random` is a flag of its own, not `check` taking `-random`.
+        assert_eq!(
+            clap("zkv a --check random -check=exact --check-random -check-exact b").join(" "),
+            "zkey verify r1cs a b --check=random --check=exact --check-random --check-exact"
         );
     }
 

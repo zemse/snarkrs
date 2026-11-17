@@ -25,6 +25,7 @@
 //!   snarkrs zkey verify r1cs [circuit.r1cs] [powersoftau.ptau] [circuit_final.zkey] (zkv)
 //!   snarkrs zkey verify init [circuit_0000.zkey] [powersoftau.ptau] [circuit_final.zkey]
 //!                                                                          (zkvi)
+//!                  both forms: [--check exact|random]
 //!   snarkrs zkey export verificationkey [circuit_final.zkey] [circuit_vk.json]    (zkev)
 //!   snarkrs zkey export solidityverifier [circuit_final.zkey] [verifier.sol]     (zkesv)
 //!   snarkrs zkey export bellman <in.zkey> [circuit.mpcparams]              (zkeb)
@@ -42,7 +43,8 @@
 //! `cli.rs` turns that line into one clap parses, and has the table. Our own options sit on
 //! top as `--` flags: `groth16 prove` and `fullprove` take `--backend auto|cpu|wgpu|metal|cuda`,
 //! `--stage-timings`, `--self-verify true|false`, `--vkey vkey.json`, `--fallback`,
-//! `--constant-work` and `--threads N`, and the ceremony commands take `--backend cpu|metal`.
+//! `--constant-work` and `--threads N`, the ceremony commands take `--backend cpu|metal`,
+//! and `zkey verify` takes `--check exact|random` (or `--check-exact`, `--check-random`).
 //!
 //! Exit codes are snarkjs': 0 for success, 1 for a failure or a proof or file that does not
 //! verify, 99 for a line that names no command or gives it the wrong parameters. Results
@@ -509,6 +511,8 @@ enum ZkeyVerifyCmd {
         zkey: PathBuf,
         #[command(flatten)]
         backend: CeremonyBackend,
+        #[command(flatten)]
+        check: VerifyCheck,
     },
     /// Check the chain from a given initial key. Nothing ties that key to any circuit.
     Init {
@@ -518,7 +522,79 @@ enum ZkeyVerifyCmd {
         ptau: PathBuf,
         #[arg(default_value = "circuit_final.zkey")]
         zkey: PathBuf,
+        #[command(flatten)]
+        check: VerifyCheck,
     },
+}
+
+impl ZkeyVerifyCmd {
+    fn check(&self) -> &VerifyCheck {
+        match self {
+            ZkeyVerifyCmd::R1cs { check, .. } | ZkeyVerifyCmd::Init { check, .. } => check,
+        }
+    }
+}
+
+/// How `zkey verify` checks the A, B1 and B2 sections. Ours, not snarkjs'.
+#[derive(clap::Args)]
+struct VerifyCheck {
+    /// exact, the default, compares every A, B1 and B2 point byte for byte, which in the
+    /// r1cs form means composing each one. random holds one random linear combination of
+    /// each section against the same combination of what it should hold, after decoding
+    /// and checking every point: about twice as fast on a large circuit, and wrong with
+    /// probability under 2^-126.
+    #[arg(long, value_enum, value_name = "METHOD")]
+    check: Vec<CheckKind>,
+    /// --check exact.
+    #[arg(long, action = clap::ArgAction::Count)]
+    check_exact: u8,
+    /// --check random.
+    #[arg(long, action = clap::ArgAction::Count)]
+    check_random: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum CheckKind {
+    Exact,
+    Random,
+}
+
+impl VerifyCheck {
+    /// The one method every spelling on the line names. Two different ones are a usage
+    /// error rather than the last one winning, because a script that says both meant one
+    /// of them and this cannot tell which.
+    fn method(&self) -> Result<zkey_mpc::Check, clap::Error> {
+        let mut named = self
+            .check
+            .iter()
+            .copied()
+            .chain((self.check_exact > 0).then_some(CheckKind::Exact))
+            .chain((self.check_random > 0).then_some(CheckKind::Random));
+        let first = named.next();
+        if named.any(|k| Some(k) != first) {
+            use clap::CommandFactory;
+            return Err(Cli::command().error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "--check exact and --check random contradict each other",
+            ));
+        }
+        Ok(match first {
+            None | Some(CheckKind::Exact) => zkey_mpc::Check::Exact,
+            Some(CheckKind::Random) => zkey_mpc::Check::Random,
+        })
+    }
+}
+
+impl Cli {
+    /// What clap cannot check on its own, as a clap error, so it exits 99 like the rest.
+    fn validate(&self) -> Result<(), clap::Error> {
+        match &self.cmd {
+            Cmd::Zkey {
+                cmd: ZkeyCmd::Verify { cmd },
+            } => cmd.check().method().map(drop),
+            _ => Ok(()),
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -639,7 +715,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let cli = match Cli::try_parse_from(line) {
+    let cli = match Cli::try_parse_from(line).and_then(|cli| cli.validate().map(|()| cli)) {
         Ok(cli) => cli,
         Err(e) => {
             // Help and version are errors to clap and successes to everyone else.
@@ -1064,27 +1140,32 @@ fn run_zkey(cmd: ZkeyCmd) -> Result<u8> {
             // points, and those compare equal, so `--backend cpu`, the default, is the
             // check that shares nothing with a GPU-built key.
             let check = msm_backend(BackendKind::Cpu)?;
+            let method = cmd.check().method()?;
             let (report, zkey) = match &cmd {
                 ZkeyVerifyCmd::R1cs {
                     r1cs,
                     ptau,
                     zkey,
                     backend,
+                    ..
                 } => {
                     let setup = msm_backend(backend.backend)?;
                     (
-                        zkey_mpc::verify_from_r1cs(
+                        zkey_mpc::verify_from_r1cs_with(
                             r1cs,
                             ptau,
                             zkey,
                             setup.as_ref(),
                             check.as_ref(),
+                            method,
                         ),
                         zkey,
                     )
                 }
-                ZkeyVerifyCmd::Init { init, ptau, zkey } => (
-                    zkey_mpc::verify_from_init(init, ptau, zkey, check.as_ref()),
+                ZkeyVerifyCmd::Init {
+                    init, ptau, zkey, ..
+                } => (
+                    zkey_mpc::verify_from_init_with(init, ptau, zkey, check.as_ref(), method),
                     zkey,
                 ),
             };
@@ -1110,6 +1191,12 @@ fn run_zkey(cmd: ZkeyCmd) -> Result<u8> {
                     "initial key recomputed on {backend}, checked on cpu"
                 ));
             }
+            log::debug(match report.check {
+                zkey_mpc::Check::Exact => "check exact: A, B1 and B2 compared byte for byte",
+                zkey_mpc::Check::Random => {
+                    "check random: A, B1 and B2 checked by random linear combination"
+                }
+            });
             log::debug(format!("stages: {}", phases.join(", ")));
             // Newest first, as `zkey_verify_frominit.js` prints them.
             for (i, h) in report.contribution_hashes.iter().enumerate().rev() {

@@ -124,6 +124,7 @@ snarkrs powersoftau prepare phase2 pot_0001.ptau powersoftau.ptau
 snarkrs powersoftau truncate powersoftau.ptau [--power 8,10]  # powersoftau_01.ptau ... _11.ptau
 snarkrs groth16 setup circuit.r1cs powersoftau.ptau circuit_0000.zkey
 snarkrs zkey contribute circuit_0000.zkey circuit_final.zkey -e=...
+snarkrs zkey verify circuit.r1cs powersoftau.ptau circuit_final.zkey [--check exact|random]
 snarkrs zkey export verificationkey circuit_final.zkey verification_key.json
 snarkrs groth16 prove circuit_final.zkey witness.wtns proof.json public.json \
         [--backend auto|cpu|wgpu|metal|cuda] [--stage-timings] [--self-verify true|false] \
@@ -157,6 +158,14 @@ in either direction:
 snarkrs g16p circuit.zkey circuit.wtns proof.json public.json --backend metal
 snarkjs groth16 verify verification_key.json public.json proof.json    # OK!
 ```
+
+`zkey verify` checks the A, B1 and B2 sections byte for byte, as snarkjs does, which in the
+r1cs form means composing every point again. `--check random` (or `--check-random`) holds one
+random linear combination of each section against the same combination of the Lagrange bases
+instead, after checking every point is canonically encoded, on its curve and, for B2, in the
+order-r subgroup. A wrong key passes it with probability under 2^-126. On a 2^25 circuit with
+18.5 million signals the r1cs form takes 115 s instead of 210, at a 4.7 GB peak footprint
+instead of 5.1.
 
 ### witnesses
 
