@@ -24,7 +24,7 @@ members = [
 exclude = ["bench/csp"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.89"
 license = "MIT OR Apache-2.0"
@@ -79,22 +79,22 @@ dhat         = "0.3"
 hotpath      = "0.26"
 criterion    = { version = "0.8", features = ["html_reports"] }
 
-snarkrs-field = { path = "crates/field", version = "0.1.0" }
-snarkrs-formats  = { path = "crates/formats", version = "0.1.0" }
-snarkrs-ntt   = { path = "crates/ntt", version = "0.1.0" }
-snarkrs-msm   = { path = "crates/msm", version = "0.1.0" }
-snarkrs-groth16  = { path = "crates/groth16", version = "0.1.0" }
-snarkrs-ceremony = { path = "crates/ceremony", version = "0.1.0" }
-snarkrs-gpu-layout = { path = "crates/gpu-layout", version = "0.1.0" }
-snarkrs-metal = { path = "crates/metal", version = "0.1.0" }
-snarkrs-cuda  = { path = "crates/cuda", version = "0.1.0" }
-snarkrs-wgpu  = { path = "crates/wgpu", version = "0.1.0" }
-snarkrs-web  = { path = "crates/web", version = "0.1.0" }
-snarkrs-witness = { path = "crates/witness", version = "0.1.0", default-features = false }
-snarkrs-lib = { path = "crates/lib", version = "0.1.0" }
-snarkrs-gnark = { path = "crates/gnark", version = "0.1.0" }
-snarkrs-gnark-solver = { path = "crates/gnark-solver", version = "0.1.0" }
-snarkrs-gnark-convert = { path = "crates/gnark-convert", version = "0.1.0" }
+snarkrs-field = { path = "crates/field", version = "0.2.0" }
+snarkrs-formats  = { path = "crates/formats", version = "0.2.0" }
+snarkrs-ntt   = { path = "crates/ntt", version = "0.2.0" }
+snarkrs-msm   = { path = "crates/msm", version = "0.2.0" }
+snarkrs-groth16  = { path = "crates/groth16", version = "0.2.0" }
+snarkrs-ceremony = { path = "crates/ceremony", version = "0.2.0" }
+snarkrs-gpu-layout = { path = "crates/gpu-layout", version = "0.2.0" }
+snarkrs-metal = { path = "crates/metal", version = "0.2.0" }
+snarkrs-cuda  = { path = "crates/cuda", version = "0.2.0" }
+snarkrs-wgpu  = { path = "crates/wgpu", version = "0.2.0" }
+snarkrs-web  = { path = "crates/web", version = "0.2.0" }
+snarkrs-witness = { path = "crates/witness", version = "0.2.0", default-features = false }
+snarkrs-lib = { path = "crates/lib", version = "0.2.0" }
+snarkrs-gnark = { path = "crates/gnark", version = "0.2.0" }
+snarkrs-gnark-solver = { path = "crates/gnark-solver", version = "0.2.0" }
+snarkrs-gnark-convert = { path = "crates/gnark-convert", version = "0.2.0" }
 
 [profile.release]
 opt-level = 3
