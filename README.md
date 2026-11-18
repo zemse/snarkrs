@@ -46,18 +46,30 @@ phase 1, powers of tau, run once for every circuit that follows:
 | command            | input    | g16 cpu (s) | g16 metal (s) | snarkjs (s) |
 | ------------------ | -------- | ----------: | ------------: | ----------: |
 | `ptau new`         | power 14 |**0.01** |         — |     0.5 |
-| `ptau contribute`  | power 19 |    36.3 |  **5.2**  |   162.3 |
-| `ptau beacon`      | power 19 |    36.2 |  **5.2**  |   162.0 |
-| `ptau prepare`     | power 20 |   929.8 | **83.8**  |  ~9,300 |
-| `ptau verify`      | power 20 |**16.9** |         — |   116.4 |
+| `ptau contribute`  | power 19 |     7.4 |  **4.2**  |   162.3 |
+| `ptau beacon`      | power 19 |     7.5 |  **3.8**  |   162.0 |
+| `ptau prepare`     | power 20 |   241.2 | **84.9**  |  ~9,300 |
+| `ptau verify`      | power 20 |  **6.7** |         — |   140.0 |
+| `ptau verify` PPoT | power 20 | **97.6** |         — |  > 2,700 |
+| `ptau truncate`    | power 20 | **0.19** |         — |     4.2 |
 
-phase 2, the proving key, run once per circuit:
+phase 2, the proving key, run once per circuit (`anon-aadhaar`, 1,115,080 constraints):
 
-| command                | domain | g16 cpu (s) | g16 metal (s) | snarkjs (s) |
-| ---------------------- | ------ | ----------: | ------------: | ----------: |
-| `setup` circom         | 2^20   |     17.4 | **17.1**  |    86.4 |
-| `zkey contribute`      | 2^20   |     16.4 |  **1.8**  |    72.6 |
-| `zkey beacon`          | 2^20   |     16.3 |  **1.8**  |    73.6 |
+| command                     | domain | g16 cpu (s) | g16 metal (s) | snarkjs (s) |
+| --------------------------- | ------ | ----------: | ------------: | ----------: |
+| `setup` circom              | 2^21   |  **2.1** |       2.3 |   176.3 |
+| `zkey contribute`           | 2^21   |      8.4 |   **3.2** |   144.2 |
+| `zkey beacon`               | 2^21   |      8.5 |   **3.2** |   138.9 |
+| `zkey verify` r1cs, exact   | 2^21   |  **3.4** |       3.7 |   205.6 |
+| `zkey verify` r1cs, random  | 2^21   |      4.5 |   **3.6** |         |
+
+> inputs: `bench/ptau/local_19.ptau` for contribute and beacon, `ppot_0080_20.ptau` for
+> prepare, truncate and the PPoT verify, `ppot_0080_21.ptau` for phase 2. The plain
+> `ptau verify` row is a power-20 file made here (new, one contribution, a beacon,
+> prepare); the PPoT file carries its full contribution chain, which is why it is 15x
+> slower. snarkjs has one `zkey verify` and no `--check`; it was stopped unfinished after
+> 45 minutes on the PPoT file. The `ptau new` to `ptau prepare` snarkjs cells are from
+> 2026-09 (snarkjs did not change); the rest are one run of snarkjs 0.7.6 on 2026-11-18.
 
 ### g4dn.2xlarge
 
