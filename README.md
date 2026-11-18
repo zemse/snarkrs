@@ -126,8 +126,9 @@ The package and the binary are both `snarkrs`, a drop-in for the snarkjs 0.7.6 c
 BN254: the same commands, aliases, positional file names and defaults, `-e=`/`-n=`/`-v`
 options and exit codes (0 ok, 1 failed or invalid, 99 bad usage). Results such as `OK!`
 print bare on stdout, and warnings and errors go to stderr as `warning:` and `error:`
-lines. `snarkrs --help` lists what it runs; a snarkjs command it does not run yet
-fails with exit 1 and says so.
+lines. Every Groth16 command snarkjs has runs, including the inspection ones (`r1cs info`,
+`r1cs print`, the `export json` commands, `wtns check`, `zkey export soliditycalldata`); a
+PLONK or FFLONK command fails with exit 1 and says so.
 
 ```sh
 snarkrs powersoftau new bn128 12                              # powersOfTau12_0000.ptau
@@ -142,6 +143,7 @@ snarkrs groth16 prove circuit_final.zkey witness.wtns proof.json public.json \
         [--backend auto|cpu|wgpu|metal|cuda] [--stage-timings] [--self-verify true|false] \
         [--vkey verification_key.json] [--constant-work]
 snarkrs groth16 verify verification_key.json public.json proof.json
+snarkrs wtns check circuit.r1cs witness.wtns                  # exit 1 names the failing constraint
 
 snarkrs bench --artifacts <DIR> [--variant NAME]... [--reps N] \
         [--backend auto|cpu|wgpu|metal|cuda] [--mode cold-inprocess|cold-process|warm|both] \

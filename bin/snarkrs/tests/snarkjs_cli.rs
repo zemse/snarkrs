@@ -86,7 +86,7 @@ fn exit_codes_follow_snarkjs() {
         ("groth16 verify --help", 0, "Usage"),
         ("--version", 0, "snarkrs"),
         ("pks", 1, "Groth16 on BN254 only"),
-        ("zkey export json", 1, "does not implement yet"),
+        ("zkey export json", 1, "circuit_final.zkey"),
         ("ptn bls12381 4", 1, "not supported"),
         ("ptn BLS12-381 4", 1, "not supported"),
         ("ptn bn128 29", 1, "Power must be between 1 and 28"),
@@ -561,6 +561,89 @@ fn truncate_matches_snarkjs() {
     }
     assert!(!dir.join("pot_05.ptau").exists());
     assert!(!dir.join("pot_0001_01.ptau").exists());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The commands that show a file to a person: `r1cs info`, `r1cs print`, every
+/// `export json`, `wtns check` both ways, `zkey export soliditycalldata` and `ptau convert`.
+/// All deterministic, so each is held to snarkjs' bytes and log.
+#[test]
+fn inspection_commands_match_snarkjs() {
+    let Some(js) = snarkjs_bin() else {
+        return;
+    };
+    let Some(tiny) = tiny_mul() else {
+        resources::skip("inspection_commands_match_snarkjs: no tiny_mul");
+        return;
+    };
+    let dir = scratch("inspect");
+    for f in [
+        "circuit.r1cs",
+        "circuit.wtns",
+        "circuit.zkey",
+        "proof.json",
+        "public.json",
+    ] {
+        std::fs::copy(tiny.join(f), dir.join(f)).unwrap();
+    }
+    // circom's `--sym` for tiny_mul, which the fixture does not keep.
+    std::fs::write(
+        dir.join("circuit.sym"),
+        "1,1,0,main.out\n2,2,0,main.a\n3,3,0,main.b\n4,4,0,main.c\n5,5,0,main.t\n",
+    )
+    .unwrap();
+    std::fs::copy(dir.join("circuit.wtns"), dir.join("witness.wtns")).unwrap();
+    let mut wtns = std::fs::read(dir.join("circuit.wtns")).unwrap();
+    let at = wtns.len() - 32;
+    wtns[at] ^= 1;
+    std::fs::write(dir.join("bad.wtns"), wtns).unwrap();
+
+    let both = |ours: &str, theirs: &str, code: i32| {
+        let o = snarkrs(&dir, ours);
+        expect(&o, code, ours);
+        let (js_code, js_out) = snarkjs(&js, &dir, theirs);
+        assert_eq!(js_code, code, "snarkjs {theirs}: {js_out}");
+        assert_eq!(said(&o), js_out, "{ours}");
+    };
+    // Default names on our side, snarkjs' spelled out on its own.
+    both("r1cs info", "ri circuit.r1cs", 0);
+    both("r1cs print", "rp circuit.r1cs circuit.sym", 0);
+    both("wtns check", "wchk circuit.r1cs circuit.wtns", 0);
+    both(
+        "wchk circuit.r1cs bad.wtns",
+        "wchk circuit.r1cs bad.wtns",
+        1,
+    );
+    both(
+        "zkey export soliditycalldata",
+        "zkesc public.json proof.json",
+        0,
+    );
+    // snarkjs' "undefined: Loading constraints" progress lines are not reproduced.
+    expect(&snarkrs(&dir, "r1cs export json"), 0, "r1cs export json");
+    assert_eq!(snarkjs(&js, &dir, "rej circuit.r1cs js_r1cs.json").0, 0);
+    same_bytes(&dir, "circuit.json", "js_r1cs.json");
+    both("wtns export json", "wej circuit.wtns js_wtns.json", 0);
+    same_bytes(&dir, "witness.json", "js_wtns.json");
+    both("zkej circuit.zkey", "zkej circuit.zkey js_zkey.json", 0);
+    same_bytes(&dir, "circuit_final.zkey.json", "js_zkey.json");
+
+    for line in [
+        "ptn bn128 4 pot_0000.ptau",
+        "ptc pot_0000.ptau pot_0001.ptau -e=one",
+        "pt2 pot_0001.ptau pot.ptau",
+    ] {
+        expect(&snarkrs(&dir, line), 0, line);
+    }
+    both("ptej pot.ptau pot.json", "ptej pot.ptau js_pot.json", 0);
+    same_bytes(&dir, "pot.json", "js_pot.json");
+    both(
+        "powersoftau convert pot.ptau cv.ptau",
+        "ptcv pot.ptau js_cv.ptau",
+        0,
+    );
+    same_bytes(&dir, "cv.ptau", "js_cv.ptau");
 
     std::fs::remove_dir_all(&dir).ok();
 }

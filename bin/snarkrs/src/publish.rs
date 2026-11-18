@@ -51,6 +51,18 @@ pub fn publish(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     .with_context(|| format!("writing {}", path.display()))
 }
 
+/// `write` given the stage, for an output too large to hold in memory first, with
+/// `writing <path>` on the error as [`publish`] has it.
+pub fn publish_with(
+    path: &Path,
+    write: impl FnOnce(std::fs::File) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    publish_all(&[path], anyhow::Error::from, |stages| {
+        write(std::fs::File::create(&stages[0])?)
+    })
+    .with_context(|| format!("writing {}", path.display()))
+}
+
 /// `proof.json` and `public.json` as one set: neither is replaced unless both are written.
 pub fn publish_proof(
     proof_out: &Path,

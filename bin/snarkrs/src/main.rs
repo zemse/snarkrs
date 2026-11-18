@@ -62,7 +62,7 @@
 //! arguments and prints what came back.
 //!
 //! Their `--backend` is not `prove`'s. `prove` selects a whole `snarkrs_groth16::Backend`; a
-//! ceremony command selects one primitive, and the eight that have the flag are the eight
+//! ceremony command selects one primitive, and the ones that have the flag are the ones
 //! with a primitive worth moving. The bar every one of them is held to is that
 //! `--backend cpu`, `--backend metal` and, where it is accepted, `--backend cuda` write
 //! **byte-identical** files, which is what carries the snarkjs equivalence the CPU path
@@ -76,16 +76,16 @@ use clap::{Parser, Subcommand};
 use snarkrs_ceremony::snarkjs_log::{self, SnarkjsLog};
 use snarkrs_ceremony::{
     bellman, challenge, contribute as zkey_mpc, phase1, prepare, ptau as ptau_file, ptau_export,
-    setup, solidity, vkey, CeremonyError,
+    r1cs::R1cs, r1cs_export, setup, solidity, sym::Syms, vkey, wtns_check, CeremonyError,
 };
 use snarkrs_cli::{
     bench,
-    cli::{self, Parsed, Support},
+    cli::{self, Parsed},
     fft_backend, json, key_backend, log, make_backend, msm_backend, publish, BackendKind,
     ProveBackend,
 };
 use snarkrs_field::Fr;
-use snarkrs_formats::{wtns::Witness, ProvingKey, VerifyingKey};
+use snarkrs_formats::{calldata, export_json, wtns::Witness, ProvingKey, VerifyingKey};
 use snarkrs_groth16::{
     prove::{prove, prove_trace, prove_unchecked},
     verify::{verify, VerifyError},
@@ -134,6 +134,11 @@ enum Cmd {
     Zkey {
         #[command(subcommand)]
         cmd: ZkeyCmd,
+    },
+    /// Circuits: what a .r1cs holds, for a person to read.
+    R1cs {
+        #[command(subcommand)]
+        cmd: R1csCmd,
     },
     /// Witnesses: circuit + input -> witness.wtns.
     Wtns {
@@ -237,6 +242,15 @@ enum PtauCmd {
         #[command(subcommand)]
         cmd: PrepareCmd,
     },
+    /// Copy the file and recompute its last Lagrange block, for a file prepared by a
+    /// snarkjs older than 0.3.
+    Convert {
+        ptau: PathBuf,
+        out: PathBuf,
+        /// cpu, metal or cuda, as `prepare phase2`.
+        #[arg(long, value_enum, default_value_t = BackendKind::Cpu)]
+        backend: BackendKind,
+    },
     /// Check the contribution chain and recompute the challenge hashes.
     Verify { ptau: PathBuf },
     /// Write the file at every smaller power: `pot.ptau` gives `pot_01.ptau` up to one
@@ -272,6 +286,9 @@ enum PtauExportCmd {
         #[arg(default_value = "challenge")]
         out: PathBuf,
     },
+    /// Write every section as snarkjs' JSON: the points as decimal coordinates, and the
+    /// contributions with their hashes.
+    Json { ptau: PathBuf, out: PathBuf },
 }
 
 #[derive(Subcommand)]
@@ -626,6 +643,52 @@ enum ZkeyExportCmd {
         #[arg(default_value = "circuit.mpcparams")]
         out: PathBuf,
     },
+    /// Write the whole key as snarkjs' JSON, byte for byte. Streams: a 2^20 key is about
+    /// 400 MB of text.
+    Json {
+        #[arg(default_value = "circuit_final.zkey")]
+        zkey: PathBuf,
+        #[arg(default_value = "circuit_final.zkey.json")]
+        out: PathBuf,
+    },
+    /// Print the arguments of a Solidity `verifyProof` call for a proof, as one line.
+    Soliditycalldata {
+        #[arg(default_value = "public.json")]
+        public: PathBuf,
+        #[arg(default_value = "proof.json")]
+        proof: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum R1csCmd {
+    /// Print the curve and the counts of wires, constraints, inputs, labels and outputs.
+    Info {
+        #[arg(default_value = "circuit.r1cs")]
+        r1cs: PathBuf,
+    },
+    /// Print every constraint as `[ A ] * [ B ] - [ C ] = 0`, with signal names.
+    Print {
+        #[arg(default_value = "circuit.r1cs")]
+        r1cs: PathBuf,
+        /// Defaults to the r1cs name with its extension changed to `.sym`.
+        sym: Option<PathBuf>,
+    },
+    Export {
+        #[command(subcommand)]
+        cmd: R1csExportCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum R1csExportCmd {
+    /// Write the circuit as snarkjs' JSON, byte for byte.
+    Json {
+        #[arg(default_value = "circuit.r1cs")]
+        r1cs: PathBuf,
+        /// Defaults to the r1cs name with its extension changed to `.json`.
+        out: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -662,6 +725,29 @@ enum WtnsCmd {
         /// Log every component start and finish. As `--get`. `-t`.
         #[arg(long)]
         trigger: bool,
+    },
+    Export {
+        #[command(subcommand)]
+        cmd: WtnsExportCmd,
+    },
+    /// Check that a witness satisfies every constraint of the circuit. Exit 1 names the
+    /// first constraint it fails.
+    Check {
+        #[arg(default_value = "circuit.r1cs")]
+        r1cs: PathBuf,
+        #[arg(default_value = "witness.wtns")]
+        witness: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum WtnsExportCmd {
+    /// Write the witness as a JSON array of decimal strings, byte for byte snarkjs'.
+    Json {
+        #[arg(default_value = "witness.wtns")]
+        witness: PathBuf,
+        #[arg(default_value = "witness.json")]
+        out: PathBuf,
     },
 }
 
@@ -707,13 +793,10 @@ fn main() -> ExitCode {
             return ExitCode::from(BAD_USAGE);
         }
         Parsed::Unsupported(c) => {
-            let words = c.words().join(" ");
-            log::error(match c.support {
-                Support::Never => {
-                    format!("`{words}` is not supported: snarkrs is Groth16 on BN254 only")
-                }
-                _ => format!("`{words}` is a snarkjs command snarkrs does not implement yet"),
-            });
+            log::error(format!(
+                "`{}` is not supported: snarkrs is Groth16 on BN254 only",
+                c.words().join(" ")
+            ));
             return ExitCode::FAILURE;
         }
     };
@@ -761,6 +844,7 @@ fn run(cmd: Cmd) -> Result<u8> {
         Cmd::Powersoftau { cmd } => run_ptau(cmd),
         Cmd::Groth16 { cmd } => run_groth16(cmd),
         Cmd::Zkey { cmd } => run_zkey(cmd),
+        Cmd::R1cs { cmd } => run_r1cs(cmd),
         Cmd::Wtns { cmd } => run_wtns(cmd),
         Cmd::File {
             cmd: FileCmd::Info { file },
@@ -881,6 +965,14 @@ fn run_ptau(cmd: PtauCmd) -> Result<u8> {
                 .with_context(|| format!("preparing {}", ptau.display()))?;
             log::debug(format!("wrote {}", out.display()));
         }
+        PtauCmd::Convert { ptau, out, backend } => {
+            let fft = fft_backend(backend)?;
+            let src = ptau_file::Ptau::open(&ptau)
+                .with_context(|| format!("opening {}", ptau.display()))?;
+            ptau_export::ptau_convert(&src, &out, fft.as_ref(), &mut CliLog)
+                .with_context(|| format!("converting {}", ptau.display()))?;
+            log::debug(format!("wrote {}", out.display()));
+        }
         PtauCmd::Verify { ptau } => {
             let report = match phase1::verify(&ptau) {
                 Ok(r) => r,
@@ -944,6 +1036,18 @@ fn run_ptau(cmd: PtauCmd) -> Result<u8> {
                 &report.challenge_hash,
                 "New Challenge Hash: ",
             ));
+            log::debug(format!("wrote {}", out.display()));
+        }
+        PtauCmd::Export {
+            cmd: PtauExportCmd::Json { ptau, out },
+        } => {
+            let src = ptau_file::Ptau::open(&ptau)
+                .with_context(|| format!("opening {}", ptau.display()))?;
+            publish::publish_with(&out, |file| {
+                ptau_export::ptau_export_json(&src, file, &mut std::io::stdout().lock())
+                    .map_err(Into::into)
+            })
+            .with_context(|| format!("exporting from {}", ptau.display()))?;
             log::debug(format!("wrote {}", out.display()));
         }
         PtauCmd::Challenge {
@@ -1241,6 +1345,34 @@ fn run_zkey(cmd: ZkeyCmd) -> Result<u8> {
                 .with_context(|| format!("exporting from {}", zkey.display()))?;
             log::debug(format!("wrote {}", out.display()));
         }
+        ZkeyCmd::Export {
+            cmd: ZkeyExportCmd::Json { zkey, out },
+        } => {
+            publish::publish_with(&out, |file| {
+                export_json::zkey_export_json(&zkey, file).map_err(Into::into)
+            })
+            .with_context(|| format!("exporting from {}", zkey.display()))?;
+            log::debug(format!("wrote {}", out.display()));
+        }
+        ZkeyCmd::Export {
+            cmd: ZkeyExportCmd::Soliditycalldata { public, proof },
+        } => {
+            let read = |path: &Path| -> Result<serde_json::Value> {
+                let text = std::fs::read_to_string(path)
+                    .with_context(|| format!("loading {}", path.display()))?;
+                serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+            };
+            let (public, proof) = (read(&public)?, read(&proof)?);
+            // snarkjs picks the exporter on the proof's protocol (`cli.js:678-686`).
+            match proof.get("protocol").and_then(|p| p.as_str()) {
+                Some("groth16") => {}
+                Some(p @ ("plonk" | "fflonk")) => {
+                    anyhow::bail!("a {p} proof: snarkrs is Groth16 on BN254 only")
+                }
+                _ => anyhow::bail!("Invalid Protocol"),
+            }
+            println!("{}", calldata::groth16_solidity_calldata(&proof, &public)?);
+        }
         ZkeyCmd::Bellman {
             cmd:
                 ZkeyBellmanCmd::Contribute {
@@ -1446,6 +1578,47 @@ fn run_wtns(cmd: WtnsCmd) -> Result<u8> {
                 return Ok(witness_failed(&e));
             }
             log::debug(format!("wrote {}", witness.display()));
+        }
+        WtnsCmd::Export {
+            cmd: WtnsExportCmd::Json { witness, out },
+        } => {
+            publish::publish_with(&out, |file| {
+                export_json::wtns_export_json(&witness, file).map_err(Into::into)
+            })
+            .with_context(|| format!("exporting from {}", witness.display()))?;
+            log::debug(format!("wrote {}", out.display()));
+        }
+        WtnsCmd::Check { r1cs, witness } => {
+            let ok = wtns_check::wtns_check(&r1cs, &witness, &mut CliLog).with_context(|| {
+                format!("checking {} against {}", witness.display(), r1cs.display())
+            })?;
+            return Ok(u8::from(!ok));
+        }
+    }
+    Ok(0)
+}
+
+fn run_r1cs(cmd: R1csCmd) -> Result<u8> {
+    let open =
+        |path: &Path| R1cs::open(path).with_context(|| format!("opening {}", path.display()));
+    match cmd {
+        R1csCmd::Info { r1cs } => r1cs_export::r1cs_info(&open(&r1cs)?, &mut CliLog)?,
+        R1csCmd::Print { r1cs, sym } => {
+            let sym = sym.unwrap_or_else(|| cli::change_ext(&r1cs.to_string_lossy(), "sym").into());
+            let syms = Syms::load(&sym).with_context(|| format!("loading {}", sym.display()))?;
+            r1cs_export::r1cs_print(&open(&r1cs)?, &syms, &mut CliLog)?;
+        }
+        R1csCmd::Export {
+            cmd: R1csExportCmd::Json { r1cs, out },
+        } => {
+            let out =
+                out.unwrap_or_else(|| cli::change_ext(&r1cs.to_string_lossy(), "json").into());
+            let circuit = open(&r1cs)?;
+            publish::publish_with(&out, |file| {
+                r1cs_export::r1cs_export_json(&circuit, file).map_err(Into::into)
+            })
+            .with_context(|| format!("exporting from {}", r1cs.display()))?;
+            log::debug(format!("wrote {}", out.display()));
         }
     }
     Ok(0)
@@ -1844,7 +2017,10 @@ mod tests {
     /// normaliser hands clap words it rejects with exit 99.
     #[test]
     fn every_supported_snarkjs_command_parses() {
-        for c in cli::COMMANDS.iter().filter(|c| c.support == Support::Yes) {
+        for c in cli::COMMANDS
+            .iter()
+            .filter(|c| c.support == cli::Support::Yes)
+        {
             let mut line = vec!["snarkrs".to_string()];
             line.extend(c.words().iter().map(|w| w.to_string()));
             // The required positionals, so only the words are under test.

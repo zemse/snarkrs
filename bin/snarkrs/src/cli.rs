@@ -25,8 +25,6 @@ use std::ffi::OsString;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Support {
     Yes,
-    /// Not yet. Groth16 on BN254, so it belongs here eventually.
-    Later,
     /// A different proving system. snarkrs is Groth16 only.
     Never,
 }
@@ -135,7 +133,7 @@ pub const COMMANDS: &[Command] = &[
         cmd: "powersoftau convert <old_powersoftau.ptau> <new_powersoftau.ptau>",
         alias: &["ptcv"],
         description: "Convert ptau",
-        support: Later,
+        support: Yes,
     },
     Command {
         cmd: "powersoftau truncate <powersoftau.ptau>",
@@ -153,25 +151,25 @@ pub const COMMANDS: &[Command] = &[
         cmd: "powersoftau export json <powersoftau_0000.ptau> <powersoftau_0000.json>",
         alias: &["ptej"],
         description: "Exports a power of tau file to a JSON",
-        support: Later,
+        support: Yes,
     },
     Command {
         cmd: "r1cs info [circuit.r1cs]",
         alias: &["ri", "info -r|r1cs:circuit.r1cs"],
         description: "Print statistiscs of a circuit",
-        support: Later,
+        support: Yes,
     },
     Command {
         cmd: "r1cs print [circuit.r1cs] [circuit.sym]",
         alias: &["rp", "print -r|r1cs:circuit.r1cs -s|sym"],
         description: "Print the constraints of a circuit",
-        support: Later,
+        support: Yes,
     },
     Command {
         cmd: "r1cs export json [circuit.r1cs] [circuit.json]",
         alias: &["rej"],
         description: "Export r1cs to JSON file",
-        support: Later,
+        support: Yes,
     },
     Command {
         cmd: "wtns calculate [circuit.wasm] [input.json] [witness.wtns]",
@@ -192,13 +190,13 @@ pub const COMMANDS: &[Command] = &[
         cmd: "wtns export json [witness.wtns] [witnes.json]",
         alias: &["wej"],
         description: "Calculate the witness with debug info.",
-        support: Later,
+        support: Yes,
     },
     Command {
         cmd: "wtns check [circuit.r1cs] [[witness.wtns]",
         alias: &["wchk"],
         description: "Check if a specific witness of a circuit fulfills the r1cs constraints",
-        support: Later,
+        support: Yes,
     },
     Command {
         cmd: "zkey contribute <circuit_old.zkey> <circuit_new.zkey>",
@@ -252,7 +250,7 @@ pub const COMMANDS: &[Command] = &[
         cmd: "zkey export json [circuit_final.zkey] [circuit_final.zkey.json]",
         alias: &["zkej"],
         description: "Exports a circuit key to a JSON file",
-        support: Later,
+        support: Yes,
     },
     Command {
         cmd: "zkey export solidityverifier [circuit_final.zkey] [verifier.sol]",
@@ -264,7 +262,7 @@ pub const COMMANDS: &[Command] = &[
         cmd: "zkey export soliditycalldata [public.json] [proof.json]",
         alias: &["zkesc", "generatecall -pub|public -p|proof"],
         description: "Generates call parameters ready to be called.",
-        support: Later,
+        support: Yes,
     },
     Command {
         cmd: "groth16 setup [circuit.r1cs] [powersoftau.ptau] [circuit_0000.zkey]",
@@ -692,10 +690,6 @@ mod tests {
         assert!(matches!(norm("powersoftau"), Parsed::Unknown(_)));
         match norm("pks") {
             Parsed::Unsupported(c) => assert_eq!(c.support, Never),
-            other => panic!("{other:?}"),
-        }
-        match norm("zkey export json") {
-            Parsed::Unsupported(c) => assert_eq!(c.support, Later),
             other => panic!("{other:?}"),
         }
     }
