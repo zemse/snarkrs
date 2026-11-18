@@ -36,7 +36,7 @@ use snarkrs_formats::binfile::bigint;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum GnarkError {
-    #[error("io: {0}")]
+    #[error(transparent)]
     Io(#[from] std::io::Error),
     /// The first eight bytes of a dump. gnark writes `0xdeadbeef` as a native `u64`, so a
     /// mismatch is either not a dump or one written on a big-endian machine.

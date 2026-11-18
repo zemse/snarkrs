@@ -44,7 +44,7 @@ use snarkrs_field::Fr;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ConvertError {
-    #[error("io: {0}")]
+    #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Gnark(#[from] snarkrs_gnark::GnarkError),

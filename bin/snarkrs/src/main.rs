@@ -976,6 +976,11 @@ fn run_ptau(cmd: PtauCmd) -> Result<u8> {
         PtauCmd::Verify { ptau } => {
             let report = match phase1::verify(&ptau) {
                 Ok(r) => r,
+                // A file that cannot be read is not a verdict on it.
+                Err(
+                    e @ (CeremonyError::Io(_)
+                    | CeremonyError::Zkey(snarkrs_formats::ZkeyError::Io(_))),
+                ) => return Err(e).with_context(|| format!("reading {}", ptau.display())),
                 // A file that does not verify is a verdict, as in snarkjs: the reason on
                 // an ERROR line and exit 1.
                 Err(e) => {

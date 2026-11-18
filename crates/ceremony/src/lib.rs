@@ -82,7 +82,7 @@ pub const PROTOCOL_GROTH16: u32 = 1;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum CeremonyError {
-    #[error("io: {0}")]
+    #[error(transparent)]
     Io(#[from] std::io::Error),
     /// Everything the shared container reader already reports: bad magic, a version past
     /// the supported one, a missing or duplicated section, a short section body.

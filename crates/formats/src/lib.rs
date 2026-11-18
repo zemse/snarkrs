@@ -362,7 +362,7 @@ pub struct VerifyingKey {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ZkeyError {
-    #[error("io: {0}")]
+    #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error("not a zkey file (bad magic {0:?})")]
     BadMagic([u8; 4]),
