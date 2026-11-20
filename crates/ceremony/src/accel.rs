@@ -30,8 +30,10 @@ const KEY_SUBCHUNK: usize = 2048;
 
 /// Points per rayon task in [`apply_fixed_g1`]. Each ladder step there is one scalar
 /// inversion for the task, next to a handful of vector products per eight points, so the
-/// task wants to be large; 8192 leaves a 65536-point chunk eight tasks to spread.
-const FIXED_SUBCHUNK: usize = 8192;
+/// task wants to be large, but its odd-multiple tables (three vectors of eight entries per
+/// eight points, 4 MB at 8192) want to stay near L2. 4096 measured a few percent faster
+/// than 8192 or 2048, and leaves `zkey contribute`'s 2^18-point chunk 64 tasks to spread.
+const FIXED_SUBCHUNK: usize = 4096;
 
 /// The group FFT on the CPU: [`crate::prepare::ifft`] behind the trait.
 pub struct CpuGroupFft;
