@@ -29,9 +29,7 @@ use snarkrs_field::raw::{RawField, RawFq, RawFq2, FQ_MOD};
 use snarkrs_field::{Fq, Fq2};
 
 use crate::xyzz::{to_projective, RawCurve, Xyzz};
-use crate::{
-    signed_digit, FastFill, OnesSum, Prescan, SideBuckets, Work,
-};
+use crate::{signed_digit, FastFill, OnesSum, Prescan, SideBuckets, Work};
 
 type G1 = snarkrs_field::g1::Config;
 type G2 = snarkrs_field::g2::Config;
@@ -606,7 +604,10 @@ impl Lanes for V2 {
             *fl = Fq2::new(lane_fq(&c0, l), lane_fq(&c1, l));
         }
         let inv = invert8(&f, |x| {
-            RawFq2::from_fq2(&x).inv().expect("inverse of zero").to_fq2()
+            RawFq2::from_fq2(&x)
+                .inv()
+                .expect("inverse of zero")
+                .to_fq2()
         });
         let (mut o0, mut o1) = ([[0u64; 8]; 5], [[0u64; 8]; 5]);
         for (l, il) in inv.iter().enumerate() {
@@ -1166,7 +1167,12 @@ impl<'a, P: IfmaCurve> Fill<'a, P> {
         let sign = _mm512_set1_epi64(NEG as i64);
         let neg = _mm512_test_epi64_mask(k, sign);
         let k = _mm512_andnot_si512(sign, k);
-        (_mm512_mul_epu32(b, row), _mm512_mul_epu32(k, row), valid, neg)
+        (
+            _mm512_mul_epu32(b, row),
+            _mm512_mul_epu32(k, row),
+            valid,
+            neg,
+        )
     }
 
     /// Flush the stragglers, convert the buckets back in one pass, then the scalar
@@ -1248,7 +1254,7 @@ impl<P: IfmaCurve> Fill<'_, P> {
         let n = self.occupied.len();
         let seg = crate::reduce_segment(n);
         let k = n / seg;
-        debug_assert!(n.is_power_of_two() && k % 8 == 0);
+        debug_assert!(n.is_power_of_two() && k.is_multiple_of(8));
         let groups = k / 8;
         let w = Self::W;
         let row = 2 * w;
@@ -1306,10 +1312,7 @@ impl<P: IfmaCurve> Fill<'_, P> {
                         bocc |= (self.occupied[j0 + l * seg] as u8) << l;
                     }
                     if bocc != 0 {
-                        let off = _mm512_add_epi64(
-                            lane_seg,
-                            _mm512_set1_epi64((j0 * row) as i64),
-                        );
+                        let off = _mm512_add_epi64(lane_seg, _mm512_set1_epi64((j0 * row) as i64));
                         let bk = self.buckets.as_ptr();
                         let bx = P::L::gather(bk, off, bocc, 0);
                         let by = P::L::gather(bk, off, bocc, w);

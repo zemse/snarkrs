@@ -90,7 +90,10 @@ fn divsteps_62_var(mut eta: i64, f0: u64, g0: u64) -> (i64, Trans) {
             // Cancel up to six bits of g, no more than i and no more than eta + 1.
             let limit = (eta as u32 + 1).min(i);
             let m = (u64::MAX >> (64 - limit)) & 63;
-            w = f.wrapping_mul(g).wrapping_mul(f.wrapping_mul(f).wrapping_sub(2)) & m;
+            w = f
+                .wrapping_mul(g)
+                .wrapping_mul(f.wrapping_mul(f).wrapping_sub(2))
+                & m;
         } else {
             // Up to four bits here, eta tending to be small on this side.
             let limit = (eta as u32 + 1).min(i);
@@ -127,10 +130,16 @@ fn update_de_62(d: &mut Signed62, e: &mut Signed62, t: &Trans, mi: &ModInfo) {
     let mut cd = u * d0 as i128 + v * e0 as i128;
     let mut ce = q * d0 as i128 + r * e0 as i128;
     md = md.wrapping_sub(
-        (mi.modulus_inv62.wrapping_mul(cd as u64).wrapping_add(md as u64) & M62) as i64,
+        (mi.modulus_inv62
+            .wrapping_mul(cd as u64)
+            .wrapping_add(md as u64)
+            & M62) as i64,
     );
     me = me.wrapping_sub(
-        (mi.modulus_inv62.wrapping_mul(ce as u64).wrapping_add(me as u64) & M62) as i64,
+        (mi.modulus_inv62
+            .wrapping_mul(ce as u64)
+            .wrapping_add(me as u64)
+            & M62) as i64,
     );
     cd += m[0] as i128 * md as i128;
     ce += m[0] as i128 * me as i128;

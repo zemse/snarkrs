@@ -127,7 +127,8 @@ impl GlvField for RawFq {
     }
 
     fn inv(self) -> RawFq {
-        RawFq::from_fq(&crate::safegcd::fq_inv(&self.to_fq()).expect("inverse of zero"))
+        // Inherent `RawFq::inv` (safegcd, crates/field/src/raw/inv.rs), not this trait method.
+        RawFq::inv(self).expect("inverse of zero")
     }
 
     type Norm = RawFq;
@@ -169,7 +170,7 @@ impl GlvField for RawFq2 {
     }
 
     fn inv(self) -> RawFq2 {
-        RawFq2::from_fq2(&crate::safegcd::fq2_inv(&self.to_fq2()).expect("inverse of zero"))
+        RawFq2::inv(self).expect("inverse of zero")
     }
 
     type Norm = RawFq;

@@ -769,11 +769,17 @@ mod tests {
         }
         for _ in 0..20000 {
             let x = Fq::rand(&mut rng);
-            assert_eq!(RawFq::from_fq(&x).inv().unwrap().to_fq(), x.inverse().unwrap());
+            assert_eq!(
+                RawFq::from_fq(&x).inv().unwrap().to_fq(),
+                x.inverse().unwrap()
+            );
         }
         for _ in 0..2000 {
             let x = Fq2::rand(&mut rng);
-            assert_eq!(RawFq2::from_fq2(&x).inv().unwrap().to_fq2(), x.inverse().unwrap());
+            assert_eq!(
+                RawFq2::from_fq2(&x).inv().unwrap().to_fq2(),
+                x.inverse().unwrap()
+            );
         }
         assert!(RawFq::ZERO.inv().is_none());
         assert!(RawFq2::ZERO.inv().is_none());
