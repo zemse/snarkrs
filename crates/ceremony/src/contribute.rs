@@ -1485,9 +1485,12 @@ fn check_h_section(
             have: ptau.power(),
         });
     }
-    let mut coeffs: Vec<Fr> = (0..domain_size)
-        .map(|_| transcript::fr_from_rng(rng))
-        .collect();
+    // Below 2^128 rather than uniform in Fr, as the random check's scalars are: a section
+    // that differs from the right one makes `r1 - r2` a nonzero linear form in the
+    // coefficients, which one drawn this way zeroes with probability at most 2^-128. Half
+    // the bits halve the multiexp against the ptau, whose upper windows are then empty;
+    // the transformed side is full width either way.
+    let mut coeffs = random_scalars(rng, domain_size);
     coeffs[domain_size - 1] = Fr::zero();
 
     let n = domain_size - 1;
