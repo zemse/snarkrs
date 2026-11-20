@@ -29,7 +29,9 @@ use snarkrs_field::raw::{RawField, RawFq, RawFq2, FQ_MOD};
 use snarkrs_field::{Fq, Fq2};
 
 use crate::xyzz::{to_projective, RawCurve, Xyzz};
-use crate::{affine_running_sum, batch_size, signed_digit, FastFill, Prescan, SideBuckets, Work};
+use crate::{
+    affine_running_sum, batch_size, signed_digit, FastFill, OnesSum, Prescan, SideBuckets, Work,
+};
 
 type G1 = snarkrs_field::g1::Config;
 type G2 = snarkrs_field::g2::Config;
@@ -673,6 +675,12 @@ macro_rules! ifma_fast_fill {
                 prepare(bases, scan)
             }
 
+            type Ones = Ones<Self>;
+
+            fn ones() -> Option<Ones<Self>> {
+                Ones::new()
+            }
+
             fn window_chunk(
                 prep: &Bases,
                 bases: &[Affine<Self>],
@@ -690,6 +698,155 @@ macro_rules! ifma_fast_fill {
 
 ifma_fast_fill!(G1);
 ifma_fast_fill!(G2);
+
+// ---------------------------------------------------------------------------
+// The ones sum
+// ---------------------------------------------------------------------------
+
+/// Groups of eight a [`Ones`] holds before it halves them, the 1024 points of
+/// [`OnesFold`](crate::OnesFold)'s buffer.
+const ONES_GROUPS: usize = 128;
+
+/// Groups left at the end that are not worth another inversion: a halving costs one
+/// scalar inversion, about 6 us, and four groups are 32 mixed additions, about the same.
+const ONES_MIN_GROUPS: usize = 4;
+
+/// [`OnesFold`](crate::OnesFold) eight points a vector. The points enter the 2^260 domain
+/// eight at a time as they arrive and stay there, structure of arrays, until `finish`, so a
+/// point costs its two conversion products once however many halvings it goes through.
+/// A halving adds group `i + half` into group `i` lane by lane behind one inversion, the
+/// arithmetic of [`Fill::flush_ifma`] without the gathers.
+// `IfmaCurve` stays private; only the two curve types reach `Ones` from outside.
+#[allow(private_bounds)]
+pub(crate) struct Ones<P: IfmaCurve> {
+    sx: [P::RF; 8],
+    sy: [P::RF; 8],
+    staged: usize,
+    gx: Vec<P::L>,
+    gy: Vec<P::L>,
+    saved: Vec<P::L>,
+    skips: Vec<u8>,
+    rest: Xyzz<P::RF>,
+}
+
+#[allow(private_bounds)]
+impl<P: IfmaCurve> Ones<P> {
+    /// `None` when the CPU has no IFMA.
+    fn new() -> Option<Self> {
+        if !available() {
+            return None;
+        }
+        Some(Ones {
+            sx: [P::RF::ZERO; 8],
+            sy: [P::RF::ZERO; 8],
+            staged: 0,
+            gx: Vec::new(),
+            gy: Vec::new(),
+            saved: Vec::new(),
+            skips: Vec::new(),
+            rest: Xyzz::ZERO,
+        })
+    }
+
+    #[inline(always)]
+    fn add_point(&mut self, x: P::RF, y: P::RF) {
+        self.sx[self.staged] = x;
+        self.sy[self.staged] = y;
+        self.staged += 1;
+        if self.staged == 8 {
+            // SAFETY: `new` checked the CPU.
+            unsafe { self.push_group() };
+        }
+    }
+
+    #[target_feature(enable = "avx512f,avx512ifma")]
+    unsafe fn push_group(&mut self) {
+        self.staged = 0;
+        if self.gx.len() == ONES_GROUPS {
+            self.halve();
+        }
+        self.gx.push(P::L::enter(&self.sx));
+        self.gy.push(P::L::enter(&self.sy));
+    }
+
+    /// Group `i` += group `i + half` for every `i` below `half`, an odd group out kept.
+    #[target_feature(enable = "avx512f,avx512ifma")]
+    unsafe fn halve(&mut self) {
+        let g = self.gx.len();
+        let half = g / 2;
+        let one = P::L::one();
+        let mut acc = one;
+        self.saved.clear();
+        self.skips.clear();
+        for i in 0..half {
+            let (lx, ly) = (self.gx[i], self.gy[i]);
+            let (ux, uy) = (self.gx[i + half], self.gy[i + half]);
+            let dx = ux.sub(&lx);
+            let same_x = dx.is_zero();
+            if same_x != 0 {
+                // The same point twice or a point and its negative, as in `OnesFold`: the
+                // upper point goes to `rest`, which knows both, and the lower one stays.
+                let (xs, ys) = (ux.leave(), uy.leave());
+                for l in 0..8 {
+                    if same_x >> l & 1 != 0 {
+                        self.rest.madd(xs[l], ys[l]);
+                    }
+                }
+            }
+            let den = P::L::select(same_x, &one, &dx);
+            self.saved
+                .extend_from_slice(&[acc, den, uy.sub(&ly), lx.add(&ux), lx, ly]);
+            self.skips.push(same_x);
+            acc = acc.mul(&den);
+        }
+        let mut inv = acc.invert();
+        for i in (0..half).rev() {
+            let s = &self.saved[i * SAVED..][..SAVED];
+            let d_inv = inv.mul(&s[0]);
+            inv = inv.mul(&s[1]);
+            let lambda = s[2].mul(&d_inv);
+            let x3 = lambda.mul(&lambda).sub(&s[3]);
+            let y3 = lambda.mul(&s[4].sub(&x3)).sub(&s[5]);
+            let skip = self.skips[i];
+            self.gx[i] = P::L::select(skip, &s[4], &x3);
+            self.gy[i] = P::L::select(skip, &s[5], &y3);
+        }
+        if g % 2 == 1 {
+            self.gx[half] = self.gx[g - 1];
+            self.gy[half] = self.gy[g - 1];
+        }
+        self.gx.truncate(g - half);
+        self.gy.truncate(g - half);
+    }
+
+    fn finish_ifma(mut self) -> Projective<P> {
+        // SAFETY: `new` checked the CPU.
+        unsafe {
+            while self.gx.len() > ONES_MIN_GROUPS {
+                self.halve();
+            }
+            for (x, y) in self.gx.iter().zip(&self.gy) {
+                for (x, y) in x.leave().into_iter().zip(y.leave()) {
+                    self.rest.madd(x, y);
+                }
+            }
+        }
+        for l in 0..self.staged {
+            self.rest.madd(self.sx[l], self.sy[l]);
+        }
+        to_projective(&self.rest)
+    }
+}
+
+impl<P: IfmaCurve> OnesSum<P> for Ones<P> {
+    #[inline(always)]
+    fn add(&mut self, x: P::RF, y: P::RF) {
+        self.add_point(x, y)
+    }
+    fn finish(self) -> Projective<P> {
+        self.finish_ifma()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // The fill

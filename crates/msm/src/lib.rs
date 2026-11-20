@@ -453,6 +453,54 @@ impl<P: RawCurve> OnesFold<P> {
     }
 }
 
+/// What [`prescan`] sums its one scalars with: [`FastFill::Ones`] where the CPU has it,
+/// else [`OnesFold`].
+enum AnyOnes<P: FastFill> {
+    Fast(P::Ones),
+    Slow(OnesFold<P>),
+}
+
+impl<P: FastFill> AnyOnes<P> {
+    fn new() -> Self {
+        match P::ones() {
+            Some(fast) => AnyOnes::Fast(fast),
+            None => AnyOnes::Slow(OnesFold::new()),
+        }
+    }
+
+    /// The caller guarantees `(x, y)` is not the point at infinity.
+    #[inline(always)]
+    fn add(&mut self, x: P::RF, y: P::RF) {
+        match self {
+            AnyOnes::Fast(f) => f.add(x, y),
+            AnyOnes::Slow(f) => f.add(x, y),
+        }
+    }
+
+    fn finish(self) -> Projective<P> {
+        match self {
+            AnyOnes::Fast(f) => f.finish(),
+            AnyOnes::Slow(f) => f.finish(),
+        }
+    }
+}
+
+/// A plain sum of affine points, none at infinity; see [`OnesFold`].
+trait OnesSum<P: RawCurve> {
+    fn add(&mut self, x: P::RF, y: P::RF);
+    fn finish(self) -> Projective<P>;
+}
+
+impl<P: RawCurve> OnesSum<P> for OnesFold<P> {
+    #[inline(always)]
+    fn add(&mut self, x: P::RF, y: P::RF) {
+        OnesFold::add(self, x, y)
+    }
+    fn finish(self) -> Projective<P> {
+        OnesFold::finish(self)
+    }
+}
+
 /// Splits the scalars into zero / one / general, once, before any window runs.
 ///
 /// `into_bigint` is a Montgomery reduction; calling it per window instead of per scalar is
@@ -483,7 +531,7 @@ impl<P: RawCurve> OnesFold<P> {
 ///
 /// [`Work::Constant`] processes every scalar through the general path and gives up both
 /// fast paths and the compaction.
-fn prescan<P: RawCurve>(
+fn prescan<P: FastFill>(
     bases: &[Affine<P>],
     scalars: &[Fr],
     n: usize,
@@ -496,7 +544,7 @@ where
     let run = |lo: usize, hi: usize| {
         let mut idx = Vec::new();
         let mut bigints = Vec::new();
-        let mut ones = OnesFold::<P>::new();
+        let mut ones = AnyOnes::<P>::new();
         for i in lo..hi {
             let s = &scalars[i];
             if work == Work::Variable && s.is_zero() {
@@ -573,7 +621,7 @@ where
 /// Each chunk compacts into its own front in parallel, then the chunks are moved down one
 /// after another. A chunk lands at or below where it starts, which is what makes the
 /// serial order safe; on a dense vector like H no chunk moves at all.
-fn prescan_in_place<'a, P: RawCurve>(
+fn prescan_in_place<'a, P: FastFill>(
     bases: &[Affine<P>],
     scalars: &'a mut [Fr],
     work: Work,
@@ -591,7 +639,7 @@ where
     debug_assert!(n <= u32::MAX as usize);
     let run = |lo: usize, chunk: &mut [Fr]| {
         let mut idx = Vec::new();
-        let mut ones = OnesFold::<P>::new();
+        let mut ones = AnyOnes::<P>::new();
         for j in 0..chunk.len() {
             let s = chunk[j];
             let i = lo + j;
@@ -1582,6 +1630,10 @@ trait FastFill: RawCurve {
     type Prepared: Sync;
     /// `None` when the replacement cannot run here.
     fn prepare(bases: &[Affine<Self>], scan: &Prescan<Self>) -> Option<Self::Prepared>;
+    /// The replacement for [`OnesFold`].
+    type Ones: OnesSum<Self>;
+    /// `None` when the replacement cannot run here.
+    fn ones() -> Option<Self::Ones>;
     fn window_chunk(
         prep: &Self::Prepared,
         bases: &[Affine<Self>],
@@ -1600,6 +1652,10 @@ macro_rules! no_fast_fill {
         impl FastFill for $cfg {
             type Prepared = core::convert::Infallible;
             fn prepare(_: &[Affine<Self>], _: &Prescan<Self>) -> Option<Self::Prepared> {
+                None
+            }
+            type Ones = OnesFold<Self>;
+            fn ones() -> Option<OnesFold<Self>> {
                 None
             }
             fn window_chunk(
@@ -2038,14 +2094,18 @@ mod tests {
         assert_eq!(msm.msm_g2(&g2, &ones), want2);
     }
 
-    fn ones_fold_case<P: RawCurve>(points: &[Affine<P>]) {
+    /// [`OnesFold`] and, where the CPU has one, the [`FastFill::Ones`] replacement.
+    fn ones_fold_case<P: FastFill>(points: &[Affine<P>]) {
         let mut fold = OnesFold::<P>::new();
+        let mut any = AnyOnes::<P>::new();
         for p in points {
             let (x, y) = P::raw_xy(p);
             fold.add(x, y);
+            any.add(x, y);
         }
         let want = points.iter().fold(Projective::<P>::zero(), |a, p| a + p);
         assert_eq!(fold.finish(), want, "n = {}", points.len());
+        assert_eq!(any.finish(), want, "n = {}, fast path", points.len());
     }
 
     /// Every size at which the fold changes path: nothing to add, too few points for an
@@ -2065,7 +2125,7 @@ mod tests {
     /// negative, and a buffer of nothing else.
     #[test]
     fn ones_fold_survives_equal_and_opposite_points() {
-        fn case<P: RawCurve>(rng: &mut impl Rng)
+        fn case<P: FastFill>(rng: &mut impl Rng)
         where
             Projective<P>: UniformRand,
         {
@@ -2435,7 +2495,7 @@ mod tests {
     #[ignore = "benchmark, meaningless in a debug build"]
     fn bench_ones_fold() {
         use std::time::Instant;
-        fn case<P: RawCurve>(name: &str, rng: &mut impl Rng)
+        fn case<P: FastFill>(name: &str, rng: &mut impl Rng)
         where
             Projective<P>: UniformRand,
         {
@@ -2443,8 +2503,8 @@ mod tests {
                 let points: Vec<Affine<P>> = walk_points(n, rng);
                 let reps = (1 << 20) / n;
                 let ns = |t: Instant| t.elapsed().as_secs_f64() * 1e9 / (reps * n) as f64;
-                let mut best = [f64::MAX; 2];
-                let mut out = [Projective::<P>::zero(); 2];
+                let mut best = [f64::MAX; 3];
+                let mut out = [Projective::<P>::zero(); 3];
                 for _ in 0..7 {
                     let t = Instant::now();
                     for _ in 0..reps {
@@ -2466,13 +2526,22 @@ mod tests {
                         out[1] = fold.finish();
                     }
                     best[1] = best[1].min(ns(t));
+                    let t = Instant::now();
+                    for _ in 0..reps {
+                        let mut fold = AnyOnes::<P>::new();
+                        for p in &points {
+                            let (x, y) = P::raw_xy(p);
+                            fold.add(x, y);
+                        }
+                        out[2] = fold.finish();
+                    }
+                    best[2] = best[2].min(ns(t));
                 }
                 assert_eq!(out[0], out[1]);
+                assert_eq!(out[0], out[2]);
                 println!(
-                    "{name} n={n:6}  madd chain {:6.1} ns  fold {:6.1} ns a point  ratio {:.2}",
-                    best[0],
-                    best[1],
-                    best[1] / best[0]
+                    "{name} n={n:6}  madd chain {:6.1} ns  fold {:6.1}  fast fold {:6.1} ns a point",
+                    best[0], best[1], best[2]
                 );
             }
         }
