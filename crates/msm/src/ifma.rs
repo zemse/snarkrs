@@ -200,6 +200,50 @@ fn mul(a: &V, b: &V) -> V {
     [t[0], t[1], t[2], t[3], t[4]]
 }
 
+/// `a^2 / 2^260`, the same value [`mul`] gives for `mul(a, a)` and under the same input
+/// bounds, from 30 limb products instead of 50: the ten cross products are taken once and
+/// doubled. The product is summed in ten columns first and reduced after, row by row as
+/// in [`mul`], so the reduction is the same 55 products. No column overflows: each holds
+/// at most twelve terms below 2^53 (doubled cross terms) before its carry is taken.
+#[inline]
+#[target_feature(enable = "avx512f,avx512ifma")]
+fn sqr(a: &V) -> V {
+    let z = _mm512_setzero_si512();
+    let mask = _mm512_set1_epi64(MASK as i64);
+    let k0 = _mm512_set1_epi64(K0 as i64);
+    let p = splat(&P);
+    let mut t = [z; 10];
+    for i in 0..5 {
+        for j in i + 1..5 {
+            t[i + j] = _mm512_madd52lo_epu64(t[i + j], a[i], a[j]);
+            t[i + j + 1] = _mm512_madd52hi_epu64(t[i + j + 1], a[i], a[j]);
+        }
+    }
+    for c in t.iter_mut() {
+        *c = _mm512_add_epi64(*c, *c);
+    }
+    for i in 0..5 {
+        t[2 * i] = _mm512_madd52lo_epu64(t[2 * i], a[i], a[i]);
+        t[2 * i + 1] = _mm512_madd52hi_epu64(t[2 * i + 1], a[i], a[i]);
+    }
+    for i in 0..5 {
+        let m = _mm512_madd52lo_epu64(z, t[i], k0);
+        for j in 0..5 {
+            t[i + j] = _mm512_madd52lo_epu64(t[i + j], m, p[j]);
+        }
+        for j in 0..5 {
+            t[i + j + 1] = _mm512_madd52hi_epu64(t[i + j + 1], m, p[j]);
+        }
+        t[i + 1] = _mm512_add_epi64(t[i + 1], _mm512_srli_epi64::<52>(t[i]));
+    }
+    let mut r = [t[5], t[6], t[7], t[8], t[9]];
+    for j in 0..4 {
+        r[j + 1] = _mm512_add_epi64(r[j + 1], _mm512_srli_epi64::<52>(r[j]));
+        r[j] = _mm512_and_si512(r[j], mask);
+    }
+    r
+}
+
 /// `x - m` where that does not borrow, else `x`. Normalised limbs in and out.
 #[inline]
 #[target_feature(enable = "avx512f,avx512ifma")]

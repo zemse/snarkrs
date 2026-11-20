@@ -5,8 +5,10 @@
 //! takes the same doublings and additions in the same order, and the batch-affine ladder of
 //! [`crate::glv::mul_batch_xyzz_in`] runs lane-parallel with no per-point scheduling at all:
 //! GLV-split `k`, one width-[`W`](crate::glv) NAF per half, a table of odd multiples per
-//! point (the `phi` half reads the same table through `beta x`), and one shared inversion
-//! per ladder step, through Montgomery's trick over two interleaved chains of vectors.
+//! point (the `phi` half reads it through `beta x`, kept as a second x table), and one
+//! shared inversion per ladder step, through Montgomery's trick over two interleaved chains
+//! of vectors. A step's doubling and its first addition are one `2P + Q` (Eisentraeger,
+//! Lauter and Montgomery), and squares go through [`sqr`].
 //!
 //! Arithmetic is the parent module's radix-2^52 Montgomery field. The output is affine,
 //! which is canonical, so the bytes written are those of any other way of computing it.
@@ -87,7 +89,16 @@ fn mul_fixed_g1_avx(points: &mut [G1Affine], k: &Fr) -> bool {
         for e in 1..tlen {
             let mut ax = tx[(e - 1) * g..e * g].to_vec();
             let mut ay = ty[(e - 1) * g..e * g].to_vec();
-            if !batch_add(&mut ax, &mut ay, &dx, &dy, &mut pre) {
+            if !batch_add(
+                &mut ax,
+                &mut ay,
+                &Entry {
+                    x: &dx,
+                    y: &dy,
+                    flip: false,
+                },
+                &mut pre,
+            ) {
                 return false;
             }
             tx.extend_from_slice(&ax);
@@ -95,32 +106,49 @@ fn mul_fixed_g1_avx(points: &mut [G1Affine], k: &Fr) -> bool {
         }
     }
 
+    // The `phi` half reads the table through `beta x`, taken once per entry here rather
+    // than once per addition.
     // SAFETY: the target features are enabled here.
     let beta = unsafe { V::enter(&[RawFq(BETA.0 .0); 8]) };
-    let zero = [_mm512_setzero_si512(); 5];
-    let (mut qx, mut qy) = (vec![zero; g], vec![zero; g]);
+    let tbx: Vec<V> = tx.iter().map(|x| mul(x, &beta)).collect();
     let (mut ax, mut ay): (Vec<V>, Vec<V>) = (Vec::new(), Vec::new());
+    let mut lam: Vec<V> = Vec::new();
     for s in (0..steps).rev() {
-        if !ax.is_empty() {
-            batch_dbl(&mut ax, &mut ay, &mut pre);
-        }
+        let mut doubled = ax.is_empty();
         for (d, phi, neg) in [(d1[s], false, k1 < 0), (d2[s], true, k2 < 0)] {
             if d == 0 {
                 continue;
             }
             let e = (d.unsigned_abs() >> 1) as usize;
             let flip = (d < 0) != neg;
-            let (ex, ey) = (&tx[e * g..(e + 1) * g], &ty[e * g..(e + 1) * g]);
-            for j in 0..g {
-                qx[j] = if phi { mul(&ex[j], &beta) } else { ex[j] };
-                qy[j] = if flip { sub(&zero, &ey[j]) } else { ey[j] };
-            }
+            let table = if phi { &tbx } else { &tx };
+            let q = Entry {
+                x: &table[e * g..(e + 1) * g],
+                y: &ty[e * g..(e + 1) * g],
+                flip,
+            };
             if ax.is_empty() {
-                ax.clone_from(&qx);
-                ay.clone_from(&qy);
-            } else if !batch_add(&mut ax, &mut ay, &qx, &qy, &mut pre) {
+                ax = q.x.to_vec();
+                ay = if flip {
+                    q.y.iter().map(|y| sub(&splat(&[0; 5]), y)).collect()
+                } else {
+                    q.y.to_vec()
+                };
+                continue;
+            }
+            let ok = if doubled {
+                batch_add(&mut ax, &mut ay, &q, &mut pre)
+            } else {
+                doubled = true;
+                lam.resize(2 * g, [_mm512_setzero_si512(); 5]);
+                batch_dbl_add(&mut ax, &mut ay, &q, &mut pre, &mut lam)
+            };
+            if !ok {
                 return false;
             }
+        }
+        if !doubled {
+            batch_dbl(&mut ax, &mut ay, &mut pre);
         }
     }
 
@@ -214,6 +242,13 @@ fn invert_groups(
     true
 }
 
+/// One table entry for every group, negated where `flip` is set.
+struct Entry<'a> {
+    x: &'a [V],
+    y: &'a [V],
+    flip: bool,
+}
+
 /// `(x, y) <- 2 (x, y)` for every lane: `l = 3 x^2 / 2 y`, `x' = l^2 - 2 x`,
 /// `y' = l (x - x') - y`. No point of G1 has `y = 0`.
 #[target_feature(enable = "avx512f,avx512ifma")]
@@ -231,9 +266,9 @@ fn batch_dbl(x: &mut [V], y: &mut [V], pre: &mut [V]) {
         },
         |j, inv| unsafe {
             let (px, py) = (*xr.add(j), *yr.add(j));
-            let xx = mul(&px, &px);
+            let xx = sqr(&px);
             let l = mul(&add_nr(&add_nr(&xx, &xx), &xx), inv);
-            let x3 = sub(&sub(&mul(&l, &l), &px), &px);
+            let x3 = sub(&sub(&sqr(&l), &px), &px);
             let y3 = sub(&mul(&l, &sub_nr(&px, &x3)), &py);
             *xr.add(j) = x3;
             *yr.add(j) = y3;
@@ -242,13 +277,17 @@ fn batch_dbl(x: &mut [V], y: &mut [V], pre: &mut [V]) {
     debug_assert!(ok, "a G1 point of order two");
 }
 
-/// `(x, y) <- (x, y) + (qx, qy)` for every lane: `l = (qy - y) / (qx - x)`,
+/// `(x, y) <- (x, y) + q` for every lane: `l = (qy - y) / (qx - x)`,
 /// `x' = l^2 - x - qx`, `y' = l (x - x') - y`. `false`, with nothing changed, when a lane
 /// has `x = qx`.
+///
+/// A negated `q` is not materialised: with `m = (qy + y) / (qx - x)` the slope is `-m`,
+/// which leaves `x'` as it was and makes `y' = m (x' - x) - y`.
 #[target_feature(enable = "avx512f,avx512ifma")]
-fn batch_add(x: &mut [V], y: &mut [V], qx: &[V], qy: &[V], pre: &mut [V]) -> bool {
+fn batch_add(x: &mut [V], y: &mut [V], q: &Entry, pre: &mut [V]) -> bool {
     let g = x.len();
     let (xr, yr) = (x.as_mut_ptr(), y.as_mut_ptr());
+    let (qx, qy, flip) = (q.x, q.y, q.flip);
     // SAFETY: as in `batch_dbl`.
     invert_groups(
         g,
@@ -256,11 +295,71 @@ fn batch_add(x: &mut [V], y: &mut [V], qx: &[V], qy: &[V], pre: &mut [V]) -> boo
         |j| unsafe { sub_nr(&qx[j], &*xr.add(j)) },
         |j, inv| unsafe {
             let (px, py) = (*xr.add(j), *yr.add(j));
-            let l = mul(&sub_nr(&qy[j], &py), inv);
-            let x3 = sub(&sub(&mul(&l, &l), &px), &qx[j]);
-            let y3 = sub(&mul(&l, &sub_nr(&px, &x3)), &py);
+            if flip {
+                let m = mul(&add_nr(&qy[j], &py), inv);
+                let x3 = sub(&sub(&sqr(&m), &px), &qx[j]);
+                *yr.add(j) = sub(&mul(&m, &sub_nr(&x3, &px)), &py);
+                *xr.add(j) = x3;
+            } else {
+                let l = mul(&sub_nr(&qy[j], &py), inv);
+                let x3 = sub(&sub(&sqr(&l), &px), &qx[j]);
+                *yr.add(j) = sub(&mul(&l, &sub_nr(&px, &x3)), &py);
+                *xr.add(j) = x3;
+            }
+        },
+    )
+}
+
+/// `(x, y) <- 2 (x, y) + q` for every lane as `((x, y) + q) + (x, y)`, which never needs
+/// the `y` of the intermediate sum (Eisentraeger, Lauter and Montgomery): with `l1` the
+/// slope of the first addition and `x2 = l1^2 - x - qx`, the second slope is
+/// `l2 = -l1 - 2 y / (x2 - x)`, then `x' = l2^2 - x - x2` and `y' = l2 (x - x') - y`.
+/// Two shared inversions as a doubling and an addition take, two products fewer.
+///
+/// `false`, with nothing changed, when a lane has `x = qx` or `x2 = x`; both depend only
+/// on the scalar. `scratch` is twice the length, holding `l1` and `x2` between the passes.
+#[target_feature(enable = "avx512f,avx512ifma")]
+fn batch_dbl_add(x: &mut [V], y: &mut [V], q: &Entry, pre: &mut [V], scratch: &mut [V]) -> bool {
+    let g = x.len();
+    let (qx, qy, flip) = (q.x, q.y, q.flip);
+    let (lam, x2) = scratch.split_at_mut(g);
+    let (xs, ys): (&[V], &[V]) = (x, y);
+    let (x2r, lr) = (x2.as_mut_ptr(), lam.as_mut_ptr());
+    // First pass: `l1` and `x2` only. `l1` is kept with its sign, so a flipped `q` is
+    // `l1 = -(qy + y) / (qx - x)`.
+    let ok = invert_groups(
+        g,
+        pre,
+        |j| sub_nr(&qx[j], &xs[j]),
+        |j, inv| unsafe {
+            let l = if flip {
+                sub(&splat(&[0; 5]), &mul(&add_nr(&qy[j], &ys[j]), inv))
+            } else {
+                mul(&sub_nr(&qy[j], &ys[j]), inv)
+            };
+            *x2r.add(j) = sub(&sub(&sqr(&l), &xs[j]), &qx[j]);
+            *lr.add(j) = l;
+        },
+    );
+    if !ok {
+        return false;
+    }
+    // A zero `x2 - x` would leave `x` changed by nothing yet, so it is checked before the
+    // second pass writes anything: `invert_groups` refuses before its first callback.
+    let (xr, yr) = (x.as_mut_ptr(), y.as_mut_ptr());
+    // SAFETY: as in `batch_dbl`; `den` reads `x` at `j` before `f` writes it.
+    invert_groups(
+        g,
+        pre,
+        |j| unsafe { sub_nr(&x2[j], &*xr.add(j)) },
+        |j, inv| unsafe {
+            let (px, py) = (*xr.add(j), *yr.add(j));
+            // l2 = -l1 - 2 y / (x2 - x) = -(l1 + 2 y inv).
+            let t = add_nr(&lam[j], &mul(&add_nr(&py, &py), inv));
+            let x3 = sub(&sub(&sqr(&t), &px), &x2[j]);
+            // y' = l2 (x - x3) - y = t (x3 - x) - y.
+            *yr.add(j) = sub(&mul(&t, &sub_nr(&x3, &px)), &py);
             *xr.add(j) = x3;
-            *yr.add(j) = y3;
         },
     )
 }
