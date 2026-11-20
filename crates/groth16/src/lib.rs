@@ -418,8 +418,8 @@ pub trait PreparedCircuit: Send + Sync {
     /// groups in sequence, and a backend that has somewhere concurrent to put stages 5-8
     /// overrides this; the Metal backend does, on its second command queue.
     fn h_and_msms(&self, witness: &[Fr], t: &mut StageTimings) -> Result<MsmOutputs, ProveError> {
-        let h = stage!("stages 0-4 compute_h", self.compute_h(witness, t))?;
-        stage!("stages 5-9 msms", self.msms(witness, &h, t))
+        let h = stage!("stages 0-4 compute_h (generic)", self.compute_h(witness, t))?;
+        stage!("stages 5-9 msms (generic)", self.msms(witness, &h, t))
     }
 
     /// Stages 1-9 with stage 0 done by the caller: `a_rows[i]` and `b_rows[i]` are

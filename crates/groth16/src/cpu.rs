@@ -354,7 +354,7 @@ impl PreparedCircuit for CpuCircuit {
             backend: "cpu",
             reason: "compute_h output came from another backend".to_string(),
         })?;
-        let h_msm = || stage!("s9 MSM H -> G1", self.msm.msm_g1(&self.pk.h_query, h));
+        let h_msm = || stage!("s9 MSM H -> G1 (borrowed)", self.msm.msm_g1(&self.pk.h_query, h));
         self.msms_with(witness, h.len(), h_msm, t)
     }
 
@@ -414,7 +414,7 @@ impl PreparedCircuit for CpuCircuit {
             rayon::join(|| pad(a_rows), || pad(b_rows))
         );
         let c: Vec<Fr> = stage!(
-            "s0 build C = A*B pointwise",
+            "s0 build C = A*B pointwise (rows)",
             a.par_iter()
                 .zip(b.par_iter())
                 .map(|(x, y)| *x * y)
@@ -432,11 +432,11 @@ impl PreparedCircuit for CpuCircuit {
                 let len = h.len();
                 let h_msm = || {
                     stage!(
-                        "s9 MSM H -> G1",
+                        "s9 MSM H -> G1 (rows)",
                         self.msm.msm_g1_in_place(&self.pk.h_query, h)
                     )
                 };
-                stage!("stages 5-9 msms", self.msms_with(witness, len, h_msm, t))
+                stage!("stages 5-9 msms (rows)", self.msms_with(witness, len, h_msm, t))
             }
             HBasis::GnarkBitReversed => {
                 let start = Instant::now();
@@ -450,11 +450,11 @@ impl PreparedCircuit for CpuCircuit {
                 let scale = -Fr::from(2u64).inverse().expect("2 is invertible mod r");
                 let h_msm = || {
                     stage!(
-                        "s9 MSM H -> G1",
+                        "s9 MSM H -> G1 (gnark rows)",
                         self.msm.msm_g1_in_place(&self.pk.h_query, &mut h[..len]) * scale
                     )
                 };
-                stage!("stages 5-9 msms", self.msms_with(witness, len, h_msm, t))
+                stage!("stages 5-9 msms (gnark rows)", self.msms_with(witness, len, h_msm, t))
             }
         }
     }
