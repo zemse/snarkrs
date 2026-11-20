@@ -40,7 +40,7 @@ pub const LAMBDA: Fr =
     MontFp!("21888242871839275217838484774961031246154997185409878258781734729429964517155");
 
 /// A cube root of unity in `Fq` with `(beta x, y) = [LAMBDA] (x, y)` on G1.
-const BETA: Fq =
+pub(crate) const BETA: Fq =
     MontFp!("21888242871839275220042445260109153167277707414472061641714758635765020556616");
 
 /// `beta^2 = -1 - beta`, which is `[LAMBDA]` on G2.
@@ -61,7 +61,7 @@ const G2: [u64; 2] = [0xd91d232ec7e0b3d7, 0x2];
 const W: u32 = 5;
 
 /// Digits per half: 127 bits plus the one wNAF can carry past the top.
-const DIGITS: usize = 130;
+pub(crate) const DIGITS: usize = 130;
 
 /// The coordinate field of a group with the endomorphism: G1's `RawFq` or G2's `RawFq2`.
 /// Keyed on the field rather than the curve so code generic over [`RawField`], like the
@@ -336,7 +336,7 @@ fn mul_shift_round(k: &[u64; 4], g: &[u64]) -> u128 {
 
 /// Signed width-`W` NAF of `k`, least significant digit first. Returns the digit count.
 #[inline]
-fn wnaf(mut k: u128, out: &mut [i8; DIGITS]) -> usize {
+pub(crate) fn wnaf(mut k: u128, out: &mut [i8; DIGITS]) -> usize {
     let mut n = 0;
     while k != 0 {
         let d = if k & 1 == 1 {
@@ -423,6 +423,21 @@ fn add_digit<F: RawField>(acc: &mut Xyzz<F>, table: &[Xyzz<F>], d: i8, neg: bool
         acc.add_assign(&Xyzz { y: e.y.neg(), ..*e });
     } else {
         acc.add_assign(e);
+    }
+}
+
+/// `P_i <- [k] P_i` for every point, one scalar for all, when a lane-parallel kernel can:
+/// AVX-512 IFMA on x86_64, eight points a vector. With one scalar every point takes the
+/// same ladder, so nothing is scheduled per point. `false`, with the points untouched,
+/// where there is no such kernel or the scalar meets an exceptional addition; the caller
+/// then takes [`mul_batch_in`]. The output is affine and so the same bytes either way.
+pub fn mul_fixed_g1(points: &mut [snarkrs_field::G1Affine], k: &Fr) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    return crate::ifma::mul_fixed_g1(points, k);
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (points, k);
+        false
     }
 }
 

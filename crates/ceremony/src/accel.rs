@@ -28,6 +28,11 @@ use crate::prepare::PrepareCurve;
 /// sixteen response chunks (262144 G1 or 131072 G2 points), zkey contribute with 65536.
 const KEY_SUBCHUNK: usize = 2048;
 
+/// Points per rayon task in [`apply_fixed_g1`]. Each ladder step there is one scalar
+/// inversion for the task, next to a handful of vector products per eight points, so the
+/// task wants to be large; 8192 leaves a 65536-point chunk eight tasks to spread.
+const FIXED_SUBCHUNK: usize = 8192;
+
 /// The group FFT on the CPU: [`crate::prepare::ifft`] behind the trait.
 pub struct CpuGroupFft;
 
@@ -56,7 +61,11 @@ impl KeyScale for CpuKeyScale {
     }
 
     fn apply_key_g1(&self, points: &mut [G1Affine], first: Fr, inc: Fr) -> Result<(), AccelError> {
-        apply_key(points, first, inc);
+        if inc == Fr::ONE {
+            apply_fixed_g1(points, first);
+        } else {
+            apply_key(points, first, inc);
+        }
         Ok(())
     }
 
@@ -64,6 +73,23 @@ impl KeyScale for CpuKeyScale {
         apply_key(points, first, inc);
         Ok(())
     }
+}
+
+/// `P_i *= k` over one chunk, in place: [`apply_key`] with `inc = 1`, which is all of
+/// `zkey contribute` and `zkey beacon`. One scalar means one ladder for every point, so
+/// [`glv::mul_fixed_g1`] runs it eight points a vector where it can; a chunk it declines
+/// goes through [`glv::mul_batch_in`] exactly as [`apply_key`] would take it.
+fn apply_fixed_g1(points: &mut [G1Affine], k: Fr) {
+    points
+        .par_chunks_mut(FIXED_SUBCHUNK)
+        .for_each_init(glv::BatchState::default, |st, chunk| {
+            if glv::mul_fixed_g1(chunk, &k) {
+                return;
+            }
+            let scalars = vec![k; chunk.len()];
+            let input = chunk.to_vec();
+            glv::mul_batch_in(st, &input, &scalars, chunk);
+        });
 }
 
 /// `P_i *= first * inc^i` over one chunk, in place.

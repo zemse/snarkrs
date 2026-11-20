@@ -959,5 +959,8 @@ unsafe fn export<L: Lanes>(buckets: &[u64], bx: &mut [L::Raw], by: &mut [L::Raw]
     }
 }
 
+mod fixed;
+pub(crate) use fixed::mul_fixed_g1;
+
 #[cfg(test)]
 mod tests;
