@@ -22,7 +22,7 @@
 //! integer quotients; only the bound depends on the rounding.
 
 use ark_ec::short_weierstrass::Affine;
-use ark_ff::{Field, MontFp, PrimeField};
+use ark_ff::{MontFp, PrimeField};
 use snarkrs_field::raw::{RawField, RawFq, RawFq2};
 use snarkrs_field::{Fq, Fq2, Fr};
 
@@ -33,6 +33,19 @@ pub use batch::{
     mul_batch, mul_batch_in, mul_batch_xyzz, mul_batch_xyzz_in, mul_sum_batch_xyzz_in,
     mul_sums_xyzz_in, BatchState,
 };
+
+/// Whether this machine runs [`mul_batch_xyzz`] on `F` eight points a vector (AVX-512
+/// IFMA), where a batch pays from a few dozen points rather than a few hundred.
+pub fn batch_is_vectorised<F: GlvField>() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        batch::lanes_available::<F>()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
 
 /// `lambda`, the eigenvalue of `phi` on G1 (ark-bn254's G1 `LAMBDA`). On G2 the same
 /// `beta` gives `lambda^2`, so G2's [`GlvField::endo`] uses `beta^2` to stay on this one.
@@ -66,7 +79,7 @@ const DIGITS: usize = 130;
 /// The coordinate field of a group with the endomorphism: G1's `RawFq` or G2's `RawFq2`.
 /// Keyed on the field rather than the curve so code generic over [`RawField`], like the
 /// group FFT, can call it.
-pub trait GlvField: RawField {
+pub trait GlvField: RawField + 'static {
     /// How many parts [`GlvField::split`] cuts a scalar into, for [`mul_batch_xyzz`]: two
     /// on G1, four on G2, which also has `psi`.
     const DIMS: usize;
@@ -114,7 +127,7 @@ impl GlvField for RawFq {
     }
 
     fn inv(self) -> RawFq {
-        RawFq::from_fq(&self.to_fq().inverse().expect("inverse of zero"))
+        RawFq::from_fq(&crate::safegcd::fq_inv(&self.to_fq()).expect("inverse of zero"))
     }
 
     type Norm = RawFq;
@@ -156,7 +169,7 @@ impl GlvField for RawFq2 {
     }
 
     fn inv(self) -> RawFq2 {
-        RawFq2::from_fq2(&self.to_fq2().inverse().expect("inverse of zero"))
+        RawFq2::from_fq2(&crate::safegcd::fq2_inv(&self.to_fq2()).expect("inverse of zero"))
     }
 
     type Norm = RawFq;
@@ -357,6 +370,35 @@ fn wnaf(mut k: u128, out: &mut [i8; DIGITS]) -> usize {
         k >>= 1;
     }
     n
+}
+
+/// [`wnaf`]'s nonzero digits only, as `f(position, digit)` in increasing position, skipping
+/// each run of zeros with one `trailing_zeros` rather than a step a bit. Returns the digit
+/// count `wnaf` would, which is one past the last nonzero digit. The batch ladder stores
+/// digits step-major, so a digit a store is a store a cache line; this makes it a sixth of
+/// them, the zeros being already in place.
+#[inline]
+fn wnaf_sparse(mut k: u128, mut f: impl FnMut(usize, i8)) -> usize {
+    let mut pos = 0usize;
+    let mut len = 0;
+    while k != 0 {
+        let z = k.trailing_zeros();
+        k >>= z;
+        pos += z as usize;
+        let m = (k & ((1 << W) - 1)) as i8;
+        let d = if m >= 1 << (W - 1) { m - (1 << W) } else { m };
+        f(pos, d);
+        len = pos + 1;
+        // `k - d` with `d` signed: a negative digit adds. Then the digit's own bit, now zero.
+        k = if d >= 0 {
+            k - d as u128
+        } else {
+            k + (-d) as u128
+        };
+        k >>= 1;
+        pos += 1;
+    }
+    len
 }
 
 /// `[k] p`. Never inlined: a call is tens of microseconds, so the call costs nothing,
@@ -565,6 +607,38 @@ mod tests {
                 p.iter().all(|x| x.unsigned_abs() < 1 << 66),
                 "k = {k}: {p:?}"
             );
+        }
+    }
+
+    #[test]
+    fn sparse_wnaf_is_wnaf_without_the_zeros() {
+        let mut x: u128 = 0x9e37_79b9_7f4a_7c15_f39c_c060_5ced_c834;
+        let mut ks = vec![
+            0u128,
+            1,
+            15,
+            16,
+            17,
+            31,
+            1 << 126,
+            (1 << 127) - 1,
+            u128::MAX >> 2,
+        ];
+        for _ in 0..2000 {
+            x = x
+                .wrapping_mul(0x2545_f491_4f6c_dd1d_0000_0000_0000_0001)
+                .wrapping_add(1);
+            ks.push(x >> (x % 61) as u32 >> 1);
+        }
+        for k in ks {
+            let mut d = [0i8; DIGITS];
+            let n = wnaf(k, &mut d);
+            let mut s = [0i8; DIGITS];
+            let m = wnaf_sparse(k, |i, v| {
+                assert_ne!(v, 0);
+                s[i] = v;
+            });
+            assert_eq!((m, s), (n, d), "k = {k}");
         }
     }
 

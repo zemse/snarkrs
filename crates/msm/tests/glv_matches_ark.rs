@@ -274,3 +274,43 @@ fn g1_sum_batch_matches_ark() {
 fn g2_sum_batch_matches_ark() {
     check_sum::<snarkrs_field::g2::Config>("G2", G2Projective::rand);
 }
+
+/// A batch long enough for many lane blocks and every chain of the shared inversion, of a
+/// length that leaves a partial block, with a run of the edge scalars spliced in and a
+/// point repeated under opposite scalars (an exceptional addition mid-batch). Run twice on
+/// one state, so reused working memory is covered too.
+fn check_long<P: RawCurve + ark_ec::CurveConfig<ScalarField = Fr>>(
+    label: &str,
+    rand: impl Fn(&mut StdRng) -> Projective<P>,
+) where
+    Projective<P>: std::fmt::Debug,
+    P::RF: GlvField,
+{
+    let mut rng = StdRng::seed_from_u64(0x10e6);
+    let n = 1029;
+    let mut ks: Vec<Fr> = (0..n).map(|_| Fr::rand(&mut rng)).collect();
+    let edge = scalars(&mut rng);
+    ks[500..500 + 18].copy_from_slice(&edge[..18]);
+    let mut ps: Vec<Affine<P>> = (0..n).map(|_| rand(&mut rng).into_affine()).collect();
+    ps[700] = Affine::<P>::identity();
+    ps[801] = ps[800];
+    ks[801] = -ks[800];
+    let mut out = vec![Affine::<P>::identity(); n];
+    let mut st = glv::BatchState::default();
+    for _ in 0..2 {
+        glv::mul_batch_in(&mut st, &ps, &ks, &mut out);
+        for i in 0..n {
+            assert_eq!(out[i], (ps[i] * ks[i]).into_affine(), "{label}: lane {i}");
+        }
+    }
+}
+
+#[test]
+fn g1_long_batch_matches_ark() {
+    check_long::<snarkrs_field::g1::Config>("G1", G1Projective::rand);
+}
+
+#[test]
+fn g2_long_batch_matches_ark() {
+    check_long::<snarkrs_field::g2::Config>("G2", G2Projective::rand);
+}

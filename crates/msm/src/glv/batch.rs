@@ -17,10 +17,18 @@ use ark_ec::short_weierstrass::Affine;
 use snarkrs_field::raw::RawField;
 use snarkrs_field::Fr;
 
-use super::{wnaf, GlvField, DIGITS, W};
+use super::{wnaf_sparse, GlvField, DIGITS, W};
 use crate::xyzz::{RawCurve, Xyzz};
 
+#[cfg(target_arch = "x86_64")]
+mod lanes;
+
 const TABLE: usize = 1 << (W - 2);
+
+#[cfg(target_arch = "x86_64")]
+pub(super) fn lanes_available<F: GlvField>() -> bool {
+    lanes::available::<F>()
+}
 
 #[derive(Clone, Copy)]
 struct Pt<F> {
@@ -103,6 +111,8 @@ pub struct BatchState<F: GlvField> {
     idx: Vec<usize>,
     adds: Vec<(usize, Pt<F>)>,
     s: Scratch<F>,
+    #[cfg(target_arch = "x86_64")]
+    lanes: lanes::LaneState,
 }
 
 impl<F: GlvField> Default for BatchState<F> {
@@ -131,6 +141,8 @@ impl<F: GlvField> Default for BatchState<F> {
                 pre: Vec::new(),
                 who: Vec::new(),
             },
+            #[cfg(target_arch = "x86_64")]
+            lanes: Default::default(),
         }
     }
 }
@@ -215,8 +227,13 @@ pub fn mul_sums_xyzz_in<F: GlvField>(
     let at = |u: usize, d: usize, e: usize| (u * dims + d) * TABLE + e;
     fill(&mut st.dig, DIGITS * dims * m, 0);
     fill(&mut st.neg, dims * m, false);
+    // The lane ladder builds its tables itself, in its own domain, from `base`.
+    #[cfg(target_arch = "x86_64")]
+    let laned = lanes::available::<F>();
+    #[cfg(not(target_arch = "x86_64"))]
+    let laned = false;
     // Every live entry is written before it is read, so the tables are only grown.
-    if st.tab.len() < dims * TABLE * m {
+    if !laned && st.tab.len() < dims * TABLE * m {
         st.tab.resize(dims * TABLE * m, zero);
     }
     // Out of the batch: every term zero, or an exceptional addition; see the module doc.
@@ -224,22 +241,24 @@ pub fn mul_sums_xyzz_in<F: GlvField>(
     // Per term: how many odd multiples its digits use, 0 for a term with none.
     fill(&mut st.need, m, 0);
     let mut steps = 0;
-    let mut tmp = [0i8; DIGITS];
     for (u, (p, k)) in base.iter().zip(scalars).enumerate() {
         let Some(p) = p else { continue };
         let split = F::split(k);
         let (mut len_max, mut top) = (0, 0);
         for (d, part) in split.iter().enumerate().take(dims) {
-            let len = wnaf(part.unsigned_abs(), &mut tmp);
-            for (s, &x) in tmp[..len].iter().enumerate() {
-                st.dig[row(s, d) + u] = x;
+            // The zeros are in place from the fill; only the nonzero digits are stored.
+            let dig = &mut st.dig;
+            let len = wnaf_sparse(part.unsigned_abs(), |s, x| {
+                dig[row(s, d) + u] = x;
                 top = top.max(x.unsigned_abs());
-            }
+            });
             st.neg[u * dims + d] = *part < 0;
             len_max = len_max.max(len);
         }
         if len_max > 0 {
-            st.tab[at(u, 0, 0)] = *p;
+            if !laned {
+                st.tab[at(u, 0, 0)] = *p;
+            }
             st.need[u] = top as usize / 2 + 1;
             st.gone[st.owner[u]] = false;
             steps = steps.max(len_max);
@@ -248,7 +267,7 @@ pub fn mul_sums_xyzz_in<F: GlvField>(
 
     // Odd multiples: 2P, then 3P = P + 2P and so on, one batched addition per entry; then
     // each endomorphism's table is its image of the first, entry by entry.
-    {
+    if !laned {
         st.idx.clear();
         st.idx.extend((0..m).filter(|&u| st.need[u] > 1));
         st.two.clear();
@@ -297,7 +316,11 @@ pub fn mul_sums_xyzz_in<F: GlvField>(
     fill(&mut st.acc_zero, n, true);
     fill(&mut st.ok, n, true);
     fill(&mut st.count, n, 0);
-    for s in (0..steps).rev() {
+    #[cfg(target_arch = "x86_64")]
+    if laned {
+        lanes::run(st, &base, n, m, steps);
+    }
+    for s in (0..if laned { 0 } else { steps }).rev() {
         st.idx.clear();
         st.idx
             .extend((0..n).filter(|&i| !st.gone[i] && st.ok[i] && !st.acc_zero[i]));
