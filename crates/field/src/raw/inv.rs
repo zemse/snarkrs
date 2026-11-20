@@ -75,8 +75,7 @@ fn divsteps_62_var(mut eta: i64, f0: u64, g0: u64) -> (i64, Trans) {
         if i == 0 {
             break;
         }
-        let w: u64;
-        if eta < 0 {
+        let w = if eta < 0 {
             eta = -eta;
             let t = f;
             f = g;
@@ -90,17 +89,16 @@ fn divsteps_62_var(mut eta: i64, f0: u64, g0: u64) -> (i64, Trans) {
             // Cancel up to six bits of g, no more than i and no more than eta + 1.
             let limit = (eta as u32 + 1).min(i);
             let m = (u64::MAX >> (64 - limit)) & 63;
-            w = f
-                .wrapping_mul(g)
+            f.wrapping_mul(g)
                 .wrapping_mul(f.wrapping_mul(f).wrapping_sub(2))
-                & m;
+                & m
         } else {
             // Up to four bits here, eta tending to be small on this side.
             let limit = (eta as u32 + 1).min(i);
             let m = (u64::MAX >> (64 - limit)) & 15;
             let w0 = f.wrapping_add(((f.wrapping_add(1)) & 4) << 1);
-            w = w0.wrapping_neg().wrapping_mul(g) & m;
-        }
+            w0.wrapping_neg().wrapping_mul(g) & m
+        };
         g = g.wrapping_add(f.wrapping_mul(w));
         q = q.wrapping_add(u.wrapping_mul(w));
         r = r.wrapping_add(v.wrapping_mul(w));
