@@ -34,6 +34,19 @@ pub use batch::{
     mul_sums_xyzz_in, BatchState,
 };
 
+/// Whether this machine runs [`mul_batch_xyzz`] on `F` eight points a vector (AVX-512
+/// IFMA), where a batch pays from a few dozen points rather than a few hundred.
+pub fn batch_is_vectorised<F: GlvField>() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        batch::lanes_available::<F>()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
 /// `lambda`, the eigenvalue of `phi` on G1 (ark-bn254's G1 `LAMBDA`). On G2 the same
 /// `beta` gives `lambda^2`, so G2's [`GlvField::endo`] uses `beta^2` to stay on this one.
 pub const LAMBDA: Fr =

@@ -25,6 +25,11 @@ mod lanes;
 
 const TABLE: usize = 1 << (W - 2);
 
+#[cfg(target_arch = "x86_64")]
+pub(super) fn lanes_available<F: GlvField>() -> bool {
+    lanes::available::<F>()
+}
+
 #[derive(Clone, Copy)]
 struct Pt<F> {
     x: F,

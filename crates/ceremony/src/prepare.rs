@@ -87,11 +87,17 @@ const BUTTERFLIES_PER_TASK: usize = 1024;
 /// pay differs by group: single thread on an M2 Max, a G1 multiplication is 26.1 us alone
 /// against 30.6 and 25.4 a point in batches of 128 and 256, a G2 one 75.8 against 72.8
 /// and 54.5 in batches of 32 and 64.
+///
+/// Where the batch runs eight points a vector it pays much sooner: single thread on a
+/// 4-core Xeon with IFMA, a G1 multiplication is 40.5 us alone against 38.6, 26.1 and
+/// 18.0 a point in batches of 32, 64 and 128, a G2 one 141.5 against 105.3, 73.3 and
+/// 43.8 in batches of 16, 32 and 64.
 fn min_batch<F: GlvField>() -> usize {
-    if F::DIMS == 4 {
-        64
-    } else {
-        256
+    match (F::DIMS == 4, glv::batch_is_vectorised::<F>()) {
+        (true, true) => 32,
+        (false, true) => 64,
+        (true, false) => 64,
+        (false, false) => 256,
     }
 }
 
