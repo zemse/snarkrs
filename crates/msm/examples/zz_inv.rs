@@ -19,6 +19,12 @@ fn main() {
         x = x.inverse().unwrap() + Fq::ONE;
     }
     eprintln!("Fq inverse {:.0} ns", t.elapsed().as_nanos() as f64 / 200.0);
+    let mut r = snarkrs_field::raw::RawFq::from_fq(&x);
+    let t = Instant::now();
+    for _ in 0..20000 {
+        r = r.inv().unwrap().add(snarkrs_field::raw::RawFq::ONE);
+    }
+    eprintln!("RawFq inv {:.0} ns {:?}", t.elapsed().as_nanos() as f64 / 20000.0, r.0[0]);
     // Distinct points cheaply: a running sum of random points, normalised in one batch.
     let seeds: Vec<G1Projective> = (0..64).map(|_| G1Projective::rand(&mut rng)).collect();
     let mut acc = G1Projective::rand(&mut rng);

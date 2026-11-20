@@ -380,14 +380,14 @@ fn put_lane(cols: &mut [[u64; 8]; 5], l: usize, x: &Fq) {
 
 /// Montgomery's trick over eight ark elements of `v 2^4`, then a factor 2^8 turns
 /// `v^-1 2^-4` into `v^-1 2^4`, which is `v^-1` in the 2^260 domain.
-fn invert8<F: Field + From<u64>>(f: &[F; 8]) -> [F; 8] {
+fn invert8<F: Field + From<u64>>(f: &[F; 8], inverse: impl Fn(F) -> F) -> [F; 8] {
     let mut prefix = [F::ONE; 8];
     let mut acc = F::ONE;
     for l in 0..8 {
         prefix[l] = acc;
         acc *= f[l];
     }
-    let mut inv = acc.inverse().expect("inverse of zero") * F::from(256u64);
+    let mut inv = inverse(acc) * F::from(256u64);
     let mut out = [F::ONE; 8];
     for l in (0..8).rev() {
         out[l] = inv * prefix[l];
@@ -470,7 +470,9 @@ impl Lanes for V {
         for (l, fl) in f.iter_mut().enumerate() {
             *fl = lane_fq(&cols, l);
         }
-        let inv = invert8(&f);
+        let inv = invert8(&f, |x| {
+            RawFq::from_fq(&x).inv().expect("inverse of zero").to_fq()
+        });
         let mut out = [[0u64; 8]; 5];
         for (l, il) in inv.iter().enumerate() {
             put_lane(&mut out, l, il);
@@ -559,7 +561,9 @@ impl Lanes for V2 {
         for (l, fl) in f.iter_mut().enumerate() {
             *fl = Fq2::new(lane_fq(&c0, l), lane_fq(&c1, l));
         }
-        let inv = invert8(&f);
+        let inv = invert8(&f, |x| {
+            RawFq2::from_fq2(&x).inv().expect("inverse of zero").to_fq2()
+        });
         let (mut o0, mut o1) = ([[0u64; 8]; 5], [[0u64; 8]; 5]);
         for (l, il) in inv.iter().enumerate() {
             put_lane(&mut o0, l, &il.c0);

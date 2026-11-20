@@ -317,6 +317,19 @@ fn fq_reduce(t: [u64; 8]) -> [u64; 4] {
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 use mont_mul_portable as mont_mul;
 
+mod inv;
+
+/// [`inv::ModInfo`] for Fq.
+const FQ_INV: inv::ModInfo = inv::ModInfo::new(&FQ_MOD, FQ_N0);
+
+/// `R^3 mod q`: a Montgomery product with it turns `(a R)^-1` into `a^-1 R`.
+const FQ_R3: [u64; 4] = [
+    0xb1cd6dafda1530df,
+    0x62f210e6a7283db6,
+    0xef7f0b0c0ada0afb,
+    0x20fd6e902d592544,
+];
+
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
 #[cfg(target_arch = "x86_64")]
@@ -399,6 +412,17 @@ impl RawFq {
     #[inline(always)]
     pub fn to_fq(self) -> Fq {
         Fq::new_unchecked(ark_ff::BigInt::new(self.0))
+    }
+
+    /// The inverse, `None` for zero. Variable time, as ark's `Field::inverse` is, and three
+    /// times faster than it (see `raw/inv.rs`).
+    pub fn inv(self) -> Option<Self> {
+        if self.is_zero() {
+            return None;
+        }
+        // The integer here is `a R`; its inverse times `R^3 / R` is `a^-1 R`.
+        let x = inv::inv_mod(&self.0, &FQ_INV);
+        Some(RawFq(mont_mul(x, FQ_R3, &FQ_MOD, FQ_N0)))
     }
 
     #[inline(always)]
@@ -505,6 +529,16 @@ impl RawFq2 {
     #[inline(always)]
     pub fn to_fq2(self) -> Fq2 {
         Fq2::new(self.c0.to_fq(), self.c1.to_fq())
+    }
+
+    /// The inverse, `None` for zero: `(c0 - c1 u) / (c0^2 + c1^2)`, one [`RawFq::inv`].
+    /// Variable time.
+    pub fn inv(self) -> Option<Self> {
+        let t = self.c0.sqr().add(self.c1.sqr()).inv()?;
+        Some(RawFq2 {
+            c0: self.c0.mul(t),
+            c1: self.c1.mul(t).neg(),
+        })
     }
 
     #[inline(always)]
@@ -714,6 +748,35 @@ mod tests {
     fn montgomery_constants_are_inverses() {
         assert_eq!(FQ_MOD[0].wrapping_mul(FQ_N0), u64::MAX);
         assert_eq!(FR_MOD[0].wrapping_mul(FR_N0), u64::MAX);
+    }
+
+    #[test]
+    fn inverses_match_ark() {
+        use ark_ff::{Field, UniformRand};
+        let mut rng = ark_std::test_rng();
+        let q = FQ_MOD;
+        let edge = [
+            [1, 0, 0, 0],
+            [2, 0, 0, 0],
+            [q[0] - 1, q[1], q[2], q[3]],
+            [q[0] - 2, q[1], q[2], q[3]],
+            [0, 0, 0, 1],
+            [u64::MAX, u64::MAX, u64::MAX, 0],
+        ];
+        for limbs in edge {
+            let x = RawFq(limbs);
+            assert_eq!(x.inv().unwrap().to_fq(), x.to_fq().inverse().unwrap());
+        }
+        for _ in 0..20000 {
+            let x = Fq::rand(&mut rng);
+            assert_eq!(RawFq::from_fq(&x).inv().unwrap().to_fq(), x.inverse().unwrap());
+        }
+        for _ in 0..2000 {
+            let x = Fq2::rand(&mut rng);
+            assert_eq!(RawFq2::from_fq2(&x).inv().unwrap().to_fq2(), x.inverse().unwrap());
+        }
+        assert!(RawFq::ZERO.inv().is_none());
+        assert!(RawFq2::ZERO.inv().is_none());
     }
 
     #[test]

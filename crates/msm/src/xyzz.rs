@@ -17,7 +17,7 @@
 //! including the doubling and cancellation corners a random sweep essentially never hits.
 
 use ark_ec::short_weierstrass::{Affine, Projective, SWCurveConfig};
-use ark_ff::{Field, Zero};
+use ark_ff::Zero;
 use snarkrs_field::raw::{RawField, RawFq, RawFq2};
 
 /// The accumulator. `ZZ == 0` is the identity, matching the GPU layout.
@@ -174,7 +174,7 @@ pub trait RawCurve: SWCurveConfig + Sized {
     /// `(x, y)` as raw limbs. Caller must have excluded the point at infinity.
     fn raw_xy(p: &Affine<Self>) -> (Self::RF, Self::RF);
     fn field_back(f: Self::RF) -> Self::BaseField;
-    /// Inverse of a nonzero element, through ark's extended Euclid. Off the hot path:
+    /// Inverse of a nonzero element, variable time (`RawFq::inv`). Off the hot path:
     /// the batch-affine fill calls it once per shared-inversion round, never per point.
     fn raw_inv(f: Self::RF) -> Self::RF;
 }
@@ -190,11 +190,8 @@ impl RawCurve for snarkrs_field::g1::Config {
         f.to_fq()
     }
     fn raw_inv(f: RawFq) -> RawFq {
-        RawFq::from_fq(
-            &f.to_fq()
-                .inverse()
-                .expect("raw_inv is only called on a nonzero denominator"),
-        )
+        f.inv()
+            .expect("raw_inv is only called on a nonzero denominator")
     }
 }
 
@@ -209,11 +206,8 @@ impl RawCurve for snarkrs_field::g2::Config {
         f.to_fq2()
     }
     fn raw_inv(f: RawFq2) -> RawFq2 {
-        RawFq2::from_fq2(
-            &f.to_fq2()
-                .inverse()
-                .expect("raw_inv is only called on a nonzero denominator"),
-        )
+        f.inv()
+            .expect("raw_inv is only called on a nonzero denominator")
     }
 }
 
