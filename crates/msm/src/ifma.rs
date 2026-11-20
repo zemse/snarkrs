@@ -30,7 +30,7 @@ use snarkrs_field::{Fq, Fq2};
 
 use crate::xyzz::{to_projective, RawCurve, Xyzz};
 use crate::{
-    affine_running_sum, signed_digit, FastFill, OnesSum, Prescan, SideBuckets, Work,
+    signed_digit, FastFill, OnesSum, Prescan, SideBuckets, Work,
 };
 
 type G1 = snarkrs_field::g1::Config;
@@ -1131,38 +1131,235 @@ impl<'a, P: IfmaCurve> Fill<'a, P> {
         self.flush();
         self.reschedule();
         self.flush();
-        let n_buckets = self.occupied.len();
-        let mut bx = vec![P::RF::ZERO; n_buckets];
-        let mut by = vec![P::RF::ZERO; n_buckets];
         // SAFETY: see the type's doc.
-        unsafe { export::<P::L>(&self.buckets, &mut bx, &mut by) };
-        let mut xy: Vec<[P::RF; 2]> = bx.into_iter().zip(by).map(|(x, y)| [x, y]).collect();
-        to_projective(&affine_running_sum::<P>(
-            &mut xy,
-            &mut self.occupied,
-            self.side.as_ref(),
-        ))
+        unsafe {
+            self.fold_side_ifma();
+            to_projective(&self.running_sum_ifma())
+        }
     }
 }
 
-/// Every bucket row back to canonical 2^256-domain raw limbs, eight buckets a vector.
-#[target_feature(enable = "avx512f,avx512ifma")]
-unsafe fn export<L: Lanes>(buckets: &[u64], bx: &mut [L::Raw], by: &mut [L::Raw]) {
-    let w = L::LIMBS;
-    let n = bx.len();
-    for lo in (0..n).step_by(8) {
-        let len = (n - lo).min(8);
-        let mut idx = [0u32; 8];
-        for (l, i) in idx.iter_mut().enumerate().take(len) {
-            *i = (lo + l) as u32;
+impl<P: IfmaCurve> Fill<'_, P> {
+    /// [`fold_side`](crate::fold_side) on the radix-2^52 buckets: the side buckets'
+    /// points go affine behind one inversion, and only the buckets they land on leave the
+    /// vector domain for the additions and come back.
+    #[target_feature(enable = "avx512f,avx512ifma")]
+    unsafe fn fold_side_ifma(&mut self) {
+        let Some(side) = self.side.take() else {
+            return;
+        };
+        let live: Vec<usize> = (0..self.occupied.len())
+            .filter(|&j| side.slot[j] != 0 && !side[j].is_zero())
+            .collect();
+        if live.is_empty() {
+            return;
         }
-        let off = row_offsets(&idx, 2 * w);
-        let valid = (((1u16 << len) - 1) & 0xff) as u8;
-        // Lanes below `len` address rows of `buckets`, the rest are masked.
-        let x = L::gather(buckets.as_ptr(), off, valid, 0).leave();
-        let y = L::gather(buckets.as_ptr(), off, valid, w).leave();
-        bx[lo..lo + len].copy_from_slice(&x[..len]);
-        by[lo..lo + len].copy_from_slice(&y[..len]);
+        let mut inv: Vec<P::RF> = live.iter().map(|&j| side[j].zzz).collect();
+        crate::batch_invert::<P>(&mut inv);
+        let w = Self::W;
+        let lanes = |chunk: &[usize]| {
+            let mut idx = [0u32; 8];
+            for (i, &j) in idx.iter_mut().zip(chunk) {
+                *i = j as u32;
+            }
+            let valid = (((1u16 << chunk.len()) - 1) & 0xff) as u8;
+            (row_offsets(&idx, 2 * w), valid)
+        };
+        let mut xy = vec![[P::RF::ZERO; 2]; live.len()];
+        let mut occ: Vec<bool> = live.iter().map(|&j| self.occupied[j]).collect();
+        for (c, chunk) in live.chunks(8).enumerate() {
+            let (off, valid) = lanes(chunk);
+            // The unmasked lanes address rows of `buckets`.
+            let x = P::L::gather(self.buckets.as_ptr(), off, valid, 0).leave();
+            let y = P::L::gather(self.buckets.as_ptr(), off, valid, w).leave();
+            for l in 0..chunk.len() {
+                xy[8 * c + l] = [x[l], y[l]];
+            }
+        }
+        let points = live.iter().zip(&inv).enumerate().map(|(i, (&j, &izzz))| {
+            let p = &side[j];
+            (i, [p.x.mul(p.zz.mul(izzz).sqr()), p.y.mul(izzz)])
+        });
+        crate::add_points::<P>(&mut xy, &mut occ, points);
+        for (c, chunk) in live.chunks(8).enumerate() {
+            let (off, valid) = lanes(chunk);
+            let (mut xs, mut ys) = ([P::RF::ZERO; 8], [P::RF::ZERO; 8]);
+            for l in 0..chunk.len() {
+                [xs[l], ys[l]] = xy[8 * c + l];
+                self.occupied[chunk[l]] = occ[8 * c + l];
+            }
+            // `live` holds each bucket once, so the unmasked offsets are distinct.
+            P::L::enter(&xs).scatter(self.buckets.as_mut_ptr(), off, valid, 0);
+            P::L::enter(&ys).scatter(self.buckets.as_mut_ptr(), off, valid, w);
+        }
+    }
+
+    /// [`segmented_running_sum`](crate::segmented_running_sum) on the radix-2^52 buckets,
+    /// segment `8 g + l` in lane `l` of group `g`: per step every segment does
+    /// `total += running` and `running += bucket` as two lane-parallel affine additions
+    /// behind one inversion, the total reading the running sum from before the step. Only
+    /// the per-segment results leave the vector domain, for the scalar fix-up.
+    #[target_feature(enable = "avx512f,avx512ifma")]
+    unsafe fn running_sum_ifma(&self) -> Xyzz<P::RF> {
+        let n = self.occupied.len();
+        let seg = crate::reduce_segment(n);
+        let k = n / seg;
+        debug_assert!(n.is_power_of_two() && k % 8 == 0);
+        let groups = k / 8;
+        let w = Self::W;
+        let row = 2 * w;
+        let one = P::L::one();
+        let zero = one.sub(&one);
+        let (mut rx, mut ry) = (vec![zero; groups], vec![zero; groups]);
+        let (mut tx, mut ty) = (vec![zero; groups], vec![zero; groups]);
+        let (mut rocc, mut tocc) = (vec![0u8; groups], vec![0u8; groups]);
+        // Per group: prefix, denominator, numerator, x sum, a.x, a.y for each side.
+        let mut saved: Vec<P::L> = Vec::with_capacity(groups * 2 * SAVED);
+        let mut upd: Vec<(u8, u8)> = Vec::with_capacity(groups);
+        let lane_seg: [u64; 8] = core::array::from_fn(|l| (l * seg * row) as u64);
+        // SAFETY: 8 u64 is 64 bytes, and the load is unaligned.
+        let lane_seg = _mm512_loadu_si512(lane_seg.as_ptr() as *const _);
+        let three = |x: &P::L| {
+            let xx = x.mul(x);
+            xx.add(&xx).add(&xx)
+        };
+        for t in 0..=seg {
+            saved.clear();
+            upd.clear();
+            let (mut acc_t, mut acc_r) = (one, one);
+            let mut work = false;
+            for g in 0..groups {
+                let (orx, ory, oro) = (rx[g], ry[g], rocc[g]);
+                let (otx, oty, oto) = (tx[g], ty[g], tocc[g]);
+
+                // Total side: `tot += run`, run as it was before this step.
+                let first_t = oro & !oto;
+                let add_t = oro & oto;
+                let dx = orx.sub(&otx);
+                let dy = ory.sub(&oty);
+                let same = dx.is_zero() & add_t;
+                let dbl_t = same & dy.is_zero();
+                let cancel_t = same & !dbl_t;
+                let upd_t = add_t & !cancel_t;
+                let mut den_t = P::L::select(upd_t, &dx, &one);
+                let mut num_t = dy;
+                if dbl_t != 0 {
+                    den_t = P::L::select(dbl_t, &oty.add(&oty), &den_t);
+                    num_t = P::L::select(dbl_t, &three(&otx), &num_t);
+                }
+                tx[g] = P::L::select(first_t, &orx, &otx);
+                ty[g] = P::L::select(first_t, &ory, &oty);
+                tocc[g] = (oto | first_t) & !cancel_t;
+
+                // Running side: `run += bucket`, the high bucket of the segment first; the
+                // last step has none and only settles the totals.
+                let mut upd_r = 0u8;
+                let (mut den_r, mut num_r, mut sx_r) = (one, one, one);
+                if t < seg {
+                    let j0 = 8 * g * seg + seg - 1 - t;
+                    let mut bocc = 0u8;
+                    for l in 0..8 {
+                        bocc |= (self.occupied[j0 + l * seg] as u8) << l;
+                    }
+                    if bocc != 0 {
+                        let off = _mm512_add_epi64(
+                            lane_seg,
+                            _mm512_set1_epi64((j0 * row) as i64),
+                        );
+                        let bk = self.buckets.as_ptr();
+                        let bx = P::L::gather(bk, off, bocc, 0);
+                        let by = P::L::gather(bk, off, bocc, w);
+                        let first_r = bocc & !oro;
+                        let add_r = bocc & oro;
+                        let dx = bx.sub(&orx);
+                        let dy = by.sub(&ory);
+                        let same = dx.is_zero() & add_r;
+                        let dbl_r = same & dy.is_zero();
+                        let cancel_r = same & !dbl_r;
+                        upd_r = add_r & !cancel_r;
+                        den_r = P::L::select(upd_r, &dx, &one);
+                        num_r = dy;
+                        if dbl_r != 0 {
+                            den_r = P::L::select(dbl_r, &ory.add(&ory), &den_r);
+                            num_r = P::L::select(dbl_r, &three(&orx), &num_r);
+                        }
+                        sx_r = bx.add(&orx);
+                        rx[g] = P::L::select(first_r, &bx, &orx);
+                        ry[g] = P::L::select(first_r, &by, &ory);
+                        rocc[g] = (oro | first_r) & !cancel_r;
+                    }
+                }
+                work |= (upd_t | upd_r) != 0;
+                saved.extend_from_slice(&[
+                    acc_t,
+                    den_t,
+                    num_t,
+                    otx.add(&orx),
+                    otx,
+                    oty,
+                    acc_r,
+                    den_r,
+                    num_r,
+                    sx_r,
+                    orx,
+                    ory,
+                ]);
+                upd.push((upd_t, upd_r));
+                acc_t = acc_t.mul(&den_t);
+                acc_r = acc_r.mul(&den_r);
+            }
+            if !work {
+                continue;
+            }
+            let inv = acc_t.mul(&acc_r).invert();
+            let (mut inv_t, mut inv_r) = (inv.mul(&acc_r), inv.mul(&acc_t));
+            for g in (0..groups).rev() {
+                let s = &saved[g * 2 * SAVED..][..2 * SAVED];
+                let (upd_t, upd_r) = upd[g];
+                let d_t = inv_t.mul(&s[0]);
+                inv_t = inv_t.mul(&s[1]);
+                let d_r = inv_r.mul(&s[6]);
+                inv_r = inv_r.mul(&s[7]);
+                if upd_t != 0 {
+                    let lambda = s[2].mul(&d_t);
+                    let x3 = lambda.mul(&lambda).sub(&s[3]);
+                    let y3 = lambda.mul(&s[4].sub(&x3)).sub(&s[5]);
+                    tx[g] = P::L::select(upd_t, &x3, &tx[g]);
+                    ty[g] = P::L::select(upd_t, &y3, &ty[g]);
+                }
+                if upd_r != 0 {
+                    let lambda = s[8].mul(&d_r);
+                    let x3 = lambda.mul(&lambda).sub(&s[9]);
+                    let y3 = lambda.mul(&s[10].sub(&x3)).sub(&s[11]);
+                    rx[g] = P::L::select(upd_r, &x3, &rx[g]);
+                    ry[g] = P::L::select(upd_r, &y3, &ry[g]);
+                }
+            }
+        }
+
+        // The fix-up of `segmented_running_sums_at`, on the segments' results.
+        let mut sum = Xyzz::<P::RF>::ZERO;
+        let mut run = Vec::with_capacity(k);
+        let mut run_occ = Vec::with_capacity(k);
+        for g in 0..groups {
+            let (x, y) = (tx[g].leave(), ty[g].leave());
+            for l in 0..8 {
+                if tocc[g] >> l & 1 != 0 {
+                    sum.madd(x[l], y[l]);
+                }
+            }
+            let (x, y) = (rx[g].leave(), ry[g].leave());
+            for l in 0..8 {
+                run.push([x[l], y[l]]);
+                run_occ.push(rocc[g] >> l & 1 != 0);
+            }
+        }
+        let mut owed = crate::segmented_running_sum::<P>(&run[1..], &run_occ[1..]);
+        for _ in 0..seg.trailing_zeros() {
+            owed = owed.dbl();
+        }
+        sum.add_assign(&owed);
+        sum
     }
 }
 

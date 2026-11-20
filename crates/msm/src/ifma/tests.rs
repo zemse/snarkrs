@@ -320,3 +320,61 @@ fn msm_matches_arkworks() {
     }
     eprintln!("ifma: msm_g1 agrees with arkworks at c = 9, 12, 15, msm_g2 at c = 9, 12");
 }
+
+/// The vector running sum against `sum_j (j + 1) B_j` with every bucket a small multiple
+/// of one point, so running sums and totals meet equal and opposite values all the time:
+/// doublings and cancellations on both sides of a step, in every lane position.
+fn running_sum_case<P: IfmaCurve + ark_ec::CurveConfig<ScalarField = Fr>>(
+    n_buckets: usize,
+    rng: &mut impl Rng,
+) where
+    Projective<P>: UniformRand,
+    P::BaseField: Send + Sync,
+{
+    let g = Projective::<P>::rand(rng);
+    let mults: Vec<i64> = vec![-3, -2, -1, 1, 2, 3];
+    let proj: Vec<Projective<P>> = mults
+        .iter()
+        .map(|&m| {
+            let p = g * Fr::from(m.unsigned_abs());
+            if m < 0 {
+                -p
+            } else {
+                p
+            }
+        })
+        .collect();
+    let bases = Projective::normalize_batch(&proj);
+    let scalars = vec![Fr::from(2u64); bases.len()];
+    let scan = scan_of::<P>(&scalars);
+    let prep = prepare::<P>(&bases, &scan).expect("IFMA is available");
+    for density in [1u32, 3, 8] {
+        let mut fill = Fill::<P>::new(&bases, &scan.idx, &prep.rows, n_buckets);
+        let mut want = Projective::<P>::zero();
+        for j in 0..n_buckets {
+            if rng.gen_range(0..8) >= density {
+                continue;
+            }
+            let k = rng.gen_range(0..bases.len());
+            let neg = rng.gen_bool(0.5);
+            fill.set(j, k as u32 | if neg { NEG } else { 0 });
+            let p: Projective<P> = if neg { -bases[k] } else { bases[k] }.into();
+            want += p * Fr::from(j as u64 + 1);
+        }
+        // SAFETY: `prepare` checked the CPU.
+        let got = to_projective(&unsafe { fill.running_sum_ifma() });
+        assert_eq!(got, want, "{n_buckets} buckets, density {density}/8");
+    }
+}
+
+#[test]
+fn running_sum_matches_on_colliding_buckets() {
+    if skip() {
+        return;
+    }
+    let mut rng = test_rng();
+    for n in [256, 512, 4096] {
+        running_sum_case::<G1>(n, &mut rng);
+        running_sum_case::<G2>(n, &mut rng);
+    }
+}

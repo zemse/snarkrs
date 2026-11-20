@@ -1026,7 +1026,7 @@ impl<P: RawCurve> BatchFill<P> {
 
 /// The running sum `sum_j (j + 1) * B_j` over the settled buckets, the side buckets folded
 /// in first when the chunk was degenerate enough to have any.
-#[cfg(any(test, target_arch = "x86_64"))]
+#[cfg(test)]
 fn affine_running_sum<P: RawCurve>(
     xy: &mut [[P::RF; 2]],
     occupied: &mut [bool],
