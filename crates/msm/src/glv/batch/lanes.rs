@@ -526,7 +526,7 @@ unsafe fn copy_group<L: Blk>(
 /// first is computed from the vectors at hand, so nothing is gathered. A term whose
 /// doubling or addition meets the exceptional case (which a point of prime order never
 /// does) takes its sum out of the batch, as the portable tables do.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 #[inline]
 #[target_feature(enable = "avx512f,avx512ifma")]
 unsafe fn build_tables<L: Blk>(
