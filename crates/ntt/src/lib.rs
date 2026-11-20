@@ -6,11 +6,44 @@
 //! separately so a backend can fuse it into an NTT epilogue.
 
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::sync::{Arc, RwLock};
 
 use rayon::prelude::*;
 use snarkrs_field::raw::RawFr;
 use snarkrs_field::{powers, Domain, Field, Fr};
+
+#[cfg(target_arch = "x86_64")]
+mod ifma;
+
+/// The caches of the AVX-512 IFMA butterflies, present only where they run.
+#[cfg(target_arch = "x86_64")]
+#[derive(Default)]
+struct Ifma {
+    /// Lane-form twiddle tables keyed like [`TwiddleCache`]: `(m, w_m)`.
+    tables: RwLock<HashMap<(usize, Fr), Arc<ifma::Table>>>,
+    /// The fused block's per-pass tables, keyed by the block's root.
+    blocks: RwLock<HashMap<Fr, Arc<ifma::BlockTables>>>,
+    /// [`CpuNtt::coset_table`] times 16, the twiddle form, keyed the same way.
+    #[allow(clippy::type_complexity)]
+    cosets: RwLock<HashMap<(usize, Fr), Arc<Vec<Fr>>>>,
+}
+
+/// A cache lookup that builds outside the write lock, the pattern every table here uses:
+/// two threads can race on a cold entry, whoever inserts first wins and the loser drops
+/// its copy.
+fn cached<K: Hash + Eq, T>(
+    map: &RwLock<HashMap<K, Arc<T>>>,
+    key: K,
+    build: impl FnOnce() -> T,
+) -> Arc<T> {
+    if let Some(hit) = map.read().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return Arc::clone(hit);
+    }
+    let built = Arc::new(build());
+    let mut guard = map.write().unwrap_or_else(|e| e.into_inner());
+    Arc::clone(guard.entry(key).or_insert(built))
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Direction {
@@ -70,6 +103,9 @@ pub struct CpuNtt {
     /// Tables for [`Self::coset_scale_bitrev`], keyed by size and shift.
     #[allow(clippy::type_complexity)]
     coset_tables: RwLock<HashMap<(usize, Fr), Arc<Vec<Fr>>>>,
+    /// `Some` where the IFMA butterflies run, see `ifma`.
+    #[cfg(target_arch = "x86_64")]
+    ifma: Option<Ifma>,
 }
 
 impl CpuNtt {
@@ -80,6 +116,72 @@ impl CpuNtt {
             threads: rayon::current_num_threads().max(1),
             twiddles: RwLock::new(HashMap::new()),
             coset_tables: RwLock::new(HashMap::new()),
+            #[cfg(target_arch = "x86_64")]
+            ifma: ifma::available().then(Ifma::default),
+        }
+    }
+
+    /// [`Self::new`] on the portable butterflies only, whatever the machine has.
+    pub fn scalar() -> Self {
+        Self {
+            #[cfg(target_arch = "x86_64")]
+            ifma: None,
+            ..Self::new()
+        }
+    }
+
+    /// Whether this instance runs the AVX-512 IFMA butterflies.
+    pub fn uses_ifma(&self) -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.ifma.is_some()
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    }
+
+    /// The lane-form twiddle table of the transform `stride` times smaller than `n`.
+    #[cfg(target_arch = "x86_64")]
+    fn ifma_table(x: &Ifma, twiddles: &[Fr], n: usize, stride: usize) -> Arc<ifma::Table> {
+        cached(&x.tables, (n / stride, twiddles[stride]), || {
+            ifma::Table::new(twiddles.iter().step_by(stride).copied())
+        })
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn ifma_blocks(x: &Ifma, local: &[Fr]) -> Arc<ifma::BlockTables> {
+        cached(&x.blocks, local[1], || {
+            ifma::BlockTables::new(local, CACHE_BLOCK)
+        })
+    }
+
+    /// Every lane-form table a size-`n` transform reads, built now so that concurrent
+    /// transforms do not race to build them. Mirrors the pass loops of
+    /// [`Self::dit_outer_passes`] and [`Self::dif_outer_passes`].
+    #[cfg(target_arch = "x86_64")]
+    fn ifma_prepare(&self, x: &Ifma, twiddles: &[Fr], n: usize) {
+        if n <= CACHE_BLOCK {
+            return;
+        }
+        Self::ifma_blocks(x, &self.block_twiddles(twiddles, n));
+        let mut half = CACHE_BLOCK;
+        while half * 4 <= n {
+            Self::ifma_table(x, twiddles, n, n / (4 * half));
+            half <<= 2;
+        }
+        if half < n {
+            Self::ifma_table(x, twiddles, n, n / (2 * half));
+        }
+        let floor = CACHE_BLOCK / 2;
+        let mut half = n / 2;
+        while half > 2 * floor {
+            Self::ifma_table(x, twiddles, n, n / (2 * half));
+            half >>= 2;
+        }
+        if half > floor {
+            Self::ifma_table(x, twiddles, n, n / (2 * half));
         }
     }
 
@@ -181,6 +283,18 @@ impl CpuNtt {
             // index depends on its offset within its 2*half block, not on where the
             // block sits in the array.
             let local = self.block_twiddles(twiddles, n);
+            #[cfg(target_arch = "x86_64")]
+            if let Some(x) = &self.ifma {
+                let bt = Self::ifma_blocks(x, &local);
+                a.par_chunks_mut(CACHE_BLOCK).for_each_init(
+                    || ifma::scratch(CACHE_BLOCK),
+                    // SAFETY: `ifma` is only `Some` where the kernels run, and every chunk
+                    // is a whole CACHE_BLOCK because `n` is a larger power of two.
+                    |s, block| unsafe { ifma::block_dit::<INV>(block, s, &bt) },
+                );
+                self.dit_outer_passes::<INV>(a, twiddles, CACHE_BLOCK);
+                return;
+            }
             a.par_chunks_mut(CACHE_BLOCK).for_each(|block| {
                 block_dit::<INV>(block, &local);
             });
@@ -206,6 +320,21 @@ impl CpuNtt {
     /// One radix-2 pass mops up when the remaining count is odd.
     fn dit_outer_passes<const INV: bool>(&self, a: &mut [Fr], twiddles: &[Fr], mut half: usize) {
         let n = a.len();
+        #[cfg(target_arch = "x86_64")]
+        if let Some(x) = &self.ifma {
+            while half * 4 <= n {
+                let s2 = n / (4 * half);
+                let tab = Self::ifma_table(x, twiddles, n, s2);
+                v_quad_pass_dit::<INV>(a, half, &tab, twiddles, s2, self.tasks());
+                half <<= 2;
+            }
+            if half < n {
+                let stride = n / (2 * half);
+                let tab = Self::ifma_table(x, twiddles, n, stride);
+                v_parallel_pass::<false, INV>(a, half, &tab, twiddles, stride, self.tasks());
+            }
+            return;
+        }
         while half * 4 <= n {
             let tw = self.stride_twiddles(twiddles, n, n / (4 * half));
             parallel_quad_pass_dit::<INV>(a, half, &tw, self.tasks());
@@ -221,6 +350,21 @@ impl CpuNtt {
     fn dif_outer_passes<const INV: bool>(&self, a: &mut [Fr], twiddles: &[Fr], floor: usize) {
         let n = a.len();
         let mut half = n / 2;
+        #[cfg(target_arch = "x86_64")]
+        if let Some(x) = &self.ifma {
+            while half > 2 * floor {
+                let s1 = n / (2 * half);
+                let tab = Self::ifma_table(x, twiddles, n, s1);
+                v_quad_pass_dif::<INV>(a, half, &tab, twiddles, s1, self.tasks());
+                half >>= 2;
+            }
+            if half > floor {
+                let stride = n / (2 * half);
+                let tab = Self::ifma_table(x, twiddles, n, stride);
+                v_parallel_pass::<true, INV>(a, half, &tab, twiddles, stride, self.tasks());
+            }
+            return;
+        }
         while half > 2 * floor {
             let tw = self.stride_twiddles(twiddles, n, n / (2 * half));
             parallel_quad_pass_dif::<INV>(a, half, &tw, self.tasks());
@@ -240,6 +384,16 @@ impl CpuNtt {
         if parallel && n > CACHE_BLOCK {
             self.dif_outer_passes::<INV>(a, twiddles, CACHE_BLOCK / 2);
             let local = self.block_twiddles(twiddles, n);
+            #[cfg(target_arch = "x86_64")]
+            if let Some(x) = &self.ifma {
+                let bt = Self::ifma_blocks(x, &local);
+                a.par_chunks_mut(CACHE_BLOCK).for_each_init(
+                    || ifma::scratch(CACHE_BLOCK),
+                    // SAFETY: as in `dit_passes`.
+                    |s, block| unsafe { ifma::block_dif::<INV>(block, s, &bt) },
+                );
+                return;
+            }
             a.par_chunks_mut(CACHE_BLOCK).for_each(|block| {
                 block_dif::<INV>(block, &local);
             });
@@ -323,7 +477,25 @@ impl CpuNtt {
     /// 256 MiB that malloc then kept resident. Call it before fanning out; on a warm cache
     /// it is two lookups.
     pub fn prepare_intt_coset_ntt(&self, domain: &Domain, shift: Fr) {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(x) = &self.ifma {
+            if domain.size() > CACHE_BLOCK && domain.size() >= PARALLEL_THRESHOLD {
+                rayon::join(
+                    || self.ifma_prepare(x, &self.twiddles(domain), domain.size()),
+                    || self.ifma_coset(x, domain, shift),
+                );
+                return;
+            }
+        }
         rayon::join(|| self.twiddles(domain), || self.coset_table(domain, shift));
+    }
+
+    /// [`Self::coset_table`] times 16, the form the IFMA multiply takes a factor in.
+    #[cfg(target_arch = "x86_64")]
+    fn ifma_coset(&self, x: &Ifma, domain: &Domain, shift: Fr) -> Arc<Vec<Fr>> {
+        cached(&x.cosets, (domain.size(), shift), || {
+            self.build_coset(domain, shift, Fr::from(16u64))
+        })
     }
 
     /// Stages 1-3 for one vector: iNTT, coset shift with the deferred `1/n`, forward
@@ -346,6 +518,21 @@ impl CpuNtt {
         }
 
         let twiddles = self.twiddles(domain);
+        #[cfg(target_arch = "x86_64")]
+        if let Some(x) = &self.ifma {
+            let c16 = self.ifma_coset(x, domain, shift);
+            let bt = Self::ifma_blocks(x, &self.block_twiddles(&twiddles, n));
+            self.dif_outer_passes::<true>(a, &twiddles, CACHE_BLOCK / 2);
+            a.par_chunks_mut(CACHE_BLOCK)
+                .zip(c16.par_chunks(CACHE_BLOCK))
+                .for_each_init(
+                    || ifma::scratch(CACHE_BLOCK),
+                    // SAFETY: as in `dit_passes`; the table has one entry per element.
+                    |s, (block, tab)| unsafe { ifma::block_fused(block, tab, s, &bt) },
+                );
+            self.dit_outer_passes::<false>(a, &twiddles, CACHE_BLOCK);
+            return;
+        }
         let table = self.coset_table(domain, shift);
         let local = self.block_twiddles(&twiddles, n);
 
@@ -365,16 +552,13 @@ impl CpuNtt {
     /// Cached `[shift^bitrev(p) / n]` table for [`Self::coset_scale_bitrev`], built and
     /// raced exactly like [`Self::twiddles`].
     fn coset_table(&self, domain: &Domain, shift: Fr) -> Arc<Vec<Fr>> {
-        let key = (domain.size(), shift);
-        if let Some(hit) = self
-            .coset_tables
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&key)
-        {
-            return Arc::clone(hit);
-        }
+        cached(&self.coset_tables, (domain.size(), shift), || {
+            self.build_coset(domain, shift, Fr::ONE)
+        })
+    }
 
+    /// `[scale * shift^bitrev(p) / n]`.
+    fn build_coset(&self, domain: &Domain, shift: Fr, scale: Fr) -> Vec<Fr> {
         let n = domain.size();
         let mut table = vec![Fr::ONE; n];
         let chunk = chunk_len(n, self.tasks());
@@ -384,17 +568,14 @@ impl CpuNtt {
             .for_each(|(c, part)| {
                 // The same per-chunk ladder re-entry as `distribute`, seeded with `1/n` so
                 // the scale costs nothing extra.
-                let mut acc = domain.size_inv() * shift.pow([(c * chunk) as u64]);
+                let mut acc = scale * domain.size_inv() * shift.pow([(c * chunk) as u64]);
                 for x in part.iter_mut() {
                     *x = acc;
                     acc *= shift;
                 }
             });
         bit_reverse_permute(&mut table, domain.log_size());
-
-        let built = Arc::new(table);
-        let mut guard = self.coset_tables.write().unwrap_or_else(|e| e.into_inner());
-        Arc::clone(guard.entry(key).or_insert(built))
+        table
     }
 
     /// In-place `a[i] *= shift^i`.
@@ -810,6 +991,189 @@ fn parallel_quad_pass_dif<const INV: bool>(
     }
 }
 
+/// [`butterflies`] through the IFMA kernel, the scalar one finishing any odd tail.
+#[cfg(target_arch = "x86_64")]
+fn v_butterflies<const DIF: bool, const INV: bool>(
+    lo: &mut [Fr],
+    hi: &mut [Fr],
+    tab: &ifma::Table,
+    twiddles: &[Fr],
+    stride: usize,
+    j0: usize,
+) {
+    // SAFETY: only reached through `CpuNtt::ifma`, which is `Some` where the kernels run;
+    // `j0 + lo.len()` is at most the pass's `half`, the table's `m / 2`.
+    let done = unsafe { ifma::butterflies::<DIF, INV>(lo, hi, tab, j0) };
+    if done < lo.len() {
+        butterflies::<DIF, INV>(
+            &mut lo[done..],
+            &mut hi[done..],
+            twiddles,
+            stride,
+            j0 + done,
+        );
+    }
+}
+
+/// [`parallel_pass`] on [`v_butterflies`]. Outer passes only, so `half >= 8`.
+#[cfg(target_arch = "x86_64")]
+fn v_parallel_pass<const DIF: bool, const INV: bool>(
+    a: &mut [Fr],
+    half: usize,
+    tab: &ifma::Table,
+    twiddles: &[Fr],
+    stride: usize,
+    tasks: usize,
+) {
+    let block_len = 2 * half;
+    let blocks = a.len() / block_len;
+    if blocks >= tasks {
+        a.par_chunks_mut(block_len).for_each(|block| {
+            let (lo, hi) = block.split_at_mut(half);
+            v_butterflies::<DIF, INV>(lo, hi, tab, twiddles, stride, 0);
+        });
+    } else {
+        let chunk = strip_chunk(half, blocks, tasks);
+        a.par_chunks_mut(block_len).for_each(|block| {
+            let (lo, hi) = block.split_at_mut(half);
+            lo.par_chunks_mut(chunk)
+                .zip(hi.par_chunks_mut(chunk))
+                .enumerate()
+                .for_each(|(c, (l, h))| {
+                    v_butterflies::<DIF, INV>(l, h, tab, twiddles, stride, c * chunk)
+                });
+        });
+    }
+}
+
+/// [`quad_dit`] through the IFMA kernel. `s2` is the pass pair's stride into the full
+/// `twiddles`, for the scalar tail.
+#[cfg(target_arch = "x86_64")]
+fn v_quad_dit<const INV: bool>(
+    strips: [&mut [Fr]; 4],
+    tab: &ifma::Table,
+    twiddles: &[Fr],
+    s2: usize,
+    half: usize,
+    j0: usize,
+) {
+    let [x0, x1, x2, x3] = strips;
+    // SAFETY: as in `v_butterflies`.
+    let done =
+        unsafe { ifma::quad_dit::<INV>([&mut *x0, &mut *x1, &mut *x2, &mut *x3], tab, half, j0) };
+    if done < x0.len() {
+        quad_dit::<INV>(
+            [
+                &mut x0[done..],
+                &mut x1[done..],
+                &mut x2[done..],
+                &mut x3[done..],
+            ],
+            twiddles,
+            s2,
+            half,
+            j0 + done,
+        );
+    }
+}
+
+/// [`quad_dif`] through the IFMA kernel, the scalar tail as in [`v_quad_dit`].
+#[cfg(target_arch = "x86_64")]
+fn v_quad_dif<const INV: bool>(
+    strips: [&mut [Fr]; 4],
+    tab: &ifma::Table,
+    twiddles: &[Fr],
+    s1: usize,
+    hh: usize,
+    j0: usize,
+) {
+    let [y0, y1, y2, y3] = strips;
+    // SAFETY: as in `v_butterflies`.
+    let done =
+        unsafe { ifma::quad_dif::<INV>([&mut *y0, &mut *y1, &mut *y2, &mut *y3], tab, hh, j0) };
+    if done < y0.len() {
+        quad_dif::<INV>(
+            [
+                &mut y0[done..],
+                &mut y1[done..],
+                &mut y2[done..],
+                &mut y3[done..],
+            ],
+            twiddles,
+            s1,
+            hh,
+            j0 + done,
+        );
+    }
+}
+
+/// [`parallel_quad_pass_dit`] on [`v_quad_dit`].
+#[cfg(target_arch = "x86_64")]
+fn v_quad_pass_dit<const INV: bool>(
+    a: &mut [Fr],
+    half: usize,
+    tab: &ifma::Table,
+    twiddles: &[Fr],
+    s2: usize,
+    tasks: usize,
+) {
+    let n = a.len();
+    let block_len = 4 * half;
+    let blocks = n / block_len;
+    if blocks >= tasks {
+        a.par_chunks_mut(block_len).for_each(|block| {
+            v_quad_dit::<INV>(quad_strips(block, half), tab, twiddles, s2, half, 0);
+        });
+    } else {
+        let chunk = strip_chunk(half, blocks, tasks);
+        a.par_chunks_mut(block_len).for_each(|block| {
+            let [x0, x1, x2, x3] = quad_strips(block, half);
+            x0.par_chunks_mut(chunk)
+                .zip(x1.par_chunks_mut(chunk))
+                .zip(x2.par_chunks_mut(chunk))
+                .zip(x3.par_chunks_mut(chunk))
+                .enumerate()
+                .for_each(|(c, (((p0, p1), p2), p3))| {
+                    v_quad_dit::<INV>([p0, p1, p2, p3], tab, twiddles, s2, half, c * chunk)
+                });
+        });
+    }
+}
+
+/// [`parallel_quad_pass_dif`] on [`v_quad_dif`].
+#[cfg(target_arch = "x86_64")]
+fn v_quad_pass_dif<const INV: bool>(
+    a: &mut [Fr],
+    half: usize,
+    tab: &ifma::Table,
+    twiddles: &[Fr],
+    s1: usize,
+    tasks: usize,
+) {
+    let n = a.len();
+    let hh = half / 2;
+    let block_len = 2 * half;
+    let blocks = n / block_len;
+    if blocks >= tasks {
+        a.par_chunks_mut(block_len).for_each(|block| {
+            v_quad_dif::<INV>(quad_strips(block, hh), tab, twiddles, s1, hh, 0);
+        });
+    } else {
+        let chunk = strip_chunk(hh, blocks, tasks);
+        a.par_chunks_mut(block_len).for_each(|block| {
+            let [y0, y1, y2, y3] = quad_strips(block, hh);
+            y0.par_chunks_mut(chunk)
+                .zip(y1.par_chunks_mut(chunk))
+                .zip(y2.par_chunks_mut(chunk))
+                .zip(y3.par_chunks_mut(chunk))
+                .enumerate()
+                .for_each(|(c, (((p0, p1), p2), p3))| {
+                    v_quad_dif::<INV>([p0, p1, p2, p3], tab, twiddles, s1, hh, c * chunk)
+                });
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1103,6 +1467,53 @@ mod tests {
             let mut fused = x;
             ntt.intt_coset_ntt(&d, &mut fused, shift);
             assert_eq!(fused, want, "fused, n = {n}");
+        }
+    }
+
+    /// The IFMA butterflies against the portable ones, entry point by entry point, at
+    /// sizes that take every outer-pass shape (an odd and an even count of passes above
+    /// the block, radix-2 leftovers on both sides), on pools whose task counts split
+    /// strips into lengths that are not multiples of eight. A no-op off IFMA machines.
+    #[test]
+    fn ifma_butterflies_match_the_portable_ones() {
+        if !CpuNtt::new().uses_ifma() {
+            return;
+        }
+        for threads in [1usize, 3, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let (fast, slow) = (CpuNtt::new(), CpuNtt::scalar());
+                assert!(fast.uses_ifma() && !slow.uses_ifma());
+                for log in [12u32, 13, 14, 15, 16, 17] {
+                    let n = 1usize << log;
+                    let d = domain(n);
+                    let shift = domain(2 * n).group_gen();
+                    let x = sample(n, 0x1F3A + log as u64);
+                    let run = |ntt: &CpuNtt| {
+                        let mut out = Vec::new();
+                        for dir in [Direction::Forward, Direction::Inverse] {
+                            let mut v = x.clone();
+                            ntt.ntt(&d, &mut v, dir);
+                            out.push(v);
+                        }
+                        let mut v = x.clone();
+                        ntt.intt_to_bitrev(&d, &mut v);
+                        out.push(v);
+                        let mut v = x.clone();
+                        ntt.ntt_from_bitrev(&d, &mut v);
+                        out.push(v);
+                        let mut v = x.clone();
+                        ntt.prepare_intt_coset_ntt(&d, shift);
+                        ntt.intt_coset_ntt(&d, &mut v, shift);
+                        out.push(v);
+                        out
+                    };
+                    assert_eq!(run(&fast), run(&slow), "n = {n}, threads = {threads}");
+                }
+            });
         }
     }
 
