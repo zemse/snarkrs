@@ -17,7 +17,7 @@ use ark_ec::short_weierstrass::Affine;
 use snarkrs_field::raw::RawField;
 use snarkrs_field::Fr;
 
-use super::{wnaf, GlvField, DIGITS, W};
+use super::{wnaf_sparse, GlvField, DIGITS, W};
 use crate::xyzz::{RawCurve, Xyzz};
 
 #[cfg(target_arch = "x86_64")]
@@ -231,17 +231,17 @@ pub fn mul_sums_xyzz_in<F: GlvField>(
     // Per term: how many odd multiples its digits use, 0 for a term with none.
     fill(&mut st.need, m, 0);
     let mut steps = 0;
-    let mut tmp = [0i8; DIGITS];
     for (u, (p, k)) in base.iter().zip(scalars).enumerate() {
         let Some(p) = p else { continue };
         let split = F::split(k);
         let (mut len_max, mut top) = (0, 0);
         for (d, part) in split.iter().enumerate().take(dims) {
-            let len = wnaf(part.unsigned_abs(), &mut tmp);
-            for (s, &x) in tmp[..len].iter().enumerate() {
-                st.dig[row(s, d) + u] = x;
+            // The zeros are in place from the fill; only the nonzero digits are stored.
+            let dig = &mut st.dig;
+            let len = wnaf_sparse(part.unsigned_abs(), |s, x| {
+                dig[row(s, d) + u] = x;
                 top = top.max(x.unsigned_abs());
-            }
+            });
             st.neg[u * dims + d] = *part < 0;
             len_max = len_max.max(len);
         }
