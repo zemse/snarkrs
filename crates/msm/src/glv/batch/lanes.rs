@@ -21,7 +21,7 @@ use core::arch::x86_64::*;
 
 use snarkrs_field::raw::{RawFq, RawFq2};
 
-use super::{BatchState, TABLE};
+use super::{BatchState, Pt, TABLE};
 use crate::glv::GlvField;
 use crate::ifma::{self, Lanes, V, V2};
 
@@ -36,6 +36,8 @@ pub(crate) trait Blk: Lanes {
     unsafe fn store(&self, p: *mut u64);
     unsafe fn sqr(&self) -> Self;
     unsafe fn neg(&self) -> Self;
+    /// The Frobenius: the identity on `Fq`, conjugation on `Fq2`.
+    unsafe fn conj(&self) -> Self;
 }
 
 impl Blk for V {
@@ -65,6 +67,11 @@ impl Blk for V {
     unsafe fn neg(&self) -> Self {
         ifma::sub(&[_mm512_setzero_si512(); 5], self)
     }
+    #[inline]
+    #[target_feature(enable = "avx512f,avx512ifma")]
+    unsafe fn conj(&self) -> Self {
+        *self
+    }
 }
 
 impl Blk for V2 {
@@ -92,28 +99,42 @@ impl Blk for V2 {
     unsafe fn neg(&self) -> Self {
         V2(self.0.neg(), self.1.neg())
     }
+    #[inline]
+    #[target_feature(enable = "avx512f,avx512ifma")]
+    unsafe fn conj(&self) -> Self {
+        V2(self.0, self.1.neg())
+    }
 }
 
-/// Run the ladder here if this machine and this field have the lanes for it. On `true` the
-/// accumulators, `acc_zero` and `ok` of `st` are what the portable ladder leaves.
-pub(super) fn run<F: GlvField>(st: &mut BatchState<F>, n: usize, m: usize, steps: usize) -> bool {
-    if n == 0 || !ifma::available() {
-        return false;
-    }
+/// Whether [`run`] takes batches of `F` on this machine.
+pub(super) fn available<F: GlvField>() -> bool {
+    let t = TypeId::of::<F>();
+    (t == TypeId::of::<RawFq>() || t == TypeId::of::<RawFq2>()) && ifma::available()
+}
+
+/// The tables and the ladder here; the caller has checked [`available`]. Leaves `gone`,
+/// the accumulators, `acc_zero` and `ok` of `st` as the portable tables and ladder do.
+pub(super) fn run<F: GlvField>(
+    st: &mut BatchState<F>,
+    base: &[Option<Pt<F>>],
+    n: usize,
+    m: usize,
+    steps: usize,
+) {
     if TypeId::of::<F>() == TypeId::of::<RawFq>() {
-        // SAFETY: `F` is `RawFq`, so this is the same type.
+        // SAFETY: `F` is `RawFq`, so these are the same types.
         let st = unsafe { &mut *(st as *mut BatchState<F> as *mut BatchState<RawFq>) };
+        let base = unsafe { &*(base as *const [Option<Pt<F>>] as *const [Option<Pt<RawFq>>]) };
         // SAFETY: `available` checked the target features.
-        unsafe { ladder::<V>(st, n, m, steps) };
-        true
+        unsafe { ladder::<V>(st, base, n, m, steps) };
     } else if TypeId::of::<F>() == TypeId::of::<RawFq2>() {
         // SAFETY: as above.
         let st = unsafe { &mut *(st as *mut BatchState<F> as *mut BatchState<RawFq2>) };
+        let base = unsafe { &*(base as *const [Option<Pt<F>>] as *const [Option<Pt<RawFq2>>]) };
         // SAFETY: as above.
-        unsafe { ladder::<V2>(st, n, m, steps) };
-        true
+        unsafe { ladder::<V2>(st, base, n, m, steps) };
     } else {
-        false
+        unreachable!("run without available");
     }
 }
 
@@ -134,6 +155,11 @@ pub(super) struct LaneState {
     groups: Vec<([u32; 8], u8)>,
     rounds: Vec<Vec<(u32, u32, bool)>>,
     used: Vec<u32>,
+    /// Table building, per block of eight terms: the entry just made and `2P`.
+    cx: Vec<u64>,
+    cy: Vec<u64>,
+    tx: Vec<u64>,
+    ty: Vec<u64>,
 }
 
 #[inline(always)]
@@ -228,8 +254,13 @@ unsafe fn pick_rows(tab: &[u64], lim: usize, rows: &[u32; 8], mask: u8, x: *mut 
 }
 
 #[target_feature(enable = "avx512f,avx512ifma")]
-unsafe fn ladder<L: Blk>(st: &mut BatchState<L::Raw>, n: usize, m: usize, steps: usize)
-where
+unsafe fn ladder<L: Blk>(
+    st: &mut BatchState<L::Raw>,
+    base: &[Option<Pt<L::Raw>>],
+    n: usize,
+    m: usize,
+    steps: usize,
+) where
     L::Raw: GlvField,
 {
     let dims = <L::Raw as GlvField>::DIMS;
@@ -250,7 +281,18 @@ where
         groups,
         rounds,
         used,
+        cx,
+        cy,
+        tx,
+        ty,
     } = &mut ls;
+
+    // The tables first, since a failure there takes its sum out of the batch.
+    let at = |u: usize, d: usize, e: usize| (u * dims + d) * TABLE + e;
+    if tab.len() < m * dims * TABLE * 2 * lim {
+        tab.resize(m * dims * TABLE * 2 * lim, 0);
+    }
+    build_tables::<L>(st, base, m, tab, den, pre, blocks, [cx, cy, tx, ty]);
 
     ax.clear();
     ax.resize(nb * w, 0);
@@ -267,50 +309,6 @@ where
         // Padding lanes never act.
         if i >= n || st.gone[i] {
             bad[i >> 3] |= 1 << (i & 7);
-        }
-    }
-
-    // The tables into the lane domain, eight entries at a time.
-    let at = |u: usize, d: usize, e: usize| (u * dims + d) * TABLE + e;
-    if tab.len() < m * dims * TABLE * 2 * lim {
-        tab.resize(m * dims * TABLE * 2 * lim, 0);
-    }
-    {
-        let zero_raw = <L::Raw as snarkrs_field::raw::RawField>::ZERO;
-        let mut xs = [zero_raw; 8];
-        let mut ys = [zero_raw; 8];
-        let mut rows = [0usize; 8];
-        let mut k = 0;
-        let mut bx = [0u64; 80];
-        let mut by = [0u64; 80];
-        let mut flush = |k: usize, xs: &[L::Raw; 8], ys: &[L::Raw; 8], rows: &[usize; 8]| {
-            L::enter(xs).store(bx.as_mut_ptr());
-            L::enter(ys).store(by.as_mut_ptr());
-            for l in 0..k {
-                let row = &mut tab[rows[l] * 2 * lim..(rows[l] + 1) * 2 * lim];
-                for j in 0..lim {
-                    row[j] = bx[j * 8 + l];
-                    row[lim + j] = by[j * 8 + l];
-                }
-            }
-        };
-        for u in 0..m {
-            for d in 0..dims {
-                for e in 0..st.need[u] {
-                    let p = st.tab[at(u, d, e)];
-                    xs[k] = p.x;
-                    ys[k] = p.y;
-                    rows[k] = at(u, d, e);
-                    k += 1;
-                    if k == 8 {
-                        flush(8, &xs, &ys, &rows);
-                        k = 0;
-                    }
-                }
-            }
-        }
-        if k > 0 {
-            flush(k, &xs, &ys, &rows);
         }
     }
 
@@ -519,4 +517,188 @@ unsafe fn copy_group<L: Blk>(
     L::select(g.3, &y.neg(), &y).store(by.as_mut_ptr());
     put(ax, lim, &g.0, g.1, bx.as_ptr());
     put(ay, lim, &g.0, g.1, by.as_ptr());
+}
+
+/// The odd-multiple tables of every term, `P, 3P, .., (2 need - 1) P` for part 0 and their
+/// images under the endomorphisms for the other parts, as rows of `tab` (`x` limbs then
+/// `y` limbs, lane domain). Blocks of eight consecutive terms: `2P` is one batched
+/// doubling, each further entry one batched addition of `2P`, and every part past the
+/// first is computed from the vectors at hand, so nothing is gathered. A term whose
+/// doubling or addition meets the exceptional case (which a point of prime order never
+/// does) takes its sum out of the batch, as the portable tables do.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+#[target_feature(enable = "avx512f,avx512ifma")]
+unsafe fn build_tables<L: Blk>(
+    st: &mut BatchState<L::Raw>,
+    base: &[Option<Pt<L::Raw>>],
+    m: usize,
+    tab: &mut [u64],
+    den: &mut Vec<u64>,
+    pre: &mut Vec<u64>,
+    blocks: &mut Vec<(u32, u8)>,
+    [cx, cy, tx, ty]: [&mut Vec<u64>; 4],
+) where
+    L::Raw: GlvField,
+{
+    use snarkrs_field::raw::RawField;
+    let dims = <L::Raw as GlvField>::DIMS;
+    let lim = L::LIMBS;
+    let w = lim * 8;
+    let nbt = m.div_ceil(8);
+    let at = |u: usize, d: usize, e: usize| (u * dims + d) * TABLE + e;
+    let need = |u: usize| if u < m { st.need[u] } else { 0 };
+    // Lanes of block `b` whose terms have more than `e` entries.
+    let mask = |b: usize, e: usize| -> u8 {
+        let mut k = 0u8;
+        for l in 0..8 {
+            k |= ((need(8 * b + l) > e) as u8) << l;
+        }
+        k
+    };
+    // `endo_j(j, x, y) = (conj^c(x) kx_j, conj^c(y) ky_j)`, conjugated from `psi` on.
+    let one_raw = <L::Raw as RawField>::ONE;
+    let mut kx = [L::one(); 4];
+    let mut ky = [L::one(); 4];
+    for j in 1..dims {
+        let (x, y) = <L::Raw as GlvField>::endo_j(j, one_raw, one_raw);
+        kx[j] = L::enter(&[x; 8]);
+        ky[j] = L::enter(&[y; 8]);
+    }
+    let one = L::one();
+    let mut bad = vec![0u8; nbt];
+    let mut bx = [0u64; 80];
+    let mut by = [0u64; 80];
+    // Entry `e` of every part, for the lanes of `k`, from part 0's `(x, y)`.
+    let mut store = |b: usize, k: u8, e: usize, x: &L, y: &L, tab: &mut [u64]| {
+        let mut emit = |d: usize, x: &L, y: &L| {
+            x.store(bx.as_mut_ptr());
+            y.store(by.as_mut_ptr());
+            for l in 0..8 {
+                if k >> l & 1 == 1 {
+                    let r = at(8 * b + l, d, e) * 2 * lim;
+                    for j in 0..lim {
+                        *tab.get_unchecked_mut(r + j) = bx[j * 8 + l];
+                        *tab.get_unchecked_mut(r + lim + j) = by[j * 8 + l];
+                    }
+                }
+            }
+        };
+        emit(0, x, y);
+        for d in 1..dims {
+            // Part `d` is `endo_j(d)` of part 0, `phi psi` included: the constants of
+            // `endo_j(3)` are those of `phi` after `psi`.
+            let (xd, yd) = if d >= 2 {
+                (x.conj().mul(&kx[d]), y.conj().mul(&ky[d]))
+            } else {
+                (x.mul(&kx[d]), *y)
+            };
+            emit(d, &xd, &yd);
+        }
+    };
+
+    cx.clear();
+    cx.resize(nbt * w, 0);
+    cy.clear();
+    cy.resize(nbt * w, 0);
+    tx.clear();
+    tx.resize(nbt * w, 0);
+    ty.clear();
+    ty.resize(nbt * w, 0);
+    let zero_raw = <L::Raw as RawField>::ZERO;
+    for b in 0..nbt {
+        let k = mask(b, 0);
+        if k == 0 {
+            continue;
+        }
+        let mut xs = [zero_raw; 8];
+        let mut ys = [zero_raw; 8];
+        for l in 0..8 {
+            if k >> l & 1 == 1 {
+                let p = base[8 * b + l]
+                    .as_ref()
+                    .expect("a term with digits has a point");
+                xs[l] = p.x;
+                ys[l] = p.y;
+            }
+        }
+        let (x, y) = (L::enter(&xs), L::enter(&ys));
+        x.store(cx.as_mut_ptr().add(b * w));
+        y.store(cy.as_mut_ptr().add(b * w));
+        store(b, k, 0, &x, &y, tab);
+    }
+
+    // 2P where a second entry is needed.
+    blocks.clear();
+    den.clear();
+    for b in 0..nbt {
+        let mut k = mask(b, 1);
+        if k == 0 {
+            continue;
+        }
+        let y = L::load(cy.as_ptr().add(b * w));
+        let d = y.add(&y);
+        let z = d.is_zero() & k;
+        bad[b] |= z;
+        k &= !z;
+        let at_k = den.len();
+        den.resize(at_k + w, 0);
+        L::select(k, &d, &one).store(den.as_mut_ptr().add(at_k));
+        blocks.push((b as u32, k));
+    }
+    batch_inv::<L>(den, pre, blocks.len(), |i, inv| {
+        let b = blocks[i].0 as usize;
+        let x = L::load(cx.as_ptr().add(b * w));
+        let y = L::load(cy.as_ptr().add(b * w));
+        let xx = x.sqr();
+        let l = xx.add(&xx).add(&xx).mul(&inv);
+        let x3 = l.sqr().sub(&x.add(&x));
+        let y3 = l.mul(&x.sub(&x3)).sub(&y);
+        x3.store(tx.as_mut_ptr().add(b * w));
+        y3.store(ty.as_mut_ptr().add(b * w));
+    });
+
+    for e in 1..TABLE {
+        blocks.clear();
+        den.clear();
+        for b in 0..nbt {
+            let mut k = mask(b, e) & !bad[b];
+            if k == 0 {
+                continue;
+            }
+            let d = L::load(tx.as_ptr().add(b * w)).sub(&L::load(cx.as_ptr().add(b * w)));
+            let z = d.is_zero() & k;
+            bad[b] |= z;
+            k &= !z;
+            let at_k = den.len();
+            den.resize(at_k + w, 0);
+            L::select(k, &d, &one).store(den.as_mut_ptr().add(at_k));
+            blocks.push((b as u32, k));
+        }
+        if blocks.is_empty() {
+            break;
+        }
+        batch_inv::<L>(den, pre, blocks.len(), |i, inv| {
+            let (b, k) = blocks[i];
+            let b = b as usize;
+            let (px, py) = (cx.as_mut_ptr().add(b * w), cy.as_mut_ptr().add(b * w));
+            let (x, y) = (L::load(px), L::load(py));
+            let qx = L::load(tx.as_ptr().add(b * w));
+            let qy = L::load(ty.as_ptr().add(b * w));
+            let l = qy.sub(&y).mul(&inv);
+            let x3 = l.sqr().sub(&x).sub(&qx);
+            let y3 = l.mul(&x.sub(&x3)).sub(&y);
+            x3.store(px);
+            y3.store(py);
+            store(b, k, e, &x3, &y3, tab);
+        });
+    }
+
+    for b in 0..nbt {
+        for l in 0..8 {
+            if bad[b] >> l & 1 == 1 {
+                st.gone[st.owner[8 * b + l]] = true;
+            }
+        }
+    }
 }

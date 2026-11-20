@@ -222,8 +222,13 @@ pub fn mul_sums_xyzz_in<F: GlvField>(
     let at = |u: usize, d: usize, e: usize| (u * dims + d) * TABLE + e;
     fill(&mut st.dig, DIGITS * dims * m, 0);
     fill(&mut st.neg, dims * m, false);
+    // The lane ladder builds its tables itself, in its own domain, from `base`.
+    #[cfg(target_arch = "x86_64")]
+    let laned = lanes::available::<F>();
+    #[cfg(not(target_arch = "x86_64"))]
+    let laned = false;
     // Every live entry is written before it is read, so the tables are only grown.
-    if st.tab.len() < dims * TABLE * m {
+    if !laned && st.tab.len() < dims * TABLE * m {
         st.tab.resize(dims * TABLE * m, zero);
     }
     // Out of the batch: every term zero, or an exceptional addition; see the module doc.
@@ -246,7 +251,9 @@ pub fn mul_sums_xyzz_in<F: GlvField>(
             len_max = len_max.max(len);
         }
         if len_max > 0 {
-            st.tab[at(u, 0, 0)] = *p;
+            if !laned {
+                st.tab[at(u, 0, 0)] = *p;
+            }
             st.need[u] = top as usize / 2 + 1;
             st.gone[st.owner[u]] = false;
             steps = steps.max(len_max);
@@ -255,7 +262,7 @@ pub fn mul_sums_xyzz_in<F: GlvField>(
 
     // Odd multiples: 2P, then 3P = P + 2P and so on, one batched addition per entry; then
     // each endomorphism's table is its image of the first, entry by entry.
-    {
+    if !laned {
         st.idx.clear();
         st.idx.extend((0..m).filter(|&u| st.need[u] > 1));
         st.two.clear();
@@ -305,9 +312,9 @@ pub fn mul_sums_xyzz_in<F: GlvField>(
     fill(&mut st.ok, n, true);
     fill(&mut st.count, n, 0);
     #[cfg(target_arch = "x86_64")]
-    let laned = lanes::run(st, n, m, steps);
-    #[cfg(not(target_arch = "x86_64"))]
-    let laned = false;
+    if laned {
+        lanes::run(st, &base, n, m, steps);
+    }
     for s in (0..if laned { 0 } else { steps }).rev() {
         st.idx.clear();
         st.idx
