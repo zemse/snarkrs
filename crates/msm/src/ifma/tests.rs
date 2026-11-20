@@ -103,6 +103,44 @@ fn field_ops_match_ark() {
     assert_eq!(unlanes(&va), want);
 }
 
+/// `sqr` gives `mul(a, a)` limb for limb, not only the same element: the same Montgomery
+/// quotient digits, so the same lazy representative, on inputs up to the `8p` the
+/// unreduced sums reach.
+#[test]
+fn sqr_is_mul_by_itself() {
+    if skip() {
+        return;
+    }
+    let mut rng = test_rng();
+    let mut vals: Vec<Fq> = vec![Fq::ZERO, Fq::ONE, -Fq::ONE, Fq::from(2u64), -Fq::from(2u64)];
+    vals.extend((0..4091).map(|_| Fq::rand(&mut rng)));
+    let p2 = unsafe { splat(&P2) };
+    for c in vals.as_chunks::<8>().0 {
+        let a = lanes(c);
+        unsafe {
+            // a, a + 2p (below 4p) and that doubled unreduced (below 8p).
+            let b = add_nr_raw(&a, &p2);
+            let d = add_nr_raw(&b, &b);
+            for v in [a, b, d] {
+                assert_eq!(store_lanes(&sqr(&v)), store_lanes(&mul(&v, &v)));
+            }
+        }
+    }
+}
+
+/// Limb-wise sum with carries and no reduction.
+unsafe fn add_nr_raw(a: &V, b: &V) -> V {
+    let mask = _mm512_set1_epi64(MASK as i64);
+    let mut s = [_mm512_setzero_si512(); 5];
+    let mut carry = _mm512_setzero_si512();
+    for j in 0..5 {
+        let t = _mm512_add_epi64(_mm512_add_epi64(a[j], b[j]), carry);
+        carry = _mm512_srli_epi64::<52>(t);
+        s[j] = if j < 4 { _mm512_and_si512(t, mask) } else { t };
+    }
+    s
+}
+
 /// Karatsuba, the lane inversion and the domain round trip for Fq2, against ark.
 #[test]
 fn fq2_lanes_match_ark() {

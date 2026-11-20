@@ -47,11 +47,12 @@ use crate::{
 
 use snarkrs_formats::binfile::{self, BinFile, Cursor};
 
-/// Points per pass over a rescaled or checked section, snarkjs' `MAX_CHUNK_SIZE`
-/// (`mpc_applykey.js:30`). It bounds the working set at 4 MB of G1 on the way in and the
-/// same on the way out, and it is the unit a GPU kernel would take: one launch per chunk,
-/// with [`scale_g1`] as the body.
-const CHUNK_POINTS: usize = 1 << 16;
+/// Points per pass over a rescaled section. snarkjs' `MAX_CHUNK_SIZE` is 2^16
+/// (`mpc_applykey.js:30`); the chunking changes no byte, and a larger one gives the pool
+/// more tasks between the joins of [`apply_key_to_section`]. 16 MB of G1 on the way in and
+/// the same on the way out, and still the unit a GPU kernel would take: one launch per
+/// chunk, with [`KeyScale::apply_key_g1`] as the body.
+const CHUNK_POINTS: usize = 1 << 18;
 
 /// Points per MSM in the L and H checks. Each check is a sum of products, so it is taken a
 /// chunk at a time and never holds a whole section decoded: 2^21 G1 points is 151 MB,
@@ -402,11 +403,23 @@ fn apply_key_to_section(
         ));
     }
     w.start_section(id)?;
-    for chunk in body.chunks(CHUNK_POINTS * SG1) {
+    let scale = |chunk: &[u8]| -> Result<Vec<G1Affine>, CeremonyError> {
         let mut points =
             binfile::decode_records(chunk, SG1, G1Affine::identity(), |_, b| binfile::g1(b))?;
         key.apply_key_g1(&mut points, k, Fr::ONE)?;
-        w.write_g1_slice(&points)?;
+        Ok(points)
+    };
+    // Chunk `i` is written on this thread while the pool decodes and scales chunk `i + 1`,
+    // so the serial encode and write is off the critical path. The order of writes is the
+    // order of the chunks either way.
+    let mut chunks = body.chunks(CHUNK_POINTS * SG1);
+    let mut done = chunks.next().map(scale).transpose()?;
+    while let Some(points) = done.take() {
+        let next = chunks.next();
+        let (written, scaled) =
+            rayon::join(|| w.write_g1_slice(&points), || next.map(scale).transpose());
+        written?;
+        done = scaled?;
     }
     w.end_section()
 }
@@ -1472,9 +1485,12 @@ fn check_h_section(
             have: ptau.power(),
         });
     }
-    let mut coeffs: Vec<Fr> = (0..domain_size)
-        .map(|_| transcript::fr_from_rng(rng))
-        .collect();
+    // Below 2^128 rather than uniform in Fr, as the random check's scalars are: a section
+    // that differs from the right one makes `r1 - r2` a nonzero linear form in the
+    // coefficients, which one drawn this way zeroes with probability at most 2^-128. Half
+    // the bits halve the multiexp against the ptau, whose upper windows are then empty;
+    // the transformed side is full width either way.
+    let mut coeffs = random_scalars(rng, domain_size);
     coeffs[domain_size - 1] = Fr::zero();
 
     let n = domain_size - 1;
