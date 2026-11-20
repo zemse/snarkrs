@@ -378,20 +378,37 @@ fn put_lane(cols: &mut [[u64; 8]; 5], l: usize, x: &Fq) {
 
 /// Montgomery's trick over eight ark elements of `v 2^4`, then a factor 2^8 turns
 /// `v^-1 2^-4` into `v^-1 2^4`, which is `v^-1` in the 2^260 domain.
-fn invert8<F: Field + From<u64>>(f: &[F; 8]) -> [F; 8] {
+fn invert8<F: FastInv + From<u64>>(f: &[F; 8]) -> [F; 8] {
     let mut prefix = [F::ONE; 8];
     let mut acc = F::ONE;
     for l in 0..8 {
         prefix[l] = acc;
         acc *= f[l];
     }
-    let mut inv = acc.inverse().expect("inverse of zero") * F::from(256u64);
+    let mut inv = acc.fast_inv().expect("inverse of zero") * F::from(256u64);
     let mut out = [F::ONE; 8];
     for l in (0..8).rev() {
         out[l] = inv * prefix[l];
         inv *= f[l];
     }
     out
+}
+
+/// The one inversion of [`invert8`], by [`crate::safegcd`] rather than arkworks'.
+trait FastInv: Field {
+    fn fast_inv(&self) -> Option<Self>;
+}
+
+impl FastInv for Fq {
+    fn fast_inv(&self) -> Option<Self> {
+        crate::safegcd::fq_inv(self)
+    }
+}
+
+impl FastInv for Fq2 {
+    fn fast_inv(&self) -> Option<Self> {
+        crate::safegcd::fq2_inv(self)
+    }
 }
 
 impl Lanes for V {

@@ -22,7 +22,7 @@
 //! integer quotients; only the bound depends on the rounding.
 
 use ark_ec::short_weierstrass::Affine;
-use ark_ff::{Field, MontFp, PrimeField};
+use ark_ff::{MontFp, PrimeField};
 use snarkrs_field::raw::{RawField, RawFq, RawFq2};
 use snarkrs_field::{Fq, Fq2, Fr};
 
@@ -114,7 +114,7 @@ impl GlvField for RawFq {
     }
 
     fn inv(self) -> RawFq {
-        RawFq::from_fq(&self.to_fq().inverse().expect("inverse of zero"))
+        RawFq::from_fq(&crate::safegcd::fq_inv(&self.to_fq()).expect("inverse of zero"))
     }
 
     type Norm = RawFq;
@@ -156,7 +156,7 @@ impl GlvField for RawFq2 {
     }
 
     fn inv(self) -> RawFq2 {
-        RawFq2::from_fq2(&self.to_fq2().inverse().expect("inverse of zero"))
+        RawFq2::from_fq2(&crate::safegcd::fq2_inv(&self.to_fq2()).expect("inverse of zero"))
     }
 
     type Norm = RawFq;

@@ -33,6 +33,7 @@ pub mod accel;
 /// The curve and spot checks the GPU backends hold a ceremony readback to.
 pub mod check;
 pub mod glv;
+pub mod safegcd;
 pub mod xyzz;
 use snarkrs_field::raw::RawField;
 use xyzz::{to_projective, RawCurve, Xyzz};
