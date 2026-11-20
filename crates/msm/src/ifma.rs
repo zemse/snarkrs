@@ -30,7 +30,7 @@ use snarkrs_field::{Fq, Fq2};
 
 use crate::xyzz::{to_projective, RawCurve, Xyzz};
 use crate::{
-    affine_running_sum, batch_size, signed_digit, FastFill, OnesSum, Prescan, SideBuckets, Work,
+    affine_running_sum, signed_digit, FastFill, OnesSum, Prescan, SideBuckets, Work,
 };
 
 type G1 = snarkrs_field::g1::Config;
@@ -878,12 +878,19 @@ struct Fill<'a, P: IfmaCurve> {
     batch: usize,
 }
 
-/// Most entries per round on the wide windows, where an eighth of the buckets is past
-/// [`batch_size`]'s cap. A round's one inversion is a 6 us scalar call here against about
-/// 40 ns an entry, so 1024 entries spent 12% of a round on it; at 2048 the conflict share
-/// is still 6% at c = 16. Dense 2^18 and 2^20 G1, one thread: 4% faster than 1024, and 4096
-/// is slower again.
-const WIDE_BATCH: usize = 2048;
+/// Entries per round of [`Fill`]: an eighth of the buckets, at least 256 and at most 2048,
+/// and at most half the buckets, which the busy map needs (see [`batch_size`](crate::batch_size)).
+///
+/// The portable fill's [`batch_size`](crate::batch_size) (half the buckets, at most 1024) is tuned for a round
+/// whose arithmetic costs several times what it does here, so its conflict share, about the
+/// batch over the bucket count, is what this fill pays for most: a conflicting entry waits a
+/// round and every round pays a 2 us inversion and the busy-map traffic. Single-thread dense
+/// G1 (`examples/zz_inv`) against that rule: 2^15 points (2048 buckets) 69-71 ms against
+/// 77-78 at 256 entries; 2^13 24 against 25-29; 2^17 and 2^16 within noise; 2^18 and 2^20
+/// 4% faster at 2048 than at 1024, and 4096 slower again. 64 entries at 2^12 cost 25% more.
+fn ifma_batch(n_buckets: usize) -> usize {
+    (n_buckets / 8).clamp(256, 2048).min(n_buckets / 2)
+}
 
 /// Groups of eight a round's forward pass prefetches ahead of the one it is on.
 const PREFETCH: usize = 4;
@@ -895,7 +902,7 @@ impl<'a, P: IfmaCurve> Fill<'a, P> {
     const W: usize = P::L::LIMBS;
 
     fn new(bases: &'a [Affine<P>], idx: &'a [u32], rows: &'a [u64], n_buckets: usize) -> Self {
-        let batch = WIDE_BATCH.min(n_buckets / 8).max(batch_size(n_buckets));
+        let batch = ifma_batch(n_buckets);
         let cap = batch + batch / 2;
         Fill {
             bases,
