@@ -66,7 +66,7 @@ const DIGITS: usize = 130;
 /// The coordinate field of a group with the endomorphism: G1's `RawFq` or G2's `RawFq2`.
 /// Keyed on the field rather than the curve so code generic over [`RawField`], like the
 /// group FFT, can call it.
-pub trait GlvField: RawField {
+pub trait GlvField: RawField + 'static {
     /// How many parts [`GlvField::split`] cuts a scalar into, for [`mul_batch_xyzz`]: two
     /// on G1, four on G2, which also has `psi`.
     const DIMS: usize;

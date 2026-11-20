@@ -33,7 +33,7 @@ use crate::{affine_running_sum, batch_size, signed_digit, FastFill, Prescan, Sid
 
 type G1 = snarkrs_field::g1::Config;
 type G2 = snarkrs_field::g2::Config;
-type V = [__m512i; 5];
+pub(crate) type V = [__m512i; 5];
 
 const MASK: u64 = (1 << 52) - 1;
 /// Set on a scan index in the pending list when the point enters negated.
@@ -127,14 +127,14 @@ const P: [u64; 5] = to_52(FQ_MOD);
 const P2: [u64; 5] = to_52(twice_p());
 const K0: u64 = k0();
 /// 1 in the 2^260 domain.
-const ONE: [u64; 5] = to_52(pow2_mod_p(260));
+pub(crate) const ONE: [u64; 5] = to_52(pow2_mod_p(260));
 /// Multiplying a 2^256-domain element by this lands it in the 2^260 domain.
 const INTO: [u64; 5] = to_52(pow2_mod_p(264));
 /// And this takes a 2^260-domain element back to the 2^256 domain.
 const OUT_OF: [u64; 5] = to_52(pow2_mod_p(256));
 
 /// Whether this machine runs the kernels. `is_x86_feature_detected!` caches the probe.
-fn available() -> bool {
+pub(crate) fn available() -> bool {
     is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512ifma")
 }
 
@@ -145,7 +145,7 @@ fn available() -> bool {
 
 #[inline]
 #[target_feature(enable = "avx512f,avx512ifma")]
-fn splat(c: &[u64; 5]) -> V {
+pub(crate) fn splat(c: &[u64; 5]) -> V {
     [
         _mm512_set1_epi64(c[0] as i64),
         _mm512_set1_epi64(c[1] as i64),
@@ -157,7 +157,7 @@ fn splat(c: &[u64; 5]) -> V {
 
 #[inline]
 #[target_feature(enable = "avx512f,avx512ifma")]
-fn select(m: __mmask8, if_set: &V, otherwise: &V) -> V {
+pub(crate) fn select(m: __mmask8, if_set: &V, otherwise: &V) -> V {
     let mut r = *otherwise;
     for j in 0..5 {
         r[j] = _mm512_mask_blend_epi64(m, otherwise[j], if_set[j]);
@@ -170,7 +170,7 @@ fn select(m: __mmask8, if_set: &V, otherwise: &V) -> V {
 /// products, edge values and 2000-step lazy chains included.
 #[inline]
 #[target_feature(enable = "avx512f,avx512ifma")]
-fn mul(a: &V, b: &V) -> V {
+pub(crate) fn mul(a: &V, b: &V) -> V {
     let z = _mm512_setzero_si512();
     let mask = _mm512_set1_epi64(MASK as i64);
     let k0 = _mm512_set1_epi64(K0 as i64);
@@ -222,7 +222,7 @@ fn cond_sub(x: &V, m: &[u64; 5]) -> V {
 /// `a + b`, inputs and output in `[0, 2p)`.
 #[inline]
 #[target_feature(enable = "avx512f,avx512ifma")]
-fn add(a: &V, b: &V) -> V {
+pub(crate) fn add(a: &V, b: &V) -> V {
     let mask = _mm512_set1_epi64(MASK as i64);
     let mut s = [_mm512_setzero_si512(); 5];
     let mut carry = _mm512_setzero_si512();
@@ -237,7 +237,7 @@ fn add(a: &V, b: &V) -> V {
 /// `a - b` as `a + 2p - b`, inputs and output in `[0, 2p)`.
 #[inline]
 #[target_feature(enable = "avx512f,avx512ifma")]
-fn sub(a: &V, b: &V) -> V {
+pub(crate) fn sub(a: &V, b: &V) -> V {
     let mask = _mm512_set1_epi64(MASK as i64);
     let mut s = [_mm512_setzero_si512(); 5];
     let mut carry = _mm512_setzero_si512();
@@ -337,11 +337,11 @@ fn row_offsets(idx: &[u32; 8], row: usize) -> __m512i {
 
 /// Fq2 as two lane vectors, `c0 + c1 u` with `u^2 = -1`.
 #[derive(Clone, Copy)]
-struct V2(V, V);
+pub(crate) struct V2(pub(crate) V, pub(crate) V);
 
 /// The coordinate field of a group, eight elements a vector. Every method needs the
 /// target features: callers must have checked [`available`].
-trait Lanes: Copy {
+pub(crate) trait Lanes: Copy {
     /// u64 limbs per element, 5 for Fq and 10 for Fq2.
     const LIMBS: usize;
     type Raw: RawField;

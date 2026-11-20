@@ -20,6 +20,9 @@ use snarkrs_field::Fr;
 use super::{wnaf, GlvField, DIGITS, W};
 use crate::xyzz::{RawCurve, Xyzz};
 
+#[cfg(target_arch = "x86_64")]
+mod lanes;
+
 const TABLE: usize = 1 << (W - 2);
 
 #[derive(Clone, Copy)]
@@ -103,6 +106,8 @@ pub struct BatchState<F: GlvField> {
     idx: Vec<usize>,
     adds: Vec<(usize, Pt<F>)>,
     s: Scratch<F>,
+    #[cfg(target_arch = "x86_64")]
+    lanes: lanes::LaneState,
 }
 
 impl<F: GlvField> Default for BatchState<F> {
@@ -131,6 +136,8 @@ impl<F: GlvField> Default for BatchState<F> {
                 pre: Vec::new(),
                 who: Vec::new(),
             },
+            #[cfg(target_arch = "x86_64")]
+            lanes: Default::default(),
         }
     }
 }
@@ -297,7 +304,11 @@ pub fn mul_sums_xyzz_in<F: GlvField>(
     fill(&mut st.acc_zero, n, true);
     fill(&mut st.ok, n, true);
     fill(&mut st.count, n, 0);
-    for s in (0..steps).rev() {
+    #[cfg(target_arch = "x86_64")]
+    let laned = lanes::run(st, n, m, steps);
+    #[cfg(not(target_arch = "x86_64"))]
+    let laned = false;
+    for s in (0..if laned { 0 } else { steps }).rev() {
         st.idx.clear();
         st.idx
             .extend((0..n).filter(|&i| !st.gone[i] && st.ok[i] && !st.acc_zero[i]));
