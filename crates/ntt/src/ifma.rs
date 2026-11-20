@@ -623,7 +623,7 @@ unsafe fn tail<const INV: bool>(x: &mut [V], t: &BlockTables) {
 #[target_feature(enable = "avx512f,avx512ifma")]
 pub(crate) unsafe fn block_dit<const INV: bool>(block: &mut [Fr], s: &mut [V], t: &BlockTables) {
     let p = block.as_mut_ptr();
-    for (g, run) in s.chunks_exact_mut(8).enumerate() {
+    for (g, run) in s.as_chunks_mut::<8>().0.iter_mut().enumerate() {
         for (i, v) in run.iter_mut().enumerate() {
             *v = load8_stride8(p.add(64 * g + i));
         }
@@ -647,7 +647,7 @@ pub(crate) unsafe fn block_dif<const INV: bool>(block: &mut [Fr], s: &mut [V], t
         *v = load8(p.add(8 * g));
     }
     dif_body::<INV>(s, t);
-    for (g, run) in s.chunks_exact_mut(8).enumerate() {
+    for (g, run) in s.as_chunks_mut::<8>().0.iter_mut().enumerate() {
         transpose8(run);
         tail::<INV>(run, t);
         for (i, v) in run.iter().enumerate() {
@@ -669,7 +669,7 @@ pub(crate) unsafe fn block_fused(block: &mut [Fr], coset16: &[Fr], s: &mut [V], 
         *v = load8(p.add(8 * g));
     }
     dif_body::<true>(s, t);
-    for (g, run) in s.chunks_exact_mut(8).enumerate() {
+    for (g, run) in s.as_chunks_mut::<8>().0.iter_mut().enumerate() {
         transpose8(run);
         tail::<true>(run, t);
         for (i, v) in run.iter_mut().enumerate() {
