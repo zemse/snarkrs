@@ -717,6 +717,16 @@ struct Fill<'a, P: IfmaCurve> {
     batch: usize,
 }
 
+/// Most entries per round on the wide windows, where an eighth of the buckets is past
+/// [`batch_size`]'s cap. A round's one inversion is a 6 us scalar call here against about
+/// 40 ns an entry, so 1024 entries spent 12% of a round on it; at 2048 the conflict share
+/// is still 6% at c = 16. Dense 2^18 and 2^20 G1, one thread: 4% faster than 1024, and 4096
+/// is slower again.
+const WIDE_BATCH: usize = 2048;
+
+/// Groups of eight a round's forward pass prefetches ahead of the one it is on.
+const PREFETCH: usize = 4;
+
 /// Prefix product, denominator, numerator, `bx + px`, `bx`, `by`.
 const SAVED: usize = 6;
 
@@ -724,7 +734,7 @@ impl<'a, P: IfmaCurve> Fill<'a, P> {
     const W: usize = P::L::LIMBS;
 
     fn new(bases: &'a [Affine<P>], idx: &'a [u32], rows: &'a [u64], n_buckets: usize) -> Self {
-        let batch = batch_size(n_buckets);
+        let batch = WIDE_BATCH.min(n_buckets / 8).max(batch_size(n_buckets));
         let cap = batch + batch / 2;
         Fill {
             bases,
@@ -836,7 +846,15 @@ impl<'a, P: IfmaCurve> Fill<'a, P> {
         self.cancels.clear();
         let one = P::L::one();
         let mut acc = one;
+        // The bucket rows a round touches are scattered over the whole bucket array, a few
+        // MiB on a wide window, so the gathers below wait on L2 or L3 without this.
+        for i in 0..(PREFETCH * 8).min(n) {
+            self.prefetch(i);
+        }
         for g in 0..groups {
+            for i in 8 * (g + PREFETCH)..(8 * (g + PREFETCH + 1)).min(n) {
+                self.prefetch(i);
+            }
             let (b_off, k_off, valid, neg) = self.group(g);
             // `group` offsets address whole rows of `buckets` and `rows`, and masks off the
             // lanes past the end of the round.
@@ -898,24 +916,45 @@ impl<'a, P: IfmaCurve> Fill<'a, P> {
         self.pend_k.clear();
     }
 
+    /// Both cache lines of pending entry `i`'s bucket row and of its point row.
+    #[inline(always)]
+    fn prefetch(&self, i: usize) {
+        let row = 2 * Self::W;
+        let b = self.pend_b[i] as usize * row;
+        let k = (self.pend_k[i] & !NEG) as usize * row;
+        // SAFETY: a prefetch never faults, and both rows are in bounds of their arrays.
+        unsafe {
+            let bp = self.buckets.as_ptr().add(b) as *const i8;
+            let kp = self.rows.as_ptr().add(k) as *const i8;
+            _mm_prefetch::<_MM_HINT_T0>(bp);
+            _mm_prefetch::<_MM_HINT_T0>(bp.add(8 * row - 8));
+            _mm_prefetch::<_MM_HINT_T0>(kp);
+            _mm_prefetch::<_MM_HINT_T0>(kp.add(8 * row - 8));
+        }
+    }
+
     /// Bucket and point row offsets, live lanes and negated lanes of group `g`.
     #[inline]
     #[target_feature(enable = "avx512f,avx512ifma")]
     fn group(&self, g: usize) -> (__m512i, __m512i, __mmask8, __mmask8) {
         let lo = 8 * g;
         let len = (self.pend_b.len() - lo).min(8);
-        let mut b = [0u32; 8];
-        let mut k = [0u32; 8];
-        let mut neg = 0u8;
-        for l in 0..len {
-            b[l] = self.pend_b[lo + l];
-            let kl = self.pend_k[lo + l];
-            k[l] = kl & !NEG;
-            neg |= ((kl >> 31) as u8) << l;
-        }
         let valid = (((1u16 << len) - 1) & 0xff) as u8;
-        let row = 2 * Self::W;
-        (row_offsets(&b, row), row_offsets(&k, row), valid, neg)
+        let row = _mm512_set1_epi64(2 * Self::W as i64);
+        // SAFETY: the mask covers only the `len` entries from `lo`, which are in bounds;
+        // masked-off lanes are not read and fault-suppressed.
+        let (b, k) = unsafe {
+            (
+                _mm512_maskz_loadu_epi32(valid as u16, self.pend_b.as_ptr().add(lo) as *const _),
+                _mm512_maskz_loadu_epi32(valid as u16, self.pend_k.as_ptr().add(lo) as *const _),
+            )
+        };
+        let b = _mm512_cvtepu32_epi64(_mm512_castsi512_si256(b));
+        let k = _mm512_cvtepu32_epi64(_mm512_castsi512_si256(k));
+        let sign = _mm512_set1_epi64(NEG as i64);
+        let neg = _mm512_test_epi64_mask(k, sign);
+        let k = _mm512_andnot_si512(sign, k);
+        (_mm512_mul_epu32(b, row), _mm512_mul_epu32(k, row), valid, neg)
     }
 
     /// Flush the stragglers, convert the buckets back in one pass, then the scalar
